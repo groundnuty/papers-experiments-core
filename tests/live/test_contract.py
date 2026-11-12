@@ -581,19 +581,23 @@ FAULTS = pytest.mark.skipif(
 
 
 @FAULTS
-def test_a_provider_taken_down_is_seen_down_and_comes_back_with_a_new_identity(config):
+def test_a_provider_taken_down_is_seen_down_and_comes_back_with_a_new_identity(config, client):
     """O11: the injector takes a provider of `[faults.services]` down (EXPCORE_LIVE_FAULT_TARGET, a label such as
-    providers[1], or the first that is not the agent's own), sees it down, and brings it back with a changed identity,
-    leaving no injection open in the journal."""
-    from expcore_onedata.faults import FaultInjector, compose_driver, load_faults
+    providers[1], or the first that is not the agent's own), sees it down, brings it back with a changed identity and
+    waits until it serves (its container healthy, its REST read answered), leaving no injection open in the journal."""
+    from expcore_onedata.faults import FaultInjector, compose_driver, load_faults, provider_serves
 
     settings = load_faults(PLATFORM, config)
     remote = [name for name in settings.services if name != config.support.local] or list(settings.services)
     target = os.environ.get("EXPCORE_LIVE_FAULT_TARGET") or config.provider_label(remote[0])
-    injector = FaultInjector(config, settings, target, sanctioned=True, driver=compose_driver(settings))
+    driver = compose_driver(settings, probe=provider_serves(config, settings, client))
+    injector = FaultInjector(config, settings, target, sanctioned=True, driver=driver)
     with injector.session({"run_key": "live-fault-check", "attempt": 1}):
         steps = [s["step"] for s in injector.snapshot()["steps"]]
         assert "injected" in steps
     snapshot = injector.finish()
     assert snapshot["ok"] is True, snapshot["steps"]
-    assert snapshot["injections"] == [{"target": target, "injected": True, "cleared": True, "verified": True}]
+    (injection,) = snapshot["injections"]
+    ready_after_s = injection.pop("ready_after_s")  # the seconds the restored provider took to serve, on this clock
+    assert injection == {"target": target, "injected": True, "cleared": True, "verified": True}
+    assert 0 <= ready_after_s <= settings.ready_timeout_s

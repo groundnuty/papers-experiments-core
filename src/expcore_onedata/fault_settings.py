@@ -14,6 +14,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     poll_s = 2                       # optional: between two readings of a service
     settle_timeout_s = 180           # optional: the longest a service may take to go down or to come back; see below
     command_timeout_s = 120          # optional: the longest one command may take
+    ready_timeout_s = 180            # optional: the longest a restored provider may take to serve; see below
     clear_attempts = 3               # optional: how many times a restore is tried
     admission_timeout_s = 3600       # optional: the longest a run waits for the federation's lock
     health_wait_s = 30               # optional: the longest the health check waits for it; below health_timeout_s
@@ -28,13 +29,21 @@ to show not running, and a service not seen down in that time is an unverified r
 outcome"). The grace period is in the Compose file, which platform.toml does not read, so nothing here can refuse a
 value below it: whoever raises the grace, or lowers `settle_timeout_s`, keeps this bound. The default is the grace
 period plus `SETTLE_MARGIN_S`.
+
+`ready_timeout_s` is the longest a restored provider may take to serve before its restore counts as unverified. A
+restore whose identity changed is not yet a provider that serves: in the federation of deploy/compose-federation the
+restarted container's REST endpoint refused connections right after its restart and its health check passed 48 to 52 s
+after its start, so the default, `DEFAULT_READY_TIMEOUT_S`, is 180 s. The wait is counted from the verified identity
+change and ends when the provider answers an authenticated REST read and its container, if it has a health check, is
+healthy (`expcore_onedata.fault_serves`, `expcore_onedata.compose`). A provider that does not serve within it leaves the
+injection open and the federation's exclusive admission held, as a failed restore does.
 """
 
 import hashlib
 import math
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +59,7 @@ PROJECT = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 STOP_GRACE_S = 120.0  # the federation's `stop_grace_period` for a provider (deploy/compose-federation/fedcompose.py)
 SETTLE_MARGIN_S = 60.0  # what the default settle timeout adds to it, for the daemon's kill and the readings' lag
 DEFAULT_SETTLE_TIMEOUT_S = STOP_GRACE_S + SETTLE_MARGIN_S
+DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48 to 52 s after their restart (measured)
 _KEYS = (
     "sanctioned",
     "journal",
@@ -60,6 +70,7 @@ _KEYS = (
     "poll_s",
     "settle_timeout_s",
     "command_timeout_s",
+    "ready_timeout_s",
     "clear_attempts",
     "admission_timeout_s",
     "health_wait_s",
@@ -82,6 +93,7 @@ class FaultSettings:
     poll_s: float = 2.0
     settle_timeout_s: float = DEFAULT_SETTLE_TIMEOUT_S
     command_timeout_s: float = 120.0
+    ready_timeout_s: float = DEFAULT_READY_TIMEOUT_S
     clear_attempts: int = 3
     admission_timeout_s: float = 3600.0
     health_wait_s: float = 30.0
@@ -134,6 +146,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         poll_s=_number(table, "poll_s", 2.0, 0.001),
         settle_timeout_s=_number(table, "settle_timeout_s", DEFAULT_SETTLE_TIMEOUT_S, 0),
         command_timeout_s=_number(table, "command_timeout_s", 120.0, 1),
+        ready_timeout_s=_number(table, "ready_timeout_s", DEFAULT_READY_TIMEOUT_S, 0),
         clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
         admission_timeout_s=_number(table, "admission_timeout_s", 3600.0, 0),
         health_wait_s=_number(table, "health_wait_s", 30.0, 0),
@@ -160,8 +173,12 @@ def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:
     return {"sanctioned": settings.sanctioned, "targets": dict(sorted(targets.items()))}
 
 
-def compose_driver(settings: FaultSettings, runner: CommandRunner = run_command) -> ComposeDriver:
-    """The Compose driver `[faults]` describes, running its commands through `runner`."""
+def compose_driver(
+    settings: FaultSettings, runner: CommandRunner = run_command, *, probe: Callable[[str], bool]
+) -> ComposeDriver:
+    """The Compose driver `[faults]` describes, running its commands through `runner`; `probe(service)` says whether
+    the provider behind a service answers its REST API (`expcore_onedata.fault_serves.provider_serves`), which a
+    restore is not verified without."""
     return ComposeDriver(
         settings.compose_file,
         project=settings.project,
@@ -169,4 +186,5 @@ def compose_driver(settings: FaultSettings, runner: CommandRunner = run_command)
         docker=settings.docker,
         runner=runner,
         timeout_s=settings.command_timeout_s,
+        probe=probe,
     )

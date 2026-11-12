@@ -27,7 +27,9 @@ the middle of it, and fails while an injection stays open, because a provider ta
 not verifiably back, leaves the federation out of its baseline state for every other run, including runs of conditions
 that use no injector. A check whose bounded wait for the federation runs out, because an outage run holds it, reads
 nothing and answers deferred, a wait that charges no run (`expcore.campaign.healthgate`). The gate is built in and
-cannot be left out; `fault_driver` replaces the Compose driver that `[faults]` describes, for tests.
+cannot be left out; `fault_driver` replaces the Compose driver that `[faults]` describes, for tests. The gate's recovery
+verifies a restore only when the provider serves, as the injector's clear does (`faults.py`, "A restore is verified
+only when the provider serves"): the Compose driver it builds reads through the check's own client.
 
 The check of the earlier study also read one known file back through its provider and compared its checksum with a study manifest. That
 belongs to the study (its data) and not to the platform, so a study adds it with its own check.
@@ -58,6 +60,7 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_recovery import FaultDriver
+from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import compose_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
@@ -127,13 +130,18 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
     return Health(True, f"ok: the space is supported by exactly the {len(matched)} declared provider(s)")
 
 
-def _fault_gate(config: PlatformConfig, driver: FaultDriver | None, inner: HealthCheck) -> FaultGate | None:
+def _fault_gate(
+    config: PlatformConfig, client: OnezoneClient, driver: FaultDriver | None, inner: HealthCheck
+) -> FaultGate | None:
     """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
-    not valid raises ConfigError here, so a platform with an injector never runs without the gate."""
+    not valid raises ConfigError here, so a platform with an injector never runs without the gate. The Compose driver
+    it recovers through finds a restored provider serving by reading through the check's own client."""
     settings = fault_settings_of(config)
     if settings is None:
         return None
-    return FaultGate(settings, driver if driver is not None else compose_driver(settings), inner)
+    if driver is None:
+        driver = compose_driver(settings, probe=provider_serves(config, settings, client))
+    return FaultGate(settings, driver, inner)
 
 
 class PlatformHealth:
@@ -157,7 +165,7 @@ class PlatformHealth:
         self._lock = threading.Lock()
         self._content_type: ContentTypeVerdict | None = None
         self._gate = PreCampaignHealth(self._space, self._measure)
-        self._faults = _fault_gate(config, fault_driver, self._gate)  # outermost: it holds the federation
+        self._faults = _fault_gate(config, client, fault_driver, self._gate)  # outermost: it holds the federation
 
     @property
     def content_type(self) -> ContentTypeVerdict | None:

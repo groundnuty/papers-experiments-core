@@ -30,9 +30,9 @@ class Runner:
         raise AssertionError(f"unexpected command {argv}")
 
 
-def driver(answers, **options):
+def driver(answers, probe=lambda service: True, **options):
     runner = Runner(answers)
-    return ComposeDriver(COMPOSE, project="stack-a", runner=runner, **options), runner
+    return ComposeDriver(COMPOSE, project="stack-a", runner=runner, probe=probe, **options), runner
 
 
 def test_o11_the_identity_is_the_containers_id_and_start_time():
@@ -106,3 +106,75 @@ def test_o11_stop_and_start_name_the_service_and_fail_on_a_nonzero_exit():
         "stop",
         "store-two",
     ]
+
+
+PS = ("ps", "--all", "--quiet", "store-two")
+INSPECT = ("inspect", "--format", INSPECT_FORMAT, "cid-9")
+
+
+def inspected(line):
+    return {PS: CommandResult(0, "cid-9\n"), INSPECT: CommandResult(0, line)}
+
+
+def test_o11_a_container_with_a_health_check_reports_its_status_in_the_observation():
+    """O11: the inspection's fourth field is the container's health status; the identity is unchanged by it."""
+    compose, _ = driver(inspected("cid-9|2026-11-09T10:00:00Z|true|starting\n"))
+    assert compose.observe("store-two") == Observation(True, "cid-9@2026-11-09T10:00:00Z", "starting")
+
+
+@pytest.mark.parametrize("line", ["cid-9|T|true|", "cid-9|T|true|none", "cid-9|T|true"])
+def test_o11_a_container_with_no_health_check_has_no_health_status(line):
+    """O11: an empty field, Docker's `none`, or an answer without the field all say there is no health check."""
+    compose, _ = driver(inspected(line + "\n"))
+    assert compose.observe("store-two").health is None
+
+
+@pytest.mark.parametrize("line", ["cid-9|T|true|healthy|extra", "cid-9|T|true|Health Status 1"])
+def test_o11_an_inspection_with_a_malformed_health_field_cannot_be_read(line):
+    """O11: a health field that is not a word is no reading, so the restore is not judged by it."""
+    compose, _ = driver(inspected(line + "\n"))
+    with pytest.raises(DriverError, match="could not be read"):
+        compose.observe("store-two")
+
+
+@pytest.mark.parametrize(
+    ("line", "probe_answer", "serves", "asked"),
+    [
+        ("cid-9|T|true|healthy", True, True, True),
+        ("cid-9|T|true|healthy", False, False, True),
+        ("cid-9|T|true|starting", True, False, False),
+        ("cid-9|T|true|unhealthy", True, False, False),
+        ("cid-9|T|true|", True, True, True),
+        ("cid-9|T|true|", False, False, True),
+        ("cid-9|T|false|", True, False, False),
+    ],
+)
+def test_o11_a_service_serves_when_its_container_is_healthy_or_has_no_health_check_and_the_probe_answers(
+    line, probe_answer, serves, asked
+):
+    """O11: `serves` needs a running container, a healthy one when it has a health check, and the probe's yes; a
+    container that is not yet healthy is not even probed."""
+    probed = []
+
+    def probe(service):
+        probed.append(service)
+        return probe_answer
+
+    compose, _ = driver(inspected(line + "\n"), probe=probe)
+    assert compose.serves("store-two") is serves
+    assert probed == (["store-two"] if asked else [])
+
+
+def test_o11_a_service_with_no_container_does_not_serve_and_an_unreadable_one_raises():
+    """O11: no container is nothing serving; a reading that fails is the caller's to ask again."""
+    compose, _ = driver({PS: CommandResult(0, "\n")})
+    assert compose.serves("store-two") is False
+    compose, _ = driver({PS: CommandResult(1, "", "no such service")})
+    with pytest.raises(DriverError, match="exit code 1"):
+        compose.serves("store-two")
+
+
+def test_o11_the_driver_cannot_be_built_without_a_probe():
+    """O11: a restore is not verified without asking whether the provider serves, so the probe is not optional."""
+    with pytest.raises(TypeError, match="probe"):
+        ComposeDriver(COMPOSE, project="stack-a", runner=Runner({}))  # type: ignore[call-arg]

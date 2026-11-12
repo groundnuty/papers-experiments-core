@@ -17,6 +17,15 @@ the service to show not running, and only then restores it and judges the restor
 that never shows down within the bound is `stop_unsettled`, not cleared, never verified. The settle timeout must
 therefore exceed the providers' `stop_grace_period` with a margin (180 s against the federation's 120 s, by default).
 
+A restore whose identity changed is not yet a provider that serves: the live run of 12 Nov 2026 found the restarted
+provider's REST endpoint refusing connections right after the restart and its health check passing 48 to 52 s later.
+`settle` therefore waits, once the identity is verified, for the driver to say the service serves
+(`FaultDriver.serves`), polling every `poll_s` for at most `ready_timeout_s`, and journals the injection cleared only
+then. A service that does not serve within the bound is `not_serving`: unverified, the injection open, its identity
+not asked for again (it is already verified), and the next `settle` finds it restored and waits again. The seconds
+waited, counted from the verified identity change, are returned (`ready_after_s`) for the injector's snapshot and the
+`recovered` reading. A service the stop never took down (`never_down`) kept running and is not waited for.
+
 `recover` settles every open injection whose target's lock it can take (its holder is gone),
 reports a lock held while its journalled holder is gone as stuck, and returns the targets live injectors hold.
 """
@@ -26,7 +35,7 @@ import hashlib
 import math
 import time
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
@@ -49,6 +58,21 @@ class FaultDriver(Protocol):
     def start(self, service: str) -> None:
         """Start the service again; raise DriverError when the command fails."""
         ...
+
+    def serves(self, service: str) -> bool:
+        """Whether the running service serves now: its API answers an authenticated read and its container, when it has
+        a health check, is healthy. False when it does not (yet); raise DriverError only when it cannot be read."""
+        ...
+
+
+class Settled(NamedTuple):
+    """How one injection's settling ended: whether it is cleared, how (or why not), the new identity's digest when one
+    was read, and the seconds the restored service took to serve (None when it was not waited for)."""
+
+    done: bool
+    how: str
+    after: str | None = None
+    ready_after_s: float | None = None
 
 
 def digest(identity: str) -> str:
@@ -89,7 +113,8 @@ class Recovery:
         """Settle every open injection whose target's lock is free; raise InfraError of kind `injector_failure` when one
         cannot be settled or its lock is stuck. Return the targets of those live injectors hold, sorted.
 
-        `on_step("recovered", ok, target=..., how=..., ...)` is told of every injection it settled or failed to.
+        `on_step("recovered", ok, target=..., how=..., ...)` is told of every injection it settled or failed to, with
+        the seconds the restored service took to serve (`ready_after_s`).
         """
         step = on_step or (lambda *args, **kwargs: None)
         held: list[str] = []
@@ -103,38 +128,39 @@ class Recovery:
                 held.append(target)  # a live injector holds the target down on purpose
                 continue
             try:
-                done, how, after = self.settle(entry)
+                done, how, after, ready_after_s = self.settle(entry)
             finally:
                 lock.close()
-            step("recovered", done, target=target, how=how, identity_after_sha256=after)
+            step("recovered", done, target=target, how=how, identity_after_sha256=after, ready_after_s=ready_after_s)
             if not done:
                 raise failure(f"an injection of {target} that an earlier run left open was not cleared", target)
         return sorted(set(held))
 
-    def settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
-        """Leave one injection's target up: find it back, find it never went down, or bring it back with a changed
-        identity; journal it cleared when it is, and its clear failed when it is not, or when settling raised. Return
-        whether it is, how, and the new identity's digest if any."""
+    def settle(self, entry: Mapping[str, Any]) -> Settled:
+        """Leave one injection's target up and serving: find it back, find it never went down, or bring it back with a
+        changed identity, and, once it was restored, wait for it to serve; journal it cleared when it is, and its clear
+        failed when it is not, or when settling raised. Return whether it is, how, the new identity's digest if any and
+        the seconds the wait for it to serve took."""
         try:
-            done, how, after = self._settle(entry)
+            settled = self._settle(entry)
         except Exception as error:
             self._clear_failed(entry, type(error).__name__)
             raise
-        if not done:
-            self._clear_failed(entry, how)
-        return done, how, after
+        if not settled.done:
+            self._clear_failed(entry, settled.how)
+        return settled
 
     def _clear_failed(self, entry: Mapping[str, Any], how: str) -> None:
         with contextlib.suppress(OSError):  # the journal may be what failed: the injection stays open all the same
             self.journal.append({"event": "clear_failed", "id": entry["id"], "how": how})
 
-    def _settle(self, entry: Mapping[str, Any]) -> tuple[bool, str, str | None]:
+    def _settle(self, entry: Mapping[str, Any]) -> Settled:
         before, injected = entry["identity_sha256"], entry["injected"]
         seen: Observation | None
         if entry.get("stop_unknown"):  # the daemon may still be stopping it: a reading now proves nothing
             seen = self._await_down(entry["service"], before)
             if seen is None:
-                return False, "stop_unsettled", None  # never seen down within the bound: fail closed
+                return Settled(False, "stop_unsettled")  # never seen down within the bound: fail closed
             injected = True  # it was seen not running (or running anew): it did go down
         else:
             try:
@@ -147,7 +173,7 @@ class Recovery:
             how, after = "found_restored", digest(seen.identity)
         elif seen is not None and seen.running and same:
             if injected:  # it was seen down, so it must have started anew: its identity cannot be trusted
-                return False, "identity_unchanged", None
+                return Settled(False, "identity_unchanged")
             how = "never_down"  # the stop never took effect
         else:
             restored, after, reason = self._restore(entry["service"], before)
@@ -156,9 +182,34 @@ class Recovery:
             elif reason == "identity_unchanged" and not injected:
                 how = "never_down"  # unreadable at first, then running as it was: it never went down
             else:
-                return False, reason, None
+                return Settled(False, reason)
+        ready_after_s = None
+        if how != "never_down":  # it was restarted: its identity changed, which is not yet that it serves
+            ready_after_s = self._await_serving(entry["service"])
+            if ready_after_s is None:
+                return Settled(False, "not_serving", after)  # fail closed: the injection stays open, the identity known
         self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
-        return True, how, after
+        return Settled(True, how, after, ready_after_s)
+
+    def _await_serving(self, service: str) -> float | None:
+        """Ask the driver whether the service serves, now and then every `poll_s`, until it does or `ready_timeout_s`
+        is over; return the seconds waited (0 when it served at the first reading), None when it never did. A service
+        that cannot be read is no answer yet, so it is asked again; the bound is checked between two readings."""
+        timeout_s, poll_s = self._settings.ready_timeout_s, self._settings.poll_s
+        polls = max(1, math.ceil(timeout_s / poll_s)) + 1
+        started = self._clock()
+        for poll in range(polls):
+            if poll:
+                self._sleep(poll_s)
+            try:
+                served = self._driver.serves(service) is True
+            except DriverError:
+                served = False
+            if served:
+                return self._clock() - started
+            if self._clock() - started >= timeout_s:
+                break
+        return None
 
     def _await_down(self, service: str, before: str) -> Observation | None:
         """After a stop of unknown outcome: read the service until it shows not running, or running with another

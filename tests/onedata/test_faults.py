@@ -130,7 +130,9 @@ def test_o11_finish_brings_the_provider_back_with_a_new_identity_and_records_eve
     assert services.identity(OUTAGE_SERVICE) != before
     assert snapshot["ok"] is True
     assert (snapshot["run_key"], snapshot["attempt"], snapshot["target"]) == (RUN["run_key"], 1, OUTAGE_TARGET)
-    assert snapshot["injections"] == [{"target": OUTAGE_TARGET, "injected": True, "cleared": True, "verified": True}]
+    assert snapshot["injections"] == [
+        {"target": OUTAGE_TARGET, "injected": True, "cleared": True, "verified": True, "ready_after_s": 0}
+    ]
     steps = [(s["step"], s["ok"]) for s in snapshot["steps"]]
     assert steps == [("sanctioned", True), ("injected", True), ("cleared", True), ("verified", True)]
     times = [s["at_s"] for s in snapshot["steps"]]

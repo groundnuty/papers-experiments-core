@@ -12,6 +12,7 @@ from fault_support import (
     FakeClock,
     FakeDaemon,
     injector_for,
+    serving,
     write_faults,
 )
 
@@ -42,7 +43,7 @@ def hanging_stop(tmp_path, exit_after_s):
     daemon = FakeDaemon(clock)
     daemon.stop_hangs, daemon.exit_after_s = True, exit_after_s
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
-    return injector_for(platform, compose_driver(settings, daemon), clock=clock), daemon, clock, settings
+    return injector_for(platform, compose_driver(settings, daemon, probe=serving), clock=clock), daemon, clock, settings
 
 
 def steps(injector):
@@ -100,7 +101,7 @@ def test_o11_a_recovery_after_a_crash_in_an_unknown_stop_waits_for_the_container
     with pytest.raises(InfraError):
         injector.start(RUN)
     assert len(open_injections(tmp_path)) == 1
-    recovery = Recovery(settings, compose_driver(settings, daemon), clock=clock, sleep=clock.sleep)
+    recovery = Recovery(settings, compose_driver(settings, daemon, probe=serving), clock=clock, sleep=clock.sleep)
     (entry,) = recovery.entries()
     assert entry["stop_unknown"] is True
     assert recovery.settle(entry)[:2] == (True, "restored")
@@ -120,6 +121,9 @@ class _RunningWithoutIdentity:
     def start(self, service):
         pass
 
+    def serves(self, service):
+        return True
+
 
 @pytest.mark.parametrize("flags", [{"injected": True}, {"injected": False}, {"injected": False, "stop_unknown": True}])
 def test_o11_running_with_no_identity_is_not_a_restore(tmp_path, flags):
@@ -130,6 +134,6 @@ def test_o11_running_with_no_identity_is_not_a_restore(tmp_path, flags):
     clock = FakeClock()
     recovery = Recovery(settings, _RunningWithoutIdentity(), clock=clock, sleep=clock.sleep)
     entry = {"id": "left-open", "service": SERVICE, "identity_sha256": digest("old"), **flags}
-    done, how, after = recovery.settle(entry)
+    done, how, after, _ = recovery.settle(entry)
     assert (done, after) == (False, None)
     assert how not in ("restored", "found_restored", "never_down")

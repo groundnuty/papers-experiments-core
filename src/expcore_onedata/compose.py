@@ -12,19 +12,27 @@ A service's identity is its container's id and the time the container last start
 id. A restore that really happened therefore always changes the identity, and a service that was never down keeps it,
 which is what lets the injector refuse to count readiness as a restore (O11).
 
+A running container is not yet a service that serves. `serves` answers whether it does: its container's health check,
+when it has one, reports healthy, and the `probe` the driver is built with, a read of the platform's REST API through
+that provider (`expcore_onedata.fault_serves`), succeeds. The probe is required, so a driver cannot be built that
+takes a restore for a ready provider without asking.
+
 No message holds a service name, a path or a command's output, which can echo either: a failure says which step failed
 and how the command ended.
 """
 
+import re
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from expcore_onedata.client import PlatformError
 
-INSPECT_FORMAT = "{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}"
+# The fourth field is the container's health status, empty for a container with no health check.
+INSPECT_FORMAT = "{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+HEALTH_STATUS = re.compile(r"[a-z]{1,20}")  # Docker's: healthy, unhealthy, starting (and none, for no health check)
 
 
 class DriverError(PlatformError):
@@ -56,10 +64,12 @@ def run_command(argv: Sequence[str], *, timeout_s: float) -> CommandResult:
 
 @dataclass(frozen=True)
 class Observation:
-    """What a service looked like at one reading: whether it runs, and its identity when it has a container."""
+    """What a service looked like at one reading: whether it runs, its identity when it has a container, and its
+    container's health status (`healthy`, `unhealthy` or `starting`) when the container has a health check."""
 
     running: bool
     identity: str | None
+    health: str | None = None
 
 
 class ComposeDriver:
@@ -74,11 +84,15 @@ class ComposeDriver:
         docker: Sequence[str] = ("docker",),
         runner: CommandRunner = run_command,
         timeout_s: float = 120.0,
+        probe: Callable[[str], bool],
     ) -> None:
+        """`probe(service)` says whether the provider behind a service answers its REST API: True when it does, False
+        when it does not (yet). It is required: the driver's `serves` is not defined without it."""
         self._compose = [*command, "--file", str(compose_file), *(["--project-name", project] if project else [])]
         self._docker = list(docker)
         self._runner = runner
         self._timeout_s = timeout_s
+        self._probe = probe
 
     def _run(self, argv: list[str], step: str) -> CommandResult:
         """Run a command; raise DriverError, naming only the step, when it cannot run, does not finish, or fails."""
@@ -116,6 +130,20 @@ class ComposeDriver:
             [*self._docker, "inspect", "--format", INSPECT_FORMAT, containers[0]], "inspect the container"
         )
         parts = shown.stdout.strip().split("|")
-        if len(parts) != 3 or not parts[0] or not parts[1] or parts[2] not in ("true", "false"):
+        if len(parts) == 3:  # an answer without the health field: no health check to consult
+            parts.append("")
+        if len(parts) != 4 or not parts[0] or not parts[1] or parts[2] not in ("true", "false"):
             raise DriverError("the container's inspection could not be read")
-        return Observation(parts[2] == "true", f"{parts[0]}@{parts[1]}")
+        health = "" if parts[3] == "none" else parts[3]
+        if health and not HEALTH_STATUS.fullmatch(health):
+            raise DriverError("the container's inspection could not be read")
+        return Observation(parts[2] == "true", f"{parts[0]}@{parts[1]}", health or None)
+
+    def serves(self, service: str) -> bool:
+        """Whether the service serves now: its container runs, its health check (when it has one) reports healthy, and
+        the probe finds the provider answering its REST API. The probe is not asked of a container that is not yet
+        healthy. Raises DriverError when the container cannot be read."""
+        seen = self.observe(service)
+        if not seen.running or seen.health not in (None, "healthy"):
+            return False
+        return self._probe(service) is True

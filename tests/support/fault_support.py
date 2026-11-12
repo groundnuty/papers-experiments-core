@@ -24,14 +24,27 @@ class FakeServices:
     `start` of a stopped service starts it anew (a new identity); `start` of a running one does nothing. With a `path`
     the state lives in that file, so a child process and its parent see the same services. Knobs: `stop_noop` (stop does
     nothing), `start_keeps_identity` (a start runs the service with the identity it had), `start_fails`, `unreadable`.
+
+    A service that starts anew does not serve at once: `serves_after` readings of `serves` (counted in this object,
+    not in the file) answer no first, and `never_serves` makes every one answer no. `on_serves` is called with the
+    service before each such reading.
     """
 
     def __init__(self, services=SERVICE_NAMES, *, path: Path | None = None, **knobs: Any) -> None:
         self.path = path
-        self.knobs = {"stop_noop": False, "start_keeps_identity": False, "start_fails": False, "unreadable": False}
+        self.knobs = {
+            "stop_noop": False,
+            "start_keeps_identity": False,
+            "start_fails": False,
+            "unreadable": False,
+            "serves_after": 0,
+            "never_serves": False,
+        }
         self.knobs.update(knobs)
         self.calls: list[tuple[str, str]] = []
         self.on_stop = None  # called with the service before a stop takes effect
+        self.on_serves = None  # called with the service before each reading of whether it serves
+        self._starting: dict[str, int] = {}  # service -> readings of `serves` that still answer no
         state = {
             name: {"running": True, "container": f"cid-{index}", "starts": 1} for index, name in enumerate(services)
         }
@@ -63,6 +76,17 @@ class FakeServices:
         entry = self._load()[service]
         return Observation(entry["running"], self.identity(service))
 
+    def serves(self, service: str) -> bool:
+        self.calls.append(("serves", service))
+        if self.on_serves is not None:
+            self.on_serves(service)
+        if self.knobs["never_serves"] or not self._load()[service]["running"]:
+            return False
+        if self._starting.get(service, 0) > 0:
+            self._starting[service] -= 1
+            return False
+        return True
+
     def stop(self, service: str) -> None:
         self.calls.append(("stop", service))
         if self.on_stop is not None:
@@ -80,6 +104,7 @@ class FakeServices:
             entry["running"] = True
             if not self.knobs["start_keeps_identity"]:
                 entry["starts"] += 1
+            self._starting[service] = self.knobs["serves_after"]
             self._save()
 
 
@@ -92,6 +117,7 @@ def faults_table(**changes: Any) -> dict[str, Any]:
         "project": "stack-a",
         "poll_s": 1,
         "settle_timeout_s": 5,
+        "ready_timeout_s": 5,
         "clear_attempts": 2,
         "admission_timeout_s": 1,
         "services": dict(SERVICES),
@@ -178,6 +204,11 @@ class FakeDaemon:
             self.clock.sleep(timeout_s)  # the CLI is killed here; the daemon is not
             raise subprocess.TimeoutExpired(list(argv), timeout_s)
         return CommandResult(0, "")
+
+
+def serving(service: str) -> bool:
+    """A readiness probe that finds every provider serving: for a driver whose tests are not about readiness."""
+    return True
 
 
 def injector_for(platform: Path, driver: Any, target: str = OUTAGE_TARGET, clock: FakeClock | None = None, **kw: Any):

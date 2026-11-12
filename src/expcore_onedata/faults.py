@@ -32,6 +32,23 @@ other than the one read before the injection (`ComposeDriver`: the container's i
 not a restore, and a provider back with the same identity is a failed restore. The start is tried a bounded number of
 times; a service that cannot be read is started all the same, and its restore is `restore_unverified`.
 
+**A restore is verified only when the provider serves (O11).** A changed identity is not yet a provider that serves: in
+the live run of 12 Nov 2026 (deploy/compose-federation/day0) the restarted provider's REST endpoint still refused
+connections about a second after the restart, and its container's health check passed 48 to 52 s after the container
+started. Releasing the federation then lets the next run, a control perhaps, start on a provider that is still starting,
+whose refusals and delays its agent can absorb without any recorded infrastructure error. So once the identity is
+verified, `clear` waits for the driver to say the provider serves (`FaultDriver.serves`: `ComposeDriver` asks that its
+container, if it has a health check, is healthy and that the platform's authenticated REST read through that provider
+succeeds, `expcore_onedata.fault_serves`), every `poll_s`, for at most `ready_timeout_s` (180 s by default), and only
+then journals the injection cleared and lets the federation go. A provider that does not serve within the bound is a
+restore `not_serving`: unverified, the injection open and journalled `clear_failed`, the target's lock and the
+federation's exclusive admission held, the fault gate failing for it, exactly as for a failed restore; the start command
+is not issued again, and a later `clear`, `finish` or `start` finds the provider restored and waits again. The snapshot
+records the wait as `ready_after_s`, in the `verified` step and in the injection once it served: the seconds from the
+verified identity change to the first reading that showed it serving (0 for a provider that already served). A provider
+the stop never took down is not waited for. The recovery of a crashed run's injection, by `start`, `recover` or the
+fault gate, waits the same way, and its `recovered` reading carries `ready_after_s` too.
+
 **A stop of unknown outcome (O11).** When the stop command raises, typically at its timeout (`command_timeout_s`), the
 CLI is killed but the Docker daemon goes on stopping the container for up to the provider's `stop_grace_period`; the
 federation's is 120 s, the default command timeout. The injection is then journalled `stop_unknown`, and the clear
@@ -66,6 +83,7 @@ while an outage run holds it, and fails only for an injection that stays open.
 
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
+The injection's own entry holds `target`, `injected`, `cleared`, `verified` and, once its provider served, `ready_after_s`.
 
 **Use.** The study's plugin passes the platform's run admission to the campaign (`admission=run_admission(config,
 schema)`, with the study's factor schema), which admits each run to the federation before anything starts (exclusive
@@ -75,7 +93,7 @@ targets. The executor, already admitted, starts the sandbox and
 the tool server, builds the injector for the target its condition declares and runs the agent inside `running`:
 
     injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
-                             driver=compose_driver(settings))
+                             driver=compose_driver(settings, probe=provider_serves(config, settings, client)))
     async with injector.running(dataclasses.asdict(request.identity)):
         record = await record_run(request, ...)
     record = await asyncio.to_thread(finish_instruments, record, [injector])
@@ -114,6 +132,7 @@ from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, digest
+from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, load_faults
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
@@ -129,6 +148,7 @@ __all__ = [
     "compose_driver",
     "load_faults",
     "provider_outage",
+    "provider_serves",
 ]
 
 
@@ -184,9 +204,9 @@ class FaultInjector:
         self._cancel = threading.Event()  # set when `running` is cancelled: an admission still awaited is given up
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
         rounds = settings.clear_attempts + 2
-        self.cancel_wait_s = (
-            settings.settle_timeout_s + settings.command_timeout_s
-        ) * rounds  # about a start's longest
+        self.cancel_wait_s = (settings.settle_timeout_s + settings.command_timeout_s) * rounds + (
+            2 * settings.ready_timeout_s  # a start may wait for a recovered provider and for its own clear's
+        )  # about a start's longest
         self._pending: tuple[str, str] | None = None  # the open injection's journal id and identity digest
         self._run: dict[str, Any] | None = None
         self._steps: list[dict[str, Any]] = []
@@ -406,7 +426,7 @@ class FaultInjector:
         entry, digest = self._pending
         injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
         try:
-            done, how, after = self._recovery.settle(
+            done, how, after, ready_after_s = self._recovery.settle(
                 {
                     "id": entry,
                     "service": self._service,
@@ -416,11 +436,18 @@ class FaultInjector:
                 }
             )
         except Exception as error:  # never lose the reading: a clear that failed stays pending and open
-            done, how, after = False, type(error).__name__, None
+            done, how, after, ready_after_s = False, type(error).__name__, None, None
         verified = done and how in ("restored", "found_restored")
-        self._injection = {**injection, "cleared": done, "verified": verified}
+        timed = {} if ready_after_s is None else {"ready_after_s": ready_after_s}
+        self._injection = {**injection, "cleared": done, "verified": verified, **timed}
         self._step("cleared", done, how=how)
-        self._step("verified", verified, identity_changed=after is not None, identity_after_sha256=after)
+        self._step(
+            "verified",
+            verified,
+            identity_changed=after is not None,
+            identity_after_sha256=after,
+            ready_after_s=ready_after_s,
+        )
         if done:
             self._pending, self._stop_unknown = None, False
             self._unlock()
