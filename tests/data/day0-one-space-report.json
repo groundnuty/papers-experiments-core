@@ -1,0 +1,197 @@
+{
+  "checks": [
+    {
+      "facts": {
+        "providers": {
+          "alpha": {
+            "build": "test",
+            "configuration": {
+              "attempts": 1,
+              "error": null,
+              "probe_ok": true,
+              "status": null
+            },
+            "online": true,
+            "tcp": {
+              "errors": 0,
+              "measured": true,
+              "median_ms": 2.0,
+              "min_ms": 2.0,
+              "samples": 3
+            },
+            "version": "25.0.0"
+          },
+          "beta": {
+            "build": "test",
+            "configuration": {
+              "attempts": 1,
+              "error": null,
+              "probe_ok": true,
+              "status": null
+            },
+            "online": true,
+            "tcp": {
+              "errors": 0,
+              "measured": true,
+              "median_ms": 2.0,
+              "min_ms": 2.0,
+              "samples": 3
+            },
+            "version": "25.0.0"
+          }
+        }
+      },
+      "mutates": false,
+      "name": "reachability",
+      "seconds": 0.6,
+      "status": "pass",
+      "summary": "all 2 declared provider(s) answered",
+      "title": "Reachability of each declared provider"
+    },
+    {
+      "facts": {},
+      "mutates": false,
+      "name": "health",
+      "seconds": 0.0,
+      "status": "pass",
+      "summary": "ok: the space is supported by exactly the 2 declared provider(s)",
+      "title": "Health against the declared support set"
+    },
+    {
+      "facts": {
+        "planes": {
+          "data_path": {
+            "caveats": {
+              "data.path": 1,
+              "data.readonly": 1,
+              "interface": 1,
+              "time": 1
+            },
+            "examined": true,
+            "seconds_left": 1500.0
+          },
+          "tool_server:manage": {
+            "examined": null,
+            "skipped": "the fixed tool-server user does not hold exactly these rights"
+          },
+          "tool_server:read": {
+            "caveats": {
+              "data.path": 1,
+              "data.readonly": 1,
+              "interface": 1,
+              "time": 1
+            },
+            "examined": true,
+            "seconds_left": 1500.0
+          }
+        }
+      },
+      "mutates": false,
+      "name": "tokens",
+      "seconds": 0.0,
+      "status": "unknown",
+      "summary": "1 condition(s) not checked: the fixed tool-server user holds other rights",
+      "title": "Token minting and examination, per plane"
+    },
+    {
+      "facts": {},
+      "mutates": false,
+      "name": "content_type",
+      "seconds": 0.0,
+      "status": "unknown",
+      "summary": "no data path is REST (no [sandbox], or none of its levels is rest), so nothing was measured: the data gate streams nothing, so there is no content type to check",
+      "title": "The content type of a file's content, read whole and by range on the local provider"
+    },
+    {
+      "facts": {
+        "providers": {
+          "alpha": {
+            "consistent": true,
+            "entries": 1,
+            "pages": 1,
+            "walked": true
+          },
+          "beta": {
+            "consistent": true,
+            "entries": 1,
+            "pages": 1,
+            "walked": true
+          }
+        }
+      },
+      "mutates": false,
+      "name": "listing",
+      "seconds": 0.0,
+      "status": "pass",
+      "summary": "the root lists on all 2 supporting provider(s), and a paged walk agrees",
+      "title": "Listing of the space root on each supporting provider"
+    },
+    {
+      "facts": {
+        "providers": {
+          "alpha": {
+            "code": "forbidden",
+            "enforced": true,
+            "sent": true,
+            "status": 403
+          },
+          "beta": {
+            "code": "forbidden",
+            "enforced": true,
+            "sent": true,
+            "status": 403
+          }
+        }
+      },
+      "mutates": true,
+      "name": "read_only",
+      "seconds": 0.0,
+      "status": "pass",
+      "summary": "the write was refused on all 2 supporting provider(s)",
+      "title": "Read-only enforcement on each data path"
+    },
+    {
+      "facts": {
+        "bytes": 8192,
+        "bytes_match": true,
+        "cleanup_verified": true,
+        "eviction_attempts": 1,
+        "held_bytes": 4096,
+        "held_covers_range": true,
+        "held_ranges": [
+          [
+            0,
+            4096
+          ]
+        ],
+        "polls": 2,
+        "range_bytes": 4096,
+        "steps": [
+          "created",
+          "placed",
+          "read back",
+          "evicted"
+        ]
+      },
+      "mutates": true,
+      "name": "round_trip",
+      "seconds": 5.0,
+      "status": "pass",
+      "summary": "placed by range reads, confirmed by the block map, read back, evicted and removed",
+      "title": "Placement round trip on a scratch file"
+    }
+  ],
+  "counts": {
+    "fail": 0,
+    "pass": 5,
+    "unknown": 2
+  },
+  "exit_code": 3,
+  "mutation_allowed": true,
+  "providers": [
+    "alpha",
+    "beta"
+  ],
+  "schema": 1,
+  "utc": "20270115T080000Z"
+}

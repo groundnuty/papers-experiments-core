@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import NOW
 from sandbox_support import COMPLETE_LEVEL, FAST
 
 from expcore.campaign.lease import LeasePool
@@ -18,6 +17,7 @@ from expcore_onedata.sandbox.api import DataPathMode, SandboxError
 from expcore_onedata.sandbox.hostops import CmdResult, MountTableError, fuse_mounts, parse_mountinfo
 from expcore_onedata.sandbox.provider import SandboxPlatform, SandboxProbe
 from expcore_onedata.sandbox.registry import Registry
+from expcore_onedata.testing import NOW
 from expcore_onedata.tokens import TokenRefused
 from expcore_onedata.users import GROUP, JOURNAL, SAFETY_MARGIN_S, TokenJournal
 

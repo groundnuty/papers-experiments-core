@@ -1,8 +1,7 @@
 """Fixtures for the platform layer: a fake federation, a loaded configuration, the client and the issuer."""
 
 import pytest
-from fake_federation import FakeFederation
-from platform_support import ADMIN_ENV, BASELINE, NOW, SPACE_NAME, USERS, leaked_values, write_platform
+from platform_support import leaked_values
 from record_support import no_secrets_in_the_environment
 
 from expcore.config.loading import ConfigError
@@ -14,6 +13,7 @@ from expcore_onedata.consistency import WaitTimeout
 from expcore_onedata.federation import FederationUnreadable, PinRefused
 from expcore_onedata.pin import PinError
 from expcore_onedata.provision import NotPlaced, ProvisionError, Refused
+from expcore_onedata.testing import ADMIN_ENV, NOW, SPACE_NAME, FakeFederation, add_users, write_platform
 from expcore_onedata.tokencheck import ExaminationFailed, TokenRefused
 from expcore_onedata.tokens import TokenIssuer
 from expcore_onedata.transferrecord import Unreadable
@@ -31,9 +31,7 @@ def fake(monkeypatch) -> FakeFederation:
     """A federation with the study space, one supporting provider, and three users who can log in and read."""
     federation = FakeFederation(space_name=SPACE_NAME)
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)
-    for login, (password, user_id) in USERS.items():
-        federation.add_user(login, password, user_id)
-        federation.grant(user_id, BASELINE)
+    add_users(federation)
     return federation
 
 

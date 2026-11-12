@@ -1,8 +1,6 @@
 """The pre-campaign check of the content type the data gate streams on (O05, O11), run once before any run starts."""
 
 import pytest
-from placement_support import DATA, with_placement
-from platform_support import SPACE_NAME, write_platform
 from sandbox_support import add_sandbox
 
 from expcore.campaign.healthgate import Health
@@ -12,6 +10,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.day0.registry import REGISTRY
 from expcore_onedata.day0.runner import build_context
 from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
+from expcore_onedata.testing import DATA, SPACE_NAME, with_placement, write_platform
 
 CHECK_FILE = "study/probe.bin"  # an invented path under the space root
 CONFIGURED = ("probe.bin", "study/", "alpha", SPACE_NAME, ".test")  # what a message must never hold (O12)
@@ -255,9 +254,8 @@ SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 
 def standard_gate(config, client):
     """The platform's standard health check, as a study gets it, with nothing composed around it."""
-    from platform_support import NOW
-
     from expcore_onedata.health import PlatformHealth
+    from expcore_onedata.testing import NOW
     from expcore_onedata.tokens import TokenIssuer
 
     return PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW)

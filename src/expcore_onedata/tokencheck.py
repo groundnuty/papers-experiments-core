@@ -59,25 +59,36 @@ def _shown(name: Any) -> str:
 
 @dataclass(frozen=True)
 class CaveatSpec:
-    """The exact caveat set of one plane's token for one space."""
+    """The exact caveat set of one plane's token for its spaces: one space's id, or the ids of several (`[[spaces]]`),
+    each of whose subtrees is one entry of the `data.path` whitelist."""
 
-    space_id: str
+    space_id: str | tuple[str, ...]
     readonly: bool
     interface: str
 
     def __post_init__(self) -> None:
-        """Refuse an interface the platform does not have."""
+        """Refuse an interface the platform does not have, and a set of spaces that is empty or names one twice."""
         if self.interface not in INTERFACES:
             raise ValueError(f"unknown interface {self.interface!r}; known: {', '.join(INTERFACES)}")
+        if not self.space_ids or len(set(self.space_ids)) != len(self.space_ids):
+            raise ValueError("a token's caveats reach at least one space, each once")
+
+    @property
+    def space_ids(self) -> tuple[str, ...]:
+        """The ids of the spaces the token reaches, in the order given."""
+        return (self.space_id,) if isinstance(self.space_id, str) else tuple(self.space_id)
+
+    def paths(self) -> list[str]:
+        """The `data.path` whitelist, decoded: each space's subtree, `/{space id}`."""
+        return [f"/{space_id}" for space_id in self.space_ids]
 
     def caveats(self, valid_until: int) -> list[dict[str, Any]]:
-        """Return the caveats to mint: the expiry, read-only when the plane is, the interface, the space's subtree."""
-        path = base64.b64encode(f"/{self.space_id}".encode()).decode()
+        """Return the caveats to mint: the expiry, read-only when the plane is, the interface, the spaces' subtrees."""
         return [
             {"type": "time", "validUntil": valid_until},
             *([{"type": "data.readonly"}] if self.readonly else []),
             {"type": "interface", "interface": self.interface},
-            {"type": "data.path", "whitelist": [path]},
+            {"type": "data.path", "whitelist": [base64.b64encode(p.encode()).decode() for p in self.paths()]},
         ]
 
     def shape(self) -> Counter[str]:
@@ -154,8 +165,8 @@ def _check_values(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> float:
     # the same path could be written many ways. Only the one canonical text of each path is accepted.
     if any(base64.b64encode(d).decode() != w for d, w in zip(decoded, whitelist, strict=True)):
         raise TokenRefused("the data.path caveat is not canonical base64")
-    if paths != [f"/{spec.space_id}"]:
-        raise TokenRefused("the data.path caveat is not the study space alone")
+    if sorted(paths) != sorted(spec.paths()):  # each declared space once, in any order, and nothing else
+        raise TokenRefused("the data.path caveat is not the study space(s) alone")
     if by_type["interface"]["interface"] != spec.interface:
         raise TokenRefused("the interface caveat is not the one the plane uses")
     expiry = by_type["time"]["validUntil"]

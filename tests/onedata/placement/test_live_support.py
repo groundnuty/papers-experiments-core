@@ -10,13 +10,12 @@ from live_support import (
     require_every_provider_refused,
     require_passed,
 )
-from placement_support import with_placement
-from platform_support import write_platform
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.day0.report import Entry
 from expcore_onedata.day0.runner import build_context
+from expcore_onedata.testing import with_placement, write_platform
 
 LIVE = Path(__file__).resolve().parents[2] / "live" / "test_contract.py"
 

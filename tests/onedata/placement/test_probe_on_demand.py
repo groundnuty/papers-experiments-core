@@ -1,9 +1,9 @@
 """The probes split a provider's gained bytes into transfer bytes and a lower bound on bytes fetched on demand (O08)."""
 
 import pytest
-from placement_support import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
 
 from expcore_onedata.probes import PlatformProbes
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
 
 PATH = "study/data.bin"
 MORE = "study/more.bin"
@@ -36,15 +36,15 @@ def test_o08_the_lower_bound_is_gained_less_the_transfer_bytes_into_the_provider
     ticker.sleep(INSIDE_S)
     snapshot = probes.finish()
     assert snapshot["ok"] is True
-    assert snapshot["on_demand"]["beta"] == {
+    assert snapshot["on_demand"]["providers[1]"] == {
         "gained_bytes": len(DATA) + 1000,
         "transfer_bytes_in": len(DATA),
         "difference": 1000,
         "on_demand_lower_bound": 1000,
         "unknown": None,
     }
-    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] == 0
-    assert snapshot["on_demand"]["alpha"]["transfer_bytes_in"] == 0
+    assert snapshot["on_demand"]["providers[0]"]["on_demand_lower_bound"] == 0
+    assert snapshot["on_demand"]["providers[0]"]["transfer_bytes_in"] == 0
 
 
 def test_o08_transfer_bytes_of_a_file_the_study_does_not_track_floor_the_bound_at_zero_and_show_the_difference(
@@ -57,7 +57,7 @@ def test_o08_transfer_bytes_of_a_file_the_study_does_not_track_floor_the_bound_a
     seeded.add_transfer("replication", OTHER, BETA_ID, scheduled=ticker.now)
     provisioner.read_through("beta", seeded.id_of(PATH), 0, 1000)
     ticker.sleep(INSIDE_S)
-    beta = probes.finish()["on_demand"]["beta"]
+    beta = probes.finish()["on_demand"]["providers[1]"]
     assert (beta["gained_bytes"], beta["transfer_bytes_in"]) == (1000, len(DATA))
     assert beta["difference"] == 1000 - len(DATA)
     assert beta["on_demand_lower_bound"] == 0
@@ -72,9 +72,9 @@ def test_o08_an_eviction_moves_no_bytes_in_and_a_migration_moves_them_into_its_t
     seeded.add_transfer("eviction", PATH, BETA_ID, scheduled=ticker.now)
     ticker.sleep(INSIDE_S)
     split = probes.finish()["on_demand"]
-    assert split["beta"]["transfer_bytes_in"] == len(DATA)
-    assert split["beta"]["on_demand_lower_bound"] == 0
-    assert split["alpha"]["transfer_bytes_in"] == 0
+    assert split["providers[1]"]["transfer_bytes_in"] == len(DATA)
+    assert split["providers[1]"]["on_demand_lower_bound"] == 0
+    assert split["providers[0]"]["transfer_bytes_in"] == 0
 
 
 def test_o08_a_transfer_into_a_provider_still_running_at_run_end_makes_its_bound_unknown(probes, seeded, ticker):
@@ -84,9 +84,9 @@ def test_o08_a_transfer_into_a_provider_still_running_at_run_end_makes_its_bound
     seeded.transfer_flip_after = 99  # reading its record does not end it, as polling does in the fake
     seeded.add_transfer("replication", MORE, BETA_ID, scheduled=ticker.now, ended=False)
     split = probes.finish()["on_demand"]
-    assert split["beta"]["on_demand_lower_bound"] is None
-    assert "transfer_not_ended" in split["beta"]["unknown"]
-    assert split["alpha"]["on_demand_lower_bound"] == 0
+    assert split["providers[1]"]["on_demand_lower_bound"] is None
+    assert "transfer_not_ended" in split["providers[1]"]["unknown"]
+    assert split["providers[0]"]["on_demand_lower_bound"] == 0
 
 
 def test_o08_a_transfer_from_before_the_run_that_went_on_into_it_makes_its_targets_bound_unknown(
@@ -99,8 +99,8 @@ def test_o08_a_transfer_from_before_the_run_that_went_on_into_it_makes_its_targe
     snapshot = probes.finish()
     assert snapshot["space_transfers"]["records"] == []
     assert snapshot["space_transfers"]["carried_over"] == 1
-    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
-    assert "transfer_carried_over" in snapshot["on_demand"]["beta"]["unknown"]
+    assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] is None
+    assert "transfer_carried_over" in snapshot["on_demand"]["providers[1]"]["unknown"]
 
 
 def test_o08_providers_that_disagree_on_a_transfer_make_its_targets_bound_unknown(probes, client, seeded, ticker):
@@ -114,13 +114,13 @@ def test_o08_providers_that_disagree_on_a_transfer_make_its_targets_bound_unknow
     seeded.provider_view[(tid, ALPHA_ID)] = {"state": "ongoing", "bytesReplicated": 0, "finishTime": 0}
     ticker.sleep(10)
     snapshot = probes.finish()
-    beta = snapshot["on_demand"]["beta"]
+    beta = snapshot["on_demand"]["providers[1]"]
     assert beta["on_demand_lower_bound"] is None
     assert "listings_disagree" in beta["unknown"]
     record = {r["transfer_id"]: r for r in snapshot["space_transfers"]["records"]}[tid]
     assert record["listings_agree"] is False
     assert (record["listed_as"], record["bytes_replicated"]) in {("ongoing", 0), ("ended", len(DATA))}
-    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] == 0
+    assert snapshot["on_demand"]["providers[0]"]["on_demand_lower_bound"] == 0
 
 
 def test_o08_without_the_listing_there_is_no_split(probes, seeded):
@@ -161,7 +161,7 @@ def test_o07_a_transfer_that_appears_only_in_the_second_poll_is_counted_and_the_
     section = snapshot["space_transfers"]
     assert (section["settled"], section["polls"]) == (True, 3)
     assert tid in {r["transfer_id"] for r in section["records"]}
-    beta = snapshot["on_demand"]["beta"]
+    beta = snapshot["on_demand"]["providers[1]"]
     assert (beta["transfer_bytes_in"], beta["on_demand_lower_bound"], beta["unknown"]) == (len(DATA), 1000, None)
     assert ticker.slept.count(30.0) == 2  # the default settle time, between the three observations
 
@@ -178,10 +178,10 @@ def test_o07_a_listing_that_keeps_changing_leaves_every_bound_unknown(probes, se
     ticker.sleep(10)
     snapshot = probes.finish()
     assert (snapshot["space_transfers"]["settled"], snapshot["space_transfers"]["polls"]) == (False, 4)
-    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
-    assert "listing_not_settled" in snapshot["on_demand"]["beta"]["unknown"]
-    assert snapshot["on_demand"]["alpha"]["on_demand_lower_bound"] is None
-    assert "listing_not_settled" in snapshot["on_demand"]["alpha"]["unknown"]
+    assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] is None
+    assert "listing_not_settled" in snapshot["on_demand"]["providers[1]"]["unknown"]
+    assert snapshot["on_demand"]["providers[0]"]["on_demand_lower_bound"] is None
+    assert "listing_not_settled" in snapshot["on_demand"]["providers[0]"]["unknown"]
 
 
 def test_o08_readings_that_place_a_transfer_on_different_sides_of_the_window_make_its_bound_unknown(
@@ -198,7 +198,7 @@ def test_o08_readings_that_place_a_transfer_on_different_sides_of_the_window_mak
     seeded.provider_view[(tid, BETA_ID)] = {"finishTime": int(start + 5)}
     ticker.sleep(10)
     snapshot = probes.finish()
-    beta = snapshot["on_demand"]["beta"]
+    beta = snapshot["on_demand"]["providers[1]"]
     assert beta["on_demand_lower_bound"] is None
     assert {"listings_disagree", "transfer_carried_over"} & set(beta["unknown"])
 
@@ -213,7 +213,7 @@ def test_o08_readings_that_name_different_targets_make_both_bounds_unknown(probe
     seeded.provider_view[(tid, ALPHA_ID)] = {"replicatingProviderId": ALPHA_ID}
     ticker.sleep(10)
     snapshot = probes.finish()
-    for provider in ("alpha", "beta"):
+    for provider in ("providers[0]", "providers[1]"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "listings_disagree" in snapshot["on_demand"][provider]["unknown"]
 
@@ -263,7 +263,7 @@ def test_o08_a_harness_transfer_the_listing_does_not_show_leaves_every_bound_unk
     scheduled.append(("beta", tid, "replication"))
     ticker.sleep(10)
     snapshot = probes.finish()
-    for provider in ("alpha", "beta"):
+    for provider in ("providers[0]", "providers[1]"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "harness_transfer_not_listed" in snapshot["on_demand"][provider]["unknown"]
 
@@ -287,7 +287,7 @@ def test_o07_a_transfer_the_listing_showed_and_then_dropped_leaves_every_bound_u
     seeded._list_transfers = first_answer_only
     ticker.sleep(10)
     snapshot = probes.finish()
-    for provider in ("alpha", "beta"):
+    for provider in ("providers[0]", "providers[1]"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "transfer_left_listing" in snapshot["on_demand"][provider]["unknown"]
 
@@ -305,8 +305,8 @@ def test_o08_a_job_listed_as_ended_whose_record_is_still_active_leaves_its_bound
         seeded.provider_view[(tid, provider)] = {"replicationStatus": "active", "bytesReplicated": 0}
     ticker.sleep(10)
     snapshot = probes.finish()
-    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
-    assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]
+    assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] is None
+    assert "transfer_not_ended" in snapshot["on_demand"]["providers[1]"]["unknown"]
 
 
 def test_o08_a_job_from_before_the_run_listed_ended_but_still_active_is_carried_over(probes, seeded, ticker):
@@ -319,8 +319,8 @@ def test_o08_a_job_from_before_the_run_listed_ended_but_still_active_is_carried_
     probes.start({})
     ticker.sleep(20)
     snapshot = probes.finish()
-    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
-    assert "transfer_carried_over" in snapshot["on_demand"]["beta"]["unknown"]
+    assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] is None
+    assert "transfer_carried_over" in snapshot["on_demand"]["providers[1]"]["unknown"]
 
 
 def test_o08_a_record_whose_status_fields_disagree_is_not_final(probes, client, seeded, ticker):
@@ -338,8 +338,8 @@ def test_o08_a_record_whose_status_fields_disagree_is_not_final(probes, client, 
         }
     ticker.sleep(10)
     snapshot = probes.finish()
-    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
-    assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]
+    assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] is None
+    assert "transfer_not_ended" in snapshot["on_demand"]["providers[1]"]["unknown"]
 
 
 def test_o08_a_record_with_a_status_field_that_cannot_be_read_is_not_final(probes, client, seeded, ticker):
@@ -357,5 +357,5 @@ def test_o08_a_record_with_a_status_field_that_cannot_be_read_is_not_final(probe
         }
     ticker.sleep(10)
     snapshot = probes.finish()
-    assert snapshot["on_demand"]["beta"]["on_demand_lower_bound"] is None
-    assert "transfer_not_ended" in snapshot["on_demand"]["beta"]["unknown"]
+    assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] is None
+    assert "transfer_not_ended" in snapshot["on_demand"]["providers[1]"]["unknown"]

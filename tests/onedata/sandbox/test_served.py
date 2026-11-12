@@ -8,7 +8,6 @@ the gate writes, with invented values; the sandbox runs over the in-memory host.
 import json
 
 import pytest
-from platform_support import write_platform
 from sandbox_support import COMPLETE_LEVEL, add_sandbox, make_spec, start_options
 
 from expcore.records.instruments import finish_instruments, start_instruments
@@ -16,6 +15,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.sandbox import gatelog, served
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 from expcore_onedata.sandbox.served import NAMESPACE, ServedBytes
+from expcore_onedata.testing import write_platform
 
 STOPPED = {
     "signalled": True,

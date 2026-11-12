@@ -1,12 +1,12 @@
 """The [sandbox] table: every image, pool, limit, mount option and data path is read from platform.toml (O12-O14)."""
 
 import pytest
-from platform_support import write_platform
 from sandbox_support import AGENT_IMAGE_ID, COMPLETE_LEVEL, GATE_IMAGE_ID, LEVELS, POOL, add_sandbox
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.testing import NOW, write_platform
 
 
 def load(tmp_path, edit=None, *, with_table=True):
@@ -255,7 +255,6 @@ def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
     """O21, C06: the platform's half of the fingerprint holds each level's kind and a REST level's listing mode, so a
     campaign started with one listing mode for a level is refused a resume with the other; the same mode resumes."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
-    from platform_support import NOW
 
     from expcore.campaign.resume import FingerprintMismatch, open_campaign
 
@@ -341,7 +340,6 @@ def test_o22_an_unknown_key_of_the_caps_is_refused_so_a_misspelt_cap_cannot_leav
 def caps_campaign(tmp_path):
     """A campaign store's resume under a platform fingerprint: `resume(fingerprint)` opens it, refusing a change."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
-    from platform_support import NOW
 
     from expcore.campaign.resume import open_campaign
 
@@ -401,3 +399,36 @@ def test_c06_a_platform_without_the_caps_table_keeps_the_fingerprint_it_had_and_
     assert config.fingerprint() == recorded
     resume(config.fingerprint())
     resume(platform_with_caps(tmp_path, "again").fingerprint())
+
+
+def test_o23_the_placeholder_token_defaults_to_a_neutral_word_and_a_file_can_name_another(tmp_path):
+    """O23: on a REST data path the agent's environment holds a placeholder token, so the published client starts; it
+    is `placeholder` unless `[sandbox] placeholder_token` names another, which a study may need to pass its own check of
+    the words its agent sees."""
+    assert load(tmp_path).placeholder_token == "placeholder"
+
+    def edit(data):
+        data["sandbox"]["placeholder_token"] = "not-a-credential"
+
+    assert load(tmp_path, edit).placeholder_token == "not-a-credential"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "two words", "line\nbreak", "tab\there", "café", "x" * 129, 7, True, ["placeholder"]],
+    ids=["empty", "space", "line-break", "tab", "not-ascii", "too-long", "number", "boolean", "list"],
+)
+def test_o23_a_placeholder_token_that_could_not_be_a_header_value_is_refused_naming_the_key_never_the_value(
+    tmp_path, value
+):
+    """O23, O12: the placeholder is sent as a header value by the client and set in the agent's environment, so it
+    must be 1 to 128 printable ASCII characters without white space; the error names the file and the key."""
+
+    def edit(data):
+        data["sandbox"]["placeholder_token"] = value
+
+    with pytest.raises(ConfigError, match=r"\[sandbox\]: key 'placeholder_token' must be 1 to 128 printable") as caught:
+        load(tmp_path, edit)
+    assert "platform.toml" in str(caught.value)
+    if isinstance(value, str) and len(value) > 3:
+        assert value not in str(caught.value)

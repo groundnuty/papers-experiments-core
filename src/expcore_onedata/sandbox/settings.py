@@ -14,9 +14,11 @@ agent_uid = 10001               # the unprivileged user the agent's code runs as
 python = "python"               # the interpreter in the agent image that runs the agent's code
 sudo = ["sudo", "-n"]           # the privilege command for host steps; [] when the driver runs as root
 earlyoom_comm = "expcore-drv"   # optional: the process name the host's earlyoom is told to spare
-trust_paths = []                # optional: paths in the agent image of CA bundles that must also trust the run's CA
+trust_paths = []                # optional: paths in the agent image of CA bundles that must also trust the run's CA;
+                                # on a rest data path the image's certifi bundle is added to them, found at the start
 content_check_file = "dir/f"    # a provisioned file under the space root, read once before a campaign to confirm
                                 # the content type the gate streams on (`precampaign.py`); required with a rest level
+placeholder_token = "placeholder"  # optional: the agent's ONEDATA_TOKEN on a rest data path, never a credential (O23)
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
 name = "image:tag"              # a tag or an id, only ever resolved to the id below
@@ -60,6 +62,12 @@ condition gives its `data_path` factor. The run's metadata records it (`listing`
 (`config.PlatformConfig.fingerprint`, from `data_path_record`), so two modes are never one experiment. A declared
 `[sandbox.served_bytes]` is in the fingerprint too (`served_caps_declared`); an absent one leaves it as it was.
 
+`placeholder_token` is what the agent's environment holds as `ONEDATA_TOKEN` on a REST data path (O23): the published
+client (`onedatarestfsspec`) refuses to start without a token, and the agent holds none, since the gate adds its own to
+every request and drops every token the agent sends. It is not a credential and goes in no fingerprint; the agent sees
+it, so a study whose check of the words its agent sees refuses the default names another. A value equal to the run's
+token refuses the start.
+
 The certificate check of the data gate's upstream and of oneclient is not declared here either: it is the platform's one
 `[tls]` setting (`tls.py`), which `load_platform` hands to `load_sandbox` and which every client of the federation
 takes. A `tls` key in `[sandbox.mount]`, oneclient's own setting in earlier versions, is refused with a pointer to it.
@@ -89,6 +97,10 @@ NAMESPACE_RE = re.compile(r"[a-z][a-z0-9.-]{0,63}")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 COMMAND_WORD = re.compile(r"[A-Za-z0-9._/-]{1,128}")
 SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under the space root
+# The agent's ONEDATA_TOKEN on a REST data path (O23): the published client sends it as a header value and the gate
+# drops it, so it is printable ASCII without white space; the default is a plain word no one takes for a real token.
+PLACEHOLDER_TOKEN = "placeholder"
+PLACEHOLDER_RE = re.compile(r"[!-~]{1,128}")
 IO_MODES = ("direct", "proxy")
 FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by the platform's [tls] only
 
@@ -157,6 +169,7 @@ class SandboxSettings:
     listings: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))  # rest level -> its listing
     served_caps: Caps = DEFAULT_CAPS  # [sandbox.served_bytes]: the bounds of a run's tables of the bytes served (O22)
     served_caps_declared: bool = False  # the table is in the file: its caps are in the campaign fingerprint (C06)
+    placeholder_token: str = PLACEHOLDER_TOKEN  # the REST agent's ONEDATA_TOKEN: no credential, the gate drops it (O23)
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -339,6 +352,16 @@ def _space_path(section: Section, key: str) -> str | None:
     return value
 
 
+def _placeholder(section: Section) -> str:
+    """Read the optional placeholder token (O23), a value never echoed: the key is named, as for any value."""
+    value = section.data.get("placeholder_token", PLACEHOLDER_TOKEN)
+    if not isinstance(value, str) or not PLACEHOLDER_RE.fullmatch(value):
+        raise section.fail(
+            "placeholder_token", "must be 1 to 128 printable ASCII characters without white space: a header value"
+        )
+    return value
+
+
 def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """Read an optional list of command words (a path or an option), with no space or control character."""
     words = section.strings(key) if key in section.data else default
@@ -361,6 +384,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
         "earlyoom_comm",
         "trust_paths",
         "content_check_file",
+        "placeholder_token",
     )
     if "users" in section.data:  # one pool of leased users: a second one here would lease a user the slots also hold
         raise section.fail(
@@ -412,6 +436,7 @@ def load_sandbox(section: Section, base: Path, *, tls: TlsSettings | None = None
         listings=listings,
         served_caps=_served_caps(section.section("served_bytes")) if "served_bytes" in section.data else DEFAULT_CAPS,
         served_caps_declared="served_bytes" in section.data,
+        placeholder_token=_placeholder(section),
     )
 
 

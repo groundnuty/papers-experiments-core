@@ -6,12 +6,13 @@ that did, and the scan itself.
 """
 
 import pytest
-from platform_support import CREDENTIALS_DIR, FAKE_TOOL_SERVER, SPACE_NAME, USERS, leaked_values, write_platform
+from platform_support import leaked_values
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
 from expcore_onedata.credentials import Principal, SecretSource, UserCredentials
+from expcore_onedata.testing import CREDENTIALS_DIR, SPACE_NAME, TOOL_SERVER_ARGS, USERS, write_platform
 
 
 def test_o12_the_scan_finds_a_configured_value_and_ignores_the_config_file_and_ordinary_words(tmp_path):
@@ -24,7 +25,7 @@ def test_o12_the_scan_finds_a_configured_value_and_ignores_the_config_file_and_o
         "no condition 'read'",
         f"the space {SPACE_NAME} is gone",
         "provider pr-beta answered",
-        f"cannot run {FAKE_TOOL_SERVER}",
+        f"cannot run {TOOL_SERVER_ARGS[1]}",
     ):
         assert leaked_values(message, tmp_path), message
     for message in (
@@ -121,9 +122,8 @@ def declared_both(data):
 
 
 def health_detail(tmp_path, fake, edit=None):
-    from platform_support import NOW
-
     from expcore_onedata.health import PlatformHealth
+    from expcore_onedata.testing import NOW
     from expcore_onedata.tokens import TokenIssuer
 
     config = load_platform(write_platform(tmp_path, edit))

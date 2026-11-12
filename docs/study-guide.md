@@ -242,6 +242,10 @@ A study selects each condition's data path through its `data_path` factor: the c
 
 A complete listing is complete only for a directory that does not change while the gate reads it, since Onedata gives a listing no snapshot. Keep the study's data fixed while runs read it, as a study's data should be anyway. An entry another client adds during the read makes one entry come twice, and the gate refuses that listing with a 502. An entry removed during the read can make another one drop out of the answer unseen, and nothing shows that it happened.
 
+An agent on a REST level can use the published Onedata client, `onedatarestfsspec`, installed in its image, with no setup of its own. Its environment holds what the client reads: the zone's host in `ONEDATA_ONEZONE_HOST` and, in `ONEDATA_TOKEN`, a placeholder rather than a token. The client will not start without a token, and the data gate drops whatever token the agent sends and adds the run's own. The placeholder is `placeholder` unless `[sandbox] placeholder_token` in `platform.toml` names another (1 to 128 printable ASCII characters, no white space). The agent can read it, so a study that checks the words its agent sees can choose one that passes the check; a value equal to the run's token refuses the run. Write the client's URLs with three slashes, `onedata:///my-space/dir/file`, because the client takes the first name after `onedata://` as a host and drops it.
+
+The client checks the gate's certificate against the certifi bundle in the agent's image, not against the CA variables the sandbox also sets, so each REST run finds that bundle and mounts it with the run's CA appended. The run's metadata records `certifi` as `run_ca_added`, or `not_in_image` for an image without certifi, which starts all the same, but any client that relies on certifi then cannot verify the gate. An agent that uses another HTTP client, with a CA bundle of its own, needs that bundle's path in the image declared in `[sandbox] trust_paths`, which gets the run's CA the same way.
+
 Two conditions that differ only in the listing mode are two levels of the factor, so they can run side by side in one campaign. The run's metadata records the mode, and `config.fingerprint()` holds every level's kind and mode, so changing a level's data path or its listing between starts is refused like any other change of the experiment. `listing` on a mount or `none` level is refused at load. What else each data path guarantees is in [`interfaces.md`](interfaces.md#the-platform-layers-sandbox).
 
 ## 3. Declare the design
@@ -517,7 +521,7 @@ assert relay["n_clusters"] == len({task.attributes["region"] for task in study.t
 
 ### Unknown platform estimates are data
 
-A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider they give `gained_bytes` (placement gained: the bytes of the blocks the provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
+A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider, keyed by its position in `platform.toml` (`providers[i]`, never its name, since records are published), they give `gained_bytes` (placement gained: the bytes of the blocks the provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
 
 That missingness is informative. An estimate is unknown exactly when, for example, the agent starts a transfer and its run ends first, which is likelier under conditions that encourage placement, so dropping the unknowns would bias a comparison between conditions. Count them per condition and reason over every attempt, set-aside and excluded ones as well as those analysed, and report the counts beside any analysis of the bound; never drop them silently. `gained_bytes` and `transfer_bytes_in` are missing far less often, when a block map or the transfer listing could not be read or a tracked path named another file at the run's end than at its start, but they too can be missing (the split is then `None`), so count those as well, under `no_split`, whichever measure you analyse; or analyse the bound and state its missingness as a limitation. A study without the platform has no probes, and the count is empty:
 
@@ -558,6 +562,82 @@ for (condition, provider, reason), n in sorted(counts.items(), key=str):
 records = [p for p in Path("my-study/out/runs").glob("*/try*/*.json") if p.name.count(".") == 2]
 assert records and all(load_record(p).run_key for p in records)  # every attempt's record is read
 assert counts == Counter()  # the example study runs without the platform
+```
+
+### Testing a study's instruments and scorers
+
+A study's own instruments (the ones that induce a state, the probes), its scorers and its plugin can be tested against the platform without a live federation. `expcore_onedata.testing`, installed with the platform layer, holds the fakes the core's own tests use: an in-process Onezone with every provider's data API (`FakeData`), a default `platform.toml` that matches it, and a clock that moves only when something sleeps (`Ticker`). Each fake's docstring says what it models and what it does not, and [`interfaces.md`](interfaces.md#the-platform-layers-testing-module) lists the names. Nothing at runtime imports the module and it imports no pytest, so a fixture is your own thin wrapper around it.
+
+Run the platform layer's real objects on the fakes rather than writing a stand-in of your own, because a stand-in drifts from the core. The first study on the core wrote one, and it counted a transfer that had started before the run's window. The core reports such a transfer as carried over and never counts it, and the fakes let the core's probes decide that. The block runs `PlatformProbes` against `FakeData` with such a transfer, then gives the snapshot to a scorer, which reads only the record's instruments. A bound the probes could not establish is `None`, so the scorer returns `None` for it and never 0. A state inducer is tested the same way: run it against `FakeData` and read what it left with `fake.held(path, provider_id)`.
+
+```python
+import os
+import shutil
+import tempfile
+from types import SimpleNamespace
+
+from expcore_onedata.client import OnezoneClient
+from expcore_onedata.config import load_platform
+from expcore_onedata.probes import PlatformProbes
+from expcore_onedata.provision import Provisioner, resolve_provider_ids
+from expcore_onedata.rangemap import load_placement
+from expcore_onedata.testing import ADMIN_ENV, BETA_ID, DATA, Ticker, make_federation, write_with_placement
+
+ticker = Ticker()  # the clock the platform layer's waits and probes take: it moves only when something sleeps
+fake = make_federation(clock=ticker.clock)  # the study space, the providers alpha and beta, three users
+fake.add_file("study/data.bin", DATA)  # alpha holds both files
+fake.add_file("study/more.bin", DATA)
+
+workdir = Path(tempfile.mkdtemp())
+os.environ[ADMIN_ENV] = fake.admin_token  # in a pytest fixture, monkeypatch.setenv
+platform = write_with_placement(workdir)  # the default platform.toml; a study points this at its own
+config = load_platform(platform)
+client = OnezoneClient(config, http=fake.client_http())  # answers from the fake: no socket is opened
+provisioner = Provisioner(
+    client,
+    config,
+    load_placement(platform, config).settings,
+    provider_ids=resolve_provider_ids(config),
+    log=workdir / "changes.jsonl",
+    clock=ticker.clock,
+    sleep=ticker.sleep,
+)
+files = {"data": "study/data.bin", "more": "study/more.bin"}
+probes = PlatformProbes(client, provisioner, files, ["alpha", "beta"], sleep=ticker.sleep, now=ticker.clock)
+
+# A replication into beta that started a minute before the run, and that ends inside it.
+job = fake.add_transfer("replication", "study/more.bin", BETA_ID, scheduled=ticker.now - 60, ended=False)
+probes.start({})
+ticker.sleep(10)
+fake.end_transfer(job)
+ticker.sleep(10)
+snapshot = probes.finish()
+
+# Beta gained the bytes during the run, and the core reports the job as carried over, not as a transfer of the run.
+assert snapshot["space_transfers"]["carried_over"] == 1 and snapshot["space_transfers"]["records"] == []
+beta = snapshot["on_demand"]["providers[1]"]  # keyed by position in the tracked list, never by name: beta is [1]
+assert (beta["gained_bytes"], beta["transfer_bytes_in"]) == (len(DATA), 0)
+assert beta["on_demand_lower_bound"] is None and beta["unknown"] == ["transfer_carried_over"]
+
+
+class OnDemandBytes:
+    """The bytes a provider fetched on demand, at least; unknown when the probes could not establish them."""
+
+    name = "on_demand_bytes"
+    version = "1"
+
+    def score(self, record):
+        bound = record.instruments["platform_probes"]["on_demand"]["providers[1]"]["on_demand_lower_bound"]
+        if bound is None:
+            return {"verdict": "not_determined", "outcomes": {"on_demand_bytes": None}}
+        return {"verdict": "fulfilled", "outcomes": {"on_demand_bytes": float(bound)}}
+
+
+record = SimpleNamespace(instruments={"platform_probes": snapshot})  # all a scorer may read of the platform
+assert OnDemandBytes().score(record) == {"verdict": "not_determined", "outcomes": {"on_demand_bytes": None}}
+
+del os.environ[ADMIN_ENV]
+shutil.rmtree(workdir)
 ```
 
 ### Bytes the agent read

@@ -194,9 +194,8 @@ def test_r12_a_link_a_directory_or_a_pipe_is_not_a_credential_file(tmp_path):
 
 def test_r12_a_credential_file_of_a_fixed_user_with_group_access_fails_the_load_of_the_platform(tmp_path, monkeypatch):
     """R12: the check that loading makes of each fixed user's file applies the whole rule, not just the group bits."""
-    from platform_support import ADMIN_ENV, write_platform
-
     from expcore_onedata.config import load_platform
+    from expcore_onedata.testing import ADMIN_ENV, write_platform
 
     monkeypatch.setenv(ADMIN_ENV, ADMIN_VALUE)
     write_platform(tmp_path)
