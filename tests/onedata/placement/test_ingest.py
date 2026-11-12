@@ -237,7 +237,8 @@ def test_o27_the_post_run_check_refuses_a_failed_arrival_naming_the_step_and_pas
     with pytest.raises(InfraError) as raised:
         failing.check()
     assert raised.value.kind == INGEST_FAILURE
-    assert "arrival" in raised.value.detail and "day-13" in raised.value.detail
+    assert "arrival" in raised.value.detail
+    assert "day-13" in raised.value.detail
     assert not [word for word in PRIVATE if word in raised.value.detail]
 
 
@@ -251,7 +252,8 @@ def test_o27_the_post_run_check_refuses_a_failed_restore_and_a_run_it_cannot_vou
     ingest.finish()
     with pytest.raises(InfraError, match="restore") as raised:
         ingest.check()
-    assert raised.value.kind == INGEST_FAILURE and "day-12" in raised.value.detail
+    assert raised.value.kind == INGEST_FAILURE
+    assert "day-12" in raised.value.detail
     never_started = make(DAY_ROW)
     with pytest.raises(InfraError, match="start") as raised:
         never_started.check()
@@ -300,7 +302,8 @@ def test_o27_a_failed_arrival_is_charged_infrastructure_and_rerun_though_the_exe
         assert attempts_of(store, key) == [("infra_fail", 1, 1), ("done", 0, 2)]
         (first, _) = store.q("SELECT infra_kind, detail FROM attempts WHERE run_key=? ORDER BY id", (key,))
         assert first["infra_kind"] == INGEST_FAILURE
-        assert NAMESPACE in first["detail"] and "arrival" in first["detail"]
+        assert NAMESPACE in first["detail"]
+        assert "arrival" in first["detail"]
         assert "instrument_refused" in event_kinds(store)
     assert content(fake, DAY_PATH) == DAY
 
@@ -449,7 +452,8 @@ def test_o27_a_file_that_cannot_be_restored_never_keeps_the_files_after_it_missi
     assert content(fake, DAY_PATH) == DAY
     restore = snapshot["restore"]
     assert restore["ok"] is False
-    assert "day-12" in restore["detail"] and "day-13" not in restore["detail"]
+    assert "day-12" in restore["detail"]
+    assert "day-13" not in restore["detail"]
     assert (restore["files"]["day-12"]["ok"], restore["files"]["day-13"]["ok"]) == (False, True)
     assert "staged source" in restore["files"]["day-12"]["detail"]
     assert snapshot["files"]["day-13"]["restored_id"] == fake.id_of(DAY_PATH)
