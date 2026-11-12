@@ -246,7 +246,7 @@ Groups: [B model backends](#b-model-backends) · [L loop and tools](#l-agent-loo
 
 **O10. Destructive operations need explicit sanction.** *Learned:* ICSOC `harness/sweep.py:235`, `provider_restart.py:279-286`. *Test:* a fault injector without the sanction flag raises.
 
-**O11. Faults and fixtures are cleared in `finally`, and clearing is verified.** "Ready" is not "restarted": confirm by a changed identity. *Learned:* ICSOC `sweep_driver.py:130-131`, `netem.py:85, 362-391` (24e2f5e), `provider_restart.py:87-104` (f627555). *Test:* a raising trial still calls clear and teardown.
+**O11. Faults and fixtures are cleared in `finally`, and clearing is verified.** "Ready" is not "restarted": confirm by a changed identity. And restarted is not ready: a restore is verified only when the provider serves (its health check healthy, its REST read answered), within a bound, before the injection is cleared and the federation released; one that does not serve in time stays open. *Learned:* ICSOC `sweep_driver.py:130-131`, `netem.py:85, 362-391` (24e2f5e), `provider_restart.py:87-104` (f627555). *Test:* a raising trial still calls clear and teardown.
 
 **O12. Federation names live in configuration only.** *Learned:* ICSA hard-codes them in at least six modules (`day0/scripts/od.py:26-34`, `harness/real_sandbox.py:27-34`, `slot_users.py:29-33`, `scripted/federation.py:21-41`, `knowledge/launch.py:21-22`, `knowledge/live_equality.py:26-29`), and `campaign/boverride.py` (845 lines) exists only to patch them in memory (d867010d, 4 Nov). *Test:* the hashed study-token test over the platform layer.
 

@@ -45,8 +45,8 @@ src/expcore_onedata/
   users.py       leased platform users (a slot gives a run one user per token plane) and the token journal
   health.py      pre- and post-run checks against the declared support set
   faults.py      the fault injector: one provider taken down per run under a double sanction, journalled first,
-                 cleared in finally and verified by a changed identity; compose.py, fault_journal.py,
-                 fault_recovery.py and fault_settings.py serve it
+                 cleared in finally and verified by a changed identity and by the provider serving;
+                 compose.py, fault_journal.py, fault_recovery.py, fault_serves.py and fault_settings.py serve it
   admission.py   the federation's reader-writer lock: outage runs exclusive with every other run, and its holder record
   fault_gate.py  the fault half of the health check: recovery, the shared lock around the check, a timed-out wait told apart
   day0/          registry of checks (reachability, health, tokens, listing, read-only, round trip) and a dated report
