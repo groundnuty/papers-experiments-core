@@ -337,6 +337,7 @@ ENTRY_KEYS = [  # what every export's analysed entry holds, in order: nothing of
     "started_at",
     "lease_wait_s",
     "lease_outcome",
+    "admission",
 ]
 MERGED_ONLY = {"shards", "shard_retries_by_kind"}  # top-level keys only a merged batch's export has
 
