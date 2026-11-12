@@ -462,6 +462,33 @@ def stage_kept_day(tmp_path, content=KEPT):
     (tmp_path / "staged" / "day-12.csv").write_bytes(content)
 
 
+def test_o27_an_absent_baseline_file_with_the_plans_bytes_is_kept_when_its_staged_copy_is_damaged(make, fake, tmp_path):
+    """O27 with O09: a file the ingest did not make lies at an absent file's path with the plan's bytes, so it may be
+    the last good copy of them. The staged copy is damaged, so the start refuses before it removes anything, and the
+    file stays."""
+    fake.add_file(NOTE_PATH, NOTE)
+    ingest = make(NOTE_ROW)
+    (tmp_path / "staged" / "note.txt").write_bytes(NOTE[:-1] + b"?")
+    with pytest.raises(InfraError, match="staged source") as raised:
+        ingest.start({})
+    assert raised.value.kind == INGEST_FAILURE
+    assert content(fake, NOTE_PATH) == NOTE
+    assert not [call for call in fake.provider_calls if call[1] == "DELETE"]
+
+
+def test_o27_an_arrival_the_ingest_made_is_removed_though_its_staged_copy_is_damaged(make, fake, ticker, tmp_path):
+    """O27: the note the ingest wrote is its own, whatever became of the copy it came from, so the finish removes it and
+    the dataset is back at its baseline; only the plan's bytes found at a path need the copy to be sound first."""
+    ingest = make(NOTE_ROW)
+    ingest.start({})
+    run_to(ingest, ticker, ticker.now, 100, 1)
+    assert content(fake, NOTE_PATH) == NOTE
+    (tmp_path / "staged" / "note.txt").write_bytes(NOTE[:-1] + b"?")
+    snapshot = ingest.finish()
+    assert content(fake, NOTE_PATH) is None
+    assert snapshot["restore"]["ok"] is True
+
+
 KEPT_ROW = {"label": "day-12", "path": KEPT_PATH, "source": "day-12.csv", "at_s": 300, "baseline": "complete"}
 
 

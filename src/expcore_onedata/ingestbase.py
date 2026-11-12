@@ -231,8 +231,12 @@ class Baseline:
                 )
         return {"holder_covered": True, "visible_s": waited}
 
+    def _made_by_ingest(self, found: Entry) -> bool:
+        """The provisioner's change log says it created this file."""
+        return found.file_id in {line["id"] for line in self._p.logged()}
+
     def _removable(self, planned: PlannedFile, found: Entry) -> bool:
-        if found.file_id in {line["id"] for line in self._p.logged()}:
+        if self._made_by_ingest(found):
             return True
         if found.kind != "REG" or found.size != planned.size:
             return False
@@ -247,6 +251,8 @@ class Baseline:
             return self._write_back(planned, phase, before)
         if before is None:
             return {"action": "absent", "file_id": None}
+        if not self._made_by_ingest(before):  # found by its bytes, it may be the last good copy of them
+            self.check_source(planned)
         if not self._removable(planned, before):
             raise ProvisionError(
                 f"{self._p.where}{planned.label}: a file at its path is neither the ingest's nor its staged source; "
