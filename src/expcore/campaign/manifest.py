@@ -171,7 +171,8 @@ def build_fingerprint(
     - `scorer_digest`: the digest of the scorers a resume must keep.
     - `configs`: the hash of every configuration file, by file name.
     - `platform`: the settings the platform says make two starts one experiment, as plain data without a secret (the
-      Onedata layer's is its TLS mode, CA bundle hash and data paths, `PlatformConfig.fingerprint`). It is a section only when
+      Onedata layer's is its TLS mode, CA bundle hash and data paths, and with `[faults]` the fault injector's sanction
+      and targets, `PlatformConfig.fingerprint`). It is a section only when
       given and not empty, so a study without a platform keeps the fingerprint it had; no change to it is growth.
     - `backend_factory`: the name and version of the factory a study's plugin builds its backends with. It is a section
       only when given, so a study on the core's factory keeps the fingerprint it had; no change to it is growth.

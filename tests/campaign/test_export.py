@@ -228,7 +228,7 @@ def test_the_export_uses_generic_field_names_only(tmp_path):
     assert set(data) == set(REQUIRED_KEYS)
     assert data["format"] == FORMAT
     assert data["factors"] == ["task", "data_path", "tools", "model", "seed"]
-    assert set(data["exhausted_runs"][0]) == identity | {"attempts", "reasons"}
+    assert set(data["exhausted_runs"][0]) == identity | {"attempts", "reasons", "admissions"}
     assert set(data["unfinished_runs"][0]) == identity | {"status"}
     assert set(data["analysed_attempts"][0]) == identity | {
         "attempt",
@@ -239,6 +239,7 @@ def test_the_export_uses_generic_field_names_only(tmp_path):
         "started_at",
         "lease_wait_s",
         "lease_outcome",
+        "admission",
     }
     assert set(data["discarded_usage"][0]) == {
         "condition",

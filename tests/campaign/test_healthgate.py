@@ -353,7 +353,7 @@ def test_c11_a_failed_post_run_check_is_the_outages_only_when_the_gate_is_closed
 def test_c11_the_status_names_a_closed_gate_and_an_unreadable_record():
     """C11: the alarm says the gate is closed, and an unreadable record is unknown, never 'no outage'."""
     unreadable = fact("{broken")
-    assert unreadable == {"readable": False, "outages": None, "open": None}
+    assert unreadable == {"readable": False, "outages": None, "open": None, "deferral": None}
     assert "unreadable" in alarms(unreadable, 30)[0]
     closed = fact(json.dumps({"outages": [{"start_utc": NOW, "end_utc": None, "checks": 2, "last_detail": "down"}]}))
     assert "HEALTH GATE CLOSED since" in alarms(closed, 30)[0]

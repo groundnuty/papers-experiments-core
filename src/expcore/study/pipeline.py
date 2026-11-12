@@ -254,6 +254,7 @@ def _run_campaign(
             health=plugin.health,
             leases=leases,
             lease_group=plugin.lease_group,
+            admission=plugin.admission,
             backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
             on_hold=_say_hold,
             shard=started,

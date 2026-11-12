@@ -1,0 +1,260 @@
+{
+ "schema_version": "expcore-record/3",
+ "run_key": "task=task-a|model=model-a|seed=0",
+ "factors": {
+  "task": "task-a",
+  "model": "model-a",
+  "seed": 0
+ },
+ "attempt": 1,
+ "treatment_kinds": [],
+ "route": {
+  "backend": "stub",
+  "model": "stub",
+  "base_url": null,
+  "seed": 0,
+  "seed_honoured": false,
+  "synthetic_tokens": true,
+  "settings_sent_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "settings": {
+   "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a": {}
+  }
+ },
+ "prompt": {
+  "system": {
+   "text": "be brief",
+   "sha256": "b0d336336bae9756708102764ccc977778d8c408df38d7050d69f9e4d22c9a43",
+   "template_sha256": null,
+   "slots": null
+  },
+  "user": {
+   "text": "do the task",
+   "sha256": "abe1e9e3f801509e9c0712b32eb6f7b1bfd3a910e1c38eaa578c884790dc08e8",
+   "template_sha256": null,
+   "slots": null
+  },
+  "tools_sha256": "6e461b33a1f6a6e9b3ea348cd1e5c576c514bb6084d69697d3caed19e873c811"
+ },
+ "tools": [
+  {
+   "name": "look",
+   "description": "The look tool.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "x": {
+      "type": "string"
+     }
+    }
+   },
+   "terminal": false
+  }
+ ],
+ "agent_config": {
+  "limits": {
+   "max_tool_rounds": 10,
+   "time_cap_s": 300.0,
+   "token_budget": 100000,
+   "output_cap_chars": 200,
+   "max_output_tokens": 4096
+  },
+  "malformed_policy": "report",
+  "ceiling_s": 900.0,
+  "ceiling_kind": "ceiling",
+  "min_call_s": 1.0,
+  "ceiling_factor": 3.0,
+  "cleanup_deadline_s": 10.0,
+  "terminal_tools": []
+ },
+ "agent_config_sha256": "a9cf99524acc335363aa15b8da24e1089e41cebc92eab3d081bad28d17ba0ee6",
+ "code": {
+  "commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "dirty": false,
+  "source": "git",
+  "stale": false,
+  "why": null,
+  "tree_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+ },
+ "core_version": "0.1.0",
+ "transcript": [
+  {
+   "index": 0,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "name": "look",
+      "arguments": {
+       "x": "1"
+      },
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1_0",
+      "type": "function",
+      "function": {
+       "name": "look",
+       "arguments": "{\"x\": \"1\"}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_1_0",
+     "content": "seen"
+    }
+   ],
+   "request_sha256": "f86f4da3c86618770cf5929aaba0accd8bd097e6421f5f69ad7ec16f2fb3edc3",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 4,
+    "output_tokens": 3,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  },
+  {
+   "index": 1,
+   "neutral": {
+    "text": "done",
+    "reasoning": null,
+    "tool_calls": []
+   },
+   "native": {
+    "role": "assistant",
+    "content": "done"
+   },
+   "tool_messages": [],
+   "request_sha256": "9de8ebc0bced24232d1706b6b74a3249fcffcbe1fbde4e0334bf5a69da846e9b",
+   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "stop_reason": "stop",
+   "usage": {
+    "input_tokens": 8,
+    "output_tokens": 2,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null
+   },
+   "latency_s": 0.0,
+   "served_model": null,
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  }
+ ],
+ "failed_request": null,
+ "tool_calls": [
+  {
+   "turn": 0,
+   "round": 1,
+   "call_id": "call_1_0",
+   "name": "look",
+   "arguments": {
+    "x": "1"
+   },
+   "status": "ok",
+   "text": "seen",
+   "raw_text": "seen",
+   "raw_chars": 4,
+   "truncated": false,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true
+  }
+ ],
+ "clock": [
+  [
+   "instrument_first_turn",
+   2000.0
+  ],
+  [
+   "start",
+   2000.25
+  ],
+  [
+   "before_model",
+   2000.25
+  ],
+  [
+   "before_tool",
+   2000.25
+  ],
+  [
+   "after_tool",
+   2000.25
+  ],
+  [
+   "before_model",
+   2000.25
+  ],
+  [
+   "end",
+   2000.25
+  ]
+ ],
+ "outcome": {
+  "name": "finished",
+  "detail": "the model answered without a tool call",
+  "infra_kind": null,
+  "error_type": null,
+  "defect": null,
+  "treatment": false
+ },
+ "totals": {
+  "rounds": 1,
+  "malformed_calls": 0,
+  "malformed_events": [],
+  "tokens_used": 17,
+  "usage_incomplete": false,
+  "agent_s": 0.0,
+  "elapsed_s": 0.0,
+  "infra_wait_s": 0.0,
+  "infra_wait_by_kind": {},
+  "cleanup_s": 0.0,
+  "cleanup_timed_out": false,
+  "abandoned_threads": 0,
+  "final_text": "done"
+ },
+ "instruments": {
+  "manipulation": {
+   "ok": true,
+   "start_state_clock_s": 2000.0,
+   "start_state_matched": false
+  }
+ },
+ "scores": {},
+ "redacted_paths": [],
+ "instrument_refusal": {
+  "namespace": "manipulation",
+  "infra_kind": "tool_plane_integrity",
+  "detail": "the arriving files were not in their declared start state"
+ }
+}

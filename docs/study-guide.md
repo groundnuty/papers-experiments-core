@@ -30,7 +30,7 @@ The study directory holds four configuration files and the plugin, the Python fi
 | `scorers` | `Scorer`s: a pure function of a record, returning named numeric outcomes | `TinyScorer` |
 | `prompts`, `tools` | per condition, the SHA-256 of its prompt template and of its tool set; both go into the campaign fingerprint | from `PromptTemplate` and `tools_sha256` ([what it hashes](interfaces.md#several-providers-and-the-hash-of-a-tool-set)) |
 | tools | `ToolProvider`s the executor passes to `record_run`: plain functions through `FunctionProvider`, or an MCP server through `McpToolProvider` | `lookup` and `submit` |
-| instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
+| instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read. An instrument can also refuse the attempt, with `at_first_turn` and `check` ([below](#an-instrument-that-refuses-an-attempt)) | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
 | `health`, `probe`, `lease_group`, `lease_keys` | the platform's health check, resource probe and leases; the Onedata layer supplies real ones | stubs that always succeed |
 | `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name; a factory imported from an installed package must declare the installed version of the distribution that owns its module's file, one defined in a file `[study] code` lists, which the code identity covers, may declare any, and one from anywhere else is refused. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
@@ -240,7 +240,7 @@ On the Onedata platform four clients talk to the federation: the platform layer'
 - **`ca_file`**, preferred: `ca_file = "federation-ca.pem"` names a CA bundle the federation's certificate chains to, relative to `platform.toml`. Verification stays on, against that bundle. The bundle must hold certificates and no private key. No client reads the file you named: its bytes are hashed when `platform.toml` is loaded, read once more for each run and refused unless they have that hash, and every client gets those bytes, the REST client in memory and the gate, the sidecar and the tool server as the run's own read-only copy. A bundle replaced after the load is never trusted; a run started after it is refused until `platform.toml` is loaded again.
 - **`insecure_tls`**: `insecure_tls = true` turns verification off for all four clients. It is for disposable test federations only: anyone on the path to the federation can then read and alter the data and the tokens. While it is on, every health reading ends with a warning.
 
-The two keys never go together, and the per-client keys of earlier versions (`insecure_tls` under `[toolserver]`, `tls` under `[sandbox.mount]`) are refused at load. Each run's sandbox metadata records the mode, `verify`, `ca_file` with the bundle's SHA-256, or `insecure`, and never the bundle's path or contents. To make the mode part of the campaign's fingerprint, the plugin passes the platform's half of it, `StudyPlugin(..., platform=config.fingerprint())` with `config` the loaded `platform.toml`; a resume under another mode or another bundle is then refused.
+The two keys never go together, and the per-client keys of earlier versions (`insecure_tls` under `[toolserver]`, `tls` under `[sandbox.mount]`) are refused at load. Each run's sandbox metadata records the mode, `verify`, `ca_file` with the bundle's SHA-256, or `insecure`, and never the bundle's path or contents. To make the mode part of the campaign's fingerprint, the plugin passes the platform's half of it, `StudyPlugin(..., platform=config.fingerprint())` with `config` the loaded `platform.toml`; a resume under another mode or another bundle is then refused. With `[faults]` the same call also carries the fault injector's sanction and, for each provider it may take down, the provider's label with the SHA-256 of its service's name, so a resume that adds or drops `[faults]`, changes the sanction or takes another service down is refused too; the injector's waits and its journal's place are not part of it.
 
 ### Data paths on the Onedata platform
 
@@ -366,7 +366,7 @@ except ConfigError as error:
 shutil.rmtree(tampered)
 ```
 
-A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds. The `health_kind` and `identity_kind` of `[scheduler]` are checked against the same vocabulary when the study is loaded ([section 2](#the-schedulers-kinds)).
+A condition may name only the kinds known when `study.toml` is loaded, and it is loaded before the plugin is imported. Two keys of `[study]` add kinds first. `platforms = ["module", ...]` names modules imported before anything is validated, so the kinds a platform registers in them with `register_infra_kind` are known; for the Onedata layer the module is `expcore_onedata.sandbox.kinds`, which registers every kind the layer raises, the fault injector's included. A module that cannot be imported is refused, naming the file and the key. `[study.kinds]` declares the study's own kinds, one line each: `name = { description = "...", treatable = true }`, where `treatable` is true unless it says false. A study's kind that is a core kind or a platform's is refused, and it lasts only while the study is loaded or run. A kind named nowhere is refused as unknown, and the error lists the treatable kinds. The `health_kind` and `identity_kind` of `[scheduler]` are checked against the same vocabulary when the study is loaded ([section 2](#the-schedulers-kinds)).
 
 ```python
 from expcore.errors import infra_kinds
@@ -628,6 +628,49 @@ assert records and all(load_record(p).run_key for p in records)  # every attempt
 assert counts == Counter()  # the example study runs without the platform
 ```
 
+### Fault injection: compare like isolation with like
+
+On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
+
+```python
+import expcore_onedata.sandbox.kinds  # what [study] platforms imports before study.toml's conditions are validated
+from expcore.campaign.factors import load_factor_schema
+
+design = Path("isolated-design.toml")
+design.write_text(
+    """
+[factors.fault]
+levels = ["outage", "none"]
+
+[identity]
+order = ["task", "fault", "model", "seed"]
+
+[conditions.outage]
+fault = "outage"
+infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]
+
+[conditions.matched-control]
+fault = "none"
+exclusive = true
+"""
+)
+isolated = load_factor_schema(design)
+assert isolated.exclusive == {"outage": False, "matched-control": True}
+
+
+def admission_by_condition(export):
+    """The admission modes each condition's analysed attempts held."""
+    held = {}
+    for entry in export["analysed_attempts"]:
+        held.setdefault(entry["condition"], set()).add(entry["admission"])
+    return held
+
+
+held = admission_by_condition(export)
+assert all(len(modes) == 1 for modes in held.values())  # each condition ran under one isolation
+assert held == dict.fromkeys(held, {"none"})  # the example study has no run admission
+```
+
 ### Testing a study's instruments and scorers
 
 A study's own instruments (the ones that induce a state, the probes), its scorers and its plugin can be tested against the platform without a live federation. `expcore_onedata.testing`, installed with the platform layer, holds the fakes the core's own tests use: an in-process Onezone with every provider's data API (`FakeData`), a default `platform.toml` that matches it, and a clock that moves only when something sleeps (`Ticker`). Each fake's docstring says what it models and what it does not, and [`interfaces.md`](interfaces.md#the-platform-layers-testing-module) lists the names. Nothing at runtime imports the module and it imports no pytest, so a fixture is your own thin wrapper around it.
@@ -713,6 +756,137 @@ To check an agent's claimed reads file by file, read `files`: one row per file w
 If your executor checks the sandbox before the agent's loop starts (its data path, read as the agent's user, say), run the check with `sandbox.exec(code, timeout_s, record=False)`, which records it as a harness step and never as one of the agent's cells, then call `sandbox.mark_run_start()` just before the loop. Both belong before the loop: once the mark is set or the agent's first cell has begun, a step and a mark are refused. The counts, the tables and the lookups then hold only what the agent was served, and the check's answers are counted apart, in `before_run_start`. When the returned `confirmed` is false the run's count will be unknown; whether such a run goes on is your executor's decision.
 
 The count is `None`, with its reasons in `unknown`, wherever it is not known: always on a mount (`mount_not_through_gate`, since oneclient's reads pass no gate), and on a REST run whose gate log may lack a line. The tables are `None` with it, never a part of the run's reads. As with the probes' estimates, count those per condition and reason over every attempt and report them beside the analysis; never treat one as zero. A run with no data path reads zero, with empty tables. [`interfaces.md`](interfaces.md#instrument) lists every field and reason.
+
+### An instrument that refuses an attempt
+
+A manipulation that holds at a moment of the agent's run needs a reading at that moment, and a way to set the attempt aside when the reading shows the manipulation did not hold. Left to the scorer, such an attempt is scored anyway and the study can only mark its outcomes as not determined. An instrument can refuse it instead, with two optional methods:
+
+- `at_first_turn(moment)` is called once just before the loop starts the agent's clock, so before the first request. `moment["clock_s"]` is the reading of the run's clock that the record logs under `instrument_first_turn`; label what you read with it, keep the reading, and record it in `finish`.
+- `check()` is called after every instrument's `finish`, and returns when the manipulation held.
+
+Either refuses by raising `InfraError` of a kind no condition can declare as its treatment, so the refused attempt can never be scored as the manipulation: a kind your `study.toml` declares with `treatable = false` under `[study.kinds]` ([section 3](#treatment-kinds)), or a platform's. A refusal at the first turn sets the attempt aside before it has sent a request, and it costs nothing. A refusal after the run is written into the record (`instrument_refusal`) and the scheduler sets the attempt aside next to its health check, for one the loop scored and for one that ended in the condition's own fault alike; the record, snapshots and usage included, is kept, and the run is tried again as for any infrastructure failure. A kind a condition can declare, or any other exception, is a defect of the instrument. The executor calls `first_turn_instruments(instruments, request.timer)` just before `record_run`, and `finish_instruments` as before; a study whose instruments have neither method records exactly what it did. The block shows the instrument alone, without a campaign, and `tool_plane_integrity` stands in for the kind your study declares.
+
+A check refuses only when the environment the condition declares was not realised, such as files that were not in their start state or a manipulation that did not take hold, and never because of the treatment fault itself. A refused attempt is run again, and the rerun is a fresh attempt, so a check that refuses whenever the condition's declared fault occurs removes that fault from every scored result: the effect the study measures is erased, as it would be by running again until the run looks healthy ([section 3](#treatment-kinds)). For a condition whose treatment is a tool-server outage, the check refuses when the outage was not the one planned, say because it began outside its window, and not whenever the tool server went down.
+
+```python
+from expcore.errors import InfraError
+from expcore.loop.timer import AgentTimer
+from expcore.records.instruments import first_turn_instruments
+
+KIND = "tool_plane_integrity"  # a core kind no condition can declare; a study uses its own, from [study.kinds]
+
+
+class StartState:
+    """Reads, at the agent's first turn, whether the arriving files are in their declared start state."""
+
+    namespace = "start_state"
+
+    def __init__(self, files_are_ready):
+        self.files_are_ready, self.seen = files_are_ready, None
+
+    def start(self, identity):
+        self.seen = None
+
+    def at_first_turn(self, moment):
+        self.seen = {"clock_s": moment["clock_s"], "matched": self.files_are_ready()}
+
+    def finish(self):
+        return {"ok": self.seen is not None, "first_turn": self.seen}
+
+    def check(self):
+        if self.seen is None:  # the hook never ran: unknown is not a pass
+            raise InfraError(KIND, "no reading at the first turn")
+        if not self.seen["matched"]:
+            raise InfraError(KIND, "the arriving files were not in their declared start state")
+
+
+timer = AgentTimer(60.0)  # the request's timer, which the loop has not started
+ready = StartState(lambda: True)
+first_turn_instruments([ready], timer)
+ready.check()  # the manipulation held: nothing to refuse
+assert [label for label, _ in timer.readings] == ["instrument_first_turn"]
+
+late = StartState(lambda: False)
+first_turn_instruments([late], AgentTimer(60.0))
+try:
+    late.check()
+except InfraError as refusal:
+    assert (
+        refusal.kind == KIND
+    )  # `finish_instruments` records this in the record, and the scheduler sets the attempt aside
+else:
+    raise AssertionError("the check should have refused")
+```
+
+[`interfaces.md`](interfaces.md#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check) says when each runs, what it may do and how a failure is classified.
+
+### Data that arrives during a run
+
+To test whether an agent notices that its data are incomplete before it computes, a condition can make part of a dataset arrive while the agent works, as if its owner were still ingesting it. The Onedata layer's `ProgressiveIngest` (from `expcore_onedata.ingest`, namespace `progressive_ingest`) is the instrument that does it. Declare the plan in a TOML file of your own, one per condition, and load it with `load_ingest_plan(path, config)` from `expcore_onedata.ingestplan`. The plan names a staging directory of sources you keep and, for each file, a label (how the record names it, never by its path), its path in the space, its source, when it arrives (`at_s`, seconds after the instrument's start), whether it is written whole or in `parts` over `over_s` seconds, and its `baseline`. Use `"complete"` for a file your other conditions read: it is removed before the run and written back from its staged source after. Use `"absent"` for new data: it is removed again after the run. Put `ingestplan.fingerprint({condition: plan})` into the platform half of the campaign fingerprint, so a resume after the schedule or a staged source changed is refused.
+
+Give the instrument a provisioner of its own, whose change log is the ingest's and never goes to a teardown, and a journal file that lasts across runs. The instrument claims the log when you build it: a log another provisioner already wrote to is refused, and so is a teardown over the ingest's log. Start it with your other instruments and finish it with them through `finish_instruments`, which runs its post-run check ([An instrument that refuses an attempt](#an-instrument-that-refuses-an-attempt)). A part that could not be written or confirmed, or a baseline that could not be restored, makes the check refuse with `InfraError("ingest_failure")`, a kind no condition may declare, so the attempt is set aside, charged and run again, never scored; `raise_if_failed()` makes the same check, as a second guard once the record is written. Each file is restored on its own, so one that cannot be restored leaves no other file missing. In your executor's `finally`, call `restore()` through `asyncio.to_thread`, since it blocks. A file that has not arrived when the run ends is the manipulation, never a failure. A start that cannot set the start state raises the same kind before the agent runs. The snapshot gives each part's planned, written and confirmed times on the loop's clock (`steps`) and every file id the ingest removed, created or restored, with the old and new id (`ids`), so a scorer can compare the agent's reads with the arrivals from the record alone, and you can map a data gate's errors to files after the run. Until the core admits such conditions exclusively (#27), keep the runs that use an ingest apart from any other run on the same owner's space.
+
+The block runs a plan of one file in two parts against the fakes. The run ends after the first part, so the day is half there, and the finish writes it back whole from the staged copy.
+
+```python
+import time
+
+from expcore_onedata.ingest import ProgressiveIngest
+from expcore_onedata.ingestplan import load_ingest_plan
+from expcore_onedata.testing import ALPHA_ID, with_placement, write_platform
+
+DAY = b"13,ok\n" * 100
+ticker = Ticker()
+fake = make_federation(clock=ticker.clock)
+fake.add_provider(BETA_ID, "beta.test")  # beta supports the space too, so each arrival is confirmed there
+fake.add_file("records/day-12.csv", b"12,ok\n" * 100)
+fake.add_file("records/day-13.csv", DAY)
+
+
+def both_providers(document):
+    with_placement(document)
+    document["support"]["providers"] = ["alpha", "beta"]
+
+
+workdir = Path(tempfile.mkdtemp())
+os.environ[ADMIN_ENV] = fake.admin_token
+platform = write_platform(workdir, both_providers)
+config = load_platform(platform)
+client = OnezoneClient(config, http=fake.client_http())
+own = Provisioner(  # the ingest's own provisioner and change log
+    client,
+    config,
+    load_placement(platform, config).settings,
+    provider_ids=resolve_provider_ids(config),
+    log=workdir / "ingest-changes.jsonl",
+    clock=ticker.clock,
+    sleep=ticker.sleep,
+)
+(workdir / "staged").mkdir()
+(workdir / "staged" / "day-13.csv").write_bytes(DAY)  # the copy the study keeps
+(workdir / "ingest.toml").write_text(
+    '[ingest]\nstaging = "staged"\n\n[[ingest.files]]\nlabel = "day-13"\npath = "records/day-13.csv"\n'
+    'source = "day-13.csv"\nat_s = 60\nbaseline = "complete"\nparts = 2\nover_s = 60\n',
+    encoding="utf-8",
+)
+plan = load_ingest_plan(workdir / "ingest.toml", config)
+ingest = ProgressiveIngest(own, plan, journal=workdir / "ingest-journal.jsonl", max_wait_s=0.001)
+
+ingest.start({})  # the day is removed: the agent starts without it
+assert not fake.exists("records/day-13.csv")
+ticker.sleep(60)  # a Ticker moves only when told; on the real clock the schedule runs by itself
+while ingest.progress < 1:
+    time.sleep(0.001)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 300]]  # half of the day has arrived
+snapshot = ingest.finish()  # the run ended before the second half
+ingest.check()  # what finish_instruments asks after the snapshots: nothing to refuse
+assert [s["step"] for s in snapshot["steps"] if s["step"] != "planned"] == ["written", "confirmed", "not_due"]
+assert [e["event"] for e in snapshot["ids"]] == ["restored", "removed", "created", "restored"]
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]  # whole again, from the staged copy
+
+del os.environ[ADMIN_ENV]
+shutil.rmtree(workdir)
+```
 
 ## 6. What a conclusion may say
 

@@ -38,10 +38,10 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign import reply_cap
-from expcore.campaign.attempt import AttemptRunner, Parts
+from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
-from expcore.campaign.factors import FactorSchema
+from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
 from expcore.campaign.healthgate import HealthCheck, HealthGate
@@ -59,6 +59,7 @@ from expcore.campaign.shard_run import ShardStart
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
+from expcore.config.loading import Section
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
 from expcore.models.admission import admit_reading, max_tokens_ignored, reply_cap_unshown
@@ -82,7 +83,8 @@ def iso(moment: dt.datetime) -> str:
 class RunSummary:
     """How a call to `run` ended: the workers it started (`dispatched`, what `max_dispatch` bounds), the holds still
     in force, the runs by status, the local log of harness defects' tracebacks when there is one (`defect_log`), and
-    the attempts it began: a worker that got no lease, or found a gate closed once it had one, began none."""
+    the attempts it began: a worker that got no lease, was not admitted by the platform (`Parts.admission`), or found a
+    gate closed once it had either, began none."""
 
     dispatched: int
     holds: Mapping[str, Hold] = field(default_factory=dict)
@@ -109,6 +111,7 @@ class Scheduler:
         health: HealthCheck | None = None,
         leases: LeasePool | None = None,
         lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None,
+        admission: RunAdmission | None = None,
         reservations: Reservations | None = None,
         backend_factory: BackendFactory = default_backend_factory,
         clock: Callable[[], dt.datetime] = utc_now,
@@ -123,6 +126,7 @@ class Scheduler:
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
         self.health_check, self.leases, self.lease_group = health, leases, lease_group
+        self.admission = admission
         self.reservations, self.backend_factory = reservations, backend_factory
         self.clock, self.monotonic, self.crash_hook = clock, monotonic, crash_hook
         self.plan_models = sorted({row.key.factors["model"] for row in manifest.rows})
@@ -130,6 +134,12 @@ class Scheduler:
         if missing:
             raise ValueError(f"the plan runs model(s) {', '.join(missing)} that have no admitted endpoint")
         self.settings.check_kinds(schema)
+        exclusive = [name for name, value in schema.exclusive.items() if value]
+        if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
+            raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(
+                EXCLUSIVE_KEY,
+                "declares an exclusive run, but the platform gives the campaign no run admission to hold exclusively",
+            )
         self.store: Store | None = None
         self.recovery: Recovery | None = None
         self.not_admitted: dict[str, str] = {}
@@ -214,7 +224,12 @@ class Scheduler:
         self.gate = None
         if self.health_check is not None:
             self.gate = HealthGate(
-                store, self.health_check, self.stamp, recheck_s=cfg.recheck_s, timeout_s=cfg.health_timeout_s
+                store,
+                self.health_check,
+                self.stamp,
+                recheck_s=cfg.recheck_s,
+                timeout_s=cfg.health_timeout_s,
+                max_defer_s=cfg.max_defer_s,
             )
             self.gate.load()
         self._sweep_leases()
@@ -241,6 +256,7 @@ class Scheduler:
                 health=self.gate,
                 leases=self.leases,
                 lease_group=self.lease_group,
+                admission=self.admission,
                 crash_hook=self.crash_hook,
                 ledger=self.ledger,
                 reserved_capped=self._admitted_capped,
@@ -445,6 +461,9 @@ class Scheduler:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
             return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+        if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
+            why = "the health gate is closed: the platform's check stayed deferred past max_defer_s"
+            return Hold("health_gate", why, temporary=False)
         if self.gate is not None and self.gate.closed:
             return Hold("health_gate", "the health gate is closed: no run starts until a check passes", temporary=True)
         return None
@@ -505,6 +524,8 @@ class Scheduler:
             key, model = row["run_key"], row[column_for("model")]
             if key in self._inflight:
                 continue
+            if all_hold is not None and not all_hold.temporary:
+                continue  # nothing starts until someone looks: no run is waiting for its time
             if self._not_before.get(key, 0.0) > mono:
                 waiting = True
                 continue
@@ -615,8 +636,13 @@ class Scheduler:
         """When dispatch held by `hold` resumes, as far as the scheduler knows."""
         if hold.kind == "unit_paused" and hold.until is not None:
             return f"dispatch on it resumes at {hold.until}, when one run may probe it"
-        if hold.kind == "health_gate":
+        if hold.kind == "health_gate" and hold.temporary:
             return f"dispatch resumes when a health check passes (checked every {self.settings.recheck_s:g} s)"
+        if hold.kind == "health_gate":  # blocking: a deferral past its bound, whose holder may never let go
+            return (
+                "it may not end by itself: dispatch resumes only when a health check passes (checked every "
+                f"{self.settings.recheck_s:g} s), so someone should look at what holds the platform"
+            )
         if hold.temporary:
             return "dispatch resumes when it ends by itself"
         return "it does not end by itself: its runs stay pending until someone looks"

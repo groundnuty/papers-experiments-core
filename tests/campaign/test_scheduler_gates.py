@@ -1,9 +1,13 @@
 """The gates around an attempt, through the scheduler: harness stops, health, budgets, units, identity, leases."""
 
+import asyncio
+import contextlib
 import datetime as dt
 import json
 import os
 import re
+import threading
+import time
 
 import pytest
 from campaign_support import NOW, make_schema
@@ -17,6 +21,7 @@ from expcore.campaign.healthgate import Health, parse
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.store import Store
 from expcore.config.loading import ConfigError
+from expcore.errors import InfraError
 
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 SCHEMA = make_schema()
@@ -148,6 +153,111 @@ def test_c11_an_unreadable_gate_state_at_restart_opens_closed_and_blocks_dispatc
         assert scheduler.run().statuses == {"done": 3}
         assert "health_gate_record_unreadable" in event_kinds(scheduler.store)
         assert "health_gate_opened" in event_kinds(scheduler.store)
+
+
+def test_c11_a_restored_blocking_outage_waits_for_the_first_check_before_dispatch_exits_as_blocked(tmp_path):
+    """C11: a campaign stopped by a blocking outage is resumed on a platform that is healthy again; the restored gate's
+    first check is slow, and dispatch waits for its answer (bounded by its own timeout) instead of exiting as blocked
+    at once and discarding it: the check passes, the gate opens and every run is done."""
+    from scheduler_support import seed_store
+
+    seed_store(tmp_path, SCHEMA)
+    store = Store(tmp_path / "state.sqlite", SCHEMA)
+    outage = {
+        "start_utc": NOW,
+        "end_utc": None,
+        "how": None,
+        "checks": 3,
+        "restarts": 0,
+        "last_check_utc": NOW,
+        "first_detail": "deferred past max_defer_s",
+        "last_detail": "deferred past max_defer_s",
+        "blocking": True,
+    }
+    store.put_meta(HEALTH_META, json.dumps({"outages": [outage]}), NOW)
+    store.close()
+
+    def slow_and_healthy():
+        time.sleep(0.5)
+        return Health(True, "fine")
+
+    settings = settings_for(recheck_s=0.01, health_timeout_s=5)
+    with build(tmp_path, health=slow_and_healthy, settings=settings, plan=SMALL) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+        [restored] = parse(scheduler.store.get_meta(HEALTH_META))
+        assert restored["how"] == "check_passed"
+
+
+class OneAtATime:
+    """A run admission that lets one run in at a time, and notes when a second run waits for it."""
+
+    def __init__(self):
+        self.lock, self.waiting = threading.Lock(), threading.Event()
+
+    @contextlib.contextmanager
+    def __call__(self, treatment_kinds, treatment_targets, cancel, exclusive):
+        if not self.lock.acquire(blocking=False):
+            self.waiting.set()
+            self.lock.acquire()
+        try:
+            yield "exclusive"
+        finally:
+            self.lock.release()
+
+
+def test_c10_a_run_that_waited_for_admission_does_not_start_once_a_harness_stop_began_meanwhile(tmp_path):
+    """C10, C17: run B waits for the platform's admission while run A holds it; A ends with a harness defect that
+    stops dispatch of the model. B, admitted after it, looks at the gates again: it never starts and uses no attempt."""
+    admission = OneAtATime()
+
+    async def defect_once_the_other_waits(request):
+        assert await asyncio.to_thread(admission.waiting.wait, 10), "the other run never waited for admission"
+        raise ValueError("a crash in our own code")
+
+    executor = FakeExecutor(default=defect_once_the_other_waits)
+    settings = settings_for(workers=2, harness_stop=HarnessStopConfig(stop_after=1, models_stop=1))
+    with build(tmp_path, executor=executor, settings=settings, plan=SMALL, admission=admission) as scheduler:
+        summary = scheduler.run()
+        kinds = event_kinds(scheduler.store)
+        attempts = scheduler.store.q("SELECT state FROM attempts")
+    assert len(executor.requests) == 1  # B never started
+    assert [r["state"] for r in attempts] == ["harness_error"]
+    assert "run_unstarted" in kinds
+    assert (summary.dispatched, summary.attempts) == (2, 1)  # B's worker began no attempt, so none is counted
+    log = summary.harness_log.read_text(encoding="utf-8")  # A's traceback, written while it held the admission
+    assert log.count("=== ") == 1
+    assert "ValueError" in log
+
+
+class RefuseFirst:
+    """A run admission that refuses the first run it is asked for, as a platform that cannot hold its resource, and
+    admits every run after it."""
+
+    def __init__(self):
+        self.refused = False
+
+    @contextlib.contextmanager
+    def __call__(self, treatment_kinds, treatment_targets, cancel, exclusive):
+        if not self.refused:
+            self.refused = True
+            raise InfraError("sandbox", "the shared resource could not be held")
+        yield "shared"
+
+
+def test_c11_a_run_the_platform_does_not_admit_begins_no_attempt_and_is_not_counted_as_one(tmp_path):
+    """C11, C19: a refused admission leaves the run unstarted, with no attempt row; it starts later under an admission
+    that holds, and the summary counts the attempts begun, not the workers started."""
+    executor = FakeExecutor()
+    settings = settings_for(workers=1)
+    with build(tmp_path, executor=executor, settings=settings, plan=SMALL, admission=RefuseFirst()) as scheduler:
+        summary = scheduler.run()
+        rows = scheduler.store.q("SELECT admission FROM attempts")
+        unstarted = [e["detail"] for e in scheduler.store.q("SELECT detail FROM events WHERE kind='run_unstarted'")]
+    assert summary.statuses == {"done": 3}
+    assert (summary.dispatched, summary.attempts) == (4, 3)
+    assert [r["admission"] for r in rows] == ["shared"] * 3
+    assert len(unstarted) == 1
+    assert "not admitted by the platform, no attempt used" in unstarted[0]
 
 
 # --- C12 and C13: the budget ------------------------------------------------------------------------------------------

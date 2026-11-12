@@ -11,10 +11,16 @@ The order is fixed, and each step is decided by what a kill at that point must l
    unit's pause or the budget may have begun, or the campaign may have been told to end. If any is closed now the
    lease is released cleanly (nothing was launched, so there is no teardown to prove) and the run stays pending with no
    attempt used (C11, C17);
+3a. the platform's **run admission**, when it has one (`Parts.admission`): it holds a shared resource for the run, may
+   wait for it before anything starts (outside the agent's clock), and is left only after the post-run check and the
+   store's record, so what the post-run check sees is what the run left; refused (`InfraError`), the run is left
+   unstarted and uses no attempt. Its wait can be long too, so once admitted the run **looks at the gates again**, as
+   after its lease: if one is closed now the admission is let go and the run stays pending, uncharged;
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
    under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26);
-6. the post-run health check and the served-identity check, which can turn the result into infrastructure (C11, C16);
+6. the post-run health check, an instrument's refusal and the served-identity check, which can turn the result into
+   infrastructure (C11, C31, C16);
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
    harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
    lose the stop or the failure it caused; the lease ends after it. A result committed from its marker at the next
@@ -33,12 +39,13 @@ import dataclasses
 import json
 import os
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.attempts import classify
+from expcore.campaign.attempts import classify, unverified
 from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
     BackendFactory,
@@ -47,10 +54,11 @@ from expcore.campaign.executor import (
     RunRequest,
     failure_result,
     result_from_record,
+    sent_no_request,
 )
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.harness_stop import HarnessStops, kind_of
-from expcore.campaign.healthgate import FOUND, HOLD, HealthGate
+from expcore.campaign.healthgate import DEFER, FOUND, HOLD, HealthGate
 from expcore.campaign.holds import Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import Lease, LeaseCancelled, LeasePool, LeaseRefused
@@ -60,12 +68,18 @@ from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.campaign.units import UnitHealth
 from expcore.config.models import ModelTable
+from expcore.errors import InfraError
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
 from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
+# A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
+# condition declares `exclusive = true`, a context manager that holds what the run needs from before the attempt until
+# after its post-run check (`Parts.admission`), and yields what it holds: "shared" or "exclusive".
+RunAdmission = Callable[[tuple[str, ...], Mapping[str, str], threading.Event, bool], AbstractContextManager[str]]
+HELD_MODES = ("shared", "exclusive")  # what a run admission may yield
 
 
 @dataclass
@@ -93,6 +107,7 @@ class Parts:
     health: HealthGate | None = None
     leases: LeasePool | None = None
     lease_group: Callable[[Mapping[str, Any]], str | None] = lambda factors: None
+    admission: RunAdmission | None = None  # the platform's hold on a shared resource, around the attempt (step 3a)
     crash_hook: Callable[[str, str], None] = lambda point, run_key: None
     ledger: Ledger | None = None  # with a budget: the top-ups of the sends a run's token cap cannot account for (C26)
     # with a budget: whether the assessment that admitted the run reserved it by the reply maximum (C27); None: unknown
@@ -109,6 +124,10 @@ class AttemptRunner:
         """Return the infrastructure kinds the run's condition declares as its treatment."""
         return self.p.schema.treatment_kinds[self.p.schema.condition_named(factors, run_key)]
 
+    def treatment_targets(self, factors: Mapping[str, Any], run_key: str) -> dict[str, str]:
+        """Return the target the run's condition declares for any of its treatment kinds."""
+        return self.p.schema.treatment_targets[self.p.schema.condition_named(factors, run_key)]
+
     def work(self, row: Any) -> float:
         """Run one attempt of the row's run, end to end. Return the seconds before the run may start again."""
         p = self.p
@@ -117,6 +136,9 @@ class AttemptRunner:
             pre = p.health.before_run(key)
             if pre.verdict == HOLD:
                 return 0.0  # nothing is tried, charged or recorded; the gate holds dispatch
+            if pre.verdict == DEFER:  # the platform is held on purpose: a wait, so nothing is tried or charged
+                p.store.event(p.stamp(), "run_deferred", factors["model"], f"{key}: {pre.detail}; no attempt used")
+                return p.settings.recheck_s
             if pre.verdict == FOUND:
                 return self._charge_outage(row, factors, pre.detail)
         timer = p.agent_config.timer(p.monotonic)
@@ -129,8 +151,15 @@ class AttemptRunner:
             if hold is not None:
                 self._leave_unstarted(row, factors, hold)
                 return 0.0  # the hold decides when it may start again
-            launched = True
-            return self._attempt(row, factors, timer, lease)
+            with self._admitted(row, factors) as admitted:
+                if admitted is None:
+                    return p.settings.retry_delay_s  # left unstarted: no attempt row exists, so none is used
+                hold = p.recheck(row) if p.admission is not None else None  # the wait may have been long: look again
+                if hold is not None:
+                    self._leave_unstarted(row, factors, hold, waited_for="the platform's admission")
+                    return 0.0  # leaving the block lets the admission go; the hold decides when it may start
+                launched = True
+                return self._attempt(row, factors, timer, lease, admitted)
         finally:
             if lease is not None and p.leases is not None:
                 if launched:
@@ -171,20 +200,50 @@ class AttemptRunner:
             p.store.event(p.stamp(), "lease_waited", model, f"{key}: waited {lease.wait_s:.1f} s for lease {lease.key}")
         return lease, True
 
-    def _leave_unstarted(self, row: Any, factors: Mapping[str, Any], hold: Hold) -> None:
-        """Say that a run which got its lease was held after all: nothing started, no attempt used (C11, C17)."""
+    @contextlib.contextmanager
+    def _admitted(self, row: Any, factors: Mapping[str, Any]) -> Iterator[str | None]:
+        """Hold the platform's run admission for the body, if it has one (step 3a); yield what the run holds of it
+        ("shared", "exclusive", or "none" with no admission), as the platform says it admitted it, or None when the run
+        may not start. An admission that yields anything else is a defect of the platform, and raises."""
+        p = self.p
+        if p.admission is None:
+            yield "none"
+            return
         key = row["run_key"]
+        kinds, targets = self.treatment_kinds(factors, key), self.treatment_targets(factors, key)
+        exclusive = p.schema.exclusive[p.schema.condition_named(factors, key)]
+        with contextlib.ExitStack() as held:
+            try:
+                mode = held.enter_context(p.admission(kinds, targets, p.stop, exclusive))
+            except InfraError as refusal:  # never admitted: nothing started, so no attempt is used
+                text = f"{key}: not admitted by the platform, no attempt used: {refusal.detail}"
+                p.store.event(p.stamp(), "run_unstarted", factors["model"], text)
+                yield None
+                return
+            if mode not in HELD_MODES:
+                raise ValueError(f"{key}: the run admission yielded {mode!r}, not one of {', '.join(HELD_MODES)}")
+            yield mode
+
+    def _leave_unstarted(
+        self, row: Any, factors: Mapping[str, Any], hold: Hold, *, waited_for: str = "its lease"
+    ) -> None:
+        """Say that a run which got its lease (or its admission) was held after all: nothing started, no attempt used
+        (C11, C17)."""
+        key = row["run_key"]
+        released = "lease" if waited_for == "its lease" else "admission"
         self.p.store.event(
             self.p.stamp(),
             "run_unstarted",
             factors["model"],
-            f"{key}: a {hold.kind} hold began while it waited for its lease; the lease is released, no attempt used: "
-            f"{hold.reason}",
+            f"{key}: a {hold.kind} hold began while it waited for {waited_for}; the {released} is released, no attempt "
+            f"used: {hold.reason}",
         )
 
-    def _begin(self, row: Any, lease: Lease | None = None, *, reserved_capped: bool | None = None) -> tuple[Any, Path]:
-        """Insert the 'running' row, with a directory of its own for this try, the lease it runs under, and the bound
-        the budget gate reserved the run (C27; None when no gate decided it)."""
+    def _begin(
+        self, row: Any, lease: Lease | None = None, *, admission: str = "none", reserved_capped: bool | None = None
+    ) -> tuple[Any, Path]:
+        """Insert the 'running' row, with a directory of its own for this try, the lease it runs under, what it holds
+        of the run admission, and the bound the budget gate reserved the run (C27; None when no gate decided it)."""
         p = self.p
         tries = len(p.store.q("SELECT 1 FROM attempts WHERE run_key=?", (row["run_key"],))) + 1
         run_dir = p.root / "runs" / row["digest"] / f"try{tries}"
@@ -197,6 +256,7 @@ class AttemptRunner:
             lease_wait_s=None if lease is None else lease.wait_s,
             lease_outcome="none" if lease is None else "granted",
             reserved_capped=reserved_capped,
+            admission=admission,
         )
         return begun, run_dir
 
@@ -213,16 +273,20 @@ class AttemptRunner:
             input_tokens=0,
             output_tokens=0,
             treatment_kinds=self.treatment_kinds(factors, key),
+            treatment_targets=self.treatment_targets(factors, key),
             turn_usage=(),
         )
         self._finish(begun, run_dir, key, result)
         return p.settings.retry_delay_s
 
-    def _attempt(self, row: Any, factors: Mapping[str, Any], timer: Any, lease: Lease | None) -> float:
+    def _attempt(
+        self, row: Any, factors: Mapping[str, Any], timer: Any, lease: Lease | None, admission: str = "none"
+    ) -> float:
         """Run the attempt the lease (or none) holds the resources for, record its result and do the bookkeeping."""
         p = self.p
         key, model = row["run_key"], factors["model"]
         endpoint, kinds = p.endpoints[model], self.treatment_kinds(factors, key)
+        targets = self.treatment_targets(factors, key)
         backend = p.backend_factory(
             p.models.resolve(model),
             seed=factors["seed"],
@@ -234,7 +298,7 @@ class AttemptRunner:
         # so an attempt whose usage turns out unknown is charged that bound; the guard takes unknown as yes, which
         # checks more, never less.
         decided = p.reserved_capped(key)
-        begun, run_dir = self._begin(row, lease, reserved_capped=decided)
+        begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
         guard = None
         if p.ledger is not None:
             guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=True if decided is None else decided)
@@ -248,8 +312,9 @@ class AttemptRunner:
             p.monotonic,
             kinds,
             lease,
-            p.models,
-            defects,
+            treatment_targets=targets,
+            models=p.models,
+            defect_log=defects,
         )
 
         async def go() -> Any:
@@ -265,14 +330,21 @@ class AttemptRunner:
             record = asyncio.run(go())
             result = result_from_record(record, ended_utc=p.stamp())
         except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
-            result = failure_result(error, ended_utc=p.stamp(), wall_s=p.monotonic() - started, treatment_kinds=kinds)
+            result = failure_result(
+                error,
+                ended_utc=p.stamp(),
+                wall_s=p.monotonic() - started,
+                treatment_kinds=kinds,
+                treatment_targets=targets,
+                sent_nothing=sent_no_request(error, backend),
+            )
             if result.outcome.defect is not None:  # the attempt keeps the class and the stack hash; the log the rest
                 defects(error, result.outcome.defect)
         result, moved = self._judge(result, record, model, key)
         mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
 
         def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
-            self._bookkeeping(model, endpoint, key, result, kinds, moved)
+            self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
             if mix is not None:
                 p.store.record_deployments(begun.id, mix)
 
@@ -285,7 +357,11 @@ class AttemptRunner:
         p = self.p
         if p.health is not None:
             health, outage = p.health.after_run()
-            if not health.ok and outage is not None:
+            if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
+                result = unverified(result, health.detail)
+                text = f"{key}: {health.detail}; nothing is scored on it ({result.outcome.infra_kind or 'set aside'})"
+                p.store.event(p.stamp(), "post_run_check_deferred", model, text)
+            elif not health.ok and outage is not None:
                 result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
                 p.health.note_discard(outage, result.input_tokens, result.output_tokens)
             elif not health.ok and not result.outcome.set_aside:
@@ -297,6 +373,7 @@ class AttemptRunner:
                 p.store.event(p.stamp(), "post_run_check_failed", model, f"{key}: {health.detail}; the outcome stands")
         if record is None:
             return result, False
+        result = self._judge_instruments(result, record, model, key)
         change = p.identities.check(model, record.transcript, p.stamp(), run_key=key)
         if change is None:
             return result, False
@@ -306,6 +383,36 @@ class AttemptRunner:
         text = "the endpoint's served identity changed during the run"
         outcome = Outcome("infrastructure", text, infra_kind=p.settings.identity_kind)
         return dataclasses.replace(result, outcome=outcome), True
+
+    def _judge_instruments(self, result: AttemptResult, record: Any, model: str, key: str) -> AttemptResult:
+        """Apply the refusal an instrument's post-run check put in the record (C31): the third way a finished attempt is
+        set aside here, after the health check, which decides first, and before the endpoint's identity.
+
+        The refusal applies to an attempt the store would score, which is what `classify` says: a cap or an answer, or
+        a fault the condition declares as its treatment, whether or not an outage flag is on it (the treatment rule is
+        checked first, C01). Such an attempt becomes infrastructure of the instrument's kind, a kind no condition can
+        have as its treatment, so it is never scored: it is run again like any infrastructure failure. The record keeps
+        what the loop saw; the result is what the store decides on, so it no longer claims the treatment the record
+        flagged. A result that still carries an `outage_kind` is then classified as an attempt an outage overlapped,
+        `outage_discarded` and not charged, as the health check's outcome would be; any other is `infra_fail` and
+        charged. Either way it is not scored and its run is tried again.
+
+        An attempt the store would not score, one set aside by the health check, an outage, or its own infrastructure
+        failure or defect, keeps its outcome and the refusal is noted.
+        """
+        p, refusal = self.p, record.instrument_refusal
+        if refusal is None:
+            return result
+        who = f"instrument {refusal['namespace']!r} refused the attempt"
+        text = f"{key}: {who}: {refusal['infra_kind']}: {refusal['detail']}"
+        scored = classify(result, result.treatment_kinds, result.treatment_targets).state == "done"
+        if not scored and (result.outage_kind is not None or result.outcome.set_aside):
+            p.store.event(p.stamp(), "instrument_refused", model, f"{text}; the outcome stands")
+            return result
+        p.store.event(p.stamp(), "instrument_refused", model, text)
+        detail = f"{who} after the run: {refusal['detail']}"
+        outcome = Outcome("infrastructure", detail, infra_kind=refusal["infra_kind"])
+        return dataclasses.replace(result, outcome=outcome, recorded_treatment=False)
 
     def _finish(
         self, begun: Any, run_dir: Path, key: str, result: AttemptResult, also: Callable[[], None] | None = None
@@ -320,11 +427,18 @@ class AttemptRunner:
         return status
 
     def _bookkeeping(
-        self, model: str, endpoint: Endpoint, key: str, result: AttemptResult, kinds: tuple[str, ...], moved: bool
+        self,
+        model: str,
+        endpoint: Endpoint,
+        key: str,
+        result: AttemptResult,
+        kinds: tuple[str, ...],
+        targets: Mapping[str, str],
+        moved: bool,
     ) -> None:
         """Count the unit's failure or success (C15) and the harness error (C10), as the result's cause says."""
         p = self.p
-        classified = classify(result, kinds)
+        classified = classify(result, kinds, targets)
         if classified.treatment:
             return  # the outage is the manipulation: it neither pauses the unit nor clears its pause
         outcome = result.outcome

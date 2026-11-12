@@ -27,6 +27,10 @@ condition that declares one, and the scheduler refuses a campaign whose health o
 `budget_hold` is no failure of anything outside the agent either, but the campaign's own decision: a request the token
 cap cannot account for would have taken the campaign past its budget, so it was not sent (`BudgetHold`, C26). It is
 set aside like infrastructure, never treatable, and costs the run no attempt.
+
+A failure may name its target, what failed, by a position label from the platform's configuration (`providers[1]`,
+`TARGET_LABEL`). A condition whose manipulation takes one target down declares the kind with that target, and only a
+failure of that target, while the run's fault injector held it down, is its treatment (`Outcome.is_treatment`).
 """
 
 from __future__ import annotations
@@ -44,6 +48,8 @@ from typing import NamedTuple
 # own time under its cap, so something other than the agent held it up (L04). tool_plane_integrity: the tool plane
 # failed the checks that it is what the condition declared (its token, its principal's privileges); not treatable.
 # budget_hold: a request was not sent because its top-up would have passed the campaign's budget (C26); not treatable.
+# post_check_unverified: the post-run health check was deferred, so the result was never verified (C11); not
+# treatable.
 CORE_KINDS = (
     "endpoint",
     "key_rejected",
@@ -53,16 +59,22 @@ CORE_KINDS = (
     "ceiling",
     "tool_plane_integrity",
     "budget_hold",
+    "post_check_unverified",
 )
 TOOL_PLANE_INTEGRITY = "tool_plane_integrity"
 BUDGET_HOLD = "budget_hold"
+POST_CHECK_UNVERIFIED = "post_check_unverified"
 # The core's kinds that no condition may declare as its treatment, and why.
 CORE_UNTREATABLE: dict[str, str] = {
     TOOL_PLANE_INTEGRITY: "a run whose tool plane failed its integrity checks says nothing about the manipulation",
     BUDGET_HOLD: "a run the budget stopped says nothing about the manipulation, only about what the campaign could pay",
+    POST_CHECK_UNVERIFIED: "a run whose post-run check verified nothing has a result nobody checked",
 }
 
 _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
+# What an infrastructure failure may name as its target: a table and a position in it, as the platform's
+# configuration orders its entries (`providers[1]`). A configured name never fits, so none can reach a record.
+TARGET_LABEL = re.compile(r"[a-z][a-z0-9_]*\[(0|[1-9][0-9]*)\]")
 _platform_kinds: dict[str, str] = {}  # process-wide: a platform registers its kinds once, when its module is imported
 _platform_untreatable: dict[str, str] = {}
 
@@ -281,24 +293,47 @@ class ContextOverflow(Exception):
         self.pattern = pattern
 
 
+def check_target(target: object) -> str | None:
+    """Return a target label when it is None or one of the form `<table>[<position>]`; raise ValueError otherwise.
+
+    The refusal never echoes the rejected value, which may well be a configured name (O12).
+    """
+    if target is not None and (not isinstance(target, str) or not TARGET_LABEL.fullmatch(target)):
+        raise ValueError("a target is a position label such as 'providers[1]', never a configured name")
+    return target
+
+
 class InfraError(RuntimeError):
     """An infrastructure failure of one of the registered kinds, with a short detail that never holds a secret.
+
+    `target` names what failed when the platform can attribute the failure, as an opaque position label from its
+    configuration (`providers[1]`), never as the name it is configured under. A condition that declares a kind with a
+    target is scored only for a failure of that target while the run's fault injector held it down (`Outcome`).
 
     `billed` is the (input, output) counts of a reply the endpoint answered, and so billed, before the failure was found
     in it (a 200 without choices, say): the recording tells the attempt's spend guard of it (C26, C27). None when no
     reply came back.
     """
 
-    def __init__(self, kind: str, detail: str, *, billed: tuple[int | None, int | None] | None = None):
+    def __init__(
+        self,
+        kind: str,
+        detail: str,
+        *,
+        target: str | None = None,
+        billed: tuple[int | None, int | None] | None = None,
+    ):
         known = infra_kinds()  # one view, for the test and the message alike
         if kind not in known:
             raise ValueError(
                 f"unknown infrastructure kind {kind!r}; known kinds: {', '.join(known)} "
                 "(a platform adds its own with register_infra_kind)"
             )
-        super().__init__(f"{kind}: {detail}")
+        check_target(target)
+        super().__init__(f"{kind}: {detail}" if target is None else f"{kind} ({target}): {detail}")
         self.kind = kind
         self.detail = detail
+        self.target = target
         self.billed = billed
 
 
@@ -311,3 +346,12 @@ class BudgetHold(InfraError):
 
     def __init__(self, detail: str):
         super().__init__(BUDGET_HOLD, detail)
+
+
+class FirstTurnRefusal(InfraError):
+    """An instrument refused the attempt at the agent's first turn (C31), before the loop sent its first request.
+
+    An infrastructure failure of the kind the instrument refused with, which is never one a condition can declare as
+    its treatment. Raised by `first_turn_instruments`; the scheduler reads it as the sign that the attempt sent
+    nothing, so it costs no tokens, unless its backend says it sent a request after all.
+    """
