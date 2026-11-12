@@ -10,6 +10,7 @@ from expcore_onedata import health
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.config import PlatformConfig, load_platform
 from expcore_onedata.consistency import WaitTimeout
+from expcore_onedata.day0.outage_driver import OutageError
 from expcore_onedata.federation import FederationUnreadable, PinRefused
 from expcore_onedata.pin import PinError
 from expcore_onedata.provision import NotPlaced, ProvisionError, Refused
@@ -67,6 +68,7 @@ LAYER_EXCEPTIONS = (
     NotPlaced,
     WaitTimeout,
     Unreadable,
+    OutageError,
 )
 
 

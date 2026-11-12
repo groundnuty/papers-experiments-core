@@ -9,7 +9,9 @@ from live_support import (
     require_cleaned,
     require_every_provider_refused,
     require_passed,
+    require_restored,
 )
+from outage_support import GAMMA_ID, SERVICE
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
@@ -54,6 +56,47 @@ def test_a_cleanup_result_that_is_absent_or_not_true_is_not_a_cleanup():
             require_cleaned(entry(True, cleanup_verified=value))
 
 
+def test_o27_a_provider_that_was_not_shown_restored_does_not_pass_the_live_outage_test():
+    """O27: the outage check's pass must carry a restore verified by a changed identity and by REST answering again."""
+    good = {"verified": True, "how": "restored", "rest_answers_again": True}
+    require_restored(entry(True, restore=good))
+    with pytest.raises(AssertionError, match="no restore"):
+        require_restored(entry(True))
+    for bad in (
+        {**good, "verified": False},
+        {**good, "verified": None},
+        {**good, "how": "never_seen_down"},
+        {**good, "rest_answers_again": False},
+        {key: value for key, value in good.items() if key != "rest_answers_again"},
+    ):
+        with pytest.raises(AssertionError, match=r"restore|never down|answer again"):
+            require_restored(entry(True, restore=bad))
+
+
+def with_outage(data):
+    with_placement(data)
+    data["providers"]["gamma"] = {"url": "https://gamma.test", "id": GAMMA_ID}
+    data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "beta"}
+    data["faults"] = {"sanctioned": True, "compose_file": "compose.yaml", "services": {"alpha": SERVICE}}
+
+
+def test_o27_the_outage_check_names_what_the_platform_file_lacks(tmp_path, fake):
+    """O27: no sanctioned [faults] table and a data provider that is the local one are each named; a platform with
+    three providers, a sanction and a data provider apart from the local one has nothing missing."""
+    fake.add_provider(GAMMA_ID, "gamma.test")
+    ctx = context(tmp_path / "one", fake, both_supporting)
+    ctx.allow_faults = True
+    assert "sanctioned = true" in prerequisite_missing("provider_outage", ctx)
+    ctx = context(tmp_path / "two", fake, with_outage)
+    ctx.allow_faults = True
+    assert prerequisite_missing("provider_outage", ctx) is None
+    ctx.allow_faults = False
+    assert "EXPCORE_LIVE_FAULTS=1" in prerequisite_missing("provider_outage", ctx)
+    ctx = context(tmp_path / "three", fake, lambda data: (with_outage(data), data["support"].update(local="alpha")))
+    ctx.allow_faults = True
+    assert "local provider" in prerequisite_missing("provider_outage", ctx)
+
+
 def test_a_read_only_check_that_ran_on_no_provider_or_left_something_behind_does_not_pass():
     """Live: a pass names the providers it ran on, each refused, and none with a scratch entry left."""
     require_every_provider_refused(entry(True, providers={"p": {"enforced": True, "status": 403}}))
@@ -83,7 +126,7 @@ def test_the_round_trip_names_what_the_platform_file_lacks(tmp_path, fake):
     assert prerequisite_missing("read_only", ctx) is None
     ctx.provider_ids = {}
     assert "id of the data provider" in prerequisite_missing("round_trip", ctx)
-    with pytest.raises(ValueError, match="read_only and round_trip"):
+    with pytest.raises(ValueError, match="read_only, round_trip and provider_outage"):
         prerequisite_missing("listing", ctx)
 
 

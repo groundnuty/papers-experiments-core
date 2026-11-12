@@ -11,19 +11,27 @@ from expcore_onedata.client import OnezoneClient, tcp_connect
 from expcore_onedata.config import load_platform
 from expcore_onedata.day0 import checks as _checks  # noqa: F401 -- importing registers the checks
 from expcore_onedata.day0 import mutating as _mutating  # noqa: F401
-from expcore_onedata.day0.registry import REGISTRY, Context, Result, failed
+from expcore_onedata.day0 import outage as _outage  # noqa: F401
+from expcore_onedata.day0.outage_driver import ServiceDriver, compose_services, load_outage_settings
+from expcore_onedata.day0.registry import REGISTRY, Context, MountAccess, Result, failed
 from expcore_onedata.day0.report import Entry, build_report, stamp, write_report
 from expcore_onedata.provision import resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
 from expcore_onedata.tokens import TokenIssuer
 
 MUTATE_VARIABLE = "EXPCORE_LIVE_MUTATE"
+FAULTS_VARIABLE = "EXPCORE_LIVE_FAULTS"
 EXIT_PASS, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE = 0, 1, 3, 2
 
 
 def mutation_allowed(environ: Mapping[str, str] | None = None) -> bool:
     """The caller has allowed the checks that change state when EXPCORE_LIVE_MUTATE is exactly "1"."""
     return (os.environ if environ is None else environ).get(MUTATE_VARIABLE) == "1"
+
+
+def faults_allowed(environ: Mapping[str, str] | None = None) -> bool:
+    """The caller has allowed taking a provider down when EXPCORE_LIVE_FAULTS is exactly "1" (O10)."""
+    return (os.environ if environ is None else environ).get(FAULTS_VARIABLE) == "1"
 
 
 def build_context(
@@ -39,16 +47,25 @@ def build_context(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.time,
+    allow_faults: bool | None = None,
+    driver: ServiceDriver | None = None,
+    mount: MountAccess | None = None,
+    outage_bound_s: float = 60.0,
 ) -> Context:
     """Load the target configuration, which must be named, and build the client and the issuer for it.
 
     The configuration is validated with its secrets present. `[placement]` is read when the file has it. A client may be
     handed in (a test's fake); otherwise one is built that talks to the configured federation.
+
+    A platform.toml with a `[faults]` table gives the outage check its sanction and its services, and the Compose driver
+    that stops and starts them unless a `driver` is handed in. Taking a provider down also needs `allow_faults`
+    (`EXPCORE_LIVE_FAULTS=1` by default), and a mount of the space is read only through the `mount` a run hands in.
     """
     path = Path(platform)
     config = load_platform(path, environ=environ)
     placement = load_placement(path, config) if "placement" in load_toml(path) else None
     client = client or OnezoneClient(config, environ=environ)
+    settings = load_outage_settings(path, config) if "faults" in load_toml(path) else None
     ctx = Context(
         config=config,
         client=client,
@@ -62,6 +79,11 @@ def build_context(
         clock=clock,
         sleep=sleep,
         now=now,
+        allow_faults=faults_allowed(environ) if allow_faults is None else allow_faults,
+        outage_settings=settings,
+        outage_driver=driver or (compose_services(settings) if settings else None),
+        mount=mount,
+        outage_bound_s=outage_bound_s,
     )
     ctx.provider_ids = resolve_provider_ids(config)
     return ctx

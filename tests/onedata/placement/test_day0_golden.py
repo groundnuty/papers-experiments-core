@@ -13,6 +13,9 @@ from expcore_onedata.day0.runner import run
 from expcore_onedata.testing import BETA_ID, ERRORS_LEGACY, with_placement, write_platform
 
 GOLDEN = Path(__file__).resolve().parents[2] / "data" / "day0-one-space-report.json"
+# The checks the golden file was written with. A check added since (the outage check, O27) is not in it, so it is not
+# run here: the golden pins what these seven report, and the later checks have tests of their own.
+GOLDEN_CHECKS = ["reachability", "health", "tokens", "content_type", "listing", "read_only", "round_trip"]
 MACHINE_BOUND = ("platform_file_sha256",)  # the platform file names this interpreter's path, so its hash is the host's
 
 
@@ -39,6 +42,7 @@ def test_the_one_space_report_is_byte_identical_to_the_one_written_before_severa
         sleep=ticker.sleep,
         clock=ticker.clock,
         allow_mutation=True,
+        names=GOLDEN_CHECKS,
     )
     report = json.loads(json_path.read_text(encoding="utf-8"))
     for key in MACHINE_BOUND:

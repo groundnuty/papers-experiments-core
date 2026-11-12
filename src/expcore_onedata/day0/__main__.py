@@ -3,7 +3,8 @@
 
 The target must be named: there is no default configuration and nothing is read from the environment to find one. The
 report (JSON and Markdown) goes into the directory the caller names. The checks that change state run only with
-`EXPCORE_LIVE_MUTATE=1` in the environment; without it they report unknown and send nothing.
+`EXPCORE_LIVE_MUTATE=1` in the environment; without it they report unknown and send nothing. The outage check, which
+takes a provider down, also needs `EXPCORE_LIVE_FAULTS=1` and `sanctioned = true` in `[faults]` of platform.toml.
 
 Exit status: 0 every check passed, 1 a check failed, 3 nothing failed but something could not be measured, 2 a usage
 or configuration error.
@@ -24,6 +25,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("platform", nargs="?", help="the platform.toml of the deployment to check (required to run)")
     parser.add_argument("--out", help="the directory the dated report is written to (required to run)")
     parser.add_argument("--only", action="append", metavar="CHECK", help="run only this check; repeatable")
+    parser.add_argument(
+        "--outage-bound-s",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="the longest the outage check waits for one answer while a provider is down (default 60)",
+    )
     parser.add_argument("--list", action="store_true", help="list the registered checks and exit")
     args = parser.parse_args(argv)
     if args.list:
@@ -35,7 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("error: name the platform.toml to check and the directory for the report (--out)", file=sys.stderr)
         return EXIT_USAGE
     try:
-        code, json_path, md_path = run(args.platform, args.out, names=args.only)
+        code, json_path, md_path = run(args.platform, args.out, names=args.only, outage_bound_s=args.outage_bound_s)
     except ConfigError as error:
         print(f"error: {error}", file=sys.stderr)
         return EXIT_USAGE

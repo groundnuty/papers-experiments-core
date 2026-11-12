@@ -17,10 +17,11 @@ failed before unknown before passed, and each space is named by its position, `s
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import PlatformConfig, StudySpace
+from expcore_onedata.day0.outage_driver import OutageSettings, ServiceDriver
 from expcore_onedata.day0.report import status
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import Placement
@@ -51,9 +52,31 @@ def unknown(summary: str, **facts: Any) -> Result:
     return Result(None, summary, facts)
 
 
+class MountAccess(Protocol):
+    """Reads through the mount of a space, as the agent sees it: a mounting client on the agent's local provider.
+
+    Day-0 starts no container, so a run that declares a mount hands one in (the live run's is a mounting sidecar and an
+    agent container; a test's is a function). Both raise `TimeoutError` when the mount does not answer within
+    `timeout_s`, and any other `OSError` (with its errno) when it answers with an error."""
+
+    def read(self, space: StudySpace, path: str, *, timeout_s: float) -> bytes:
+        """Return the content of a file, `path` relative to the space's root."""
+        ...
+
+    def listdir(self, space: StudySpace, path: str, *, timeout_s: float) -> list[str]:
+        """Return the names in a directory, `path` relative to the space's root."""
+        ...
+
+
 @dataclass
 class Context:
-    """Everything a check may use: the loaded configuration, the client, and the permission to change state."""
+    """Everything a check may use: the loaded configuration, the client, and the permission to change state.
+
+    Taking a provider down is a second permission, `allow_faults` (`EXPCORE_LIVE_FAULTS=1`), beside `allow_mutation`
+    and beside `sanctioned = true` in `[faults]` of platform.toml (`outage_settings`). `outage_driver` is the
+    deployment's driver for it (Compose by default), `mount` a reader of the mount when a run has one, and
+    `outage_bound_s` the longest a read or a call of the outage check waits for an answer.
+    """
 
     config: PlatformConfig
     client: OnezoneClient
@@ -68,6 +91,11 @@ class Context:
     sleep: Callable[[float], None] = lambda seconds: None
     now: Callable[[], float] = lambda: 0.0
     provider_ids: dict[str, str] = field(default_factory=dict)
+    allow_faults: bool = False
+    outage_settings: OutageSettings | None = None
+    outage_driver: ServiceDriver | None = None
+    mount: MountAccess | None = None
+    outage_bound_s: float = 60.0
     _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space
 
     def provisioner(self, space: str | None = None) -> Provisioner:
@@ -92,6 +120,13 @@ class Context:
                 sleep=self.sleep,
             )
         return self._provisioners[entry.label]
+
+
+def holder_of(ctx: Context, entry: StudySpace) -> str | None:
+    """A space's data provider, as its provisioner takes it: a `[[spaces]]` entry's own, else `[placement] holder`."""
+    if ctx.config.spaces_table:
+        return entry.holder
+    return ctx.placement.settings.holder if ctx.placement else None
 
 
 def worst(verdicts: Iterable[bool | None]) -> bool | None:

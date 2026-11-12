@@ -6,6 +6,7 @@ import pytest
 
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
+from expcore_onedata.day0.outage import prerequisite as outage_prerequisite
 from expcore_onedata.day0.registry import Context
 from expcore_onedata.day0.report import Entry
 from expcore_onedata.tokencheck import PrivilegesMismatch
@@ -52,7 +53,9 @@ def prerequisite_missing(name: str, ctx: Context) -> str | None:
         if any(p not in ctx.provider_ids for p in (holder, receiver)):
             return "the round_trip check needs the id of the data provider and of the receiving provider"
         return None
-    raise ValueError("this helper knows the read_only and round_trip checks only")
+    if name == "provider_outage":
+        return outage_prerequisite(ctx)
+    raise ValueError("this helper knows the read_only, round_trip and provider_outage checks only")
 
 
 def require_passed(entry: Entry) -> None:
@@ -69,6 +72,16 @@ def require_every_provider_refused(entry: Entry) -> None:
         f"the {entry.name} check shows a write not refused"
     )
     assert all(row.get("cleaned") is not False for row in rows.values()), f"the {entry.name} check left a scratch entry"
+
+
+def require_restored(entry: Entry) -> None:
+    """Fail unless the check shows the provider back: its restore verified by a changed identity and by its REST
+    answering again. A pass that does not say so is no pass."""
+    restore = entry.facts.get("restore")
+    assert isinstance(restore, Mapping), f"the {entry.name} check reports no restore"
+    assert restore.get("verified") is True, f"the {entry.name} check did not verify the restore"
+    assert restore.get("how") == "restored", f"the {entry.name} check found the provider never down"
+    assert restore.get("rest_answers_again") is True, f"the {entry.name} check did not see the provider answer again"
 
 
 def require_cleaned(entry: Entry) -> None:
