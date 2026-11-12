@@ -113,9 +113,8 @@ def test_c24_a_model_without_tiers_keeps_its_price_and_its_fingerprint():
         api_id="vendor/flat-1",
         status="frozen",
         base_url="https://llm.example.invalid/v1",
-        key_env="TEST_FLAT_KEY",
         context_tokens=128000,
         price=Price(0.5, 2.5, None, 0.05),
-    )
-    before = "8bc96d05e697f299fe2e848ac8ef915dadef06b1d8471d9656dc053da4678af2"  # computed before tiers existed
+    )  # no key location: where a key lives enters as a placeholder (K13), which gave a keyed entry a new digest
+    before = "b7d61f77c0f53d147d195b2da109f4b157a950beb20236cc329be87b7c3f61bf"  # computed before tiers existed
     assert model_digest(spec) == before  # the entry's digest in the fingerprint; it declares no accepted fingerprints

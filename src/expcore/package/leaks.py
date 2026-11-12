@@ -2,7 +2,8 @@
 """The leak checks a package's files pass: the study-token scan, and for an anonymised package its terms and identity.
 
 `scan_tokens` is the study-token scanner run over every stream of every file, under every view (`views`), with the
-hashes of the names private everywhere. `findings_in` adds what an anonymised package must not hold either.
+hashes of the names private everywhere. `findings_in` adds a key location models.toml still holds, which no package
+may (`config.key_locations`), and what an anonymised package must not hold either.
 """
 
 import importlib.resources
@@ -12,13 +13,16 @@ from collections.abc import Collection, Mapping
 from pathlib import Path
 
 import expcore
+from expcore.config.key_locations import NO_LOCATIONS, KeyFinders, location_findings
 from expcore.package.anonymise import Anonymisation, find_terms, holds_term
 from expcore.package.identity import find_identity
-from expcore.package.spec import PackageError
+from expcore.package.keycopies import Walk, walk
+from expcore.package.spec import WHEELS_DIR, PackageError
 from expcore.package.views import JOINED, PARSED, Stream, streams, views
 from expcore.provenance.hashfile import Hashes, parse_hash_file
 from expcore.provenance.redact import Redactor
 from expcore.provenance.scanner import Finding, scan_source
+from expcore.study.config import MODELS_FILE
 
 HASHES_NAME = "study_tokens.sha256"
 PRIVATE_NAME = "a private name"
@@ -158,9 +162,11 @@ def findings_in(
     *,
     generated: Collection[str] = frozenset(),
     redactor: Redactor | None = None,
+    locations: KeyFinders = NO_LOCATIONS,
 ) -> list[str]:
-    """Every leak the checks find: study tokens, and for an anonymised package its terms and its identity, each
-    naming a path through the one `redactor`.
+    """Every leak the checks find: a key location left in models.toml, or one of `locations` (what finds each key
+    location the study's models declare) anywhere, a declared key file itself included (K13); study tokens; and for an
+    anonymised package its terms and its identity, each naming a path through the one `redactor`.
 
     The files in `generated` are the build's own (SHA256SUMS, PACKAGE.json, ...), which list the package's paths. A
     path whose own finding reports it is not reported again through them: they are read with each exact mention of it
@@ -170,11 +176,99 @@ def findings_in(
         redactor = Redactor(tokens, (lambda text: holds_term(terms, text)) if terms is not None else None)
     reported = reported_paths(files, tokens, terms, opaque)
     files = {path: without_paths(data, reported) if path in generated else data for path, data in files.items()}
-    findings = scan_tokens(files, tokens, opaque=opaque, redactor=redactor)
+    findings = (
+        [f"{MODELS_FILE}: {found}" for found in location_findings(files[MODELS_FILE])] if MODELS_FILE in files else []
+    )
+    findings += find_locations(files, locations, opaque=opaque, redactor=redactor)
+    findings += scan_tokens(files, tokens, opaque=opaque, redactor=redactor)
     if terms is not None:
         findings += find_terms(files, terms, opaque=opaque, redactor=redactor)
         findings += find_identity(files, commits, urls, opaque=opaque, redactor=redactor)
     return findings
+
+
+FOUND_LOCATION = "a key location the study's models.toml declares, which no package holds"
+FOUND_COPY = (
+    "a copy of a key file the study's models.toml declares, which no package holds, was found at this path and must be "
+    "removed"
+)
+
+
+def path_holds(label: str, locations: KeyFinders) -> bool:
+    """Whether a stream's path holds a key location, or is a declared key file itself (`KeyFinders.names_file`)."""
+    return locations.names_file(label) or any(found.search(label) for found in locations.patterns)
+
+
+UNCHECKED = "could not be checked for a copy of the key file of a model the study's models.toml declares"
+UNCHECKED_FIX = "leave it out, or package what it holds in a form the build can open"
+
+
+def find_copies(
+    files: Mapping[str, bytes],
+    locations: KeyFinders,
+    *,
+    unopened: Collection[str] = frozenset(),
+    redactor: Redactor | None = None,
+) -> list[str]:
+    """One finding per file, and per stream inside it at any depth (an archive member, a decompressed stream, a
+    database value, a decoded run), that is a copy of a declared key file under any name (`FOUND_COPY`), and one per
+    stream the walk could not finish (`UNCHECKED`): each file is walked whole on its own (`keycopies.walk`), whatever
+    the content scanner refuses in it and whether it is attested or not. A file in `unopened` (a vendored wheel, whose
+    members `wheelscan` walks) is compared by its own bytes only. Each finding names its path, hidden when it holds a
+    key location; none prints a digest or says how to attest it. Nothing clears a copy: it is removed, never attested
+    in `[[opaque]]`."""
+    if not locations.digests:
+        return []
+    redactor = Redactor() if redactor is None else redactor
+    findings: set[str] = set()
+    for name in sorted(files):
+        if name in unopened:
+            held = locations.is_key_file(files[name]) or locations.holds_key_file(files[name])
+            found = Walk(copies=[name] if held else [])
+        else:
+            found = walk(name, files[name], locations)
+        shown = {label: redactor.name(label, hide=path_holds(label, locations)) for label in found.labels()}
+        findings |= {f"{shown[label]}: {FOUND_COPY}" for label in found.copies}
+        findings |= {f"{shown[label]}: {UNCHECKED}: {why}; {UNCHECKED_FIX}" for label, why in found.unchecked}
+    return sorted(findings)
+
+
+def find_locations(
+    files: Mapping[str, bytes],
+    locations: KeyFinders,
+    *,
+    opaque: Collection[str] = frozenset(),
+    redactor: Redactor | None = None,
+    copies: bool = True,
+) -> list[str]:
+    """One finding per stream and line that holds a key location (`key_locations.location_finders`), never the value:
+    every stream of every file, under every view, as the token check reads it; and the path of each stream
+    (`path_holds`), shown by its hidden name when it holds one. Every file, and every stream inside one at any depth,
+    that is a copy of a declared key file under any name, by size and SHA-256, is one finding naming its path, and so
+    is every stream that walk could not finish (`copies`, `find_copies`). The files in `opaque` were attested by hash
+    and are not read, but a copy of a key file is not attested away: each is walked for one like any file, except a
+    vendored wheel, which is compared by its own bytes (`wheelscan` walks its members). Empty when nothing is looked
+    for."""
+    if not locations:
+        return []
+    redactor = Redactor() if redactor is None else redactor
+    findings: set[str] = set()
+    for name in sorted(files):
+        if name in opaque:  # attested: not read
+            continue
+        for stream in streams(name, files[name])[0]:
+            held = path_holds(stream.label, locations)
+            shown = redactor.name(stream.label, hide=held)
+            if held:
+                findings.add(f"{shown}: the path holds {FOUND_LOCATION}")
+            for _, text in views(stream):
+                found_at = (m.start() for found in locations.patterns for m in found.finditer(text))
+                lines = {text.count("\n", 0, start) + 1 for start in found_at}
+                findings |= {f"{shown}:{line}: {FOUND_LOCATION}" for line in lines}
+    if copies:
+        wheels = {name for name in opaque if name.startswith(f"{WHEELS_DIR}/")}
+        findings.update(find_copies(files, locations, unopened=wheels, redactor=redactor))
+    return sorted(findings)
 
 
 def reported_paths(

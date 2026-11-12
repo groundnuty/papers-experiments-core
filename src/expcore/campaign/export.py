@@ -275,7 +275,7 @@ def _admission(attempt: Any) -> str | None:
     return attempt["admission"] if "admission" in attempt.keys() else None  # noqa: SIM118
 
 
-def _none_last(item: tuple[tuple, Any]) -> tuple:
+def none_last(item: tuple[tuple, Any]) -> tuple:
     """Order the cells of a table by their key, with a missing part (None) after every present one.
 
     A kind can be missing on an attempt a database recorded before the outage kind had its own column and that no
@@ -326,7 +326,7 @@ def _discarded_usage(identities: dict[str, dict], attempts: dict[str, list[Any]]
                 cell[name] += attempt[name] or 0
     return [
         {"condition": condition, "model": model, "state": state, **cell}
-        for (condition, model, state), cell in sorted(cells.items(), key=_none_last)
+        for (condition, model, state), cell in sorted(cells.items(), key=none_last)
     ]
 
 
@@ -348,7 +348,7 @@ def _retries_by_kind(identities: dict[str, dict], attempts: dict[str, list[Any]]
                 ] += 1
     return [
         {"condition": condition, "model": model, "kind": kind, "state": state, "charged": charged, "attempts": n}
-        for (condition, model, kind, state, charged), n in sorted(counts.items(), key=_none_last)
+        for (condition, model, kind, state, charged), n in sorted(counts.items(), key=none_last)
     ]
 
 
@@ -364,7 +364,7 @@ def _budget_holds(identities: dict[str, dict], attempts: dict[str, list[Any]]) -
         counts[(who["condition"], who["factors"]["model"])] += sum(a["infra_kind"] == BUDGET_HOLD for a in tried)
     return [
         {"condition": condition, "model": model, "attempts": n}
-        for (condition, model), n in sorted(counts.items(), key=_none_last)
+        for (condition, model), n in sorted(counts.items(), key=none_last)
     ]
 
 
@@ -403,7 +403,7 @@ def _infrastructure_by_condition(
             cells.setdefault((condition, _kind_of(attempt)), blank())[field] += 1
     return [
         {"condition": condition, "kind": kind, "declared_treatment": kind in declared[condition], **counts}
-        for (condition, kind), counts in sorted(cells.items(), key=_none_last)
+        for (condition, kind), counts in sorted(cells.items(), key=none_last)
     ]
 
 
