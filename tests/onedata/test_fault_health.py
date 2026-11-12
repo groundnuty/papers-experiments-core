@@ -10,7 +10,6 @@ import time
 
 from campaign_support import keys_under, planned_store
 from fault_support import LOCAL_TARGET, FakeServices, faults_table, injector_for, write_faults
-from platform_support import NOW, write_platform
 
 from expcore.campaign.healthgate import FOUND, GO, HealthGate
 from expcore_onedata.admission import FederationLock
@@ -18,6 +17,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokens import TokenIssuer
 

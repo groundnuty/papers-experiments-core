@@ -30,7 +30,16 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
     require_passed,
 )
 
-from expcore_onedata.client import API_PROVIDER, AUTH_HEADER, OnezoneClient, PlatformError  # noqa: E402
+from expcore_onedata import consistency  # noqa: E402
+from expcore_onedata.client import (  # noqa: E402
+    API_PROVIDER,
+    AUTH_HEADER,
+    NotSent,
+    OnezoneClient,
+    PlatformError,
+    _error_fields,
+    answered_absent,
+)
 from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E402
 from expcore_onedata.health import PlatformHealth  # noqa: E402
@@ -92,11 +101,67 @@ def test_the_study_space_resolves_to_its_declared_name(config, client):
     assert client.space_name(config.space.id) == config.space.name  # the name the mutation gate checks the prefixes of
 
 
-def test_a_file_resolves_to_its_space_through_its_path_attribute(config, client):
+def nested_file(client, provider, root):
+    """The first regular file two levels below the space root, found by listing: its id, its names from the root and
+    the ids of the directories above it. Skips when the space holds none."""
+    params = {"limit": 100, "attribute": ["name", "file_id", "type"]}
+    for entry in client.get(f"/data/{root}/children", provider=provider, params=params)["children"]:
+        if entry["type"] != "DIR":
+            continue
+        inner = client.get(f"/data/{entry['file_id']}/children", provider=provider, params=params)["children"]
+        found = next((child for child in inner if child["type"] == "REG"), None)
+        if found is not None:
+            return found["file_id"], [entry["name"], found["name"]], [root, entry["file_id"]]
+    pytest.skip("the space holds no regular file two levels below its root")
+
+
+def test_a_nested_file_resolves_to_its_space_by_its_parent_links(config, client):
+    """O09: Onedata 25.0 has no path attribute, so the gate walks a file's `parent_id` links up to the root of the
+    configured space: the root's is null, each other's names the directory above it, the root is the same file on
+    every supporting provider, and a file two levels down resolves to the configured space and its name on each."""
     # covers: GET /data/{id}
+    roots = {p: client.get(f"/spaces/{config.space.id}", provider=p)["fileId"] for p in config.support.providers}
+    assert len(set(roots.values())) == 1
     provider = config.support.providers[0]
-    root = client.get(f"/spaces/{config.space.id}", provider=provider)["fileId"]
-    assert client.file_space_name(root, provider) == config.space.name  # the name a mutation by file id is gated on
+    root = roots[provider]
+    file_id, _, above = nested_file(client, provider, root)
+    link = {"attribute": "parent_id"}
+    assert client.get(f"/data/{root}", provider=provider, params=link) == {"parent_id": None}
+    assert client.get(f"/data/{file_id}", provider=provider, params=link) == {"parent_id": above[-1]}
+    assert client.get(f"/data/{above[-1]}", provider=provider, params=link) == {"parent_id": root}
+    for each in config.support.providers:
+        fresh = OnezoneClient(config)  # nothing kept from another provider's walk
+        try:
+            assert fresh.file_space_id(file_id, each) == config.space.id
+            assert fresh.file_space_name(file_id, each) == config.space.name  # the name a mutation is gated on
+        finally:
+            fresh.close()
+
+
+def test_the_pre_campaign_content_check_measures_a_nested_file_and_passes(config, tmp_path):
+    """O05, O09: the check a campaign with a REST data path runs before its first run, on a file two levels down, read
+    through the gate's walk on a client that has walked nothing yet: it measures a type, and it is the one the data
+    gate streams on. The federation's platform.toml has no [sandbox], so the test adds one with a REST level."""
+    import dataclasses
+
+    from sandbox_support import sandbox_data
+
+    from expcore.config.loading import Section
+    from expcore_onedata.precampaign import measure_content_type
+    from expcore_onedata.sandbox.settings import load_sandbox
+
+    fresh = OnezoneClient(config)
+    try:
+        local = config.support.local
+        root = fresh.get(f"/spaces/{config.space.id}", provider=local)["fileId"]
+        _, names, _ = nested_file(fresh, local, root)
+        table = {**sandbox_data(), "data_paths": {"via-rest": "rest"}, "content_check_file": "/".join(names)}
+        sandbox = load_sandbox(Section(table, tmp_path / "platform.toml", "[sandbox]"), tmp_path, tls=config.tls)
+        verdict = measure_content_type(dataclasses.replace(config, sandbox=sandbox), fresh)
+    finally:
+        fresh.close()
+    assert verdict.measured, verdict.detail
+    assert verdict.ok, verdict.detail
 
 
 def test_discovery_finds_the_space_and_the_declared_local_provider(config, issuer, client):
@@ -118,6 +183,15 @@ def test_the_health_check_reads_the_declared_support_set(config, client, issuer)
     assert result.ok, result.detail
 
 
+def lookup_absent(answer: httpx.Response) -> bool:
+    """Whether a provider's raw answer says the entry is not there, read as the client reads absence
+    (`answered_absent`): a 404, or Onedata 25.0's 400 posix enoent. Any other answer is not absence."""
+    if answer.status_code < 400:
+        return False
+    code, errno = _error_fields(answer)
+    return answered_absent(PlatformError("the lookup", status=answer.status_code, code=code, errno=errno))
+
+
 def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_streams(config, issuer):
     """O05: the data gate streams only a 200 or 206 of a file's content with the data content type, and buffers every
     other answer up to 4 MiB (gateboundary.streams). Read a provisioned file whole and by range through the provider's
@@ -129,8 +203,14 @@ def test_a_files_content_whole_and_by_range_comes_with_the_type_the_data_gate_st
         )
     token = issuer.mint(data_path_spec(config.space.id), service_user(config), ceiling_s=CEILING_S).reveal()
     base, headers = config.local_provider.url + API_PROVIDER, {AUTH_HEADER: token}
-    with httpx.Client(timeout=120) as http:
+    # The platform's one [tls], as every client of the federation takes it: a federation's own CA, or the defaults.
+    with httpx.Client(timeout=120, verify=config.tls.client_verify()) as http:
         found = http.post(f"{base}/lookup-file-id/{config.space.name}/{CONTENT_PATH.strip('/')}", headers=headers)
+        if lookup_absent(found):  # unknown, never a pass or a failure of the platform
+            pytest.skip(
+                "EXPCORE_LIVE_CONTENT_PATH names a file the space does not hold: a space declared baseline = false "
+                "holds none, so set it only where the file was provisioned"
+            )
         assert found.status_code == 200
         content = f"{base}/data/{found.json()['fileId']}/content"
         whole = http.get(content, headers=headers)
@@ -153,7 +233,9 @@ def test_each_condition_mints_and_examines_its_tool_server_token(index, config, 
 
 @SLOW
 def test_a_token_stops_working_when_its_lifetime_ends(config, client):
-    """Tokens are not revoked; they expire. Mint with a minimal lifetime, wait it out, expect a refusal (401 or 403)."""
+    """Tokens are not revoked; they expire. Mint with a minimal lifetime, wait it out, expect a refusal: 401 or 403, or
+    the 400 `tokenCaveatUnverified` with which Onedata 25.0 answers the scope inference of a token past its time
+    caveat (seen on the Compose federation of deploy/compose-federation, 10 Nov 2026)."""
     user = service_user(config)
     caveats = CaveatSpec(config.space.id, readonly=True, interface="rest").caveats(int(time.time()) + EXPIRY_S)
     value = client.mint_own_token(user, caveats)
@@ -161,7 +243,8 @@ def test_a_token_stops_working_when_its_lifetime_ends(config, client):
     time.sleep(EXPIRY_S + 5)
     with pytest.raises(PlatformError) as refused:
         read_space(client, value, config.space.id)
-    assert refused.value.status in (401, 403)
+    answer = (refused.value.status, refused.value.code)
+    assert answer[0] in (401, 403) or answer == (400, "tokenCaveatUnverified")
 
 
 # -- step 4b2: placement, probes and day-0 checks ----------------------------------------------------------------------
@@ -190,9 +273,26 @@ def test_the_read_only_day0_checks_do_not_fail_on_the_real_deployment(day0):
     assert not failures, failures
 
 
+def test_the_space_roots_distribution_gives_each_supporting_providers_physical_size(day0, tmp_path):
+    """O08: the reset's occupancy stage reads the space root's distribution on the data provider: every supporting
+    provider has a physical size there, a whole number of bytes, or the reading is unknown and the test fails (a space
+    without directory statistics cannot pass the reset). Read-only."""
+    # covers: GET /data/{id}/distribution
+    from expcore_onedata.occupancy import physical_sizes
+    from expcore_onedata.provision import Provisioner
+
+    if day0.placement is None:
+        pytest.skip("the occupancy check needs a [placement] table, which platform.toml does not have")
+    provisioner = Provisioner(
+        day0.client, day0.config, day0.placement.settings, provider_ids=day0.provider_ids, log=tmp_path / "log.jsonl"
+    )
+    sizes = physical_sizes(provisioner, day0.config.support.providers)
+    assert set(sizes) >= set(day0.config.support.providers)
+    assert all(isinstance(size, int) and size >= 0 for size in sizes.values())
+
+
 def test_a_real_block_map_has_the_documented_shape(day0, client, config):
     """The distribution answer parses; a regular file is found by listing the first supporting provider's root."""
-    from expcore_onedata import consistency
     from expcore_onedata.placement import provider_blocks
 
     provider = config.support.providers[0]
@@ -277,6 +377,202 @@ def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name
     else:
         require_every_provider_refused(entry)
 
+
+# -- the reset's calls (issue #118) -----------------------------------------------------------------------------------
+# Each makes scratch files under the configured prefixes, acts on them alone and tears them down: EXPCORE_LIVE_MUTATE=1.
+# The last runs a whole reset of the space, which removes every QoS requirement and cancels every running transfer in
+# it, so it needs EXPCORE_LIVE_RESET=1 as well: never set it on a federation another run is using.
+
+RESET = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_RESET") != "1",
+    reason="EXPCORE_LIVE_RESET=1 is not set; this test resets the whole configured space",
+)
+
+
+@pytest.fixture
+def scratch(day0, tmp_path):
+    """A provisioner with a scratch directory of two small files, the provider they are replicated to, and their
+    teardown afterwards; skipped when platform.toml has no [placement] or no provider besides the data provider."""
+    from expcore_onedata.provision import Provisioner
+
+    missing = prerequisite_missing("round_trip", day0)
+    if missing is not None:
+        pytest.skip(missing)
+    holder = day0.placement.settings.holder
+    receiver = next(p for p in day0.config.support.providers if p != holder)
+    provisioner = Provisioner(
+        day0.client, day0.config, day0.placement.settings, provider_ids=day0.provider_ids, log=tmp_path / "log.jsonl"
+    )
+    directory = f"expcore-live-reset-{int(time.time())}"
+    ids = [provisioner.put_file(f"{directory}/part-{i}.bin", bytes(range(256)) * 4) for i in range(2)]
+    try:
+        yield provisioner, receiver, directory, ids
+    finally:
+        require_torn_down(provisioner.teardown())
+
+
+def require_torn_down(report):
+    assert report.ok, f"the scratch files were not all removed: {len(report.left)} left"
+
+
+@MUTATE
+def test_a_directory_eviction_covers_every_file_under_it(scratch):
+    """O01: a scratch directory's two files, replicated to a provider, leave it with one eviction of the directory,
+    and both block maps then show nothing held there (`eviction.evict_tree` verifies them)."""
+    # covers: POST /transfers
+    from expcore_onedata.eviction import evict_tree
+
+    provisioner, receiver, directory, _ = scratch
+    for i in range(2):
+        provisioner.replicate(f"{directory}/part-{i}.bin", receiver)
+    record = evict_tree(provisioner, directory, receiver)
+    assert (record["files"], record["transfers"], record["empty"]) == (2, 1, True)
+
+
+@MUTATE
+def test_a_running_transfer_is_cancelled_through_the_gate_and_then_reports_an_ended_state(scratch):
+    """O11: a replication of a scratch file is cancelled at once, the gate having read the record's spaceId; the
+    cancel answers 204, or 400 when the job ended first, and the record then reports an ended state."""
+    # covers: DELETE /transfers/{id}
+    provisioner, receiver, _, ids = scratch
+    tid = provisioner.schedule_transfer("replication", ids[0], receiver)
+    statuses = []
+    try:
+        provisioner.client.mutate("DELETE", f"/transfers/{tid}", provider=receiver)
+    except NotSent:
+        raise  # the gate never sent the cancel: its own read failed, so this test has not shown the DELETE
+    except PlatformError as error:
+        statuses.append(error.status)
+    assert statuses in ([], [400])  # 400: the job ended before the cancel reached it
+    done = consistency.wait_transfers(provisioner.client, receiver, [tid], timeout_s=120, poll_s=2)
+    assert not done.timed_out
+    assert consistency.transfer_state(done.records[tid]) in consistency.ENDED_STATES
+
+
+@MUTATE
+def test_a_qos_requirement_is_listed_by_its_files_summary_read_and_removed(scratch):
+    """O11: a requirement put on a scratch file appears, keyed by its id, in the file's summary; its record names the
+    file, which the gate of its removal resolves; once removed it answers that it is not there (`answered_absent`)."""
+    # covers: GET /data/{id}/qos/summary
+    # covers: GET /qos_requirements/{qid}
+    # covers: DELETE /qos_requirements/{qid}
+    provisioner, _, _, ids = scratch
+    holder = provisioner.settings.holder
+    body = {"fileId": ids[0], "expression": "anyStorage", "replicasNum": 1}
+    qid = provisioner.client.mutate("POST", "/qos_requirements", provider=holder, json=body)["qosRequirementId"]
+    summary = provisioner.client.get(f"/data/{ids[0]}/qos/summary", provider=holder)
+    assert qid in summary["requirements"]
+    assert provisioner.client.get(f"/qos_requirements/{qid}", provider=holder)["fileId"] == ids[0]
+    provisioner.client.mutate("DELETE", f"/qos_requirements/{qid}", provider=holder)
+    with pytest.raises(PlatformError) as gone:
+        provisioner.client.get(f"/qos_requirements/{qid}", provider=holder)
+    assert answered_absent(gone.value), (gone.value.status, gone.value.code, gone.value.errno)
+
+
+@MUTATE
+@RESET
+def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_the_history(scratch):
+    """O11: with a requirement and a running replication left on the scratch files, the reset passes every stage:
+    the requirement is gone, no job is waiting or ongoing, the receiver holds nothing of the directory, and the ended
+    history is recorded with its count, never removed. Each stage has its seconds."""
+    from expcore_onedata.reset import STAGES, SpaceReset
+
+    provisioner, receiver, directory, ids = scratch
+    holder = provisioner.settings.holder
+    body = {"fileId": ids[1], "expression": "anyStorage", "replicasNum": 1}
+    provisioner.client.mutate("POST", "/qos_requirements", provider=holder, json=body)
+    provisioner.schedule_transfer("replication", ids[0], receiver)
+    record = SpaceReset(provisioner).run({receiver: [directory]})
+    assert record["ok"] is True
+    assert list(record["stages"]) == list(STAGES)
+    assert record["stages"]["qos"]["removed"] >= 1
+    assert record["stages"]["history"]["removable"] is False
+    assert all(isinstance(stage["seconds"], float) for stage in record["stages"].values())
+
+
+# -- large files (issue #127) -----------------------------------------------------------------------------------------
+
+LARGE_FILE_BYTES = 40 << 20  # tens of MB: ten chunks of the size below, quick to move
+LARGE_FILE_CHUNK = 4 << 20
+
+
+def write_random(path, size, seed):
+    """Write `size` pseudo-random bytes, a MiB at a time, and return their SHA-256."""
+    import hashlib
+    import random
+
+    stream, hasher = random.Random(seed), hashlib.sha256()
+    with open(path, "wb") as handle:
+        for start in range(0, size, 1 << 20):
+            piece = stream.randbytes(min(1 << 20, size - start))
+            hasher.update(piece)
+            handle.write(piece)
+    return hasher.hexdigest()
+
+
+def copy_prefix(source, dest, size):
+    """Copy the first `size` bytes of `source` to `dest`, a MiB at a time, and return their SHA-256. A stream drawn
+    again with the same seed is no prefix: `randbytes` of a length that is not a multiple of four ends otherwise."""
+    import hashlib
+
+    hasher = hashlib.sha256()
+    with open(source, "rb") as reader, open(dest, "wb") as writer:
+        while size > 0:
+            piece = reader.read(min(1 << 20, size))
+            assert piece, "the source ended before the prefix"
+            hasher.update(piece)
+            writer.write(piece)
+            size -= len(piece)
+    return hasher.hexdigest()
+
+
+@MUTATE
+def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_back_by_its_hash(
+    config, client, tmp_path
+):
+    """O25: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
+    nothing, a shorter file over the longer target is written again from a write without an offset (which must
+    truncate it), and the streamed read gives each file's SHA-256. Everything is under a fresh scratch directory and
+    torn down; skipped without a [placement] table."""
+    # covers: PUT /data/{id}/content
+    import dataclasses
+    import secrets
+
+    from expcore.config.loading import ConfigError
+    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+    from expcore_onedata.rangemap import load_placement
+
+    try:
+        placement = load_placement(PLATFORM, config)
+    except ConfigError:
+        pytest.skip("the large-file test needs a [placement] table, which platform.toml does not have")
+    settings = dataclasses.replace(placement.settings, chunk_bytes=LARGE_FILE_CHUNK)
+    provisioner = Provisioner(
+        client, config, settings, provider_ids=resolve_provider_ids(config), log=tmp_path / "changes.jsonl"
+    )
+    whole, prefix = tmp_path / "whole.bin", tmp_path / "prefix.bin"
+    whole_sha = write_random(whole, LARGE_FILE_BYTES, seed=127)
+    cut = 2 * LARGE_FILE_CHUNK + 4321  # ends inside a chunk, as a write cut part way leaves it
+    prefix_sha = copy_prefix(whole, prefix, cut)
+    path = f"expcore-live-{secrets.token_hex(6)}/large.bin"
+    try:
+        assert provisioner.upload(path, prefix).action == "created"
+        resumed = provisioner.upload(path, whole)
+        assert (resumed.action, resumed.sent_bytes) == ("resumed", LARGE_FILE_BYTES - cut)
+        assert (resumed.digest.size, resumed.digest.sha256) == (LARGE_FILE_BYTES, whole_sha)
+        assert provisioner.upload(path, whole).action == "skipped"
+        restarted = provisioner.upload(path, prefix)  # the target is longer, so only a truncating write fits it
+        assert (restarted.action, restarted.digest.sha256) == ("restarted", prefix_sha)
+        back = tmp_path / "back.bin"
+        found = provisioner.read_file(restarted.file_id, dest=back)
+        assert (found.size, found.sha256) == (cut, prefix_sha)
+        assert back.stat().st_size == cut
+    finally:
+        report = provisioner.teardown()
+    assert report.ok, report.left
+
+
+# -- the fault injector (issue #17) -----------------------------------------------------------------------------------
 
 FAULTS = pytest.mark.skipif(
     os.environ.get("EXPCORE_LIVE_FAULTS") != "1",

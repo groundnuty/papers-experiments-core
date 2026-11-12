@@ -47,12 +47,14 @@ from expcore_onedata.admission import require_admission, retain_admission
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox import gatelog, kinds
-from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec
+from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.gatepolicy import PAGED
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, mount_identity, parse_mountinfo
+from expcore_onedata.sandbox.inputs import InputsRecord
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
-from expcore_onedata.tokens import MintedToken, RunTokens, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, Plane, RunTokens, TokenIssuer, data_path_spec
 from expcore_onedata.users import GROUP, SlotProbe, Slots, SlotTokens, TokenJournal
 
 if TYPE_CHECKING:
@@ -266,6 +268,7 @@ class SandboxPlatform:
         sandbox_options: Mapping[str, Any] | None = None,
         cancel_wait_s: float = CANCEL_WAIT_S,
         clock: Callable[[], float] = time.time,
+        read_only_inputs: Mapping[str, Sequence[ReadOnlyInput]] | None = None,
     ) -> None:
         if config.sandbox is None:
             raise ValueError(f"{config.file}: has no [sandbox] section")
@@ -276,6 +279,7 @@ class SandboxPlatform:
         self._registry, self._options = registry, dict(sandbox_options or {})
         self._cancel_wait_s = cancel_wait_s
         self._threads = _StartThreads()
+        self._declared = {item for items in (read_only_inputs or {}).values() for item in items}
         self._planes: weakref.WeakKeyDictionary[DockerSandbox, _ToolPlane] = weakref.WeakKeyDictionary()
 
     # ------------------------------------------------------------------------------------------------ the plugin's hooks
@@ -321,16 +325,27 @@ class SandboxPlatform:
             raise ValueError("a run with a data path needs a leased slot, or [principals.data_path] for a fixed user")
         return fixed
 
-    def _spec(self, run_key: str, mode: DataPathMode, token: MintedToken | None, lease: Lease | None) -> SandboxSpec:
+    def _spec(
+        self,
+        run_key: str,
+        level: str,
+        token: MintedToken | None,
+        lease: Lease | None,
+        inputs: Sequence[ReadOnlyInput] = (),
+    ) -> SandboxSpec:
+        mode = self._s.mode_of(level)
+        lease_key, given = (lease.key if lease else None), tuple(inputs)
         if mode is DataPathMode.NONE:
-            return SandboxSpec(run_key=run_key, mode=mode, lease_key=lease.key if lease else None)
+            return SandboxSpec(run_key=run_key, mode=mode, lease_key=lease_key, inputs=given)
         return SandboxSpec(
             run_key=run_key,
             mode=mode,
             token=token,
             zone=Endpoint.from_url(self._config.zone.url),
             provider=Endpoint.from_url(self._config.local_provider.url),  # the agent is pinned to its local provider
-            lease_key=lease.key if lease else None,
+            lease_key=lease_key,
+            listing=self._s.listing_of(level) or PAGED,  # the level's listing mode (O21)
+            inputs=given,
         )
 
     def _mint(
@@ -344,7 +359,7 @@ class SandboxPlatform:
                 raise ValueError("a run with a tool server needs a leased slot: its tool-server user is the slot's")
             if mode is DataPathMode.NONE:
                 return None
-            spec = data_path_spec(self._config.space.id, mode.interface or "rest")
+            spec = data_path_spec(self._config.space_ids(Plane.DATA_PATH), mode.interface or "rest")
             return RunTokens(self._issuer.mint(spec, self._fixed(), ceiling_s=ceiling_s), None)
         if mode is DataPathMode.NONE and condition is None:
             return None  # a run that needs neither plane mints nothing, whatever it holds
@@ -365,7 +380,13 @@ class SandboxPlatform:
             ended()
 
     def _prepare(
-        self, run_key: str, mode: DataPathMode, lease: Lease | None, tokens: RunTokens | None, condition: str | None
+        self,
+        run_key: str,
+        level: str,
+        lease: Lease | None,
+        tokens: RunTokens | None,
+        condition: str | None,
+        inputs: Sequence[ReadOnlyInput] = (),
     ) -> DockerSandbox:
         """The sandbox of a run, built and not started: it has no effect on the host, so a launch holds it, and can stop
         it, from before the first resource exists."""
@@ -373,7 +394,7 @@ class SandboxPlatform:
         sandbox = DockerSandbox(
             self._host,
             self._s,
-            self._spec(run_key, mode, data, lease),
+            self._spec(run_key, level, data, lease, inputs),
             registry=self._registry,
             config_sha256=self._config.sha256,
             **self._options,
@@ -398,8 +419,18 @@ class SandboxPlatform:
         ceiling_s: float,
         lease: Lease | None = None,
         condition: str | None = None,
+        inputs: Sequence[ReadOnlyInput] = (),
+        inputs_record: InputsRecord | None = None,
     ) -> AsyncIterator[DockerSandbox]:
         """Start the sandbox of a run and yield it; stop it, verified, on leaving.
+
+        `inputs` are the run's read-only inputs (`ReadOnlyInput`): files the study supplies, such as scripts the agent
+        may run but not change, which the executor passes, from the run's condition or its own, as the platform was
+        built with them (`read_only_inputs`, from `inputs.declare`): any other is refused, as is a run with inputs and
+        no `inputs_record`, before anything is minted or created. Each is hashed again and refused when its content is
+        no longer the declared one, copied into the run's directory, mounted read-only in the agent from that copy,
+        proved read-only from inside the agent, and recorded by its hash in the sandbox's metadata and, through
+        `inputs_record` (`inputs.InputsRecord`), in the run's record itself (`sandbox.inputs`, O20).
 
         A run with a lease has its tokens minted through its slot (`users.SlotTokens`): the data path's, and the tool
         server's when `condition` names the run's tool-server condition, which `tool_server` then starts the server
@@ -436,6 +467,10 @@ class SandboxPlatform:
         """
         require_admission(self._config)  # first: a refused run mints, journals and starts nothing (O11)
         mode = self._s.mode_of(level)
+        if any(item not in self._declared for item in inputs):
+            raise StartRefused("a read-only input passed to launch was not declared to the platform (inputs.declare)")
+        if inputs and inputs_record is None:
+            raise ValueError("a run with read-only inputs needs the instrument that keeps them in its record")
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None
         minting: asyncio.Future[RunTokens | None] | None = None
@@ -447,13 +482,15 @@ class SandboxPlatform:
                 )
                 minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
                 tokens = await asyncio.shield(minting)
-                sandbox = self._prepare(run_key, mode, lease, tokens, condition)
+                sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
                 started.add_done_callback(lambda _: share.never_ran())
                 await asyncio.shield(started)
+                if inputs_record is not None:
+                    inputs_record.attach(sandbox.read_only_inputs)
         except BaseException:
             if minting is not None and not minting.done():  # cancelled mid-mint: the worker goes on, so wait for it
                 minting.add_done_callback(lambda f: f.cancelled() or f.exception())  # its failure is not unretrieved

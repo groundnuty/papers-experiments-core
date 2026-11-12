@@ -6,11 +6,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from platform_support import write_platform
-
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import FaultInjector, load_faults
+from expcore_onedata.testing import write_platform
 
 SERVICES = {"alpha": "store-one", "beta": "store-two"}  # by provider name; providers[0] is alpha, providers[1] beta
 SERVICE_NAMES = tuple(SERVICES.values())

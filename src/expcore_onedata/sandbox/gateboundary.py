@@ -23,9 +23,9 @@ rewrites one, since a partial rewrite can leave a piece behind. Every answer pas
     study's data was provisioned, and the agent's data path is read-only, so a file's content cannot hold it; the
     watch is defence in depth, with the bound `held_back` states.
 
-That a file's content comes as a 200 or 206 with `DATA_CONTENT_TYPE` is an assumption no source confirms: only the
-earlier study's mock of a provider answers so. It is listed in `expcore_onedata.client.UNVERIFIED_ENDPOINTS` and pinned
-by a live contract test (tests/live/test_contract.py). Should a deployment answer with another type, nothing leaks and
+That a file's content comes as a 200 or 206 with `DATA_CONTENT_TYPE` was first only the earlier study's mock of a
+provider; the live contract test (tests/live/test_contract.py) confirmed it against Onedata 25.0 (`[L1]` in
+`expcore_onedata.client`) and stays to pin it. Should a deployment answer with another type, nothing leaks and
 nothing is mis-scored: every read of a file is then buffered, one up to 4 MiB is checked whole and passes, and one over
 4 MiB is refused loudly (`OVERSIZED_RESPONSE`), so its run ends as `data_gate_integrity` and is set aside.
 
@@ -58,6 +58,8 @@ ENCODED_RESPONSE = "encoded_response"
 REDIRECT_REFUSED = "redirect_refused"
 OVERSIZED_RESPONSE = "oversized_response"
 OVERSIZED_DETAILS = "the upstream's answer is larger than the gate checks whole, so the gate does not pass it on"
+LISTING_TOO_LARGE = "listing_too_large"  # a complete listing past its bounds (`gatepolicy.COMPLETE_LISTING_*`, O21)
+LISTING_DETAILS = "the directory's complete listing is larger than the gate serves whole, so it passes no part of it on"
 BUFFER_CAP = 4 * 1024 * 1024  # the most of an answer that is no file's content the gate buffers and checks whole
 DATA_CONTENT_TYPE = "application/octet-stream"  # what the content endpoint answers a file's content with
 

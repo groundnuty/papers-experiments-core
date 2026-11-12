@@ -100,6 +100,138 @@ def test_R10_a_missing_count_is_none_and_a_non_finite_number_is_refused():
         validate(bad)
 
 
+def test_R02_version_three_adds_the_extra_usage_fields_to_the_usage_section_and_no_older_version_has_them():
+    """R02: the usage fields of a provider beyond the counts are a version of their own, appended to the table."""
+    assert CURRENT == "expcore-record/3"
+    assert [s.name for s in SCHEMAS] == ["expcore-record/1", "expcore-record/2", "expcore-record/3"]
+    assert added_after("expcore-record/1", "usage") == {"extra", "extra_cut"}
+    assert added_after("expcore-record/2", "usage") == {"extra", "extra_cut"}
+    assert added_after("expcore-record/3", "usage") == frozenset()
+    assert list(fields_of("usage", "expcore-record/3"))[-2:] == ["extra", "extra_cut"]
+    assert "extra" not in fields_of("usage", "expcore-record/2")
+
+
+def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_version_has_any_optional_field():
+    """R02: until v0.1.0 an extension of version 3 is additive, so a field it adds is optional: a record of version 3
+    written before the field existed lacks it, and is valid. Version 3 adds the extra usage fields and the target of a
+    fault, the outcome's and the declared ones."""
+    from expcore.records import schema as rules
+
+    assert SCHEMAS[-1].optional == {
+        "usage": ("extra", "extra_cut"),
+        "record": ("treatment_targets",),
+        "outcome": ("infra_target",),
+    }
+    assert SCHEMAS[-1].optional == SCHEMAS[-1].added
+    assert rules.optional_in("usage", "expcore-record/3") == {"extra", "extra_cut"}
+    assert rules.optional_in("record", "expcore-record/3") == {"treatment_targets"}
+    assert rules.optional_in("outcome", "expcore-record/3") == {"infra_target"}
+    assert rules.optional_in("record", "expcore-record/2") == rules.optional_in("outcome", "expcore-record/2") == set()
+    assert rules.optional_in("usage", "expcore-record/2") == frozenset()
+    assert rules.optional_in("turn", "expcore-record/3") == frozenset()
+
+
+def test_R02_a_current_record_may_lack_the_extra_usage_fields_or_hold_either_alone_and_an_older_one_may_not_hold_any():
+    """R02: an older writer of version 3 left the fields out; absent means not recorded, and a record that holds only
+    one, or both, validates too. A record that names version 2 still refuses them, and a required field is still
+    required."""
+    plain = copy.deepcopy(data())
+    assert "extra" not in plain["transcript"][0]["usage"]
+    assert validate(plain) == CURRENT
+    for held in ({"extra": {"used_credits": 1.5}}, {"extra_cut": 2}, {"extra": {}, "extra_cut": 0}):
+        record = copy.deepcopy(data())
+        record["transcript"][0]["usage"].update(held)
+        assert validate(record) == CURRENT
+    older = copy.deepcopy(data())
+    older["transcript"][0]["usage"].update(extra={}, extra_cut=0)
+    older["schema_version"] = "expcore-record/2"
+    with pytest.raises(RecordError, match=r"unknown field\(s\) \['extra', 'extra_cut'\] .*later schema than"):
+        validate(older)
+    required = copy.deepcopy(data())
+    del required["transcript"][0]["usage"]["input_tokens"]
+    with pytest.raises(RecordError, match=r"usage: missing field\(s\) \['input_tokens'\]"):
+        validate(required)
+
+
+def test_R02_a_field_a_version_marks_optional_must_be_one_it_adds_and_the_section_must_exist():
+    """R02: the table cannot call a field optional that an earlier version already required, or one the format lacks."""
+    with pytest.raises(ValueError, match=r"optional fields .*not add"):
+        SchemaVersion("expcore-record/4", optional={"usage": ("input_tokens",)})
+    with pytest.raises(ValueError, match=r"optional fields .*not add"):
+        SchemaVersion("expcore-record/4", added={"usage": ("extra",)}, optional={"usage": ("extra_cut",)})
+    with pytest.raises(ValueError, match=r"optional fields .*not add"):
+        SchemaVersion("expcore-record/4", optional={"nope": ("x",)})
+    assert SchemaVersion("expcore-record/4", added={"usage": ("extra",)}, optional={"usage": ("extra",)})
+
+
+@pytest.mark.parametrize(
+    "held",
+    [{"extra": {"used_credits": True}}, {"extra": {"used credits": 1}}, {"extra_cut": -1}, {"extra_cut": True}],
+    ids=["bool_alone", "name_alone", "negative_cut_alone", "bool_cut_alone"],
+)
+def test_R02_an_optional_field_is_validated_when_it_is_present_even_without_its_sibling(held):
+    """R02: a field that may be absent is checked all the same when it is there."""
+    bad = copy.deepcopy(data())
+    bad["transcript"][0]["usage"].update(held)
+    with pytest.raises(RecordError, match=r"usage\.extra"):
+        validate(bad)
+
+
+OVER_THE_CAP = "one field more than the cap, built in the test"
+
+
+@pytest.mark.parametrize(
+    ("extra", "cut", "message"),
+    [
+        ({"used_credits": True}, 0, r"usage\.extra\.used_credits: .*number"),
+        ({"used_credits": "3"}, 0, r"usage\.extra\.used_credits: .*number"),
+        ({"used_credits": None}, 0, r"usage\.extra\.used_credits: .*number"),
+        ({"used_credits": [1]}, 0, r"usage\.extra\.used_credits: .*number"),
+        ({"used_credits": float("nan")}, 0, r"usage\.extra\.used_credits: .*number"),
+        ({"used_credits": float("inf")}, 0, r"usage\.extra\.used_credits: .*number"),
+        ({"used_credits": 10**30}, 0, r"usage\.extra\.used_credits: .*number"),
+        ({"used credits": 1}, 0, r"usage\.extra: .*name"),
+        ({"x" * 200: 1}, 0, r"usage\.extra: .*name"),
+        (OVER_THE_CAP, 0, r"usage\.extra: .*at most"),
+        ({}, -1, r"usage\.extra_cut: .*not negative"),
+        ({}, True, r"usage\.extra_cut: expected int, got bool"),
+    ],
+    ids=[
+        "bool",
+        "text",
+        "null",
+        "list",
+        "nan",
+        "inf",
+        "huge",
+        "name_with_space",
+        "long_name",
+        "over_the_cap",
+        "negative_cut",
+        "bool_cut",
+    ],
+)
+def test_R02_the_extra_usage_fields_hold_only_bounded_numbers_under_plain_names(extra, cut, message):
+    """R02: a record cannot carry a usage field that is not a number, a name that is not a plain identifier, or more
+    fields than the cap, so a hostile or odd endpoint cannot grow the record without limit."""
+    if extra == OVER_THE_CAP:
+        from expcore.models.usage import USAGE_EXTRA_CAP
+
+        extra = {f"field_{i:03d}": i for i in range(USAGE_EXTRA_CAP + 1)}
+    bad = copy.deepcopy(data())
+    bad["transcript"][0]["usage"].update(extra=extra, extra_cut=cut)
+    with pytest.raises(RecordError, match=message):
+        validate(bad)
+
+
+def test_R02_a_record_may_hold_ints_and_floats_zero_and_a_cut_count_in_the_extra_usage_fields():
+    """R02: what a provider reported is kept as reported: a zero is a field, and the cut is a count."""
+    good = copy.deepcopy(data())
+    kept = {"used_credits": 2.5, "details.reasoning_tokens": 0, "n": -1}
+    good["transcript"][0]["usage"].update(extra=kept, extra_cut=4)
+    assert validate(good) == CURRENT
+
+
 def test_an_outcome_outside_the_vocabulary_or_with_a_stray_kind_is_refused():
     bad = copy.deepcopy(data())
     bad["outcome"]["name"] = "exploded"

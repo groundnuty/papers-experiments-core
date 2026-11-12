@@ -115,6 +115,43 @@ def test_b10_cache_parts_the_reply_does_not_report_stay_none_and_do_not_change_t
     assert (turn.cache_creation_input_tokens, turn.cache_read_input_tokens) == (None, None)
 
 
+def test_b10_cache_and_reasoning_fields_beyond_the_dedicated_ones_are_kept_under_their_own_names(
+    make_spec, limits, message, fake_client
+):
+    """B10: the cache split and the thinking count a reply reports ride on the turn, recorded only. The counts the turn
+    already holds (the input, the output and the two cache counts) are not repeated, and text is left out."""
+    usage = {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "cache_creation_input_tokens": 20,
+        "cache_read_input_tokens": 100,
+        "cache_creation": {"ephemeral_5m_input_tokens": 12, "ephemeral_1h_input_tokens": 8},
+        "reasoning_tokens": 41,
+        "service_tier": "standard",
+    }
+    client = fake_client(message(usage=usage), api="anthropic")
+    backend = adapter(make_spec(backend="anthropic"), limits, client)
+    backend.begin("", "go", [])
+    turn = step(backend)
+    assert turn.usage_extra == {
+        "cache_creation.ephemeral_1h_input_tokens": 8,
+        "cache_creation.ephemeral_5m_input_tokens": 12,
+        "reasoning_tokens": 41,
+    }
+    assert turn.usage_extra_cut == 0
+    assert turn.input_tokens == 127  # the budget's count is unchanged by the extras
+    assert (turn.uncached_input_tokens, turn.cache_creation_input_tokens, turn.cache_read_input_tokens) == (7, 20, 100)
+
+
+def test_b10_a_reply_with_only_the_usual_counts_has_no_extra_fields(make_spec, limits, message, fake_client):
+    """B10: a field the reply does not carry is absent from the mapping, never 0."""
+    client = fake_client(message(usage={"input_tokens": 7, "output_tokens": 3}), api="anthropic")
+    backend = adapter(make_spec(backend="anthropic"), limits, client)
+    backend.begin("", "go", [])
+    turn = step(backend)
+    assert (turn.usage_extra, turn.usage_extra_cut) == ({}, 0)
+
+
 def test_b10_a_reply_without_usage_is_infrastructure_and_counted_missing(make_spec, limits, message, fake_client):
     """B10: unreported usage is None, never 0."""
     reply = message()

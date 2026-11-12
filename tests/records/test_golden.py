@@ -1,10 +1,9 @@
 """The golden records: version 1 of the record format is frozen from its first pushed commit (R01, R02).
 
 `tests/data/golden-record-v2.json` is the same for version 2, which adds no field but changes a rule: an infrastructure
-outcome is flagged as treatment only after the model completed a turn. `tests/data/golden-record-v3.json` is the same
-for version 3, which adds the target of a fault (`treatment_targets`, `outcome.infra_target`) and the target rule: a
-declared target is treatment only for its own failure while the fault injector's reading shows it injected. Each file
-loads, writes back byte for byte, and replays, under the rule of its own version.
+outcome is flagged as treatment only after the model completed a turn. Both files load, write back byte for byte, and
+replay, each under the rule of its own version. Version 3 is still being extended before v0.1.0, so it has no single
+golden: `tests/data/record-v3/` holds one fixture per merge point, and `test_v3_fixtures.py` replays them all.
 
 `tests/data/golden-record-v1.json` is a record of a synthetic run with invented names: tool calls of every outcome, a
 result the data source cut, a call the loop skipped, a secret redacted from the prompt and from a result. It must
@@ -16,15 +15,14 @@ variable named GOLDEN_API_KEY set to an invented key, and writing `record.dumps(
 
 from pathlib import Path
 
-from expcore.records.injections import FAULT_NAMESPACE
 from expcore.records.record import RunRecord, decode, load_record
-from expcore.records.schema import SCHEMAS, first_turn_rule, target_rule
+from expcore.records.schema import SCHEMAS, first_turn_rule
 from expcore.replay.check import check_record
 from expcore.replay.replay import replay_record
 
 GOLDEN = Path(__file__).resolve().parents[1] / "data" / "golden-record-v1.json"
 GOLDEN_V2 = Path(__file__).resolve().parents[1] / "data" / "golden-record-v2.json"
-GOLDEN_V3 = Path(__file__).resolve().parents[1] / "data" / "golden-record-v3.json"
+V3_FIXTURES = sorted((Path(__file__).resolve().parents[1] / "data" / "record-v3").glob("*.json"))
 
 
 def test_R01_the_golden_record_of_version_one_loads_and_writes_back_byte_for_byte():
@@ -112,42 +110,6 @@ def test_R03_the_version_two_golden_passes_the_replay_check_stages():
     assert check_record(GOLDEN_V2.read_bytes()) is None
 
 
-def test_R01_the_golden_record_of_version_three_loads_and_writes_back_byte_for_byte():
-    """R01: version 3 is frozen beside the others: its bytes load and come back as they were."""
-    stored = GOLDEN_V3.read_bytes()
-    record = load_record(GOLDEN_V3)
-    assert record.schema_version == "expcore-record/3" == SCHEMAS[2].name
-    assert record.dumps().encode("utf-8") == stored
-    assert RunRecord.from_json(decode(stored)).dumps() == stored.decode("utf-8")
-
-
-def test_R02_version_three_adds_exactly_the_declared_targets_and_the_outcome_target():
-    """R02: the version-3 golden holds the fields of version 2 in their order, then the declared targets; its outcome
-    holds version 2's fields and then the target."""
-    v2, v3 = decode(GOLDEN_V2.read_bytes()), decode(GOLDEN_V3.read_bytes())
-    assert list(v3) == [*v2, "treatment_targets"]
-    assert list(v3["outcome"]) == [*v2["outcome"], "infra_target"]
-
-
-def test_C01_the_version_three_golden_is_a_targeted_treatment_and_replays_as_one():
-    """C01: a failure naming the declared target, after two completed turns, with the injector's reading of it: it is
-    treatment, and replay, served the reading from the record, agrees byte for byte."""
-    assert (target_rule("expcore-record/2"), target_rule("expcore-record/3")) == (False, True)
-    v3 = load_record(GOLDEN_V3)
-    assert len(v3.transcript) == 2
-    assert v3.treatment_targets == {"knowledge": "servers[1]"}
-    assert (v3.outcome["infra_target"], v3.outcome["treatment"], v3.set_aside) == ("servers[1]", True, False)
-    assert v3.instruments[FAULT_NAMESPACE]["injections"][0]["target"] == "servers[1]"
-    replayed = replay_record(v3)
-    assert (replayed.schema_version, replayed.outcome["treatment"]) == ("expcore-record/3", True)
-    assert replayed.dumps().encode("utf-8") == GOLDEN_V3.read_bytes()
-
-
-def test_R03_the_version_three_golden_passes_the_replay_check_stages():
-    """R03: it loads, writes back and replays through the loop."""
-    assert check_record(GOLDEN_V3.read_bytes()) is None
-
-
 SECRET_SHAPED = {  # values a checking environment may hold: every form the redaction rules recognise, none in a golden
     "TOYLAB_TOKEN": "amber-line-one\ncobalt-line-two",
     "OTHER_API_KEY": "abcd/efgh-4471",
@@ -160,7 +122,7 @@ def test_R12_the_golden_records_check_and_replay_whatever_secrets_the_checking_e
     redacts nothing and the replay redacts nothing, so only a secret the record really holds can stop it."""
     for name, value in SECRET_SHAPED.items():
         monkeypatch.setenv(name, value)
-    for golden in (GOLDEN, GOLDEN_V2, GOLDEN_V3):
+    for golden in (GOLDEN, GOLDEN_V2, *V3_FIXTURES):
         assert check_record(golden.read_bytes()) is None
 
 

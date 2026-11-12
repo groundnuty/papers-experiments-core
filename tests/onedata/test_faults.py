@@ -20,7 +20,7 @@ from fault_support import (
     injector_for,
     write_faults,
 )
-from platform_support import NOW, configured_values, write_platform
+from platform_support import configured_values
 
 from expcore.campaign.resume import FingerprintMismatch, open_campaign
 from expcore.config.loading import ConfigError
@@ -37,6 +37,7 @@ from expcore_onedata.faults import (
     load_faults,
     provider_outage,
 )
+from expcore_onedata.testing import NOW, write_platform
 
 OUTAGE_SERVICE = SERVICES["beta"]
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1, "factors": {}}

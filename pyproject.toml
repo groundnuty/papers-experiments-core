@@ -25,6 +25,11 @@ onedata = [
 
 [dependency-groups]
 dev = [
+    # The published Onedata REST client (both MIT): a development dependency only, so
+    # tests/onedata/sandbox/test_published_client.py runs it through the data gate as an agent's code would. The
+    # platform layer never imports it.
+    "onedatafilerestclient==25.2.0",
+    "onedatarestfsspec==25.2.0",
     "pytest>=8",
     "ruff>=0.8",
     # The example platform beside the Onedata layer (examples/sparql_platform), with its store, pyoxigraph: a
@@ -50,6 +55,9 @@ dev-mode-dirs = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --import-mode=importlib"
+markers = [
+    "benchmark: a generous wall-time bound on top of a work-count test; deselect with -m 'not benchmark'",
+]
 # Helper modules shared by several test files live here, outside any package, and are imported by plain name.
 pythonpath = ["tests/support"]
 
@@ -121,7 +129,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore_onedata/probes.py" = ["E501"]
 "src/expcore_onedata/users.py" = ["E501"]
 "src/expcore_onedata/faults.py" = ["E501"]
-"tests/support/fake_onedata.py" = ["E501"]
+"src/expcore_onedata/testing/fake_onedata.py" = ["E501"]
 
 [tool.uv.sources]
 sparql-platform = { path = "examples/sparql_platform", editable = true }

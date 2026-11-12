@@ -7,6 +7,7 @@ key, and the platform is a stub whose health, probe and leases always succeed.
 The campaigns are built once per module (the module-scoped fixtures) and each test asserts one thing about them.
 """
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -155,10 +156,25 @@ def test_every_record_holds_the_instruments_snapshot_and_the_scorer_reads_its_co
         assert scores[entry["run_key"]]["tiny"]["result"]["outcomes"]["served"] == float(served)
 
 
+def test_b15_each_record_holds_the_prompt_filled_from_its_tasks_own_attributes(resumed):
+    """B15: adds that the user prompt a record keeps is the one the model was sent, filled per task: the example's
+    executor reads the task's `region` from `study.tasks`, and the record holds the slot values and the template's
+    hash beside the text."""
+    study = load_study(resumed.root)
+    template = (resumed.root / "prompt.txt").read_text(encoding="utf-8")
+    for entry in resumed.read("export.json")["analysed_attempts"]:
+        record = record_of(resumed, entry)
+        user, task = record.prompt["user"], study.tasks[record.factors["task"]]
+        region = task.attributes["region"]
+        assert (user["slots"]["TASK"], user["slots"]["REGION"]) == (task.id, region)
+        assert user["text"].startswith(f"You are answering a question about one place: {task.id}, in the {region}.")
+        assert user["template_sha256"] == hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+
 def test_the_example_scorer_takes_a_failed_snapshot_as_unmeasured_never_as_zero(resumed):
     entry = resumed.read("export.json")["analysed_attempts"][0]
     record = record_of(resumed, entry).with_instrument("facts", {"ok": False, "error": "TimeoutError"})
-    plugin = import_plugin_module(resumed.root / "plugin.py")
+    plugin = import_plugin_module(load_study(resumed.root))
     assert plugin.TinyScorer().score(record)["outcomes"]["served"] is None
 
 
@@ -364,6 +380,65 @@ def test_s10_a_scorer_that_leaves_treatment_attempts_none_is_refused_until_the_c
     )
     report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
     assert table(report, "## Preregistered contrasts")["relay-vs-baseline"][12] == "excluded (2 pair(s) left out)"
+
+
+FAMILY = 'holm_family = ["extended-vs-baseline", "relay-vs-baseline"]'
+
+
+def test_s12_an_exploratory_only_preregistration_runs_through_analyze_and_report_with_no_confirmatory_claim(
+    resumed, tmp_path, clean_environment, capsys
+):
+    """S12: through the command line: with the family replaced by exploratory_only = true, check, analyze and report
+    succeed; analysis.json says so and holds no Holm decision; every contrast is exploratory in it, in the report's
+    one exploratory table and on the terminal; the report's summary says no confirmatory claim is made; and an empty
+    family alone is refused, naming exploratory_only."""
+    copy = copy_campaign(resumed, tmp_path, "exploratory-only")
+    prereg = copy.root / "preregistration.toml"
+    edit_once(prereg, FAMILY, "holm_family = []")
+    code, errors = cli(clean_environment, "analyze", str(copy.root))  # refused at load, before the code is looked at
+    assert code == 1
+    assert "key 'holm_family' is empty" in errors
+    assert "exploratory_only = true" in errors
+    edit_once(prereg, "holm_family = []", "exploratory_only = true")
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    analysis = copy.read("analysis.json")
+    assert (analysis["exploratory_only"], analysis["holm"]) == (True, [])
+    assert {c["name"]: (c["exploratory"], c["in_family"]) for c in analysis["contrasts"]} == dict.fromkeys(
+        CONTRASTS, (True, False)
+    )
+    report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
+    assert "makes no confirmatory claim" in report.split("## Exploratory contrasts")[0]
+    assert "## Preregistered contrasts" not in report
+    assert set(table(report, "## Exploratory contrasts")) - {"Contrast"} == set(CONTRASTS)
+    capsys.readouterr()
+    assert main(["analyze", str(copy.root)]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    summary = [line for line in printed if "estimate" in line]
+    assert any("No confirmatory claim" in line for line in printed[: printed.index(summary[0])])
+    assert len(summary) == len(CONTRASTS)
+    assert all(line.endswith("(exploratory)") for line in summary)
+
+
+def test_c25_a_budgeted_study_without_context_windows_still_analyses_reports_and_regenerates_but_does_not_run(
+    resumed, tmp_path, clean_environment
+):
+    """C25: the context window bounds what a run is reserved, so only starting or resuming a run needs it: a finished
+    study whose models declare none (one made before the rule) is checked, analysed, reported and regenerated as a
+    replication package's check does, and `run` refuses it, naming models.toml and the models."""
+    copy = copy_campaign(resumed, tmp_path, "no-windows")
+    models = copy.root / "models.toml"
+    models.write_text(models.read_text(encoding="utf-8").replace("context_tokens = 8192\n", ""), encoding="utf-8")
+    assert "context_tokens" not in models.read_text(encoding="utf-8")
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    assert regenerate(copy.root, stamped=True) == []
+    code, errors = cli(clean_environment, "run", str(copy.root))
+    assert code != 0
+    assert "models.toml" in errors
+    assert "no context window for model(s) 'alpha-stub', 'beta-stub'" in errors
 
 
 def test_c23_an_exhausted_run_is_counted_under_its_condition_and_as_the_cause_of_the_pairs_it_costs(

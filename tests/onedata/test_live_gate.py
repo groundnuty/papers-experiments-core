@@ -9,7 +9,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_the_live_tests_are_skipped_when_no_platform_is_named():
-    env = {k: v for k, v in os.environ.items() if k not in ("EXPCORE_LIVE_PLATFORM", "EXPCORE_LIVE_DOCKER")}
+    gates = ("EXPCORE_LIVE_PLATFORM", "EXPCORE_LIVE_DOCKER", "EXPCORE_LIVE_MUTATE")
+    env = {k: v for k, v in os.environ.items() if k not in gates}
     done = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/live", "-q", "-rs", "-p", "no:cacheprovider"],
         cwd=ROOT,
@@ -22,43 +23,58 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     assert done.returncode in (0, 5), done.stdout[-500:]  # 5: pytest found no test to run, only a skipped module
     assert "EXPCORE_LIVE_PLATFORM is not set" in done.stdout
     assert "EXPCORE_LIVE_DOCKER is not set" in done.stdout
-    assert "2 skipped" in done.stdout
+    assert "EXPCORE_LIVE_DOCKER=1, EXPCORE_LIVE_MUTATE=1 and EXPCORE_LIVE_PLATFORM are needed" in done.stdout
+    assert "3 skipped" in done.stdout
+
+
+def test_o09_only_the_resets_qos_calls_cancel_and_the_truncating_write_are_unconfirmed_and_the_path_read_is_gone():
+    """O09, O11: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did,
+    the gate's walk by `parent_id` among them, the reset's eviction of a directory and a transfer record's `spaceId`,
+    and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
+    asks for it; the client's docstring records what refuted it. What is left unconfirmed are the reset's calls no live
+    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal) and the write of content
+    without an offset, which truncates the file and which a restarted upload relies on (O25)."""
+    from expcore_onedata import client
+
+    assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
+        ("PUT", "/data/{id}/content"),
+        ("DELETE", "/transfers/{id}"),
+        ("GET", "/data/{id}/qos/summary"),
+        ("GET", "/qos_requirements/{qid}"),
+        ("DELETE", "/qos_requirements/{qid}"),
+    }
+    what = " ".join(w for _, _, w in client.UNVERIFIED_ENDPOINTS)
+    assert all(field in what for field in ("fileId", "requirements", "400", "truncates"))
+    assert "badValueNotAllowed" in client.__doc__
+    assert '"attribute": "path"' not in Path(client.__file__).read_text(encoding="utf-8")
 
 
 def test_every_unverified_endpoint_has_a_live_contract_test():
-    """Each (method, path) no source confirms is named by a `covers:` line of a live test, so none goes unchecked."""
+    """Each (method, path) neither a source nor a live run confirms is named by a `covers:` line of a live test, so
+    none goes unchecked."""
     from expcore_onedata.client import UNVERIFIED_ENDPOINTS
 
     live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
-    assert UNVERIFIED_ENDPOINTS, "the list is empty: remove this test along with the last unconfirmed endpoint"
     missing = [f"{m} {p}" for m, p, _ in UNVERIFIED_ENDPOINTS if f"# covers: {m} {p}\n" not in live]
     assert not missing, f"no live test covers: {missing}"
 
 
-def test_the_unconfirmed_calls_and_details_are_exactly_the_gate_reads_the_answer_details_and_the_transfer_log():
-    """O05, O08: the list holds the two reads the mutation gate relies on (a space's details, a file's path attribute),
-    the three answer details no source confirms (the subject of an examination, the providers' name and online fields,
-    and the content type of a file's content, which the data gate streams on), and the two details of the probes'
-    transfer log (the waiting state of the listing, a record's type, provider ids and times); nothing else."""
-    from expcore_onedata.client import UNVERIFIED_ENDPOINTS
-
-    assert {(m, p) for m, p, _ in UNVERIFIED_ENDPOINTS} == {
-        ("GET", "/spaces/{space}"),
+def test_every_endpoint_the_live_federation_confirmed_keeps_its_live_test():
+    """O05, O08, O09: an entry that left the list on a live run keeps the test that confirmed it, so a release that
+    answers otherwise fails it."""
+    live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
+    for method, path in (
         ("GET", "/data/{id}"),
+        ("GET", "/spaces/{space}"),
         ("POST", "/tokens/examine"),
         ("POST", "/tokens/infer_access_token_scope"),
         ("GET", "/data/{file}/content"),
         ("GET", "/spaces/{space}/transfers"),
         ("GET", "/transfers/{id}"),
-    }
-    what = " ".join(w for _, _, w in UNVERIFIED_ENDPOINTS)
-    assert "subject" in what
-    assert "name and online" in what
-    assert "name field" in what
-    assert "application/octet-stream" in what
-    assert "mock" in what  # the only basis there is
-    assert "waiting" in what
-    assert all(field in what for field in ("type", "replicatingProviderId", "scheduleTime", "finishTime"))
+        ("POST", "/transfers"),
+        ("GET", "/data/{id}/distribution"),
+    ):
+        assert f"# covers: {method} {path}\n" in live
 
 
 def test_the_slow_live_expiry_test_needs_its_own_switch():

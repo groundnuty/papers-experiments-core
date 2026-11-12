@@ -21,8 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import write_platform
-from sandbox_support import TOKEN, add_sandbox, make_spec, start_options
+from sandbox_support import TOKEN, add_sandbox, fail_copies, make_spec, start_options
 from tls_support import HAS_OPENSSL, TlsServer, make_federation_ca, swap_after_check
 
 from expcore_onedata.config import load_platform
@@ -32,6 +31,7 @@ from expcore_onedata.sandbox.api import StartRefused
 from expcore_onedata.sandbox.hostops import DockerHost
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.testing import write_platform
 
 pytestmark = pytest.mark.skipif(not HAS_OPENSSL, reason="the openssl command makes the test CAs")
 
@@ -242,7 +242,7 @@ def test_o05_oneclient_is_given_the_tls_setting_and_the_bundle_read_only(tmp_pat
     sidecar = world.host.containers[sbx.names.sidecar]
     command, mounts = sidecar.command, mounts_of(sidecar)
     binary = command.index(C.ONECLIENT_BIN)
-    settings = command[:binary]  # what `env` sets and unsets before it runs oneclient
+    settings = command[command.index(C.SIDECAR_SHELL_NAME) + 1 : binary]  # what `env` sets and unsets for oneclient
     copy = the_run_copy(sbx, mounts[C.SIDECAR_CA_PATH][0]) if C.SIDECAR_CA_PATH in mounts else None
     sbx.stop()
     assert settings[:2] == ["-u", "ONECLIENT_INSECURE"]  # the image's own skip-verification flag is always removed
@@ -313,15 +313,14 @@ def test_o12_the_run_record_names_the_tls_mode_and_a_bundle_by_its_sha256_alone(
 def test_o05_the_runs_copy_of_the_bundle_is_never_kept_with_the_evidence(tmp_path, federation):
     """O05: when collection fails and the run directory is kept as evidence, the run's copy of the CA bundle is
     removed first: the bundle is configuration, not evidence of the run."""
-    from expcore_onedata.sandbox.hostops import CmdResult
 
     world = world_with(tmp_path / "kept", MODES["ca_file"], federation)
     sbx = start(world, "via-gate")
     assert any(p.read_bytes() == federation.ca.read_bytes() for p in sbx.dir.glob("*.pem"))
-    world.host.run_handlers["cp"] = lambda argv: CmdResult(1, "", "disk full")
+    undo = fail_copies(world.host)
     with contextlib.suppress(Exception):
         sbx.collect(tmp_path / "e", outputs=["out.txt"])
-    world.host.run_handlers.pop("cp")
+    undo()
     sbx.stop()
     kept = world.s.work_root / "_kept_evidence" / sbx.sid
     assert kept.exists()

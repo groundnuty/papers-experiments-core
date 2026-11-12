@@ -1,11 +1,11 @@
 """The declared range map and the `[placement]` settings: validation names the file and the key, never the value."""
 
 import pytest
-from placement_support import write_with_placement
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
 from expcore_onedata.rangemap import RangeRow, load_placement, safe_path, trace_reads
+from expcore_onedata.testing import write_with_placement
 
 ROWS = """
 [[placement.map]]
@@ -44,7 +44,7 @@ def test_a_study_file_can_hold_the_rows(tmp_path):
 
 
 def test_a_platform_without_a_placement_table_is_refused_naming_the_key(tmp_path):
-    from platform_support import write_platform
+    from expcore_onedata.testing import write_platform
 
     path = write_platform(tmp_path)
     with pytest.raises(ConfigError, match=r"platform\.toml: key 'placement' is required"):

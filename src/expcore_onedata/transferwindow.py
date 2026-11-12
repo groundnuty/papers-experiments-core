@@ -137,7 +137,8 @@ def split_gained(
     everywhere: Collection[str] = (),
 ) -> dict[str, dict[str, Any]]:
     """Split each tracked provider's gained bytes into what the jobs in the window moved into it and a lower bound on
-    the rest. `name_of` names the declared provider of an id; a job into no tracked provider counts for none.
+    the rest. `name_of` maps a provider id to the key `gained` uses for it (the probes pass its position label,
+    `providers[i]`); a job into no tracked provider counts for none.
     `flagged` holds `(target id, reason)` of jobs that leave their target's bound unknown, and `everywhere` the
     reasons that leave every bound unknown."""
     into = dict.fromkeys(gained, 0)

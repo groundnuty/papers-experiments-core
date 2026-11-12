@@ -17,8 +17,16 @@ entry with such a backend and a problem of its own (a missing `api_id`, a rule i
 not build its backend, so a misspelt core backend is never reported as a missing key, and a name close to a core
 backend is named with it.
 
+`accepted_fingerprints` declares the serving fingerprints (`system_fingerprint`) a load-balanced endpoint serves the
+model under, each a deployment the study decided is the same model (B18, `expcore.campaign.identity`). It is a set,
+kept sorted; an empty list, a repeat or a value that joins several fingerprints is refused, and so is the key on an
+`anthropic` model, whose adapter records no fingerprint to check it against.
+
 Secrets never appear here. An entry points at an environment variable (`key_env`) or a file (`key_file`), and the
 key is read when a request is built, not when the table is loaded.
+
+A price is `[models.<key>.price]`, in dollars per million tokens, flat or in tiers by the prompt's length, a request
+priced, its reply included, at the tier its prompt fell in (`expcore.config.price_table`, C24).
 """
 
 from __future__ import annotations
@@ -32,7 +40,9 @@ from typing import Any
 
 from expcore.config.loading import ConfigError, Section, close_match, load_toml
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
-from expcore.config.prices import Price
+from expcore.config.price_table import read_price
+from expcore.config.prices import Price, TieredPrice
+from expcore.models.served import MIXED_FINGERPRINTS
 
 BACKENDS = ("openai_compat", "anthropic", "stub")  # the backends the core builds; a plugin's factory serves others
 STATUSES = ("frozen", "draft")
@@ -116,11 +126,18 @@ class ModelSpec:
     echo_reasoning_field: str | None = None  # openai_compat: assistant-message field the reasoning is sent back in
     extra_body: dict[str, Any] = dataclasses.field(default_factory=dict)  # vendor extras sent verbatim (B14)
     prompt_cache_ttl: str | None = None  # anthropic: cache lifetime ("5m" or "1h"); None sends no cache marker
-    price: Price | None = None  # dollars per million tokens; None with free=False is an unknown cost (C12)
+    price: Price | TieredPrice | None = None  # dollars per million tokens, flat or by prompt tier (C24); None with
+    # free=False is an unknown cost (C12)
     free: bool = False  # a model that costs nothing per token (hosted by the study): priced without a price
+    # the deployments' fingerprints the study declares the same model (B18); () checks against a baseline (C16)
+    accepted_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        """Refuse an entry whose settings break a rule, before any request can be built from it."""
+        """Keep the accepted fingerprints sorted, then refuse an entry whose settings break a rule, before any request
+        can be built from it."""
+        accepted = self.accepted_fingerprints
+        if isinstance(accepted, list | tuple) and all(isinstance(f, str) for f in accepted):
+            object.__setattr__(self, "accepted_fingerprints", tuple(sorted(accepted)))
         problems = _rule_problems(self)
         if problems:
             raise RuleViolation(self.key, problems)
@@ -185,6 +202,29 @@ def _rule_problems(spec: ModelSpec) -> list[str]:
     problems += _endpoint_problems(spec)
     problems += _limit_problems(spec)
     problems += _request_problems(spec)
+    problems += _fingerprint_problems(spec)
+    return problems
+
+
+def _fingerprint_problems(spec: ModelSpec) -> list[str]:
+    """Rules for the declared set of accepted fingerprints (B18): distinct, single, non-empty fingerprints, on a
+    backend whose replies carry one."""
+    accepted = spec.accepted_fingerprints
+    if not isinstance(accepted, tuple) or not all(isinstance(f, str) and f.strip() for f in accepted):
+        return ["accepted_fingerprints must be a list of non-empty strings"]
+    problems = [
+        f"accepted_fingerprints lists {f!r} twice" for f in sorted({f for f in accepted if accepted.count(f) > 1})
+    ]
+    problems += [
+        f"accepted_fingerprints entry {f!r} holds several fingerprints joined by {MIXED_FINGERPRINTS.strip()!r}; list "
+        "each on its own"
+        for f in accepted
+        if MIXED_FINGERPRINTS in f
+    ]
+    if accepted and spec.backend == "anthropic":
+        problems.append(
+            "accepted_fingerprints cannot apply to an anthropic model: its adapter records no system fingerprint"
+        )
     return problems
 
 
@@ -327,6 +367,22 @@ class ModelTable:
                 "or mark it free = true if it costs nothing per token; a study run needs a known cost to enforce its budget"
             )
 
+    def require_context_window(self, names: Iterable[str]) -> None:
+        """Refuse a campaign with a budget whose models, other than free ones, do not all declare `context_tokens`.
+
+        The budget reserves for each run the request it can make past its token cap, and only the context window
+        bounds that request's prompt (C25).
+        """
+        missing = [spec.key for spec in map(self.resolve, names) if not spec.free and spec.context_tokens is None]
+        if missing:
+            raise ConfigError(
+                f"{self.source}: no context window for model(s) {', '.join(map(repr, missing))}: with a budget "
+                "(max_usd), each run "
+                "is reserved what it can cost, including the one request it can send just under its token cap and end "
+                "past it, whose prompt only the context window bounds; give each model context_tokens = <the "
+                "endpoint's context window in tokens>, or mark it free = true if it costs nothing per token"
+            )
+
     def require_keys(self, names: Iterable[str], env: Mapping[str, str] | None = None) -> None:
         """Check at startup that the key of every named model can be read; the values are discarded."""
         for name in names:
@@ -355,8 +411,8 @@ _ENTRY_KEYS = (
     "prompt_cache_ttl",
     "price",
     "free",
+    "accepted_fingerprints",
 )
-_PRICE_KEYS = ("input_per_mtok", "output_per_mtok", "cache_write_per_mtok", "cache_read_per_mtok")
 
 
 def _flag(section: Section, key: str) -> bool:
@@ -365,29 +421,6 @@ def _flag(section: Section, key: str) -> bool:
     if not isinstance(value, bool):
         raise section.fail(key, f"must be true or false, got {type(value).__name__}")
     return value
-
-
-def _price(section: Section) -> Price | None:
-    """Read the optional `price` table; its input and output prices are required, and a failure names the key."""
-    table = section.table("price")
-    if not table:
-        return None
-    where = section.section("price")
-    where.reject_unknown(_PRICE_KEYS)
-    values: dict[str, float] = {}
-    for name in _PRICE_KEYS:
-        if name in table:
-            value = table[name]
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                raise where.fail(name, f"must be a number of dollars per million tokens, got {type(value).__name__}")
-            values[name] = float(value)
-    for name in ("input_per_mtok", "output_per_mtok"):
-        if name not in values:
-            raise where.fail(name, "is required in a price table")
-    try:
-        return Price(**values)
-    except ValueError as error:
-        raise section.fail("price", str(error)) from None
 
 
 def _backend_first(backend: str) -> list[str]:
@@ -444,14 +477,27 @@ def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
         "echo_reasoning_field": section.optional_string("echo_reasoning_field"),
         "extra_body": section.table("extra_body"),
         "prompt_cache_ttl": section.optional_string("prompt_cache_ttl"),
-        "price": _price(section),
+        "price": read_price(section),
         "free": _flag(section, "free"),
+        "accepted_fingerprints": _accepted(section),
     }
+
+
+def _accepted(section: Section) -> tuple[str, ...]:
+    """Read the optional set of accepted fingerprints (B18); a key that lists none is refused, as it declares nothing."""
+    accepted = section.strings("accepted_fingerprints")
+    if "accepted_fingerprints" in section.data and not accepted:
+        raise section.fail("accepted_fingerprints", "must list at least one fingerprint; leave it out to declare none")
+    return accepted
 
 
 def load_models(path: str | os.PathLike[str]) -> ModelTable:
     """Load and validate `models.toml`; fail at once, naming the file and the key, on the first bad entry."""
-    data = load_toml(path)
+    return parse_models(load_toml(path), path)
+
+
+def parse_models(data: Mapping[str, Any], path: str | os.PathLike[str]) -> ModelTable:
+    """Validate the parsed TOML of a model table, whose messages name `path` as its file."""
     root = Section(data, path, "(file)")
     root.reject_unknown(["models"])
     table = root.table("models")

@@ -28,7 +28,7 @@ from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import LoopResult, TurnRecord
 from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
-from expcore.models.adapters import ModelBackend
+from expcore.models.adapters import ModelBackend, ModelTurn
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
@@ -45,7 +45,10 @@ from expcore.records.schema import (
     SchemaVersion,
     fields_of,
     first_turn_rule,
+    optional_in,
+    reply_count_rule,
     target_rule,
+    unread_replies,
 )
 from expcore.records.seal import mark_unverified, seal
 
@@ -130,7 +133,8 @@ def outcome_entry(
     the fault injector recorded it as injected (`injected`). Then it is a scored final attempt and the record is not
     set aside. A failure before the first turn is never treatment, except under `first_turn_rule=False`, the rule of
     schema version 1, which a replay of a version-1 record keeps. `with_target` is False for a version before 3, whose
-    outcome has no target field.
+    outcome has no target field. The target is optional in version 3: an outcome that names none has no `infra_target`,
+    never a null.
     """
     defect = outcome.defect
     entry = {
@@ -148,10 +152,10 @@ def outcome_entry(
             injected=injected,
         ),
     }
-    if with_target:
+    if outcome.infra_target is not None:
+        if not with_target:
+            raise RecordError("the outcome names a target, which a record of a version before 3 cannot hold")
         entry["infra_target"] = outcome.infra_target
-    elif outcome.infra_target is not None:
-        raise RecordError("the outcome names a target, which a record of a version before 3 cannot hold")
     return entry
 
 
@@ -196,7 +200,26 @@ def call_entry(call: Any) -> dict[str, Any]:
     return entry
 
 
-def turn_entry(index: int, captured: Captured, settings_sha256: str, loop_turn: TurnRecord) -> dict[str, Any]:
+def usage_entry(turn: ModelTurn, schema_version: str) -> dict[str, Any]:
+    """Return the usage of one turn as a record of `schema_version` keeps it: without a field a later version added,
+    and without an optional field the turn did not report (None), which stays absent and is never written as a null or
+    a zero."""
+    usage = {
+        "input_tokens": turn.input_tokens,
+        "output_tokens": turn.output_tokens,
+        "uncached_input_tokens": turn.uncached_input_tokens,
+        "cache_creation_input_tokens": turn.cache_creation_input_tokens,
+        "cache_read_input_tokens": turn.cache_read_input_tokens,
+        "extra": None if turn.usage_extra is None else dict(turn.usage_extra),
+        "extra_cut": turn.usage_extra_cut,
+    }
+    held, optional = fields_of("usage", schema_version), optional_in("usage", schema_version)
+    return {name: v for name, v in usage.items() if name in held and not (v is None and name in optional)}
+
+
+def turn_entry(
+    index: int, captured: Captured, settings_sha256: str, loop_turn: TurnRecord, schema_version: str = CURRENT
+) -> dict[str, Any]:
     """Return one model turn as the record keeps it: the neutral and the native message, and what surrounded them."""
     turn = captured.turn
     return {
@@ -211,13 +234,7 @@ def turn_entry(index: int, captured: Captured, settings_sha256: str, loop_turn: 
         "request_sha256": "",  # filled in by `seal`, over the redacted conversation
         "settings_sha256": settings_sha256,
         "stop_reason": turn.stop_reason,
-        "usage": {
-            "input_tokens": turn.input_tokens,
-            "output_tokens": turn.output_tokens,
-            "uncached_input_tokens": turn.uncached_input_tokens,
-            "cache_creation_input_tokens": turn.cache_creation_input_tokens,
-            "cache_read_input_tokens": turn.cache_read_input_tokens,
-        },
+        "usage": usage_entry(turn, schema_version),
         "latency_s": turn.latency_s,
         "served_model": turn.served_model,
         "system_fingerprint": turn.system_fingerprint,
@@ -360,7 +377,7 @@ def _build_record(
     sets: dict[str, Any] = {}
     turns = []
     for index, c in enumerate(captured):
-        turns.append(turn_entry(index, c, digest(c.settings), result.turns[index]))
+        turns.append(turn_entry(index, c, digest(c.settings), result.turns[index], schema_version))
         sets[digest(c.settings)] = c.settings
     failed = None
     if recording.failure is not None:
@@ -402,7 +419,8 @@ def _build_record(
             "malformed_calls": result.malformed_calls,
             "malformed_events": plain(result.malformed_events),
             "tokens_used": result.tokens_used,
-            "usage_incomplete": result.usage_incomplete,
+            "usage_incomplete": result.usage_incomplete
+            or (reply_count_rule(schema_version) and unread_replies(result.backend_info.get("usage_seen"), len(turns))),
             "agent_s": result.agent_s,
             "elapsed_s": result.elapsed_s,
             "infra_wait_s": result.infra_wait_s,

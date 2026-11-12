@@ -13,7 +13,6 @@ import time
 import pytest
 from fake_host import FakeHost
 from fault_support import FakeServices, faults_table, injector_for
-from platform_support import NOW, write_platform
 from sandbox_support import FAST, add_sandbox
 
 from expcore.campaign.lease import LeasePool
@@ -22,6 +21,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
 from expcore_onedata.sandbox.provider import SandboxPlatform
 from expcore_onedata.sandbox.registry import Registry
+from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.users import GROUP, TokenJournal
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}

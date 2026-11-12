@@ -202,6 +202,9 @@ class RecordedBackend:
             served_model=entry["served_model"],
             system_fingerprint=entry["system_fingerprint"],
             retries=tuple(copy.deepcopy(entry["retries"])),
+            # absent in the record stays absent (None): a record of version 1 or 2, or an older writer of version 3
+            usage_extra=dict(usage["extra"]) if "extra" in usage else None,
+            usage_extra_cut=usage.get("extra_cut"),
         )
 
     async def _raise_failure(self, failed: dict[str, Any]) -> None:
@@ -248,7 +251,7 @@ class RecordedBackend:
         return copy.deepcopy(self._conversation)
 
     async def probe(self) -> None:
-        """Nothing to probe."""
+        """Nothing to probe: a replay is never admitted, so it reports no usage."""
 
     async def aclose(self) -> None:
         """Nothing to release."""

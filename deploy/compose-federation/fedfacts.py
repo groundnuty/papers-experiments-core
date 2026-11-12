@@ -1,0 +1,178 @@
+"""What up writes into the root for an integrator, and what the day-0 report records of a deployment.
+
+facts.json holds the addresses, ids and names a platform.toml needs, the declared layout's name, digest and memory
+limits, and the root's allowed parent; never a secret, since credentials are named by their files. platform.toml is
+rendered from the layout's template with those facts. `describe` gives the deployment's table for the day-0 report.
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+
+from fedboot import Bootstrap
+from feddocker import gib
+from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout
+from fedspec import Spec
+
+PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
+
+
+def root_parent(layout: Layout) -> dict:
+    """Where the root was allowed to lie, and which setting said so: the day-0 report records it."""
+    return {
+        "path": str(layout.parent),
+        "set_by": "default" if layout.parent_is_default else "EXPCORE_FED_ROOT_PARENT",
+    }
+
+
+def baseline_files(spec: Spec) -> dict | None:
+    """The study space's baseline files a check may read, or None when the study space is declared `baseline = false`:
+    it holds none, so a check that reads one has nothing to read there. `spaces.<name>.baseline` says which other
+    spaces keep theirs."""
+    if not spec.space(spec.study_space).baseline:
+        return None
+    return {"content": CONTENT_FILE, "listing_directory": LISTING_DIR, "listing_entries": LISTING_ENTRIES}
+
+
+def baseline_left_behind(layout: Layout) -> list[str]:
+    """The spaces the recorded facts show were brought up with baseline files and the layout now declares
+    `baseline = false`: up on a federation that is up writes and removes none, so those files would stay where an agent
+    can read them. Facts from before the flag was recorded count as having had the files; a space the facts do not list
+    had none; no facts.json (a first up) means nothing was written."""
+    if not layout.facts.is_file():
+        return []
+    try:
+        recorded = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]
+        had_files = {name: space.get("baseline", True) for name, space in recorded.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError(
+            f"{layout.facts.name} cannot be read as the facts up writes ({type(error).__name__})"
+        ) from None
+    return [s.name for s in layout.spec.spaces if not s.baseline and had_files.get(s.name, False)]
+
+
+def facts_of(boot: Bootstrap) -> dict:
+    """What an integrator needs to write platform.toml: addresses, ids, names and where the credentials are.
+
+    It holds no secret: the credentials are named by their files."""
+    spec, ids = boot.layout.spec, boot.ids
+    return {
+        "layout": {
+            "file": spec.source,
+            "sha256": spec.digest,
+            "project": spec.project,
+            "memory_limits": {service.name: service.memory_limit for service in spec.services},
+        },
+        "zone": {"url": spec.zone.url, "domain_on_project_network": spec.zone.domain},
+        "providers": {
+            p.name: {"url": p.url, "id": ids.providers[p.name], "domain_on_project_network": p.domain}
+            for p in spec.providers
+        },
+        "spaces": {
+            s.name: {
+                "id": ids.spaces[s.name],
+                "owner": s.owner,
+                "mirrors": list(s.mirrors),
+                "supported_by": list(s.supporters),
+                "agent_visible": s.agent_visible,
+                "baseline": s.baseline,
+            }
+            for s in spec.spaces
+        },
+        "study_space": spec.study_space,
+        "data_provider": spec.holder,
+        "principals": {
+            p.name: {
+                "user_id": ids.users[p.name],
+                "privileges": list(p.privileges),
+                "spaces": list(p.spaces),
+                "agent": p.agent,
+            }
+            for p in spec.principals
+        },
+        "credentials": {
+            "admin_access_token_file": "secrets/admin.token",
+            "user_password_directory": "secrets/users",
+            "user_password_file_pattern": "{user}.pass",
+        },
+        "ca_file": "ca/federation-ca.pem",
+        "files": baseline_files(spec),
+        "paths_relative_to": "the directory holding this file",
+        "root_parent": root_parent(boot.layout),
+    }
+
+
+def placeholders(facts: dict) -> dict[str, str]:
+    """The values a platform template names, by placeholder."""
+    values = {"zone_url": facts["zone"]["url"], "space_name": facts["study_space"]}
+    for name, provider in facts["providers"].items():
+        values[f"provider_url.{name}"] = provider["url"]
+        values[f"provider_id.{name}"] = provider["id"]
+    for name, space in facts["spaces"].items():
+        values[f"space_id.{name}"] = space["id"]
+    for user, principal in facts["principals"].items():
+        values[f"user_id.{user}"] = principal["user_id"]
+    return values
+
+
+def render(template: str, values: dict[str, str]) -> str:
+    """Fill every placeholder of the template; refuse one that has no value."""
+    missing = sorted({m for m in PLACEHOLDER.findall(template) if m not in values})
+    if missing:
+        raise RuntimeError(f"the platform template names {len(missing)} placeholder(s) the facts do not hold")
+    return PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
+
+
+def write_facts(layout: Layout, boot: Bootstrap) -> str:
+    """Write facts.json, and platform.toml when the layout names a template; say which were written."""
+    facts = facts_of(boot)
+    layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    template = layout.spec.platform_template
+    if template is None:
+        return "facts.json written; the layout names no platform_template, so no platform.toml"
+    write_private(layout.platform, render(template.read_text(encoding="utf-8"), placeholders(facts)))
+    return "facts.json and platform.toml written"
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a file of mode 0600, tightening one that exists, never through a symbolic link: platform.toml says where
+    the credentials are."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
+
+
+def describe(layout: Layout) -> str:
+    """The declared layout and the root, as the rows of the day-0 report's table of the deployment."""
+    spec = layout.spec
+    parent = root_parent(layout)
+    rows = [
+        ("Layout", f"`{spec.source}`, SHA-256 `{spec.digest[:16]}`"),
+        ("Compose project", f"`{spec.project}`, domain `{spec.domain}`"),
+        ("Root parent", f"`{parent['path']}` ({parent['set_by']})"),
+        ("Root", f"`{layout.root}`"),
+        ("Onezone", f"`{spec.zone.name}` on 127.0.0.1:{spec.zone.port}, memory limit {spec.zone.memory_limit}"),
+        *((f"Oneprovider `{p.name}`", f"127.0.0.1:{p.port}, memory limit {p.memory_limit}") for p in spec.providers),
+        *(
+            (
+                f"Space `{s.name}`" + (" (study space)" if s.name == spec.study_space else ""),
+                f"owner `{s.owner}`, mirrors {', '.join(f'`{m}`' for m in s.mirrors) or 'none'}, "
+                f"support {gib(s.support_bytes)} each"
+                + ("" if s.agent_visible else "; day-0 only, no agent user")
+                + ("" if s.baseline else "; no baseline files"),
+            )
+            for s in spec.spaces
+        ),
+        *(
+            (
+                f"Principal `{p.name}`",
+                f"{', '.join(p.privileges)} in {', '.join(f'`{s}`' for s in p.spaces)}"
+                + ("" if p.agent else "; not an agent user"),
+            )
+            for p in spec.principals
+        ),
+        ("Memory limits together", f"{gib(spec.memory_bytes)} for {len(spec.services)} services"),
+    ]
+    return "\n".join(["| Fact | Value |", "|---|---|", *(f"| {fact} | {value} |" for fact, value in rows)])

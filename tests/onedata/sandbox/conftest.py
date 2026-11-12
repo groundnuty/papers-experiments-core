@@ -7,8 +7,15 @@ from types import SimpleNamespace
 
 import pytest
 from fake_host import FakeHost
-from platform_support import BASELINE, CREDENTIALS_DIR, configured_values, write_platform
-from sandbox_support import SLOT_USERS, add_sandbox, configured_sandbox_values
+from platform_support import configured_values
+from sandbox_support import (
+    FED_NETWORK,
+    FED_SUBNET,
+    SLOT_USERS,
+    add_federation,
+    add_sandbox,
+    configured_sandbox_values,
+)
 
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
@@ -17,6 +24,7 @@ from expcore_onedata.sandbox import reap, teardown
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.testing import BASELINE, CREDENTIALS_DIR, write_platform
 from expcore_onedata.tokencheck import TokenRefused
 from expcore_onedata.users import Slots, load_slots
 
@@ -50,6 +58,20 @@ def world(tmp_path):
     for ref in (s.agent, s.gate, s.oneclient):
         host.add_image(ref.name, ref.id)
     host.oneclient_images.add(s.oneclient.id)
+    return SimpleNamespace(host=host, config=config, s=s, registry=Registry(), tmp_path=tmp_path)
+
+
+@pytest.fixture
+def fed_world(tmp_path):
+    """The `world`, with `[sandbox.federation]` in the platform document and the federation's own network on the host:
+    a network the federation's deployment made, which carries no label of the sandbox's."""
+    config = load_platform(write_platform(tmp_path, add_federation), require_secrets=False)
+    s = config.sandbox
+    host = FakeHost()
+    for ref in (s.agent, s.gate, s.oneclient):
+        host.add_image(ref.name, ref.id)
+    host.oneclient_images.add(s.oneclient.id)
+    host.networks[FED_NETWORK] = {"id": "f" * 12, "subnet": FED_SUBNET, "labels": {}, "args": []}
     return SimpleNamespace(host=host, config=config, s=s, registry=Registry(), tmp_path=tmp_path)
 
 
@@ -93,6 +115,27 @@ def _gate_log_leaks(root, values: list[str]) -> list[tuple[str, str]]:
     return leaks
 
 
+SERVED_TABLES = ("files", "listings")  # the tables of the bytes served (O22), keyed by ids the agent's requests named
+
+
+def _agent_chosen(meta: dict) -> tuple[dict, list[str]]:
+    """The metadata without what the agent's requests chose, and those values: the file and directory ids that key the
+    tables of the bytes served and the paths that name them, the agent's own as the gate log's request fields are. Each
+    is matched whole, as `_gate_log_leaks` matches those (a configured mount path such as `/data` is a substring of
+    every API path); everything else in a row is scanned as the rest of the metadata is."""
+    served = meta.get("served_bytes")
+    if not isinstance(served, dict):
+        return meta, []
+    asked: list[str] = []
+    tables = {}
+    for name in SERVED_TABLES:
+        rows = served.get(name)
+        if isinstance(rows, dict):
+            asked += [str(v) for row_id, row in rows.items() for v in (row_id, row.get("path"))]
+            tables[name] = [{k: v for k, v in row.items() if k != "path"} for row in rows.values()]
+    return meta | {"served_bytes": served | tables}, asked
+
+
 def _written_logs_and_records(root):
     """The files the sandbox code writes as logs and records, wherever a test put them: the teardown logs and the
     reaper's records. (The gate's request log is not among them: it holds the paths the agent asked for, its own.)"""
@@ -109,6 +152,7 @@ def _no_sandbox_output_holds_a_configured_value(monkeypatch, tmp_path):
     image, a pool, a path, a login, a level). They name keys, roles and positions instead, and a tool's stderr by its
     size and SHA-256."""
     found: list[tuple[str, str]] = []
+    asked: list[str] = []  # the values in the metadata the agent's requests chose (`_agent_chosen`)
 
     def recording(original):
         def init(self, *args, **kwargs):
@@ -124,7 +168,9 @@ def _no_sandbox_output_holds_a_configured_value(monkeypatch, tmp_path):
 
     def recording_metadata(self):
         out = metadata(self)
-        found.append(("the metadata of a run", json.dumps(out, default=str)))
+        rest, chosen = _agent_chosen(out)
+        found.append(("the metadata of a run", json.dumps(rest, default=str)))
+        asked.extend(chosen)
         return out
 
     monkeypatch.setattr(DockerSandbox, "metadata", recording_metadata)
@@ -155,4 +201,7 @@ def _no_sandbox_output_holds_a_configured_value(monkeypatch, tmp_path):
     }
     for where, value in _gate_log_leaks(tmp_path, values + configured_values(tmp_path)):  # the hosts it serves too
         leaks.setdefault(where, []).append(value)
+    for value in values + configured_values(tmp_path):
+        if value in asked:
+            leaks.setdefault("an id or path of the bytes served in a run's metadata", []).append(value)
     assert not leaks, f"the output of the sandbox code holds configured values: {leaks}"

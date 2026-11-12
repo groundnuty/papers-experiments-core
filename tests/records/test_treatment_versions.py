@@ -7,7 +7,7 @@ from record_support import no_secrets_in_the_environment, record_run
 
 from expcore.errors import InfraError
 from expcore.records.record import RunRecord, decode
-from expcore.records.schema import CURRENT, RecordError, validate
+from expcore.records.schema import CURRENT, RecordError, first_turn_rule, validate
 from expcore.replay.replay import replay_record
 
 pytestmark = pytest.mark.usefixtures("no_secrets_in_the_environment")
@@ -24,10 +24,11 @@ def record_as(version, script):
     return record_run(script, ECHO, record_options={"treatment_kinds": ["knowledge"], "schema_version": version})
 
 
-def test_c01_new_records_are_version_three():
-    """C01: the current version is 3, and records are built as the current version."""
+def test_c01_new_records_are_the_current_version_and_it_keeps_the_first_turn_rule():
+    """C01: records are built as the current version (3, which adds usage fields and keeps version 2's rule)."""
     assert CURRENT == "expcore-record/3"
     assert record_run(AFTER_A_TURN, ECHO).schema_version == CURRENT
+    assert first_turn_rule(CURRENT) is first_turn_rule(V2) is True
 
 
 def test_c01_a_version_one_record_flags_treatment_by_the_declared_kind_alone():

@@ -14,7 +14,7 @@ from expcore.records import redact
 from expcore.records.build import RunIdentity, _record_attempt, record_attempt
 from expcore.records.record import RunRecord
 from expcore.records.redact import SECRET_NAME
-from expcore.records.schema import CURRENT, fields_of
+from expcore.records.schema import CURRENT
 from expcore.records.seal import seal
 
 CODE = {"commit": "c" * 40, "dirty": False, "source": "git", "stale": False, "why": None, "tree_sha256": "d" * 64}
@@ -79,7 +79,6 @@ def hand_made(**overrides: Any) -> RunRecord:
             "error_type": None,
             "defect": None,
             "treatment": False,
-            "infra_target": None,
         },
         "totals": {
             "rounds": 0,
@@ -100,8 +99,6 @@ def hand_made(**overrides: Any) -> RunRecord:
     }
     seal(fields)  # a hand-made record is consistent; a test that breaks it does so with an override
     fields.update(overrides)
-    if "outcome" not in overrides and "infra_target" not in fields_of("outcome", fields["schema_version"]):
-        fields["outcome"] = {k: v for k, v in fields["outcome"].items() if k != "infra_target"}  # added by version 3
     return RunRecord(**fields)
 
 

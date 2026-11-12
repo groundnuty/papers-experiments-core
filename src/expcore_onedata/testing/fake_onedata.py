@@ -9,7 +9,7 @@ onedatarestfsspec 25.0.0 / onedatafilerestclient 25.0.0 call:
   POST /api/v3/onezone/tokens/infer_access_token_scope
   POST /api/v3/oneprovider/lookup-file-id/{space}@{id}[/{path}]
   GET  /api/v3/oneprovider/data/{id}                 (attributes; JSON body lists them)
-  GET  /api/v3/oneprovider/data/{id}/children        (limit, token; nextPageToken, isLast)
+  GET  /api/v3/oneprovider/data/{id}/children        (limit, token; nextPageToken, isLast, ending as 25.0's do)
   GET  /api/v3/oneprovider/data/{id}/content         (Range -> 206 + Content-Range)
 
 Page size as measured on the real federation (#10): default 1000, `max_limit` 10000, and a larger
@@ -40,10 +40,21 @@ class Request:
     range: str | None
     token: str | None
     body: bytes = b""
-    run_headers: tuple = ()  # every X-dataset-192 header value received
 
 
 class MockOnedata:
+    """The REST surface above, served over a real local HTTP socket (`start`, `stop`, `.port`) from a fixed file set.
+
+    Models: the five calls listed in the module docstring, with the paging rule measured on the real federation, byte
+    ranges (206 with `Content-Range`, 416 past the end), file ids made from paths, the single token it accepts, and a
+    space whose providers (`providers`) and the ones that support it (`supports`) a test changes. Every request is in
+    `.requests`.
+
+    Does not model: writes, deletes, transfers or block maps (`FakeData` has them), tokens other than the one it was
+    given (a subclass adds the ones it issues), file times (always 0) and permissions (always 644), more than one
+    space, and symbolic links. The file set is fixed when the mock is made.
+    """
+
     SPACE_ID = "spmock0001"
     PROVIDER_ID = "prmock0001"
 
@@ -51,7 +62,7 @@ class MockOnedata:
         self,
         files: Mapping[str, bytes | pathlib.Path],
         *,
-        space_name: str = "dataset-176",
+        space_name: str = "test-space",
         zone_host: str = "onezone.mock",
         provider_host: str = "provider.mock",
         max_limit: int | None = 10000,
@@ -159,7 +170,6 @@ class MockOnedata:
                             self.headers.get("Range"),
                             tok,
                             body,
-                            tuple(self.headers.get_all("X-dataset-192") or ()),
                         )
                     )
                 if self.command == "POST" and u.path.endswith("/onezone/tokens/infer_access_token_scope"):
@@ -189,21 +199,28 @@ class MockOnedata:
                 self._err(404, "notFound", u.path)
 
             def _children(self, path, q, keys):
+                # A page ends as 25.0's were measured to: a token on every page, the last included; `isLast` true only
+                # on a page shorter than its limit, so a full page of the last entries is followed by an empty one; the
+                # page after a last page is a 400 posix eagain (fake_data.LISTING_END_FACTS).
                 names = outer._children(path)
                 limit = int(q.get("limit", 1000))
                 if outer.max_limit is not None and limit > outer.max_limit:
                     return self._err(400, "badValueNotInRange", f"limit must be <= {outer.max_limit}")
+                if limit < 1:
+                    return self._err(400, "badValueNotInRange", "limit must be >= 1")
+                if q.get("token", "").startswith("end-"):
+                    return self._err(400, "posix", {"errno": "eagain"})
                 start = int(q["token"]) if q.get("token") else 0
                 page = names[start : start + limit]
                 nxt = start + len(page)
-                last = nxt >= len(names)
+                last = len(page) < limit
                 pre = path + "/" if path else ""
                 self._json(
                     200,
                     {
-                        "children": [outer._attrs(pre + n, keys) for n in page],
+                        "nextPageToken": f"end-{nxt}" if last else str(nxt),
                         "isLast": last,
-                        "nextPageToken": None if last else str(nxt),
+                        "children": [outer._attrs(pre + n, keys) for n in page],
                     },
                 )
 

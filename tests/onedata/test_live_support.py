@@ -2,8 +2,9 @@
 
 import pytest
 from live_support import mint_for_condition
-from platform_support import BASELINE, CEILING_S, MANAGE, TOOLS
 
+from expcore_onedata.testing import BASELINE, CEILING_S, MANAGE
+from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
 from expcore_onedata.tokencheck import PrivilegesMismatch, TokenRefused
 
 

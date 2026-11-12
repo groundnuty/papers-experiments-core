@@ -16,11 +16,14 @@ attempt is discarded, and so are all the attempts of an exhausted run. Interrupt
 attempts are reported in their own rows of `discarded_usage`, never folded into one another.
 
 Infrastructure retries are grouped by the kind from the closed vocabulary in `expcore.errors`, each under its own name
-(C02). `infrastructure_by_condition` adds, per condition and kind, how many attempts were set aside and run again and
-how many were scored as treatment, with the kinds each condition declares, so a reader sees whether a condition's
-fault was measured or re-run away. Field names are generic: a run is named by its key, its condition, its model and its
-factor values. The file is written to a temporary file in its directory and moved into place, so a reader sees the old
-file or the new one; it is owner-only (0600), because an export can carry study data.
+(C02), per condition and model; an outage-discarded attempt is counted under the outage's kind.
+`infrastructure_by_condition` adds, per condition and kind, how many attempts were set aside and run again and how many
+were scored as treatment, with the kinds each condition declares, so a reader sees whether a condition's fault was
+measured or re-run away. `budget_holds` counts, per condition and model the plan runs (a row of zeros for a pair with
+none), the attempts a budget hold ended (C26), by the kind of their own outcome, so an outage that overlapped one does
+not hide it. Field names are generic: a run is named by its key, its condition, its model and its factor values. The
+file is written to a temporary file in its directory and moved into place, so a reader sees the old file or the new
+one; it is owner-only (0600), because an export can carry study data.
 
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
 an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
@@ -42,6 +45,20 @@ set aside, not a population analysed. Without `excluded` the export has none of 
 `excluded_attempts` counts them with the other lists of runs.
 
 Empty lists are valid and must be written out: `read_export` rejects a file with a missing key.
+
+A campaign with a model that declares accepted fingerprints (B18, `expcore.campaign.identity`) also exports
+`deployment_shares`: per such model, each declared fingerprint (and any other its analysed turns carried) with the
+analysed turns and runs it served, their fractions, and whether the admission probe or a run confirmed it. The
+fractions of turns are over the turns of the model's analysed runs that recorded their mix; those of runs are over
+those runs, and a run served by two deployments counts for both, so they can add up to more than 1. `mixed_runs`
+counts the runs served by more than one, and `runs_without_mix` the analysed runs whose attempt recorded none (one
+recovery committed from its marker). A campaign without such a model has no `deployment_shares`, so its export is
+the one it had before the key.
+
+A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
+`spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
+budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
+export has no such key, and every byte of it is what it was before shards existed.
 """
 
 import collections
@@ -54,8 +71,10 @@ from contextlib import AbstractContextManager
 from pathlib import Path, PurePath
 from typing import Any, Protocol
 
+from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
-from expcore.errors import CORE_KINDS
+from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
+from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
 FORMAT = "campaign-export-1"
 RUN_LISTS = ("exhausted_runs", "unfinished_runs", "analysed_attempts")
@@ -67,6 +86,7 @@ REQUIRED_KEYS = (
     "discarded_usage",
     "retries_by_kind",
     "infrastructure_by_condition",
+    "budget_holds",
     "kinds",
 )
 _DISCARDED_STATES = ("infra_fail", "outage_discarded", "interrupted", "harness_error")
@@ -115,8 +135,11 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         for attempt in store.q("SELECT * FROM attempts ORDER BY id"):
             attempts[attempt["run_key"]].append(attempt)
         identities = {run["run_key"]: _identity(store, run) for run in runs}
+        declared = store.q("SELECT value FROM meta WHERE key=?", (ACCEPTED_META,))
+        shard = _shard_facts(store)
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
+    scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
     for run in runs:
         who, tried = identities[run["run_key"]], attempts[run["run_key"]]
         if run["status"] == "infra_exhausted":
@@ -155,6 +178,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                     **_dispatch(done[0]),
                 }
             )
+            scored.append((who["factors"]["model"], done[0]))
         else:
             raise ExportError(f"run {run['run_key']}: unknown status {run['status']!r}")
     unknown = sorted(set(left_out) - {entry["run_key"] for entry in left})
@@ -172,12 +196,46 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         "infrastructure_by_condition": _infrastructure_by_condition(
             identities, attempts, store.schema.treatment_kinds, None if excluded is None else frozenset(left_out)
         ),
+        "budget_holds": _budget_holds(identities, attempts),
         "kinds": _study_kinds(attempts, store.schema.treatment_kinds),
     }
+    if declared:  # only a campaign with a declared set has the key (B18)
+        try:
+            data["deployment_shares"] = deployment_shares(json.loads(declared[0]["value"]), scored)
+        except (ValueError, DeploymentsUnreadable) as error:
+            raise ExportError(f"the store's {ACCEPTED_META} cannot be exported: {error}") from None
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
+    if shard is not None:
+        data[EXPORT_KEY] = shard
     return data
+
+
+def _shard_facts(store: RunState) -> dict[str, Any] | None:
+    """What the store pinned when its campaign started as a shard, for the export; None for an unsharded campaign.
+
+    The campaign's meta table holds the facts as JSON text (`campaign.shard_run`). A store that holds the spec but not
+    every other fact was not written by a shard's start, and the export says so rather than guess.
+    """
+    held = {
+        row["key"]: row["value"]
+        for row in store.q(
+            "SELECT key, value FROM meta WHERE key IN (?,?,?,?)",
+            (META_SHARD, META_STARTED, META_ENVIRONMENT, META_SHARES),
+        )
+    }
+    if META_SHARD not in held:
+        return None
+    missing = [key for key in (META_STARTED, META_ENVIRONMENT, META_SHARES) if key not in held]
+    if missing:
+        raise ExportError(f"the store records a shard but not {', '.join(missing)}")
+    return {
+        "spec": json.loads(held[META_SHARD]),
+        "started_utc": held[META_STARTED],
+        "environment_identity": json.loads(held[META_ENVIRONMENT]),
+        "shares": json.loads(held[META_SHARES]),
+    }
 
 
 def batch_relative(run_dir: str | None) -> str | None:
@@ -291,6 +349,22 @@ def _retries_by_kind(identities: dict[str, dict], attempts: dict[str, list[Any]]
     return [
         {"condition": condition, "model": model, "kind": kind, "state": state, "charged": charged, "attempts": n}
         for (condition, model, kind, state, charged), n in sorted(counts.items(), key=_none_last)
+    ]
+
+
+def _budget_holds(identities: dict[str, dict], attempts: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    """Count the attempts a budget hold ended, per condition and model, with a row of zeros for each pair the plan runs.
+
+    An attempt is counted by the kind of its own outcome, `infra_kind`, whatever outage overlapped it: `retries_by_kind`
+    counts an outage-discarded attempt under the outage's kind, which would hide that the budget stopped it (C26).
+    """
+    counts = collections.Counter({(who["condition"], who["factors"]["model"]): 0 for who in identities.values()})
+    for key, tried in attempts.items():
+        who = identities[key]
+        counts[(who["condition"], who["factors"]["model"])] += sum(a["infra_kind"] == BUDGET_HOLD for a in tried)
+    return [
+        {"condition": condition, "model": model, "attempts": n}
+        for (condition, model), n in sorted(counts.items(), key=_none_last)
     ]
 
 

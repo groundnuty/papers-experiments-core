@@ -2,9 +2,8 @@
 
 import json
 
+import httpx
 import pytest
-from placement_support import BETA_ID, with_placement
-from platform_support import write_platform
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient
@@ -21,6 +20,8 @@ from expcore_onedata.day0.runner import (
     run,
     run_checks,
 )
+from expcore_onedata.testing import BETA_ID, with_placement, write_platform
+from expcore_onedata.testing.fake_federation import ZONE
 
 NAMES = ("reachability", "health", "tokens", "content_type", "listing", "read_only", "round_trip")
 
@@ -77,6 +78,7 @@ def test_a_check_is_registered_once():
 
 
 def test_the_read_only_checks_pass_against_a_conforming_federation(context, fake):
+    fake.add_file("item.bin", b"x")  # a space that holds something: an empty one measures nothing for the listing
     entries = by_name(run_checks(context(), ["reachability", "health", "tokens", "listing"]))
     # the fixed tool-server user holds the baseline only, so the condition that needs more is not checked with it
     assert {n: e.ok for n, e in entries.items()} == {
@@ -91,7 +93,7 @@ def test_the_read_only_checks_pass_against_a_conforming_federation(context, fake
 
 def test_every_condition_passes_when_the_fixed_user_matches_its_rights(context, fake):
     """Tokens: with a user whose rights equal every condition's, each plane is minted and examined."""
-    from platform_support import BASELINE
+    from expcore_onedata.testing import BASELINE
 
     fake.grant("u-tools", BASELINE)
     entries = by_name(run_checks(context(), ["tokens"]))
@@ -131,6 +133,37 @@ def test_a_listing_is_read_by_the_servers_pages_and_two_at_a_time_and_the_two_ag
     assert entry.facts["providers"]["alpha"]["pages"] >= 2
 
 
+def test_an_empty_listing_is_unknown_naming_the_missing_baseline_never_a_pass(context, fake):
+    """A study space declared baseline = false holds nothing until a study ingests: a root with no entry has nothing to
+    list or to walk page by page, so the listing check reports unknown, which is not a pass, and says why."""
+    entry = by_name(run_checks(context(), ["listing"]))["listing"]
+    assert entry.ok is None
+    assert "no entry on 2 supporting provider(s): alpha, beta" in entry.summary
+    assert "no baseline file is in the space" in entry.summary
+    assert {row["entries"] for row in entry.facts["providers"].values()} == {0}
+
+
+def test_a_study_space_with_no_baseline_files_fails_no_check_and_passes_none_that_needs_them(context, fake):
+    """The baseline-off study space through the whole run: the checks that read no file of the space are as they are
+    on any space (the two that change state work on a scratch file of their own and remove it) and the listing is
+    unknown. The content type reads the configured check file, which a baseline-off space lacks: it is unknown when a
+    data path is REST (test_o05_the_check_is_a_day0_check_too, and the day-0 health check in test_precampaign.py), and
+    unknown here too, where none is and it measures nothing. Nothing fails for want of a file and nothing passes on
+    one."""
+    assert [n for n in fake.nodes.values() if n.parent is not None] == []
+    entries = by_name(run_checks(context(allow_mutation=True)))
+    assert {n: e.ok for n, e in entries.items()} == {
+        "reachability": True,
+        "health": True,
+        "tokens": None,  # the fixed tool-server user holds the baseline rights only, as in every run here
+        "content_type": None,  # no data path is REST here, so nothing is measured (O08)
+        "listing": None,
+        "read_only": True,
+        "round_trip": True,
+    }
+    assert [n for n in fake.nodes.values() if n.name.startswith("day0-")] == []
+
+
 def test_o11_without_consent_the_checks_that_change_state_are_unknown_and_send_nothing(context, fake):
     """O11: a check that would change state does nothing without consent, and reports unknown."""
     entries = by_name(run_checks(context(allow_mutation=False), ["read_only", "round_trip"]))
@@ -146,9 +179,11 @@ def test_the_consent_is_the_variable_set_to_exactly_one():
 
 
 def test_read_only_enforcement_passes_when_every_write_is_refused(context, fake):
+    """O05: every provider refuses the read-only token's write as Onedata 25.0 does, 400 posix eacces: a refusal."""
     entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
     assert entry.ok is True
-    assert {row["status"] for row in entry.facts["providers"].values()} == {403}
+    rows = entry.facts["providers"].values()
+    assert {(row["status"], row["code"], row["errno"]) for row in rows} == {(400, "posix", "eacces")}
     assert not [c for c in fake.provider_calls if c[1] in ("PUT", "DELETE")]
 
 
@@ -160,8 +195,100 @@ def test_read_only_enforcement_fails_when_a_write_is_accepted_and_the_write_is_r
     assert [n.name for n in fake.nodes.values() if n.name.startswith("day0-")] == []
 
 
+def refusing_the_gates_name_read(fake):
+    """A transport on which Onezone answers the gate's read of the space's name with 400 `badValueNotAllowed`, the
+    answer the gate's own lookup got on Onedata 25.0 when it asked for a path; everything else is the fake's."""
+
+    def handler(request):
+        if request.method == "GET" and request.url.path == f"{ZONE}/spaces/{fake.SPACE_ID}":
+            return httpx.Response(400, json={"error": {"id": "badValueNotAllowed", "details": {}}})
+        return fake.respond(request)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("cause", ["the gate's lookup", "the space root"])
+def test_o08_a_write_that_was_never_sent_makes_read_only_unknown_because_the_probe_could_not_run(
+    context, platform, fake, cause
+):
+    """O08, O05: when the gate's own read of the target's space fails, or the space root cannot be read, no write is
+    sent, so nothing was refused or accepted. The check is unknown and says the probe could not run and no write was
+    sent, never that a write was not refused with a 401 or 403."""
+    options = {"allow_mutation": True}
+    if cause == "the gate's lookup":
+        options["client"] = OnezoneClient(load_config(platform), http=refusing_the_gates_name_read(fake))
+    else:
+        fake.statuses = [[f"/spaces/{fake.SPACE_ID}", 99, 503]]
+    entry = by_name(run_checks(context(**options), ["read_only"]))["read_only"]
+    assert entry.ok is None
+    assert "could not run" in entry.summary
+    assert "no write was sent" in entry.summary
+    assert "not refused" not in entry.summary
+    assert {row["sent"] for row in entry.facts["providers"].values()} == {False}
+    assert mutating_calls(fake) == []
+
+
+def test_o08_a_write_answered_neither_way_is_unknown_and_says_it_was_sent(context, fake):
+    """O08: a write that was sent and answered with neither an acceptance nor a 401 or 403 (here a 500) is unknown,
+    and the summary says the write was sent and how it was answered."""
+    fake.statuses = [["/children", 99, 500]]
+    entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
+    assert entry.ok is None
+    assert "was sent" in entry.summary
+    assert "but 500 internalServerError" in entry.summary
+    rows = entry.facts["providers"].values()
+    assert {(row["sent"], row["status"], row["code"]) for row in rows} == {(True, 500, "internalServerError")}
+
+
+@pytest.mark.parametrize(
+    ("answer", "refused"),
+    [
+        ((400, "posix", "eacces"), True),  # how Onedata 25.0 refuses it
+        ((400, "posix", "eperm"), None),  # the same id with another errno
+        ((400, "posix", None), None),
+        ((400, "badValueNotAllowed", None), None),  # another 400
+    ],
+)
+def test_o05_a_write_refused_as_400_posix_eacces_is_a_refusal_and_no_other_400_is(context, fake, answer, refused):
+    """O05: Onedata 25.0 refuses a write made with the read-only token as 400 posix with errno eacces, and that exact
+    answer is a refusal, so the check passes. Another errno of the same id, none, or another 400 is not: the check is
+    unknown, with the answer as it came."""
+    fake.readonly_answer = answer
+    entry = by_name(run_checks(context(allow_mutation=True), ["read_only"]))["read_only"]
+    assert entry.ok is refused
+    assert {row["enforced"] for row in entry.facts["providers"].values()} == {refused}
+    assert mutating_calls(fake)  # the writes were sent
+    assert not [c for c in fake.provider_calls if c[1] in ("PUT", "DELETE")]
+
+
+def test_o11_an_accepted_write_whose_directory_reads_400_posix_enoent_is_cleaned(context, fake):
+    """O11: when a broken enforcement accepts the write, its directory is deleted and read until gone; on Onedata
+    25.0 a deleted entry reads 400 posix enoent, which is absence as a 404 is, so the clean-up is confirmed."""
+    fake.enforce_readonly = False
+    fake.answer_missing_as_25()
+    entry, rows = read_only_rows(context)
+    assert entry.ok is False  # the write was accepted: that is the failure
+    assert {row["cleaned"] for row in rows} == {True}
+    assert [n.name for n in fake.nodes.values() if n.name.startswith("day0-")] == []
+
+
+@pytest.mark.parametrize("answer", [(400, "posix", "eacces"), (400, "badValueNotAllowed", None), (400, None, None)])
+def test_o11_an_accepted_write_whose_directory_reads_any_other_400_is_not_cleaned(context, fake, ticker, answer):
+    """O11: after the delete, an answer that is neither a 404 nor 400 posix enoent (another errno, another 400, a body
+    that is no error object) is not absence. The reads go on to their bound and the directory is reported not cleaned,
+    never removed."""
+    fake.enforce_readonly = False
+    fake.answer_missing_as_25(answer)
+    began = ticker.clock()
+    entry, rows = read_only_rows(context)
+    assert entry.ok is False
+    assert {row["cleaned"] for row in rows} == {False}
+    assert {row["cleanup_reason"] for row in rows} == {"the entry could not be read to confirm that it is gone"}
+    assert ticker.clock() - began >= 2 * 5.0  # each provider's reads went on to their bound, with pauses
+
+
 def attribute_reads(fake):
-    """The reads of the scratch directory itself: a GET of its entry that is not the gate's read of its path."""
+    """The reads of the scratch directory itself: a GET of its entry that is not one of the gate's reads."""
     return [r for r in fake.requests if r.method == "GET" and "/fid-" in r.path and not r.query]
 
 
@@ -225,6 +352,35 @@ def test_o11_the_round_trip_places_confirms_reads_back_evicts_and_cleans_up(cont
     assert not [c for c in fake.provider_calls if c[1] == "POST" and c[2] == "/transfers" and c[0] == "prmock0001"]
 
 
+def test_o11_the_round_trip_accepts_held_bytes_that_cover_the_range_read_and_records_both(context, fake):
+    """O11: on Onedata 25.0 reading half of the 8 KiB scratch file through the receiver places all of it, and an
+    eviction right after completes with nothing evicted. The round trip passes when the block map covers the range
+    read, records the bytes held (8192) beside the bytes read (4096) with the held ranges, and evicts again until the
+    receiver holds nothing."""
+    fake.onthefly_unit = 1 << 20
+    fake.evictions_noop_first = 1
+    entry = by_name(run_checks(context(allow_mutation=True), ["round_trip"]))["round_trip"]
+    assert entry.ok is True, entry.summary
+    assert (entry.facts["range_bytes"], entry.facts["held_bytes"]) == (4096, 8192)
+    assert entry.facts["held_ranges"] == [[0, 8192]]
+    assert entry.facts["eviction_attempts"] == 2
+    assert entry.facts["cleanup_verified"] is True
+
+
+@pytest.mark.parametrize("answer", [(404, "notFound", None), (400, "posix", "enoent")])
+def test_o07_the_round_trip_waits_for_the_receiver_to_see_its_scratch_file(context, fake, answer):
+    """O07: as on Onedata 25.0, the receiver sees the scratch file written through the data provider only after some
+    reads (404 or 400 posix enoent meanwhile). The round trip waits, bounded, before it reads through the receiver,
+    and passes."""
+    fake.unseen_after_create = {BETA_ID: 3}
+    fake.unseen_answer = answer
+    fake.answer_missing_as_25()
+    entry = by_name(run_checks(context(allow_mutation=True), ["round_trip"]))["round_trip"]
+    assert entry.ok is True, entry.summary
+    assert entry.facts["steps"] == ["created", "placed", "read back", "evicted"]
+    assert entry.facts["cleanup_verified"] is True
+
+
 def test_o11_a_round_trip_that_raises_still_tears_down_and_says_so(context, fake):
     """O11: a trip that fails after creating the scratch file still removes it, in a finally, and verifies it."""
     fake.onthefly_places = False  # the placement fails after the scratch file exists
@@ -271,6 +427,7 @@ def test_an_unknown_check_name_is_a_usage_error(context):
 
 
 def test_run_writes_a_dated_report_in_json_and_markdown_with_unknown_apart(platform, fake, tmp_path, ticker):
+    fake.add_file("item.bin", b"x")
     client = OnezoneClient(load_config(platform), http=fake.client_http())
     code, json_path, md_path = run(
         platform,
@@ -286,7 +443,8 @@ def test_run_writes_a_dated_report_in_json_and_markdown_with_unknown_apart(platf
     assert json_path.name == "day0-20270115T080000Z.json"
     assert md_path.name == "day0-20270115T080000Z.md"
     report = json.loads(json_path.read_text())
-    assert report["counts"] == {"pass": 4, "fail": 0, "unknown": 3}  # content_type passes: no data path is REST
+    # content_type is unknown: no data path is REST, so it measured nothing, which is never a pass (O08)
+    assert report["counts"] == {"pass": 3, "fail": 0, "unknown": 4}
     assert [c["name"] for c in report["checks"]] == list(NAMES)
     text = md_path.read_text()
     assert "## Blocked or unknown" in text

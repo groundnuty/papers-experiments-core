@@ -9,7 +9,10 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   directory and the scope study.toml names, and every record carries it. Its environment (the distributions the
   study's code imports, `provenance.environment`) goes into the campaign fingerprint, so a resume under another one
   is refused (C06). Each hold is said on stderr once, as it begins, changes or ends, with when dispatch resumes, so a
-  run waiting out a pause is not silent.
+  run waiting out a pause is not silent. With a `shard` (#154) it runs that shard's part of the plan: the fingerprint
+  is still computed from the totals, of the whole plan, and only then are the caps and the budget replaced by the
+  shard's shares and the plugin's environment identity read, once. A shard says its environment on stderr as it
+  starts (`campaign.shard_run.environment_block`), so a host that differs from the others shows before it runs.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -17,15 +20,19 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
   table and imports nothing, unless a record needs it, and says so first: a kind still unknown imports the modules
   `[study] platforms` names, and a backend no native parser is registered for also imports the plugin module, so
   what is registered there is known in a new process. `build` is not called, so no model or key is needed.
-  It refuses to run under another environment than the campaign's, and records the one it ran under.
+  It refuses to run under another environment than the campaign's, and records the one it ran under. The side
+  files study.toml declares (`[[study.side_files]]`) are found in the batch it parses, hashed with the records and
+  paired each with the record beside it (`replay.side_files`), and the check records the declaration.
 - `analyse_study` refuses unless the batch has a current passing check (R04, R05), made under the environment in use
-  and the campaign's (the snapshot's fingerprint), and writes nothing. It then uses
-  only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once and compared
-  with the check's hash, cross-validated against each other. It exports from the snapshot, scores the records in
-  memory (a record is never written after its check, since that would change its hash) and runs the preregistered
-  analysis. Every score is
-  derived anew from a record on each call and none is read back: `scores.json` is an output, so `analyze` is how a
-  study is re-scored (R13), offline, after a change to a scorer and a new check (a scorer is code the identity covers).
+  and the campaign's (the snapshot's fingerprint) and under the study's declaration of side files, and writes nothing.
+  It then uses only bytes the check verified (`study.verified`): the snapshot and the replayed records, each read once
+  and compared with the check's hash, cross-validated against each other, and each side file paired with its record
+  again. It exports from the snapshot, scores the records in memory (a record is never written after its check, since
+  that would change its hash) and runs the preregistered analysis. A scorer that takes `side_files` is handed the
+  record's side files as the bytes `load_verified` read and verified, all of them before the plugin is loaded, so
+  no scorer runs on a batch that does not verify. Every score is derived anew from a record on each call and none is
+  read back: `scores.json` is an output, so `analyze` is how a study is re-scored (R13), offline, after a change to a
+  scorer and a new check (a scorer is code the identity covers).
 - `output_bytes` is the one place the bytes of `export.json`, `scores.json`, `analysis.json` and `report.md` are made;
   `write_analysis` and `write_report` write them and `regenerate` compares them with the files in `out/`, which is
   what a replication package's `make check` runs. Every time in them comes from the records and the store, every
@@ -48,10 +55,14 @@ from expcore.accounting import condition_accounting
 from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.lease import LeasePool
-from expcore.campaign.manifest import build_fingerprint
+from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
+from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard import ShardError, ShardSpec, check_identity
+from expcore.campaign.shard_run import ShardStart, environment_block, share_settings
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
@@ -65,6 +76,7 @@ from expcore.replay.check import (
     require_current_check,
     verify_batch,
     what_records_need,
+    with_side_files,
     write_check,
 )
 from expcore.replay.native import has_native_parser
@@ -122,6 +134,15 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 
+def model_digest(spec: ModelSpec) -> str:
+    """The digest of a model entry in the campaign fingerprint: every field of it, its declared set of accepted
+    fingerprints only when it declares one (B18), so an entry without one keeps the digest it had before the key."""
+    entry = dataclasses.asdict(spec)
+    if not entry["accepted_fingerprints"]:
+        del entry["accepted_fingerprints"]
+    return _digest(entry)
+
+
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
     """The environment of the study's code: the core and what `[study] requires` names, with their requirements."""
     try:
@@ -146,7 +167,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
     return build_fingerprint(
         study.schema,
         tasks={task.id: _digest(dict(task.attributes)) for task in study.tasks.values()},
-        models={key: _digest(dataclasses.asdict(study.models.resolve(key))) for key in study.campaign.models},
+        models={key: model_digest(study.models.resolve(key)) for key in study.campaign.models},
         seeds=study.campaign.seeds,
         caps=study.campaign.caps(),
         prompts=plugin.prompts,
@@ -165,6 +186,7 @@ def run_study(
     allow_dirty: bool = False,
     code_root: str | os.PathLike[str] | None = None,
     crash_hook: Callable[[str, str], None] | None = None,
+    shard: ShardSpec | None = None,
 ) -> RunSummary:
     """Open or resume the study's campaign and run the scheduler until nothing more can start.
 
@@ -172,11 +194,13 @@ def run_study(
     no run is in flight and every pending run is held by something that will not end by itself (a budget, a stop):
     a command line has no one to release it. Every backend is built by the plugin's `backend_factory`, or the core's
     when it supplies none. `crash_hook` is the scheduler's own test seam for killing the process at a chosen point of
-    an attempt.
+    an attempt. With `shard` the campaign is that shard of N: its part of the plan, its shares of the caps and the
+    budget, and the environment identity the plugin gives, kept in the store (`campaign.shard_run`); a shard that has
+    no run, or whose share of a total is nothing, is refused before the store is touched.
     """
     study = load_study(path)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
-        return _run_campaign(study, allow_dirty, code_root, crash_hook)
+        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard)
 
 
 def _run_campaign(
@@ -184,6 +208,7 @@ def _run_campaign(
     allow_dirty: bool,
     code_root: str | os.PathLike[str] | None,
     crash_hook: Callable[[str, str], None] | None,
+    shard: ShardSpec | None = None,
 ) -> RunSummary:
     """Run the campaign of a loaded study, with its own infrastructure kinds in scope."""
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
@@ -191,12 +216,17 @@ def _run_campaign(
     out = out_dir(study)
     leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
+    fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
+    manifest, started = study.manifest, None
+    if shard is not None:
+        manifest, settings, started = _shard_of(study, plugin, settings, shard)
+        print(environment_block(shard, fingerprint["environment"]), file=sys.stderr)  # before a store can refuse it
     options = {} if crash_hook is None else {"crash_hook": crash_hook}
     with Scheduler(
         out,
         study.schema,
-        study.manifest,
-        fingerprint_of(study, plugin),
+        manifest,
+        fingerprint,
         plugin.executor,
         agent_config=study.campaign.agent,
         models=study.models,
@@ -208,9 +238,52 @@ def _run_campaign(
         admission=plugin.admission,
         backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
         on_hold=_say_hold,
+        shard=started,
         **options,
     ) as scheduler:
         return scheduler.run()
+
+
+def _shard_of(
+    study: StudyConfig, plugin: StudyPlugin, settings: SchedulerConfig, spec: ShardSpec
+) -> tuple[Manifest, SchedulerConfig, ShardStart]:
+    """A shard's part of the plan, its shares of the caps and the budget and the identity it runs against.
+
+    Every refusal is made here, before the store is opened: a shard with no run, a total smaller than the number of
+    shards (the message names the key) and an environment identity that the plugin cannot give or that is not names
+    mapped to SHA-256 digests (the message names the plugin).
+    """
+    manifest = shard_manifest(study.manifest, spec)
+    if not manifest.rows:
+        raise Refused(
+            f"shard {spec.index} of {spec.count} gets no run of this plan: there are fewer pairs of task, model and "
+            "seed than shards; run with fewer shards"
+        )
+    try:
+        shared, shares = share_settings(settings, spec)
+    except ShardError as error:
+        raise Refused(str(error)) from None
+    return manifest, shared, ShardStart(spec, _identity_of(study, plugin), shares)
+
+
+def _identity_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, str]:
+    """The plugin's environment identity, read once and checked; empty when it declares none.
+
+    The plugin's own function can raise, and what it returns can be of a form no identity has: each is a refusal that
+    names the plugin's file (by its name, not the path of this machine), not a traceback.
+    """
+    if plugin.environment_identity is None:
+        return {}
+    where = f"{study.plugin_file.name}: the plugin's environment_identity()"
+    try:
+        given = plugin.environment_identity()
+    except Exception as error:  # the plugin is the study's code, and whatever it raises is the study's to fix
+        detail = f": {error}" if str(error) else ""
+        raise Refused(f"{where} raised {type(error).__name__}{detail}") from error
+    try:
+        return check_identity(given)
+    except ShardError as error:
+        raise Refused(f"{where} gave an unusable identity: {error}") from None
 
 
 def _say_hold(line: str) -> None:
@@ -264,7 +337,9 @@ def _check_batch_of(
         running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
         raise Refused(str(error)) from None
-    check = verify_batch(directory, code=code, hashed_only=list(HASHED_ONLY), environment=env)
+    check = verify_batch(
+        directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
+    )
     check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
     write_check(directory, check)
     return check
@@ -278,7 +353,7 @@ def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
     that fails its record. A record that names a backend no parser is registered for also imports the plugin, whose
     code is the study's own. A batch that needs neither imports nothing.
     """
-    needs = what_records_need(batch, HASHED_ONLY)
+    needs = what_records_need(batch, with_side_files(HASHED_ONLY, study.side_files))  # a side file is no record
     if needs.kinds and study.platforms:
         print(
             f"check: importing the study's platforms ({', '.join(study.platforms)}) to read the records of "
@@ -296,7 +371,7 @@ def _import_what_the_records_need(study: StudyIdentity, batch: Path) -> None:
         file=sys.stderr,
     )
     import_platforms(study.study_file, study.platforms)
-    import_plugin_module(study.plugin_file, error_text=False)
+    import_plugin_module(study, error_text=False)
 
 
 def _json_text(data: Any) -> str:
@@ -397,8 +472,9 @@ def _analyse_loaded(
             rerun_command=f"python -m expcore check {batch}",
             environment=env,
             compare_sources=not stamped,
+            side_files=study.side_files,
         )
-        verified = load_verified(batch, check, study.schema, partial=partial)
+        verified = load_verified(batch, check, study.schema, partial=partial, side_files=study.side_files)
     except (BatchNotVerified, Unverified) as error:
         raise Refused(str(error)) from None
     rows = verified.snapshot.q("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,))
@@ -413,10 +489,11 @@ def _analyse_loaded(
         verified.snapshot.close()
     rows, scores = [], {}
     for entry in export["analysed_attempts"]:
-        record = verified.record_for(entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
+        where = (entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
+        record = verified.record_for(*where)
         if record is None:  # load_verified guarantees one for every attempt it did not exclude
             raise Refused(f"no verified record for {entry['run_key']}")
-        scored = rescore(record, plugin.scorers)
+        scored = rescore(record, plugin.scorers, side_files=verified.side_files_for(*where))
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
@@ -431,9 +508,11 @@ def _analyse_loaded(
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
-    Holm decision."""
+    Holm decision. `exploratory_only` is true when the preregistration makes no confirmatory claim (S12): there is then
+    no Holm decision, and every contrast is exploratory."""
     return {
         "preregistration": dict(analysis.result.manifest),
+        "exploratory_only": analysis.result.exploratory_only,
         "alpha": analysis.result.alpha,
         "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
         "core_version": analysis.core_version,

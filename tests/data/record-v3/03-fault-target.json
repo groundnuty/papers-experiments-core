@@ -1,11 +1,10 @@
 {
  "schema_version": "expcore-record/3",
- "run_key": "task=task-a|access=relay|model=m1|seed=1",
+ "run_key": "task=task-a|model=model-a|seed=0",
  "factors": {
   "task": "task-a",
-  "access": "relay",
-  "model": "m1",
-  "seed": 1
+  "model": "model-a",
+  "seed": 0
  },
  "attempt": 1,
  "treatment_kinds": [
@@ -36,12 +35,12 @@
    "template_sha256": null,
    "slots": null
   },
-  "tools_sha256": "a2fde5c56e9eb315b23e06f4563d8c95c4a3f1e20bbc601c162b6eecdd870fb1"
+  "tools_sha256": "a18d966ea9e37c3058f1d274c457a8a810b11a3dc1dfeeb0b4fdea80316440af"
  },
  "tools": [
   {
-   "name": "fetch",
-   "description": "The fetch tool.",
+   "name": "echo",
+   "description": "The echo tool.",
    "input_schema": {
     "type": "object",
     "properties": {
@@ -88,7 +87,7 @@
     "tool_calls": [
      {
       "id": "call_1_0",
-      "name": "fetch",
+      "name": "echo",
       "arguments": {
        "x": "1"
       },
@@ -105,7 +104,7 @@
       "id": "call_1_0",
       "type": "function",
       "function": {
-       "name": "fetch",
+       "name": "echo",
        "arguments": "{\"x\": \"1\"}"
       }
      }
@@ -115,7 +114,7 @@
     {
      "role": "tool",
      "tool_call_id": "call_1_0",
-     "content": "the first part"
+     "content": "echoed"
     }
    ],
    "request_sha256": "f86f4da3c86618770cf5929aaba0accd8bd097e6421f5f69ad7ec16f2fb3edc3",
@@ -134,77 +133,31 @@
    "retries": [],
    "waits_left_open": 0,
    "infra_wait_by_kind": {}
-  },
-  {
-   "index": 1,
-   "neutral": {
-    "text": "",
-    "reasoning": null,
-    "tool_calls": [
-     {
-      "id": "call_2_0",
-      "name": "fetch",
-      "arguments": {
-       "x": "2"
-      },
-      "parse_error": null,
-      "raw_arguments": null
-     }
-    ]
-   },
-   "native": {
-    "role": "assistant",
-    "content": null,
-    "tool_calls": [
-     {
-      "id": "call_2_0",
-      "type": "function",
-      "function": {
-       "name": "fetch",
-       "arguments": "{\"x\": \"2\"}"
-      }
-     }
-    ]
-   },
-   "tool_messages": [
-    {
-     "role": "tool",
-     "tool_call_id": "call_2_0",
-     "content": "skipped: not completed: this call failed and the attempt ended"
-    }
-   ],
-   "request_sha256": "effec9833677e6447f4e223528100e72b1d123a6c16945093c247b19bb0c49d1",
-   "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
-   "stop_reason": "tool_calls",
-   "usage": {
-    "input_tokens": 10,
-    "output_tokens": 3,
-    "uncached_input_tokens": null,
-    "cache_creation_input_tokens": null,
-    "cache_read_input_tokens": null
-   },
-   "latency_s": 0.0,
-   "served_model": null,
-   "system_fingerprint": null,
-   "retries": [],
-   "waits_left_open": 0,
-   "infra_wait_by_kind": {}
   }
  ],
- "failed_request": null,
+ "failed_request": {
+  "kind": "infra",
+  "infra_kind": "knowledge",
+  "detail": "the tool server went down",
+  "status": null,
+  "pattern": null,
+  "error_type": null,
+  "settings_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "request_sha256": "ed4596d332947950ab022e66c5124853a01d3cbdf74fd8b122ceba661b44a7e8"
+ },
  "tool_calls": [
   {
    "turn": 0,
    "round": 1,
    "call_id": "call_1_0",
-   "name": "fetch",
+   "name": "echo",
    "arguments": {
     "x": "1"
    },
    "status": "ok",
-   "text": "the first part",
-   "raw_text": "the first part",
-   "raw_chars": 14,
+   "text": "echoed",
+   "raw_text": "echoed",
+   "raw_chars": 6,
    "truncated": false,
    "error_class": null,
    "raw_arguments": null,
@@ -212,31 +165,6 @@
    "started_s": 0.0,
    "ended_s": 0.0,
    "detail": "",
-   "source_truncated": null,
-   "waits_left_open": 0,
-   "terminal": false,
-   "infra_wait_by_kind": {},
-   "rendering_verified": true
-  },
-  {
-   "turn": 1,
-   "round": 2,
-   "call_id": "call_2_0",
-   "name": "fetch",
-   "arguments": {
-    "x": "2"
-   },
-   "status": "failed",
-   "text": "skipped: not completed: this call failed and the attempt ended",
-   "raw_text": "skipped: not completed: this call failed and the attempt ended",
-   "raw_chars": 62,
-   "truncated": false,
-   "error_class": "skipped",
-   "raw_arguments": null,
-   "infra_wait_s": 0.0,
-   "started_s": 0.0,
-   "ended_s": 0.0,
-   "detail": "infrastructure: knowledge",
    "source_truncated": null,
    "waits_left_open": 0,
    "terminal": false,
@@ -266,14 +194,6 @@
    1000.0
   ],
   [
-   "before_tool",
-   1000.0
-  ],
-  [
-   "after_tool",
-   1000.0
-  ],
-  [
    "end",
    1000.0
   ]
@@ -288,10 +208,10 @@
   "infra_target": "servers[1]"
  },
  "totals": {
-  "rounds": 2,
+  "rounds": 1,
   "malformed_calls": 0,
   "malformed_events": [],
-  "tokens_used": 20,
+  "tokens_used": 7,
   "usage_incomplete": false,
   "agent_s": 0.0,
   "elapsed_s": 0.0,
@@ -305,8 +225,9 @@
  "instruments": {
   "fault_injector": {
    "ok": true,
-   "run_key": "task=task-a|access=relay|model=m1|seed=1",
+   "run_key": "task=task-a|model=model-a|seed=0",
    "attempt": 1,
+   "kind": "knowledge",
    "target": "servers[1]",
    "injections": [
     {
@@ -327,19 +248,23 @@
      "step": "injected",
      "at_s": 1.5,
      "target": "servers[1]",
-     "ok": true
+     "ok": true,
+     "identity_before_sha256": "6db7d803e74f1ffa7d8f5adc0bf95b3e15bf4c8373fffadf546227cc6c6742cb"
     },
     {
      "step": "cleared",
      "at_s": 40.0,
      "target": "servers[1]",
-     "ok": true
+     "ok": true,
+     "how": "restored"
     },
     {
      "step": "verified",
      "at_s": 52.5,
      "target": "servers[1]",
-     "ok": true
+     "ok": true,
+     "identity_changed": true,
+     "identity_after_sha256": "f39592393ef0859cb196a52693d2cea00fb2df784b3c04ae54aa7cadb8e562f8"
     }
    ]
   }

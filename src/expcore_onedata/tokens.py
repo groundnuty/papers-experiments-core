@@ -32,7 +32,7 @@ waits, and a token that expired at the cap plus a margin could end during one.
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -135,15 +135,28 @@ class TokenWindow:
     mint_ttl_s: int
 
 
-def data_path_spec(space_id: str, interface: str = "rest") -> PlaneSpec:
-    """The data path: read-only and scoped to the space; its principal holds exactly view and read."""
-    return PlaneSpec(Plane.DATA_PATH, BASELINE_RIGHTS, CaveatSpec(space_id, readonly=True, interface=interface))
+def _scope(spaces: str | Sequence[str]) -> str | tuple[str, ...]:
+    """One space's id as it is, or several as a tuple; a sequence of one is that one id, so a one-space token is the
+    same whichever way its space was named."""
+    if isinstance(spaces, str):
+        return spaces
+    ids = tuple(spaces)
+    return ids[0] if len(ids) == 1 else ids
 
 
-def tool_server_spec(space_id: str, condition: Condition) -> PlaneSpec:
-    """The tool server of a condition: its declared rights, read-only exactly when none of them writes."""
+def data_path_spec(space_id: str | Sequence[str], interface: str = "rest") -> PlaneSpec:
+    """The data path: read-only and scoped to its spaces (`PlatformConfig.space_ids`); its principal holds exactly
+    view and read in each."""
+    return PlaneSpec(Plane.DATA_PATH, BASELINE_RIGHTS, CaveatSpec(_scope(space_id), readonly=True, interface=interface))
+
+
+def tool_server_spec(space_id: str | Sequence[str], condition: Condition) -> PlaneSpec:
+    """The tool server of a condition, scoped to its spaces: its declared rights in each, read-only exactly when none
+    of them writes."""
     return PlaneSpec(
-        Plane.TOOL_SERVER, condition.rights, CaveatSpec(space_id, readonly=not condition.writes, interface="rest")
+        Plane.TOOL_SERVER,
+        condition.rights,
+        CaveatSpec(_scope(space_id), readonly=not condition.writes, interface="rest"),
     )
 
 
@@ -174,12 +187,12 @@ class TokenIssuer:
         self._config = config
         self._clock = clock
 
-    def _read_privileges(self, user_id: str) -> tuple[Any, Any]:
-        """Read a user's privileges in the study space, direct and effective.
+    def _read_privileges(self, user_id: str, space_id: str) -> tuple[Any, Any]:
+        """Read a user's privileges in one space, direct and effective.
 
         Both paths and the `privileges` key of the answer are confirmed by the source named in this file's header.
         """
-        space, user = quote(self._config.space.id, safe=""), quote(user_id, safe="")
+        space, user = quote(space_id, safe=""), quote(user_id, safe="")
         answers = [
             self._client.get(f"/spaces/{space}/{kind}/{user}/privileges") for kind in ("users", "effective_users")
         ]
@@ -189,16 +202,35 @@ class TokenIssuer:
             raise TokenRefused("the principal's privileges could not be read") from None
 
     def check_user(self, spec: PlaneSpec, user_id: str) -> None:
-        """Require the user to hold exactly the plane's rights, direct and effective, as Onezone reports them now.
+        """Require the user to hold exactly the plane's rights, direct and effective, in every space the plane's token
+        reaches, as Onezone reports them now; with several spaces a refusal names the space by its position.
 
         An answer that cannot be had raises `ExaminationFailed` (a `TokenRefused` that keeps the cause, so a caller can
         tell an outage from a refusal); one that differs from the plane's set raises `TokenRefused`.
         """
+        space_ids = spec.caveats.space_ids
+        if len(space_ids) == 1:
+            self._check_in(spec, user_id, space_ids[0])
+            return
+        for space_id in space_ids:
+            try:
+                self._check_in(spec, user_id, space_id)
+            except ExaminationFailed as failed:
+                raise ExaminationFailed(f"{self._position(space_id)}: {failed}", failed.error) from None
+            except TokenRefused as refused:  # PrivilegesMismatch or TokenRefused, each with a message alone
+                raise type(refused)(f"{self._position(space_id)}: {refused}") from None
+
+    def _check_in(self, spec: PlaneSpec, user_id: str, space_id: str) -> None:
+        """Require the plane's exact rights of the user in one space; raise as `check_user` says."""
         try:
-            direct, effective = self._read_privileges(user_id)
+            direct, effective = self._read_privileges(user_id, space_id)
         except PlatformError as error:
             raise ExaminationFailed(f"the principal's privileges could not be read ({error})", error) from None
         require_privileges(spec.rights, direct=direct, effective=effective)
+
+    def _position(self, space_id: str) -> str:
+        """Name a space for a message by its position in the file, `spaces[i]`, never by its id."""
+        return next((e.position for e in self._config.spaces if e.space.id == space_id), "an undeclared space")
 
     def check_principal(self, spec: PlaneSpec, principal: Principal) -> None:
         """Require the principal to hold exactly the plane's rights, direct and effective; refuse when unreadable."""
@@ -263,7 +295,7 @@ class TokenIssuer:
         The two users must differ by name and by id; the two tokens are checked to be different after minting. A
         refusal returns neither. With `valid_until` both tokens are minted with exactly that expiry (see `mint`).
         """
-        space = self._config.space.id
+        data_spaces, tool_spaces = (self._config.space_ids(plane) for plane in (Plane.DATA_PATH, Plane.TOOL_SERVER))
         if data is None and tool_server is None:
             raise ValueError("a run with neither a data path nor a tool server needs no token")
         if (
@@ -275,13 +307,13 @@ class TokenIssuer:
         data_token = (
             None
             if data is None
-            else self.mint(data_path_spec(space, interface), data, ceiling_s=ceiling_s, valid_until=valid_until)
+            else self.mint(data_path_spec(data_spaces, interface), data, ceiling_s=ceiling_s, valid_until=valid_until)
         )
         if tool_server is None:
             return RunTokens(data_token, None)
         principal, condition = tool_server
         tool = self.mint(
-            tool_server_spec(space, self._config.condition(condition)),
+            tool_server_spec(tool_spaces, self._config.condition(condition)),
             principal,
             ceiling_s=ceiling_s,
             valid_until=valid_until,

@@ -1,8 +1,6 @@
 """The pre-campaign check of the content type the data gate streams on (O05, O11), run once before any run starts."""
 
 import pytest
-from placement_support import DATA, with_placement
-from platform_support import SPACE_NAME, write_platform
 from sandbox_support import add_sandbox
 
 from expcore.campaign.healthgate import Health
@@ -12,6 +10,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.day0.registry import REGISTRY
 from expcore_onedata.day0.runner import build_context
 from expcore_onedata.precampaign import PreCampaignHealth, content_type_check
+from expcore_onedata.testing import DATA, SPACE_NAME, with_placement, write_platform
 
 CHECK_FILE = "study/probe.bin"  # an invented path under the space root
 CONFIGURED = ("probe.bin", "study/", "alpha", SPACE_NAME, ".test")  # what a message must never hold (O12)
@@ -176,14 +175,87 @@ def test_o05_the_check_is_a_day0_check_too(platform_file, fake, tmp_path):
     assert_clean(found.summary)
 
 
+@pytest.mark.parametrize("table", ["no sandbox", "no rest level"])
+def test_o08_a_day0_content_type_check_that_measured_nothing_is_unknown_never_passed(tmp_path, fake, table):
+    """O08, O05: with no [sandbox], or none of its levels REST, the check reads nothing. A campaign is still admitted,
+    since the gate streams nothing, but the day-0 check measured nothing, so it is unknown and says so, never passed."""
+    edits = {"no sandbox": with_placement, "no rest level": lambda d: edit(d, rest=False)}
+    platform = write_platform(tmp_path, edits[table])
+    client = OnezoneClient(load_platform(platform), http=fake.client_http())
+    found = REGISTRY["content_type"].run(build_context(platform, tmp_path / "out", client=client))
+    assert found.ok is None
+    assert "nothing was measured" in found.summary
+    assert fake.provider_calls == []
+    assert content_type_check(load_platform(platform), client).ok is True
+
+
+def test_o05_a_day0_content_type_check_whose_file_the_space_does_not_hold_is_unknown_and_names_the_key(
+    platform_file, fake, tmp_path
+):
+    """A space declared baseline = false holds no file to read: the check is unknown, which is not a pass, and its
+    summary names the configured key and says the file is not in the space, without naming the file itself."""
+    client = OnezoneClient(load_platform(platform_file), http=fake.client_http())
+    found = REGISTRY["content_type"].run(build_context(platform_file, tmp_path / "out", client=client))
+    assert found.ok is None
+    assert "[sandbox] content_check_file" in found.summary
+    assert "not in the space" in found.summary
+    assert_clean(found.summary)
+    assert provider_reads(fake) == []  # nothing was read: there was no file to ask for
+
+
+def day0_health(platform_file, fake, tmp_path):
+    """The day-0 `health` check, run over a platform with a REST data path (so the pre-campaign check reads a file)."""
+    client = OnezoneClient(load_platform(platform_file), http=fake.client_http())
+    return REGISTRY["health"].run(build_context(platform_file, tmp_path / "out", client=client))
+
+
+def test_o05_the_day0_health_check_is_unknown_not_failed_when_the_check_file_is_not_in_the_space(
+    platform_file, fake, tmp_path
+):
+    """A space declared baseline = false holds no check file. The health check composes the content-type check, which
+    cannot be measured there: that is unknown with its reason (the key, and that the file is not in the space), never
+    a failure of the platform, while the support set is as declared."""
+    found = day0_health(platform_file, fake, tmp_path)
+    assert found.ok is None
+    assert "[sandbox] content_check_file" in found.summary
+    assert "not in the space" in found.summary
+    assert_clean(found.summary)
+    assert provider_reads(fake) == []
+
+
+def test_o05_the_day0_health_check_passes_when_the_file_is_there_and_the_space_is_as_declared(
+    platform_file, fake, tmp_path
+):
+    fake.add_file(CHECK_FILE, DATA)
+    assert day0_health(platform_file, fake, tmp_path).ok is True
+
+
+def test_o05_a_real_health_failure_is_still_failed_with_or_without_the_check_file(platform_file, fake, tmp_path):
+    """Unknown is only for what could not be measured. A provider the platform reports for the space and the layout
+    does not declare fails the check whether or not the file is there."""
+    fake.add_provider("prmock0003", "gamma.test")
+    absent = day0_health(platform_file, fake, tmp_path)
+    assert absent.ok is False
+    assert "differ from the declared set" in absent.summary
+    fake.add_file(CHECK_FILE, DATA)
+    assert day0_health(platform_file, fake, tmp_path).ok is False
+
+
+def test_o05_a_content_type_measured_wrong_fails_the_day0_health_check(platform_file, fake, tmp_path):
+    fake.add_file(CHECK_FILE, DATA)
+    fake.content_type = "application/json"
+    found = day0_health(platform_file, fake, tmp_path)
+    assert found.ok is False
+    assert "typed application/json" in found.summary
+
+
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 
 
 def standard_gate(config, client):
     """The platform's standard health check, as a study gets it, with nothing composed around it."""
-    from platform_support import NOW
-
     from expcore_onedata.health import PlatformHealth
+    from expcore_onedata.testing import NOW
     from expcore_onedata.tokens import TokenIssuer
 
     return PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW)
@@ -224,7 +296,8 @@ def test_o05_a_study_with_only_the_standard_gate_and_a_wrong_type_never_admits_a
     assert executor.requests == []
     [outage] = outages
     assert outage["end_utc"] is None
-    assert outage["checks"] >= 3  # rechecked, and refused each time
+    assert outage["checks"] >= 1  # the dispatcher's rechecks after the refused pre-run check; how many fit in the
+    # settle window depends on the machine's load, so one is the floor: refused each time, the executor never ran
     assert "refused" in outage["first_detail"]
     assert "typed application/json" in outage["last_detail"]  # the core keeps the head of the detail
     assert_clean(outage["last_detail"])

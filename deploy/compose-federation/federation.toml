@@ -1,0 +1,40 @@
+# The default layout of the throwaway federation: what federation.py brings up without --layout.
+#
+# One Onezone and three Oneproviders. A study declares its own in a file of this form and passes it with
+# --layout PATH (see README.md, "Declaring a layout"); every name here is invented.
+
+project = "expcore-fed"          # the Compose project name: every container and network carries it, the root's mark holds it
+domain = "expcore-fed.test"      # under the reserved .test: it resolves only on the project's network
+study_space = "alpha-space"      # the space the core studies; its owner is the data provider
+memory_limit = "6g"              # per service, unless a service sets its own
+support_bytes = 10737418240      # each supporting provider's support of each space (10 GiB), unless a space sets its own
+platform_template = "platform.toml.template"  # relative to this file; up renders it into the root as platform.toml
+
+[zone]
+port = 29443                     # every port is published on 127.0.0.1 only
+
+[providers.pine]
+port = 29444
+
+[providers.birch]
+port = 29445
+
+[providers.cedar]
+port = 29446
+
+[spaces.alpha-space]
+owner = "pine"                   # its data is written through and kept on the owner
+mirrors = ["birch", "cedar"]     # other providers supporting it; reset --replicas evicts what they hold of it
+
+[spaces.beta-space]              # outside the study's prefix: a mutation must never reach it
+owner = "birch"
+mirrors = ["cedar"]
+
+[principals.alpha-reader]        # the data path's user; a member of the study space unless spaces = [...] says otherwise
+privileges = ["space_view", "space_read_data"]
+
+[principals.alpha-tools]         # a tool-server user, for a condition with the baseline rights
+privileges = ["space_view", "space_read_data"]
+
+[principals.alpha-health]        # the health check's user
+privileges = ["space_view", "space_read_data"]

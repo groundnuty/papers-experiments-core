@@ -12,7 +12,8 @@ hash of the same code, which a reader can recompute, and drops every source:
   field is free text under the format and no seal covers it (`records.seal` pins prompts, configuration, tools and
   settings), so no record format changes, and every digest a record holds stays valid;
 - the campaign snapshot's fingerprint and the replay check lose the environment's `sources`;
-- the replay check is made again over the rewritten records, so the claim that they replay is a fresh one, keeping
+- the replay check is made again over the rewritten records, under the original check's declaration of side files
+  (which pair as before: a side file's hash is not a commit), so the claim that they replay is a fresh one, keeping
   only the time of the original check, since the archive must not depend on when it was built (K06);
 - the tables and the report are derived again from the rewritten records and must be exactly the author's, with the
   commit replaced: a table the records do not give is refused here as it is everywhere;
@@ -55,7 +56,7 @@ from expcore.provenance.environment import without_sources
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.redact import Redactor
 from expcore.records.record import RunRecord, decode
-from expcore.replay.check import CHECK_FILE, inputs_sha256, verify_batch, write_check
+from expcore.replay.check import CHECK_FILE, inputs_sha256, recorded_side_files, verify_batch, write_check
 from expcore.study.pipeline import OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
 
 PREFIX_DIGITS = 12
@@ -174,7 +175,13 @@ def _anonymised_check(
     batch = parent / "batch"
     lay_out(batch, {path[len(BATCH) + 1 :]: data for path, data in files.items() if path.startswith(f"{BATCH}/")})
     (batch / CHECK_FILE).unlink()
-    made = verify_batch(batch, code=code, hashed_only=check.get("hashed_only_patterns") or (), environment=env)
+    made = verify_batch(
+        batch,
+        code=code,
+        hashed_only=check.get("hashed_only_patterns") or (),
+        environment=env,
+        side_files=recorded_side_files(check, f"{BATCH}/{CHECK_FILE}"),
+    )
     if made["failures"] or made["n_ok"] != check.get("n_ok") or made["n_records"] != check.get("n_records"):
         raise PackageError(f"{BATCH}/{CHECK_FILE}: the anonymised records do not pass the check the originals passed")
     made["checked_at"] = check.get("checked_at")

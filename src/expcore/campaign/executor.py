@@ -30,7 +30,7 @@ from expcore.prompt.templates import RenderedPrompt
 from expcore.records.build import DefectSink, PromptText, RunIdentity, record_attempt
 from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
-from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule
+from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule, unread_replies
 
 
 @dataclass(frozen=True)
@@ -168,21 +168,31 @@ def _total(turns: Sequence[Mapping[str, Any]], name: str) -> int | None:
     return sum(values) if values else None
 
 
+def turn_usage_of(turns: Sequence[Mapping[str, Any]]) -> tuple[tuple[int | None, ...], ...]:
+    """Each turn's counts as its record reported them: input tokens (the whole prompt), output tokens, cache writes,
+    cache reads; a count the turn did not report is None. A tiered price is applied to each request from these (C24)."""
+    names = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    return tuple(tuple((t.get("usage") or {}).get(name) for name in names) for t in turns)
+
+
 def outcome_of(entry: Mapping[str, Any]) -> Outcome:
     """Rebuild an outcome from the record's outcome section, its target included (none before version 3)."""
     return outcome_from_entry(entry)
 
 
 def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | None = None) -> AttemptResult:
-    """Return the store's result for a record: its outcome, tokens as the turns reported them, its treatment kinds and
-    targets, the turns it completed, the targets its fault injector recorded as injected in this attempt, and the
-    treatment flag it carries (the store checks that flag against its own decision).
+    """Return the store's result for a record: its outcome, tokens as the turns reported them (summed, and per turn),
+    its treatment kinds and targets, the turns it completed, the targets its fault injector recorded as injected in this
+    attempt, and the treatment flag it carries (the store checks that flag against its own decision).
 
-    A count no turn reported is unknown, and totals the loop knows to be short are marked incomplete (C05). The wall
-    time is the record's elapsed time unless the caller gives one.
+    A count no turn reported is unknown, and totals the loop knows to be short are marked incomplete (C05), and so are
+    totals that miss a billed reply the backend counted and could not read, whatever rule the record's version keeps
+    in its own totals (C26): the campaign charges such an attempt its bound. The wall time is the record's elapsed time
+    unless the caller gives one.
     """
     turns = record.transcript
     elapsed = record.totals.get("elapsed_s")
+    unread = unread_replies(record.route.get("usage_seen"), len(turns))
     return AttemptResult(
         outcome=outcome_of(record.outcome),
         ended_utc=ended_utc,
@@ -191,11 +201,12 @@ def result_from_record(record: RunRecord, *, ended_utc: str, wall_s: float | Non
         output_tokens=_total(turns, "output_tokens"),
         cache_creation_tokens=_total(turns, "cache_creation_input_tokens"),
         cache_read_tokens=_total(turns, "cache_read_input_tokens"),
-        usage_complete=not record.totals.get("usage_incomplete", False),
+        usage_complete=not record.totals.get("usage_incomplete", False) and not unread,
         treatment_kinds=tuple(record.treatment_kinds),
         model_turns=len(turns),
         recorded_treatment=bool(record.outcome["treatment"]),
         first_turn_rule=first_turn_rule(record.schema_version),
+        turn_usage=turn_usage_of(turns),
         target_rule=target_rule(record.schema_version),
         treatment_targets=dict(record.treatment_targets),
         injected_targets=tuple(injected_targets(record.instruments, record.run_key, record.attempt)),

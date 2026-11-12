@@ -97,6 +97,24 @@ def test_a_bad_study_file_is_refused_naming_file_and_key(tmp_path, edit, needle)
     assert needle in message
 
 
+@pytest.mark.parametrize(
+    ("line", "needle"),
+    [
+        ("seeds = [1]", "key 'seeds' is not a declared factor; declared: data_path, tools"),
+        ("seed = [1, 2]", "key 'seed' is built in; a condition assigns declared factors only"),
+        ('model = ["m1"]', "key 'model' is built in; a condition assigns declared factors only"),
+        ('tools = ["read"]', "key 'tools' must be a non-empty string, got list"),
+    ],
+)
+def test_r11_a_condition_key_is_checked_as_a_factor_before_its_value_is_typed(tmp_path, line, needle):
+    """R11: adds that a condition that tries to set replicates or a built-in factor, with a value of any type, is told
+    the key is no factor it may assign, rather than that a string would do; a declared factor keeps its type check."""
+    text = STUDY_TOML.replace('tools = "read"', line if line.startswith("tools") else f'tools = "read"\n{line}', 1)
+    with pytest.raises(ConfigError) as caught:
+        load_text(tmp_path, text)
+    assert str(caught.value) == f"{tmp_path / 'study.toml'}: [conditions.mount-read]: {needle}"
+
+
 def test_a_study_file_without_conditions_or_identity_is_refused(tmp_path):
     with pytest.raises(ConfigError, match=r"\[conditions\]: needs at least one condition"):
         load_text(tmp_path, '[identity]\norder = ["task", "model", "seed"]\n[conditions]\n')
@@ -278,8 +296,8 @@ def test_c02_the_kinds_an_unknown_kind_error_offers_are_the_treatable_ones(tmp_p
     with pytest.raises(ConfigError) as caught:
         load_factor_schema(path)
     offered = str(caught.value).split("treatable kinds: ", 1)[1].split(";", 1)[0].split(", ")
-    never = ("tool_plane_integrity", "post_check_unverified", "provider_tampered")
-    assert offered == [k for k in errors.infra_kinds() if k not in never]
+    untreatable = ("tool_plane_integrity", "budget_hold", "post_check_unverified", "provider_tampered")
+    assert offered == [k for k in errors.infra_kinds() if k not in untreatable]
     assert "post_check_unverified" not in offered  # the core's kind for a post-run check that verified nothing
     assert "[study] platforms" in str(caught.value)
     assert "[study.kinds]" in str(caught.value)

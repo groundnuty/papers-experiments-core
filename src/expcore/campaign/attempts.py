@@ -1,9 +1,9 @@
 # Provenance: new
 """The vocabulary of attempts: their states, how each is charged, which are treatment, and the store's refusals.
 
-Charging (C03). An attempt counts against the attempt limit only when the infrastructure failed and the cause was not
-the key's (`UNCHARGED_KINDS`) and no outage overlapped it. Interrupted, outage-discarded and harness-error attempts are
-never charged. The charge is decided once, when the attempt finishes, and stored in the row.
+Charging (C03). An attempt counts against the attempt limit only when the infrastructure failed, the cause was neither
+the key's nor the budget's (`UNCHARGED_KINDS`) and no outage overlapped it. Interrupted, outage-discarded and
+harness-error attempts are never charged. The charge is decided once, when the attempt finishes, and stored in the row.
 
 Treatment. A condition may declare infrastructure kinds that are its treatment (`FactorSchema.treatment_kinds`). An
 attempt that ends as infrastructure of such a kind, under that condition, is a scored final attempt: its state is
@@ -34,8 +34,10 @@ from expcore.loop.outcomes import Outcome
 
 STATES = ("running", "done", "infra_fail", "outage_discarded", "interrupted", "harness_error")
 RUN_STATUSES = ("pending", "done", "infra_exhausted", "harness_error")
-# An infrastructure failure the key caused, not the attempt's run: it holds the model but costs the run no attempt.
-UNCHARGED_KINDS = frozenset({"key_rejected"})
+# An infrastructure failure the key caused, not the attempt's run: it holds the model but costs the run no attempt. A
+# budget hold is the campaign's own decision not to pay for a request (C26): the run is set aside and run again, if the
+# budget lets it, under the same attempt number.
+UNCHARGED_KINDS = frozenset({"key_rejected", "budget_hold"})
 # How the lease an attempt ran under was obtained. A refused lease (every key quarantined, a timeout) starts no attempt
 # and so has no row: it is in the lease wait log and the event log. `none`: the run's condition needs no lease.
 LEASE_OUTCOMES = ("granted", "none")

@@ -3,10 +3,12 @@
 import importlib.machinery
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 from importlib import metadata
 from pathlib import Path
@@ -213,6 +215,29 @@ def test_k10_the_cores_own_wheel_built_from_this_checkout_matches_its_editable_i
     assert compare_supplied(metadata.distribution("papers-experiments-core"), True, name, data) == ()
 
 
+def test_k10_the_cores_wheel_holds_the_testing_package_because_the_build_includes_the_whole_platform_layer():
+    """K10: the platform layer's testing package ships in the core's wheel, its two runnable servers included, since the
+    build includes all of `src/expcore_onedata`; nothing of it is a test tree, and the core's runtime never loads it
+    (the import boundary test), so a distribution without the `onedata` extra still imports without it."""
+    root = Path(__file__).resolve().parents[2]
+    wheel = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["hatch"]["build"]["targets"][
+        "wheel"
+    ]
+    assert "src/expcore_onedata" in wheel["only-include"]
+    shipped = core_wheel_files()
+    for module in (
+        "__init__",
+        "fake_data",
+        "fake_federation",
+        "fake_onedata",
+        "fake_mcp_server",
+        "fake_onedata_mcp",
+        "world",
+    ):
+        assert f"expcore_onedata/testing/{module}.py" in shipped, module
+    assert not [name for name in shipped if name.startswith("expcore_onedata/testing/") and "conftest" in name]
+
+
 @pytest.mark.parametrize("member", ["expcore/examples/tiny_study/plugin.py", "expcore/examples/tiny_study/prompt.txt"])
 def test_k10_an_edited_example_file_in_the_cores_wheel_is_refused(member):
     """K10: the example the core's wheel maps in from the checkout is compared with the checkout's file, Python or
@@ -374,7 +399,14 @@ def test_k10_the_make_environment_target_installs_exactly_the_vendored_wheels_of
     (package / REQUIREMENTS).write_bytes(requirements([wheel]))
     python = f"{sys.version_info.major}.{sys.version_info.minor}"
     (package / "Makefile").write_bytes(makefile({"python": python, "distributions": {}}))
-    for option in ("--no-index", "--no-deps", "--require-hashes", "--isolated", "PIP_CONFIG_FILE=/dev/null"):
+    for option in (
+        "--no-index",
+        "--no-deps",
+        "--require-hashes",
+        "--isolated",
+        "--no-cache-dir",
+        "PIP_CONFIG_FILE=/dev/null",
+    ):
         assert option in MAKEFILE
     venv = tmp_path / "fresh"
     environ = {"PATH": "/usr/bin:/bin", "PIP_INDEX_URL": "http://127.0.0.1:9/simple", "HOME": str(tmp_path)}
@@ -439,4 +471,37 @@ def test_k10_the_install_ignores_the_readers_pip_environment_and_configuration(s
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert "absent" not in done.stdout + done.stderr
+    shutil.rmtree(venv, ignore_errors=True)
+
+
+def test_k10_the_install_neither_reads_nor_writes_the_readers_pip_cache(site, tmp_path):
+    """K10: the install is offline and pinned by hash, so a cache adds nothing; without --no-cache-dir pip still looks
+    at the reader's cache directory, and where it is not writable (a sandbox) warns that the cache was disabled, which
+    reads like a failure of the check."""
+    if os.geteuid() == 0:
+        pytest.skip("root can write to any directory, so pip finds no cache it cannot use")
+    name, data = repack(installed_distribution(site, "toy-platform", "2.0.0", CODE))
+    wheel = Wheel("toy-platform", "2.0.0", name, data, from_index=False)
+    package = tmp_path / "pkg"
+    (package / "wheels").mkdir(parents=True)
+    (package / wheel.path).write_bytes(wheel.data)
+    (package / REQUIREMENTS).write_bytes(requirements([wheel]))
+    python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    (package / "Makefile").write_bytes(makefile({"python": python, "distributions": {}}))
+    cache = tmp_path / "home" / ".cache" / "pip"
+    cache.mkdir(parents=True)
+    cache.chmod(0o500)  # exists and is not writable: what a reader's sandbox leaves
+    venv = tmp_path / "fresh"
+    try:
+        done = subprocess.run(
+            ["make", "-C", str(package), "-f", "Makefile", "environment", f"PYTHON={sys.executable}", f"VENV={venv}"],
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "home")},
+        )
+    finally:
+        cache.chmod(0o700)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stderr == "", done.stderr  # pip's warning is on stderr; make's own lines are not
+    assert list(cache.iterdir()) == []  # nothing was written into it either
     shutil.rmtree(venv, ignore_errors=True)

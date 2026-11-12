@@ -78,11 +78,17 @@ _ADDED_COLUMNS = (
     ("attempts", "dispatch_seq", "INTEGER"),  # place in the campaign's dispatch sequence; grows with every attempt
     ("attempts", "lease_wait_s", "REAL"),  # seconds waited for the lease the attempt ran under; NULL: none or unknown
     ("attempts", "lease_outcome", "TEXT"),  # how the lease was obtained (attempts.LEASE_OUTCOMES); NULL: unknown
-    (
-        "attempts",
-        "admission",
-        "TEXT",
-    ),  # what of the run admission the attempt held (attempts.ADMISSION_MODES); NULL: unknown
+    ("attempts", "turn_usage", "TEXT"),  # JSON: each turn's [input, output, cache writes, cache reads]; NULL: unknown
+    ("attempts", "topups", "INTEGER NOT NULL DEFAULT 0"),  # sends the token cap could not account for (C26)
+    ("attempts", "topup_usd", "REAL NOT NULL DEFAULT 0"),  # what they were charged, each its bound, never refunded
+    # the bound the run was reserved at dispatch (C27): 1 by the reply maximum, 0 by the window; NULL: not recorded
+    ("attempts", "reserved_capped", "INTEGER"),
+    # 1: usage_complete also says every reply the backend counted became a turn (C26); NULL: a row from before the check
+    ("attempts", "replies_checked", "INTEGER"),
+    # JSON [[fingerprint or null, turns], ...] of a model that declares accepted fingerprints (B18); NULL: none kept
+    ("attempts", "deployments", "TEXT"),
+    # what of the run admission the attempt held (attempts.ADMISSION_MODES); NULL: unknown
+    ("attempts", "admission", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -411,6 +417,7 @@ class Store:
         *,
         lease_wait_s: float | None = None,
         lease_outcome: str = "none",
+        reserved_capped: bool | None = None,
         admission: str = "none",
     ) -> BegunAttempt:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
@@ -418,11 +425,16 @@ class Store:
         The attempt number is one more than the run's charged attempts, so an interrupted or uncharged attempt is
         run again under the number it had. The row also takes the next place in the campaign's dispatch sequence (one
         more than the largest so far, in the same write transaction, so it grows with every attempt and a restart
-        carries on from where the dead process stopped) and the lease it runs under: how long it waited for it and
-        how it was obtained (`LEASE_OUTCOMES`), and what it held of the platform's run admission (`ADMISSION_MODES`).
+        carries on from where the dead process stopped), the lease it runs under: how long it waited for it and
+        how it was obtained (`LEASE_OUTCOMES`), the bound the budget gate reserved the run when it let it start:
+        by the reply maximum or by the window (`reserved_capped`, C27; None when no gate decided it), and what it held
+        of the platform's run admission (`ADMISSION_MODES`). An attempt whose usage turns out unknown is charged that
+        bound, at this start or any later one (`attempt_bounds`).
         """
         if lease_outcome not in LEASE_OUTCOMES:
             raise ValueError(f"lease_outcome {lease_outcome!r} must be one of: {', '.join(LEASE_OUTCOMES)}")
+        if reserved_capped is not None and not isinstance(reserved_capped, bool):
+            raise ValueError(f"reserved_capped is True, False or None, not {reserved_capped!r}")
         if admission not in ADMISSION_MODES:
             raise ValueError(f"admission {admission!r} must be one of: {', '.join(ADMISSION_MODES)}")
 
@@ -438,18 +450,56 @@ class Store:
                 "SELECT COALESCE(SUM(charged),0)+1 FROM attempts WHERE run_key=?", (run_key,)
             ).fetchone()[0]
             sequence = self.db.execute("SELECT COALESCE(MAX(dispatch_seq),0)+1 FROM attempts").fetchone()[0]
+            capped = None if reserved_capped is None else int(reserved_capped)
             cursor = self.db.execute(
                 "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir,dispatch_seq,lease_wait_s,"
-                "lease_outcome,admission) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (run_key, number, "running", started, pid, run_dir, sequence, lease_wait_s, lease_outcome, admission),
+                "lease_outcome,reserved_capped,admission) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    run_key,
+                    number,
+                    "running",
+                    started,
+                    pid,
+                    run_dir,
+                    sequence,
+                    lease_wait_s,
+                    lease_outcome,
+                    capped,
+                    admission,
+                ),
             )
             return BegunAttempt(int(cursor.lastrowid), number, int(sequence))
 
         return self.transact(go)
 
+    def add_topup(self, attempt_id: int, usd: float, now: str, event: tuple[str, str | None, str]) -> None:
+        """Charge a running attempt one top-up of `usd` dollars and append its event, in one transaction (C26).
+
+        A top-up is charged when it is reserved and never refunded, so it is part of what was spent from that moment,
+        whatever comes of the attempt; `finish_attempt` leaves it as it is. An attempt that is not running is refused.
+        """
+        if isinstance(usd, bool) or not isinstance(usd, int | float) or not usd >= 0 or usd == float("inf"):
+            raise ValueError(f"a top-up is a finite number of dollars, not below zero, not {usd!r}")
+
+        def go() -> None:
+            cursor = self.db.execute(
+                "UPDATE attempts SET topups = topups + 1, topup_usd = topup_usd + ? WHERE id=? AND state='running'",
+                (float(usd), attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
+            self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
+
+        self.transact(go)
+
     def running_attempts(self) -> list[sqlite3.Row]:
         """Return the attempts now marked running."""
         return self.q("SELECT id, run_key, run_dir FROM attempts WHERE state='running' ORDER BY id")
+
+    def record_deployments(self, attempt_id: int, mix: str) -> None:
+        """Keep an attempt's deployment mix (B18): the JSON pairs of a fingerprint and the turns it served. Called from
+        the `also` step of `finish_attempt`, it joins that transaction, so the mix stands or falls with the result."""
+        self.transact(lambda: self.db.execute("UPDATE attempts SET deployments=? WHERE id=?", (mix, attempt_id)))
 
     def finish_attempt(
         self, attempt_id: int, result: AttemptResult, max_attempts: int, *, also: Callable[[], None] | None = None
@@ -505,7 +555,7 @@ class Store:
             self.db.execute(
                 "UPDATE attempts SET state=?, charged=?, treatment=?, ended_utc=?, wall_s=?, infra_kind=?, outage_kind=?,"
                 " detail=?, termination=?, input_tokens=?, output_tokens=?, cache_creation_tokens=?,"
-                " cache_read_tokens=?, usage_complete=? WHERE id=?",
+                " cache_read_tokens=?, usage_complete=?, turn_usage=?, replies_checked=? WHERE id=?",
                 (
                     state,
                     int(charged),
@@ -521,6 +571,8 @@ class Store:
                     result.cache_creation_tokens,
                     result.cache_read_tokens,
                     int(result.usage_complete),
+                    None if result.turn_usage is None else json.dumps(result.turn_usage),
+                    int(result.replies_checked),
                     attempt_id,
                 ),
             )

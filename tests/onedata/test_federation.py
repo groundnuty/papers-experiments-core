@@ -1,7 +1,6 @@
 """O03: discovery returns every provider of the space; the agent is pinned to its declared local provider or refused."""
 
 import pytest
-from platform_support import CEILING_S, SVC
 
 from expcore_onedata.federation import (
     FederationUnreadable,
@@ -11,6 +10,8 @@ from expcore_onedata.federation import (
     pin_provider,
     read_space,
 )
+from expcore_onedata.testing import CEILING_S
+from expcore_onedata.testing import SERVICE_USER as SVC
 from expcore_onedata.tokens import data_path_spec
 
 SPACE = "spmock0001"
@@ -124,8 +125,9 @@ BREAKS = [
 
 @pytest.mark.parametrize(("field", "breakage"), BREAKS)
 def test_o03_a_provider_field_that_is_absent_or_shaped_otherwise_is_refused_by_name(field, breakage):
-    """O03: nothing is guessed. The name and online fields are unconfirmed by any source, the domain is confirmed;
-    a supporting provider without any of them, or with another shape, makes the answer unreadable, naming the field."""
+    """O03: nothing is guessed. The name and online fields are confirmed only by one live release, the domain by a
+    source; a supporting provider without any of them, or with another shape, makes the answer unreadable, naming the
+    field."""
     broken = dict(GOOD_PROVIDER)
     if breakage == "absent":
         del broken[field]

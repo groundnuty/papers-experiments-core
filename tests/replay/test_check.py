@@ -6,11 +6,13 @@ import json
 import tarfile
 
 import pytest
+from read_support import counting_open, whole_reads
 from record_support import CODE
 from replay_scenarios import SCENARIOS
 
 from expcore.records.record import RunRecord, decode
 from expcore.records.schema import CURRENT
+from expcore.replay import check as check_module
 from expcore.replay.archive import ARCHIVE_GLOB, archive_batch, archived_records, archives_under
 from expcore.replay.check import (
     CHECK_FILE,
@@ -258,6 +260,29 @@ def test_R04_a_run_record_cannot_be_hashed_only_so_a_check_cannot_replay_nothing
         with pytest.raises(HashedOnlyRecord, match=r"is a run record, so it must be replayed"):
             verify_batch(batch, code=CODE, hashed_only=[pattern])
     assert not (batch / CHECK_FILE).exists()
+
+
+def test_R04_a_hashed_only_file_over_the_bound_is_told_from_a_record_by_its_size_and_a_prefix_never_read_whole(
+    batch, monkeypatch
+):
+    """R04: a hashed-only file larger than the bound read whole is looked at only by its size and a bounded prefix: one
+    that does not open as a JSON object is no record and is hashed, and a JSON object that large, which cannot be told
+    from a record without reading it whole, is refused; neither is read whole, when the check is made or compared."""
+    monkeypatch.setattr(check_module, "RECORD_PROBE_BYTES", 64)
+    (batch / "blob.bin").write_bytes(b"SQLite format 3\x00" + b"\x00" * (1 << 20))
+    whole = whole_reads(monkeypatch, "blob.bin", "manifest.json")
+    served: dict[str, int] = {}
+    counting_open(monkeypatch, check_module, served)
+    check = verify_batch(batch, code=CODE, hashed_only=["blob.bin"])
+    assert check["hashed_only"] == ["blob.bin"]
+    write_check(batch, check)
+    require_current_check(batch, code=CODE)
+    (batch / "manifest.json").write_text(json.dumps({"cells": list(range(100))}), encoding="utf-8")
+    with pytest.raises(HashedOnlyRecord, match="too large to tell whether it is a run record"):
+        verify_batch(batch, code=CODE, hashed_only=["blob.bin", "manifest.json"])
+    assert whole == []
+    # one prefix each when the check is made, when it is compared, and when the second check is made
+    assert served["blob.bin"] == 3 * check_module.RECORD_PREFIX_BYTES
 
 
 def test_R04_a_record_is_taken_for_one_by_its_name_or_by_its_schema_marker(tmp_path):

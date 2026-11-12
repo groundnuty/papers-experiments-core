@@ -25,9 +25,11 @@ probe_backoff_s = 1.0
 transfer_settle_s = 30.0        # the wait between two observations of the transfer listing: at least its lag (O07)
 transfer_settle_polls = 4       # the most observations of the listing before it counts as not settled (2 or more)
 clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that widen the run's window (O08)
+concurrency = 16                # the most requests a bulk operation has in flight at once (eviction, block maps, reset)
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
+space = "<label>"               # the [[spaces]] entry the file lies in: required with several spaces, else optional
 provider = "<provider>"         # the receiving provider
 ranges = [[0, 4096], [8192, 1024]]
 ```
@@ -48,6 +50,7 @@ from typing import Any
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.placement import Range, merged
+from expcore_onedata.spaces import ONE_SPACE_LABEL
 
 PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")
 
@@ -68,15 +71,18 @@ class PlacementSettings:
     transfer_settle_s: float = 30.0  # at least the lag of a provider's transfer listing behind a new job
     transfer_settle_polls: int = 4
     clock_skew_allowance_s: float = 5.0  # beyond the providers' estimated clock offsets
+    concurrency: int = 16  # the named bound on a bulk operation's requests in flight (eviction, block maps, reset)
 
 
 @dataclass(frozen=True)
 class RangeRow:
-    """One file on one receiving provider: the merged ranges that must be there."""
+    """One file on one receiving provider: the merged ranges that must be there, and the label of the space the file
+    lies in (`[[spaces]]`; the only space's label when the row names none)."""
 
     file: str
     provider: str
     ranges: tuple[Range, ...]
+    space: str = ONE_SPACE_LABEL
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,10 @@ class RangeMap:
     def for_provider(self, provider: str) -> tuple[RangeRow, ...]:
         """Return the rows whose receiving provider is the one named."""
         return tuple(row for row in self.rows if row.provider == provider)
+
+    def for_space(self, label: str) -> tuple[RangeRow, ...]:
+        """Return the rows whose file lies in the space the label names."""
+        return tuple(row for row in self.rows if row.space == label)
 
     def files(self) -> tuple[str, ...]:
         """Return the distinct files the map names, in the order of first appearance."""
@@ -144,7 +154,8 @@ def _ranges(section: Section) -> tuple[Range, ...]:
 
 
 def parse_rows(rows: Any, file: Path, where: str, config: PlatformConfig, holder: str) -> list[RangeRow]:
-    """Validate the rows of a map; the receiving provider must be declared and must not be the data provider."""
+    """Validate the rows of a map; the receiving provider must be declared and must not be the data provider of the
+    row's space (its own holder, or `holder`). With several spaces a row names its space by its label."""
     if not isinstance(rows, list):
         raise ConfigError(f"{file}: {where}: must be an array of tables")
     parsed: list[RangeRow] = []
@@ -152,27 +163,34 @@ def parse_rows(rows: Any, file: Path, where: str, config: PlatformConfig, holder
         if not isinstance(row, Mapping):
             raise ConfigError(f"{file}: {where}: row {number} must be a table")
         section = Section(row, file, f"{where} row {number}")
-        section.reject_unknown(("file", "provider", "ranges"))
+        section.reject_unknown(("file", "provider", "ranges", "space"))
         path, provider = section.string("file"), section.string("provider")
+        label = section.optional_string("space")
+        try:
+            entry = config.space_named(label)
+        except ConfigError:
+            raise section.fail(
+                "space", "must be the label of a declared space; with several spaces it is required"
+            ) from None
         try:
             safe_path(path)
         except ValueError as error:
             raise section.fail("file", str(error)) from None
         if provider not in config.providers:
             raise section.fail("provider", "must be a provider declared in [providers]")
-        if provider == holder:
+        if provider == (entry.holder or holder):
             raise section.fail("provider", "must not be the data provider, whose copy is the source of every range")
-        parsed.append(RangeRow(path, provider, _ranges(section)))
+        parsed.append(RangeRow(path, provider, _ranges(section), entry.label))
     return parsed
 
 
 def build_map(rows: list[RangeRow], file: Path) -> RangeMap:
     """Join the rows into a map; a file and provider named twice is refused, since the later row would win silently."""
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for row in rows:
-        if (row.file, row.provider) in seen:
+        if (row.space, row.file, row.provider) in seen:
             raise ConfigError(f"{file}: [placement]: the map names one file on one provider more than once")
-        seen.add((row.file, row.provider))
+        seen.add((row.space, row.file, row.provider))
     return RangeMap(tuple(rows))
 
 
@@ -213,6 +231,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "transfer_settle_s",
             "transfer_settle_polls",
             "clock_skew_allowance_s",
+            "concurrency",
         )
     )
     holder = table.string("holder")
@@ -231,6 +250,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         transfer_settle_s=_number(table, "transfer_settle_s", 30.0, minimum=0),
         transfer_settle_polls=_number(table, "transfer_settle_polls", 4, minimum=2, integer=True),
         clock_skew_allowance_s=_number(table, "clock_skew_allowance_s", 5.0, minimum=0),
+        concurrency=_number(table, "concurrency", 16, minimum=1, integer=True),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))

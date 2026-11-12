@@ -19,7 +19,8 @@ Per-backend tool-calling adaptation:
     with tool results (B05).
 
 Every request is built once, and the record's settings come from that request object (B15). Usage is counted the
-moment a reply arrives and unreported counts stay None (B10).
+moment a reply arrives and unreported counts stay None (B10). The provider's other numeric usage fields ride on the
+turn as `usage_extra`, recorded only.
 """
 
 from __future__ import annotations
@@ -35,9 +36,12 @@ from expcore.errors import InfraError
 from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
 from expcore.models.route import public_url, sdk_version, settings_sent
 from expcore.models.served import Served, requested_from_sent
-from expcore.models.usage import UsageTally, token_count
+from expcore.models.usage import ANTHROPIC_COUNTED, OPENAI_COUNTED, UsageTally, extra_usage, token_count
 
 PROBE_PROMPT = "ping"
+# The probe of the reply maximum (C27): a request that asks for a reply far longer than the max_tokens it carries.
+REPLY_CAP_PROBE_TOKENS = 16
+REPLY_CAP_PROMPT = "Count from 1 to 500, one number per line, and write nothing else."
 # Stop reasons that mean the reply was cut at the output limit: OpenAI-compatible "length", Anthropic "max_tokens".
 OUTPUT_LIMIT_STOPS = frozenset({"length", "max_tokens"})
 
@@ -62,6 +66,17 @@ class ToolResult:
     is_error: bool = False
 
 
+@dataclasses.dataclass(frozen=True)
+class ProbeReply:
+    """What the reply to an admission probe reported: the max_tokens the request carried, the reply's usage, a count
+    the reply left out being None (B07), and the provider's stop reason, when read (C27)."""
+
+    max_tokens: int
+    input_tokens: int | None
+    output_tokens: int | None
+    stop_reason: str | None = None
+
+
 @dataclasses.dataclass
 class ModelTurn:
     """One reply of the model with its usage; a count the reply did not carry is None, never 0 (B10)."""
@@ -81,6 +96,12 @@ class ModelTurn:
     served_model: str | None = None  # the id the server said it ran (B06)
     system_fingerprint: str | None = None
     retries: tuple[dict[str, Any], ...] = ()  # the retries this reply took, each with its error (B01)
+    # The provider's other numeric usage fields (a credit count, cache or reasoning tokens) under its own names, recorded
+    # only: no budget arithmetic reads them. A field the reply left out is absent, never 0; `usage_extra_cut` counts the
+    # fields the cap left out (`expcore.models.usage.extra_usage`). None means not recorded (a stub, or a backend that
+    # reads no such fields), and the record then has no field; an adapter that read a usage object gives {} and 0.
+    usage_extra: dict[str, int | float] | None = None
+    usage_extra_cut: int | None = None
 
     @property
     def hit_output_limit(self) -> bool:
@@ -121,8 +142,10 @@ class ModelBackend(Protocol):
         """Return a copy of the conversation as sent, system prompt first."""
         ...
 
-    async def probe(self) -> None:
-        """Send a one-token completion; raise when the model cannot serve one (B07)."""
+    async def probe(self) -> ProbeReply | None:
+        """Send a one-token completion and return what its reply reported; raise when the model cannot serve one (B07).
+
+        None says nothing of the usage, so admission refuses it as usage it cannot show is reported."""
         ...
 
     async def aclose(self) -> None:
@@ -216,7 +239,7 @@ class _SdkBackend:
         """Count a reply's usage the moment it arrives, and refuse a reply that carried none: its tokens are unknown."""
         self.usage.note(input_tokens, output_tokens)
         if input_tokens is None and output_tokens is None:
-            raise InfraError("endpoint", "reply carried no usage: its tokens are unknown")
+            raise InfraError("endpoint", "reply carried no usage: its tokens are unknown", billed=(None, None))
 
 
 class OpenAICompatAdapter(_SdkBackend):
@@ -302,9 +325,14 @@ class OpenAICompatAdapter(_SdkBackend):
         in_tok, out_tok = token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens")
         self.served.note(resp)
         self._count(in_tok, out_tok)
+        usage_extra, usage_cut = extra_usage(usage, skip=OPENAI_COUNTED)
         choices = getattr(resp, "choices", None)
         if not isinstance(choices, (list, tuple)) or not choices:
-            raise InfraError("endpoint", f"reply carried no choices ({type(choices).__name__}); usage already counted")
+            raise InfraError(
+                "endpoint",
+                f"reply carried no choices ({type(choices).__name__}); usage already counted",
+                billed=(in_tok, out_tok),
+            )
         choice = choices[0]
         msg = choice.message
         extra = getattr(msg, "model_extra", None) or {}
@@ -343,6 +371,8 @@ class OpenAICompatAdapter(_SdkBackend):
             served_model=str(resp.model) if getattr(resp, "model", None) else None,
             system_fingerprint=str(fingerprint) if fingerprint else None,
             retries=retries,
+            usage_extra=usage_extra,
+            usage_extra_cut=usage_cut,
         )
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
@@ -350,7 +380,7 @@ class OpenAICompatAdapter(_SdkBackend):
         for r in results:
             self._messages.append({"role": "tool", "tool_call_id": r.call.id, "content": r.text})
 
-    async def probe(self) -> None:
+    async def probe(self) -> ProbeReply:
         """Send a one-token completion with the model's id and its vendor extras (a provider pin applies to it too)."""
         kw: dict[str, Any] = {
             "model": self.spec.api_id,
@@ -360,8 +390,28 @@ class OpenAICompatAdapter(_SdkBackend):
         if extra := self._extra_body():
             kw["extra_body"] = extra
         resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        self.served.note(resp)  # what it says it ran, for info(): admission reads it for a declared set (B18)
         if not getattr(resp, "choices", None):
             raise InfraError("endpoint", "the one-token completion carried no choices")
+        usage = getattr(resp, "usage", None)  # reported, never tallied: the probe is no part of a run
+        return ProbeReply(1, token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens"))
+
+    async def probe_reply_cap(self) -> ProbeReply:
+        """Ask for a long reply under a small max_tokens, with the vendor extras, and return what came back (C27)."""
+        kw: dict[str, Any] = {
+            "model": self.spec.api_id,
+            "messages": [{"role": "user", "content": REPLY_CAP_PROMPT}],
+            "max_tokens": REPLY_CAP_PROBE_TOKENS,
+        }
+        if extra := self._extra_body():
+            kw["extra_body"] = extra
+        resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            raise InfraError("endpoint", "the probe of the reply maximum carried no choices")
+        usage = getattr(resp, "usage", None)
+        counts = token_count(usage, "prompt_tokens"), token_count(usage, "completion_tokens")
+        return ProbeReply(REPLY_CAP_PROBE_TOKENS, *counts, getattr(choices[0], "finish_reason", None))
 
     def _wire_messages(self) -> list[dict]:
         """The conversation as sent: the internal copy of the reasoning is stripped."""
@@ -461,12 +511,14 @@ class AnthropicAdapter(_SdkBackend):
         fresh = token_count(ua, "input_tokens")  # the API's input_tokens is only the uncached remainder
         created = token_count(ua, "cache_creation_input_tokens")
         read = token_count(ua, "cache_read_input_tokens")
-        out_tok = token_count(ua, "output_tokens")
-        in_tok = None if fresh is None else fresh + (created or 0) + (read or 0)  # the prompt size the budget counts
+        in_tok, out_tok = _anthropic_counts(ua)  # the prompt size the budget counts, cached parts included
         self.served.note(resp)
         self._count(in_tok, out_tok)
+        usage_extra, usage_cut = extra_usage(ua, skip=ANTHROPIC_COUNTED)
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
-            raise InfraError("endpoint", "reply carried no content blocks; usage already counted")
+            raise InfraError(
+                "endpoint", "reply carried no content blocks; usage already counted", billed=(in_tok, out_tok)
+            )
         text, calls, reasoning = [], [], []
         thinking_types = ("thinking", "redacted_thinking")
         self.served.note_thinking(any(getattr(b, "type", None) in thinking_types for b in resp.content))
@@ -502,6 +554,8 @@ class AnthropicAdapter(_SdkBackend):
             cache_read_input_tokens=read,
             served_model=str(resp.model) if getattr(resp, "model", None) else None,
             retries=retries,
+            usage_extra=usage_extra,
+            usage_extra_cut=usage_cut,
         )
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
@@ -521,12 +575,27 @@ class AnthropicAdapter(_SdkBackend):
             }
         )
 
-    async def probe(self) -> None:
+    async def probe(self) -> ProbeReply:
         """Send a one-token completion. The vendor extras are left out: extended thinking needs a larger budget."""
         kw = {"model": self.spec.api_id, "messages": [{"role": "user", "content": PROBE_PROMPT}], "max_tokens": 1}
         resp, _ = await self.retrier.call(lambda: self._client.messages.create(**kw))
         if not isinstance(getattr(resp, "content", None), (list, tuple)):
             raise InfraError("endpoint", "the one-token completion carried no content blocks")
+        return ProbeReply(1, *_anthropic_counts(getattr(resp, "usage", None)))
+
+    async def probe_reply_cap(self) -> ProbeReply:
+        """Ask for a long reply under a small max_tokens, without the vendor extras as the probe above, and return what
+        came back (C27)."""
+        kw = {
+            "model": self.spec.api_id,
+            "messages": [{"role": "user", "content": REPLY_CAP_PROMPT}],
+            "max_tokens": REPLY_CAP_PROBE_TOKENS,
+        }
+        resp, _ = await self.retrier.call(lambda: self._client.messages.create(**kw))
+        if not isinstance(getattr(resp, "content", None), (list, tuple)):
+            raise InfraError("endpoint", "the probe of the reply maximum carried no content blocks")
+        counts = _anthropic_counts(getattr(resp, "usage", None))
+        return ProbeReply(REPLY_CAP_PROBE_TOKENS, *counts, getattr(resp, "stop_reason", None))
 
     def transcript(self) -> list[dict]:
         """Return the conversation with the system prompt first; on the wire it travels as a separate parameter."""
@@ -536,6 +605,15 @@ class AnthropicAdapter(_SdkBackend):
     async def aclose(self) -> None:
         """Close the client."""
         await self._client.close()
+
+
+def _anthropic_counts(usage: Any) -> tuple[int | None, int | None]:
+    """The whole prompt (the uncached remainder the API calls input_tokens, plus both cache parts) and the output of a
+    Messages API usage object; a count it left out is None."""
+    fresh = token_count(usage, "input_tokens")
+    created, read = token_count(usage, "cache_creation_input_tokens"), token_count(usage, "cache_read_input_tokens")
+    whole = None if fresh is None else fresh + (created or 0) + (read or 0)
+    return whole, token_count(usage, "output_tokens")
 
 
 class StubAdapter:
@@ -653,10 +731,11 @@ class StubAdapter:
         """Return a copy of the conversation."""
         return json.loads(json.dumps(self._messages, default=str))
 
-    async def probe(self) -> None:
-        """Succeed, or raise the error the stub was given."""
+    async def probe(self) -> ProbeReply:
+        """Succeed with a synthetic one-token reply, as the stub's counts are synthetic, or raise the error it was given."""
         if self._probe_error is not None:
             raise self._probe_error
+        return ProbeReply(1, 1, 1)
 
     async def aclose(self) -> None:
         """Nothing to release."""

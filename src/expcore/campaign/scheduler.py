@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign import reply_cap
 from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
@@ -49,16 +50,19 @@ from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock
 from expcore.campaign.manifest import Manifest
+from expcore.campaign.probe_spend import MeteredProbes
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard_run import ShardStart
 from expcore.campaign.store import Store, column_for
+from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
 from expcore.config.loading import Section
 from expcore.config.models import ModelTable
 from expcore.loop.config import AgentConfig
-from expcore.models.admission import admit
+from expcore.models.admission import admit_reading, max_tokens_ignored, reply_cap_unshown
 
 __all__ = ["CampaignLocked", "RunSummary", "Scheduler", "iso", "utc_now"]
 
@@ -114,8 +118,10 @@ class Scheduler:
         monotonic: Callable[[], float] = time.monotonic,
         crash_hook: Callable[[str, str], None] = lambda point, run_key: None,
         on_hold: Callable[[str], None] | None = None,
+        shard: ShardStart | None = None,
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
+        self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
         self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
@@ -145,6 +151,8 @@ class Scheduler:
             threading.Lock()
         )  # the budget is assessed by the dispatcher and by the workers' recheck, one at a time
         self._not_before: dict[str, float] = {}  # run key -> monotonic time before which it does not start again
+        # run key -> whether the assessment that admitted the run reserved it by the reply maximum (C27)
+        self._reserved_capped: dict[str, bool] = {}
         self._workers: list[threading.Thread] = []
         self._run_thread: threading.Thread | None = None  # the thread inside `run`, while there is one
         self._fatal: BaseException | None = None
@@ -174,6 +182,8 @@ class Scheduler:
         cfg = self.settings
         if cfg.budget is not None and cfg.refuse_unpriced:
             self.models.require_priced(self.plan_models)
+        if cfg.budget is not None:  # the reservation bounds the request past the token cap by the window (C25)
+            self.models.require_context_window(self.plan_models)
         self.store, self.recovery = open_campaign(
             self.root / STATE_FILE,
             self.schema,
@@ -182,6 +192,7 @@ class Scheduler:
             now=self.stamp(),
             max_attempts=cfg.max_attempts,
             allow_growth=cfg.allow_growth,
+            shard=self.shard,
         )
         store = self.store
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)
@@ -194,11 +205,20 @@ class Scheduler:
         )
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
-        self.identities = ServedIdentities(store, self.stamp)
-        self.budget = None
+        self.identities = ServedIdentities(store, self.stamp, {m: self.models.resolve(m) for m in self.plan_models})
+        self.budget, self.ledger = None, None
+        paying = None  # with a budget: the ledger admission's probes are paid from (C26)
         if cfg.budget is not None:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
-            self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits.token_budget)
+            # No model is shown held to R yet; an attempt whose usage is unknown is charged the bound its row records
+            # it was reserved at dispatch, so the probes find the room the campaign really has (C27).
+            early = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)
+            early.take_releases(self.stamp())  # a release given for a stopped campaign makes room for its probes
+            paying = self._ledger(early)
+        held = self._admit_models(paying)  # before the gate: which models are held to the reply maximum (C27)
+        if cfg.budget is not None:
+            self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits, reply_capped=held)
+            self.ledger = self._ledger(self.budget)
         else:
             store.event(self.stamp(), "budget_gate_off", None, "no budget in this campaign: runs are not held for cost")
         self.gate = None
@@ -212,7 +232,6 @@ class Scheduler:
                 max_defer_s=cfg.max_defer_s,
             )
             self.gate.load()
-        self._admit_models()
         self._sweep_leases()
         self.runner = AttemptRunner(
             Parts(
@@ -239,8 +258,23 @@ class Scheduler:
                 lease_group=self.lease_group,
                 admission=self.admission,
                 crash_hook=self.crash_hook,
+                ledger=self.ledger,
+                reserved_capped=self._admitted_capped,
             )
         )
+
+    def _ledger(self, gate: BudgetGate) -> Ledger:
+        """A ledger over the gate: a top-up is decided under the dispatcher's locks, in its order, against the runs in
+        flight (C26)."""
+        assert self.store
+
+        def in_flight() -> list[str]:  # read while the locks are held
+            return [m for m, _ in self._inflight.values()]
+
+        def live() -> frozenset[str]:  # the runs a worker is working on; read while the locks are held (C17)
+            return frozenset(self._inflight)
+
+        return Ledger(gate, self.store, self.stamp, (self._cv, self._assess), in_flight, live)
 
     def reconcile_accounting(self) -> None:
         """Derive the harness-error stops and the units' failures from the stored attempts (C04, C10, C15).
@@ -256,29 +290,62 @@ class Scheduler:
             )
         )
 
-    def _admit_models(self) -> None:
-        """Admit each model's endpoint once (C14). The endpoint checked here is the one every run of the model uses."""
-        assert self.store
-        for model in self.plan_models:
-            endpoint = self.endpoints[model]
-            backend = self.backend_factory(
-                self.models.resolve(model),
-                seed=0,
-                limits=self.agent_config.limits,
-                base_url=endpoint.base_url,
-                time_left=None,
-            )
+    def _admit_models(self, paying: Ledger | None) -> frozenset[str]:
+        """Admit each model's endpoint once (C14). The endpoint checked here is the one every run of the model uses.
 
-            async def check(backend: Any = backend) -> str | None:
+        With a budget, a model of the core's own factory is also probed for the reply maximum; return the models the
+        probe showed held to it, and mark in the store those it did not (C27). A one-token completion answered with
+        more than one output token shows the endpoint ignores max_tokens: the model is marked at once, and the probe of
+        the reply maximum is not sent.
+
+        With a budget (`paying`), every send of a probe is paid from it (C26): reserved one request's bound before it
+        goes out, charged in the store, and settled to what an answered reply's counts cost. A probe that does not fit
+        is not sent, and its model is not admitted, its reason saying the budget is spent. The stub sends nothing an
+        endpoint could bill, so its probes are not paid for; a model without a price is not probed at all, since what
+        a probe of it costs is unknown, and the budget gate holds it (C12).
+        """
+        assert self.store
+        held = set()
+        for model in self.plan_models:
+            endpoint, spec = self.endpoints[model], self.models.resolve(model)
+            pays = paying if spec.backend != "stub" else None  # the ledger this model's probes are paid from
+            if pays is not None and pays.probe_bound(model) is None:
+                continue
+            backend = self.backend_factory(
+                spec, seed=0, limits=self.agent_config.limits, base_url=endpoint.base_url, time_left=None
+            )
+            metered = None if pays is None else MeteredProbes(backend, pays, model)
+            probed = reply_cap.probed(spec, self.backend_factory, self.settings.budget is not None)
+
+            async def check(
+                backend: Any = backend, probing: Any = metered or backend, probed: bool = probed
+            ) -> tuple[str | None, str | None, str | None]:
                 try:
-                    return await admit(backend)
+                    reason, reply = await admit_reading(probing)
+                    ignored = max_tokens_ignored(reply)  # the one-token reply went past its max_tokens of 1 (C27)
+                    asked = reason is None and probed and ignored is None
+                    return reason, ignored, await reply_cap_unshown(probing) if asked else None
                 finally:
                     await backend.aclose()
 
-            reason = asyncio.run(check())
+            reason, ignored, unshown = asyncio.run(check())
+            if ignored is not None and self.settings.budget is not None:  # at once: no later probe can be refused first
+                detail = f"{model}: {ignored}; its runs are reserved by its context window"
+                reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_cap_not_shown", detail)
+            if metered is not None and metered.refusal is not None:  # not sent: no reply says anything of the model
+                reason = f"the campaign's budget is spent: {metered.refusal}"
+            # a model that declares accepted fingerprints is held to them by its probe's reply (B18): read from what the
+            # one-token completion already noted, so nothing more is sent, and only for a model nothing refused before
+            reason = reason or self.identities.admit(model, backend, self.stamp())
             if reason is not None:
                 self.not_admitted[model] = reason
                 self.store.event(self.stamp(), "model_not_admitted", model, f"{model}: {reason}")
+            elif probed and unshown is None and ignored is None:
+                held.add(model)
+            elif probed and unshown is not None:
+                detail = f"{model}: {unshown}; its runs are reserved by its context window"
+                reply_cap.mark_unheld(self.store, model, self.stamp(), "reply_cap_not_shown", detail)
+        return frozenset(held)
 
     def _sweep_leases(self) -> None:
         """Look for what dead lease holders left (C19); the keys still held back are said to the event log."""
@@ -350,31 +417,45 @@ class Scheduler:
                 counts[unit] = counts.get(unit, 0) + 1
         return counts
 
-    def _assessed(self, flying: list[str], now: str) -> Any:
-        """Assess the budget for the models of the runs in flight (None without a budget)."""
+    def _assessed(self, flying: list[str], now: str, live: frozenset[str]) -> Any:
+        """Assess the budget for the models of the runs in flight (None without a budget). `live` are the keys of the
+        runs a worker is working on, read under `_cv` by the caller: a running attempt of any other run lost its worker
+        to a crash in our own bookkeeping, and is charged its bound (C17)."""
         if self.budget is None:
             return None
         with self._assess:
-            return self.budget.assess(flying, now, exact=self.exact_stamp())
+            return self.budget.assess(flying, now, exact=self.exact_stamp(), live=live)
 
     def recheck(self, row: Any) -> Hold | None:
         """Tell why a run that holds its lease may not start after all, or None: the gates dispatch looked at, again.
 
         A worker calls it once its lease is in hand, because the wait for a lease can be long. The run is not counted
-        among the runs in flight for the budget, as at dispatch, so its own bound is reserved once.
+        among the runs in flight for the budget, as at dispatch, so its own bound is reserved once. A run it lets start
+        keeps whether this assessment reserved it by the reply maximum, for its spend guard (C27).
         """
         if self.stop.is_set():
             return Hold("shutdown", "the campaign is ending", temporary=True)
         key, model = row["run_key"], row[column_for("model")]
         with self._cv:
             others = [m for k, (m, _) in self._inflight.items() if k != key]
+            live = frozenset(self._inflight)
         stopped, stopped_all = self.stops.stopped()
-        budget = self._assessed(others, self.stamp())
-        return (
+        budget = self._assessed(others, self.stamp(), live)
+        hold = (
             self._all_hold(stopped_all)
             or self._model_hold(model, stopped, budget)
             or self._unit_hold(self.endpoints[model].unit)
         )
+        if hold is None and budget is not None:
+            with self._cv:
+                self._reserved_capped[key] = model in budget.capped
+        return hold
+
+    def _admitted_capped(self, run_key: str) -> bool | None:
+        """Tell whether the assessment that admitted the run reserved it by the reply maximum; None when none did, as
+        without a budget (C27). The attempt's row records it as it is; its spend guard takes None as yes."""
+        with self._cv:
+            return self._reserved_capped.get(run_key)
 
     def _all_hold(self, stopped_all: bool) -> Hold | None:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
@@ -433,7 +514,7 @@ class Scheduler:
         if self.leases is not None:
             self.leases.settle_quarantines()
         stopped, stopped_all = self.stops.stopped()
-        budget = self._assessed([m for m, _ in self._inflight.values()], now)
+        budget = self._assessed([m for m, _ in self._inflight.values()], now, frozenset(self._inflight))
         in_use = self._in_use()
         held_in_unit = self._live_per_unit()
         waiting = False
@@ -466,6 +547,8 @@ class Scheduler:
             if in_use >= self.settings.workers or full:
                 waiting = True
                 continue
+            if budget is not None:  # the decision a run begun before its recheck (an outage's) records (C27)
+                self._reserved_capped[key] = model in budget.capped
             return row, waiting
         return None, waiting
 
@@ -487,6 +570,7 @@ class Scheduler:
         finally:
             with self._cv:
                 self._inflight.pop(key, None)
+                self._reserved_capped.pop(key, None)
                 self._cv.notify_all()
 
     def run(self, max_dispatch: int | None = None) -> RunSummary:

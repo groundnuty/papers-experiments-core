@@ -13,7 +13,6 @@ import time
 
 import pytest
 from fault_support import LOCAL_TARGET, OUTAGE_TARGET, SERVICES, FakeServices, injector_for, write_faults
-from platform_support import NOW
 
 from expcore.campaign.factors import load_factor_schema
 from expcore.config.loading import ConfigError
@@ -23,6 +22,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import INJECTOR_FAILURE, load_faults
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.testing import NOW
 from expcore_onedata.tokens import TokenIssuer
 from expcore_onedata.toolserver import ToolServerLauncher
 
@@ -389,7 +389,7 @@ def test_o11_an_exclusive_control_holds_the_federation_exclusively_and_never_ove
 def test_o11_an_exclusive_condition_on_a_platform_without_faults_is_refused_naming_the_file_and_key(tmp_path):
     """O11: without `[faults]` there is no federation lock to hold, so a condition that declares `exclusive = true` is
     refused, naming the study file and the key."""
-    from platform_support import write_platform
+    from expcore_onedata.testing import write_platform
 
     config = load_platform(write_platform(tmp_path), require_secrets=False)
     _, schema = matched_design(tmp_path)

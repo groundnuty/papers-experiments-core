@@ -37,6 +37,7 @@ from expcore.records.schema import (
     SchemaVersion,
     added_after,
     derived_treatment,
+    optional_in,
     validate,
 )
 from expcore.records.seal import mark_unverified, seal
@@ -106,20 +107,29 @@ class RunRecord:
         return dataclasses.replace(record, outcome={**record.outcome, "treatment": flag})
 
     def to_json(self, schemas: tuple[SchemaVersion, ...] = SCHEMAS) -> dict[str, Any]:
-        """Return the record as a dictionary in file order, without the fields a later schema added.
+        """Return the record as a dictionary in file order, without the fields a later schema added, and without an
+        optional field that holds its default.
 
         A later-added field is dropped when it holds its default; one that holds data cannot be written into a record
-        of an earlier version, and raises.
+        of an earlier version, and raises. A field the record's own version marks optional (`treatment_targets`, from
+        version 3) is absent when it holds its default, "not recorded", never written as an empty value.
         """
         data = dataclasses.asdict(self)
-        ordered = {"schema_version": data.pop("schema_version"), **data}
-        for name in sorted(added_after(ordered["schema_version"], "record", schemas)):
-            default = next(f for f in dataclasses.fields(self) if f.name == name)
-            empty = default.default_factory() if default.default_factory is not dataclasses.MISSING else default.default
-            if ordered[name] != empty:
-                raise RecordError(f"{name} holds data but {ordered['schema_version']} predates the field")
+        version = data.pop("schema_version")
+        ordered = {"schema_version": version, **data}
+        for name in sorted(added_after(version, "record", schemas)):
+            if ordered[name] != self._empty(name):
+                raise RecordError(f"{name} holds data but {version} predates the field")
             del ordered[name]
+        for name in sorted(optional_in("record", version, schemas)):
+            if ordered[name] == self._empty(name):
+                del ordered[name]
         return ordered
+
+    def _empty(self, name: str) -> Any:
+        """The default of one of the record's fields, the value it holds when the record says nothing of it."""
+        held = next(f for f in dataclasses.fields(self) if f.name == name)
+        return held.default_factory() if held.default_factory is not dataclasses.MISSING else held.default
 
     @classmethod
     def from_json(cls, data: Any, schemas: tuple[SchemaVersion, ...] = SCHEMAS) -> "RunRecord":
