@@ -14,7 +14,9 @@ changed shares. A start without a shard reads one meta row and writes nothing, s
 it was before shards existed.
 
 The totals stay in the campaign fingerprint, which every shard shares; the shares are applied to the settings after it
-is computed (`share_settings`), so they never reach it.
+is computed (`share_settings`, or `share_settings_by_model` for a campaign that shards by model, C31), so they never
+reach it. Before any share is taken, a shard holding pairs of a model whose concurrency share is 0 is refused, naming
+the model (`refuse_unrunnable`).
 
 The fingerprint also holds the environment of the shard's host: its Python and the installed distributions it
 imports through, and the shards of one campaign must have one fingerprint. A host whose environment differs would be

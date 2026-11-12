@@ -4,7 +4,8 @@
 A shard is one driver on one host, with its own store, `out/` and platform, running a fixed part of the campaign's
 plan. Shard i of N is given on the command line (`run --shard i/N --shard-label L`), never in `campaign.toml`, so
 every shard has the campaign fingerprint of the whole plan. Without `--shard` a campaign is unsharded, and nothing
-in this module is consulted: its store, records and exports are byte for byte what they were before shards existed.
+in this module is consulted but the `[shards]` layout a campaign may declare: without that table too, its store,
+records and exports are byte for byte what they were before shards existed.
 
 **The partition is by pair, balanced per model (C28).** `assign(pairs, count)` takes every (task, model, seed) of
 the whole plan, ranks each model's pairs by the SHA-256 of their canonical text, and deals them round the shards from a
