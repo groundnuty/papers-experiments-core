@@ -246,6 +246,57 @@ def test_the_tls_flag_cannot_be_smuggled_through_the_extra_arguments(tmp_path):
         load(tmp_path, edit)
 
 
+# Every form oneclient's parser (boost::program_options, default style: abbreviations and clustered short options
+# allowed) reads as its log-directory option, as the operator may write it in `extra_args`, with the option it names.
+LOG_DIR_FORMS = [
+    (["-l/oc-log"], "-l"),
+    (["-l", "/oc-log"], "-l"),
+    (["-fl/oc-log"], "-l"),  # `-f -l/oc-log`: a cluster of switches ends in the option
+    (["-dfl", "/oc-log"], "-l"),
+    (["--log-dir", "/oc-log"], "--log-dir"),
+    (["--log-dir=/oc-log"], "--log-dir"),
+    (["--log-d", "/oc-log"], "--log-d"),  # an abbreviation oneclient accepts: nothing else starts `log-d`
+    (["--log-di=/oc-log"], "--log-di"),
+    (["--log", "/oc-log"], "--log"),  # ambiguous in oneclient, which refuses it itself: refused here all the same
+    (["-f", "--log-dir"], "--log-dir"),  # no value: oneclient would take the mountpoint
+    (["-f", "-l"], "-l"),
+]
+
+
+@pytest.mark.parametrize(("args", "option"), LOG_DIR_FORMS)
+def test_o05_the_log_directory_option_is_refused_in_every_form_oneclient_reads(tmp_path, args, option):
+    """O05: the sandbox owns oneclient's log directory (it binds the run's own there, as evidence), so `extra_args`
+    never carries the option, however it is written; the message names the option, never a value."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["extra_args"] = args
+
+    with pytest.raises(ConfigError, match="log directory") as e:
+        load(tmp_path, edit)
+    assert f"({option})" in str(e.value)
+    assert "/oc-log" not in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--provider-timeout", "30", "--storage-timeout=30"],
+        ["--log-read-write-perf"],  # another option that starts `log-`
+        ["-f", "-d", "-s"],
+        ["-o", "allow_root", "-oallow_other,nonempty"],  # an `l` inside `-o`'s value is not an option
+        ["-Hhost-l"],  # nor one in the value of `-H`
+        ["--opt=nolock"],
+    ],
+)
+def test_o05_arguments_that_are_not_the_log_directory_option_are_kept(tmp_path, args):
+    """O05: the refusal is of the log directory's option alone."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["extra_args"] = args
+
+    assert load(tmp_path, edit).mount.extra_args == tuple(args)
+
+
 @pytest.mark.parametrize(
     ("table", "key", "value", "named"),
     [

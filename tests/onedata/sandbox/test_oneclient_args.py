@@ -63,12 +63,31 @@ def test_the_tls_flag_in_any_spelling_is_refused_as_an_extra_argument(argument):
 
 
 @pytest.mark.parametrize(
+    ("argument", "option"),
+    [
+        ("-l/var/lib/ci/private", "-l"),  # its value's `c` and `i` are not options: it is the log directory's
+        ("-fl/private", "-l"),
+        ("--log-dir=/private", "--log-dir"),
+        ("--log-di", "--log-di"),
+        ("--l", "--l"),  # ambiguous in oneclient, refused here all the same
+    ],
+)
+def test_o05_the_one_check_of_extra_arguments_refuses_the_log_directory_by_its_option(argument, option):
+    """O05: the log directory is the sandbox's, so the same check that refuses what O36 declares refuses it, naming the
+    option as written and never its value."""
+    problem = extra_arg_problem(argument)
+    assert "log directory" in problem
+    assert f"({option})" in problem
+    assert "private" not in problem
+
+
+@pytest.mark.parametrize(
     "argument",
     [
         "--provider-timeout",
         "45",
-        "--log-dir=/somewhere/private",
-        "-l/var/lib/ci/private",  # a short option's attached value may hold any letter
+        "--space=/somewhere/private",
+        "-o/var/lib/ci/private",  # a short option's attached value may hold any letter
         "-v3",
         "max_read=131072",  # a value of `-o`, in the form of an assignment
         "--communicator-pool-size=3",  # starts as `--co`, but is not a prefix of `--config`
@@ -135,10 +154,10 @@ def test_o36_oneclients_own_options_are_kept_by_name_and_nothing_else_is():
 
 
 def test_o36_a_value_that_starts_with_a_dash_is_never_recorded_verbatim():
-    """O36: `["--log-dir", "--private/path"]` is accepted by the loader (the second word is a value), and the metadata
+    """O36: `["--space", "--private/path"]` is accepted by the loader (the second word is a value), and the metadata
     recorded `--private/path` as if it were an option name. It records `<value>`, and the hash of the whole list."""
-    extra = ("--log-dir", "--private/path", "-/another/private", "--provider-timeout=30")
+    extra = ("--space", "--private/path", "-/another/private", "--provider-timeout=30")
     record = C.extra_args_record(extra)
-    assert record["names"] == ["--log-dir", UNKNOWN, UNKNOWN, "--provider-timeout"]
+    assert record["names"] == ["--space", UNKNOWN, UNKNOWN, "--provider-timeout"]
     assert record["sha256"] == hashlib.sha256("\0".join(extra).encode()).hexdigest()
     assert "private" not in str(record)

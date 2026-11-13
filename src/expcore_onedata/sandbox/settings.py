@@ -49,7 +49,7 @@ gate_memory_bytes = 1073741824  # optional
 path = "/data"                  # where the agent sees the space, read-only
 io_mode = "proxy"               # required, no default: "proxy" (O36); "direct" is refused until #223 maps the storage
 extra_args = []                 # further oneclient arguments, never one that sets the TLS mode, the I/O mode, the
-                                # config file or oneclient's environment
+                                # config file, oneclient's environment or its log directory
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does

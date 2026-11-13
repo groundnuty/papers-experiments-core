@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from expcore_onedata.sandbox import oneclient_start as start
-from expcore_onedata.sandbox.containers import ENV_ACCESS_TOKEN, ONECLIENT_LOG_DIR, sidecar_options, sidecar_route
+from expcore_onedata.sandbox.containers import ENV_ACCESS_TOKEN, SIDECAR_LOG_DIR, sidecar_options, sidecar_route
 from expcore_onedata.sandbox.hostops import HostOps
 from expcore_onedata.sandbox.oneclient_args import UNSET_ENV
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -50,7 +50,7 @@ def effective_facts(host: HostOps, sidecar: str, settings: SandboxSettings, prov
     expected = start.expected_settings(
         sidecar_options(settings), sidecar_route(settings, provider_host)[1], SIDECAR_MOUNT, settings.mount.extra_args
     )
-    log = host.docker("exec", "-u", "0", sidecar, "cat", f"{ONECLIENT_LOG_DIR}/oneclient.INFO", check=False, timeout=60)
+    log = host.docker("exec", "-u", "0", sidecar, "cat", f"{SIDECAR_LOG_DIR}/oneclient.INFO", check=False, timeout=60)
     if log.returncode == 0:
         found = start.start_settings(log.stdout)
         problems = start.differences(found, expected)

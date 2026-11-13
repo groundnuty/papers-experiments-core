@@ -2,11 +2,13 @@
 """What a study may pass to the sidecar's oneclient, and how a run's metadata names it (O36).
 
 The core declares everything oneclient would otherwise decide at run time: the I/O mode (`io_mode`), the TLS check (the
-platform's `[tls]`), the configuration file (never read: `--config /dev/null`) and the environment (`env -u` of the
-three variables of the image and of oneclient's own that could set an option). A study's `extra_args` reach the same
-argv, so none of them may set what the core sets. `extra_arg_problem` names the reason an argument is refused, and the
-same check runs where the settings are built (`MountSettings`), where the platform file is loaded and where the
-command is made, so settings built in code cannot give oneclient two force-I/O options or a second configuration.
+platform's `[tls]`), the configuration file (never read: `--config /dev/null`), the environment (`env -u` of the
+three variables of the image and of oneclient's own that could set an option) and the log directory (`--log-dir`, where
+the run's own directory is bound so the log is part of its evidence, O05). A study's `extra_args` reach the same argv,
+so none of them may set what the core sets. `extra_arg_problem` is the one check of them: it names the reason an
+argument is refused, and it runs where the settings are built (`MountSettings`), where the platform file is loaded and
+where the command is made, so settings built in code cannot give oneclient two force-I/O options, a second
+configuration or a second log directory.
 
 `LONG_OPTIONS` and `SHORT_OPTIONS` are the option names oneclient 25.0 (tag `bb8a63e3`) accepts on its command line,
 read from `src/options/options.cc`. A run's metadata keeps an extra argument's name only when it is one of them
@@ -26,6 +28,7 @@ IO_MODES = tuple(IO_MODE_FLAGS)
 CONFIG_OPTION = "--config"
 CONFIG_NULL = "/dev/null"  # an empty file: boost's parser reads no option from it, so no configuration file is parsed
 INSECURE_OPTION = "--insecure"
+LOG_DIR_OPTION = "--log-dir"  # the sandbox's own (`containers.sidecar_command`); oneclient takes it once
 UNSET_ENV = ("ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG")  # removed from the sidecar's environment
 
 # The long options of the oneclient binary (`options.cc`, `withLongName`), without OneS3's, which it does not accept.
@@ -66,6 +69,14 @@ ENV_REFUSAL = (
 ENV_SETTING = re.compile(r"ONECLIENT_[A-Za-z0-9_]*=", re.IGNORECASE)
 
 
+def log_dir_refusal(option: str) -> str:
+    """Why `[sandbox.mount] extra_args` may not carry `option`, the log directory's, as written without its value."""
+    return (
+        f"must not carry oneclient's log directory ({option}): the sandbox sets it, and binds the run's own directory "
+        "there so the log is part of the run's evidence"
+    )
+
+
 def abbreviates(argument: str, option: str) -> bool:
     """Whether a long option `argument` (with or without `=value`) is `option` or a prefix of it, which boost's parser
     takes for it when it is unique among oneclient's options. Every such prefix of more than the dashes is counted: a
@@ -93,13 +104,23 @@ def short_letters(argument: str) -> str:
 
 def extra_arg_problem(argument: str) -> str | None:
     """Why a study's extra argument may not reach oneclient, or None when it may: it sets the TLS check, the I/O mode,
-    the configuration file or oneclient's environment, which the core declares. The reason never holds the argument."""
+    the configuration file, the log directory or oneclient's environment, which the core declares. The reason never
+    holds a value: the log directory's names the option as written (`-l`, `--log-d`), its value dropped.
+
+    oneclient reads its command line with boost::program_options in its default style, so the log directory has more
+    forms than `-l` and `--log-dir`: an attached value (`-l/x`), switches clustered before it (`-fl /x`, which
+    `short_letters` reads) and any prefix of the long name (`--log-d`; `--l`, `--lo`, `--log` and `--log-` also start
+    `--log-read-write-perf`, which oneclient refuses as ambiguous, and are refused here all the same)."""
     if abbreviates(argument, INSECURE_OPTION) or "i" in short_letters(argument):
         return TLS_REFUSAL
     if any(abbreviates(argument, flag) for flag in IO_MODE_FLAGS.values()):
         return IO_MODE_ARGS_REFUSAL
     if abbreviates(argument, CONFIG_OPTION) or "c" in short_letters(argument):
         return CONFIG_REFUSAL
+    if abbreviates(argument, LOG_DIR_OPTION):
+        return log_dir_refusal(argument.split("=", 1)[0])
+    if "l" in short_letters(argument):
+        return log_dir_refusal("-l")
     if ENV_SETTING.match(argument):
         return ENV_REFUSAL
     return None
