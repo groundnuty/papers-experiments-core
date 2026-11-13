@@ -337,6 +337,22 @@ class InfraError(RuntimeError):
         self.billed = billed
 
 
+class CallTimedOut(InfraError):
+    """A tool call outlasted its `timeout_s` without the tool server answering it (L16): infrastructure of kind
+    `knowledge`.
+
+    It is its own class so that a caller that bounds a call itself, as the day-0 outage check does, can tell the bound's
+    expiry from a server that closed or failed, and so that the loop can tell it from a failure it has no other
+    explanation for: inside the loop the bound is the agent's time left, so an expiry that arrives with the agent's
+    time used up is the loop's own cut and is judged as one (`Watcher`). `tool` and `bound_s` are what the detail says.
+    """
+
+    def __init__(self, tool: str, bound_s: float):
+        super().__init__("knowledge", f"the tool server did not answer a call to {tool!r} within {bound_s:g} s")
+        self.tool = tool
+        self.bound_s = bound_s
+
+
 class BudgetHold(InfraError):
     """A request was not sent: the top-up it needed would have taken the campaign past its budget (C26).
 

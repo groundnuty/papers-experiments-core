@@ -27,7 +27,7 @@ from mcp import ClientSession, MCPError, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR
 
-from expcore.errors import InfraError
+from expcore.errors import CallTimedOut, InfraError
 from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolSpec
 from expcore.tools.manifest import FrozenManifest, ManifestError, canonical, list_all_tools, mismatches
 
@@ -59,19 +59,6 @@ def _is_transport_error(exc: BaseException) -> bool:
 def _detail(exc: BaseException) -> str:
     """A short line for an infrastructure detail: the class and message, never longer than the limit."""
     return f"{type(exc).__name__}: {exc}"[:DETAIL_LIMIT]
-
-
-class CallTimedOut(InfraError):
-    """A tool call outlasted its `timeout_s` without the server answering it (L16): infrastructure of kind `knowledge`.
-
-    It is its own class so that a caller that bounds a call itself, as the day-0 outage check does, can tell the bound's
-    expiry from a server that closed or failed. `tool` and `bound_s` are what the detail says.
-    """
-
-    def __init__(self, tool: str, bound_s: float):
-        super().__init__("knowledge", f"the tool server did not answer a call to {tool!r} within {bound_s:g} s")
-        self.tool = tool
-        self.bound_s = bound_s
 
 
 class McpToolProvider:
@@ -148,8 +135,8 @@ class McpToolProvider:
         """Call a tool. The call ends within `timeout_s`, and that bound is its only limit (L05, L16).
 
         Inside the loop `timeout_s` is the agent's time left, so the bound is the loop's own and never longer; the loop
-        cuts the call at the same moment, and the run ends as the loop's cut or as this expiry, whichever it sees
-        first. Outside the loop (a pre-run check, a health probe) the bound is the only one there is: a server that is
+        cuts the call at the same moment, and judges this expiry as that cut (`Watcher`), so the run ends the same way
+        whichever the event loop runs first. Outside the loop (a pre-run check, a health probe) the bound is the only one there is: a server that is
         up and never answers raises `CallTimedOut`, which is `InfraError` of kind `knowledge` and names the tool and the
         bound. The call is abandoned and the session stays usable.
 

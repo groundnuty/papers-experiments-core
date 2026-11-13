@@ -10,7 +10,7 @@ import asyncio
 
 from loop_support import FakeProvider, ScriptedBackend, call, turn
 
-from expcore.errors import InfraError
+from expcore.errors import CallTimedOut, InfraError
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
@@ -250,6 +250,65 @@ def test_l04_a_tool_call_cut_at_the_ceiling_with_the_agents_time_also_used_up_is
     )
     assert result.outcome.name == "time_cap"
     assert result.outcome.infra_kind is None
+
+
+def expires(clock, seconds, *, wait=False):
+    """A tool handler that runs `seconds` on the fake clock, in a wait on infrastructure when `wait`, and then raises
+    the expiry of its own `timeout_s`."""
+
+    async def handler(args, ctx):
+        if wait:
+            async with ctx.infrastructure_wait("lease_queue"):
+                clock.advance(seconds)
+        else:
+            clock.advance(seconds)
+        raise CallTimedOut("hang", seconds)
+
+    return handler
+
+
+def test_l16_a_call_that_expires_at_the_agents_cap_is_cut_as_a_time_cap_not_set_aside(run, clock):
+    """L16: a provider's own expiry at the bound it was handed (the agent's time left) and the loop's cut are one
+    moment. When the expiry is the one to arrive first (an event loop stalled for a moment holds both due at once),
+    the run still ends as the loop's cut at the agent's cap, a time cap, and never as knowledge infrastructure that
+    sets the attempt aside."""
+    result = run(
+        StubAdapter([[("hang", {})], "never asked"]),
+        [FakeProvider({"hang": expires(clock, 300)})],
+        time_cap_s=300,
+        ceiling_s=1200,
+        ceiling_kind="sandbox",
+    )
+    assert result.outcome.name == "time_cap"
+    assert result.outcome.infra_kind is None
+    assert result.tool_calls[0].status == "cut"
+    assert len([m for m in result.transcript if m["role"] == "tool"]) == 1
+
+
+def test_l16_a_call_that_expires_at_the_ceiling_with_the_agent_under_its_cap_is_the_ceilings_infrastructure(run, clock):
+    """L16: the same arrival at the whole-time ceiling, the agent under its cap, is judged as any cut at the ceiling."""
+    result = run(
+        StubAdapter([[("hang", {})], "never asked"]),
+        [FakeProvider({"hang": expires(clock, 450, wait=True)})],
+        time_cap_s=300,
+        ceiling_s=400,
+        ceiling_kind="sandbox",
+    )
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "sandbox")
+    assert result.tool_calls[0].status == "cut"
+
+
+def test_l16_a_call_that_expires_with_time_left_is_the_providers_knowledge_failure(run, clock):
+    """L16: an expiry the loop's own limits do not explain (the agent has time left) is not hidden: the call failed as
+    knowledge infrastructure, naming the tool and the bound."""
+
+    async def early(args):
+        raise CallTimedOut("hang", 5.0)
+
+    result = run(StubAdapter([[("hang", {})], "never asked"]), [FakeProvider({"hang": early})], time_cap_s=300)
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "knowledge")
+    assert "'hang'" in result.outcome.detail
+    assert result.tool_calls[0].status == "failed"
 
 
 def test_l05_the_timeout_passed_to_the_provider_is_the_deadline_minus_now(run, clock):

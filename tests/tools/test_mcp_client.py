@@ -367,8 +367,9 @@ def test_l16_a_timeout_raised_inside_the_call_that_is_not_the_bound_is_not_repor
 
 def test_l16_inside_the_loop_the_bound_does_not_extend_the_loops_time_cap(frozen_with_stall):
     """L16: the loop passes the agent's time left as the call's bound, so a hung call ends the run at the loop's own
-    time cap and the per-call bound never carries it past. At the very cap the loop's cut and the call's expiry meet:
-    the run ends as the time cap (the loop's cut) or as knowledge infrastructure (the call's expiry), never later."""
+    time cap and the per-call bound never carries it past. At the very cap the loop's cut and the call's expiry meet,
+    and whichever the event loop runs first the run ends the same way: a time cap, the call cut, never knowledge
+    infrastructure that would set the attempt aside."""
     limits = Limits(
         max_tool_rounds=5, time_cap_s=3.0, token_budget=100_000, output_cap_chars=2000, max_output_tokens=512
     )
@@ -384,6 +385,5 @@ def test_l16_inside_the_loop_the_bound_does_not_extend_the_loops_time_cap(frozen
 
     result, elapsed = asyncio.run(go())
     assert limits.time_cap_s <= elapsed < limits.time_cap_s + 30
-    assert result.outcome.name in {"time_cap", "infrastructure"}
-    if result.outcome.name == "infrastructure":
-        assert result.outcome.infra_kind == "knowledge"
+    assert (result.outcome.name, result.outcome.infra_kind) == ("time_cap", None)
+    assert [t.status for t in result.tool_calls] == ["cut"]
