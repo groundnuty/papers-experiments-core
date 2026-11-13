@@ -54,13 +54,13 @@ def stocked(fake) -> FakeReset:
 
 
 def test_o11_a_requirement_only_one_provider_has_seen_is_found_there_removed_and_shown_gone_everywhere(
-    provisioner, stocked
+    provisioner, stocked, ticker
 ):
     """O11: a requirement the data provider has not seen yet is still in the space: the walk on the other provider
     finds it, it is removed there, and every provider then shows it gone."""
     qid = stocked.add_qos(FILES[2])
     stocked.qos_hidden_on[qid] = {ALPHA_ID}
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert stocked.qos == {}
     assert record["stages"]["qos"]["removed"] == 1
     removals = [c for c in stocked.provider_calls if c[1] == "DELETE" and c[2] == f"/qos_requirements/{qid}"]
@@ -71,74 +71,82 @@ def test_o11_a_job_both_providers_list_is_cancelled_and_waited_for_on_each(provi
     """O11: a running job is cancelled on every provider that lists it, and its end is read on each."""
     stocked.add_file("other/twice.bin", DATA)
     tid = stocked.add_transfer("replication", "other/twice.bin", BETA_ID, scheduled=ticker.now, ended=False)
-    SpaceReset(provisioner).run({"beta": ["study"]})
+    SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     cancels = {c[0] for c in stocked.provider_calls if c[1] == "DELETE" and c[2] == f"/transfers/{tid}"}
     assert cancels == {ALPHA_ID, BETA_ID}
     reads = {c[0] for c in stocked.provider_calls if c[1] == "GET" and c[2] == f"/transfers/{tid}"}
     assert reads == {ALPHA_ID, BETA_ID}
 
 
-def test_o07_the_transfer_stage_needs_the_settle_count_of_clean_observations_in_a_row(provisioner, stocked):
+def test_o07_the_transfer_stage_needs_the_settle_count_of_clean_observations_in_a_row(provisioner, stocked, ticker):
     """O07: a quiet space still takes `transfer_settle_polls` observations (three here), each of both providers'
     waiting and ongoing listings, before the transfer stage passes."""
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert record["stages"]["transfers"]["observations"] == 3
 
 
-def test_o01_a_job_that_starts_during_the_eviction_fails_the_reset_before_any_block_map_is_read(provisioner, stocked):
+def test_o01_a_job_that_starts_during_the_eviction_fails_the_reset_before_any_block_map_is_read(
+    provisioner, stocked, ticker
+):
     """O01: a replication into the evicted provider starts as the eviction ends; the listings show it running, so the
     block maps, which it may still change, are never read and the reset fails at its eviction stage."""
     stocked.spawn_on_evict = BETA_ID  # its record is never read, so the fake never ends it: it runs on
     with pytest.raises(ResetFailed, match="eviction stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert "still waiting or ongoing" in str(caught.value)
     assert not [c for c in stocked.provider_calls if c[2].endswith("/distribution")]
 
 
-def test_o11_without_an_eviction_plan_the_reset_still_shows_that_only_the_owner_holds_data(provisioner, stocked):
+def test_o11_without_an_eviction_plan_the_reset_still_shows_that_only_the_owner_holds_data(
+    provisioner, stocked, ticker
+):
     """O11: with nothing to evict, a provider other than the data provider that holds bytes of the space fails the
     reset at its occupancy stage, by its physical size; bytes the caller allows pass, and are recorded."""
     with pytest.raises(ResetFailed, match=r"occupancy stage .*providers\[1\] hold"):
-        SpaceReset(provisioner).run()
+        SpaceReset(provisioner, now=ticker.clock).run()
     held = len(FILES) * len(DATA)
-    record = SpaceReset(provisioner).run(allowed={"beta": held})
+    record = SpaceReset(provisioner, now=ticker.clock).run(allowed={"beta": held})
     assert record["stages"]["occupancy"]["physical_bytes"] == {"providers[0]": held, "providers[1]": held}
 
 
-def test_o08_a_physical_size_that_is_unknown_fails_the_reset_rather_than_pass_as_empty(provisioner, stocked):
+def test_o08_a_physical_size_that_is_unknown_fails_the_reset_rather_than_pass_as_empty(provisioner, stocked, ticker):
     """O08: a space without directory statistics answers no physical size; that is unknown, never zero, so the reset
     fails at its occupancy stage even after the eviction emptied the provider."""
     stocked.dir_stats_disabled = True
     with pytest.raises(ResetFailed, match="occupancy stage"):
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
 
 
 def test_o09_a_reset_first_checks_the_space_is_the_configured_one_and_changes_nothing_when_it_is_not(
-    provisioner, stocked
+    provisioner, stocked, ticker
 ):
     """O09: the space renamed within the prefixes is not the configured one: the reset is refused before its first
     stage, and the requirement in it is not removed."""
     stocked.add_qos(FILES[0])
     stocked.space_name = "study-a-renamed"
     with pytest.raises(Refused, match="not the configured one"):
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert stocked.qos
     assert stocked.provider_calls == []
 
 
-def test_o09_the_data_provider_is_refused_by_its_id_as_by_its_name_before_anything_is_sent(provisioner, stocked):
+def test_o09_the_data_provider_is_refused_by_its_id_as_by_its_name_before_anything_is_sent(
+    provisioner, stocked, ticker
+):
     """O09: a bulk eviction or a reset that names the data provider by its Onezone id is refused like one that names
     it by its name, before any request."""
     with pytest.raises(Refused, match="own copy"):
         evict_ids(provisioner, [stocked.id_of(FILES[0])], ALPHA_ID)
     with pytest.raises(Refused, match="own copy"):
-        SpaceReset(provisioner).run({ALPHA_ID: ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({ALPHA_ID: ["study"]})
     assert stocked.requests == []
 
 
-def test_o12_a_path_the_plan_names_that_is_missing_fails_the_reset_without_naming_the_path(provisioner, stocked):
+def test_o12_a_path_the_plan_names_that_is_missing_fails_the_reset_without_naming_the_path(
+    provisioner, stocked, ticker
+):
     """O12: the reset's message and record say a planned path is not in the space, never which part of it."""
     with pytest.raises(ResetFailed, match="eviction stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study/missing-dataset-part"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study/missing-dataset-part"]})
     assert "missing-dataset-part" not in str(caught.value)
     assert "missing-dataset-part" not in str(caught.value.record)

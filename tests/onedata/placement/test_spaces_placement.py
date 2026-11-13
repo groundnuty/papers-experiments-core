@@ -214,7 +214,7 @@ def test_o11_a_reset_of_one_space_reads_and_changes_that_space_alone(owned, fake
     fake.transfers[mine].file_id = fake.id_of("study/a.bin", SPACE_IDS[1])
     theirs = fake.add_transfer("replication", "study/b.bin", BETA_ID, scheduled=ticker.now, ended=False)
     fake.transfer_flip_after = 10**6
-    record = SpaceReset(owned).run()
+    record = SpaceReset(owned, now=ticker.clock).run()
     assert record["space"] == "spaces[1]"
     assert fake.transfers[mine].cancelled
     assert not fake.transfers[theirs].ended

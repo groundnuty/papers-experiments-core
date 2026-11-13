@@ -11,7 +11,8 @@ and with these changes to the calls it inherits:
 - `add_data_space` adds a space with a root of its own, which `GET /spaces/{space}` answers on a provider and at which
   a file's parent links end, and the transfer listing of the space holds only the jobs on its files; `add_file`,
   `id_of`, `held`, `exists` and `add_qos` take `space=` (the study space by default);
-- a job's record has the `spaceId` of its file's space, and a cancelled job reports `cancelled`;
+- a job's record has the `spaceId` of its file's space, and a cancelled job reports `cancelled`, with no start or
+  finish time (0) when it was cancelled while still waiting;
 - an eviction scheduled on a directory evicts every file under it when it ends, unless `evictions_noop_first` makes
   it one that evicted nothing, as FakeData's file evictions are;
 - every provider call is answered under one lock, so a bulk operation's threads never interleave inside the fake.
@@ -133,9 +134,12 @@ class FakeReset(FakeData):
         if transfer.ended:
             return self._error(400, "badValueNotAllowed")
         if not self.ignore_cancels:
+            # A job cancelled while still scheduled is given no start or finish time, so it is listed last in `ended`
+            # (op-worker f118ed9, replication_status.erl:264-271); one cancelled once running is stamped.
+            if not transfer.waiting:
+                transfer.started = transfer.started or transfer.scheduled
+                transfer.finished = int(self.clock())
             transfer.ended, transfer.waiting, transfer.cancelled = True, False, True
-            transfer.started = transfer.started or transfer.scheduled
-            transfer.finished = int(self.clock())
         return httpx.Response(204)
 
     def _transfer(self, tid: str, provider: str) -> httpx.Response:

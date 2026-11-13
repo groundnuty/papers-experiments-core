@@ -31,11 +31,11 @@ def scanned(request, client, config, platform_file, ticker, tmp_path, fake) -> P
     return provisioner_with(client, config, platform_file, ticker, tmp_path, scan=request.param)
 
 
-def test_o33_the_runs_requirements_are_removed_and_the_baselines_kept(scanned, fake):
+def test_o33_the_runs_requirements_are_removed_and_the_baselines_kept(scanned, fake, ticker):
     """O33: a requirement present at the run's start is in the baseline and stays; the two the agent added, on a file
     and on a directory, are found by either scan, removed, and the second scan finds none but the baseline's."""
     kept = fake.add_qos(FILES[0])
-    reset = SpaceReset(scanned)
+    reset = SpaceReset(scanned, now=ticker.clock)
     baseline = reset.qos_requirements()
     assert baseline == {kept}
     added = {fake.add_qos(FILES[1]), fake.add_qos("study")}
@@ -89,7 +89,7 @@ def test_o33_a_listing_page_without_its_end_marker_fails_the_qos_stage(
 
     fake._list_recursive = unmarked
     with pytest.raises(ResetFailed, match=r"qos stage.*nextPageToken"):
-        SpaceReset(listing).run({"beta": ["study"]})
+        SpaceReset(listing, now=ticker.clock).run({"beta": ["study"]})
     assert len(fake.qos) == 1
 
 
@@ -108,9 +108,8 @@ def test_o33_block_maps_that_change_once_settle_and_ones_that_keep_changing_fail
             fake.blocks[(first, BETA_ID)] = [[0, len(DATA)]]
 
     fake.add_qos(FILES[4])
-    record = SpaceReset(provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=lands_once)).run(
-        {"beta": ["study"]}
-    )
+    lands = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=lands_once)
+    record = SpaceReset(lands, now=ticker.clock).run({"beta": ["study"]})
     settled = record["stages"]["qos_settle"]
     assert settled["seconds"] >= 2 * resetqos.SETTLE_POLL_S + resetqos.SETTLE_STABLE_S
 
@@ -123,10 +122,9 @@ def test_o33_block_maps_that_change_once_settle_and_ones_that_keep_changing_fail
             fake.blocks[(second, BETA_ID)] = [[0, grown[0]]]
 
     fake.add_qos(FILES[5])
+    keeps = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=keeps_landing)
     with pytest.raises(ResetFailed, match=r"qos_settle stage.*still changing") as caught:
-        SpaceReset(provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=keeps_landing)).run(
-            {"beta": ["study"]}
-        )
+        SpaceReset(keeps, now=ticker.clock).run({"beta": ["study"]})
     seconds = caught.value.record["stages"]["qos_settle"]["seconds"]
     assert resetqos.SETTLE_BOUND_S <= seconds <= resetqos.SETTLE_BOUND_S + resetqos.SETTLE_POLL_S
 
@@ -172,7 +170,7 @@ def test_o33_a_listing_that_could_not_enter_a_path_fails_the_qos_stage(
 
     fake._list_recursive = partial
     with pytest.raises(ResetFailed, match=r"qos stage.*inaccessiblePaths"):
-        SpaceReset(listing).run({"beta": ["study"]})
+        SpaceReset(listing, now=ticker.clock).run({"beta": ["study"]})
     assert len(fake.qos) == 1
 
 
@@ -206,5 +204,5 @@ def test_o33_the_settles_bound_counts_its_waits_not_its_reads(scanned, fake, tic
 
     fake.add_qos("study")
     fake._distribution = slow
-    record = SpaceReset(scanned).run({"beta": ["study"]})
+    record = SpaceReset(scanned, now=ticker.clock).run({"beta": ["study"]})
     assert record["stages"]["qos_settle"]["seconds"] > resetqos.SETTLE_BOUND_S

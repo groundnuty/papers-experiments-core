@@ -27,7 +27,7 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     assert "3 skipped" in done.stdout
 
 
-def test_o09_only_the_resets_calls_the_truncating_write_and_the_tool_server_user_reads_are_unconfirmed():
+def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_reads_and_the_clock_are_unconfirmed():
     """O09, O11: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did,
     the gate's walk by `parent_id` among them, the reset's eviction of a directory and a transfer record's `spaceId`,
     and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
@@ -36,7 +36,9 @@ def test_o09_only_the_resets_calls_the_truncating_write_and_the_tool_server_user
     without an offset, which truncates the file and which a restarted upload relies on (O25), and the two reads that
     bound a writing tool-server user (#177): its Onezone admin privileges, named by Onezone's REST description alone,
     and the clusters its token acts in, the current user's read sent as the token, named by that description and the
-    route of oz-worker."""
+    route of oz-worker. And, since a job's times are stamped on the platform's global clock, Onezone's reading of it
+    that the transfer log and the reset's history place their window by (#207), a public call named by oz-worker's
+    source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
@@ -48,11 +50,15 @@ def test_o09_only_the_resets_calls_the_truncating_write_and_the_tool_server_user
         ("GET", "/data/{id}/files"),  # the QoS scan's recursive listing, from the source only (O33)
         ("GET", "/users/{id}/effective_privileges"),
         ("GET", "/user/effective_clusters"),
+        ("GET", "/provider/public/get_current_time"),
     }
     what = " ".join(w for _, _, w in client.UNVERIFIED_ENDPOINTS)
     assert all(
-        field in what for field in ("fileId", "requirements", "400", "truncates", "oz_view_privileges", "clusters")
+        field in what
+        for field in ("fileId", "requirements", "400", "truncates", "oz_view_privileges", "clusters", "timeMillis")
     )
+    assert "14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55" in client.__doc__  # the source that names the clock's endpoint
+    assert "provider_routes.erl:192-198" in client.__doc__
     assert "58c697695fd73ff480f4a6e5fdbf733036465398" in client.__doc__  # the REST description they are named by
     assert "paths/user/effective_clusters.yaml" in client.__doc__
     assert "03af698e5759f9db97a003047eb4e29e4ba7507f" in client.__doc__  # oz-worker's route of the clusters read
