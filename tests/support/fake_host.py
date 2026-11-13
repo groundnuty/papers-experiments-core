@@ -151,7 +151,7 @@ class FakeHost:
         self.links = {"/proc/self/ns/pid": PID_NS}
         self.alive: set[int] = set()
         # processes a signal does not end: a read waiting in the kernel on a FUSE mount, which takes its kill only when
-        # it returns (O30); a test releases one by removing it from here and from /proc
+        # it returns (O34); a test releases one by removing it from here and from /proc
         self.unkillable: set[int] = set()
         self.init_starts_sleep = True  # docker-init starts the `sleep` of a `--init ... sleep infinity` container
         self.calls: list[tuple] = []

@@ -139,7 +139,7 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     ]
 
 
-# At a cell's deadline, when a process of the cell outlived its kill (O30): abort the mount's FUSE connection from the
+# At a cell's deadline, when a process of the cell outlived its kill (O34): abort the mount's FUSE connection from the
 # sidecar, which holds the mount, SYS_ADMIN and /dev/fuse (the agent's container has none of them). The connection's
 # fusectl entry is mounted in the sidecar's own mount namespace first when it is not there (a container's /sys does not
 # carry fusectl), then its `abort` is written, which ends every request waiting on the connection with an errno. A lazy

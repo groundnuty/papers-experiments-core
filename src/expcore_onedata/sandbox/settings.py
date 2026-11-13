@@ -20,7 +20,7 @@ content_check_file = "dir/f"    # a provisioned file under the space root, read 
                                 # the content type the gate streams on (`precampaign.py`); required with a rest level
 placeholder_token = "placeholder"  # optional: the agent's ONEDATA_TOKEN on a rest data path, never a credential (O23)
 kill_grace_s = 5                # optional, 1 to 60: how long a cell's processes have to end after their kill at its
-                                # deadline before the mount is aborted or the sandbox stopped (deadline.py, O30); the
+                                # deadline before the mount is aborted or the sandbox stopped (deadline.py, O34); the
                                 # whole escalation lasts at most two graces and 20 s past the cap (deadline.margin_s)
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
@@ -202,7 +202,7 @@ class SandboxSettings:
     served_caps_declared: bool = False  # the table is in the file: its caps are in the campaign fingerprint (C06)
     federation: FederationNetwork | None = None  # [sandbox.federation]: None puts the sidecar on the default bridge
     placeholder_token: str = PLACEHOLDER_TOKEN  # the REST agent's ONEDATA_TOKEN: no credential, the gate drops it (O23)
-    kill_grace_s: float = KILL_GRACE_S  # a cell's processes' time to end after the kill at its deadline (O30)
+    kill_grace_s: float = KILL_GRACE_S  # a cell's processes' time to end after the kill at its deadline (O34)
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -425,7 +425,7 @@ def _placeholder(section: Section) -> str:
 
 
 def _kill_grace(section: Section) -> float:
-    """Read the optional grace of a cell's kill at its deadline (O30): a number of seconds from 1 to 60."""
+    """Read the optional grace of a cell's kill at its deadline (O34): a number of seconds from 1 to 60."""
     grace = float(_number(section, "kill_grace_s", minimum=1, default=KILL_GRACE_S))
     if grace > KILL_GRACE_MAX_S:
         raise section.fail("kill_grace_s", f"must be at most {KILL_GRACE_MAX_S:g} seconds")

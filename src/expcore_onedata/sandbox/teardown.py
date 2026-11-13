@@ -247,7 +247,7 @@ def _cgroup_procs(host: HostOps, cid: str) -> list[int] | None:
 def init_sleep(host: HostOps, agent: dict) -> dict | None:
     """The init's `sleep infinity` of an agent container that has just started, by its pid and start time (/proc/<pid>/stat
     field 22): the one process of its cgroup besides the init, a child of the init named `sleep`. None while that is not
-    what the cgroup holds (the init has not started it yet), or when it cannot be read (O30)."""
+    what the cgroup holds (the init has not started it yet), or when it cannot be read (O34)."""
     procs = _cgroup_procs(host, agent["id"])
     others = [pid for pid in procs or [] if pid != agent["pid"]]
     if len(others) != 1:
@@ -266,7 +266,7 @@ def _the_init_sleep(procs: list[dict], agent: dict) -> dict | None:
     """Which of the container's processes is its init's `sleep`: the one `agent["sleep"]` names by its pid and start
     time, as `init_sleep` read them when the container started. A process of the agent's can name itself `sleep`
     (/proc/self/comm is its own to write) and, orphaned, be reparented to the init; it cannot take that start time
-    (O30). Without that record (the orphan reaper's teardown, `fuse_first`, knows nothing of the start) it is the
+    (O34). Without that record (the orphan reaper's teardown, `fuse_first`, knows nothing of the start) it is the
     init's child of that name that started first, which no process of the agent's can predate."""
     known = agent.get("sleep")
     if known is not None:

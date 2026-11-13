@@ -1,4 +1,4 @@
-"""O30: a cell's hard deadline. At its cap every process of the cell is killed; one that outlives the kill (a read
+"""O34: a cell's hard deadline. At its cap every process of the cell is killed; one that outlives the kill (a read
 waiting in the kernel on the FUSE mount, which a kill reaches only when it returns) gets a grace period, then the
 mount's FUSE connection is aborted from the sidecar, and if that fails or cannot be done the sandbox is stopped. Every
 step is recorded with its time, and a cell that outlived its kill makes the attempt infrastructure of a kind no
@@ -33,8 +33,8 @@ from expcore_onedata.testing import write_platform
 
 
 # ---------------------------------------------------------------------------------------------- the escalation alone
-def test_o30_a_cell_whose_processes_end_at_the_kill_is_killed_at_its_deadline_and_nothing_more():
-    """O30: the cell's processes go at the kill: the outcome is `killed`, recorded with its time, and the mount is
+def test_o34_a_cell_whose_processes_end_at_the_kill_is_killed_at_its_deadline_and_nothing_more():
+    """O34: the cell's processes go at the kill: the outcome is `killed`, recorded with its time, and the mount is
     neither aborted nor the sandbox stopped."""
     clock, procs = Clock(), Processes({11: "python", 12: "worker"})
     esc, calls = escalation(clock)
@@ -49,8 +49,8 @@ def test_o30_a_cell_whose_processes_end_at_the_kill_is_killed_at_its_deadline_an
     assert "utc" in record
 
 
-def test_o30_a_process_that_ignores_sigterm_and_sigkill_outlives_the_grace_and_the_mount_is_aborted():
-    """O30: a wedged process survives its kill; the sandbox waits out the grace period (not less), records it as
+def test_o34_a_process_that_ignores_sigterm_and_sigkill_outlives_the_grace_and_the_mount_is_aborted():
+    """O34: a wedged process survives its kill; the sandbox waits out the grace period (not less), records it as
     survived with its state, aborts the mount, and the process then ends: the outcome is `mount_aborted`."""
     clock, procs = Clock(), Processes({11: "python", 12: "reader"}, wedged=(12,))
 
@@ -79,8 +79,8 @@ def test_o30_a_process_that_ignores_sigterm_and_sigkill_outlives_the_grace_and_t
         pytest.param(lambda _: {"ok": True, "connections": 1}, id="aborted, and the process still lives"),
     ],
 )
-def test_o30_when_the_abort_fails_or_cannot_be_done_or_frees_nothing_the_sandbox_is_stopped(abort):
-    """O30: the abort is the first resort only: when it fails, when there is no FUSE mount to abort, or when the
+def test_o34_when_the_abort_fails_or_cannot_be_done_or_frees_nothing_the_sandbox_is_stopped(abort):
+    """O34: the abort is the first resort only: when it fails, when there is no FUSE mount to abort, or when the
     process still lives after it, the sandbox's stop is ordered, its last step, and the outcome is `sandbox_stopped`:
     the stop itself is the caller's, once that outcome is recorded."""
     clock, procs = Clock(), Processes({12: "reader"}, wedged=(12,))
@@ -92,8 +92,8 @@ def test_o30_when_the_abort_fails_or_cannot_be_done_or_frees_nothing_the_sandbox
     assert steps(record)[-1] == "stop"
 
 
-def test_o30_processes_that_cannot_be_listed_are_never_taken_for_gone():
-    """O30: unknown is never gone: a cell whose processes cannot be listed escalates as one that survived."""
+def test_o34_processes_that_cannot_be_listed_are_never_taken_for_gone():
+    """O34: unknown is never gone: a cell whose processes cannot be listed escalates as one that survived."""
     clock, procs = Clock(), Processes({11: "python"})
     procs.unknown = True
     esc, calls = escalation(clock)
@@ -104,8 +104,8 @@ def test_o30_processes_that_cannot_be_listed_are_never_taken_for_gone():
     assert [name for name, _ in calls] == ["abort"]
 
 
-def test_o30_a_process_the_cell_starts_during_the_grace_is_killed_too():
-    """O30: a process that appears while the grace runs (a worker forked before its parent died) is killed as well."""
+def test_o34_a_process_the_cell_starts_during_the_grace_is_killed_too():
+    """O34: a process that appears while the grace runs (a worker forked before its parent died) is killed as well."""
     clock, procs = Clock(), Processes({11: "python"})
     kill = procs.kill
 
@@ -120,8 +120,8 @@ def test_o30_a_process_the_cell_starts_during_the_grace_is_killed_too():
     assert [21] in procs.kills
 
 
-def test_o30_the_kill_survived_reason_is_infrastructure_of_a_kind_no_condition_may_declare():
-    """O30: a cell that outlived its kill is infrastructure, of the platform's kind `cell_unkillable`, which is not
+def test_o34_the_kill_survived_reason_is_infrastructure_of_a_kind_no_condition_may_declare():
+    """O34: a cell that outlived its kill is infrastructure, of the platform's kind `cell_unkillable`, which is not
     treatable; a clean kill at the deadline stays the agent's own time limit."""
     record = {"outcome": deadline.MOUNT_ABORTED, "steps": []}
     kill = {"reason": "kill_survived", "category": "infrastructure", "basis": "x", "deadline": record}
@@ -134,8 +134,8 @@ def test_o30_the_kill_survived_reason_is_infrastructure_of_a_kind_no_condition_m
 
 
 # ---------------------------------------------------------------------------------------------- through the sandbox
-def test_o30_a_normal_cell_killed_at_its_deadline_is_its_own_time_limit_as_before(world, mounted):
-    """O30: a cell whose processes end at the kill is the agent's own time limit, as before, with the deadline's record
+def test_o34_a_normal_cell_killed_at_its_deadline_is_its_own_time_limit_as_before(world, mounted):
+    """O34: a cell whose processes end at the kill is the agent's own time limit, as before, with the deadline's record
     saying `killed`; nothing is aborted and the sandbox runs on."""
     cell_processes(world, mounted)
     result, others = run_to_the_cap(mounted, world)
@@ -149,8 +149,8 @@ def test_o30_a_normal_cell_killed_at_its_deadline_is_its_own_time_limit_as_befor
     assert mounted.exec("print(1)", 30).exit_code == 0  # the run goes on
 
 
-def test_o30_the_kill_at_the_deadline_reaches_a_grandchild_in_a_session_of_its_own(world, mounted):
-    """O30: the kill at the deadline takes every process of the cell from the container's cgroup, wider than its
+def test_o34_the_kill_at_the_deadline_reaches_a_grandchild_in_a_session_of_its_own(world, mounted):
+    """O34: the kill at the deadline takes every process of the cell from the container's cgroup, wider than its
     process group: the cell's python, its child and a grandchild that left the group, never the init or its sleep."""
     pids = cell_processes(world, mounted)
     run_to_the_cap(mounted, world)
@@ -161,8 +161,8 @@ def test_o30_the_kill_at_the_deadline_reaches_a_grandchild_in_a_session_of_its_o
     assert pids["sleep"] not in killed
 
 
-def test_o30_a_wedged_cell_has_its_mount_aborted_from_the_sidecar_and_its_attempt_is_infrastructure(world, mounted):
-    """O30: a cell process that ignores SIGKILL outlives the grace; the sandbox aborts the mount's FUSE connection from
+def test_o34_a_wedged_cell_has_its_mount_aborted_from_the_sidecar_and_its_attempt_is_infrastructure(world, mounted):
+    """O34: a cell process that ignores SIGKILL outlives the grace; the sandbox aborts the mount's FUSE connection from
     the sidecar (the connection the host's mount table gives the run's mount, written as root in the sidecar, nothing
     in the agent's container), the process ends, and the cell is `kill_survived`, infrastructure of the untreatable
     kind `cell_unkillable`. The run is over: the next cell is refused with that kind, and the record keeps each step
@@ -200,8 +200,8 @@ def test_o30_a_wedged_cell_has_its_mount_aborted_from_the_sidecar_and_its_attemp
     assert refused.value.kind == "cell_unkillable"
 
 
-def test_o30_an_abort_that_fails_stops_the_sandbox_and_the_attempt_is_infrastructure(world, mounted):
-    """O30: when the sidecar's abort fails, the sandbox is stopped (its ordered teardown), the outcome is
+def test_o34_an_abort_that_fails_stops_the_sandbox_and_the_attempt_is_infrastructure(world, mounted):
+    """O34: when the sidecar's abort fails, the sandbox is stopped (its ordered teardown), the outcome is
     `sandbox_stopped`, and a later cell or collection is refused as `cell_unkillable`, not as a sandbox that is
     merely not running."""
     cell_processes(world, mounted, wedged=True)
@@ -223,8 +223,8 @@ def test_o30_an_abort_that_fails_stops_the_sandbox_and_the_attempt_is_infrastruc
     assert uncollected.value.kind == "cell_unkillable"
 
 
-def test_o30_without_a_mount_a_cell_that_outlives_its_kill_stops_the_sandbox(world):
-    """O30: with no FUSE mount (no data path) there is nothing to abort: the sandbox is stopped."""
+def test_o34_without_a_mount_a_cell_that_outlives_its_kill_stops_the_sandbox(world):
+    """O34: with no FUSE mount (no data path) there is nothing to abort: the sandbox is stopped."""
     sandbox = DockerSandbox.start(world.host, world.s, make_spec(world, "isolated"), **start_options(world))
     try:
         cell_processes(world, sandbox, wedged=True)
@@ -239,8 +239,8 @@ def test_o30_without_a_mount_a_cell_that_outlives_its_kill_stops_the_sandbox(wor
         sandbox.stop()
 
 
-def test_o30_the_code_tool_ends_the_attempt_as_cell_unkillable(world, mounted):
-    """O30: the code tool raises the cell's kind for a cell that outlived its kill, never a timeout told to the
+def test_o34_the_code_tool_ends_the_attempt_as_cell_unkillable(world, mounted):
+    """O34: the code tool raises the cell's kind for a cell that outlived its kill, never a timeout told to the
     model."""
     import asyncio
 
@@ -260,8 +260,8 @@ def test_o30_the_code_tool_ends_the_attempt_as_cell_unkillable(world, mounted):
     assert ended.value.kind == "cell_unkillable"
 
 
-def test_o30_the_grace_period_is_a_setting_and_is_recorded(world, mounted):
-    """O30: `[sandbox] kill_grace_s` sets the grace (5 s unless declared) and the run's metadata records it."""
+def test_o34_the_grace_period_is_a_setting_and_is_recorded(world, mounted):
+    """O34: `[sandbox] kill_grace_s` sets the grace (5 s unless declared) and the run's metadata records it."""
     assert world.s.kill_grace_s == 5.0
     assert mounted.metadata()["cell_deadline"] == {"grace_s": 5.0, "margin_s": 30.0}
     assert "fusermount" not in SIDECAR_ABORT  # a lazy unmount leaves the agent's copy and its waiting reads
@@ -269,8 +269,8 @@ def test_o30_the_grace_period_is_a_setting_and_is_recorded(world, mounted):
 
 
 @pytest.mark.parametrize(("value", "loads"), [(2, 2.0), (12.5, 12.5), (0.5, None), (61, None), ("5", None)])
-def test_o30_the_grace_period_is_read_from_the_file_within_its_bounds(tmp_path, value, loads):
-    """O30: a declared grace of 1 to 60 seconds is read; one outside that, or not a number, refuses the load naming
+def test_o34_the_grace_period_is_read_from_the_file_within_its_bounds(tmp_path, value, loads):
+    """O34: a declared grace of 1 to 60 seconds is read; one outside that, or not a number, refuses the load naming
     the key."""
 
     def edit(data):
@@ -285,8 +285,8 @@ def test_o30_the_grace_period_is_read_from_the_file_within_its_bounds(tmp_path, 
         assert load_platform(path, require_secrets=False).sandbox.kill_grace_s == loads
 
 
-def test_o30_the_sidecars_abort_takes_a_connection_number_and_nothing_else(world):
-    """O30: the abort's argument is the connection's number from the mount table, never a path or a name."""
+def test_o34_the_sidecars_abort_takes_a_connection_number_and_nothing_else(world):
+    """O34: the abort's argument is the connection's number from the mount table, never a path or a name."""
     names = DockerSandbox(world.host, world.s, make_spec(world, "mounted")).names
     assert sidecar_abort_args(names, "61")[-1] == "61"
     for bad in ("", "6/1", "../abort", "0:61"):

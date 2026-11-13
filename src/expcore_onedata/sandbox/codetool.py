@@ -19,7 +19,7 @@ such. A kill the counters attribute to the host or a component, or that nothing 
 raises `InfraError` of kind `sandbox` or `unattributed_kill` and ends the attempt (O17). A cell during which the data
 gate refused an answer for its own integrity raises `InfraError` of kind `data_gate_integrity`, which no condition can
 treat (O05, C01). A cell a process of which outlived its kill at the cell's deadline raises `InfraError` of kind
-`cell_unkillable`, before anything else, which no condition can treat either (O30).
+`cell_unkillable`, before anything else, which no condition can treat either (O34).
 """
 
 import asyncio
@@ -63,7 +63,7 @@ class CodeExecutionProvider:
                 "the argument 'code' must be a non-empty string", is_error=True, error_class="bad_arguments"
             )
         result = await asyncio.to_thread(self._sandbox.exec, code, max(float(timeout_s), MIN_TIMEOUT_S))
-        # a cell that outlived its kill first (O30): its mount or its sandbox is gone, and nothing read after that, the
+        # a cell that outlived its kill first (O34): its mount or its sandbox is gone, and nothing read after that, the
         # gate's log included, is the cell's evidence; then the gate's refusal: its read was cut by the gate
         failure = (
             kinds.deadline_error(result.kill) or kinds.gate_error(result.gate_refusals) or kinds.kill_error(result.kill)

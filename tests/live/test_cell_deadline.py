@@ -1,4 +1,4 @@
-"""A cell's hard deadline against a live federation (O30, #190), skipped unless every gate below is set.
+"""A cell's hard deadline against a live federation (O34, #190), skipped unless every gate below is set.
 
     EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_PLATFORM=<root>/platform.toml \\
     EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range the host routes nowhere> \\
@@ -239,8 +239,8 @@ def attempt(tmp_path_factory):
     return facts
 
 
-def test_o30_a_read_of_a_file_only_the_stopped_provider_holds_outlives_its_kill_at_the_cap(attempt):
-    """O30: the read through the mount waits in the kernel past the cap: the deadline records it as killed, then
+def test_o34_a_read_of_a_file_only_the_stopped_provider_holds_outlives_its_kill_at_the_cap(attempt):
+    """O34: the read through the mount waits in the kernel past the cap: the deadline records it as killed, then
     survived, with the process in D state."""
     record = attempt["during"]["deadline"]
     steps = {s["step"]: s for s in record["steps"]}
@@ -249,8 +249,8 @@ def test_o30_a_read_of_a_file_only_the_stopped_provider_holds_outlives_its_kill_
     assert "D" in steps["survived"]["states"]
 
 
-def test_o30_the_sidecar_aborts_the_mount_and_the_read_then_ends(attempt):
-    """O30: the abort from the sidecar (its SYS_ADMIN, fusectl in its own namespace) ends the waiting read: the
+def test_o34_the_sidecar_aborts_the_mount_and_the_read_then_ends(attempt):
+    """O34: the abort from the sidecar (its SYS_ADMIN, fusectl in its own namespace) ends the waiting read: the
     outcome is `mount_aborted`, and no process of the cell is left. A `sandbox_stopped` here means the sidecar could
     not write the abort, and the stop did the rest."""
     record = attempt["during"]["deadline"]
@@ -259,22 +259,22 @@ def test_o30_the_sidecar_aborts_the_mount_and_the_read_then_ends(attempt):
     assert attempt["during"]["mount_aborted"] is True
 
 
-def test_o30_the_cell_returns_within_its_hard_deadline(attempt):
-    """O30: `exec` returns within the cap and the escalation's margin (two graces and the commands' allowance), not
+def test_o34_the_cell_returns_within_its_hard_deadline(attempt):
+    """O34: `exec` returns within the cap and the escalation's margin (two graces and the commands' allowance), not
     when the read would."""
     assert attempt["during"]["exec_s"] < HARD_BOUND_S
 
 
-def test_o30_the_attempt_is_infrastructure_and_the_run_is_over(attempt):
-    """O30: the cell is `kill_survived`, kind `cell_unkillable`, and the next cell is refused with that kind."""
+def test_o34_the_attempt_is_infrastructure_and_the_run_is_over(attempt):
+    """O34: the cell is `kill_survived`, kind `cell_unkillable`, and the next cell is refused with that kind."""
     during = attempt["during"]
     assert during["kill"] == {"reason": "kill_survived", "category": "infrastructure"}
     assert during["error_kind"] == "cell_unkillable"
     assert during["next_cell"] == "cell_unkillable"
 
 
-def test_o30_the_provider_is_restored_and_nothing_of_the_sandbox_is_left(attempt):
-    """O30: the injector restored the target, the sandbox stopped with no FUSE mount left, and the file is gone."""
+def test_o34_the_provider_is_restored_and_nothing_of_the_sandbox_is_left(attempt):
+    """O34: the injector restored the target, the sandbox stopped with no FUSE mount left, and the file is gone."""
     assert attempt["restored"] is True
     assert attempt["after"] == {"stopped": True, "fuse_mounts_left": 0}
     assert attempt["files_left"] == 0

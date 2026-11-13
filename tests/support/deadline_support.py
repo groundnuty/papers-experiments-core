@@ -1,4 +1,4 @@
-"""Helpers for the tests of a cell's hard deadline (O30): a fake clock and process tracker for the escalation alone, and
+"""Helpers for the tests of a cell's hard deadline (O34): a fake clock and process tracker for the escalation alone, and
 the cell processes, the run to the cap and the kills sent, for the deadline through a sandbox on the fake host.
 
 A real process in uninterruptible sleep cannot be made in a test: the escalation is driven by a fake process tracker,

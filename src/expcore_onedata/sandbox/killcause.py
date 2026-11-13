@@ -23,7 +23,7 @@ attempts per condition and model).
 is one, whatever its elapsed time, since a cell killed by something else just before its limit has run as long. A failure of
 docker itself without that flag is no time limit either: a dead container is infrastructure, anything else nothing attributes.
 
-`kill_survived` is the harness's own record too (deadline.py, O30): a process of the cell outlived its kill at the cap
+`kill_survived` is the harness's own record too (deadline.py, O34): a process of the cell outlived its kill at the cap
 (a read waiting in the kernel on the FUSE mount), so the mount was aborted or the sandbox stopped. It overrides what the
 counters say, since after an abort or a stop they describe the harness's doing, not the cell's.
 

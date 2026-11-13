@@ -535,7 +535,7 @@ class SandboxPlatform:
         only when the body's own error stands, for the caller to raise. First any cell's deadline is settled
         (`settle_deadline`): the loop gives a cell the agent's remaining time, so it cuts the call at the cell's own cap
         and would score the agent's `time_cap` while the escalation still runs. A deadline that went past a clean kill
-        ends the run as `cell_unkillable` (O30), before anything else: the gate's log, gone with a stopped sandbox, is
+        ends the run as `cell_unkillable` (O34), before anything else: the gate's log, gone with a stopped sandbox, is
         then not the run's evidence. Then the gate's refusals: the gate cut the condition's read, which ends the run,
         not the body's own failure, and a refusal no cell reported (a read the agent's code left running) the same
         (O05, C01). A run with neither stops, and one whose body returned must be shown gone."""

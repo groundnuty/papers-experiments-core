@@ -32,7 +32,7 @@ when this module is first imported. Four are the sandbox's and the ingest's, and
   ingest that fails on its own says nothing about the agent, so the run is set aside and no condition may declare it.
 - `cell_unkillable`: a process of a cell outlived its kill at the cell's deadline (a read waiting in the kernel on the
   FUSE mount, as one of a file only a stopped provider holds does), so the sandbox aborted the mount or stopped
-  (`deadline.py`, O30). The harness could not bound the cell, and the run's mount or sandbox is gone: the run says
+  (`deadline.py`, O34). The harness could not bound the cell, and the run's mount or sandbox is gone: the run says
   nothing about the agent or the manipulation, so it is set aside, and no condition may declare it, an outage's
   included. A cell killed cleanly at its deadline is the agent's own time limit, never this kind.
 
@@ -113,7 +113,7 @@ def deadline_error(kill: Mapping[str, Any] | None) -> InfraError | None:
 
 
 def run_ended_error(record: Mapping[str, Any]) -> InfraError:
-    """The error of every later cell of a run a cell's deadline ended (O30), and of its collection once the sandbox was
+    """The error of every later cell of a run a cell's deadline ended (O34), and of its collection once the sandbox was
     stopped: kind `cell_unkillable`, with how that deadline ended."""
     outcome = record.get("outcome", "unknown")
     return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}): nothing more runs")

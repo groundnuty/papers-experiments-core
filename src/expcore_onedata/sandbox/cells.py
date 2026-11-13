@@ -9,7 +9,7 @@ the host's out-of-memory killer likewise. An exit code alone never makes a kill.
 bytes that are not UTF-8 is the agent's own outcome: they are replaced, never an exception. The only time limit is the
 `timeout_s` the caller sets, so no hidden per-cell limit can creep back.
 
-That limit is a hard deadline (deadline.py, O30): at the cap every process of the cell is killed, and one that outlives
+That limit is a hard deadline (deadline.py, O34): at the cap every process of the cell is killed, and one that outlives
 the kill past the grace period has the mount aborted under it, or the sandbox stopped. Its record is the cell's
 `deadline`, and a cell that outlived its kill is `kill_survived`, infrastructure, and ends the run (`ended`). The record
 is published from the timer's thread under `meta_lock`, before the sandbox's stop, which runs after it.
@@ -61,7 +61,7 @@ class CellTimer:
     it fired, then kills what runs; the record and the cell's end are taken under one lock, so a cell that ended first
     never has a fired timer, and one this timer ended always has. No time limit is inferred from how long a cell ran.
 
-    The kill may hand back what is to run once its outcome is decided (the sandbox's stop a deadline ordered, O30): the
+    The kill may hand back what is to run once its outcome is decided (the sandbox's stop a deadline ordered, O34): the
     timer runs it after it marks the outcome decided, so `end`, which waits for the outcome, never waits for that."""
 
     def __init__(self, seconds: float, kill: Callable[[], Callable[[], None] | None]) -> None:
@@ -225,7 +225,7 @@ class CellRunner:
 
     # ------------------------------------------------------------------------------------------------ processes
     def agent_processes(self, timeout_s: float | None = None) -> list[dict] | None:
-        """Every process of the agent's container except its init and the init's `sleep` (`init_sleep`, O30); [] when it
+        """Every process of the agent's container except its init and the init's `sleep` (`init_sleep`, O34); [] when it
         has stopped, None when that cannot be read (within `timeout_s`, when given)."""
         waits = TD.WAITS
         if timeout_s is not None:
@@ -302,7 +302,7 @@ class CellRunner:
     def settle(self) -> dict[str, Any] | None:
         """The run's body is over (`launch` leaves it, or `collect` begins): a cell still running is past its cap, the
         agent's own, so its deadline is enforced now if its timer has not fired, and one under way is waited for, at
-        most its margin and `SETTLE_SLACK_S`. Only then may anyone decide how the run ended (O30). The deadline that
+        most its margin and `SETTLE_SLACK_S`. Only then may anyone decide how the run ended (O34). The deadline that
         ended the run, or None; a deadline whose outcome was not decided in that time ends it too, as `survived_kill`:
         unknown is never a clean kill. It never raises."""
         with self.meta_lock:
@@ -316,7 +316,7 @@ class CellRunner:
 
     def wait_decided(self) -> None:
         """Wait for the outcome of a cell's deadline already under way, at most its margin and `SETTLE_SLACK_S`; never
-        fire one. A stop calls this first, so that its teardown never races an escalation (O30)."""
+        fire one. A stop calls this first, so that its teardown never races an escalation (O34)."""
         with self.meta_lock:
             timer = self._running
         if timer is not None:

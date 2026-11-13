@@ -1,4 +1,4 @@
-"""O30: a cell's deadline through the agent loop, as a study runs it. The loop gives each cell the agent's remaining
+"""O34: a cell's deadline through the agent loop, as a study runs it. The loop gives each cell the agent's remaining
 time as its cap, so the cell's deadline falls with the agent's own; the loop's watch then cuts the call and cancels its
 wait for it while the deadline's escalation is still under way, which alone would make the attempt the agent's
 `time_cap`. A cell a process of which outlived its kill must still end the run as `cell_unkillable`: `launch` settles
@@ -6,11 +6,12 @@ the deadline of a cell still running, and decides from it before anything else, 
 
 import asyncio
 import contextlib
+import json
 import threading
 from types import SimpleNamespace
 
 import pytest
-from deadline_support import cell_processes
+from deadline_support import CELL_S, Clock, cell_processes
 from fake_host import FakeHost
 from loop_support import ScriptedBackend, call, turn
 from sandbox_support import FAST, SleptClock
@@ -21,6 +22,8 @@ from expcore.errors import InfraError
 from expcore.loop.agent_loop import run_agent
 from expcore.loop.config import AgentConfig
 from expcore.loop.toolbox import ToolBox
+from expcore_onedata.sandbox import cells as cells_module
+from expcore_onedata.sandbox import deadline
 from expcore_onedata.sandbox.codetool import CodeExecutionProvider
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.provider import SandboxPlatform
@@ -112,8 +115,8 @@ def run_the_agent(sandbox) -> object:
     return run_agent(backend, box, "system", "task", config)
 
 
-def test_o30_a_cell_that_outlives_its_kill_in_the_agent_loop_ends_the_run_as_cell_unkillable(platform):
-    """O30: through `launch`, the agent loop and the code tool: the agent's one cell reads through the mount and its
+def test_o34_a_cell_that_outlives_its_kill_in_the_agent_loop_ends_the_run_as_cell_unkillable(platform):
+    """O34: through `launch`, the agent loop and the code tool: the agent's one cell reads through the mount and its
     python ignores the kill at the cap until the mount is aborted. The loop sees only its own cap passing
     (`time_cap`); the attempt still ends `cell_unkillable`, raised by `launch`, not the agent's time cap, and the
     sandbox is stopped."""
@@ -140,8 +143,8 @@ def test_o30_a_cell_that_outlives_its_kill_in_the_agent_loop_ends_the_run_as_cel
     assert sandbox.metadata()["evidence_kept"]["relocated"] is True  # launch's stop keeps a set-aside run's disks
 
 
-def test_o30_collect_settles_a_cell_still_running_before_it_decides(world, mounted):
-    """O30: a cell the loop cut is still running, its own cap far off, when the body collects the run's outputs:
+def test_o34_collect_settles_a_cell_still_running_before_it_decides(world, mounted):
+    """O34: a cell the loop cut is still running, its own cap far off, when the body collects the run's outputs:
     `collect` enforces the cell's deadline first, and waits for it, so none fires while the agent is frozen and copied.
     A cell that outlives its kill, with an abort that fails, makes the collection `cell_unkillable`; without that, the
     quiesce took its read waiting in the kernel for a quiet process and the outputs were copied."""
@@ -175,3 +178,137 @@ def test_o30_collect_settles_a_cell_still_running_before_it_decides(world, mount
     assert cells.ended["outcome"] == "sandbox_stopped"
     cut.join(30)
     assert not cut.is_alive()
+
+
+# --------------------------------------------------------------------- the run's end comes before the gate's refusals
+REFUSAL = {"status": 502, "upstream_status": 200, "gate_refusal": "credential_in_header", "client_saw": "5xx"}
+
+
+@pytest.mark.parametrize("by_the_code_tool", [False, True], ids=["the body returns", "the code tool raises the cell's"])
+def test_o34_a_cell_that_outlives_its_kill_ends_a_rest_run_before_the_gates_refusals_do(platform, by_the_code_tool):
+    """O34: in a REST run whose gate has refused an answer, a cell that outlives its kill (with no FUSE mount there is
+    nothing to abort: the sandbox is stopped) ends the run as `cell_unkillable`, not `data_gate_integrity`: after a
+    stop the gate's log is not the run's evidence, so its refusals do not end the run in place of the cell, whether the
+    body returns or raises the code tool's own error for the cell."""
+    kept = []
+
+    async def body(sandbox):
+        kept.append(sandbox)
+        with open(sandbox.dir / "gatelog" / "requests.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(REFUSAL) + "\n")
+        assert sandbox.gate_refusals() == ["credential_in_header"]  # the gate has refused something
+        wedge_the_cell(sandbox, platform.host)
+        if by_the_code_tool:
+            await CodeExecutionProvider(sandbox).execute("python", {"code": CODE}, timeout_s=CELL_S, ctx=None)
+        else:
+            await asyncio.to_thread(sandbox.exec, CODE, CELL_S)
+
+    async def go():
+        async with platform.platform.launch(
+            Context(), run_key="run-1", level="via-gate", ceiling_s=CEILING_S
+        ) as sandbox:
+            await body(sandbox)
+
+    with pytest.raises(InfraError) as ended:
+        asyncio.run(go())
+    assert ended.value.kind == "cell_unkillable"
+    assert "sandbox_stopped" in ended.value.detail
+    assert "credential_in_header" not in ended.value.detail
+    assert kept[0].stopped is True
+
+
+# ------------------------------------------------------------------ an escalation that never decides, by the clock
+class DecidedByTheClock:
+    """The event a cell's timer waits on for its kill's outcome, its bounded waits taken by a fake clock: a wait that
+    finds the outcome not decided takes all its seconds of the clock, at once, and says so. An unbounded wait is the
+    real one, and the bounds asked for are kept."""
+
+    def __init__(self, event: threading.Event, clock: Clock) -> None:
+        self.event, self.clock, self.bounds = event, clock, []
+
+    def set(self) -> None:
+        self.event.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if timeout is None:
+            return self.event.wait()
+        self.bounds.append(timeout)
+        if self.event.is_set():
+            return True
+        self.clock.now += timeout
+        return False
+
+
+def hang_the_escalation(sandbox, host, release: threading.Event) -> None:
+    """The cell runs until its deadline fires, and the deadline's escalation then never returns, as one whose commands
+    a docker daemon never answers, until `release`."""
+    firing = threading.Event()
+
+    def hangs(*cell):
+        firing.set()
+        release.wait(60)
+
+    def runs_until_its_cap(container, argv, stdin):
+        if stdin == CODE:
+            assert firing.wait(30), "the cell's deadline never fired"
+            return CmdResult(137, "", "")
+        return CmdResult(0)
+
+    sandbox._cells._kill_at_the_cap, host.exec_handler = hangs, runs_until_its_cap
+
+
+def test_o34_a_deadline_that_never_decides_ends_the_run_as_cell_unkillable_within_its_bound(platform, monkeypatch):
+    """O34: the agent loop has cut the call and the body is over while the cell's escalation never decides. `launch`
+    settles it: it waits for the outcome the cell's margin and `SETTLE_SLACK_S` by the clock (60 s with the default
+    grace, counted here by a fake clock) and no longer, and then ends the run as `cell_unkillable` through
+    `survived_kill`: an outcome never known is not a clean kill, and without that the attempt would be scored the
+    agent's own `time_cap`."""
+    lease = platform.pool.acquire(GROUP, run_key="run-1")
+    clock, release, kept, decided = Clock(), threading.Event(), [], []
+    real_timer = cells_module.CellTimer
+
+    def timer_by_the_clock(seconds, kill):
+        timer = real_timer(seconds, kill)
+        timer._decided = DecidedByTheClock(timer._decided, clock)
+        decided.append(timer._decided)
+        return timer
+
+    monkeypatch.setattr(cells_module, "CellTimer", timer_by_the_clock)
+    safety = threading.Timer(30, release.set)  # nothing outlasts a test: a settle that waits for ever fails instead
+    safety.daemon = True
+    safety.start()
+
+    async def go():
+        async with platform.platform.launch(
+            Context(), run_key="run-1", level="mounted", ceiling_s=CEILING_S, lease=lease
+        ) as sandbox:
+            kept.append(sandbox)
+            hang_the_escalation(sandbox, platform.host, release)
+            cut = threading.Thread(target=sandbox.exec, args=(CODE, 120), daemon=True)  # its own cap is far off
+            stop = sandbox.stop
+
+            def stop_once_the_hung_deadline_and_the_cell_are_released():
+                release.set()
+                cut.join(30)
+                stop()
+
+            sandbox.stop = stop_once_the_hung_deadline_and_the_cell_are_released
+            cut.start()
+            while sandbox._cells._running is None:
+                await asyncio.sleep(0.01)  # the body is over only once the cell runs
+
+    try:
+        with pytest.raises(InfraError) as ended:
+            asyncio.run(go())
+    finally:
+        safety.cancel()
+        release.set()
+    sandbox = kept[0]
+    assert ended.value.kind == "cell_unkillable"
+    assert "survived_kill" in ended.value.detail
+    assert sandbox._cells.ended["outcome"] == deadline.SURVIVED
+    assert sandbox.stopped is True
+    bound = deadline.margin_s(5.0) + cells_module.SETTLE_SLACK_S
+    assert bound == 60.0
+    assert set(decided[-1].bounds) == {bound}  # the cell's timer (the start's probes had theirs): every wait bounded
+    assert clock.now >= 100.0 + bound  # the settle waited the whole bound before it decided: sooner would be a guess

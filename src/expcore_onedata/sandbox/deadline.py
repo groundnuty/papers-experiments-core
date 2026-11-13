@@ -1,5 +1,5 @@
 # Provenance: new
-"""A cell's hard deadline (O30): the kill at its cap, and what follows when a process of the cell outlives it.
+"""A cell's hard deadline (O34): the kill at its cap, and what follows when a process of the cell outlives it.
 
 At the cap every process of the cell is SIGKILLed: every process of the agent's container but its init and the init's
 `sleep`, read from the container's cgroup (`teardown._readers`), so a worker in a process group or session of its own
