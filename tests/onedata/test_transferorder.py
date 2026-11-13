@@ -169,6 +169,24 @@ def test_o32_a_record_with_no_finish_time_that_does_not_say_it_ended_may_lag_and
     assert (list(found.kept), found.earlier, found.pages) == (["run", "lag", "also"], False, 1)
 
 
+def test_o32_past_the_stop_no_record_is_kept_not_even_one_that_may_lag():
+    """O32 (Codex's case): once the walk has stopped, at an old job or at one with no finish time that says it ended,
+    the records after it on the page are read for the order check alone; one with no finish time that does not say it
+    ended is not kept there either, so a tail of them cannot exhaust the bound."""
+    says_ended = {"run": True, "done": True, "lag1": False, "lag2": False}
+    listing = Listing([("run", 1010.0), ("done", 0.0), ("lag1", 0.0), ("lag2", 0.0)])
+    found = newest_first(
+        listing.page,
+        list,  # each record is its id here, so `ended` can tell the records apart
+        lambda tid: listing.finish[tid],
+        cutoff=CUTOFF,
+        bound=2,
+        max_pages=10,
+        ended=lambda tid: says_ended[tid],
+    )
+    assert (list(found.kept), found.pages) == (["run"], 1)
+
+
 # -- the band at the window's start ----------------------------------------------------------------------------------
 
 

@@ -148,10 +148,10 @@ def newest_first(
     reads the records of a few ids in their order, `chunk` at a time; `finish` gives a record's finish time, 0 for a
     job cancelled before it was enqueued (given none), None when the record gives no readable one, and `ended` whether
     the record says the job ended (every record, by default). A record with a finish time of 0 that says it ended
-    stops the walk as a job older than the cutoff does, and is not kept, nor are those after it: by the order they have
-    no finish time either. Past `bound` kept jobs, or `max_pages` pages without an end, the listing is unknown: raise
-    Unreadable. Raise OrderBroken when a finish time is later than the one before it, or follows a record with none,
-    through the page past the stop's, whose every record the walk reads for that check alone and keeps none of (one
+    stops the walk as a job older than the cutoff does, and is not kept, nor is any record after a stop, whatever its
+    finish time: past the stop a record is read for the order check alone. Past `bound` kept jobs, or `max_pages` pages
+    without an end, the listing is unknown: raise Unreadable. Raise OrderBroken when a finish time is later than the
+    one before it, or follows a record with none, through the page past the stop's, whose every record the walk reads for that check alone and keeps none of (one
     page more than `max_pages` at most). An order broken only further on is not seen: the module docstring has the
     residual. `where` starts every message."""
     if bound < 1 or max_pages < 1 or chunk < 1:
@@ -173,6 +173,8 @@ def newest_first(
                 order.unstamped()
                 stopped = True
                 continue  # no finish time sorts last: none after it has one, so none counts, and the page is checked
+            if stopped:
+                continue  # past the stop a record is read for the order check alone, never kept, not even one that lags
             kept[tid] = record
             if len(kept) > bound:
                 raise Unreadable(
