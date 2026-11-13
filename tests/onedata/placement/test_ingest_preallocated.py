@@ -337,6 +337,31 @@ def test_o44_a_crash_between_the_removal_and_the_new_file_ends_complete_after_th
     again.check()
 
 
+def test_o44_a_crash_after_the_new_file_was_made_and_before_its_extension_ends_complete_after_the_next_start(
+    make, fake, ticker, tmp_path
+):
+    """O44: the new file was made, then every write of content failed (its extension first), so the start and its
+    own recovery fail with the file left at size 0; its id was recorded as soon as it existed. The next start finds
+    the ingest's file short, writes it whole at its offsets in place, and then sets the start state."""
+    fake.writes_before_reset = 0  # the extension is the start's first write of content
+    failed = make(ROW)
+    with pytest.raises(InfraError):
+        failed.start({})
+    short = fake.id_of(DAY_PATH)
+    assert len(node(fake).content) == 0
+    journal = [json.loads(line) for line in (tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
+    made = [e for e in journal if e.get("entry") == "id" and e["event"] == "created"]
+    assert [(e["new_id"], e["action"]) for e in made] == [(short, "preallocated")]
+    fake.writes_before_reset = None
+    again = make(ROW)
+    again.start({})
+    first_turn(again, ticker)
+    snapshot = again.finish()
+    assert snapshot["start"]["restore"]["day-13"] == {"ok": True, "action": "completed", "file_id": short}
+    assert bytes(node(fake).content) == DAY
+    again.check()
+
+
 def test_o44_an_empty_preallocated_plan_records_the_same_steps_and_passes(make, fake, ticker):
     """O44: a sham control: nothing to arrive, the hook anchors nothing to write, and the check passes."""
     ingest = make()
