@@ -11,14 +11,16 @@ the thread that holds it). The core always starts the sidecar's oneclient with t
 on a live federation, that with it every space of one mount reads.
 
 It starts containers (`EXPCORE_LIVE_DOCKER`) and writes one small file into each declared space and deletes it again
-(`EXPCORE_LIVE_MUTATE`). `EXPCORE_LIVE_PLATFORM` is a federation's platform.toml (the Compose federation's, from a
-layout whose study declares at least two spaces in `[[spaces]]`, with `facts.json` beside it); the data-path principal
-must be a member of every space it declares, since the mount's token is scoped to all of them. The test writes a copy
-with a `[sandbox]` table into a directory of its own (`mount_live.derive_platform`), as `test_mount_path.py` does, with
+(`EXPCORE_LIVE_MUTATE`). `EXPCORE_LIVE_PLATFORM` is a federation's platform.toml with `facts.json` beside it. It needs a
+platform file made for this check: no committed layout has one. It declares at least two spaces in `[[spaces]]` that
+share one `local` provider (every entry's `local` is one of its providers, so the local provider supports them all),
+and its data-path principal is a member of every one of them, since the mount's token is scoped to all of them. The
+default layout's `local` provider supports one space only, and the five-provider layout's only provider on two spaces
+has no principal in both; the Compose templates render the one-space form. The test writes a copy with a `[sandbox]`
+table into a directory of its own (`mount_live.derive_platform`), as `test_mount_path.py` does, with
 `io_mode = "proxy"`. It skips, naming the reason, when the file declares fewer than two spaces, and never writes into a
-space the file does not declare. For the check to reach the failure it guards, the local provider supports the spaces
-on one storage, which the Compose federation arranges (each provider has one storage, which supports every space it
-supports).
+space the file does not declare. The failure it guards needs the spaces on one storage of the local provider, which the
+Compose federation arranges (each provider has one storage, which supports every space it supports).
 
 The attempt runs once, in a fixture: one file is written into each space through the local provider, one sandbox
 mounts them all, and the agent reads the files one after another, each in a child process given `READ_DEADLINE_S`.

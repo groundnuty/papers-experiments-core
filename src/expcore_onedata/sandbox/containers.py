@@ -140,8 +140,9 @@ def sidecar_options(settings: SandboxSettings) -> list[str]:
 
 def extra_args_record(extra_args: Sequence[str]) -> dict[str, Any]:
     """The study's extra oneclient arguments as a run's metadata keeps them: the option names, and the SHA-256 of the
-    whole list, never a value (a value may be a path or an identifier, O12)."""
-    names = [a.split("=", 1)[0] for a in extra_args if a.startswith("-")]
+    whole list, never a value (a value may be a path or an identifier, O12). A short option's value may be attached to
+    it (`-l/path`), so only its two characters are kept; a long option's name ends at an `=`."""
+    names = [a.split("=", 1)[0] if a.startswith("--") else a[:2] for a in extra_args if a.startswith("-")]
     return {"names": names, "sha256": hashlib.sha256("\0".join(extra_args).encode()).hexdigest()}
 
 

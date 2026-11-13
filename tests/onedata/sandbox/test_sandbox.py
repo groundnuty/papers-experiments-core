@@ -791,18 +791,19 @@ def test_o36_a_direct_mount_records_direct_and_the_study_extra_arguments_only_by
     names and the SHA-256 of the whole list, never by value (a value may be a path or an identifier, O12)."""
     from dataclasses import replace
 
-    extra = ("--provider-timeout", "45", "--log-dir=/somewhere/private")
+    extra = ("--provider-timeout", "45", "--log-dir=/somewhere/private", "-l/attached/private")
     world.s = replace(world.s, mount=replace(world.s.mount, io_mode="direct", extra_args=extra))
     sbx = start(world, "mounted")
     meta = sbx.metadata()
     assert meta["mount"]["io_mode"] == "direct"
     assert meta["mount"]["options"] == ["-o", "ro,allow_other", "--force-direct-io"]
     assert meta["mount"]["extra_args"] == {
-        "names": ["--provider-timeout", "--log-dir"],
+        "names": ["--provider-timeout", "--log-dir", "-l"],  # a short option's attached value is never kept
         "sha256": hashlib.sha256("\0".join(extra).encode()).hexdigest(),
     }
     text = json.dumps(meta, default=str)
     assert "/somewhere/private" not in text
+    assert "/attached/private" not in text
     assert "45" not in meta["mount"]["extra_args"]["names"]
     sbx.stop()
 
