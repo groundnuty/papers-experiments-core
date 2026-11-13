@@ -585,7 +585,6 @@ def test_o28_a_provider_that_runs_but_does_not_serve_after_the_restore_fails_the
     restore = entry.facts["restore"]
     assert (restore["cleared"], restore["verified"], restore["how"]) == (False, False, "not_serving")
     assert "could not be brought back (not_serving)" in entry.summary
-    assert "the outage raised RestoreNotVerified" in entry.summary  # the injector's exit raised it, the facts stay
 
 
 def test_o28_a_provider_whose_driver_finds_it_serving_and_whose_rest_does_not_answer_fails_the_check(

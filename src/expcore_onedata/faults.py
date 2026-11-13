@@ -73,15 +73,23 @@ lock held, so a later `clear`, `finish` or `start` tries again, and the health g
 refuse the provider until then.
 
 **A restore that is not verified is never passed silently (O11).** `clear` and `finish` answer it as data (`False`, the
-snapshot's `ok` false), which a caller that handles only a raising exit never reads, so every other way out raises:
+snapshot's `ok` false), which a caller that handles only a raising exit never reads, so every other way out either
+raises or leaves the failure in the record, which the campaign refuses to score:
 
-- `session` and `running` clear however the start and the body end, and raise `RestoreNotVerified` at their exit when
-  the restore is not verified. It is an `InfraError` of kind `injector_failure`, so a caller keyed on that kind sees what
-  it saw for a failed start, and it names the provider by its label, how the restore ended (`how`, a word such as
-  `not_serving`), and what was checked (whether the identity changed to a running one, and whether the provider then
-  served), never a service, a path or a token. When the start or the body raised too, it is raised from that exception
-  (`__cause__`), so neither is lost; an interrupt, an exit or a cancellation (anything but an `Exception`) is raised as
-  it was, with the restore failure in its notes.
+- `session` clears however the start and the body end, and raises `RestoreNotVerified` at its exit when the restore is
+  not verified. It is an `InfraError` of kind `injector_failure`, so a caller keyed on that kind sees what it saw for a
+  failed start, and it names the provider by its label, how the restore ended (`how`, a word such as `not_serving`), and
+  what was checked (whether the identity changed to a running one, and whether the provider then served), never a
+  service, a path or a token. When the start or the body raised too, it is raised from that exception (`__cause__`), so
+  neither is lost; an interrupt, an exit or a cancellation (anything but an `Exception`) is raised as it was, with the
+  restore failure in its notes.
+- `running` clears the same way and **returns** when its body returned, so the executor that runs the agent inside it
+  (`record = await record_run(...)`) keeps its record. The record carries the failure itself: the snapshot, which is
+  the record's instrument reading, holds `restore_verified` (`true` once a restore of a target this injector took down
+  is verified, `false` with `how`, `identity_changed` and `serving` when it is not, absent when nothing was taken down).
+  The core never scores a record that carries it as anything but `true` (`expcore.records.injections.restore_refusal`):
+  the record is set aside, and the scheduler sets its attempt aside as `injector_failure` whatever the post-run health
+  check decides. When the body raised, no record exists to carry it, and `running` raises as `session` does.
 - `check`, the instrument's post-run check, raises the same failure, so an executor that starts the injector with
   `start_instruments` and clears it itself gets the refusal from `finish_instruments`: the record keeps its snapshot
   and holds the refusal (`instrument_refusal`), and the attempt is set aside as infrastructure and run again.
@@ -128,10 +136,11 @@ the tool server, builds the injector for the target its condition declares and r
 
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
 so on cancellation it waits for it (shielded, bounded), clears however the block ends and raises the cancellation again.
-A restore that is not verified raises `RestoreNotVerified` at the block's exit, which the executor lets reach the
-campaign as an `injector_failure`: the attempt is set aside to run again, and the journal keeps the provider unhealthy
-for the gate. An executor that drives the injector through `start_instruments` and clears it itself gets the same
-refusal from `finish_instruments` (`check`), with its record kept. Never
+A restore that is not verified does not raise at the block's exit: the record, built inside the block, is kept, and
+`finish_instruments` puts the injector's reading into it, with `restore_verified` false, which the campaign refuses to
+score (it sets the attempt aside as `injector_failure` to run again), and `check` refuses it as well. The journal keeps
+the provider unhealthy for the gate. An executor that drives the injector through `start_instruments` and clears it
+itself gets the same from `finish_instruments`, with its record kept. Never
 await `asyncio.to_thread(injector.start, ...)` bare: cancelled, it leaves the thread stopping the provider while the
 code meant to clear it never runs. `start` and `clear` hold the injector's own lock, so a clear waits for a start still
 running in its thread. `finish_instruments` puts the snapshot into the record and derives its treatment flag again from it.
@@ -395,9 +404,12 @@ class FaultInjector:
         about the longest a start takes), then the clear runs and the cancellation is raised again. The clear, in its
         own thread, waits for a start that is still running, through the injector's lock.
 
-        The exit raises `RestoreNotVerified` when the restore is not verified, as `session` does: from the body's
-        exception when it raised one; a cancellation or any other `BaseException` is raised as it was, with the failure
-        in its notes.
+        An exit that follows the body returning returns too, whether or not the restore is verified: the executor that
+        runs the agent inside the block (`record = await record_run(...)`) keeps its record, which carries the failure
+        itself (`snapshot`: `restore_verified` false, with `how`, `identity_changed` and `serving`) for the campaign to
+        refuse to score, and `check` refuses it as well. When the body raised, no record exists to carry it, so the
+        restore failure is raised from the body's exception as `session` does; a cancellation or any other
+        `BaseException` is raised as it was, with the failure in its notes.
         """
         bound = self.cancel_wait_s if cancel_wait_s is None else cancel_wait_s
         self._cancel = threading.Event()
@@ -415,7 +427,6 @@ class FaultInjector:
             self._raise_unrestored(error)
             raise
         await self._clear_for(bound)
-        self.check()
 
     async def _clear_for(self, bound: float) -> None:
         """Clear in a worker thread, shielded: a cancellation waits for it for at most `bound` and is raised again, with
@@ -516,7 +527,24 @@ class FaultInjector:
             "target": self.target,
             "injections": [] if injection is None else [injection],
             "steps": [dict(step) for step in self._steps],
+            **self._restore_reading(injection),
         }
+
+    def _restore_reading(self, injection: Mapping[str, Any] | None) -> dict[str, Any]:
+        """What the snapshot says of the restore, so that the record carries a failure itself (O11): `restore_verified`
+        true once a target this injector took down is verified restored; false, with `how` the restore ended, whether the
+        provider's `identity_changed` and whether it was `serving`, when an injection is open or was not verified. The
+        core reads it (`expcore.records.injections.restore_refusal`) and never scores the record. Nothing, when the
+        injector took nothing down and has nothing open: no restore was needed, so none is claimed verified."""
+        failure = self._unrestored()
+        if failure is not None:
+            return {
+                "restore_verified": False,
+                "how": failure.how,
+                "identity_changed": failure.identity_changed,
+                "serving": failure.serving,
+            }
+        return {"restore_verified": True} if injection and injection["injected"] else {}
 
     # --- clearing and recovery --------------------------------------------------------------------------------
 

@@ -1,5 +1,7 @@
-"""O11: a restore that is not verified is never passed silently. The exit of a session raises `RestoreNotVerified`, the
-journal keeps the provider marked unhealthy for the next gate, and a body's own exception is never lost.
+"""O11: a restore that is not verified is never passed silently. The exit of a session raises `RestoreNotVerified`; the
+exit of `running`, which an executor holds its record inside, returns, and the injector's reading in the record carries
+`restore_verified: false` for the campaign to refuse to score. The journal keeps the provider marked unhealthy for the
+next gate either way, and a body's own exception is never lost.
 
 Every test runs against `FakeServices`, whose `never_serves` knob is a provider that never comes back to serving.
 """
@@ -14,12 +16,13 @@ from fault_support import OUTAGE_TARGET, SERVICES, FakeServices, injector_for, w
 from record_support import hand_made
 
 from expcore.errors import InfraError
+from expcore.records.injections import INJECTOR_FAILURE, restore_refusal
 from expcore.records.instruments import finish_instruments
 from expcore_onedata.admission import FederationLock
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import JOURNAL
-from expcore_onedata.faults import INJECTOR_FAILURE, RestoreNotVerified, load_faults
+from expcore_onedata.faults import RestoreNotVerified, load_faults
 
 SERVICE = SERVICES["beta"]
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -161,6 +164,7 @@ def test_o11_a_verified_restore_leaves_the_exit_of_a_session_as_it_was(tmp_path)
     assert open_injections(tmp_path) == []
     snapshot = injector.finish()
     assert snapshot["ok"] is True
+    assert snapshot["restore_verified"] is True
     injector.check()  # a verified restore passes the post-run check
 
 
@@ -177,23 +181,92 @@ def test_o11_a_body_exception_with_a_verified_restore_is_raised_unchanged(tmp_pa
 # --- the async form -----------------------------------------------------------------------------------------------
 
 
-def test_o11_running_raises_when_the_restore_is_not_verified(tmp_path):
-    """O11: `running`, the async form, raises `RestoreNotVerified` at its exit as `session` does."""
+def test_o11_running_returns_when_the_restore_is_not_verified_so_the_executor_keeps_its_record(tmp_path):
+    """O11: `running` does not raise for a restore that is not verified: an executor that records the run inside the
+    block (`record = await record_run(...)`) keeps that record. The journal still holds the injection open and
+    journalled `clear_failed`, so the gate and the next start refuse the provider."""
+    platform, injector = unserving(tmp_path)
+
+    async def scenario():
+        async with injector.running(RUN):
+            record = hand_made()  # what `record_run` returns inside the block
+        return record
+
+    record = asyncio.run(scenario())  # returned, not raised
+    assert record.run_key == hand_made().run_key
+    (still,) = open_injections(tmp_path)
+    failed = [line for line in journal_lines(tmp_path) if line["event"] == "clear_failed"]
+    assert [(line["id"], line["how"]) for line in failed] == [(still["id"], "not_serving")]
+    assert federation_is_exclusive(platform) is True
+
+
+def test_o11_the_record_of_a_running_whose_restore_is_not_verified_carries_the_failure(tmp_path):
+    """O11: the reading the record keeps says the restore was not verified, with how it ended and what was checked,
+    whether it is taken from the snapshot or put in by `finish_instruments`, so the failure is in the record itself and
+    does not depend on the exception the exit no longer raises."""
     _, injector = unserving(tmp_path)
 
     async def scenario():
         async with injector.running(RUN):
-            pass
+            return hand_made()
 
-    with pytest.raises(RestoreNotVerified) as caught:
-        asyncio.run(scenario())
-    assert (caught.value.kind, caught.value.target, caught.value.how) == (
-        INJECTOR_FAILURE,
-        OUTAGE_TARGET,
-        "not_serving",
-    )
-    assert caught.value.__cause__ is None
-    assert len(open_injections(tmp_path)) == 1
+    record = finish_instruments(asyncio.run(scenario()), [injector])
+    reading = record.instruments["fault_injector"]
+    assert reading["restore_verified"] is False
+    assert (reading["how"], reading["identity_changed"], reading["serving"]) == ("not_serving", True, False)
+    assert reading["ok"] is False
+    assert SERVICE not in json.dumps(reading)
+
+
+def test_o11_a_reading_that_records_the_restore_not_verified_is_a_record_that_is_set_aside(tmp_path):
+    """O11: the core reads the injector's reading as the platform writes it: a record that carries it is set aside,
+    so `rescore` hands it back unscored and the campaign sets the attempt aside as `injector_failure`."""
+    _, injector = unserving(tmp_path)
+
+    async def scenario():
+        async with injector.running(RUN):
+            return hand_made()
+
+    record = finish_instruments(asyncio.run(scenario()), [injector])
+    refusal = restore_refusal(record.instruments)
+    assert refusal is not None
+    assert (refusal["namespace"], refusal["infra_kind"]) == ("fault_injector", INJECTOR_FAILURE)
+    assert OUTAGE_TARGET in refusal["detail"]
+    assert "not_serving" in refusal["detail"]
+    assert SERVICE not in refusal["detail"]
+    assert record.set_aside is True
+
+
+def test_o11_a_session_records_the_same_reading_in_its_snapshot(tmp_path):
+    """O11: `session` raises for the restore, and the snapshot it leaves says the same as `running`'s."""
+    _, injector = unserving(tmp_path)
+    with pytest.raises(RestoreNotVerified):
+        in_session(injector)
+    reading = injector.snapshot()
+    assert reading["restore_verified"] is False
+    assert (reading["how"], reading["identity_changed"], reading["serving"]) == ("not_serving", True, False)
+
+
+def test_o11_a_start_that_failed_and_cannot_restore_records_the_restore_not_verified(tmp_path):
+    """O11: the provider may be down after a start that stopped it and then broke, so the reading says so even though
+    the injection was never seen down."""
+    injector = injector_for(write_faults(tmp_path), StopThenBreakAndNeverStart(start_fails=True))
+    with pytest.raises(RestoreNotVerified):
+        in_session(injector)
+    reading = injector.snapshot()
+    assert reading["injections"][0]["injected"] is False
+    assert (reading["restore_verified"], reading["how"]) == (False, "start_failed")
+
+
+def test_o11_an_injector_that_took_nothing_down_records_no_restore_at_all(tmp_path):
+    """O11: `restore_verified` is the reading of a restore that was needed: it is absent before a start and after a
+    start whose stop had no effect, so a record is never told that a restore that was not needed was verified."""
+    injector = injector_for(write_faults(tmp_path), FakeServices(stop_noop=True))
+    assert "restore_verified" not in injector.snapshot()
+    with pytest.raises(InfraError):
+        injector.start(RUN)
+    assert "restore_verified" not in injector.snapshot()
+    assert restore_refusal({"fault_injector": injector.snapshot()}) is None
 
 
 def test_o11_running_chains_the_restore_failure_to_what_the_body_raised(tmp_path):
@@ -322,8 +395,9 @@ def test_o11_the_note_for_a_cancelled_clear_never_waits_for_the_injectors_lock(t
     assert waited_s < 2
 
 
-def test_o11_running_with_a_verified_restore_raises_nothing(tmp_path):
-    """O11: a verified restore leaves the exit of `running` as it was."""
+def test_o11_running_with_a_verified_restore_raises_nothing_and_records_it_verified(tmp_path):
+    """O11: a verified restore leaves the exit of `running` as it was, and the reading says `restore_verified: true`,
+    with none of the failure's fields."""
     injector = injector_for(write_faults(tmp_path), FakeServices())
 
     async def scenario():
@@ -331,8 +405,14 @@ def test_o11_running_with_a_verified_restore_raises_nothing(tmp_path):
             pass
 
     asyncio.run(scenario())
-    assert injector.snapshot()["ok"] is True
+    reading = injector.snapshot()
+    assert reading["ok"] is True
+    assert reading["restore_verified"] is True
+    assert not {"how", "identity_changed", "serving"} & set(reading)
     assert open_injections(tmp_path) == []
+    record = finish_instruments(hand_made(), [injector])
+    assert restore_refusal(record.instruments) is None
+    assert record.set_aside is False
 
 
 # --- the instrument's own route -----------------------------------------------------------------------------------
