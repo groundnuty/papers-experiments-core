@@ -7,7 +7,7 @@ and through the sandbox by the fake host's processes that ignore every signal (`
 import threading
 import time
 
-from expcore_onedata.sandbox import deadline
+from expcore_onedata.sandbox import cells, deadline
 from expcore_onedata.sandbox.hostops import CmdResult
 
 CELL_S = 1.5  # a cell's limit: more than the second a cell needs once prepared, and short for a test
@@ -66,6 +66,42 @@ class Processes:
         for pid in self.wedged:
             self.procs.pop(pid, None)
         self.wedged.clear()
+
+
+class DecidedByTheClock:
+    """The event a cell's timer waits on for its kill's outcome, its bounded waits taken by a fake clock: a wait that
+    finds the outcome not decided takes all its seconds of the clock, at once, and says so. An unbounded wait is the
+    real one, and the bounds asked for are kept."""
+
+    def __init__(self, event: threading.Event, clock: Clock) -> None:
+        self.event, self.clock, self.bounds = event, clock, []
+
+    def set(self) -> None:
+        self.event.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if timeout is None:
+            return self.event.wait()
+        self.bounds.append(timeout)
+        if self.event.is_set():
+            return True
+        self.clock.now += timeout
+        return False
+
+
+def timers_by_the_clock(monkeypatch, clock: Clock) -> list[DecidedByTheClock]:
+    """Every cell timer made from now on waits for its kill's outcome by `clock` (`DecidedByTheClock`); their events,
+    in the order the timers were made."""
+    real_timer, decided = cells.CellTimer, []
+
+    def timer_by_the_clock(seconds, kill):
+        timer = real_timer(seconds, kill)
+        timer._decided = DecidedByTheClock(timer._decided, clock)
+        decided.append(timer._decided)
+        return timer
+
+    monkeypatch.setattr(cells, "CellTimer", timer_by_the_clock)
+    return decided
 
 
 def escalation(clock: Clock, *, abort=None, grace_s: float = 3.0) -> tuple[deadline.Escalation, list]:

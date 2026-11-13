@@ -11,7 +11,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from deadline_support import CELL_S, Clock, cell_processes
+from deadline_support import CELL_S, Clock, cell_processes, timers_by_the_clock
 from fake_host import FakeHost
 from loop_support import ScriptedBackend, call, turn
 from sandbox_support import FAST, SleptClock
@@ -218,27 +218,6 @@ def test_o34_a_cell_that_outlives_its_kill_ends_a_rest_run_before_the_gates_refu
 
 
 # ------------------------------------------------------------------ an escalation that never decides, by the clock
-class DecidedByTheClock:
-    """The event a cell's timer waits on for its kill's outcome, its bounded waits taken by a fake clock: a wait that
-    finds the outcome not decided takes all its seconds of the clock, at once, and says so. An unbounded wait is the
-    real one, and the bounds asked for are kept."""
-
-    def __init__(self, event: threading.Event, clock: Clock) -> None:
-        self.event, self.clock, self.bounds = event, clock, []
-
-    def set(self) -> None:
-        self.event.set()
-
-    def wait(self, timeout: float | None = None) -> bool:
-        if timeout is None:
-            return self.event.wait()
-        self.bounds.append(timeout)
-        if self.event.is_set():
-            return True
-        self.clock.now += timeout
-        return False
-
-
 def hang_the_escalation(sandbox, host, release: threading.Event) -> None:
     """The cell runs until its deadline fires, and the deadline's escalation then never returns, as one whose commands
     a docker daemon never answers, until `release`."""
@@ -264,16 +243,8 @@ def test_o34_a_deadline_that_never_decides_ends_the_run_as_cell_unkillable_withi
     `survived_kill`: an outcome never known is not a clean kill, and without that the attempt would be scored the
     agent's own `time_cap`."""
     lease = platform.pool.acquire(GROUP, run_key="run-1")
-    clock, release, kept, decided = Clock(), threading.Event(), [], []
-    real_timer = cells_module.CellTimer
-
-    def timer_by_the_clock(seconds, kill):
-        timer = real_timer(seconds, kill)
-        timer._decided = DecidedByTheClock(timer._decided, clock)
-        decided.append(timer._decided)
-        return timer
-
-    monkeypatch.setattr(cells_module, "CellTimer", timer_by_the_clock)
+    clock, release, kept = Clock(), threading.Event(), []
+    decided = timers_by_the_clock(monkeypatch, clock)
     safety = threading.Timer(30, release.set)  # nothing outlasts a test: a settle that waits for ever fails instead
     safety.daemon = True
     safety.start()
