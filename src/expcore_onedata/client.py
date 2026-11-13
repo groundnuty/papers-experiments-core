@@ -816,11 +816,17 @@ class OnezoneClient:
         provider's `GET /spaces/{id}`, read once per space and provider and kept once it was answered. An absence
         (`answered_absent`) is a space the provider does not hold, left out and asked again next time; when the
         provider holds none of them, the target resolves to no space (OutOfScope). Any other failure, or an answer
-        without a plain id, raises PlatformError and keeps nothing of that space."""
+        without a plain id, raises PlatformError and keeps nothing of that space. The link check's probe space
+        (`[link_check]`, O35) is asked too, of a provider that supports it, so a probe file resolves to it; only a
+        request bound to it passes the gate there (`_require_in_scope`)."""
         roots: dict[str, str] = {}
         declared = self._config.spaces
         supported = [entry for entry in declared if provider in entry.support.providers] or declared
-        for space_id in dict.fromkeys(entry.space.id for entry in supported):
+        ids = [entry.space.id for entry in supported]
+        probe = self._config.link_check
+        if probe is not None and provider in probe.providers:
+            ids.append(probe.space.id)
+        for space_id in dict.fromkeys(ids):
             root = self._space_root(provider, space_id, reads)
             if root is not None:
                 roots[root] = space_id
@@ -1045,10 +1051,14 @@ class OnezoneClient:
     def _require_in_scope(self, target: tuple[str, str], space: Space | None) -> None:
         """Refuse a target space whose name starts with no declared space's prefix (every `[[spaces]]` entry's), and,
         for a request bound to one space (`space`), a target that is not that space: another id, another name, or a
-        name outside its own prefixes, whatever the other spaces' prefixes allow."""
+        name outside its own prefixes, whatever the other spaces' prefixes allow. A request bound to the link check's
+        probe space (`PlatformConfig.probe_space`, O35) passes on that space alone; no other request reaches it, since
+        its prefixes are not among the study's."""
         space_id, name = target
         if space is not None and (space_id != space.id or name != space.name or not name.startswith(space.prefixes)):
             raise OutOfScope("the target lies in another space than the one the request is bound to; nothing was sent")
+        if space is not None and space == self._config.probe_space:
+            return
         if not name.startswith(self._config.prefixes):
             raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
 

@@ -113,7 +113,8 @@ def health(ctx: Context) -> Result:
     """The platform's own health check: the providers supporting the space equal the declared set."""
     if ctx.config.principals.service is None:
         return unknown("no [principals] service user is declared, so the health check cannot mint its token")
-    platform = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now)
+    # Without the link check (O35): it writes probes and evicts them, and a day-0 reading check changes nothing.
+    platform = PlatformHealth(ctx.config, ctx.client, ctx.issuer, clock=ctx.now, links=False)
     verdict = platform()
     if verdict.ok:
         return passed(verdict.detail)

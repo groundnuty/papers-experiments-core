@@ -94,7 +94,19 @@ ONE_ATTEMPT_SITES = {
     ("precampaign.py", "_child", "client.get"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "client.content_answer"): ["<one attempt>", "<one attempt>"],
-    ("fault_serves.py", "provider_serves.probe", "client.get"): ["ONE_ATTEMPT"],
+    ("fault_serves.py", "ServingProbe.__call__", "client.get"): ["ONE_ATTEMPT"],
+    # the link check (O35): its fetch is the measurement, and every read and write of setting its probe up is part of
+    # the health gate's check, one attempt like the content-type check's
+    ("linkcheck.py", "_Check._digest", "client.read_content"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._empty_on", "client.get"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._evict", "consistency.wait_transfers"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._find", "client.get"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._held", "client.get"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._provision", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._provision", "consistency.space_root"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._schedule_eviction", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._write", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check.prepare", "consistency.wait_visible"): ["ONE_ATTEMPT"],
     # the placement probes: the transfer records they record, the transfer log, the block map
     ("probes.py", "PlatformProbes._transfer_records", "client.get"): ["ONE_ATTEMPT"],
     ("probes.py", "PlatformProbes._read_maps", "provisioner.blocks"): ["<default>"],
@@ -240,6 +252,7 @@ MEASURING_MODULES = {
     "probes.py",
     "transferlog.py",
     "precampaign.py",
+    "linkcheck.py",
     "fault_serves.py",
     "tokens.py",
     "tokenscope.py",
