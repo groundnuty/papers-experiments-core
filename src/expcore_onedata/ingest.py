@@ -25,8 +25,20 @@ else: every write goes through the provisioner, so through the mutation gate bou
   again, whatever the executor does. **`raise_if_failed`** is the same check, a second guard for the executor to call
   once the record is written.
 
+**The preallocated mode** (`[ingest] mode = "preallocated"`, #107, O36; `ingestsparse.py`) takes each planned file,
+part of the baseline, from complete to its final size with only its declared prefix written, at the start: the
+complete file is removed (confirmed absent everywhere), made again under its name, extended to its final size by an
+empty write and given its prefix, each step confirmed. The schedule starts at the agent's first model turn, through the
+first-turn hook (`at_first_turn`, C31), which an executor calls with `first_turn_instruments`; a run whose first turn
+never came is refused by the post-run check. Each part is written at its offsets once the data provider's block map is
+exactly the ranges before it, then its prefix's hash is read back and the block maps must show exactly the written
+ranges at the final size. The restore completes each file in place and never removes it.
+
 The snapshot (version 1) is clock-labelled: a reading carries `clock`, the provisioner's monotonic clock, which the
-loop's clock readings use too, `t_rel_s` from the schedule's start (`anchor`: `instrument_start`) and `utc`. `steps`
+loop's clock readings use too, `t_rel_s` from the schedule's start (`anchor`: `instrument_start`, or `first_turn` in
+the preallocated mode, whose `first_turn` holds the run's clock reading the hook was given and the seconds from the end
+of the start, `after_start_s`) and `utc`. In the preallocated mode `start.files` holds each file's verified start state
+(its old and new id, its size and blocks), and a file no part of which has arrived is `prefix_only`. `steps`
 holds each part as planned, written (with how late), confirmed (with the seconds each provider took to show it),
 failed, abandoned or not due; `ids` every file id the ingest removed, created or restored, with the old and new id and
 the file's label, so a study can map a gate's errors to files after the run. Providers are named by their position,
@@ -48,14 +60,16 @@ from typing import Any
 
 from expcore.errors import InfraError
 from expcore_onedata.ingestbase import FAILURES, Baseline, RestoreFailed, detail
-from expcore_onedata.ingestplan import IngestPlan, Step
+from expcore_onedata.ingestplan import PREALLOCATED, IngestPlan, Step
+from expcore_onedata.ingestsparse import SparseBaseline
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.sandbox.kinds import INGEST_FAILURE
 from expcore_onedata.streamed import Digest
 
 NAMESPACE = "progressive_ingest"
 VERSION = 1
-ANCHOR = "instrument_start"  # the schedule's zero: the end of `start`
+ANCHOR = "instrument_start"  # the arrival schedule's zero: the end of `start`
+FIRST_TURN = "first_turn"  # the preallocated schedule's zero: the agent's first model turn (`at_first_turn`)
 
 
 class ProgressiveIngest:
@@ -84,7 +98,8 @@ class ProgressiveIngest:
         self.namespace = f"{NAMESPACE}_space{index}" if several else NAMESPACE
         self._space = provisioner.space.position if several else None
         self._p, self._plan = provisioner, plan
-        self._base = Baseline(provisioner, plan, Path(journal), now)
+        self._sparse = plan.mode == PREALLOCATED
+        self._base = (SparseBaseline if self._sparse else Baseline)(provisioner, plan, Path(journal), now)
         self._steps = plan.steps()
         self._max_wait_s = max_wait_s
         self._join_timeout_s = provisioner.settings.transfer_timeout_s if join_timeout_s is None else join_timeout_s
@@ -93,6 +108,8 @@ class ProgressiveIngest:
         self._started = self._closed = False
         self._retried_before = provisioner.reads_retried  # the count the snapshot's `reads_retried` is taken from
         self._t0: float | None = None
+        self._ready: float | None = None  # the provisioner's clock at the end of a start that set the start state
+        self._first_turn: dict[str, Any] | None = None
         self._readings: list[dict[str, Any]] = []
         self._files = {f.label: {"baseline_id": None, "arrived_id": None, "restored_id": None} for f in plan.files}
         self._done = 0
@@ -110,6 +127,12 @@ class ProgressiveIngest:
     def failure(self) -> dict[str, Any] | None:
         """The ingest failure recorded so far, or None."""
         return self._failure
+
+    @property
+    def at_first_turn(self) -> Callable[[Mapping[str, Any]], None] | None:
+        """The first-turn hook (C31) in the preallocated mode, which anchors the schedule there; None in the arrival
+        mode, whose schedule starts with the instrument, so `first_turn_instruments` takes no reading for it."""
+        return self._anchor_at_first_turn if self._sparse else None
 
     def _reading(self, kind: str, step: Step, **fields: Any) -> None:
         base = {"step": kind, "label": step.label, "part": step.part, "parts": step.parts, "due_s": step.due_s}
@@ -143,8 +166,7 @@ class ProgressiveIngest:
             for planned in self._plan.files:
                 if planned.baseline == "absent":  # a "complete" one was checked by its restore
                     self._base.check_source(planned)
-            for label, file_id in self._base.remove_for_start().items():
-                self._files[label]["baseline_id"] = file_id
+            states = self._set_start_state()
         except RestoreFailed as error:  # every file was tried, and every other one restored
             self._start = {**self._failed("start", error, began), "restore": error.files}
             raise self._start_refused(error) from None
@@ -152,11 +174,48 @@ class ProgressiveIngest:
             self._start = {**self._failed("start", error, began), "recovered": self._recover()}
             raise self._start_refused(error) from None
         self._start = {"ok": True, "seconds": round(self._p.clock() - began, 3), "restore": restored}
-        self._t0 = self._p.clock()
+        self._start.update({} if states is None else {"files": states})
+        self._ready = self._p.clock()
         for step in self._steps:
             self._reading("planned", step, bytes=step.stop, sha256=step.sha256)
+        if not self._sparse:  # the preallocated schedule starts at the agent's first turn (`at_first_turn`)
+            self._begin(self._ready)
+
+    def _set_start_state(self) -> dict[str, Any] | None:
+        """Remove each "complete" file (the arrival mode), or take it to its prefix at its final size (the preallocated
+        mode, whose verified state per file is returned); note the ids."""
+        if not self._sparse:
+            for label, file_id in self._base.remove_for_start().items():
+                self._files[label]["baseline_id"] = file_id
+            return None
+        assert isinstance(self._base, SparseBaseline)
+        states = self._base.start_state()
+        for label, state in states.items():
+            self._files[label].update(baseline_id=state["baseline_id"], arrived_id=state["file_id"])
+        return states
+
+    def _begin(self, t0: float) -> None:
+        self._t0 = t0
         self._thread = threading.Thread(target=self._drive, name="progressive-ingest", daemon=True)
         self._thread.start()
+
+    def _anchor_at_first_turn(self, moment: Mapping[str, Any]) -> None:
+        """The preallocated mode's first-turn hook: start the schedule now, its offsets counted from here, and record
+        the run's clock reading the executor gave and the seconds since the start state was set. Nothing starts after
+        a start that did not set the start state, or after the schedule was stopped."""
+        if self._ready is None or self._halt.is_set():
+            return
+        if self._t0 is not None:
+            raise RuntimeError("the first-turn hook anchors one run's schedule once")
+        t0 = self._p.clock()
+        clock_s = moment.get("clock_s")
+        self._first_turn = {
+            "clock": round(t0, 3),
+            "run_clock_s": clock_s if isinstance(clock_s, int | float) and not isinstance(clock_s, bool) else None,
+            "after_start_s": round(t0 - self._ready, 3),
+            "utc": self._base.stamp()["utc"],
+        }
+        self._begin(t0)
 
     def _start_refused(self, error: BaseException) -> InfraError:
         text = f"{self._p.where}the progressive ingest could not set its start state: {detail(error)}"
@@ -196,6 +255,9 @@ class ProgressiveIngest:
         return False
 
     def _perform(self, step: Step) -> None:
+        if self._sparse:
+            self._perform_part(step)
+            return
         planned, ids = self._plan.file(step.label), self._files[step.label]
         old = self._base.last_id.get(step.label)
         try:
@@ -217,6 +279,21 @@ class ProgressiveIngest:
         confirmed = self._base.confirm(done.file_id, step.stop)
         self._reading("confirmed", step, **self._base.stamp(), bytes=step.stop, file_id=done.file_id, **confirmed)
 
+    def _perform_part(self, step: Step) -> None:
+        """A part of the preallocated mode: written at its offsets into the file the start made, then its prefix's
+        hash read back and the file's state confirmed (`ingestsparse.py`)."""
+        assert isinstance(self._base, SparseBaseline)
+        planned, file_id = self._plan.file(step.label), self._files[step.label]["arrived_id"]
+        sent = self._base.write_part(planned, step, file_id)
+        written = self._base.stamp()
+        self._base.check_part(planned, step, file_id)
+        late = round(written["clock"] - (self._t0 or 0.0) - step.due_s, 3)
+        self._reading(
+            "written", step, **written, late_s=late, start=step.start, bytes=step.stop, sent=sent.size, file_id=file_id
+        )
+        confirmed = self._base.confirm_part(planned, step, file_id)
+        self._reading("confirmed", step, **self._base.stamp(), bytes=step.stop, file_id=file_id, **confirmed)
+
     def _fail(self, phase: str, error: str, text: str, step: Step | None = None) -> None:
         """Record an ingest failure (the first one is the attempt's) and, for a part, its reading."""
         failure = {"kind": INGEST_FAILURE, "phase": phase, "error": error, "detail": text}
@@ -237,7 +314,7 @@ class ProgressiveIngest:
                 if self._failure is None or self._failure["phase"] != "stop":
                     self._fail("stop", "Timeout", "a part was still being written when the schedule's bound ran out")
                 return False
-        if not self._closed and self._t0 is not None:
+        if not self._closed and self._ready is not None:  # the start state was set, so the plan's parts are recorded
             self._closed = True
             failed = self._failure is not None and self._failure["phase"] == "arrival"
             for step in self._steps[self._done + (1 if failed else 0) :]:
@@ -297,6 +374,8 @@ class ProgressiveIngest:
         if self._start is None or not self._start["ok"]:
             why = f": {self._start['detail']}" if self._start is not None else ": it never ran"
             self._refuse(f"at the start, which did not set the start state{why}")
+        if self._sparse and self._steps and self._t0 is None:
+            self._refuse("before its schedule began: the agent's first model turn, which anchors it, never came")
         if self._failure is not None:
             step = "an arrival" if self._failure["phase"] == "arrival" else "the stop of its schedule"
             part = f" ({self._failure['label']}, part {self._failure['part']})" if "label" in self._failure else ""
@@ -326,7 +405,8 @@ class ProgressiveIngest:
         files = {}
         for planned in self._plan.files:
             parts = sum(1 for s in steps if s["step"] == "confirmed" and s["label"] == planned.label)
-            state = "arrived" if parts == planned.parts else "partial" if parts else "not_arrived"
+            none = "prefix_only" if self._sparse else "not_arrived"
+            state = "arrived" if parts == planned.parts else "partial" if parts else none
             state = "failed" if failed == planned.label else state
             files[planned.label] = {"baseline": planned.baseline, "state": state, "parts_confirmed": parts}
             files[planned.label].update(self._files[planned.label])
@@ -335,8 +415,9 @@ class ProgressiveIngest:
             "version": VERSION,
             **({} if self._space is None else {"space": self._space}),
             "ok": ok,
-            "anchor": ANCHOR,
+            "anchor": FIRST_TURN if self._sparse else ANCHOR,
             "anchor_clock": None if self._t0 is None else round(self._t0, 3),
+            **({"first_turn": self._first_turn} if self._sparse else {}),
             "providers": [self._p.client.provider_label(p) for p in self._base.visible_on],
             "plan": self._plan.summary(),
             "start": self._start,
@@ -350,4 +431,4 @@ class ProgressiveIngest:
         }
 
 
-__all__ = ["ANCHOR", "NAMESPACE", "VERSION", "ProgressiveIngest"]
+__all__ = ["ANCHOR", "FIRST_TURN", "NAMESPACE", "VERSION", "ProgressiveIngest"]
