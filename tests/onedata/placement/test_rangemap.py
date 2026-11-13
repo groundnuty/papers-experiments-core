@@ -4,8 +4,8 @@ import pytest
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
-from expcore_onedata.rangemap import RangeRow, load_placement, safe_path, trace_reads
-from expcore_onedata.testing import write_with_placement
+from expcore_onedata.rangemap import PlacementSettings, RangeRow, load_placement, safe_path, trace_reads
+from expcore_onedata.testing import write_platform, write_with_placement
 
 ROWS = """
 [[placement.map]]
@@ -84,6 +84,8 @@ def test_a_file_on_a_provider_named_twice_is_refused(tmp_path):
         ("poll_s", 0, r"key 'poll_s'.*at least"),
         ("consecutive_polls", 0, r"key 'consecutive_polls'.*integer"),
         ("chunk_bytes", 1.5, r"key 'chunk_bytes'.*integer"),
+        ("fresh_connection_bytes", 0, r"key 'fresh_connection_bytes'.*integer of at least 1"),
+        ("fresh_connection_bytes", 1.5, r"key 'fresh_connection_bytes'.*integer"),
         ("settle_timeout_s", -1, r"key 'settle_timeout_s'"),
         ("probe_attempts", True, r"key 'probe_attempts'"),
     ],
@@ -160,3 +162,20 @@ def test_trace_reads_returns_the_merged_ranges_a_reader_read(tmp_path):
         handle.read(5)
 
     assert trace_reads(file, reader) == [(10, 30), (1000, 5)]
+
+
+def test_o25_the_default_chunk_is_16_mib_and_every_full_default_chunk_goes_on_a_new_connection(tmp_path):
+    """O25: on the 25.0 development build a 64 MiB or 32 MiB chunk stalled on a reused connection (3 of 289 such PUTs
+    against 0 of 336 on new ones) and 16 MiB never did, so the default is 16 MiB, in the dataclass and as the loader
+    reads it from a table that names neither key, and the threshold from which a content write is sent on a new
+    connection is 16 MiB too: with the defaults every full chunk is above it."""
+    bare = write_platform(tmp_path, lambda data: data.update(placement={"holder": "alpha"}))
+    loaded = load_placement(bare, load_platform(bare)).settings
+    for settings in (PlacementSettings(holder="alpha"), loaded):
+        assert (settings.chunk_bytes, settings.fresh_connection_bytes) == (16777216, 16777216)
+    assert loaded.chunk_bytes >= loaded.fresh_connection_bytes
+
+
+def test_o25_the_threshold_for_a_new_connection_can_be_set(tmp_path):
+    """O25: `[placement] fresh_connection_bytes` is the smallest content write sent on a connection of its own."""
+    assert load(tmp_path, fresh_connection_bytes=4 << 20).settings.fresh_connection_bytes == 4 << 20
