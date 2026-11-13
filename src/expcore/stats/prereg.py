@@ -48,6 +48,11 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     outcome = "score"
     estimator = "wilcoxon_cluster_bootstrap"
     cluster = "group"
+
+    [descriptives.waited-in-a] # optional, S14: a one-arm estimate, descriptive, never in the Holm family
+    conditions = ["cond-a"]    # one condition or a set of them, pooled
+    outcome = "waited"         # a rate or share; or `numerator` and `denominator` for a ratio of totals
+    cluster = "group"
 """
 
 from __future__ import annotations
@@ -65,13 +70,24 @@ from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
 from expcore.stats import estimators
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
+from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
 DEFAULT_TARGET_POWER = 0.8
-_TOP_KEYS = ("alpha", "holm_family", "exploratory_only", "bootstrap", "power", "estimators", "contrasts")
+_TOP_KEYS = (
+    "alpha",
+    "holm_family",
+    "exploratory_only",
+    "bootstrap",
+    "power",
+    "estimators",
+    "contrasts",
+    "descriptives",
+)
+_DESCRIPTIVE_KEYS = ("conditions", "cluster", "outcome", "numerator", "denominator")
 _CONTRAST_KEYS = (
     "conditions",
     "factor",
@@ -127,11 +143,12 @@ class Preregistration:
     estimator_params: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
     schema_digest: str | None = None  # the factor schema the contrasts were validated against
     exploratory_only: bool = False  # no confirmatory claim: no Holm family, every contrast exploratory (S12)
+    descriptives: Mapping[str, DescriptiveSpec] = dataclasses.field(default_factory=dict)  # one-arm estimates (S14)
 
     def __post_init__(self) -> None:
-        """Deep-freeze the contrasts, the family and the estimator parameters into fresh read-only containers; refuse a
-        family beside `exploratory_only`, and neither of them (S12)."""
-        for name in ("contrasts", "holm_family", "estimator_params"):
+        """Deep-freeze the contrasts, the family, the estimator parameters and the one-arm estimates into fresh
+        read-only containers; refuse a family beside `exploratory_only`, and neither of them (S12)."""
+        for name in ("contrasts", "holm_family", "estimator_params", "descriptives"):
             object.__setattr__(self, name, freeze(getattr(self, name)))
         if self.exploratory_only and self.holm_family:
             raise ValueError("a preregistration with exploratory_only has no Holm family, and this one names one")
@@ -171,6 +188,14 @@ class Preregistration:
             level=self.bootstrap.ci_level,
             seed=(self.bootstrap.seed, name_digest(spec.name)),
             params=dict(self.estimator_params.get(spec.estimator, {})),
+        )
+
+    def descriptive_settings(self, spec: DescriptiveSpec) -> EstimatorSettings:
+        """The bootstrap a one-arm estimate draws (S14): the contrasts' replicates and level, its own name's seed."""
+        return EstimatorSettings(
+            replicates=self.bootstrap.replicates,
+            level=self.bootstrap.ci_level,
+            seed=(self.bootstrap.seed, name_digest(spec.name)),
         )
 
 
@@ -213,9 +238,60 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
     _check_family_claims(root, contrasts, family, exploratory_only)
     power = _power(_table_section(root, "power")) if "power" in raw else None
     params = {name: _estimator_params(source, name, table) for name, table in _tables(root, "estimators").items()}
+    descriptives = {
+        name: _descriptive(source, name, table, schema, contrasts)
+        for name, table in _tables(root, "descriptives").items()
+    }
     return Preregistration(
-        source, sha256, alpha, bootstrap, contrasts, family, power, params, schema.digest, exploratory_only
+        source,
+        sha256,
+        alpha,
+        bootstrap,
+        contrasts,
+        family,
+        power,
+        params,
+        schema.digest,
+        exploratory_only,
+        descriptives,
     )
+
+
+def _descriptive(
+    source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, contrasts: Mapping[str, ContrastSpec]
+) -> DescriptiveSpec:
+    """Read one [descriptives.<name>] table (S14): its conditions, cluster, and an outcome or a numerator and a
+    denominator. Its name may not be a contrast's, which would share its seed and its place in the tables."""
+    section = Section(table, source, f"[descriptives.{name}]")
+    section.reject_unknown(_DESCRIPTIVE_KEYS)
+    if name in contrasts:
+        raise section.fail(None, f"{name!r} is also a contrast's name; a one-arm estimate needs a name of its own")
+    conditions = section.strings("conditions")
+    if not conditions:
+        raise section.fail("conditions", "must name one condition or more")
+    if len(set(conditions)) != len(conditions):
+        raise section.fail("conditions", "must name each condition once")
+    for condition in conditions:
+        if condition not in schema.conditions:
+            raise section.fail(
+                "conditions",
+                f"names unknown condition {condition!r}; the conditions of {schema.file} are: "
+                f"{', '.join(schema.conditions)}",
+            )
+    cluster = section.string("cluster")
+    ratio = [key for key in ("numerator", "denominator") if key in table]
+    if "outcome" in table:
+        if ratio:
+            raise section.fail(
+                ratio[0], "is given with an outcome: give an outcome, or a numerator and a denominator, not both"
+            )
+        return DescriptiveSpec(name, conditions, cluster, outcome=section.string("outcome"))
+    if not ratio:
+        raise section.fail("outcome", "is required: give an outcome, or a numerator and a denominator")
+    numerator, denominator = section.string("numerator"), section.string("denominator")
+    if numerator == denominator:
+        raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+    return DescriptiveSpec(name, conditions, cluster, numerator=numerator, denominator=denominator)
 
 
 def _flag(section: Section, key: str) -> bool:
