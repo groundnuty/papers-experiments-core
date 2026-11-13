@@ -282,6 +282,24 @@ def test_o33_the_listing_sends_no_token_on_its_first_page_and_follows_the_ones_i
     assert found.reads["listing_pages"] == math.ceil((1 + 1 + len(FILES)) / 2)
 
 
+def test_o33_the_settles_bound_counts_its_waits_not_its_reads(scanned, fake, ticker):
+    """O33: a requirement on a large directory makes one reading of every file's map long; here the settle's first
+    reading takes 5 s a map, a minute for six files on two providers, past the bound, and nothing changes. The settle
+    passes, since the bound counts the waits between readings, never the readings."""
+    original, reads = fake._distribution, [0]
+
+    def slow(node):
+        reads[0] += 1
+        if reads[0] <= len(FILES) * 2:  # the first reading: every file on both providers
+            ticker.sleep(5.0)
+        return original(node)
+
+    fake.add_qos("study")
+    fake._distribution = slow
+    record = SpaceReset(scanned).run({"beta": ["study"]})
+    assert record["stages"]["qos_settle"]["seconds"] > resetqos.SETTLE_BOUND_S
+
+
 @pytest.mark.parametrize(("depth", "lag"), [(1, 10.0), (2, 15.0), (3, 20.0)])
 def test_o33_the_quiet_wait_is_twice_the_occupancys_longest_lag_for_the_deepest_file(depth, lag):
     """O33: from the source, a placement reaches the space root's physical size after the file location's flush

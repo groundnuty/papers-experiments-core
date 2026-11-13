@@ -40,8 +40,10 @@ the same for `SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND
 eviction and the occupancy they are read again, and once more after `quiet_wait_s`, together with the occupancy: a
 provider holding more of an affected file than before the wait fails the reset, and so does a provider other than the
 data provider holding more of the space than at the occupancy stage. The block maps decide: a file's distribution
-shows its provider's in-memory location at once. The occupancy only adds a second sign, and a zero there is never
-taken alone as nothing having landed, because a directory's physical size lags a placement:
+shows its provider's in-memory location at once. A replication that lands between the eviction's verification and
+the first of these readings is already in that reading, so the maps show no growth; the occupancy read after the wait,
+set against the occupancy stage's, is what catches it. The occupancy is otherwise a second sign, and a zero there is
+never taken alone as nothing having landed, because a directory's physical size lags a placement:
 
 - a placement's size change is held until the file location's flush, `blocks_flush_delay` after its first change
   (10 s, `rel/files/app.config:511`; `fslogic_cache.erl:524-530,706-715`), and only then reported to the parent
@@ -325,18 +327,20 @@ def read_maps(p: Provisioner, files: Iterable[str], providers: Sequence[str]) ->
 
 def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -> dict[str, Any]:
     """Read the affected files' block maps every `SETTLE_POLL_S` until they have stayed the same for
-    `SETTLE_STABLE_S`; raise ProvisionError when they are still changing at `SETTLE_BOUND_S`."""
+    `SETTLE_STABLE_S`; raise ProvisionError when they are still changing after `SETTLE_BOUND_S` of waiting. The bound
+    counts the waits alone, never the reads: a requirement on a large directory makes one reading of every file's map
+    on every provider take long, and that is no change."""
     if not files:
         return {"files": 0, "polls": 0}
-    began = p.clock()
-    last, since, polls = read_maps(p, files, providers), p.clock(), 1
+    last, since, polls, waited = read_maps(p, files, providers), p.clock(), 1, 0.0
     while p.clock() - since < SETTLE_STABLE_S:
-        if p.clock() - began >= SETTLE_BOUND_S:
+        if waited >= SETTLE_BOUND_S:
             raise ProvisionError(
                 f"the block maps of {len(files)} file(s) a removed QoS requirement applied to were still changing "
-                f"after {SETTLE_BOUND_S:.0f} s"
+                f"after {SETTLE_BOUND_S:.0f} s of waiting"
             )
         p.sleep(SETTLE_POLL_S)
+        waited += SETTLE_POLL_S
         current = read_maps(p, files, providers)
         polls += 1
         if current != last:
