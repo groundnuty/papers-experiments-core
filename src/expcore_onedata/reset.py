@@ -31,11 +31,20 @@ read and every check is made on each provider that supports the space, since eac
    distribution gives each provider's physical size, the bytes its storage holds of the space; never the logical
    figures, which lag. A provider other than the data provider that holds more than the caller allows (nothing by
    default) fails the reset, so a reset without an eviction plan still shows that only the owner holds data.
-   **quiet**: when a requirement was removed, its files' block maps are read, again after `resetqos.quiet_wait_s`
-   (twice the occupancy's longest lag for the deepest of them, from the source), and the occupancy with them: a
-   provider holding more of one of those files, or a provider other than the data provider
+   **quiet**: the block maps of the files a removed requirement applied to, and of every regular file a provider other
+   than the data provider held when the run ended (read before the eviction), are read, again after
+   `resetqos.quiet_wait_s` (twice the occupancy's longest lag for the deepest of them, from the source), and the
+   occupancy with them: a provider holding more of one of those files, or a provider other than the data provider
    holding more of the space than at the occupancy stage, fails the reset (a replication that landed after the
    eviction). The block maps decide; the occupancy, which grows late, is a second sign and never alone the proof.
+   It runs for every run whose condition declares the right to manage QoS (`run(qos_rights=True`, from
+   `Condition.manages_qos`), whether or not a requirement is left at the reset, since an agent can add a requirement
+   and remove it before the run ends while its replication, which creates no transfer document, is still landing; and
+   for a caller that does not say (the default, fail safe). It is skipped only for `qos_rights=False` with no
+   requirement removed. The record gives `ran`, `why` (`requirements`, `rights` or `default`, `resetheld.py`) and
+   the stage's seconds. It costs the wait, 30 s for files one directory below the root and 10 s more per further
+   level (with no requirement to name the files, the depth of the deepest file of the space), and one block-map read
+   per file on each provider other than the data provider.
 5. **history**: ended transfers cannot be removed. The 25.0 REST description offers, for a transfer, only `GET` and
    `DELETE /transfers/{tid}`, a cancel that answers 400 for a job that has ended, and `POST .../rerun`; the space's
    listing (`GET /spaces/{sid}/transfers`) only reads. So the next agent sees every ended transfer, the reset's own
@@ -72,7 +81,7 @@ from functools import partial
 from math import isfinite
 from typing import Any
 
-from expcore_onedata import consistency, resetqos
+from expcore_onedata import consistency, resetheld, resetqos
 from expcore_onedata.client import NotSent, PlatformError
 from expcore_onedata.eviction import evict_ids, evict_tree
 from expcore_onedata.occupancy import physical_sizes
@@ -134,6 +143,7 @@ class SpaceReset:
         *,
         since: float | None = None,
         qos_baseline: Collection[str] = (),
+        qos_rights: bool | None = None,
     ) -> dict[str, Any]:
         """Check the plan, verify the space, run the stages in order and return the record; raise ResetFailed at the
         first stage that fails.
@@ -144,13 +154,28 @@ class SpaceReset:
         plan that breaks this is refused, and so is a space whose live name is not the configured one, before any
         stage runs. `since` is where the history's window starts, epoch seconds on `now`: the run's start, to count
         what the run and the reset added; by default the reset's own start. `qos_baseline` holds the ids of the QoS
-        requirements the run started with (`qos_requirements()` at its start), which are kept; by default none is."""
+        requirements the run started with (`qos_requirements()` at its start), which are kept; by default none is.
+        `qos_rights` says whether the run's condition declares the right to manage QoS (`Condition.manages_qos`):
+        the quiet stage runs for every such run, and for a caller that does not say (`None`, the fail-safe default),
+        whether or not a requirement is left at the reset, since an agent can add one and remove it before the run
+        ends while its replication is still landing; only `False` with no requirement removed skips it (O33)."""
         if since is not None and (isinstance(since, bool) or not isinstance(since, int | float) or not isfinite(since)):
             raise ValueError("the history's since is a finite number of epoch seconds")
         if isinstance(qos_baseline, str) or not all(isinstance(q, str) for q in qos_baseline):
             raise ValueError("the QoS baseline is a collection of requirement ids")
+        if qos_rights is not None and not isinstance(qos_rights, bool):
+            raise ValueError("qos_rights is True, False, or None for a caller that does not say")
         history_since = float(self._now() if since is None else since)
-        run: dict[str, Any] = {"affected": {}, "occupancy": {}}  # what one stage hands a later one
+        # what one stage hands a later one: the files a removed requirement applied to, why the quiet check runs (None:
+        # it is skipped), the files a local provider held at the run's end and the seconds that read took, the occupancy
+        run: dict[str, Any] = {
+            "affected": {},
+            "why": resetheld.quiet_reason(0, qos_rights),
+            "held": resetheld.Held({}, 0),
+            "held_read_s": 0.0,
+            "occupancy": {},
+            "qos_rights": qos_rights,
+        }
         plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (evict or {}).items()}
         bounds = dict(allowed or {})
         for provider in [*plan, *bounds]:
@@ -162,7 +187,7 @@ class SpaceReset:
             "qos": lambda: self._qos(qos_baseline, run),
             "qos_settle": lambda: self._qos_settle(run),
             "transfers": self._transfers,
-            "eviction": lambda: self._evict(plan),
+            "eviction": lambda: self._evict(plan, run),
             "occupancy": lambda: self._occupancy(bounds, run),
             "quiet": lambda: self._quiet(run),
             "history": lambda: self._history(history_since),
@@ -204,17 +229,41 @@ class SpaceReset:
     def _qos(self, baseline: Collection[str], run: dict[str, Any]) -> dict[str, Any]:
         """Remove every requirement not in the baseline and show them gone; keep the files they applied to."""
         facts, run["affected"] = resetqos.remove(self._p, self._providers, baseline)
+        run["why"] = resetheld.quiet_reason(facts["removed"], run["qos_rights"])
         return facts
 
     def _qos_settle(self, run: dict[str, Any]) -> dict[str, Any]:
         """Wait for the affected files' block maps to stay the same, within the bound."""
         return resetqos.settle(self._p, run["affected"], self._providers)
 
+    def _hold(self, run: dict[str, Any]) -> None:
+        """When the quiet check will run, read the files a local provider holds now, before anything leaves it."""
+        if run["why"] is None:
+            return
+        self._require_quiet()  # no map is read while a job still changes it (O01)
+        began = self._p.clock()
+        run["held"] = resetheld.held_at_end(self._p, self._providers)
+        run["held_read_s"] = round(self._p.clock() - began, 3)
+
     def _quiet(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Show that nothing reappeared on the affected files after the eviction, by their block maps after a wait, and
-        that the occupancy did not grow."""
+        """Show that nothing reappeared after the eviction, by the block maps of the files a removed requirement
+        applied to and of those a local provider held when the run ended, read again after a wait, and that the
+        occupancy did not grow. Skipped, and recorded so, for a run with no QoS right and no requirement removed."""
+        why, held = run["why"], run["held"]
+        if why is None:
+            return {"ran": False, "why": None, "qos_rights": run["qos_rights"], "files": 0, "waited_s": 0.0}
         sizes = partial(physical_sizes, self._p, self._providers, retry=self._p.retry)  # read after the wait
-        return resetqos.quiet(self._p, run["affected"], self._providers, sizes, run["occupancy"])
+        files = {**held.files, **run["affected"]}
+        depth = resetheld.quiet_depth(run["affected"], held, run["qos_rights"])
+        facts = resetqos.quiet(self._p, files, self._providers, sizes, run["occupancy"], depth=depth)
+        return {
+            "ran": True,
+            "why": why,
+            "qos_rights": run["qos_rights"],
+            "held_files": len(held.files),
+            "held_read_s": run["held_read_s"],
+            **facts,
+        }
 
     # -- 2. running transfers ---------------------------------------------------------
     def _page(self, provider: str, state: str, token: str | None) -> tuple[list[str], str | None]:
@@ -313,9 +362,11 @@ class SpaceReset:
         )
 
     # -- 3. eviction ------------------------------------------------------------------
-    def _evict(self, plan: Mapping[str, list[str]]) -> dict[str, Any]:
+    def _evict(self, plan: Mapping[str, list[str]], run: dict[str, Any]) -> dict[str, Any]:
         """Evict each provider's paths: a directory in one transfer, the files together, each verified on the block
-        maps only once no transfer runs on any provider; then require that no transfer runs again."""
+        maps only once no transfer runs on any provider; then require that no transfer runs again. Before anything
+        leaves, the files a local provider holds are read for the quiet check, when it will run."""
+        self._hold(run)
         try:
             resolved = self._p.resolve_many(path for paths in plan.values() for path in paths)
         except KeyError:

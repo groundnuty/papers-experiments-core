@@ -39,7 +39,10 @@ removed can go on placing bytes. So after the removal the affected files' block 
 the same for `SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND_S`, or the reset fails. After the
 eviction and the occupancy they are read again, and once more after `quiet_wait_s`, together with the occupancy: a
 provider holding more of an affected file than before the wait fails the reset, and so does a provider other than the
-data provider holding more of the space than at the occupancy stage. The block maps decide: a file's distribution
+data provider holding more of the space than at the occupancy stage. That check does not wait for a requirement to be
+found: an agent can add one and remove it before the run ends, leaving the reset none to see while its replication is
+still landing, so it runs for every run that declares QoS rights, and by default, and covers the files a local
+provider held when the run ended as well (`resetheld.py`). The block maps decide: a file's distribution
 shows its provider's in-memory location at once. A replication that lands between the eviction's verification and
 the first of these readings is already in that reading, so the maps show no growth; the occupancy read after the wait,
 set against the occupancy stage's, is what catches it. The occupancy is otherwise a second sign, and a zero there is
@@ -123,9 +126,10 @@ def _plain(value: str) -> bool:
     return _PLAIN_ID.fullmatch(value) is not None
 
 
-def _leaves(p: Provisioner, root: str, provider: str) -> list[tuple[str, str, int]]:
-    """Every leaf under the root on one provider, a file or an empty directory, as `(id, kind, depth)`: the tree
-    `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth."""
+def tree(p: Provisioner, provider: str) -> tuple[str, list[tuple[str, str, int]]]:
+    """The space root on one provider and every leaf under it, a file or an empty directory, as `(id, kind, depth)`:
+    the tree `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth."""
+    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=p.retry)
     listings: Listings = {}
     found: list[tuple[str, str, int]] = []
     pending = [(root, 0)]
@@ -139,7 +143,7 @@ def _leaves(p: Provisioner, root: str, provider: str) -> list[tuple[str, str, in
                 found.append((entry.file_id, entry.kind, depth + 1))
             pending.append((entry.file_id, depth + 1))
         listings.pop((provider, current), None)  # entered: no longer needed
-    return found
+    return root, found
 
 
 def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
@@ -148,8 +152,7 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
     files: dict[str, dict[str, int]] = {}
     read = 0
     for provider in providers:
-        root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=p.retry)
-        leaves = _leaves(p, root, provider)
+        root, leaves = tree(p, provider)
         entries = [root, *(file_id for file_id, _, _ in leaves)]
         summaries = consistency.bounded_map(lambda f, q=provider: _summary(p, f, q), entries, p.settings.concurrency)
         for qid in sorted(set().union(*summaries)):
@@ -363,13 +366,14 @@ def quiet(
     providers: Sequence[str],
     occupancy: Callable[[], Mapping[str, int]],
     before: Mapping[str, int],
+    *,
+    depth: int,
 ) -> dict[str, Any]:
-    """Read the affected files' block maps, wait `quiet_wait_s` for the deepest of them, and read the maps and the
-    occupancy again; raise ProvisionError when a provider holds more of an affected file than before the wait, or a
-    provider other than the data provider holds more of the space than at the occupancy stage (`before`)."""
-    if not files:
-        return {"files": 0, "waited_s": 0.0}
-    wait = quiet_wait_s(max(files.values()))
+    """Read the block maps of `files`, wait `quiet_wait_s(depth)`, and read the maps and the occupancy again; raise
+    ProvisionError when a provider holds more of a file than before the wait, or a provider other than the data
+    provider holds more of the space than at the occupancy stage (`before`). It runs whatever `files` holds: with none
+    the occupancy alone is read again, since a replication that has placed nothing yet shows in no block map."""
+    wait = quiet_wait_s(depth)
     first = read_maps(p, files, providers)
     p.sleep(wait)
     second = read_maps(p, files, providers)
@@ -378,8 +382,8 @@ def quiet(
     if more:
         where = ", ".join(sorted({p.client.provider_label(provider) for _, provider in more}))
         raise ProvisionError(
-            f"{len(more)} block map(s) of files a removed QoS requirement applied to grew after the eviction, "
-            f"on {where}"
+            f"{len(more)} block map(s) of files held when the run ended or a removed QoS requirement applied to grew "
+            f"after the eviction, on {where}"
         )
     over = [q for q, size in sizes.items() if q != p.settings.holder and size > before.get(q, 0)]
     if over:
@@ -401,4 +405,5 @@ __all__ = [
     "remove",
     "scan",
     "settle",
+    "tree",
 ]

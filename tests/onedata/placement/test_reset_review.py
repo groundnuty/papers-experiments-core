@@ -87,10 +87,12 @@ def test_o07_the_transfer_stage_needs_the_settle_count_of_clean_observations_in_
 
 def test_o01_a_job_that_starts_during_the_eviction_fails_the_reset_before_any_block_map_is_read(provisioner, stocked):
     """O01: a replication into the evicted provider starts as the eviction ends; the listings show it running, so the
-    block maps, which it may still change, are never read and the reset fails at its eviction stage."""
+    block maps, which it may still change, are never read and the reset fails at its eviction stage. The run declares
+    no QoS right, so the quiet check's read of what the provider held before the eviction (made while no job runs) is
+    not in play."""
     stocked.spawn_on_evict = BETA_ID  # its record is never read, so the fake never ends it: it runs on
     with pytest.raises(ResetFailed, match="eviction stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner).run({"beta": ["study"]}, qos_rights=False)
     assert "still waiting or ongoing" in str(caught.value)
     assert not [c for c in stocked.provider_calls if c[2].endswith("/distribution")]
 
