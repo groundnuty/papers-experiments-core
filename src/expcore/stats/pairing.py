@@ -30,8 +30,10 @@ The absent runs come from the export (`AbsentRun`); without them every pair with
 `unpaired_or_left_out` and a pair with neither is not seen.
 
 A ratio contrast (S13, `ContrastSpec.ratio`) reads two outcomes of each run, a numerator and a denominator, and a run
-misses its outcome when either is None. Its used pairs are summed per cluster, every task, model and seed of it
-together, into one log ratio per cluster (`expcore.stats.ratio`). Its missing pairs have three more causes,
+misses its outcome when either is None. Its used pairs are summed per cluster of its declared key into one log ratio
+per cluster (`expcore.stats.ratio`): by default a cluster is a value of the attribute, every task, model and seed of
+it together; with `cluster_key = ("model", attribute)` it is one model's cell of a value, so the zero rule, the
+clusters counted and those dropped are cells. Its missing pairs have three more causes,
 `ratio.RATIO_CAUSES`, after the five above:
 - `numerator_none_at_zero`: no treatment attempt lost an outcome, and a run's numerator is None while its denominator
   is 0, a failed run whose cost was not measured (an ordinary None otherwise is `outcome_none`);
@@ -55,6 +57,7 @@ from expcore.stats.rows import AbsentRun, Row
 
 TREATMENT_OUTCOMES = ("scored", "excluded")  # how a contrast declares its treatment attempts enter it
 MISSING_CAUSES = ("treatment_outcome_none", "treatment_excluded", "exhausted", "unpaired_or_left_out", "outcome_none")
+MODEL_KEY = "model"  # the run's model, as a field of a ratio contrast's cluster key
 NONE_CAUSES = ("treatment_outcome_none", "outcome_none", "numerator_none_at_zero")  # pairs lost to a None outcome
 
 
@@ -69,7 +72,9 @@ class ContrastSpec:
     `max_unscored_treatment` is how many pairs a "scored" member of the Holm family may still lose to a treatment
     attempt's None: 0 unless preregistered, for a rare genuine "could not be measured". `ratio` makes it a ratio
     contrast (S13): it compares `ratio.numerator` per unit of `ratio.denominator`, its `outcome` is the label of the
-    two (`RatioForm.label`), and its margin is a natural-log ratio.
+    two (`RatioForm.label`), and its margin is a natural-log ratio. `cluster` is the task attribute that clusters the
+    contrast, and `cluster_key` what one cluster is: `(cluster,)`, a value of the attribute (the default), or for a
+    ratio contrast `("model", cluster)`, one model's cell of a value.
     """
 
     name: str
@@ -83,10 +88,13 @@ class ContrastSpec:
     treatment_outcomes: str | None = None
     max_unscored_treatment: int = 0
     ratio: RatioForm | None = None
+    cluster_key: tuple[str, ...] | None = None  # None is the default key, (cluster,)
 
     def __post_init__(self) -> None:
         """Require exactly one form, with two different arms, a positive finite margin and a known treatment word; a
-        ratio contrast's outcome is its form's label."""
+        ratio contrast's outcome is its form's label; the cluster key is the attribute alone or, for a ratio contrast,
+        the model and the attribute."""
+        self._check_cluster_key()
         if self.ratio is not None:
             if not isinstance(self.ratio, RatioForm):
                 raise ValueError(f"contrast {self.name!r}: ratio must be a RatioForm, got {type(self.ratio).__name__}")
@@ -116,6 +124,27 @@ class ContrastSpec:
         arms = self.arms
         if len(arms) != 2 or arms[0] == arms[1]:
             raise ValueError(f"contrast {self.name!r}: the two arms must be two different names")
+
+    def _check_cluster_key(self) -> None:
+        """Hold the canonical key: (cluster,) by default, or ("model", cluster) for a ratio contrast."""
+        key = (self.cluster,) if self.cluster_key is None else tuple(self.cluster_key)
+        by_model = (MODEL_KEY, self.cluster)
+        if key not in ((self.cluster,), by_model) or len(set(key)) != len(key):
+            raise ValueError(
+                f"contrast {self.name!r}: cluster_key must be ({self.cluster!r},) or {by_model!r}, the attribute "
+                f"alone or the model and the attribute; got {key!r}"
+            )
+        if key == by_model and self.ratio is None:
+            raise ValueError(
+                f"contrast {self.name!r}: the model in its cluster key is for a ratio contrast, whose sums it splits "
+                "by model; a contrast of one outcome already pairs within each model and averages the models"
+            )
+        object.__setattr__(self, "cluster_key", key)
+
+    @property
+    def by_model(self) -> bool:
+        """Whether a cluster is one model's cell of a value of the attribute (a ratio contrast's key with the model)."""
+        return self.cluster_key == (MODEL_KEY, self.cluster)
 
     @property
     def arms(self) -> tuple[str, ...]:
@@ -292,14 +321,20 @@ def _aggregate(used: list[tuple[Row, tuple[Value, Value]]], cluster_of_task: Map
 
 
 def _ratio_input(
-    used: list[tuple[Row, tuple[Value, Value]]], cluster_of_task: Mapping[str, str], form: RatioForm
+    used: list[tuple[Row, tuple[Value, Value]]], cluster_of_task: Mapping[str, str], form: RatioForm, by_model: bool
 ) -> tuple[PairedDifferences, dict[str, int]]:
-    """A ratio contrast's input: the used pairs of each cluster, every model's together, summed into one log ratio
-    under the declared rule (`ratio.aggregate`); and the pairs the rule excluded, by cause."""
-    cells: dict[str, list[tuple[ratio.Totals, ratio.Totals]]] = {}
+    """A ratio contrast's input: the used pairs of each cluster of its key summed into one log ratio under the declared
+    rule, every model's together (`ratio.aggregate`) or each model's cell apart (`ratio.aggregate_by_model`); and the
+    pairs the rule excluded, by cause. Both runs of a pair share the model, which is part of every pairing key."""
+    if not by_model:
+        pooled: dict[str, list[tuple[ratio.Totals, ratio.Totals]]] = {}
+        for row, values in used:
+            pooled.setdefault(cluster_of_task[row.task], []).append(values)
+        return ratio.aggregate(pooled, form)
+    cells: dict[tuple[str, str], list[tuple[ratio.Totals, ratio.Totals]]] = {}
     for row, values in used:
-        cells.setdefault(cluster_of_task[row.task], []).append(values)
-    return ratio.aggregate(cells, form)
+        cells.setdefault((row.model, cluster_of_task[row.task]), []).append(values)
+    return ratio.aggregate_by_model(cells, form)
 
 
 def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRun] = ()) -> Pairing:
@@ -310,12 +345,13 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
     """
     arms: tuple[dict[tuple, Row], dict[tuple, Row]] = ({}, {})
     cluster_of_task: dict[str, str] = {}
-    seen: set[str] = set()
+    seen: set[str | tuple[str, str]] = set()  # the clusters of the key seen in either arm: values, or cells by model
     for row in rows:
         arm = _arm(row, spec)
         if arm is None:
             continue
-        seen.add(_cluster(row, spec, cluster_of_task))
+        cluster = _cluster(row, spec, cluster_of_task)
+        seen.add((row.model, cluster) if spec.by_model else cluster)
         key = _key(row, spec)
         if key in arms[arm]:
             raise ValueError(
@@ -345,7 +381,7 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
     if spec.ratio is None:
         differences = _aggregate(used_pairs, cluster_of_task)
     else:
-        differences, excluded = _ratio_input(used_pairs, cluster_of_task, spec.ratio)
+        differences, excluded = _ratio_input(used_pairs, cluster_of_task, spec.ratio, spec.by_model)
         missing.update(excluded)
     return Pairing(
         differences=differences,

@@ -7,6 +7,7 @@ import pytest
 
 from expcore.report import render_report, summary_lines
 from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision
+from expcore.stats.estimators import ModelEstimate
 from expcore.stats.ratio import RatioForm
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
@@ -723,12 +724,13 @@ def test_s13_the_ratio_contrasts_table_gives_the_rule_and_the_ratio_itself():
         "Contrast",
         "Numerator",
         "Denominator",
+        "Cluster key",
         "Zero total",
         "Ratio (A / B)",
         "Ratio interval",
     ]
-    assert table["spend-per-win"][1:] == ["spend", "wins", "exclude", "2", "[1.5, 3]"]
-    assert table["spend-per-win-c"][3] == "continuity correction 0.5"
+    assert table["spend-per-win"][1:] == ["spend", "wins", "group", "exclude", "2", "[1.5, 3]"]
+    assert table["spend-per-win-c"][4] == "continuity correction 0.5"
     assert "the cluster is excluded from the contrast" in report.split("## Ratio contrasts")[1]
 
 
@@ -762,4 +764,42 @@ def test_s13_an_untestable_ratio_contrast_names_the_rule_that_took_its_pairs():
     dry = ratio_contrast(conclusion="untestable", n_pairs=0, **nothing)
     report = render(analysis(dry))
     assert row(report, "spend-per-win")[11] == "0 (missing: numerator None at denominator 0 1, zero denominator 3)"
-    assert table_of(report, "## Ratio contrasts")["spend-per-win"][4:] == ["n/a", "[n/a, n/a]"]
+    assert table_of(report, "## Ratio contrasts")["spend-per-win"][5:] == ["n/a", "[n/a, n/a]"]
+
+
+BY_MODEL = (
+    ModelEstimate("model-a", math.log(4.0), math.log(2.0), math.log(8.0), 0),
+    ModelEstimate("model-b", math.log(1.25), math.log(0.8), math.log(2.0), 3),
+)
+
+
+def by_model_contrast(name="spend-per-win") -> ContrastResult:
+    """A ratio contrast clustered by (model, group) cells, with each model's estimate from the same draws."""
+    return ratio_contrast(name, cluster_key=("model", "group"), per_model=BY_MODEL)
+
+
+def test_s13_the_ratio_contrasts_table_names_each_contrasts_cluster_key():
+    """S13: the key decides the estimand and the units the Clusters column counts, so the report names it."""
+    report = render(analysis(by_model_contrast(), ratio_contrast("pooled-per-win", cluster_key=("group",))))
+    table = table_of(report, "## Ratio contrasts")
+    assert (table["spend-per-win"][3], table["pooled-per-win"][3]) == ("model, group", "group")
+    assert "one cluster per model and value of the attribute" in report.split("## Ratio contrasts")[1]
+
+
+def test_s13_a_ratio_contrast_by_model_shows_each_models_ratio_as_an_exploratory_breakdown():
+    """S13: each model's log ratio, its ratio and its interval, under a heading that says it is no test."""
+    report = render(analysis(by_model_contrast()))
+    table = table_of(report, "### Ratio contrasts by model (exploratory)")
+    assert table["Contrast"] == ["Contrast", "Model", "Estimate", "Ratio (A / B)", "Ratio interval"]
+    lines = report.split("### Ratio contrasts by model (exploratory)")[1].splitlines()
+    first, second = ([cell.strip() for cell in line.strip("|").split(" | ")] for line in lines if "| spend" in line)
+    assert first == ["spend-per-win", "model-a", "1.386", "4", "[2, 8]"]
+    assert second[1:3] == ["model-b", "0.2231"]
+    assert "no test of its own" in report.split("### Ratio contrasts by model (exploratory)")[1]
+
+
+def test_s13_a_report_whose_ratio_contrasts_pool_the_models_has_no_breakdown_by_model():
+    """S13: a pooled key has no estimate by model, so the report has no section for one."""
+    report = render(analysis(ratio_contrast()))
+    assert "## Ratio contrasts" in report
+    assert "### Ratio contrasts by model" not in report

@@ -40,7 +40,9 @@ refused.
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
 
 A ratio contrast (S13, `expcore.stats.ratio`) runs the same way on its log ratios: its estimate, interval, margin and
-minimum detectable effect are natural-log ratios. A member of the Holm family that loses a pair because a run's
+minimum detectable effect are natural-log ratios, and with a cluster key that names the model its clusters are
+(model, attribute) cells, so `n_clusters` counts cells and `per_model` holds each model's estimate over its own cells,
+from the same draws, with no test of its own. A member of the Holm family that loses a pair because a run's
 numerator is None while its denominator is 0 is refused (`RatioNumeratorRefused`): its ratio would count the cost of
 successful runs alone. An exploratory one reports the count. Both refusals are `ContrastRefused`.
 """
@@ -115,6 +117,9 @@ class ContrastResult:
     conclusion: str  # one of CONCLUSIONS
     minimum_detectable_effect: float | None  # None without power settings, NaN when it cannot be reached
     ratio: RatioForm | None = None  # a ratio contrast's form (S13): every number above is then a natural-log ratio
+    # what one cluster is (S13): (cluster,), a value of the attribute, or ("model", cluster), one model's cell of a
+    # value, whose clusters, cells, are what n_clusters counts; None in a result built without one, read as (cluster,)
+    cluster_key: tuple[str, ...] | None = None
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -345,6 +350,7 @@ def run_contrast(
         conclusion=conclude(significant, equivalent, untestable),
         minimum_detectable_effect=mde,
         ratio=spec.ratio,
+        cluster_key=spec.cluster_key,
     )
 
 

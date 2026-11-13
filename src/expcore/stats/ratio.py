@@ -7,16 +7,27 @@ mean over clusters of the cluster's log ratio of ratios of sums,
     theta = mean over clusters c of  ln( (N_cA / D_cA) / (N_cB / D_cB) ),
 
 where N_ca and D_ca are the sums of the numerator and of the denominator over every run of arm a in cluster c that
-belongs to a used pair (every task, model and seed of the cluster together). It is a ratio of sums, not a mean of
-per-run ratios: a run whose denominator is 0 (a failed run, with no correct result) has no ratio of its own, and its
-numerator still counts toward its arm's sum. exp(theta) is the geometric mean over clusters of how many times arm A's
-numerator per unit of denominator is arm B's, so the log scale makes "x2" and "x1/2" symmetric thresholds. The
-cluster's value pools its models: a model with no correct result in a cluster still adds its cost there, where a
-value per model would have none to give, so the input is one column per cluster (`POOLED`). The inference on theta is
-the statistics kernel's, on these per-cluster log ratios (see `estimators.ratio`).
+belongs to a used pair. It is a ratio of sums, not a mean of per-run ratios: a run whose denominator is 0 (a failed
+run, with no correct result) has no ratio of its own, and its numerator still counts toward its arm's sum. exp(theta)
+is the geometric mean over clusters of how many times arm A's numerator per unit of denominator is arm B's, so the log
+scale makes "x2" and "x1/2" symmetric thresholds. The inference on theta is the statistics kernel's, on these
+per-cluster log ratios (see `estimators.ratio`).
+
+What a cluster is, the contrast declares (`ContrastSpec.cluster_key`), and the two keys are two estimands:
+- the task attribute alone (the default, `cluster = "group"`): a cluster is a value of the attribute, and its sums run
+  over every task, model and seed of it, so its models are pooled. A model with no correct result in the cluster
+  still adds its cost there, and the models that spend the most weigh the most in its ratio. The input has one column,
+  `POOLED` (`aggregate`);
+- the model and the attribute (`cluster = ["model", "group"]`): a cluster is one model's cell of a value of the
+  attribute, its sums run over that model's tasks and seeds only, and each cell is a unit of the test and of the
+  bootstrap, as a power analysis by (model, instance) cell counts them. The cells of one value of the attribute are
+  treated as independent of each other, which is that declared unit's assumption, not something the data show. The
+  input has one row per cell and one column per model, the cell's log ratio in its own model's column and NaN in the
+  others (`aggregate_by_model`), so each model's estimate is the mean of its own cells.
 
 A cluster whose sum is 0 in either arm has an undefined (0 / 0, x / 0) or infinite (ln 0) log ratio. It is never set
-to 0 or an infinity and never dropped silently: the preregistration declares one rule, `zero_denominator`,
+to 0 or an infinity and never dropped silently: the preregistration declares one rule, `zero_denominator`, which
+applies to each cluster of the declared key (to each (model, value) cell when the key names the model),
 - "exclude": the cluster leaves this contrast, and each of its pairs is counted under its cause, `zero_denominator`
   (a denominator sum of 0 in either arm, checked first) or `zero_numerator` (a numerator sum of 0 in either arm);
 - "continuity": a declared `continuity_correction` c > 0 is added to all four sums of every cluster, a zero or not,
@@ -33,6 +44,7 @@ The analysis refuses a confirmatory contrast that has any (`analysis.RatioNumera
 
 from __future__ import annotations
 
+import json
 import math
 import numbers
 from collections.abc import Mapping, Sequence
@@ -45,7 +57,17 @@ from expcore.stats.estimators import POOLED, PairedDifferences
 
 ZERO_RULES = ("exclude", "continuity")  # what a cluster with a zero sum does, as the preregistration declares
 RATIO_CAUSES = ("numerator_none_at_zero", "zero_denominator", "zero_numerator")  # the missing causes it adds
-__all__ = ["POOLED", "RATIO_CAUSES", "ZERO_RULES", "RatioForm", "Totals", "aggregate", "log_ratio"]
+__all__ = [
+    "POOLED",
+    "RATIO_CAUSES",
+    "ZERO_RULES",
+    "RatioForm",
+    "Totals",
+    "aggregate",
+    "aggregate_by_model",
+    "cell_label",
+    "log_ratio",
+]
 
 Totals = tuple[float, float]  # (numerator, denominator) of one run, or the sums of an arm in a cluster
 
@@ -126,23 +148,58 @@ def _sums(pairs: Sequence[tuple[Totals, Totals]]) -> tuple[tuple[Fraction, Fract
     return (na, da), (nb, db)
 
 
-def aggregate(
-    cells: Mapping[str, Sequence[tuple[Totals, Totals]]], form: RatioForm
-) -> tuple[PairedDifferences, dict[str, int]]:
-    """The input of a ratio contrast's estimator, and the pairs the rule excluded by cause.
-
-    `cells` maps a cluster to its used pairs, each the (numerator, denominator) of the run of arm A and of arm B. A
-    cluster the rule excludes is not a row, and its pairs are counted; the one column is `POOLED`.
-    """
+def _values[K: (str, tuple[str, str])](
+    cells: Mapping[K, Sequence[tuple[Totals, Totals]]], form: RatioForm
+) -> tuple[dict[K, float], dict[str, int]]:
+    """Each cluster's log ratio, in the order of the sorted keys (an attribute's value, or a (model, value) cell),
+    and the pairs the rule excluded by cause."""
     excluded = {"zero_denominator": 0, "zero_numerator": 0}
-    values: dict[str, float] = {}
+    values: dict[K, float] = {}
     for cluster, pairs in sorted(cells.items()):
         cause, value = log_ratio(*_sums(pairs), form)
         if cause is not None:
             excluded[cause] += len(pairs)
         else:
             values[cluster] = value
+    return values, excluded
+
+
+def aggregate(
+    cells: Mapping[str, Sequence[tuple[Totals, Totals]]], form: RatioForm
+) -> tuple[PairedDifferences, dict[str, int]]:
+    """The input of a ratio contrast's estimator under the default key, and the pairs the rule excluded by cause.
+
+    `cells` maps a cluster to its used pairs, each the (numerator, denominator) of the run of arm A and of arm B, every
+    model's together. A cluster the rule excludes is not a row, and its pairs are counted; the one column is `POOLED`.
+    """
+    values, excluded = _values(cells, form)
     if not values:
         return PairedDifferences((), (), np.empty((0, 0))), excluded
     clusters = tuple(values)
     return PairedDifferences(clusters, (POOLED,), np.array([[values[c]] for c in clusters])), excluded
+
+
+def cell_label(model: str, cluster: str) -> str:
+    """The name of a (model, cluster) cell among an input's clusters: the two as a JSON array, so no two cells share
+    one whatever characters their names hold."""
+    return json.dumps([model, cluster], ensure_ascii=False)
+
+
+def aggregate_by_model(
+    cells: Mapping[tuple[str, str], Sequence[tuple[Totals, Totals]]], form: RatioForm
+) -> tuple[PairedDifferences, dict[str, int]]:
+    """The input of a ratio contrast's estimator under a (model, cluster) key, and the pairs the rule excluded by cause.
+
+    `cells` maps a (model, cluster) cell to that model's used pairs in that cluster. Each cell the rule keeps is a row,
+    named by `cell_label`, its log ratio in its model's column and NaN in every other; a cell the rule excludes is no
+    row, and its pairs are counted. The columns are the models with a cell left, sorted.
+    """
+    values, excluded = _values(cells, form)
+    if not values:
+        return PairedDifferences((), (), np.empty((0, 0))), excluded
+    models = tuple(sorted({model for model, _ in values}))
+    column = {model: j for j, model in enumerate(models)}
+    matrix = np.full((len(values), len(models)), np.nan)
+    for row, ((model, _), value) in enumerate(values.items()):
+        matrix[row, column[model]] = value
+    return PairedDifferences(tuple(cell_label(*cell) for cell in values), models, matrix), excluded

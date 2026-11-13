@@ -337,3 +337,49 @@ def test_the_ratio_estimators_parameters_are_checked_under_its_own_name():
     estimators.check_params(RATIO, {"snap_decimals": 9, "method": "exact"})
     with pytest.raises(ParamError, match="is not a parameter of ratio"):
         estimators.check_params(RATIO, {"depth": 1})
+
+
+# --- the ratio estimator by (model, cluster) cell: the cells are the units, and each model has its own estimate ------
+
+CELLS = {  # each model's cells of a (model, cluster) key, as log ratios
+    "model-a": [math.log(r) for r in (6.0, 2.0, 3.0)],
+    "model-b": [math.log(r) for r in (1.5, 4.0, 0.5)],
+}
+
+
+def by_model(cells):
+    """A ratio contrast's input by cell: one row per (model, cluster) cell, its log ratio in its model's column."""
+    rows = []
+    for column, values in enumerate(cells.values()):
+        for value in values:
+            rows.append([value if j == column else math.nan for j in range(len(cells))])
+    return paired(rows, models=tuple(cells))
+
+
+def test_s13_by_cell_the_estimate_and_the_test_run_on_the_cells_with_each_models_estimate_beside_them():
+    """S13, hand-computed: the estimate is the mean of the six cells' log ratios and the p-value scipy's signed-rank
+    test of them; each model's estimate is the mean of its own cells, with no test of its own."""
+    result = estimators.get(RATIO)(by_model(CELLS), settings(method="exact"))
+    every = [*CELLS["model-a"], *CELLS["model-b"]]
+    assert result.estimate == pytest.approx(sum(every) / 6)
+    assert result.p_value == pytest.approx(stats.wilcoxon(every, method="exact").pvalue)
+    assert result.n_clusters == 6
+    assert [m.model for m in result.per_model] == ["model-a", "model-b"]
+    assert [m.estimate for m in result.per_model] == pytest.approx([sum(v) / 3 for v in CELLS.values()])
+
+
+def test_s13_by_cell_each_models_interval_comes_from_the_same_draws_as_the_overall_one():
+    """S13, S04: one resample of the cells serves the overall interval and every model's."""
+    paired_cells = by_model(CELLS)
+    result = estimators.get(RATIO)(paired_cells, settings())
+    boot = kernel.cluster_bootstrap(paired_cells.matrix, 300, np.random.default_rng([7, 11]))
+    assert (result.ci_low, result.ci_high) == pytest.approx(kernel.percentile_interval(boot.overall, 0.95)[:2])
+    for column, model in enumerate(result.per_model):
+        low, high, _ = kernel.percentile_interval(boot.per_model[:, column], 0.95)
+        assert (model.ci_low, model.ci_high) == pytest.approx((low, high))
+
+
+def test_s13_the_ratio_estimator_refuses_a_row_holding_more_than_one_models_cell():
+    """S13: a row by cell holds one model's log ratio; a row with two would be averaged as no ratio contrast is."""
+    with pytest.raises(ValueError, match="one column of the pooled models"):
+        estimators.get(RATIO)(paired([[0.1, math.nan], [0.3, 0.4]]), settings())

@@ -30,11 +30,13 @@ def both_arms(task, model, seed, a, b, *, cluster="grp-a", **kwargs):
     ]
 
 
-def ratio_row(task, model, seed, spend, wins, *, condition="cond-a", cluster="grp-a", treatment=False):
-    """A row with the two outcomes of a ratio contrast: `spend` (the numerator) and `wins` (the denominator)."""
+def ratio_row(task, model, seed, spend, wins, *, condition="cond-a", cluster="grp-a", treatment=False, extra=None):
+    """A row with the two outcomes of a ratio contrast: `spend` (the numerator) and `wins` (the denominator), and any
+    `extra` outcomes, such as a second numerator column."""
     factors = {"task": task, "model": model, "seed": seed}
     run_key = "|".join(f"{name}={value}" for name, value in [*factors.items(), ("condition", condition)])
-    return Row(run_key, condition, factors, {"spend": spend, "wins": wins}, {"group": cluster}, treatment)
+    outcomes = {"spend": spend, "wins": wins, **(extra or {})}
+    return Row(run_key, condition, factors, outcomes, {"group": cluster}, treatment)
 
 
 def ratio_arms(task, model, seed, a, b, *, cluster="grp-a"):
@@ -46,6 +48,7 @@ def ratio_arms(task, model, seed, a, b, *, cluster="grp-a"):
 
 
 def ratio_spec(name="spend-per-win", *, zero="exclude", correction=None, estimator="ratio", **declared):
-    """A ratio contrast of spend over wins between cond-a and cond-b, clustered by `group`."""
+    """A ratio contrast of spend over wins between cond-a and cond-b, clustered by `group` (with `cluster_key =
+    ("model", "group")` among `declared`, by each model's cell of a group)."""
     form = RatioForm("spend", "wins", zero, correction)
     return ContrastSpec(name, form.label, estimator, "group", conditions=("cond-a", "cond-b"), ratio=form, **declared)

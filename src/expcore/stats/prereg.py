@@ -55,7 +55,7 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     numerator = "tokens"       # in place of `outcome`
     denominator = "success"
     zero_denominator = "exclude"   # or "continuity", with `continuity_correction = 0.5` (required with it, only with it)
-    cluster = "group"
+    cluster = "group"              # or ["model", "group"]: one cluster per model's cell of a group (S13)
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
 from expcore.stats import estimators
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
-from expcore.stats.pairing import TREATMENT_OUTCOMES, ContrastSpec
+from expcore.stats.pairing import MODEL_KEY, TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
 from expcore.stats.ratio import ZERO_RULES, RatioForm
 
@@ -411,16 +411,54 @@ def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
     return RatioForm(numerator, denominator, rule, correction)
 
 
+def _cluster_key(section: Section, schema: FactorSchema, ratio: bool) -> tuple[str, tuple[str, ...]]:
+    """Read `cluster`: a task attribute, or an array of one task attribute and, for a ratio contrast, "model" (S13).
+    Return the attribute and the key, the model first whichever order the array has."""
+    value = section.data.get("cluster")
+    if value is None or isinstance(value, str):
+        attribute = section.string("cluster")
+        return attribute, (attribute,)
+    if not isinstance(value, list):
+        raise section.fail(
+            "cluster", f'must be a task attribute, or an array of one and "model", got a {type(value).__name__}'
+        )
+    fields = section.strings("cluster")
+    if len(set(fields)) != len(fields):
+        raise section.fail("cluster", f"names a field twice: {list(fields)}")
+    for field in fields:
+        if field != MODEL_KEY and (field in BUILTIN_FACTORS or field in schema.declared):
+            raise section.fail(
+                "cluster",
+                f'{field!r} is a field of the run key; a cluster key holds one task attribute, and "model" beside it '
+                "for a ratio contrast",
+            )
+    attributes = [field for field in fields if field != MODEL_KEY]
+    if len(attributes) != 1:
+        raise section.fail(
+            "cluster", f'must hold one task attribute, and "model" beside it for a ratio contrast; got {list(fields)}'
+        )
+    if MODEL_KEY not in fields:
+        return attributes[0], (attributes[0],)
+    if not ratio:
+        raise section.fail(
+            "cluster",
+            'names "model", which is for a ratio contrast, whose sums it splits by model: a contrast of one outcome '
+            "already pairs within each model and averages the models of a cluster",
+        )
+    return attributes[0], (MODEL_KEY, attributes[0])
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
     section.reject_unknown(_CONTRAST_KEYS)
-    estimator, cluster = section.string("estimator"), section.string("cluster")
+    estimator = section.string("estimator")
     try:
         estimators.get(estimator)
     except UnknownEstimator as error:
         raise section.fail("estimator", str(error)) from None
     form = _ratio_form(section, estimator)
+    cluster, key = _cluster_key(section, schema, form is not None)
     outcome = section.string("outcome") if form is None else form.label
     treatment = _treatment_outcomes(section)
     declared = {
@@ -428,6 +466,7 @@ def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSc
         "treatment_outcomes": treatment,
         "max_unscored_treatment": _max_unscored(section, treatment),
         "ratio": form,
+        "cluster_key": key,
     }
     if "conditions" in table:
         for extra in ("factor", "levels"):

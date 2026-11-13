@@ -37,8 +37,9 @@ are the same text: no clock, no path and no random number enters it.
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
 - A ratio contrast (S13) shows its outcome as `ln(numerator/denominator)`, since its numbers are natural-log ratios,
-  and a section "Ratio contrasts" gives each one's two outcomes, its preregistered rule for a zero sum and exp of its
-  estimate and interval. Its pairs table has three more causes, `-` for a contrast of one outcome. A report with no
+  and a section "Ratio contrasts" gives each one's two outcomes, its cluster key, its preregistered rule for a zero sum
+  and exp of its estimate and interval, then, for a contrast whose key names the model, each model's estimate as an
+  exploratory breakdown. Its pairs table has three more causes, `-` for a contrast of one outcome. A report with no
   ratio contrast has none of this, so it is the text it was before ratio contrasts existed.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
@@ -61,6 +62,7 @@ from expcore.report_notes import (
     MISSING_PAIRS,
     NO_CLAIM,
     NO_KIND,
+    RATIO_BY_MODEL_NOTES,
     RATIO_MISSING_PAIRS,
     RATIO_NOTES,
     UNKNOWN,
@@ -330,9 +332,34 @@ def _zero_rule(form: RatioForm) -> str:
     return form.zero_denominator
 
 
+def _cluster_key(result: ContrastResult) -> str:
+    """The contrast's cluster key as the ratio table shows it: the attribute, or the model and the attribute."""
+    return ", ".join(result.cluster_key or (result.cluster,))
+
+
+def _by_model(ratios: Sequence[ContrastResult]) -> list[str]:
+    """Each model's estimate of a ratio contrast whose key names the model, as a ratio (S13); nothing when none has
+    one. Exploratory: from the same draws as the contrast's, with no test of its own."""
+    rows = [
+        [
+            r.name,
+            m.model,
+            _num(m.estimate),
+            _num(_exp(m.estimate)),
+            f"[{_num(_exp(m.ci_low))}, {_num(_exp(m.ci_high))}]",
+        ]
+        for r in ratios
+        for m in r.per_model
+    ]
+    if not rows:
+        return []
+    header = ["Contrast", "Model", "Estimate", "Ratio (A / B)", "Ratio interval"]
+    return ["### Ratio contrasts by model (exploratory)", "", *_table(header, rows), "", *RATIO_BY_MODEL_NOTES, ""]
+
+
 def _ratios(results: Sequence[ContrastResult]) -> list[str]:
-    """Each ratio contrast's two outcomes, its zero rule, and its estimate and interval as ratios (S13); nothing when
-    there is none."""
+    """Each ratio contrast's two outcomes, its cluster key, its zero rule, and its estimate and interval as ratios
+    (S13), then each model's where the key names the model; nothing when there is no ratio contrast."""
     ratios = [r for r in results if r.ratio is not None]
     if not ratios:
         return []
@@ -341,14 +368,15 @@ def _ratios(results: Sequence[ContrastResult]) -> list[str]:
             r.name,
             r.ratio.numerator,
             r.ratio.denominator,
+            _cluster_key(r),
             _zero_rule(r.ratio),
             _num(_exp(r.estimate)),
             f"[{_num(_exp(r.ci_low))}, {_num(_exp(r.ci_high))}]",
         ]
         for r in ratios
     ]
-    header = ["Contrast", "Numerator", "Denominator", "Zero total", "Ratio (A / B)", "Ratio interval"]
-    return ["## Ratio contrasts", "", *_table(header, rows), "", *RATIO_NOTES, ""]
+    header = ["Contrast", "Numerator", "Denominator", "Cluster key", "Zero total", "Ratio (A / B)", "Ratio interval"]
+    return ["## Ratio contrasts", "", *_table(header, rows), "", *RATIO_NOTES, "", *_by_model(ratios)]
 
 
 def _conditions(export: Mapping[str, Any]) -> list[str]:

@@ -553,3 +553,54 @@ def test_s13_a_ratio_contrast_may_declare_an_equivalence_margin_on_the_log_scale
     """S13: its margin, like its estimate, is a natural-log ratio (ln 1.25: within a factor of 1.25 either way)."""
     text = with_ratio('cluster = "group"', 'cluster = "group"\nequivalence_margin = 0.2231')
     assert load(write(tmp_path, text)).contrasts["spend-per-win"].equivalence_margin == 0.2231
+
+
+# --- a ratio contrast's cluster key: the attribute alone, or the model and the attribute -----------------------------
+
+
+@pytest.mark.parametrize("written", ['["model", "group"]', '["group", "model"]'])
+def test_s13_a_ratio_contrast_may_declare_the_model_and_the_attribute_as_its_cluster_key(tmp_path, written):
+    """S13: one cluster per model's cell of a group, the key held in one order whichever way it is written; the
+    attribute is still the contrast's `cluster`, which every task must have."""
+    spec = load(write(tmp_path, with_ratio('cluster = "group"', f"cluster = {written}"))).contrasts["spend-per-win"]
+    assert (spec.cluster, spec.cluster_key) == ("group", ("model", "group"))
+
+
+@pytest.mark.parametrize("written", ['"group"', '["group"]'])
+def test_s13_the_attribute_alone_is_the_default_key_written_bare_or_as_a_list(tmp_path, written):
+    """S13: the default, the models of a group pooled, is the key of the attribute alone."""
+    spec = load(write(tmp_path, with_ratio('cluster = "group"', f"cluster = {written}"))).contrasts["spend-per-win"]
+    assert (spec.cluster, spec.cluster_key) == ("group", ("group",))
+    assert load(write(tmp_path)).contrasts["a-vs-b"].cluster_key == ("group",)
+
+
+@pytest.mark.parametrize(
+    ("written", "message"),
+    [
+        ('["model"]', "one task attribute"),
+        ("[]", "one task attribute"),
+        ('["group", "region"]', "one task attribute"),
+        ('["model", "group", "region"]', "one task attribute"),
+        ('["model", "model"]', "twice"),
+        ('["task", "group"]', "'task' is a field of the run key"),
+        ('["seed", "group"]', "'seed' is a field of the run key"),
+        ('["gate", "group"]', "'gate' is a field of the run key"),
+        ('["model", ""]', "array of non-empty strings"),
+        ("3", "a task attribute, or an array"),
+    ],
+)
+def test_s13_a_cluster_key_that_is_not_the_model_and_one_attribute_is_refused(tmp_path, written, message):
+    """S13: the key exposes the model and one task attribute, the unit the kernel resamples; anything else fails."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key 'cluster' .*{message}"):
+        load(write(tmp_path, with_ratio('cluster = "group"', f"cluster = {written}")))
+
+
+def test_s13_a_model_in_the_cluster_key_of_a_contrast_of_one_outcome_is_refused(tmp_path):
+    """S13: a difference contrast already pairs within each model and averages the models of a cluster."""
+    text = edited('estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"',
+                  'estimator = "wilcoxon_cluster_bootstrap"\ncluster = ["model", "group"]')  # fmt: skip
+    with pytest.raises(ConfigError, match=r"\[contrasts.a-vs-b\]: key 'cluster' .*ratio contrast"):
+        load(write(tmp_path, text))
+    listed = edited('estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"',
+                    'estimator = "wilcoxon_cluster_bootstrap"\ncluster = ["group"]')  # fmt: skip
+    assert load(write(tmp_path, listed)).contrasts["a-vs-b"].cluster_key == ("group",)

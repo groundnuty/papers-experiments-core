@@ -4,7 +4,16 @@ import math
 
 import pytest
 
-from expcore.stats.ratio import POOLED, RATIO_CAUSES, ZERO_RULES, RatioForm, aggregate, log_ratio
+from expcore.stats.ratio import (
+    POOLED,
+    RATIO_CAUSES,
+    ZERO_RULES,
+    RatioForm,
+    aggregate,
+    aggregate_by_model,
+    cell_label,
+    log_ratio,
+)
 
 EXCLUDE = RatioForm("spend", "wins", "exclude")
 
@@ -152,3 +161,44 @@ def test_a_form_that_is_not_a_declared_rule_is_refused(args, message):
     """The rule is declared, never defaulted: a missing or a misspelt one, or a correction without its rule, fails."""
     with pytest.raises(ValueError, match=message):
         RatioForm(*args)
+
+
+# --- a (model, cluster) key: one log ratio per model's cell of a cluster ------------------------------------------
+
+
+def test_s13_by_model_each_cell_is_a_row_with_its_log_ratio_in_its_models_column():
+    """S13, hand-computed: model-a's cell of grp-a is ln(300 / 1) - ln(100 / 2) = ln 6; model-b's of grp-b sums
+    30 + 0 for 1 + 0 wins in A and 10 + 10 for 1 + 1 in B, ln(30 / 10) = ln 3. Each row has one defined cell."""
+    cells = {
+        ("model-b", "grp-b"): [((30.0, 1.0), (10.0, 1.0)), ((0.0, 0.0), (10.0, 1.0))],
+        ("model-a", "grp-a"): [((300.0, 1.0), (100.0, 2.0))],
+    }
+    differences, excluded = aggregate_by_model(cells, EXCLUDE)
+    assert differences.clusters == (cell_label("model-a", "grp-a"), cell_label("model-b", "grp-b"))
+    assert differences.models == ("model-a", "model-b")
+    assert differences.matrix[0, 0] == pytest.approx(math.log(6.0))
+    assert differences.matrix[1, 1] == pytest.approx(math.log(3.0))
+    assert math.isnan(differences.matrix[0, 1])
+    assert math.isnan(differences.matrix[1, 0])
+    assert list(differences.cluster_differences) == pytest.approx([math.log(6.0), math.log(3.0)])
+    assert excluded == {"zero_denominator": 0, "zero_numerator": 0}
+
+
+def test_s13_by_model_the_zero_rule_excludes_a_cell_and_counts_its_pairs():
+    """S13: model-b never wins in B in grp-a, so that cell's two pairs are counted under zero_denominator and it is no
+    row; model-a's cell of the same group stays. A model with no cell left is no column."""
+    cells = {
+        ("model-a", "grp-a"): [((300.0, 1.0), (100.0, 2.0))],
+        ("model-b", "grp-a"): [((10.0, 1.0), (10.0, 0.0)), ((20.0, 1.0), (10.0, 0.0))],
+    }
+    differences, excluded = aggregate_by_model(cells, EXCLUDE)
+    assert differences.clusters == (cell_label("model-a", "grp-a"),)
+    assert differences.models == ("model-a",)
+    assert excluded == {"zero_denominator": 2, "zero_numerator": 0}
+    assert aggregate_by_model({("model-b", "grp-a"): cells[("model-b", "grp-a")]}, EXCLUDE)[0].clusters == ()
+
+
+def test_a_cell_label_cannot_be_read_as_another_cell():
+    """The label of a (model, cluster) cell names both parts unambiguously, whatever characters they hold."""
+    assert cell_label("model-a", "x / y") != cell_label("model-a / x", "y")
+    assert cell_label("model-a", "grp-a") == '["model-a", "grp-a"]'
