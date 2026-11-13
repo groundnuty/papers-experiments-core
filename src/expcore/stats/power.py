@@ -157,7 +157,8 @@ def tost_t_p_values(samples: np.ndarray, margin: float) -> np.ndarray:
     if n < 2:
         return np.full(x.shape[0], math.nan)
     sd = x.std(axis=1, ddof=1)
-    spread = x.max(axis=1) > x.min(axis=1)  # equal values have no spread, whatever their float SD
+    # Equal values have no spread whatever their float SD, and an SD that underflows to 0 is none to divide by.
+    spread = (x.max(axis=1) > x.min(axis=1)) & (sd > 0)
     with np.errstate(invalid="ignore", divide="ignore"):
         se = np.where(spread, sd / math.sqrt(n), math.nan)
         lower = stats.t.sf((x.mean(axis=1) + margin) / se, n - 1)

@@ -279,6 +279,7 @@ def test_s15_the_simulation_judges_each_study_by_the_rule_the_analysis_uses():
     never = feasibility(0.01, p_values=lambda studies, margin: np.ones(studies.shape[0]))
     assert never == [0.0, 0.0]
     assert np.isnan(tost_t_p_values(np.full((2, 3), 0.1), 0.2)).all()  # equal values: no spread, whatever the float SD
+    assert np.isnan(tost_t_p_values(np.array([[-1e-200, 0.0, 1e-200]]), 1e-201)).all()  # an SD that underflows to 0
 
 
 def test_s15_the_feasibility_is_a_function_of_its_seed():
