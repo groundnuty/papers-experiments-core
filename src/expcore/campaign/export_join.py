@@ -16,6 +16,9 @@ snapshot and this module joins the results:
   of the first shard, in index order, that did. Each shard serves one model under `expcore-shard/3`, and a store keeps
   a record of accepted fingerprints only when the models of its plan declare a set, so a shard's export may lack the
   key that another's has: it counts as no entries, and the joined export has the key exactly when any shard's does;
+- `shard_retries_by_kind` keeps what the sum of `retries_by_kind` loses: every row of every shard's own table, in shard
+  order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
+  the key is there all the same: it says the set-asides were recorded;
 - `shards` is merge.json's list of shards, as it is.
 
 The joined run lists must hold every run of the whole plan exactly once, and the planned runs must add up to it: a
@@ -23,7 +26,8 @@ merged batch with a shard left out is refused here too, whatever its merge.json 
 
 What stays the shard's own is when and how an attempt began: `dispatch_seq`, `started_at` and `lease_wait_s` come from
 the shard's store, where each shard counts its own dispatches, so they say nothing about the order across shards.
-An unmerged batch's export has neither `shard` nor `shards`: nothing here runs for it.
+An unmerged batch's export has neither `shard` nor `shards`: nothing here runs for it. A run's wall time and turn
+latency are no concern of the join either: they are added to each shard's export before it (`study.merged_times`).
 """
 
 import collections
@@ -37,6 +41,7 @@ from expcore.errors import CORE_KINDS
 
 SHARD_KEY = "shard"  # the key of each run entry in a merged export: the index of the shard that ran it
 SHARDS_KEY = "shards"  # the top-level key of a merged export: merge.json's list of shards
+SHARD_RETRIES_KEY = "shard_retries_by_kind"  # the top-level key of a merged export: each shard's own retries rows
 LISTS = (*RUN_LISTS, "excluded_attempts")
 _SUMMED = ("planned_runs", "running_attempts")
 _TABLES = {
@@ -89,6 +94,9 @@ def join_exports(
                 raise ExportError(f"the shards' exports disagree on {key!r}")
             joined[key] = value
     _require_the_plan(joined, seq_of)
+    joined[SHARD_RETRIES_KEY] = [
+        {**row, SHARD_KEY: index} for index in order for row in exports[index]["retries_by_kind"]
+    ]
     joined[SHARDS_KEY] = [dict(shard) for shard in shards]
     return joined
 

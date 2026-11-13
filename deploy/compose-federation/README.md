@@ -204,6 +204,78 @@ EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_SLOW=1 uv run pytest tests/live/test_contract
 uv run python -m expcore_onedata.day0 /mnt/volume2/expcore-federation/platform.toml --out <directory>
 ```
 
+## The day-0 outage check against it
+
+`provider_outage` (#108, O28) takes a provider down through the fault injector of #17 and reads and calls through
+what the agent meets, so it runs against a platform file the root's is not. The file needs a space whose data provider
+is not the agent's local provider, with a third provider beside them; a sanctioned `[faults]` table (the injector's,
+whose journal and Compose project are required); a `[sandbox]` table with a level that maps to the mount and the
+sidecar on the federation's network, derived as `tests/support/mount_live.py` derives the mount test's; `[slots]`, whose
+users the sandbox and the tool server lease; and a `[toolserver]` condition whose allow-list has `get_file_distribution`,
+`list_space_providers`, `schedule_file_replication` and `get_transfer`, with its frozen manifest and the rights to
+schedule a replication. In the default layout `pine` owns the study space and is the local provider, so the root's file
+makes the check unknown, saying so. Derive a file with `birch` local, `pine` taken down and `cedar` the mirror (no
+value below is a secret; every path in `[faults]` is relative to the file):
+
+```toml
+support = { providers = ["pine", "birch", "cedar"], local = "birch" }
+placement = { holder = "pine" }
+
+[faults]
+sanctioned = true
+journal = "fault-journal"              # the injection journal and the federation's lock, beside this file
+compose_file = "outage.compose.yaml"   # federation.py compose > <root>/outage.compose.yaml, beside this file
+project = "expcore-fed"
+command = ["docker", "compose", "--project-directory", "<absolute path of deploy/compose-federation>"]
+settle_timeout_s = 600                 # a provider takes minutes to answer again; above the 120 s stop grace
+command_timeout_s = 300                # a stop waits for its grace period, 120 s
+
+[faults.services]
+pine = "pine"                          # provider name -> Compose service
+```
+
+```sh
+EXPCORE_FED_ROOT=/mnt/volume2/expcore-federation EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_DOCKER=1 \
+  uv run python -m expcore_onedata.day0 <derived platform.toml> --only provider_outage --out <directory> \
+  [--tool-condition <condition>]
+```
+
+Run it outside any sandbox, after `up`, with nothing else using the federation. For each space the check holds the
+federation's lock exclusively, starts a sandbox in mount mode and the condition's tool server on a leased slot, and
+stops `pine` through the injector: the injection is journalled before the stop, and every run, tool server and mount
+that reaches `pine` stops answering until the injector restores it, in a `finally`, counted only by the container's
+new identity and `pine` answering REST again. A process killed in between leaves the injection open in the journal:
+the next injector start, or the platform's health check, settles it, and `federation.py up` starts what is stopped.
+The live test is `tests/live/test_contract.py -k provider_outage` with `EXPCORE_LIVE_PLATFORM` naming the derived file
+and `EXPCORE_LIVE_MUTATE=1`, `EXPCORE_LIVE_FAULTS=1` and `EXPCORE_LIVE_DOCKER=1`; it passes only with the mount read
+and the four tools called in every space.
+
+**What the live run must measure**, in the terms of #108. Every value is a fact of the report (`facts` of the check),
+with `seconds` against `bound_s` and an `outcome`; where a value cannot be had the report says unknown and why, and
+nothing is filled in.
+
+| Step of #108 | Where in the facts | What it must record |
+|---|---|---|
+| What the agent meets | `agent`, `mount`, `knowledge` | That the sandbox started in mount mode and the tool server started, or why not; a declared mount or a knowledge tool not measured makes the check unknown. |
+| 1. Baseline, all providers up | `baseline.rest`, `baseline.mount`, `baseline.knowledge` | A file read over REST through the target, the mirror and, cold, the local provider, and through the sandbox's mount: the bytes, whether the hash is the one written, the seconds; the listing; each knowledge tool's answer. Each must serve, or nothing is stopped. |
+| The scenario | `held_before` | By the local provider's own block map, who holds how much of each file: the target all of every file, the mirror all of the replicated ones, the local provider nothing. |
+| 2. The target stopped | `outage`, `admission` | Through the injector: the stop sent, the identity before (a digest), the service seen down, the federation held exclusively, and that the target answers no REST call. |
+| A file with a replica at the second provider | `during.rest.replicated`, `during.mount.replicated` | Whether the read succeeds, the hash against the baseline, how slowly against the baseline, and from where (`during.knowledge.from_where`: the agent's `get_file_distribution` of the very file read, called while the provider is down). |
+| A file with no other replica | `during.rest.owner_only`, `during.mount.owner_only` | Whether it errors (REST: status and error id; mount: the errno by name and number and its exception), times out (`no answer`, or `blocked` once it took the bound's blocked fraction; a mount's ETIMEDOUT, Python's `TimeoutError`, keeps its errno) or blocks (the mount's `blocked: true`, and whether the kill took), and for how long up to the bound. This gives a study its read-timeout setting. |
+| A directory listing | `during.rest.listing`, `during.mount.listing` | Whole, partial (a listing cut after some pages keeps what it got) or different against the baseline, and the seconds. |
+| `get_file_distribution` | `during.knowledge.get_file_distribution` | Per tool call: the outcome, seconds, whether it timed out, its attempts, and the error's wording and the answer's text each as a digest (a SHA-256 prefix of it with every known name and id-like token replaced), its length and the error terms it holds, never as text; what each provider holds when the answer is a REST distribution. |
+| `list_space_providers` | `during.knowledge.list_space_providers` | The same, and which of the three providers the answer names. |
+| `schedule_file_replication`, to local | `during.knowledge.schedule_file_replication` | Whether the job is accepted for a file with a replica and for one without, or the digest and error terms of the tool's wording when it is not. |
+| `get_transfer` | the same, under `get_transfer` | The states the job goes through and when, whether it ends within the bound, and the number of calls; each call classified by its own timing. |
+| 3. The restore | `restore`, `after` | The injection cleared and the restore verified (`how` in the injector's words, the new identity's digest, `ready_after_s` until the injector found it serving), the seconds until the target answers REST, the reads of step 2 again through REST and the mount, which must return what was written; the transfers scheduled during the outage; the scratch gone (`cleanup_verified`). |
+
+The result feeds a study's choice between a design that relies on the platform failing over transparently and one
+that keeps a replica elsewhere, and its read-timeout setting. Not measured by this check: a provider other than the
+data provider going down, an outage that lasts longer than one run of the check, and a tool whose required argument
+its schema does not let the check fill (unmeasured, with the reason). If a first live run finds that `docker compose
+start` alone does not bring a provider's services back, the report shows a restore that is not verified, the injection
+stays open in the journal, and `federation.py up` brings the federation back.
+
 ## The sandbox's mount path against it
 
 The sandbox starts its containers outside this project, and inside a container `127.0.0.1` is the container itself, so

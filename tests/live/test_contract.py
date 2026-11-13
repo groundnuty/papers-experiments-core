@@ -27,7 +27,9 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
     prerequisite_missing,
     require_cleaned,
     require_every_provider_refused,
+    require_measured,
     require_passed,
+    require_restored,
 )
 
 from expcore_onedata import consistency  # noqa: E402
@@ -404,6 +406,41 @@ def test_a_day0_check_that_changes_state_passes_and_shows_its_cleanup(day0, name
         require_every_provider_refused(entry)
 
 
+# -- a provider's outage (issue #108) -----------------------------------------------------------------------------
+# It takes a provider of the live federation down and brings it back, and starts a sandbox in mount mode and the tool
+# server to read and call through as the agent does: EXPCORE_LIVE_MUTATE=1, EXPCORE_LIVE_FAULTS=1 and
+# EXPCORE_LIVE_DOCKER=1, a platform.toml with a sanctioned [faults] table, a [sandbox] table with a mount level (as
+# tests/support/mount_live.py derives one), [slots] and a [toolserver] condition allowing the four knowledge tools, and
+# a space whose data provider is not the agent's local one, with a third provider besides. Never set it on a
+# federation another run is using.
+
+FAULTS = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_FAULTS") != "1" or os.environ.get("EXPCORE_LIVE_DOCKER") != "1",
+    reason="EXPCORE_LIVE_FAULTS=1 and EXPCORE_LIVE_DOCKER=1 are needed: this test takes a provider of the federation "
+    "down and starts a sandbox and the tool server",
+)
+
+
+@MUTATE
+@FAULTS
+def test_a_provider_outage_is_measured_and_the_provider_is_restored(day0):
+    """O28: the check takes the data provider down through the fault injector, records the answers of the REST path,
+    of the mount of a real sandbox and of the agent's tools through MCP, restores the provider and shows it answering
+    again with another identity, and removes its scratch. It is skipped only when platform.toml lacks what it needs,
+    and the skip names that."""
+    from expcore_onedata.day0.runner import run_checks
+
+    day0.allow_mutation = day0.allow_faults = True
+    missing = prerequisite_missing("provider_outage", day0)
+    if missing is not None:
+        pytest.skip(missing)
+    entry = {e.name: e for e in run_checks(day0, ["provider_outage"])}["provider_outage"]
+    require_passed(entry)
+    require_measured(entry)
+    require_restored(entry)
+    require_cleaned(entry)
+
+
 # -- the reset's calls (issue #118) -----------------------------------------------------------------------------------
 # Each makes scratch files under the configured prefixes, acts on them alone and tears them down: EXPCORE_LIVE_MUTATE=1.
 # The last runs a whole reset of the space, which removes every QoS requirement and cancels every running transfer in
@@ -596,6 +633,67 @@ def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_
     finally:
         report = provisioner.teardown()
     assert report.ok, report.left
+
+
+DEFAULT_CHUNK_UPLOAD_BYTES = 50 << 20  # three full default chunks (16 MiB each) and a remainder of 2 MiB
+
+
+@MUTATE
+def test_an_upload_at_the_default_chunk_size_sends_each_full_chunk_on_a_new_connection_and_reads_back_by_its_hash(
+    config, client, tmp_path, caplog, record_property
+):
+    """O25: the default itself, on the real deployment (#186). No `chunk_bytes` is set here: a 50 MiB file goes up in
+    the chunks the settings give by default, three full ones and a remainder, each full chunk on a connection the
+    client opened for it, and the file read back by its SHA-256 equals the local one. It records, per PUT, its size and
+    whether its connection was new, from the client's own log, which holds no path, id or token (`record_property`,
+    and on stdout). On the 25.0 development build 32 and 64 MiB chunks stalled on reused connections and 16 MiB never
+    did, so a stall here is what the default must not do. Torn down; skipped without a [placement] table."""
+    # covers: PUT /data/{id}/content
+    import logging
+    import re
+    import secrets
+
+    from expcore.config.loading import ConfigError
+    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+    from expcore_onedata.rangemap import DEFAULT_CHUNK_BYTES, DEFAULT_FRESH_CONNECTION_BYTES, load_placement
+
+    try:
+        placement = load_placement(PLATFORM, config)
+    except ConfigError:
+        pytest.skip("the large-file test needs a [placement] table, which platform.toml does not have")
+    settings = placement.settings  # unchanged: the point is that the default is what is verified
+    assert (settings.chunk_bytes, settings.fresh_connection_bytes) == (
+        DEFAULT_CHUNK_BYTES,
+        DEFAULT_FRESH_CONNECTION_BYTES,
+    ), "platform.toml sets chunk_bytes or fresh_connection_bytes, so this run would not verify the defaults"
+    chunk = settings.chunk_bytes
+    assert 3 * chunk < DEFAULT_CHUNK_UPLOAD_BYTES < 4 * chunk
+    provisioner = Provisioner(
+        client, config, settings, provider_ids=resolve_provider_ids(config), log=tmp_path / "changes.jsonl"
+    )
+    source = tmp_path / "default-chunks.bin"
+    sha = write_random(source, DEFAULT_CHUNK_UPLOAD_BYTES, seed=186)
+    path = f"expcore-live-{secrets.token_hex(6)}/default-chunks.bin"
+    caplog.set_level(logging.INFO, logger="expcore_onedata.client")
+    try:
+        uploaded = provisioner.upload(path, source)
+        assert (uploaded.action, uploaded.sent_bytes) == ("created", DEFAULT_CHUNK_UPLOAD_BYTES)
+        assert (uploaded.digest.size, uploaded.digest.sha256) == (DEFAULT_CHUNK_UPLOAD_BYTES, sha)
+        back = provisioner.read_file(uploaded.file_id)
+        assert (back.size, back.sha256) == (DEFAULT_CHUNK_UPLOAD_BYTES, sha)
+    finally:
+        report = provisioner.teardown()
+    assert report.ok, report.left
+    puts = []
+    for record in caplog.records:
+        found = re.search(r"a PUT of (\d+) bytes .*\(connection (new|reused[^)]*)\)", record.getMessage())
+        if found and record.name == "expcore_onedata.client":
+            puts.append((int(found.group(1)), found.group(2)))
+    for number, (size, connection) in enumerate(puts, start=1):
+        record_property(f"put_{number}", f"{size} bytes, connection {connection}")
+        print(f"PUT {number}: {size} bytes, connection {connection}")
+    assert [size for size, _ in puts] == [chunk, chunk, chunk, DEFAULT_CHUNK_UPLOAD_BYTES - 3 * chunk]
+    assert [connection for size, connection in puts if size == chunk] == ["new"] * 3
 
 
 # -- the fault injector (issue #17) -----------------------------------------------------------------------------------
