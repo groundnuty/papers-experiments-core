@@ -1,4 +1,4 @@
-"""Lease groups by tool-server rights (O30): one campaign runs a read-only and a writing condition interleaved, and each
+"""Lease groups by tool-server rights (O31): one campaign runs a read-only and a writing condition interleaved, and each
 run leases only a slot whose tool-server user holds exactly its condition's rights."""
 
 import asyncio
@@ -143,10 +143,10 @@ def changes(sequence):
     return sum(1 for before, after in itertools.pairwise(sequence) if before != after)
 
 
-def test_o30_one_campaign_runs_a_read_only_and_a_writing_condition_interleaved_each_on_a_slot_of_its_rights(
+def test_o31_one_campaign_runs_a_read_only_and_a_writing_condition_interleaved_each_on_a_slot_of_its_rights(
     mixed, tmp_path
 ):
-    """O30: a campaign whose plan interleaves a read-only condition (two rights) and a writing one (six), in its
+    """O31: a campaign whose plan interleaves a read-only condition (two rights) and a writing one (six), in its
     randomised order, leases each run a slot whose tool-server user declares and holds exactly its condition's
     rights, so every token mint succeeds; nothing has to be split into one campaign per condition."""
     executor = MintingExecutor(mixed)
@@ -171,8 +171,8 @@ def test_o30_one_campaign_runs_a_read_only_and_a_writing_condition_interleaved_e
     assert {d["key"] for d in executor.drawn if d["condition"] == "write"} == {"slot-b"}
 
 
-def test_o30_runs_of_two_conditions_hold_a_slot_of_each_group_at_once(mixed, tmp_path):
-    """O30: a read-only run and a writing run are in flight together, each on its own group's slot: neither waits for
+def test_o31_runs_of_two_conditions_hold_a_slot_of_each_group_at_once(mixed, tmp_path):
+    """O31: a read-only run and a writing run are in flight together, each on its own group's slot: neither waits for
     the other, since they lease from different groups."""
     executor = MintingExecutor(mixed, meet=threading.Barrier(2))
     with build(
@@ -189,8 +189,8 @@ def test_o30_runs_of_two_conditions_hold_a_slot_of_each_group_at_once(mixed, tmp
     assert {(d["condition"], d["key"]) for d in executor.drawn} == {("read", "slot-a"), ("write", "slot-b")}
 
 
-def test_o30_a_run_waits_only_for_a_slot_of_its_own_group(mixed):
-    """O30: with the read-only group's one slot held, another read-only run gets no slot while the writing group's
+def test_o31_a_run_waits_only_for_a_slot_of_its_own_group(mixed):
+    """O31: with the read-only group's one slot held, another read-only run gets no slot while the writing group's
     slot is free, and a writing run takes that one at once."""
     platform, pool = mixed.platform, mixed.pool
     read = platform.lease_group({"data_path": "via-gate", "tools": "read"})
@@ -204,16 +204,16 @@ def test_o30_a_run_waits_only_for_a_slot_of_its_own_group(mixed):
     assert (first.key, writing.key) == ("slot-a", "slot-b")
 
 
-def test_o30_a_run_without_a_tool_server_may_take_any_slot(mixed):
-    """O30: a run with a data path and no tool server needs only a data-path user, which every slot has with the
+def test_o31_a_run_without_a_tool_server_may_take_any_slot(mixed):
+    """O31: a run with a data path and no tool server needs only a data-path user, which every slot has with the
     baseline rights, so it leases from every slot (the group of the platform's users), whichever rights its tool-server
     user declares."""
     assert mixed.platform.lease_group({"data_path": "via-gate"}) == GROUP
     assert mixed.platform.lease_keys(GROUP) == ["slot-a", "slot-b"]
 
 
-def test_o30_a_condition_whose_rights_no_slot_declares_is_refused_when_the_campaign_is_built(mixed, tmp_path):
-    """O30: `manage` (three rights) is in the plan and no slot's tool-server user declares its rights, so its group
+def test_o31_a_condition_whose_rights_no_slot_declares_is_refused_when_the_campaign_is_built(mixed, tmp_path):
+    """O31: `manage` (three rights) is in the plan and no slot's tool-server user declares its rights, so its group
     would be empty. The campaign is refused when it is built, naming the condition by its position and the rights,
     before its store is opened or any run is tried; never at a run's mint."""
     with pytest.raises(ConfigError, match=r"\[toolserver\] conditions\[1\]") as refused:
@@ -232,8 +232,8 @@ def test_o30_a_condition_whose_rights_no_slot_declares_is_refused_when_the_campa
         mixed.platform.lease_group({"data_path": "via-gate", "tools": "manage"})
 
 
-def test_o30_a_slot_leased_for_another_condition_mints_nothing(mixed):
-    """O30: a lease of the writing group handed to a read-only run is refused before anything is journalled or minted,
+def test_o31_a_slot_leased_for_another_condition_mints_nothing(mixed):
+    """O31: a lease of the writing group handed to a read-only run is refused before anything is journalled or minted,
     naming the slot and the condition by their positions."""
     lease = mixed.pool.acquire(mixed.platform.lease_group({"tools": "write", "data_path": "via-gate"}), timeout_s=0)
     with pytest.raises(ValueError, match=r"slots\[1\].*conditions\[0\]"):
@@ -242,8 +242,8 @@ def test_o30_a_slot_leased_for_another_condition_mints_nothing(mixed):
     assert TokenJournal(mixed.pool.dir).latest_expiry(lease.key) is None
 
 
-def test_o30_a_campaign_of_one_rights_set_leases_every_slot_as_before(tmp_path, fake):
-    """O30: when every slot declares the rights of the campaign's one condition, its group is every slot, as the one
+def test_o31_a_campaign_of_one_rights_set_leases_every_slot_as_before(tmp_path, fake):
+    """O31: when every slot declares the rights of the campaign's one condition, its group is every slot, as the one
     group of the platform's users was, and its runs lease, mint and finish as they did."""
     single = staged(tmp_path, fake, {})
     read = single.platform.lease_group({"data_path": "via-gate", "tools": "read"})
@@ -273,8 +273,8 @@ def test_o30_a_campaign_of_one_rights_set_leases_every_slot_as_before(tmp_path, 
         ([*BASELINE, "space_view"], r"key 'rights' must list known rights, each once"),
     ],
 )
-def test_o30_a_slot_must_declare_the_rights_of_its_tool_server_user(tmp_path, fake, rights, message):
-    """O30: the rights a slot's tool-server user holds decide the conditions whose runs may lease it, so they are
+def test_o31_a_slot_must_declare_the_rights_of_its_tool_server_user(tmp_path, fake, rights, message):
+    """O31: the rights a slot's tool-server user holds decide the conditions whose runs may lease it, so they are
     declared, with a condition's vocabulary and rules; a slot without them, or with rights a condition could not
     declare, is refused at load, naming the slot by its position."""
 

@@ -2,7 +2,7 @@
 """What the agent of an outage meets, started for the day-0 outage check as a run starts it (O28, issue #108).
 
 For one space's scenario `AgentPlane.opened` leases a slot of `[slots]` (`expcore.campaign.lease.LeasePool`, over the
-platform's own probe) from the condition's group, whose tool-server users declare its rights (O30), and through the
+platform's own probe) from the condition's group, whose tool-server users declare its rights (O31), and through the
 platform's `SandboxPlatform`:
 
 - **the sandbox** (`launch`): the sandbox package's `DockerSandbox` at the first level of `[sandbox.data_paths]` that
@@ -149,7 +149,7 @@ class AgentPlane:
             pool = LeasePool(
                 ctx.out_dir / LEASES, platform.lease_keys, platform.probe(), clock=ctx.clock, sleep=ctx.sleep
             )
-            group = GROUP if condition is None else platform.condition_group(condition)  # its rights' slots (O30)
+            group = GROUP if condition is None else platform.condition_group(condition)  # its rights' slots (O31)
             lease = pool.acquire(group, run_key=self._run_key, timeout_s=ctx.outage_bound_s)
         except (ConfigError, LeaseRefused, OSError, ValueError) as error:
             reason = f"no slot could be leased for the sandbox and the tool server ({type(error).__name__})"

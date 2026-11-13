@@ -26,7 +26,7 @@ the run has. The slots are the only pool of leased users: the sandbox platform (
 every run that needs a data-path token or a tool server, mints both through `SlotTokens`, and its probe is a `SlotProbe`
 whose `sandbox_gone` is the sandbox's own probe.
 
-**A slot serves the conditions whose rights its tool-server user holds (O30).** That user must hold exactly the rights
+**A slot serves the conditions whose rights its tool-server user holds (O31).** That user must hold exactly the rights
 of the condition its token is minted for (`tokens.py`), so each set of rights the slots declare is a lease group of its
 own, `group_of(rights)`, holding the slots that declare it in the order of the file; conditions with the same rights
 share it. A run with a tool server leases from its condition's group, so one campaign can interleave conditions of
@@ -399,7 +399,7 @@ class SlotTokens:
         the provisional one before the tokens are returned. Any other failure leaves the provisional line.
 
         A slot whose tool-server user declares other rights than the condition's is refused before anything is
-        journalled or minted (O30): its user would fail the privilege check, and the run leased the wrong group.
+        journalled or minted (O31): its user would fail the privilege check, and the run leased the wrong group.
         """
         slot = self._slots.users_of(lease)
         if interface is None and condition is None:

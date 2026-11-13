@@ -616,7 +616,7 @@ def test_c19_one_lease_key_per_run_serves_both_planes(stage, tmp_path):
         seen["metadata"] = sandbox.metadata()
 
     run_launch(stage, "via-gate", lease, body, ctx, condition="read")
-    assert stage.platform.lease_group(factors) == group_of(stage.config.condition("read").rights)  # O30
+    assert stage.platform.lease_group(factors) == group_of(stage.config.condition("read").rights)  # O31
     assert seen["tools"] == "the run's tools"
     [started] = launcher.started
     assert seen["data"].subject == slot.data_path.user_id
@@ -642,7 +642,7 @@ def test_c19_a_run_with_a_tool_server_and_no_data_path_leases_a_slot_and_mints_o
     launcher = with_tools(stage)
     factors = {"data_path": "isolated", "tools": "read"}
     group = stage.platform.lease_group(factors)
-    assert group == group_of(stage.config.condition("read").rights)  # the condition's group (O30)
+    assert group == group_of(stage.config.condition("read").rights)  # the condition's group (O31)
     lease = lease_pool(stage, tmp_path).acquire(group, run_key="run-1")
     slot = stage.slots.get(lease.key)
     ctx = RecordingContext()

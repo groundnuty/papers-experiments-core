@@ -134,7 +134,7 @@ class Scheduler:
         if missing:
             raise ValueError(f"the plan runs model(s) {', '.join(missing)} that have no admitted endpoint")
         # The lease groups of the plan's runs, asked of the platform once, before the store is opened or a model probed:
-        # a platform that can name no group for a run (O30: no slot holds its condition's rights) refuses it here.
+        # a platform that can name no group for a run (O31: no slot holds its condition's rights) refuses it here.
         self.plan_groups: tuple[str, ...] = (
             tuple(sorted({g for row in manifest.rows if (g := lease_group(row.key.factors)) is not None}))
             if leases is not None

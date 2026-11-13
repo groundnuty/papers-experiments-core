@@ -214,7 +214,7 @@ is not the agent's local provider, with a third provider beside them; a sanction
 whose journal and Compose project are required); a `[sandbox]` table with a level that maps to the mount and the
 sidecar on the federation's network, derived as `tests/support/mount_live.py` derives the mount test's; `[slots]`, whose
 users the sandbox and the tool server lease, each slot's `toolserver` declaring the rights its user holds (`rights`: the
-condition's below, since the check leases from the condition's group, O30); and a `[toolserver]` condition whose
+condition's below, since the check leases from the condition's group, O31); and a `[toolserver]` condition whose
 allow-list has `get_file_distribution`, `list_space_providers`, `schedule_file_replication` and `get_transfer`, with its
 frozen manifest and the rights to schedule a replication. In the default layout `pine` owns the study space and is the local provider, so the root's file
 makes the check unknown, saying so. Derive a file with `birch` local, `pine` taken down and `cedar` the mirror (no

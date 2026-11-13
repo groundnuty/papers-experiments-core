@@ -7,7 +7,7 @@
 Per run (never per campaign) the run leases one slot of `[slots.<name>]` (`users.py`) when it needs a data-path token or
 a tool server, and none when it needs neither. A slot gives the run both planes' users, so there is one pool of leased
 users and one lease key per run. A run with a tool server leases from its condition's group, the slots whose tool-server
-user declares the condition's rights (`users.group_of`, O30), so conditions of different rights interleave in one
+user declares the condition's rights (`users.group_of`, O31), so conditions of different rights interleave in one
 campaign; a run with a data path alone leases from every slot. `users.SlotTokens` mints the run's tokens on the slot's
 users at once, with one journalled expiry: the data path's (read-only and scoped to the study space, with the interface
 of the run's data path) and, for a condition with a tool server, the tool server's, each with a lifetime from the run's
@@ -291,7 +291,7 @@ class SandboxPlatform:
         return self._s.mode_of(str(factors[DATA_PATH_FACTOR]))
 
     def lease_group(self, factors: Mapping[str, Any]) -> str | None:
-        """The lease group of a run (O30): with a tool server, its condition's (`condition_group`), the slots whose
+        """The lease group of a run (O31): with a tool server, its condition's (`condition_group`), the slots whose
         tool-server user holds exactly the condition's rights; with a data path alone, `GROUP`, every slot; None when
         it needs neither. The scheduler asks it of every run of the plan when the campaign is built, so a condition
         whose rights no slot declares is refused then, never at a run's mint."""
