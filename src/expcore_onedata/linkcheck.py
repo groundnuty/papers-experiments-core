@@ -52,20 +52,21 @@ transfer id it scheduled. The fetch itself is on-the-fly replication, which no t
 evictions are documents of the probe space, never of a study space, so no study's transfer listing holds any of them,
 and the ids and the window let a study set them apart in any other listing it reads.
 
-**Where it runs.** `health.PlatformHealth` runs it at its first call, after the content-type check
-(`precampaign.PreCampaignHealth`), and keeps that verdict: a refusal holds every run. It runs it again every `every_s`
-of the campaign (`[link_check]`, 600 s by default), so a link that sticks mid-campaign closes the health gate: the run
-whose check found it is an infrastructure outcome, never scored, and the whole campaign is held until a check passes
-again. Periodic rather than per run: each check costs a few seconds of eviction polls on 25.0, which every run would
-pay. A fault injector's restore runs it for every pair the restored provider is in, and the restore fails while a pair
-does not pass (`fault_serves.ServingProbe.links`). `deploy/compose-federation`'s `up` runs it last and does not report
-the federation ready until it passes.
+**Where it runs.** `health.PlatformHealth` runs it at its first call, after the content-type check and the space, and
+a failure holds every run until a re-check of the closed gate passes. It runs it again at every call after a failure,
+and every `every_s` of the campaign (`[link_check]`, 600 s by default), so a link that sticks mid-campaign closes the
+health gate: the run whose check found it is an infrastructure outcome, never scored, and the whole campaign is held
+(the core's gate holds all dispatch, not one rights group's) until a check passes again. Periodic rather than per run:
+each check costs a few seconds of eviction and block-map polls on 25.0, which every run would pay. A fault injector's
+restore runs it for every pair the restored provider is in, and the restore fails while a pair does not pass
+(`fault_serves.ServingProbe.links`). `deploy/compose-federation`'s `up` runs it last and does not report the federation
+ready until it passes.
 
 **Its time.** The first check after the probe space was emptied writes the probes and waits for the local provider to
 see them (about 6 s on 25.0); every other check evicts the probes the last one left, a few seconds, fetches, and
 evicts once more. A study keeps the campaign's `health_timeout_s` above `visible_timeout_s + timeout_s +
-evict_timeout_s` (150 s by default): a first call that outlives it reads unhealthy once, and the verdict it keeps
-answers every call after it.
+evict_timeout_s` (150 s by default): a call that outlives it reads unhealthy, which closes the gate, or sets a run's
+post-run check aside, though the links work.
 """
 
 import dataclasses
@@ -470,7 +471,10 @@ def check_links(
     if failed:
         detail = "a provider link is stuck or untested: " + "; ".join(str(result.reason) for result in failed)
     else:
-        detail = f"each of the {len(results)} provider pair(s) fetched its probe within {settings.timeout_s:g} s"
+        timed = ", ".join(f"{r.source}->{r.local} {r.seconds:.2f} s" for r in results)  # the gate keeps the detail
+        detail = (
+            f"each of the {len(results)} provider pair(s) fetched its probe within {settings.timeout_s:g} s ({timed})"
+        )
     return LinkReport(not failed, detail, results, started, now())
 
 

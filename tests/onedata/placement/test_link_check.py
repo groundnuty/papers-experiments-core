@@ -177,20 +177,27 @@ def test_o35_pairs_and_no_probe_space_refuse_and_no_pairs_pass_without_one(tmp_p
     assert run(alone, client, ticker).ok
 
 
-def test_o35_platform_health_runs_the_check_at_its_first_call_and_keeps_the_report(fake, config, client, ticker):
-    """O35: Platform health runs the check at its first call and keeps the report."""
+def test_o35_a_link_stuck_at_the_first_call_holds_every_run_until_a_recheck_after_the_remedy_passes(
+    fake, config, client, ticker
+):
+    """O35: the first call fails naming the pair, and the verdict is not kept: every later call (the closed gate's
+    re-checks) checks the links again, so the remedied link reopens the gate without restarting the campaign."""
     fake.links[(ALPHA_ID, BETA_ID)] = "fail"
     issuer = TokenIssuer(client, config, clock=lambda: 1_800_000_000.0)
     health = PlatformHealth(config, client, issuer, monotonic=ticker.clock, sleep=ticker.sleep)
     verdict = health()
     assert not verdict.ok
-    assert "refused before any run starts" in verdict.detail
+    assert verdict.detail.startswith("no run is admitted until every provider link transfers: ")
     assert "no transfer from providers[1] to providers[0]" in verdict.detail
     assert health.links is not None
     assert not health.links.ok
     calls = len(fake.provider_calls)
-    assert not health().ok
-    assert len(fake.provider_calls) == calls
+    assert not health().ok  # still stuck: checked again
+    assert len(fake.provider_calls) > calls
+    del fake.links[(ALPHA_ID, BETA_ID)]  # the remedy: the link restarted
+    passed = health()
+    assert passed.ok, passed.detail
+    assert health.links.ok
 
 
 def test_o35_platform_health_passes_and_answers_as_the_space_check_once_every_link_works(fake, config, client, ticker):

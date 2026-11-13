@@ -43,15 +43,16 @@ not be measured, answers every call after it with its detail, so the gate stays 
 lets every call answer as the space check does. With no REST data path nothing is read. The composition is
 `precampaign.PreCampaignHealth`, built here, so a study that uses this check cannot leave the measurement out.
 
-**So is the link check (O35, `linkcheck.py`), after the content type, with no opt-out.** At the first call every
-(local, source) pair a run can fetch through must fetch its probe from the `[link_check]` probe space within the bound;
-a pair that cannot, or that could not be tested, refuses the campaign, named in the detail, and the verdict is kept as
-the content type's is. A federation with no pair (every space supported by the local provider alone) has nothing to
-check; one with pairs and no `[link_check]` is refused. `links` holds the report: each pair's seconds and bytes and the
-transfers the check made. After the first call it runs again, at a call, whenever its last run is older than `[link_check]
-every_s` (600 s by default) or failed: a link that sticks mid-campaign fails that call, so the health gate closes, the run
-whose check found it is set aside as infrastructure, the whole campaign is held, and the gate's re-checks run it until
-it passes. `monotonic` and `sleep` are its clock and its pauses, a test's `Ticker`. The check writes
+**So is the link check (O35, `linkcheck.py`), after the content type and the space, with no opt-out.** At the first
+call every (local, source) pair a run can fetch through must fetch its probe from the `[link_check]` probe space within
+the bound; a pair that cannot, or that could not be tested, fails the call, named in the detail with its remedy. Unlike
+the content type its verdict is not kept: a stuck link is remedied while the campaign waits, so the check runs again at
+every call after a failure, and whenever its last run is older than `[link_check] every_s` (600 s by default). A failure
+at the first call holds every run until a re-check of the closed gate passes; one later, a link that stuck
+mid-campaign, closes the gate, sets the run whose check found it aside as infrastructure and holds the whole campaign
+the same way. A federation with no pair (every space supported by the local provider alone) has nothing to check; one
+with pairs and no `[link_check]` always fails. `links` holds the last report: each pair's seconds and bytes and the
+transfers the check made. `monotonic` and `sleep` are its clock and its pauses, a test's `Ticker`. The check writes
 probes and evicts them, so a caller that must change nothing, day-0's read-only `health` check alone, builds this with
 `links=False`; a campaign's health gate never does.
 
@@ -76,6 +77,7 @@ from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import compose_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.linkcheck import LinkReport, check_links
+from expcore_onedata.linksettings import LinkCheckSettings
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
 from expcore_onedata.tokencheck import TokenRefused
@@ -183,10 +185,12 @@ class PlatformHealth:
         self._content_type: ContentTypeVerdict | None = None
         self._links: LinkReport | None = None
         self._links_at = 0.0  # when the last link check ended, on `monotonic`
+        self._links_passed = False  # whether any link check of this campaign passed
         self._links_lock = threading.Lock()
-        self._periodic = links and config.link_check is not None
-        checks = (self._measure, self._check_links) if links else (self._measure,)
-        self._gate = PreCampaignHealth(self._regular, *checks)
+        self._with_links = links
+        # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
+        # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
+        self._gate = PreCampaignHealth(self._regular, self._measure)
         self._faults = _fault_gate(config, client, fault_driver, self._gate)  # outermost: it holds the federation
 
     @property
@@ -197,37 +201,44 @@ class PlatformHealth:
 
     @property
     def links(self) -> LinkReport | None:
-        """What the link check found at the first call (None before it, or when the content-type check refused
-        first): every pair's verdict, seconds and bytes, and the transfers it made (`LinkReport.to_json()`)."""
+        """What the last link check found (None before the first, or while the content type or the space refuses):
+        every pair's verdict, seconds and bytes, and the transfers it made (`LinkReport.to_json()`)."""
         return self._links
 
     def _measure(self) -> Health:
         self._content_type = measure_content_type(self._config, self._client)
         return self._content_type.health
 
-    def _check_links(self) -> Health:
+    def _check_links(self) -> None:
         self._links = check_links(self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock)
         self._links_at = self._monotonic()
-        return self._links.health
+        self._links_passed = self._links_passed or self._links.ok
 
     def _regular(self) -> Health:
-        """Every call after the pre-campaign checks passed: the space, then the links again when the last check is
-        older than `[link_check] every_s`, or failed. A check already under way in another thread is not waited for:
-        its caller answers with the last verdict (O35)."""
+        """Every call once the content type passed: the space, then the links (O35), at the first call and again
+        whenever the last check is older than `[link_check] every_s` or failed, so a remedied link reopens the gate at
+        its next re-check. The first check is waited for by every caller; a later one under way in another thread is
+        not, and its caller answers with the last verdict."""
         verdict = self._space()
-        if not verdict.ok or not self._periodic:
+        if not verdict.ok or not self._with_links:
             return verdict
-        if self._links_lock.acquire(blocking=False):
+        settings = self._config.link_check
+        every_s = settings.every_s if settings is not None else LinkCheckSettings.every_s
+        if self._links_lock.acquire(blocking=self._links is None):
             try:
-                last, every_s = self._links, self._config.link_check.every_s
+                last = self._links
                 if last is None or not last.ok or self._monotonic() - self._links_at >= every_s:
                     self._check_links()
             finally:
                 self._links_lock.release()
         report = self._links
-        if report is None or report.ok:
+        if report is None:  # pragma: no cover - the first check is waited for, so a report is there
+            return Health(False, "the link check has not answered yet, so no run is admitted")
+        if report.ok:
             return verdict
-        return Health(False, f"a provider link stopped transferring during the campaign: {report.detail}")
+        if self._links_passed:
+            return Health(False, f"a provider link stopped transferring during the campaign: {report.detail}")
+        return Health(False, f"no run is admitted until every provider link transfers: {report.detail}")
 
     def _current_token(self) -> MintedToken:
         """Return the cached token, minting a new one when none is left or it is about to expire."""

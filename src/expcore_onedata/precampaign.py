@@ -1,6 +1,7 @@
 # Provenance: new
-"""What is checked once before a campaign admits its first run: the content type the data gate streams on (O05, O11),
-and, after it, every provider link a run can fetch through (O35, `linkcheck.py`, composed by `health.PlatformHealth`).
+"""What is checked once before a campaign admits its first run: the content type the data gate streams on (O05, O11).
+The provider links (O35, `linkcheck.py`) are checked at the same first call, but by `health.PlatformHealth` itself and
+not kept here: a stuck link is remedied while the campaign waits, so its check runs again until it passes.
 
 The data gate streams only a file's content, an answer of 200 or 206 from the content endpoint typed
 `application/octet-stream` (`sandbox/gateboundary.py`); every other answer it buffers whole, up to 4 MiB, and refuses
