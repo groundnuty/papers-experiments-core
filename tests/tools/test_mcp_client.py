@@ -18,7 +18,7 @@ from expcore.loop.config import AgentConfig
 from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
 from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
-from expcore.tools.mcp_client import McpToolProvider
+from expcore.tools.mcp_client import CallTimedOut, McpToolProvider
 
 SERVER = ["-m", "expcore_onedata.testing.fake_mcp_server"]  # the stand-in MCP server: its module, run with -m
 
@@ -53,6 +53,11 @@ def frozen() -> FrozenManifest:
 @pytest.fixture(scope="module")
 def frozen_with_crash() -> FrozenManifest:
     return freeze("echo,crash")
+
+
+@pytest.fixture(scope="module")
+def frozen_with_stall() -> FrozenManifest:
+    return freeze("echo,stall")
 
 
 def start_fails(p) -> BaseException:
@@ -289,3 +294,96 @@ def test_the_tool_box_shows_the_model_the_frozen_tools_with_the_cap_stated(froze
     assert [d["name"] for d in definitions] == ["add", "echo"]
     assert all("longer than 1234 characters" in d["description"] for d in definitions)
     assert definitions[1]["input_schema"]["required"] == ["text"]
+
+
+def gone(pid: int) -> bool:
+    """Tell whether the process is gone."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_l16_a_call_the_server_never_answers_ends_at_its_bound_naming_the_tool(frozen_with_stall, spawned):
+    """L16: a server that is up and accepts a call but never answers no longer hangs the caller: the call ends at its
+    `timeout_s` as knowledge infrastructure that names the tool and the bound, and the server's child is gone after.
+
+    The tool sleeps for an hour, so a call that returns at all was cut by the bound. The bound is never honoured early
+    (the lower limit); the upper limit is loose by tens of seconds, so the test does not depend on how fast the
+    machine is, only on the bound being enforced rather than the hour being waited out.
+    """
+    bound_s = 1.0
+
+    async def go():
+        async with provider(frozen_with_stall, "echo,stall") as p:
+            began = time.monotonic()
+            try:
+                await p.execute("stall", {}, timeout_s=bound_s)
+            except InfraError as error:
+                return error, time.monotonic() - began
+            raise AssertionError("the call was expected to fail at its bound")
+
+    error, elapsed = asyncio.run(go())
+    assert bound_s <= elapsed < bound_s + 30
+    assert isinstance(error, CallTimedOut)
+    assert error.kind == "knowledge"
+    assert (error.tool, error.bound_s) == ("stall", bound_s)
+    assert "'stall'" in error.detail
+    assert "within 1 s" in error.detail
+    assert len(spawned) == 1
+    wait_for(lambda: gone(spawned[0]), what="the exit of the server's child process after the timed-out call")
+
+
+def test_l16_the_session_serves_the_next_call_after_a_call_timed_out(frozen_with_stall):
+    """L16: a call cut at its bound is abandoned, not the session: the day-0 check calls on after a blocked tool."""
+
+    async def go():
+        async with provider(frozen_with_stall, "echo,stall") as p:
+            with pytest.raises(CallTimedOut):
+                await p.execute("stall", {}, timeout_s=0.5)
+            return await p.execute("echo", {"text": "again"}, timeout_s=30)
+
+    assert asyncio.run(go()).text == '{"result": "again"}'
+
+
+@pytest.mark.parametrize("bound", [0, -1.0, float("nan")])
+def test_l16_a_bound_that_is_not_positive_is_refused_before_the_call(frozen, bound):
+    """L16: no call runs under a bound that has already passed or is not a number."""
+    p = provider(frozen)
+    p._session = FakeSession(AssertionError("the call must not be made"))
+    with pytest.raises(ValueError, match="must be positive"):
+        asyncio.run(p.execute("echo", {}, timeout_s=bound))
+
+
+def test_l16_a_timeout_raised_inside_the_call_that_is_not_the_bound_is_not_reported_as_the_bound(frozen):
+    """L16: only the bound's own expiry is named as the bound; any other timeout propagates as it was raised."""
+    p = provider(frozen)
+    p._session = FakeSession(TimeoutError("the SDK's own"))
+    with pytest.raises(TimeoutError, match="the SDK's own") as caught:
+        asyncio.run(p.execute("echo", {}, timeout_s=30))
+    assert not isinstance(caught.value, InfraError)
+
+
+def test_l16_inside_the_loop_the_bound_does_not_extend_the_loops_time_cap(frozen_with_stall):
+    """L16: the loop passes the agent's time left as the call's bound, so a hung call ends the run at the loop's own
+    time cap and the per-call bound never carries it past. At the very cap the loop's cut and the call's expiry meet:
+    the run ends as the time cap (the loop's cut) or as knowledge infrastructure (the call's expiry), never later."""
+    limits = Limits(
+        max_tool_rounds=5, time_cap_s=3.0, token_budget=100_000, output_cap_chars=2000, max_output_tokens=512
+    )
+    config = AgentConfig(limits)
+
+    async def go():
+        async with provider(frozen_with_stall, "echo,stall") as p:
+            box = ToolBox([p], cap_chars=limits.output_cap_chars)
+            backend = StubAdapter([[("stall", {})], "never"])
+            began = time.monotonic()
+            result = await run_agent(backend, box, "system", "task", config)
+            return result, time.monotonic() - began
+
+    result, elapsed = asyncio.run(go())
+    assert limits.time_cap_s <= elapsed < limits.time_cap_s + 30
+    assert result.outcome.name in {"time_cap", "infrastructure"}
+    if result.outcome.name == "infrastructure":
+        assert result.outcome.infra_kind == "knowledge"
