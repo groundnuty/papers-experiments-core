@@ -163,3 +163,99 @@ def test_o27_a_provider_that_must_see_arrivals_must_support_the_space(tmp_path, 
             plan_file(tmp_path, PLAN.replace('staging = "staged"', 'staging = "staged"\nvisible_on = ["beta"]')),
             platform,
         )
+
+
+PREALLOCATED = """
+[ingest]
+staging = "staged"
+mode = "preallocated"
+
+[[ingest.files]]
+label = "day-13"
+path = "records/day-13.csv"
+source = "day-13.csv"
+at_s = 30
+baseline = "complete"
+prefix = 1024
+parts = 3
+over_s = 60
+"""
+
+
+def test_o36_a_preallocated_plan_writes_its_parts_after_the_declared_prefix(tmp_path, platform):
+    """O36: in the preallocated mode each file declares the prefix written at the start, and its parts split the rest:
+    part k ends at `prefix + ceil((size - prefix) * k / parts)`, starts where the one before it ended, and carries the
+    hash of everything before its end."""
+    staged(tmp_path)
+    plan = load_ingest_plan(plan_file(tmp_path, PREALLOCATED), platform)
+    (day,) = plan.files
+    assert (plan.mode, day.prefix, day.prefix_sha256) == ("preallocated", 1024, hashlib.sha256(DAY[:1024]).hexdigest())
+    assert [(s.part, s.due_s, s.start, s.stop) for s in plan.steps()] == [
+        (1, 30.0, 1024, 4096),
+        (2, 60.0, 4096, 7168),
+        (3, 90.0, 7168, 10240),
+    ]
+    assert all(s.sha256 == hashlib.sha256(DAY[: s.stop]).hexdigest() for s in plan.steps())
+    assert plan.summary()["mode"] == "preallocated"
+    assert plan.summary()["files"][0]["prefix"] == 1024
+
+
+def test_o36_an_arrival_plan_keeps_its_mode_its_steps_and_its_hash(tmp_path, platform):
+    """O36: a plan without `mode` is an arrival plan, as before: its parts start at the byte the one before ended (the
+    first at 0), and its hash, which a running campaign's fingerprint holds, is the one it had before the keys came."""
+    staged(tmp_path)
+    plan = load_ingest_plan(plan_file(tmp_path, PLAN), platform)
+    assert plan.mode == "arrival"
+    assert [(s.label, s.start, s.stop) for s in plan.steps()][:3] == [
+        ("note", 0, len(NOTE)),
+        ("day-13", 0, 2560),
+        ("day-13", 2560, 5120),
+    ]
+    keys = ("label", "path", "size", "sha256", "at_s", "parts", "over_s", "baseline")
+    content = {
+        "space": plan.space,
+        "visible_on": None,
+        "files": [{key: getattr(f, key) for key in keys} for f in plan.files],
+    }
+    before = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+    assert plan.sha256 == hashlib.sha256(before).hexdigest()
+
+
+def test_o36_the_fingerprint_follows_the_mode_and_the_prefix(tmp_path, platform):
+    """O36: a resume after the prefix changed is refused, and so is one after the mode did."""
+    staged(tmp_path)
+    first = load_ingest_plan(plan_file(tmp_path, PREALLOCATED), platform).sha256
+    longer = load_ingest_plan(plan_file(tmp_path, PREALLOCATED.replace("prefix = 1024", "prefix = 2048")), platform)
+    arrival = PREALLOCATED.replace('mode = "preallocated"\n', "").replace("prefix = 1024\n", "")
+    assert len({first, longer.sha256, load_ingest_plan(plan_file(tmp_path, arrival), platform).sha256}) == 3
+
+
+def test_o36_an_empty_preallocated_plan_is_allowed(tmp_path, platform):
+    """O36: a preallocated plan with no files loads, for a sham control, and has no steps."""
+    staged(tmp_path)
+    plan = load_ingest_plan(plan_file(tmp_path, '[ingest]\nstaging = "staged"\nmode = "preallocated"\n'), platform)
+    assert (plan.mode, plan.files, plan.steps()) == ("preallocated", (), ())
+
+
+@pytest.mark.parametrize(
+    ("edit", "key"),
+    [
+        (lambda t: t.replace('mode = "preallocated"', 'mode = "sparse"'), "mode"),
+        (lambda t: t.replace('mode = "preallocated"', "mode = 1"), "mode"),
+        (lambda t: t.replace("prefix = 1024\n", ""), "prefix"),
+        (lambda t: t.replace("prefix = 1024", "prefix = -1"), "prefix"),
+        (lambda t: t.replace("prefix = 1024", "prefix = 10240"), "prefix"),
+        (lambda t: t.replace("prefix = 1024", "prefix = 1.5"), "prefix"),
+        (lambda t: t.replace("prefix = 1024", "prefix = true"), "prefix"),
+        (lambda t: t.replace('mode = "preallocated"\n', ""), "prefix"),  # a prefix in an arrival plan
+        (lambda t: t.replace('baseline = "complete"', 'baseline = "absent"'), "baseline"),
+        (lambda t: t.replace("parts = 3", "parts = 9217"), "parts"),
+    ],
+)
+def test_o36_a_preallocated_plan_that_cannot_be_carried_out_is_refused_naming_the_key(tmp_path, platform, edit, key):
+    """O36: the mode is one of the two, a preallocated file declares a whole prefix below its size and belongs to the
+    baseline (the reset completes it and never removes it), an arrival file declares no prefix, and the parts fit in
+    the bytes after the prefix; each is refused at load, naming the plan's file and the key."""
+    staged(tmp_path)
+    with pytest.raises(ConfigError, match=f"key '{key}'"):
+        load_ingest_plan(plan_file(tmp_path, edit(PREALLOCATED)), platform)
