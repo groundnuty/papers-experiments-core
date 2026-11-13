@@ -606,7 +606,7 @@ def test_o35_a_probe_that_could_not_be_retired_at_all_is_said_so_and_retired_by_
     fake, config, client, ticker
 ):
     """O35: when the record, the successor and the deletion all fail, nothing excludes the failed file: the failure
-    says the next check may read it again, and the check after that retires it."""
+    says a later check may read it again, and the check after that retires it."""
     fake.joins_stuck_jobs = True
     fake.links[(ALPHA_ID, BETA_ID)] = "hang"
 
@@ -631,6 +631,38 @@ def test_o35_a_probe_that_could_not_be_retired_at_all_is_said_so_and_retired_by_
     assert len(markers_of(fake)) == 1
     del fake.links[(ALPHA_ID, BETA_ID)]
     assert run(config, client, ticker).ok
+
+
+def test_o35_a_successor_alone_does_not_make_a_failed_file_retired(fake, config, client, ticker):
+    """O35: with the record unwritable and the failed file not deleted, only the generation order holds the file back
+    while its successor is the highest: it is not reported retired, the failure says a later check may read it again,
+    and the next check reads the successor."""
+    fake.joins_stuck_jobs = True
+    fake.links[(ALPHA_ID, BETA_ID)] = "hang"
+
+    def hang(seconds):
+        ticker.sleep(seconds)
+        fake.fail_creates.add(ALPHA_ID)  # the record cannot be written; the source still writes
+        fake.fail_deletes = True
+
+    fake.hang_hook = hang
+    failed = run(config, client, ticker).pairs[0]
+    assert failed.retired is False
+    assert "no record of it written" in failed.reason
+    assert "a later check may read it again" in failed.reason
+    both = probes_of(fake, BETA_ID)
+    assert set(both) == {0, 1}  # the successor stands
+    assert markers_of(fake) == []
+    fake.fail_creates.clear()
+    fake.fail_deletes = False
+    fake.hang_hook = ticker.sleep
+    del fake.links[(ALPHA_ID, BETA_ID)]
+    calls = len(fake.provider_calls)
+    second = run(config, client, ticker)
+    assert second.ok, second.detail
+    assert both[1] in alpha_reads(fake, calls)
+    assert both[0] not in alpha_reads(fake, calls)
+    assert second.pairs[0].purged == 1
 
 
 def test_o35_the_health_gate_reopens_at_the_first_recheck_after_a_hung_link_recovers(fake, config, client, ticker):

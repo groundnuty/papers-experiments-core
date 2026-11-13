@@ -30,9 +30,9 @@ deletes the failed file and every other probe file the source holds (a delete of
 nothing reads it). The deletions are best-effort and a later check retries them: a probe that passed purges the
 retired files it finds listed (`purge`), and a retired id stays excluded for as long as its file exists. A record is
 dropped once its file is gone: provisioning deletes every marker whose file the source's listing no longer shows, so
-the record is bounded by the retired files that remain. Only when the record, the successor and the deletion all fail
-is the failed file not excluded, and `retire` says so: the next check reads it once more and, if it fails, retires it
-again.
+the record is bounded by the retired files that remain. Only when the record cannot be written and the failed file (with
+the lower generations no failure retired) is not deleted is the failed file not excluded for good, and `retire` says so,
+a successor or not: a later check may read it again and, if it fails, retires it again.
 """
 
 import hashlib
@@ -123,8 +123,10 @@ class Probe:
 
 @dataclass(frozen=True)
 class Retired:
-    """What retiring a failed probe came to: whether the failed file is out of use (recorded as retired, superseded or
-    deleted), the files deleted with it and those that could not be, and why the rest was not done when it was not."""
+    """What retiring a failed probe came to: whether the failed file is out of use for good (recorded as retired, or
+    deleted with every lower generation no failure retired), the files deleted with it and those that could not be,
+    and why the rest was not done when it was not. A successor alone is not retirement: it holds the failed file back
+    only while it is the highest generation."""
 
     ok: bool
     deleted: int
@@ -313,20 +315,15 @@ class ProbeFiles:
     def retire(self, source: str, local: str, probe: Probe) -> Retired:
         """Retire a probe whose fetch failed, so its file id is never read again: record it (a marker through the local
         provider, which answered), write the next generation, a fresh file under a new name, through the source, then
-        delete the failed file and the source's other probe files, best-effort. It is retired once recorded, superseded
-        or deleted; otherwise the next check reads it again."""
+        delete the failed file and the source's other probe files, best-effort. It is retired once recorded, or once it
+        and every lower generation without a record are deleted; otherwise a later check may read it again."""
         recorded, causes = self._record(source, local, probe)
-        written = False
         try:
             name = probe_name(self._ids[source], probe.newest + 1)
             self._create(source, self._root(source), name, self.content(source))
-            written = True
         except (PlatformError, consistency.WaitTimeout, ProbeNotReady) as error:
             causes = (*causes, f"no successor written: {error}")
         deleted, undeleted = self.delete(source, (probe.file_id, *probe.others))
-        return Retired(
-            recorded or written or probe.file_id in deleted,
-            len(deleted),
-            undeleted,
-            "; ".join(causes) or None,
-        )
+        gone = set(deleted)
+        out_of_use = recorded or (probe.file_id in gone and set(probe.unmarked) <= gone)
+        return Retired(out_of_use, len(deleted), undeleted, "; ".join(causes) or None)

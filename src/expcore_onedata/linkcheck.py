@@ -49,8 +49,9 @@ otherwise, until a fetch of it fails: then its file is retired for good and the 
    probe for <source> to <local>: creation failed", and no retired file is read in its place. The deletions are
    best-effort: a retired file that stays is deleted by a later check of the pair that passes, and stays excluded
    until then; a marker is deleted once the source no longer lists its file, so the record is bounded by the retired
-   files that remain. Only when the marker, the new file and the deletion all fail is the failed file not excluded:
-   the failure says so, and the next check reads it once more, retiring it again if it fails. The probe space is the
+   files that remain. Only when the marker cannot be written and the failed file is not deleted is it not excluded
+   for good: the failure says so, with a new file or without, and a later check may read it once more, retiring it
+   again if it fails. The probe space is the
    check's alone, so no other reader has the file open.
 3. *Evict afterwards*, only when every pair passed: each probe is evicted from the local provider once, the eviction
    waited for and the local block map read. On Onedata 25.0 an eviction scheduled right after a fetch completes having
@@ -396,7 +397,7 @@ class _Check:
         note = ""
         if not retired.ok:
             cause = retired.why or "not deleted"
-            note = f"; its probe could not be retired ({cause}), so the next check may read it again"
+            note = f"; its probe could not be retired ({cause}), so a later check may read it again"
         return _with(result, retired=retired.ok, reason=f"{result.reason}{note}", unpurged=retired.undeleted)
 
     def run(self, pairs: Sequence[Pair], workers: int) -> tuple[PairResult, ...]:
