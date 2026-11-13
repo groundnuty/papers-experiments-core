@@ -297,6 +297,19 @@ def test_o28_the_answers_of_each_path_are_recorded_with_status_latency_and_outco
     assert entry.facts["during"]["knowledge"]["get_file_distribution"]["replicated"]["outcome"] == "served"
 
 
+def test_o35_a_rest_read_records_the_statuses_and_bytes_of_the_answers_it_was_given(context):
+    """O37: a REST read of the outage check says what the platform answered, never only that it served: the count of
+    its answers by status (a ranged read is answered 206, a range at a time) and the body bytes they held; a read that
+    got no answer says so with no counts."""
+    entry = outage_check(context)
+    rest = entry.facts["during"]["rest"]
+    served = rest["replicated"]["answers"]
+    assert set(served["statuses"]) == {"206"}
+    assert served["statuses"]["206"] > 1
+    assert served["body_bytes"] == outage_run.FILE_BYTES
+    assert rest["owner_only"]["answers"] == {"statuses": {}, "body_bytes": 0}
+
+
 def test_o28_a_read_the_platform_refuses_records_its_status_and_error_id(context, world):
     """O28: a read the platform refuses records its status and error id."""
     world.reads_while_down = "refuse"

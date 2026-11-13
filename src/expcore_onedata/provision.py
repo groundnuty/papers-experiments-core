@@ -57,7 +57,7 @@ from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
 from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
-from expcore_onedata.streamed import OCTET_STREAM, Digest, Upload, chunks, media_type
+from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome, Upload, chunks, media_type
 
 LISTING_LIMIT = 1000
 _SEGMENT = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # the charset of a file id the client accepts
@@ -656,6 +656,7 @@ class Provisioner:
         dest: Path | str | None = None,
         size: int | None = None,
         deadline_s: float | None = None,
+        answers: Callable[[ReadOutcome], None] | None = None,
     ) -> Digest:
         """Read a file's whole content through a provider (the data provider unless named), hashing it as it comes,
         and write it to `dest` when one is given; return its size and SHA-256 (O25).
@@ -666,7 +667,8 @@ class Provisioner:
         given), no wait for the platform lasting longer than `request_timeout_s`. Every range is bound to this
         provisioner's space, as a mutation is. Through a provider other than the data provider it first waits until the
         file is visible there (`await_visible`). With `dest`, the bytes go to `<dest>.part`, which replaces `dest` only
-        once the read is whole and is removed when it fails.
+        once the read is whole and is removed when it fails. `answers` is the client's (`read_content`): told what the
+        platform answered to each range, once the range is accepted (O37).
         """
         self._verified()
         provider = provider or self._settings.holder
@@ -689,6 +691,7 @@ class Provisioner:
             timeout_s=self._settings.request_timeout_s,
             space=self._entry.space,
             gate_retry=self._retry,
+            answers=answers,
         )
         if dest is None:
             return read()
@@ -772,11 +775,20 @@ class Provisioner:
         """Read a range of a file through a provider, which fetches what it lacks; return how many bytes were read."""
         return len(self.fetch(provider, file_id, offset, length))
 
-    def fetch(self, provider: str, file_id: str, offset: int, length: int) -> bytes:
+    def fetch(
+        self,
+        provider: str,
+        file_id: str,
+        offset: int,
+        length: int,
+        *,
+        answers: Callable[[ReadOutcome], None] | None = None,
+    ) -> bytes:
         """Read a range of a file through a provider, which fetches what it lacks; return the bytes.
 
         This is a range read and never a transfer job (O02). It is gated like a mutation, because it changes the
-        provider's block map. The provider must see the file first (`await_visible`).
+        provider's block map. The provider must see the file first (`await_visible`). `answers` is the client's
+        (`read_range`): told what the platform answered, once the answer is accepted (O37).
         """
         self._verified()
         self.await_visible(provider, [file_id])
@@ -788,6 +800,7 @@ class Provisioner:
             timeout_s=self._settings.request_timeout_s,
             space=self._entry.space,
             gate_retry=self._retry,
+            answers=answers,
         )
 
     def holds(self, provider: str, file_ids: Iterable[str], *, retry: ReadRetry = ONE_ATTEMPT) -> int:

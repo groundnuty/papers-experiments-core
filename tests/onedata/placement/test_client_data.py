@@ -13,6 +13,7 @@ from expcore_onedata.client import (
     PlatformError,
     ScopeUnread,
 )
+from expcore_onedata.streamed import ReadOutcome
 from expcore_onedata.testing import DATA, PROVIDER, ROOT_ID, SPACE_NAME
 from expcore_onedata.testing.fake_federation import ZONE
 
@@ -498,6 +499,48 @@ def test_a_range_read_refuses_an_answer_that_is_not_the_range_asked_for(config, 
     client, _ = scripted(config, ranged(status, body, content_range))
     with pytest.raises(PlatformError):
         read(client)
+
+
+def test_o35_a_range_read_reports_the_status_and_the_range_it_was_answered_with(config):
+    """O37: the bytes are returned as before, and `answers` is told, once, what the platform answered: its status, its
+    Content-Range as sent, and the bytes of the body."""
+    client, _ = scripted(config, ranged(206, b"abcde", "bytes 10-14/100"))
+    got = []
+    assert read(client, answers=got.append) == b"abcde"
+    assert got == [ReadOutcome(206, "bytes 10-14/100", 5)]
+
+
+def test_o35_a_range_clipped_at_the_end_of_the_file_reports_the_range_it_got_and_its_shorter_body(config):
+    """O37: a range that runs past the end is answered with its clipped range and fewer bytes than asked for; the
+    outcome says so, so a reader tells a clipped answer from a whole one without the request."""
+    client, _ = scripted(config, ranged(206, b"abc", "bytes 10-12/13"))
+    got = []
+    assert read(client, answers=got.append) == b"abc"
+    assert got == [ReadOutcome(206, "bytes 10-12/13", 3)]
+    assert got[0].to_json() == {"status": 206, "content_range": "bytes 10-12/13", "body_bytes": 3}
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "content_range"),
+    [
+        (200, b"abcde", None),  # the whole file, not a range
+        (200, b"abcde", "bytes 10-14/100"),  # a 200 is never a range read, whatever it says
+        (206, b"abcde", None),  # no Content-Range
+        (206, b"abcde", "bytes 10-14/12"),  # a range that ends past the end of the file it names
+        (206, b"", "bytes 10-9/10"),  # an empty body at the end of the file: no byte of the range asked for
+        (206, b"abcde", "bytes 10-14/*"),  # a file of no known size
+    ],
+)
+def test_o35_an_answer_that_is_not_the_range_asked_for_is_refused_and_never_reported_as_it(
+    config, status, body, content_range
+):
+    """O37: a refused answer reports nothing to `answers`, so no consumer takes a whole file, a range that does not
+    fit its file or an empty answer for the bytes asked for."""
+    client, _ = scripted(config, ranged(status, body, content_range))
+    got = []
+    with pytest.raises(PlatformError):
+        read(client, answers=got.append)
+    assert got == []
 
 
 def test_the_range_header_is_sent_to_the_named_provider_with_the_admin_credential(config):
