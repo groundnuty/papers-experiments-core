@@ -187,9 +187,24 @@ class FakeData(FakeFederation):
       POST   /transfers, GET /transfers/{id}        replication, eviction and migration jobs
       GET    /spaces/{space}/transfers              the ids of the space's jobs in one state (`limit`, `page_token`),
                                                     newest first and ending as 25.0's do
+      POST   /qos_requirements                      a requirement on a file or a directory (body fileId, expression)
+      GET    /qos_requirements/{qid}                the requirement: qosRequirementId, fileId, expression, status
+      DELETE /qos_requirements/{qid}                remove it (204; once gone, answered as `missing_answer`)
+      GET    /data/{id}/qos/summary                 the requirements on the entry and its ancestors, keyed by id
+      GET    /data/{id}/files                       the recursive listing (`attributes`, `include_directories`,
+                                                    `limit`, `token`), with `effQosInheritancePath`
 
     and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, and where a delay is in
     seconds it is seconds of the fake's own `clock`, never of the wall, so a test never waits.
+
+    **QoS requirements** (#206) are the minimum the reset's QoS stages need, as the 25.0 build's source answers them
+    (`expcore_onedata.resetqos` cites it): a requirement is added (`add_qos`, or the POST) and kept until removed; a
+    summary holds the requirements on the entry and its ancestors; the recursive listing gives each entry's
+    `effQosInheritancePath` (`direct`, `ancestor`, both, or `none`), ends on `nextPageToken` null and has no
+    `isLast`. A QoS replication creates no transfer document: with `qos_replicates_to` set, a new requirement's files
+    land whole on that provider `qos_land_after_s` seconds of `clock` later, even if the requirement was removed
+    meanwhile. Assumed, not seen live: the summary's and the record's `status` is always `fulfilled`, an expression is
+    not evaluated, and only `qos_replicates_to` decides where a replication lands.
 
     **Block maps.** Each provider holds ranges of each file (`GET /data/{id}/distribution`, `held`). The provider a file
     is made on holds all of it (`add_file`'s `holder`) or the bytes it wrote. A range read through a provider that lacks
@@ -340,7 +355,7 @@ class FakeData(FakeFederation):
     holds counts it, and differs from the core there.
 
     Does not model: a transfer's duration (it ends after `transfer_flip_after` polls of its record, or when a test ends
-    it), partial replication (a replication places the whole file, as Onedata's does), QoS requirements, file
+    it), partial replication (a replication places the whole file, as Onedata's does), QoS beyond the above, file
     metadata other than the id, name, type, size and parent, storage backends beyond one per provider, concurrent
     writers, quotas, symbolic links, a token's space or interface caveats (only the read-only caveat is enforced, and
     `enforce_readonly=False` turns that off), a delete that other providers show late (unless `delete_delay_s` is set),
@@ -397,6 +412,9 @@ class FakeData(FakeFederation):
       at once, as a real provider's is while its listing lags);
     - `listing_time`: job id to the time its listing key is built from in place of its record's, which lists it out
       of the newest-first order while its record keeps its own times (a broken order, for a reader's check);
+    - `qos` (requirement id to its record), `ignore_qos_deletes` (a removal answers 204 and the requirement stays),
+      `qos_hidden_on` (requirement id to the provider ids that have not seen it: their summaries, listings and reads
+      leave it out), `qos_replicates_to` and `qos_land_after_s` (where and when a new requirement's files land);
     - every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
       negative when behind); `date_override` (provider id to a header value, or None for none) replaces it.
 
