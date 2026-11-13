@@ -200,13 +200,31 @@ def test_o43_an_agent_cap_that_the_kept_text_fits_but_its_note_does_not_shows_th
 
 
 def test_o43_a_cap_a_few_characters_short_of_the_kept_text_and_its_note_leaves_a_piece_of_the_note(big_cell):
-    """O43: the note is part of the text the cap counts, so a cap within the note's length (87 characters) below the
-    whole text cuts it in the middle; it is the same piece on every run, and a study keeps its cap away from this."""
+    """O43: the note is part of the text the cap counts, and the loop's notice takes room from the cap too, so a cap
+    below the whole text by fewer than the note is longer than the loop's notice (14 characters: 1,048,650 to
+    1,048,663) cuts the note in the middle. It is the same piece on every run, and a study keeps its cap away."""
     run = model_sees(big_cell, 1_048_663)
     assert run.result.text == (
         "a" * KEPT + "\n[output cut by\n[output truncated: 73 of 1048664 characters dropped by the harness cap]"
     )
     assert len(run.result.text) == 1_048_663
+    shortest = model_sees(big_cell, 1_048_650)  # the first cap that leaves a piece of it: one character
+    assert shortest.result.text == (
+        "a" * KEPT + "\n[\n[output truncated: 86 of 1048664 characters dropped by the harness cap]"
+    )
+    nothing = model_sees(big_cell, 1_048_649)  # one less leaves no piece: the loop's notice follows the newline
+    assert nothing.result.text == (
+        "a" * KEPT + "\n\n[output truncated: 87 of 1048664 characters dropped by the harness cap]"
+    )
+
+
+def test_o43_a_cap_too_short_for_the_loops_notice_cuts_the_text_plain_and_77_characters_hold_the_notice_alone(big_cell):
+    """O43 with L06: the notice that counts inside the cap needs 77 characters here; below that the model reads the
+    first characters of the output and no notice, at that it reads the notice and no output."""
+    assert model_sees(big_cell, 76).result.text == "a" * 76
+    assert model_sees(big_cell, 77).result.text == (
+        "\n[output truncated: 1048664 of 1048664 characters dropped by the harness cap]"
+    )
 
 
 def test_o43_a_cap_of_2_mib_and_1_kib_cuts_nothing_of_the_longest_text_the_default_cap_lets_the_tool_return():

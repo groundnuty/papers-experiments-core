@@ -29,8 +29,9 @@ numbers are on the cell's record too (`output_cut`).
 The loop's cap (`output_cap_chars`, L06) then applies to that whole text, the notice included, and the order is fixed:
 the sandbox cuts first, this tool adds its notice, and the loop cuts last, from the end of the text, with its own notice
 counted inside the cap. A cap that the text and the notice fit leaves the notice as the last line. A smaller cap cuts
-it off with the tail, and the model sees the loop's notice instead; a cap within the notice's length below the text cuts
-the notice in the middle. The record keeps the whole text and both flags either way.
+it off with the tail, and the model sees the loop's notice instead. A cap just below the text, by less than the notice
+is longer than the loop's own, cuts the notice in the middle, and a cap too short for the loop's notice cuts the text
+plain. The record keeps the whole text and both flags either way.
 """
 
 import asyncio
