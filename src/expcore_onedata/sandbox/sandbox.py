@@ -98,6 +98,7 @@ TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run director
 GATE_TOKEN_FILE = Path("gate-secret", "gate-token")  # likewise while the gate starts, owned by the gate's user
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 RUN_START_POLLS = 50  # reads of the gate's log, 0.1 s apart, for the mark of the run's start it was signalled to write
+INIT_SLEEP_POLLS = 50  # reads of the agent's cgroup, 0.1 s apart, for the `sleep` its init starts (O30)
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
 NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
@@ -169,6 +170,7 @@ class DockerSandbox:
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
+        self._init_sleep: dict[str, Any] | None = None  # the agent's init's `sleep`, by pid and start time (O30)
         self._uptime0: float | None = None
         self.teardown_log: list[dict] = []
 
@@ -324,6 +326,7 @@ class DockerSandbox:
         share = self._start_mount() if mode is DataPathMode.MOUNT else None
         self._checkpoint()
         self._start_agent(work, share, gate_ip, list(hosts))
+        self._init_sleep = self._identify_init_sleep()  # before any cell: a probe's process would be one more
         self._checkpoint()
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
         if share:
@@ -332,6 +335,7 @@ class DockerSandbox:
         self._cells = CellRunner(
             self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation
         )
+        self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
         self._verify_inputs()
         self._cells.sample_pids()
@@ -628,6 +632,22 @@ class DockerSandbox:
         )  # fmt: skip
         self._register_container(self.names.agent)
         self.host.docker(*args, env=env)
+
+    def _identify_init_sleep(self) -> dict[str, Any]:
+        """The agent's init's `sleep infinity`, by its pid and start time, read once the container has started and before
+        any cell runs (`teardown.init_sleep`): the one process the kill at a cell's deadline, the quiesce and the
+        teardown spare besides the init. A process of the agent's can name itself `sleep` and be reparented to the init,
+        but it cannot take this start time (O30). The init starts it just after docker returns, so it is looked for a few
+        times; a container whose `sleep` cannot be told from the agent's processes could not bound a cell, so its start
+        fails."""
+        for _ in range(INIT_SLEEP_POLLS):
+            info = TD._inspect(self.host, self.names.agent, self.waits)
+            if info is not None and info["running"] and info["pid"] > 0:
+                found = TD.init_sleep(self.host, info)
+                if found is not None:
+                    return found
+            self._sleep(0.1)
+        raise SandboxError("the agent container's init and its sleep could not be identified at its start")
 
     def _verify_read_only(self) -> None:
         """Prove the root and the mount refuse a write, from inside the agent, and refuse to hand out a sandbox that does not."""
@@ -1206,7 +1226,13 @@ class DockerSandbox:
                 log_path = self.s.work_root / TD.TEARDOWN_LOG_DIR / f"{self.sid}.jsonl"
                 agent = self.names.agent if self.names.agent in self._containers else None
                 res = TD.ordered_fuse_teardown(
-                    self.host, agent, self.names.sidecar, self.dir / "mount", waits=self.waits, log_path=log_path
+                    self.host,
+                    agent,
+                    self.names.sidecar,
+                    self.dir / "mount",
+                    waits=self.waits,
+                    log_path=log_path,
+                    agent_sleep=self._init_sleep,
                 )
                 self.teardown_log = res.log
                 errors.extend(res.errors)

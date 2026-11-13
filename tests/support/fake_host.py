@@ -54,6 +54,7 @@ class FakeContainer:
     logs: str = ""
     started_at: str = "2026-01-01T00:00:00Z"
     paused: bool = False
+    init_child: int = 0  # the `sleep` docker-init started, in a container run with `--init ... sleep infinity`
 
     def mount_specs(self) -> list[str]:
         return [*self.options.get("-v", []), *self.options.get("--mount", [])]
@@ -152,6 +153,7 @@ class FakeHost:
         # processes a signal does not end: a read waiting in the kernel on a FUSE mount, which takes its kill only when
         # it returns (O30); a test releases one by removing it from here and from /proc
         self.unkillable: set[int] = set()
+        self.init_starts_sleep = True  # docker-init starts the `sleep` of a `--init ... sleep infinity` container
         self.calls: list[tuple] = []
         self.routes = "default via 192.0.2.1 dev eth0\n"
         self.dmesg = ""
@@ -432,7 +434,12 @@ class FakeHost:
         self.alive.add(container.pid)
         self.containers[name] = container
         self.add_stat(container.pid, "tini", 1)
-        self.add_cgroup(container, [container.pid], events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+        if options.get("--init") and command == ["sleep", "infinity"] and self.init_starts_sleep:
+            self.next_pid += 1
+            container.init_child = self.next_pid
+            self.add_stat(container.init_child, "sleep", container.pid, start=2)
+        procs = [container.pid, *([container.init_child] if container.init_child else [])]
+        self.add_cgroup(container, procs, events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
         container.options["_files"] = {  # what each file bound in held when the container started, by destination
             spec.split(":")[1]: Path(spec.split(":")[0]).read_text(encoding="utf-8")

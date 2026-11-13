@@ -126,6 +126,9 @@ class CellRunner:
         self._escalation = escalation or DL.Escalation(
             settings.kill_grace_s, lambda: {"ok": None, "why": "no abort"}, lambda: {"ok": None, "why": "no stop"}
         )
+        # the agent's init's `sleep`, by pid and start time from the container's start (`teardown.init_sleep`): the one
+        # process besides the init that a kill of the agent's processes spares; a process merely named `sleep` is killed
+        self.init_sleep: dict[str, Any] | None = None
         self._deadline: dict[str, Any] | None = None  # the record of the running cell's deadline, once it fired
         self.ended: dict[str, Any] | None = None  # the deadline that ended the run: a process outlived its kill
         self.cells: list[dict[str, Any]] = []
@@ -177,13 +180,15 @@ class CellRunner:
 
     # ------------------------------------------------------------------------------------------------ processes
     def agent_processes(self) -> list[dict] | None:
-        """Every process of the agent's container except its init and the init's `sleep`; [] when it has stopped,
-        None when that cannot be read."""
+        """Every process of the agent's container except its init and the init's `sleep` (`init_sleep`, O30); [] when it
+        has stopped, None when that cannot be read."""
         info = TD._inspect(self._host, self._names.agent, TD.WAITS)
         if info is None:
             return []
         if info.get("unknown"):
             return None
+        if self.init_sleep is not None:
+            info = {**info, "sleep": self.init_sleep}
         return TD._readers(self._host, info) if info["running"] else []
 
     def quiesce(self, reason: str = "end of run") -> dict[str, Any]:
