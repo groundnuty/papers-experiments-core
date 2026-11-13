@@ -36,9 +36,9 @@ def test_o17_a_cell_the_harnesss_timer_ended_is_a_time_limit(world, sbx):
     cells, killing = sbx._cells, threading.Event()
     kill = cells._kill_at_the_cap
 
-    def the_harness_kills():  # the fake docker holds its lock while a cell runs: the kill proceeds once it returns
+    def the_harness_kills(*cell):  # the fake docker holds its lock while a cell runs: the kill proceeds once it returns
         killing.set()
-        kill()
+        return kill(*cell)
 
     def runs_until_killed(container, argv, stdin):
         assert killing.wait(10), "the harness's timer did not fire"

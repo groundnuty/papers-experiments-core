@@ -20,7 +20,8 @@ content_check_file = "dir/f"    # a provisioned file under the space root, read 
                                 # the content type the gate streams on (`precampaign.py`); required with a rest level
 placeholder_token = "placeholder"  # optional: the agent's ONEDATA_TOKEN on a rest data path, never a credential (O23)
 kill_grace_s = 5                # optional, 1 to 60: how long a cell's processes have to end after their kill at its
-                                # deadline before the mount is aborted or the sandbox stopped (deadline.py, O30)
+                                # deadline before the mount is aborted or the sandbox stopped (deadline.py, O30); the
+                                # whole escalation lasts at most two graces and 20 s past the cap (deadline.margin_s)
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
 name = "image:tag"              # a tag or an id, only ever resolved to the id below
@@ -122,7 +123,9 @@ NETWORK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a docker netwo
 NOT_A_FEDERATION_NETWORK = ("bridge", "default", "host", "none")  # docker's own: no name resolves, or no isolation
 HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 KILL_GRACE_S = 5.0  # [sandbox] kill_grace_s unless declared: a few seconds, so a dying process is not taken for a wedge
-KILL_GRACE_MAX_S = 60.0  # the grace is waited twice at most (after the kill, after an abort) past a cell's cap
+# a cell's whole escalation past its cap is bounded by `deadline.margin_s`: two graces (after the kill, after an
+# abort) and `deadline.COMMANDS_S` for its commands; 30 s at the default grace, 140 s at this maximum
+KILL_GRACE_MAX_S = 60.0
 
 
 @dataclass(frozen=True)

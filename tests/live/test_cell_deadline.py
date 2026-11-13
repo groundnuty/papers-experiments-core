@@ -56,7 +56,7 @@ from expcore_onedata import consistency  # noqa: E402
 from expcore_onedata.client import OnezoneClient  # noqa: E402
 from expcore_onedata.config import PlatformConfig, load_platform  # noqa: E402
 from expcore_onedata.faults import FaultInjector, compose_driver, load_faults, provider_serves  # noqa: E402
-from expcore_onedata.sandbox import hostops, kinds  # noqa: E402
+from expcore_onedata.sandbox import deadline, hostops, kinds  # noqa: E402
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec  # noqa: E402
 from expcore_onedata.sandbox.hostops import DockerHost  # noqa: E402
 from expcore_onedata.sandbox.sandbox import DockerSandbox  # noqa: E402
@@ -68,9 +68,10 @@ FILE_BYTES = 16384  # as the outage check's scratch files
 CELL_S = 20.0  # the reading cell's cap: well inside the 60 s the 12 Nov read was still waiting at
 GRACE_S = 5.0  # [sandbox] kill_grace_s of the derived platform
 VISIBLE_S = 180.0
-# the deadline's whole bound when the abort works: the cap, the grace after the kill, the abort's own command, the
-# grace after the abort, and the docker client's return; the host call's own backstop is 30 s past the cap
-HARD_BOUND_S = CELL_S + 2 * GRACE_S + 15.0
+# the deadline's whole bound: the cap and the escalation's margin past it (deadline.margin_s: two graces and the
+# commands' allowance). An abort that works ends the escalation about one grace after the cap, which leaves the rest of
+# the margin for the docker client's return and the cell's record
+HARD_BOUND_S = CELL_S + deadline.margin_s(GRACE_S)
 
 STAT = """
 import json, os, time
@@ -259,7 +260,8 @@ def test_o30_the_sidecar_aborts_the_mount_and_the_read_then_ends(attempt):
 
 
 def test_o30_the_cell_returns_within_its_hard_deadline(attempt):
-    """O30: `exec` returns within the cap, two grace periods and the commands' margin, not when the read would."""
+    """O30: `exec` returns within the cap and the escalation's margin (two graces and the commands' allowance), not
+    when the read would."""
     assert attempt["during"]["exec_s"] < HARD_BOUND_S
 
 

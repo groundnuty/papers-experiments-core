@@ -11,11 +11,13 @@ bytes that are not UTF-8 is the agent's own outcome: they are replaced, never an
 
 That limit is a hard deadline (deadline.py, O30): at the cap every process of the cell is killed, and one that outlives
 the kill past the grace period has the mount aborted under it, or the sandbox stopped. Its record is the cell's
-`deadline`, and a cell that outlived its kill is `kill_survived`, infrastructure, and ends the run (`ended`).
+`deadline`, and a cell that outlived its kill is `kill_survived`, infrastructure, and ends the run (`ended`). The record
+is published from the timer's thread under `meta_lock`, before the sandbox's stop, which runs after it.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -41,6 +43,7 @@ QUIESCE_ROUNDS = (
     5  # a forking worker can start a child between the listing and the kill: listed again until none is new
 )
 HOST_CALL_MARGIN_S = 30.0  # what the docker client may take beyond the cell's own limit before it is given up on
+KILL_S = 20.0  # a `kill` of the agent's processes through the host's privilege
 
 
 def docker_failed(rc: int, err: str) -> bool:
@@ -55,11 +58,15 @@ def docker_failed(rc: int, err: str) -> bool:
 class CellTimer:
     """The harness's own timer of a cell, the one that decides `time_limit` (O17). At the cell's limit it records that
     it fired, then kills what runs; the record and the cell's end are taken under one lock, so a cell that ended first
-    never has a fired timer, and one this timer ended always has. No time limit is inferred from how long a cell ran."""
+    never has a fired timer, and one this timer ended always has. No time limit is inferred from how long a cell ran.
 
-    def __init__(self, seconds: float, kill: Callable[[], None]) -> None:
+    The kill may hand back what is to run once its outcome is decided (the sandbox's stop a deadline ordered, O30): the
+    timer runs it after it marks the outcome decided, so `end`, which waits for the outcome, never waits for that."""
+
+    def __init__(self, seconds: float, kill: Callable[[], Callable[[], None] | None]) -> None:
         self._lock = threading.Lock()
         self._ended = self._fired = False
+        self._decided = threading.Event()  # the kill has recorded its outcome
         self._kill = kill
         self._timer = threading.Timer(seconds, self._fire)
         self._timer.daemon = True
@@ -67,42 +74,57 @@ class CellTimer:
     def start(self) -> None:
         self._timer.start()
 
-    def _fire(self) -> None:
+    def _claim(self) -> bool:
+        """Mark the timer fired, unless the cell has ended or it already has; whether this call did."""
         with self._lock:
-            if self._ended:
-                return
+            if self._ended or self._fired:
+                return False
             self._fired = True
-        self._kill()
+            return True
+
+    def _fire(self) -> None:
+        if self._claim():
+            self._run_kill()
+
+    def _run_kill(self) -> None:
+        then = None
+        try:
+            then = self._kill()
+        finally:
+            self._decided.set()
+        if then is not None:
+            then()
 
     def end(self) -> bool:
-        """The cell has ended: from now on the timer does nothing. Whether it fired, after its kill has finished, so
-        that what is read next is read after it."""
+        """The cell has ended: from now on the timer does nothing. Whether it fired, after its kill's outcome is
+        decided, so that what is read next is read after it."""
         with self._lock:
             self._ended = True
             fired = self._fired
         self._timer.cancel()
-        if fired and self._timer.is_alive():
-            self._timer.join()
+        if fired:
+            self._decided.wait()
         return fired
 
 
 class _CellProcesses:
     """The deadline's tracker (deadline.Tracker): the cell's processes are every process of the agent's container but
     its init and the init's `sleep`, from its cgroup, so a worker in a session of its own is one; SIGKILLed through the
-    host's privilege, as the quiesce does."""
+    host's privilege, as the quiesce does. Each command is given at most the time the deadline has left for it."""
 
     def __init__(self, runner: CellRunner) -> None:
         self._runner = runner
 
-    def processes(self) -> list[dict] | None:
+    def processes(self, timeout_s: float) -> list[dict] | None:
         try:
-            return self._runner.agent_processes()
+            return self._runner.agent_processes(timeout_s)
         except Exception as e:  # unknown, never none
             log.error("the processes of a cell could not be listed at its deadline: %s", describe_error(e))
             return None
 
-    def kill(self, procs: list[dict]) -> None:
-        TD._sudo(self._runner._host, "kill", "-s", "KILL", *[str(p["pid"]) for p in procs], timeout_s=20.0)
+    def kill(self, procs: list[dict], timeout_s: float) -> None:
+        pids = [str(p["pid"]) for p in procs]
+        TD._sudo(self._runner._host, "kill", "-s", "KILL", *pids, timeout_s=min(KILL_S, timeout_s))
 
 
 class CellRunner:
@@ -119,13 +141,16 @@ class CellRunner:
         roles: dict[str, str],
         started_epoch: float,
         escalation: DL.Escalation | None = None,
+        stop: Callable[[], dict[str, Any]] | None = None,
+        meta_lock: threading.RLock | None = None,
     ) -> None:
         self._host, self._obs, self._names, self._s = host, observer, names, settings
         self._meta, self._registry, self.roles, self._started = meta, registry, roles, started_epoch
         # past the kill at a cell's deadline: by default the grace alone, with nothing to abort and no stop
-        self._escalation = escalation or DL.Escalation(
-            settings.kill_grace_s, lambda: {"ok": None, "why": "no abort"}, lambda: {"ok": None, "why": "no stop"}
-        )
+        self._escalation = escalation or DL.Escalation(settings.kill_grace_s, lambda _: {"ok": None, "why": "no abort"})
+        self._stop = stop or (lambda: {"ok": None, "why": "no stop"})  # the sandbox's, after a deadline's outcome
+        # what the deadline's thread writes into the metadata, and whoever reads it whole (`DockerSandbox.metadata`)
+        self.meta_lock = meta_lock or threading.RLock()
         # the agent's init's `sleep`, by pid and start time from the container's start (`teardown.init_sleep`): the one
         # process besides the init that a kill of the agent's processes spares; a process merely named `sleep` is killed
         self.init_sleep: dict[str, Any] | None = None
@@ -179,10 +204,13 @@ class CellRunner:
         return new
 
     # ------------------------------------------------------------------------------------------------ processes
-    def agent_processes(self) -> list[dict] | None:
+    def agent_processes(self, timeout_s: float | None = None) -> list[dict] | None:
         """Every process of the agent's container except its init and the init's `sleep` (`init_sleep`, O30); [] when it
-        has stopped, None when that cannot be read."""
-        info = TD._inspect(self._host, self._names.agent, TD.WAITS)
+        has stopped, None when that cannot be read (within `timeout_s`, when given)."""
+        waits = TD.WAITS
+        if timeout_s is not None:
+            waits = dataclasses.replace(waits, command_s=min(waits.command_s, timeout_s))
+        info = TD._inspect(self._host, self._names.agent, waits)
         if info is None:
             return []
         if info.get("unknown"):
@@ -228,21 +256,39 @@ class CellRunner:
         SIGKILL pending or is dead: it returns to no user code, so it changes nothing."""
         return state["killed"] is not None and not [p for p in state["left"] if p["state"] not in ("D", "Z")]
 
-    def _kill_at_the_cap(self) -> None:
+    def _kill_at_the_cap(self, cell: int) -> Callable[[], None] | None:
         """In the timer's thread, when a cell's time runs out: its deadline (deadline.py). Every process of the agent's
         except its init and `sleep`, the cell's own and any worker it detached, is killed, and one that outlives the
-        kill past the grace has the mount aborted or the sandbox stopped. The record is kept for the cell; it never
-        raises."""
+        kill past the grace has the mount aborted or the sandbox's stop ordered. The record is published under the
+        metadata's lock, under `cell_deadlines` and, when a process outlived the kill, as `ended`: the run is classified
+        before anything else happens. The stop is handed back to the timer, which runs it only once the outcome is
+        decided, so its teardown neither holds up the classification nor counts in the cell's time. It never raises."""
         try:
-            self._deadline = DL.enforce(_CellProcesses(self), self._escalation)
+            record = DL.enforce(_CellProcesses(self), self._escalation)
         except Exception as e:
             log.error("the deadline of a cell failed: %s", describe_error(e))
             self.quiesce("time cap")
-            return
-        outcome = self._deadline["outcome"]
-        if outcome in DL.ESCALATED:  # the run is over from now, whatever the cell's record makes of it after
-            self.ended = self._deadline
+            return None
+        outcome = record["outcome"]
+        with self.meta_lock:
+            self._deadline = record
+            self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})  # shares the record's steps
+            if outcome in DL.ESCALATED:  # the run is over from now, whatever the cell's record makes of it after
+                self.ended = record
+        if outcome in DL.ESCALATED:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
+        return (lambda: self._stop_after(record)) if outcome in DL.STOPS else None
+
+    def _stop_after(self, record: dict[str, Any]) -> None:
+        """The sandbox's stop a deadline ordered, once its outcome is recorded; how it went is the record's last step,
+        `stopped`. It never raises."""
+        began = time.monotonic()
+        try:
+            note = dict(self._stop())
+        except Exception as e:
+            note = {"ok": False, "error": f"the stop raised {type(e).__name__}"}
+        with self.meta_lock:
+            record["steps"].append({"step": "stopped", "teardown_s": round(time.monotonic() - began, 3), **note})
 
     # ------------------------------------------------------------------------------------------------ the cell
     def run(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
@@ -281,8 +327,10 @@ class CellRunner:
         if remaining < 1:  # too little left to start it: nothing runs, no timer was started, so none fired
             return self._not_started(record)
         t0, wall0 = time.monotonic(), time.time()
-        self._deadline = None  # this cell's, once its timer fires
-        timer = CellTimer(remaining, self._kill_at_the_cap)
+        with self.meta_lock:
+            self._deadline = None  # this cell's, once its timer fires
+        cell = len(self.cells) + 1
+        timer = CellTimer(remaining, lambda: self._kill_at_the_cap(cell))
         gave_up = fired = False
         try:
             if record:  # the probes kill nothing of the agent's
@@ -364,24 +412,25 @@ class CellRunner:
         self.cells.append(entry)
 
     def _with_deadline(self, res: ExecResult, entry: dict[str, Any], fired: bool) -> bool:
-        """The record of the cell's deadline, when its timer fired; and when a process of the cell outlived its kill,
-        its kill becomes `kill_survived`, whatever else the counters said (after an abort or a stop they describe the
-        harness's doing); the timer's thread has already ended the run (`ended`). Whether that happened."""
-        record = self._deadline if fired else None
-        if record is None:
-            return False
-        entry["deadline"] = record
-        self._meta.setdefault("cell_deadlines", []).append({"cell": entry["cell"], **record})
-        if record["outcome"] not in DL.ESCALATED:
-            return False
-        kill = {**(entry.get("kill") or {}), **KC.survived_cause(record)}
-        entry["kill"] = res.kill = kill
-        cell_kills = self._meta.setdefault("cell_kills", [])
-        if cell_kills and cell_kills[-1]["cell"] == entry["cell"]:
-            cell_kills[-1] = {"cell": entry["cell"], **kill}
-        else:
-            cell_kills.append({"cell": entry["cell"], **kill})
-        return True
+        """The record of the cell's deadline, when its timer fired (the timer's thread has put it under `cell_deadlines`
+        already); and when a process of the cell outlived its kill, its kill becomes `kill_survived`, whatever else the
+        counters said (after an abort or a stop they describe the harness's doing); the timer's thread has already ended
+        the run (`ended`). Whether that happened."""
+        with self.meta_lock:
+            record = self._deadline if fired else None
+            if record is None:
+                return False
+            entry["deadline"] = record
+            if record["outcome"] not in DL.ESCALATED:
+                return False
+            kill = {**(entry.get("kill") or {}), **KC.survived_cause(record)}
+            entry["kill"] = res.kill = kill
+            cell_kills = self._meta.setdefault("cell_kills", [])
+            if cell_kills and cell_kills[-1]["cell"] == entry["cell"]:
+                cell_kills[-1] = {"cell": entry["cell"], **kill}
+            else:
+                cell_kills.append({"cell": entry["cell"], **kill})
+            return True
 
     def _with_earlyoom(self, res, entry, before, up0, used, timeout_s, gave_up, fired, wall0) -> dict[str, Any] | None:
         """Whatever the exit code, the host's killer's victim may be another container of the run, and the cell may

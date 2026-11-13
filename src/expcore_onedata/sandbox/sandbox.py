@@ -127,9 +127,11 @@ class DockerSandbox:
         sample_period_s: float | None = 1.0,
         sleep: Callable[[float], None] = time.sleep,
         config_sha256: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.host, self.s, self.spec, self.registry = host, settings, spec, registry
         self.waits, self._sample_period, self._sleep = waits or TD.WAITS, sample_period_s, sleep
+        self._clock = clock  # what a cell's deadline counts its graces and its margin by (O30), with `sleep`
         key = spec.lease_key or re.sub(r"[^A-Za-z0-9_.-]", "_", spec.run_key)[:48]
         self.sid = f"{key}-{uuid.uuid4().hex[:8]}"
         self.names = Names.make(settings.name_prefix, self.sid)
@@ -152,8 +154,10 @@ class DockerSandbox:
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
             "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O23); never the bundle's path
-            "cell_deadline": {"grace_s": settings.kill_grace_s},  # each cell's deadline: `cell_deadlines` (O30)
+            # each cell's deadline: `cell_deadlines`, each bounded by the margin past its cap (deadline.margin_s, O30)
+            "cell_deadline": {"grace_s": settings.kill_grace_s, "margin_s": DL.margin_s(settings.kill_grace_s)},
         }
+        self._meta_lock = threading.RLock()  # a cell's deadline writes here from its timer's thread (cells.py)
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -331,10 +335,11 @@ class DockerSandbox:
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
         if share:
             roles["sidecar"] = self.names.sidecar
-        escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, self._stop_at_deadline, sleep=self._sleep)
+        escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock)
         self._cells = CellRunner(
-            self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation
-        )
+            self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation,
+            stop=self._stop_at_deadline, meta_lock=self._meta_lock,
+        )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
         self._verify_inputs()
@@ -855,20 +860,25 @@ class DockerSandbox:
         if record is not None and record["outcome"] not in unless:
             raise kinds.run_ended_error(record)
 
-    def _abort_mount(self) -> dict[str, Any]:
+    def _abort_mount(self, timeout_s: float) -> dict[str, Any]:
         """At a cell's deadline, when a process of the cell outlived its kill (O30): abort the run's FUSE connection from
         the sidecar, which holds the mount and SYS_ADMIN (`containers.sidecar_abort_args`), nothing in the agent's
-        container. The connection is the device of the run's mount in the host's table, read without touching the
-        mount. `ok` is None when there is no mount to abort; once it is True the mount is dead for the rest of the run."""
+        container, within `timeout_s`, what the deadline's margin has left. The connection is the device of the run's
+        mount in the host's table, read without touching the mount. `ok` is None when there is no mount to abort; once it
+        is True the mount is dead for the rest of the run."""
         if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
             return {"ok": None, "why": "the run has no FUSE mount"}
+        until = self._clock() + timeout_s
         found = TD._fuse_at(self.host, TD.host_path(self.dir / "mount"), self.waits)
         connections = sorted({n for m in found or [] if (n := TD._conn(m["dev"])) is not None})
         if not connections:
             return {"ok": None, "why": "the mount's FUSE connection is not in the host's mount table"}
         failed = []
         for n in connections:
-            done = self.host.docker(*sidecar_abort_args(self.names, n), check=False, timeout=self.waits.command_s)
+            left = min(self.waits.command_s, until - self._clock())
+            if left <= 0:
+                return {"ok": False, "connections": len(connections), "why": "the deadline's margin ran out"}
+            done = self.host.docker(*sidecar_abort_args(self.names, n), check=False, timeout=left)
             if done.returncode != 0:
                 failed.append(done)
         note: dict[str, Any] = {"ok": not failed, "connections": len(connections)}
@@ -876,13 +886,15 @@ class DockerSandbox:
             note.update(rc=failed[0].returncode, stderr=stderr_digest(failed[0].stderr))
             log.error("the sidecar could not abort the mount's FUSE connection: %s", describe_stderr(failed[0].stderr))
         else:
-            self._meta.setdefault("mount", {})["aborted"] = True  # dead for the rest of the run
+            with self._meta_lock:
+                self._meta.setdefault("mount", {})["aborted"] = True  # dead for the rest of the run
         return note
 
     def _stop_at_deadline(self) -> dict[str, Any]:
-        """At a cell's deadline, when the abort could not end the cell (O30): stop the sandbox, from the timer's thread;
-        the ordered teardown has its own last resorts, and the driver's later stop finds it stopped. A stop that fails is
-        recorded, never raised here."""
+        """At a cell's deadline, when the abort could not end the cell (O30): stop the sandbox, from the timer's thread,
+        once the deadline's outcome is recorded and the run classified (`cells.CellRunner._stop_after`); the ordered
+        teardown has its own last resorts, and the driver's later stop finds it stopped. A stop that fails is recorded,
+        never raised here."""
         try:
             self.stop()
         except SandboxError as e:
@@ -1170,7 +1182,8 @@ class DockerSandbox:
 
     def metadata(self) -> dict[str, Any]:
         """The facts of the run for its record. Never a secret: tokens are not in it, and the sidecar's log is summarised."""
-        meta = json.loads(json.dumps(self._meta, default=str))
+        with self._meta_lock:  # a cell's deadline may be writing its record from its timer's thread (O30)
+            meta = json.loads(json.dumps(self._meta, default=str))
         if not self._stopped and self._cells is not None:
             meta["cells"] = len(self._cells.cells)
             meta["memory"] = {k: v for k, v in self.obs.memory_facts(self.names.agent).items() if k != "events"}

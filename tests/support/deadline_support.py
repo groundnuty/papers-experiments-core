@@ -5,6 +5,7 @@ A real process in uninterruptible sleep cannot be made in a test: the escalation
 and through the sandbox by the fake host's processes that ignore every signal (`FakeHost.unkillable`)."""
 
 import threading
+import time
 
 from expcore_onedata.sandbox import deadline
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -29,20 +30,32 @@ class Clock:
 
 class Processes:
     """A fake process tracker: the cell's processes and the kills sent to them. A kill ends a process unless it is
-    wedged (in D state, a read waiting in the kernel), which ignores SIGTERM and SIGKILL alike until released."""
+    wedged (in D state, a read waiting in the kernel), which ignores SIGTERM and SIGKILL alike until released. With a
+    `clock` and `slow_s`, each listing takes `slow_s` of it, as a slow docker daemon's inspect does, and one given less
+    time than that times out unknown; the time each listing and kill was given is kept."""
 
-    def __init__(self, pids: dict[int, str], *, wedged: tuple[int, ...] = ()) -> None:
+    def __init__(
+        self, pids: dict[int, str], *, wedged: tuple[int, ...] = (), clock: Clock | None = None, slow_s: float = 0.0
+    ) -> None:
         self.procs = {pid: {"pid": pid, "comm": comm, "state": "S", "start": str(pid)} for pid, comm in pids.items()}
         self.wedged = set(wedged)
         for pid in self.wedged:
             self.procs[pid]["state"] = "D"
         self.kills: list[list[int]] = []
         self.unknown = False
+        self.clock, self.slow_s = clock, slow_s
+        self.given: list[tuple[str, float]] = []
 
-    def processes(self) -> list[dict] | None:
+    def processes(self, timeout_s: float) -> list[dict] | None:
+        self.given.append(("processes", timeout_s))
+        if self.clock is not None and self.slow_s:
+            self.clock.now += min(self.slow_s, timeout_s)
+            if self.slow_s > timeout_s:
+                return None
         return None if self.unknown else [dict(p) for p in self.procs.values()]
 
-    def kill(self, procs: list[dict]) -> None:
+    def kill(self, procs: list[dict], timeout_s: float) -> None:
+        self.given.append(("kill", timeout_s))
         self.kills.append(sorted(p["pid"] for p in procs))
         for p in procs:
             if p["pid"] not in self.wedged:
@@ -55,19 +68,15 @@ class Processes:
         self.wedged.clear()
 
 
-def escalation(clock: Clock, *, abort=None, stop=None, grace_s: float = 3.0) -> tuple[deadline.Escalation, list]:
-    """The escalation under test, and the list of what it was asked to do, in order."""
-    calls: list[str] = []
+def escalation(clock: Clock, *, abort=None, grace_s: float = 3.0) -> tuple[deadline.Escalation, list]:
+    """The escalation under test, and the list of what it was asked to do, in order, with the time each was given."""
+    calls: list[tuple[str, float]] = []
 
-    def aborting() -> dict:
-        calls.append("abort")
-        return abort() if abort else {"ok": None, "why": "no FUSE mount"}
+    def aborting(timeout_s: float) -> dict:
+        calls.append(("abort", timeout_s))
+        return abort(timeout_s) if abort else {"ok": None, "why": "no FUSE mount"}
 
-    def stopping() -> dict:
-        calls.append("stop")
-        return stop() if stop else {"ok": True}
-
-    return deadline.Escalation(grace_s=grace_s, abort=aborting, stop=stopping, sleep=clock.sleep, clock=clock), calls
+    return deadline.Escalation(grace_s=grace_s, abort=aborting, sleep=clock.sleep, clock=clock), calls
 
 
 def steps(record: dict) -> list[str]:
@@ -117,3 +126,15 @@ def run_to_the_cap(sandbox, world, code: str = "open('/data/x').read()"):
 
 def killed_pids(world) -> set[int]:
     return {int(p) for argv in world.host.sudo_commands if argv[:3] == ["kill", "-s", "KILL"] for p in argv[3:]}
+
+
+def stopped_step(record: dict, within_s: float = 10.0) -> dict:
+    """The `stopped` step of a deadline that ordered the sandbox's stop: the stop runs in the timer's thread once the
+    outcome is recorded, so it may still be under way when the cell returns."""
+    deadline_at = time.monotonic() + within_s
+    while time.monotonic() < deadline_at:
+        found = [s for s in record["steps"] if s["step"] == "stopped"]
+        if found:
+            return found[-1]
+        time.sleep(0.01)
+    raise AssertionError("the sandbox's stop did not finish")

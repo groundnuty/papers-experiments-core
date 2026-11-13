@@ -17,6 +17,7 @@ from deadline_support import (
     killed_pids,
     run_to_the_cap,
     steps,
+    stopped_step,
 )
 from sandbox_support import add_sandbox, make_spec, start_options
 
@@ -44,6 +45,7 @@ def test_o30_a_cell_whose_processes_end_at_the_kill_is_killed_at_its_deadline_an
     assert procs.kills == [[11, 12]]
     assert calls == []
     assert record["grace_s"] == 3.0
+    assert record["margin_s"] == deadline.margin_s(3.0) == 2 * 3.0 + deadline.COMMANDS_S
     assert "utc" in record
 
 
@@ -52,7 +54,7 @@ def test_o30_a_process_that_ignores_sigterm_and_sigkill_outlives_the_grace_and_t
     survived with its state, aborts the mount, and the process then ends: the outcome is `mount_aborted`."""
     clock, procs = Clock(), Processes({11: "python", 12: "reader"}, wedged=(12,))
 
-    def abort() -> dict:
+    def abort(timeout_s: float) -> dict:
         procs.release()
         return {"ok": True, "connections": 1}
 
@@ -64,7 +66,7 @@ def test_o30_a_process_that_ignores_sigterm_and_sigkill_outlives_the_grace_and_t
     assert survived["t_s"] >= 3.0  # the whole grace period, by the clock
     assert (survived["left"], survived["states"]) == (1, ["D"])
     assert record["steps"][2]["ok"] is True
-    assert calls == ["abort"]
+    assert [name for name, _ in calls] == ["abort"]
     times = [s["t_s"] for s in record["steps"]]
     assert times == sorted(times)
 
@@ -72,33 +74,22 @@ def test_o30_a_process_that_ignores_sigterm_and_sigkill_outlives_the_grace_and_t
 @pytest.mark.parametrize(
     "abort",
     [
-        pytest.param(lambda: {"ok": False, "rc": 1}, id="the abort failed"),
-        pytest.param(lambda: {"ok": None, "why": "no FUSE mount"}, id="no mount to abort"),
-        pytest.param(lambda: {"ok": True, "connections": 1}, id="aborted, and the process still lives"),
+        pytest.param(lambda _: {"ok": False, "rc": 1}, id="the abort failed"),
+        pytest.param(lambda _: {"ok": None, "why": "no FUSE mount"}, id="no mount to abort"),
+        pytest.param(lambda _: {"ok": True, "connections": 1}, id="aborted, and the process still lives"),
     ],
 )
 def test_o30_when_the_abort_fails_or_cannot_be_done_or_frees_nothing_the_sandbox_is_stopped(abort):
     """O30: the abort is the first resort only: when it fails, when there is no FUSE mount to abort, or when the
-    process still lives after it, the sandbox is stopped, and the outcome is `sandbox_stopped`."""
+    process still lives after it, the sandbox's stop is ordered, its last step, and the outcome is `sandbox_stopped`:
+    the stop itself is the caller's, once that outcome is recorded."""
     clock, procs = Clock(), Processes({12: "reader"}, wedged=(12,))
     esc, calls = escalation(clock, abort=abort)
     record = deadline.enforce(procs, esc)
     assert record["outcome"] == deadline.SANDBOX_STOPPED
-    assert calls == ["abort", "stop"]
+    assert record["outcome"] in deadline.STOPS
+    assert [name for name, _ in calls] == ["abort"]
     assert steps(record)[-1] == "stop"
-    assert record["steps"][-1]["ok"] is True
-
-
-def test_o30_a_stop_that_fails_leaves_the_cell_survived_and_says_so():
-    """O30: when the stop fails too, nothing ended the cell: the outcome is `survived_kill`, every step on record."""
-    clock, procs = Clock(), Processes({12: "reader"}, wedged=(12,))
-    esc, calls = escalation(
-        clock, abort=lambda: {"ok": False, "rc": 1}, stop=lambda: {"ok": False, "error": "SandboxError"}
-    )
-    record = deadline.enforce(procs, esc)
-    assert record["outcome"] == deadline.SURVIVED
-    assert steps(record) == ["kill", "survived", "abort", "stop"]
-    assert calls == ["abort", "stop"]
 
 
 def test_o30_processes_that_cannot_be_listed_are_never_taken_for_gone():
@@ -110,7 +101,7 @@ def test_o30_processes_that_cannot_be_listed_are_never_taken_for_gone():
     assert record["outcome"] == deadline.SANDBOX_STOPPED
     assert record["steps"][0]["signalled"] is None
     assert record["steps"][1]["left"] is None
-    assert calls == ["abort", "stop"]
+    assert [name for name, _ in calls] == ["abort"]
 
 
 def test_o30_a_process_the_cell_starts_during_the_grace_is_killed_too():
@@ -118,8 +109,8 @@ def test_o30_a_process_the_cell_starts_during_the_grace_is_killed_too():
     clock, procs = Clock(), Processes({11: "python"})
     kill = procs.kill
 
-    def kill_and_fork(listed: list[dict]) -> None:
-        kill(listed)
+    def kill_and_fork(listed: list[dict], timeout_s: float) -> None:
+        kill(listed, timeout_s)
         if len(procs.kills) == 1:  # the first kill: a child forked just before it appears
             procs.procs[21] = {"pid": 21, "comm": "worker", "state": "R", "start": "21"}
 
@@ -219,9 +210,9 @@ def test_o30_an_abort_that_fails_stops_the_sandbox_and_the_attempt_is_infrastruc
     assert [name for name, _ in others] == [mounted.names.sidecar]
     record = result.kill["deadline"]
     assert record["outcome"] == "sandbox_stopped"
-    assert [s["step"] for s in record["steps"]] == ["kill", "survived", "abort", "stop"]
+    assert stopped_step(record)["ok"] is True  # the stop ran once the outcome was recorded: its own last step
+    assert [s["step"] for s in record["steps"]] == ["kill", "survived", "abort", "stop", "stopped"]
     assert record["steps"][2]["ok"] is False
-    assert record["steps"][3]["ok"] is True
     assert mounted.stopped is True
     assert kinds.kill_error(result.kill).kind == "cell_unkillable"
     with pytest.raises(InfraError) as refused:
@@ -241,6 +232,7 @@ def test_o30_without_a_mount_a_cell_that_outlives_its_kill_stops_the_sandbox(wor
         record = result.kill["deadline"]
         assert record["outcome"] == "sandbox_stopped"
         assert record["steps"][2]["ok"] is None  # no abort was possible
+        assert stopped_step(record)["ok"] is True
         assert others == []
     finally:
         world.host.unkillable.clear()
@@ -271,7 +263,7 @@ def test_o30_the_code_tool_ends_the_attempt_as_cell_unkillable(world, mounted):
 def test_o30_the_grace_period_is_a_setting_and_is_recorded(world, mounted):
     """O30: `[sandbox] kill_grace_s` sets the grace (5 s unless declared) and the run's metadata records it."""
     assert world.s.kill_grace_s == 5.0
-    assert mounted.metadata()["cell_deadline"] == {"grace_s": 5.0}
+    assert mounted.metadata()["cell_deadline"] == {"grace_s": 5.0, "margin_s": 30.0}
     assert "fusermount" not in SIDECAR_ABORT  # a lazy unmount leaves the agent's copy and its waiting reads
     assert "/abort" in SIDECAR_ABORT
 
