@@ -21,6 +21,7 @@ from expcore_onedata.admission import (
     FEDERATION_INTENT,
     FEDERATION_LOCK,
     AdmissionRefused,
+    FederationBusy,
     FederationLock,
     require_admission,
     run_admission,
@@ -98,13 +99,26 @@ class WatchedLock(FederationLock):
 
 
 WAIT_S = 10.0  # the bound of every wait of a test that holds the lock between threads
-GRACE_S = 0.3  # how long a party that must be held back is given to get in anyway
+GRACE_S = 0.3  # how long a party that must be held back is given to get in anyway (a secondary check)
+PROBE_S = 0.2  # how long the test thread's own try for the lock is given before it counts as refused
 
 
 def held_back(entered, names, grace_s=GRACE_S):
-    """The names, after a grace, that are in despite the test not having let them: empty when each is held back."""
+    """The names, after a grace, that are in despite the test not having let them: empty when each is held back. A
+    thread that has not yet got as far as the lock is held back too, so this alone proves no exclusion."""
     time.sleep(grace_s)
     return [name for name in names if entered[name].is_set()]
+
+
+def refused(lock, exclusive):
+    """Whether a bounded try for the lock, made by the calling thread itself, is refused: it times out
+    (`FederationBusy`, the turnstile let go on the way out) instead of being granted. Unlike a wait on another
+    thread's progress, it holds back nothing vacuously: a thread that is slow to get anywhere cannot make it pass."""
+    try:
+        with lock.held(exclusive=exclusive, timeout_s=PROBE_S):
+            return False
+    except FederationBusy:
+        return True
 
 
 def overlapping(one, other):
@@ -304,6 +318,17 @@ def test_o11_a_baseline_health_check_waits_for_an_injection_in_progress_and_pass
     assert verdicts[0].ok is True, verdicts[0].detail
 
 
+def writer_between(holds, lock, present, later):
+    """The outage run's hold against the others, from the times each recorded: it overlaps none, it is in only after
+    every present reader is out, and each later reader is in only after it is out and took the turnstile only once the
+    outage run had the main lock."""
+    writer = holds["writer"]
+    assert [name for name in present + later if overlapping(holds[name], writer)] == [], holds
+    assert writer["in"] >= max(holds[name]["out"] for name in present), holds
+    assert all(holds[name]["in"] >= writer["out"] for name in later), holds
+    assert all(lock.taken[name, FEDERATION_INTENT] >= lock.taken["writer", FEDERATION_LOCK] for name in later)
+
+
 def test_o11_a_writer_is_admitted_once_the_readers_at_its_arrival_finish_and_later_readers_wait_for_it(tmp_path):
     """O11: a turnstile in front of the federation's lock: readers present when an outage run arrives finish, the
     outage run gets in, and readers arriving after it wait for it, so a steady stream of readers cannot starve it. No
@@ -311,9 +336,14 @@ def test_o11_a_writer_is_admitted_once_the_readers_at_its_arrival_finish_and_lat
 
     Every party holds until the test lets it go, so the contention is the test's to keep and not a matter of sleeps a
     slow thread could outlast: the present readers hold until `release_present`, the outage run until `release_writer`.
-    The test shows the outage run waiting while the present readers hold (it holds the turnstile and is not in), shows
-    the later readers held at the turnstile while it waits and again while it holds, and checks each hold against the
-    others from the times it recorded."""
+    The deciding checks are tries for the lock that the test thread makes itself (`refused`), which rest on no other
+    thread's progress, and so cannot pass for a thread that is slow, or paused after taking the turnstile and before it
+    asks for the lock: an exclusive request made while the present readers hold must be refused (before the outage run
+    starts, so a lock that grants an exclusive request as a shared one is caught), and a shared request made once the
+    outage run holds the turnstile must be refused while the present readers, who hold shared, still hold (a turnstile
+    that queues nobody, or let go before the main lock, lets it through). A shared request is refused again while the
+    outage run holds. The sleeps of `held_back` are a secondary check of the same, and the times each hold recorded
+    are checked against the others."""
     platform = write_faults(tmp_path)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     present, later = ["first", "second"], [f"later{i}" for i in range(3)]
@@ -340,14 +370,17 @@ def test_o11_a_writer_is_admitted_once_the_readers_at_its_arrival_finish_and_lat
     try:
         threads += [holder(name, False, release_present) for name in present]
         assert all(entered[name].wait(WAIT_S) for name in present)  # both readers are on the federation
+        assert refused(lock, exclusive=True), "an exclusive request was granted with readers on the federation"
         threads.append(holder("writer", True, release_writer))
-        assert lock.at_turnstile["writer"].wait(WAIT_S)  # the outage run has arrived: it holds the turnstile
-        assert held_back(entered, ["writer"]) == [], "the outage run was admitted with readers on the federation"
+        assert lock.at_turnstile["writer"].wait(WAIT_S)  # the outage run holds the turnstile; the readers still hold
+        assert refused(lock, exclusive=False), "a reader arriving after the outage run was let past its turnstile"
+        assert not entered["writer"].is_set(), "the outage run was admitted with readers on the federation"
         threads += [holder(name, False) for name in later]
         assert all(trying[name].wait(WAIT_S) for name in later)
         assert held_back(entered, later) == [], "a reader that arrived after the outage run passed it"
         release_present.set()
         assert entered["writer"].wait(WAIT_S)  # the readers it waited for are gone: it is in
+        assert refused(lock, exclusive=False), "a reader was granted the federation while the outage run holds it"
         assert held_back(entered, later) == [], "a reader that arrived after the outage run got in while it holds"
         release_writer.set()
         for thread, landed in threads:
@@ -359,12 +392,7 @@ def test_o11_a_writer_is_admitted_once_the_readers_at_its_arrival_finish_and_lat
         release_writer.set()
         for thread, _ in threads:
             thread.join(WAIT_S)
-    writer = holds["writer"]
-    assert [name for name in present + later if overlapping(holds[name], writer)] == [], holds
-    assert writer["in"] >= max(holds[name]["out"] for name in present), holds
-    assert all(holds[name]["in"] >= writer["out"] for name in later), holds
-    # the turnstile let a later reader through only once the writer had the main lock
-    assert all(lock.taken[name, FEDERATION_INTENT] >= lock.taken["writer", FEDERATION_LOCK] for name in later)
+    writer_between(holds, lock, present, later)
 
 
 def test_o11_the_first_health_check_recovers_a_crashed_runs_injection_and_admits_runs(tmp_path, fake):
