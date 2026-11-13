@@ -15,6 +15,7 @@ import httpx
 
 from expcore_onedata.testing.fake_federation import FakeFederation
 from expcore_onedata.testing.fake_onedata import Request
+from expcore_onedata.testing.fake_qos import FakeQos
 
 PROVIDER = "/api/v3/oneprovider"
 ZONE_TIME = "/api/v3/onezone/provider/public/get_current_time"  # Onezone's reading of the global clock, public
@@ -171,7 +172,7 @@ def _merge(blocks: list[list[int]]) -> list[list[int]]:
     return merged
 
 
-class FakeData(FakeFederation):
+class FakeData(FakeQos, FakeFederation):
     """Onezone plus the data API of every provider it reports, with files, block maps and transfers.
 
     Models: the calls of `/api/v3/oneprovider`, chosen by the request's host (a provider is the one whose domain is
@@ -204,9 +205,10 @@ class FakeData(FakeFederation):
     summary holds the requirements on the entry and its ancestors; the recursive listing gives each entry's
     `effQosInheritancePath` (`direct`, `ancestor`, both, or `none`), ends on `nextPageToken` null and has no
     `isLast`. A QoS replication creates no transfer document: with `qos_replicates_to` set, a new requirement's files
-    land whole on that provider `qos_land_after_s` seconds of `clock` later, even if the requirement was removed
-    meanwhile. Assumed, not seen live: the summary's and the record's `status` is always `fulfilled`, an expression is
-    not evaluated, and only `qos_replicates_to` decides where a replication lands.
+    land whole on that provider from `qos_land_after_s` seconds of `clock` on, until its removal reaches that provider.
+    How a requirement reaches each provider (dbsync), the status it reports and how its replication ends are
+    `fake_qos.FakeQos`'s, whose docstring says what is modelled and what is not. Assumed, not seen live: an expression
+    is not evaluated, and only `qos_replicates_to` decides where a replication lands.
 
     **Block maps.** Each provider holds ranges of each file (`GET /data/{id}/distribution`, `held`). The provider a file
     is made on holds all of it (`add_file`'s `holder`) or the bytes it wrote. A range read through a provider that lacks
@@ -416,7 +418,9 @@ class FakeData(FakeFederation):
       of the newest-first order while its record keeps its own times (a broken order, for a reader's check);
     - `qos` (requirement id to its record), `ignore_qos_deletes` (a removal answers 204 and the requirement stays),
       `qos_hidden_on` (requirement id to the provider ids that have not seen it: their summaries, listings and reads
-      leave it out), `qos_replicates_to` and `qos_land_after_s` (where and when a new requirement's files land);
+      leave it out), `qos_replicates_to` and `qos_land_after_s` (where and when a new requirement's files land), and
+      `FakeQos`'s: `qos_sync_s` and `qos_sync_by_provider` (an addition's or a removal's dbsync to another provider),
+      `qos_land_every_s`, `qos_missed_cancel`, `qos_status_of`, and what happened, `qos_removed` and `qos_landed`;
     - every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
       negative when behind); `date_override` (provider id to a header value, or None for none) replaces it. A job's
       times are `clock`'s, the platform's global clock, so a provider's skew moves its Date headers alone, as a
@@ -526,7 +530,7 @@ class FakeData(FakeFederation):
         self.qos_hidden_on: dict[str, set[str]] = {}  # requirement id -> provider ids that have not seen it yet
         self.qos_replicates_to: str | None = None  # a new requirement replicates its files into this provider id
         self.qos_land_after_s = 0.0  # seconds of `clock` before that replication's bytes land, with no transfer
-        self._qos_landings: list[tuple[float, str, str]] = []  # (when, file id, provider id) still to land
+        self._init_qos_model()  # dbsync, status and replication of a requirement (`fake_qos.py`)
         self._qos_ids = itertools.count(1)
         self._ids = itertools.count(1)
         self._root_polls = 0
@@ -940,7 +944,7 @@ class FakeData(FakeFederation):
         ):
             return self._answer(self.readonly_answer)
         self._settle_deletes()
-        self._land_qos()
+        self._advance_qos()
         found = re.fullmatch(r"/spaces/([^/]+)", route)
         if found and method == "GET":
             return self._space_root(found.group(1))
@@ -988,18 +992,19 @@ class FakeData(FakeFederation):
         return self._error(404, "notFound")
 
     # -- QoS requirements and the recursive listing -------------------------------
-    def add_qos(self, path: str, *, expression: str = "anyStorage") -> str:
-        """Put a requirement on an entry, as an agent's QoS tool would, and return its id."""
-        return self._new_qos(self.id_of(path), expression)
+    def add_qos(self, path: str, *, expression: str = "anyStorage", through: str | None = None) -> str:
+        """Put a requirement on an entry, as an agent's QoS tool would, and return its id; `through` is the provider
+        id it is added through, which the others see `qos_sync_s` later (None: everywhere at once)."""
+        return self._new_qos(self.id_of(path), expression, through)
 
-    def _new_qos(self, file_id: str, expression: str) -> str:
-        """Record a requirement; with `qos_replicates_to`, its files land there after `qos_land_after_s`, as a QoS
-        replication's do: with no transfer document, and even if the requirement is removed before they land."""
+    def _new_qos(self, file_id: str, expression: str, through: str | None = None) -> str:
+        """Record a requirement; with `qos_replicates_to`, its files land there from `qos_land_after_s` on, as a QoS
+        replication's do: with no transfer document, until its removal reaches that provider (`fake_qos.py`)."""
         qid = f"qos-{next(self._qos_ids):04d}"
         self.qos[qid] = {"qosRequirementId": qid, "fileId": file_id, "expression": expression, "replicasNum": 1}
+        self._qos_added_at(qid, through)
         if self.qos_replicates_to is not None:
-            lands = self.clock() + self.qos_land_after_s
-            self._qos_landings += [(lands, f, self.qos_replicates_to) for f in self._regular_under(file_id)]
+            self._qos_schedule(qid, file_id, self.qos_replicates_to)
         return qid
 
     def _regular_under(self, file_id: str) -> list[str]:
@@ -1011,22 +1016,10 @@ class FakeData(FakeFederation):
             f for child in self.nodes.values() if child.parent == file_id for f in self._regular_under(child.file_id)
         ]
 
-    def _land_qos(self) -> None:
-        """Place every QoS replication whose time has come: the whole file, on its provider."""
-        now, due = self.clock(), []
-        for landing in self._qos_landings:
-            if landing[0] <= now:
-                due.append(landing)
-        for landing in due:
-            self._qos_landings.remove(landing)
-            _, file_id, provider_id = landing
-            node = self.nodes.get(file_id)
-            if node is not None and node.content:
-                held = self.blocks.get((file_id, provider_id), [])
-                self.blocks[(file_id, provider_id)] = _merge([*held, [0, len(node.content)]])
-
     def _visible_qos(self, provider: str) -> dict[str, dict]:
-        return {q: r for q, r in self.qos.items() if provider not in self.qos_hidden_on.get(q, set())}
+        """The requirements a provider has: not hidden from it, reached by their addition and not by their removal."""
+        seen = [q for q in self.qos if provider not in self.qos_hidden_on.get(q, ()) and self._qos_reaches(q, provider)]
+        return {q: self.qos[q] for q in seen}
 
     def _qos_route(self, request: httpx.Request, provider: str, route: str) -> httpx.Response | None:
         """The QoS calls and the recursive listing, or None for another call."""
@@ -1035,18 +1028,19 @@ class FakeData(FakeFederation):
             sent = json.loads(request.content or b"{}")
             if sent.get("fileId") not in self.nodes or not sent.get("expression"):
                 return self._error(400, "badValueNotAllowed")
-            return httpx.Response(201, json={"qosRequirementId": self._new_qos(sent["fileId"], sent["expression"])})
+            qid = self._new_qos(sent["fileId"], sent["expression"], provider)
+            return httpx.Response(201, json={"qosRequirementId": qid})
         found = re.fullmatch(r"/qos_requirements/([^/]+)", route)
         if found and method in ("GET", "DELETE"):
             record = self._visible_qos(provider).get(found.group(1))
             if record is None:
                 return self._answer(self.missing_answer)  # a 404, or 25.0's 400 posix enoent
             if method == "DELETE" and not self.ignore_qos_deletes:
-                del self.qos[found.group(1)]
+                self._qos_remove(found.group(1), provider)
             return (
                 httpx.Response(204)
                 if method == "DELETE"
-                else httpx.Response(200, json={**record, "status": "fulfilled"})
+                else httpx.Response(200, json={**record, "status": self._qos_status(found.group(1))})
             )
         found = re.fullmatch(r"/data/([^/]+)/(qos/summary|files)", route)
         if not found or method != "GET":
@@ -1057,8 +1051,9 @@ class FakeData(FakeFederation):
         if found.group(2) == "files":
             return self._list_recursive(node, request.url.params, provider)
         chain = set(self._ancestry(node.file_id))
-        requirements = {q: "fulfilled" for q, r in self._visible_qos(provider).items() if r["fileId"] in chain}
-        return httpx.Response(200, json={"requirements": requirements, "status": "fulfilled"})
+        requirements = {q: self._qos_status(q) for q, r in self._visible_qos(provider).items() if r["fileId"] in chain}
+        status = next((s for s in ("impossible", "pending") if s in requirements.values()), "fulfilled")
+        return httpx.Response(200, json={"requirements": requirements, "status": status})
 
     def _ancestry(self, file_id: str) -> list[str]:
         """An entry's id and its ancestors' ids, up to its root."""

@@ -161,9 +161,12 @@ class FakeReset(FakeData):
             return False
         return True
 
-    def add_qos(self, path: str, *, space: str | None = None, expression: str = "anyStorage") -> str:  # type: ignore[override]
-        """Put a requirement on an entry of a space, as an agent's QoS tool would, and return its id."""
-        return self._new_qos(self.id_of(path, space), expression)
+    def add_qos(  # type: ignore[override]
+        self, path: str, *, space: str | None = None, expression: str = "anyStorage", through: str | None = None
+    ) -> str:
+        """Put a requirement on an entry of a space, as an agent's QoS tool would, and return its id; `through` is the
+        provider id it is added through (None: everywhere at once)."""
+        return self._new_qos(self.id_of(path, space), expression, through)
 
     # -- answers ---------------------------------------------------------------
     def respond(self, request: httpx.Request) -> httpx.Response:
