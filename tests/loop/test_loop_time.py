@@ -252,9 +252,9 @@ def test_l04_a_tool_call_cut_at_the_ceiling_with_the_agents_time_also_used_up_is
     assert result.outcome.infra_kind is None
 
 
-def expires(clock, seconds, *, wait=False):
+def expires(clock, seconds, *, bound=300.0, wait=False):
     """A tool handler that runs `seconds` on the fake clock, in a wait on infrastructure when `wait`, and then raises
-    the expiry of its own `timeout_s`."""
+    the expiry of the `bound` it was handed: the loop gives a call the agent's time left, 300 s at the first call."""
 
     async def handler(args, ctx):
         if wait:
@@ -262,7 +262,7 @@ def expires(clock, seconds, *, wait=False):
                 clock.advance(seconds)
         else:
             clock.advance(seconds)
-        raise CallTimedOut("hang", seconds)
+        raise CallTimedOut("hang", bound)
 
     return handler
 

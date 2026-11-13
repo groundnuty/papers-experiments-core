@@ -134,6 +134,11 @@ def _ended_at_the_bound_it_was_given(job: asyncio.Future, tick: Tick) -> bool:
     the agent's time or the ceiling was cut by it, whoever noticed first, so the watch judges such an expiry as a cut
     when a reading shows a limit passed. An expiry of a shorter bound (a provider's own, tighter one) is the provider's
     failure, and takes no reading, so a replay, which raises the recorded failure, reads the clock as the run did.
+
+    One case reads the clock in a run and not in its replay: an expiry of a bound as long as the call's whole time that
+    a reading then shows inside both limits. A provider that marks no wait cannot produce it, since its call's wall
+    time is the time charged to the agent, so the expiry lands with the agent's time used up. A provider that does mark
+    waits and also bounds the call by the time it was handed could, and its record would diverge on replay.
     """
     if job.cancelled():
         return False
