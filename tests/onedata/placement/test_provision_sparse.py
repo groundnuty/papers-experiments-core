@@ -88,6 +88,27 @@ def test_o44_a_range_into_a_file_the_provisioner_did_not_make_or_outside_the_sou
     assert bytes(seeded.nodes[stranger].content) == DATA
 
 
+def test_o44_a_change_log_line_a_crash_cut_short_is_no_line_and_the_next_one_starts_clean(
+    provisioner, directory, tmp_path
+):
+    """O44: a crash while a creation's line was written leaves a fragment with no newline: it is read as no line (the
+    creation is then unknown to the log, which a preallocated ingest's journal covers), the next line is written on a
+    line of its own, and a whole line that only lost its newline is kept. Any other unreadable line fails closed."""
+    log = tmp_path / "changes.jsonl"
+    first = provisioner.preallocate(TARGET, FINAL)
+    log.write_text(log.read_text(encoding="utf-8") + '{"action": "create", "id": "torn', encoding="utf-8")
+    assert [line["id"] for line in provisioner.logged()] == [first]
+    second = provisioner.preallocate("study/next.bin", FINAL)
+    assert [line["id"] for line in provisioner.logged()] == [first, second]
+    whole = log.read_text(encoding="utf-8")
+    log.write_text(whole.removesuffix("\n"), encoding="utf-8")  # the last line whole, its newline lost
+    third = provisioner.preallocate("study/third.bin", FINAL)
+    assert [line["id"] for line in provisioner.logged()] == [first, second, third]
+    log.write_text("not a line\n" + log.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(ProvisionError, match="cannot be read"):
+        provisioner.logged()
+
+
 def test_o44_a_prefix_of_a_longer_file_is_read_back_by_its_hash_and_nothing_past_it(provisioner, directory, tmp_path):
     """O44: the prefix of a file of FINAL bytes is read by ranges that stop at its end, each answer checked against
     the file's size, so the gap after it is never read."""

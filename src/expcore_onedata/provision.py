@@ -39,7 +39,8 @@ configured name or lies outside the prefixes. On top of that gate:
   An instrument's own read (`resolve(wait=False)`) is one attempt.
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
-no token and no credential.
+no token and no credential. A last line a crash cut short (no newline after it, and not a whole line) is no line, and
+is dropped before the next line is written; any other line that cannot be read fails closed (ProvisionError).
 """
 
 import dataclasses
@@ -371,14 +372,50 @@ class Provisioner:
         """Append one line to the change log; fail loudly, since an unlogged creation could never be torn down."""
         self._log.parent.mkdir(parents=True, exist_ok=True)
         line = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "action": action, **fields}
-        with self._log_lock, open(self._log, "a", encoding="utf-8") as handle:  # a bulk eviction writes from threads
-            handle.write(json.dumps(line, sort_keys=True) + "\n")
-            handle.flush()
+        with self._log_lock:  # a bulk eviction writes from threads
+            self._cut_torn_tail()
+            with open(self._log, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(line, sort_keys=True) + "\n")
+                handle.flush()
+
+    def _cut_torn_tail(self) -> None:
+        """End a last line a crash left without its newline, so the next line starts on a line of its own: kept when it
+        reads whole, dropped when it was cut short, since it then recorded nothing that can be read. Called under the
+        log's lock."""
+        if not self._log.exists():
+            return
+        with open(self._log, "rb") as handle:  # the last byte alone, as a rule: the log grows with every run
+            end = handle.seek(0, os.SEEK_END)
+            if end == 0 or (handle.seek(end - 1), handle.read(1))[1] == b"\n":
+                return
+            handle.seek(0)
+            data = handle.read()
+        start = data.rfind(b"\n") + 1
+        try:
+            json.loads(data[start:])
+            kept = data + b"\n"
+        except ValueError:  # a JSONDecodeError, or bytes that are no UTF-8
+            kept = data[:start]
+        partial = self._log.with_name(self._log.name + ".part")
+        partial.write_bytes(kept)
+        os.replace(partial, self._log)
 
     def _lines(self) -> list[dict[str, Any]]:
+        """Every line of the change log. A last line a crash cut short is no line (`_cut_torn_tail`); any other line
+        that cannot be read fails closed."""
         if not self._log.exists():
             return []
-        return [json.loads(text) for text in self._log.read_text(encoding="utf-8").splitlines() if text.strip()]
+        text = self._log.read_text(encoding="utf-8")
+        rows = text.splitlines()
+        if rows and not text.endswith("\n"):
+            try:
+                json.loads(rows[-1])
+            except json.JSONDecodeError:
+                rows = rows[:-1]
+        try:
+            return [json.loads(row) for row in rows if row.strip()]
+        except json.JSONDecodeError:
+            raise ProvisionError(f"{self._where}the change log has a line that cannot be read") from None
 
     def logged(self) -> list[dict[str, Any]]:
         """Return the creations the log holds that no later deletion line cancels, oldest first."""
@@ -926,10 +963,7 @@ class Provisioner:
 
     def transfers(self) -> list[tuple[str, str, str]]:
         """Return `(provider, transfer id, kind)` of every transfer the log says this provisioner scheduled."""
-        if not self._log.exists():
-            return []
-        lines = (json.loads(t) for t in self._log.read_text(encoding="utf-8").splitlines() if t.strip())
-        return [(x["provider"], x["id"], x["kind"]) for x in lines if x.get("action") == "transfer"]
+        return [(x["provider"], x["id"], x["kind"]) for x in self._lines() if x.get("action") == "transfer"]
 
     def replicate(self, path: str, to_provider: str) -> dict[str, Any]:
         """Replicate a whole file to a provider and return a record once its block map there covers the file (O01).

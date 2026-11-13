@@ -277,6 +277,34 @@ def test_o44_a_creation_whose_answer_was_lost_is_taken_back_and_the_file_written
     again.stop()
 
 
+def test_o44_a_lost_creation_whose_removal_failed_is_removed_by_the_next_start(make, fake, provisioner):
+    """O44: the answer of the new file's creation was lost and the recovery's delete of the empty file failed too, so
+    the attempt is set aside with the empty file in place; its removal's intent is journalled, so the next start
+    removes it, writes the day back whole and sets the start state."""
+    real = provisioner.mutate
+    lost = []
+
+    def answer_lost(method, path, **options):
+        answer = real(method, path, **options)
+        if method == "POST" and path.endswith("/children") and options["params"]["type"] == "REG" and not lost:
+            lost.append(answer["fileId"])
+            fake.fail_deletes = True  # the recovery's delete of the empty file fails
+            raise PlatformError("providers[0]: POST failed (ReadTimeout)", transport=True)
+        return answer
+
+    provisioner.mutate = answer_lost
+    with pytest.raises(InfraError):
+        make(ROW).start({})
+    assert (fake.id_of(DAY_PATH), len(node(fake).content)) == (lost[0], 0)
+    del provisioner.mutate
+    fake.fail_deletes = False
+    again = make(ROW)
+    again.start({})
+    assert again.finish()["start"]["restore"]["day-13"]["action"] == "created"
+    assert lost[0] not in {fake.id_of(DAY_PATH)}
+    assert bytes(node(fake).content) == DAY
+
+
 def test_o44_a_part_out_of_order_is_refused_before_anything_is_written(provisioner, config, fake, tmp_path):
     """O44: a part that does not start where the written ranges end is out of order: refused, nothing sent."""
     plan = load_ingest_plan(write_plan(tmp_path, [ROW]), config)

@@ -49,13 +49,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import PlatformError
+from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.ingestbase import FAILURES, Baseline, plain
 from expcore_onedata.ingestplan import PlannedFile, Step
 from expcore_onedata.placement import Range, merged, provider_blocks, uncovered
 from expcore_onedata.provision import Entry, NotPlaced, ProvisionError
 from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
 from expcore_onedata.streamed import Digest
+
+PREALLOCATE = "preallocate"  # the start's journalled intent to make a removed file again
+REMOVE_LOST = "remove_lost"  # the restore's journalled intent to remove the empty file a lost creation left
 
 
 @dataclass(frozen=True)
@@ -173,7 +176,7 @@ class SparseBaseline(Baseline):
         """Make the file again at its final size, its id recorded as soon as it exists, a failed extension's too. The
         intent is journalled first, so a creation whose answer was lost, or whose change-log line a crash cut, is
         known as the ingest's at the next restore (`_lost_creation`)."""
-        self.journal(entry="intent", label=planned.label, action="preallocate", file_id=old, phase="start")
+        self.journal(entry="intent", label=planned.label, action=PREALLOCATE, file_id=old, phase="start")
         made_before = self._made_at(planned.path)
         try:
             file_id = self._p.preallocate(planned.path, planned.size)
@@ -233,7 +236,10 @@ class SparseBaseline(Baseline):
         """Bring one file back to its complete baseline without removing it, verified; return what was done and its id.
         A name a crashed start removed is written back once every provider answers the old id absent."""
         before = self.entry(planned.path)
+        pending = self._pending(planned.label)
         if before is None:
+            if pending is not None and pending.get("action") == REMOVE_LOST:  # its delete may still be landing
+                self.await_absent(planned.label, pending["file_id"])
             if planned.label in self.last_id:
                 self.await_absent(planned.label, self.last_id[planned.label])
             return self._write_back(planned, phase, None)
@@ -243,8 +249,8 @@ class SparseBaseline(Baseline):
                 "nothing was written"
             )
         if not self._made_by_ingest(before):
-            if before.size == 0 and self._lost_creation(planned.label):
-                self.remove(planned, before, phase)  # empty, so nothing is lost; then written back whole
+            if before.size == 0 and pending is not None and pending.get("action") in (PREALLOCATE, REMOVE_LOST):
+                self._remove_lost(planned, before, phase)  # empty, so nothing is lost; then written back whole
                 return self._write_back(planned, phase, None)
             return self._keep(planned, phase, before)
         self.check_source(planned)
@@ -253,12 +259,14 @@ class SparseBaseline(Baseline):
         self.confirm(before.file_id, planned.size)
         return {"action": action, "file_id": before.file_id}
 
-    def _lost_creation(self, label: str) -> bool:
-        """The journal's last word on the file is the start's intent to make it again, with no id after it: a creation
-        whose answer was lost or whose change-log line was never written. An empty file at its path is then the
-        ingest's own, made after its baseline was removed."""
+    def _pending(self, label: str) -> dict[str, Any] | None:
+        """The journal's last intent or id line for the file when it is an intent, with no id after it: a step a crash
+        or a lost answer may have left half done. The start's intent to make the file again (`preallocate`) means an
+        empty file at its path is the ingest's own, a creation whose answer was lost or whose change-log line was never
+        written, made after its baseline was removed; so does the intent to remove such a file (`remove_lost`), whose
+        delete may not have been sent."""
         if not self._journal.exists():
-            return False
+            return None
         last = None
         for text in self._journal.read_text(encoding="utf-8").splitlines():
             try:
@@ -267,7 +275,20 @@ class SparseBaseline(Baseline):
                 continue  # a torn line, which a crash can leave; `read_journal` refuses any other
             if isinstance(line, dict) and line.get("space") == self._p.space.position and line.get("label") == label:
                 last = line if line.get("entry") in ("intent", "id") else last
-        return last is not None and last.get("entry") == "intent" and last.get("action") == "preallocate"
+        return last if last is not None and last.get("entry") == "intent" else None
+
+    def _remove_lost(self, planned: PlannedFile, before: Entry, phase: str) -> None:
+        """Delete an empty file a lost creation left, journalled first so that a failed delete is tried again by the
+        next restore, and wait until every provider answers it absent before the name is written again."""
+        label = planned.label
+        self.journal(entry="intent", label=label, action=REMOVE_LOST, file_id=before.file_id, phase=phase)
+        try:
+            self._p.mutate("DELETE", f"/data/{plain(before.file_id)}", provider=self.holder)
+        except PlatformError as error:
+            if not answered_absent(error):
+                raise
+        self.await_absent(label, before.file_id)
+        self.record_id(label, "removed", phase, before.file_id, None, action="lost_creation")
 
     def _keep(self, planned: PlannedFile, phase: str, before: Entry) -> dict[str, Any]:
         """A file the ingest did not make is the dataset's own: kept when its bytes are its staged source's, refused

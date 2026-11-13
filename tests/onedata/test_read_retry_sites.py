@@ -206,7 +206,7 @@ HELPER_USERS = {
         "provisioner.replicate",
     },
     "ingest.py": {"provisioner.verify_space"},
-    "ingestsparse.py": {"provisioner.resolve", "provisioner.read_file"},
+    "ingestsparse.py": {"provisioner.resolve", "provisioner.read_file", "provisioner.mutate"},
     "ingestbase.py": {
         "provisioner.resolve",
         "provisioner.mutate",
