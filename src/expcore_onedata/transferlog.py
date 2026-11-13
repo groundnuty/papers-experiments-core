@@ -12,6 +12,17 @@ Every request goes through the probes' own probe (`probes.run_probe`): a real an
 is retried, a bounded number of times.
 `transferrecord.py` reads the answers and says which of their fields are confirmed.
 
+**The run's window, not the space's history (O32).** Ended jobs are never removed, so the space's history grows with
+every run and reset. The waiting and ongoing listings are read to their end, since they are few and any job in them
+can bear on the run. The ended listing, newest first by finish time, is read down to the first job whose record says
+it ended (a final state) before the cutoff, `ended_since`: the window's start less `[placement]
+clock_skew_allowance_s` and `transferorder.STOP_MARGIN_S`, on this host's clock and fixed for the whole reading, so
+every observation reads alike. Such a job can be neither in the window, nor carried over into it, nor near its edge;
+one that finished before the cutoff but whose record does not say it ended is read, and may be carried over. The
+order is checked as the listing is read, and a listing out of that order is unknown (`transferorder.py`). The window
+on the providers' clocks must not open before the cutoff: a provider's clock more than the margin behind this host's
+leaves the listing unknown, naming the clock.
+
 **One provider's observation at a time.** A job's state and counters are always taken from one provider's listing and
 record together, never one provider's state with another's counters. A provider lists a job only after a lag (a
 source waits up to 60 s for a fresh one to show, the second `merged:` line), and a job posted on one provider reaches
@@ -31,11 +42,13 @@ setting is what bounds that.
 
 **Fail closed.** A page or record that cannot be read, or one not in the documented shape (`transferrecord.py`), makes
 the whole listing `probe_ok` false with the reason and no records, never fewer or no transfers. A listing longer than
-its bound (`MAX_LISTED` distinct ids, or a token that keeps coming back) is unknown in the same way, not truncated.
+its bound (`MAX_LISTED` distinct ids read: the waiting, the ongoing and the ended ones down to the cutoff, never the
+older history; or a token that keeps coming back) is unknown in the same way, not truncated.
 `transferwindow.py` places the jobs in the run's window, moved onto the providers' clocks by the offsets the listing
 answers' Date headers give (recorded under `clock`), and splits a provider's gained bytes.
 """
 
+import math
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -43,11 +56,13 @@ from typing import Any, Protocol
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.readretry import ONE_ATTEMPT
-from expcore_onedata.transferrecord import STATES, UNDECLARED, Job, Unreadable, job_of, page_of, record_of
+from expcore_onedata.transferorder import STOP_MARGIN_S, newest_first
+from expcore_onedata.transferrecord import STATES, UNDECLARED, Job, Unreadable, job_of, page_of, record_of, state_of
 from expcore_onedata.transferwindow import (
     CARRIED_OVER,
     CLOCK_UNKNOWN,
     DISAGREE,
+    FINAL_STATES,
     HARNESS_UNLISTED,
     LISTING_DROPPED,
     NEAR_EDGE,
@@ -58,7 +73,8 @@ from expcore_onedata.transferwindow import (
 )
 
 PAGE_LIMIT = 1000  # ids asked for per page; the listing takes 1 to 1000
-MAX_LISTED = 2000  # distinct ids read before the listing is unknown: each one costs a read of its record
+MAX_LISTED = 2000  # distinct ids of the window read before the listing is unknown: each one costs a read of its record
+ACTIVE = ("waiting", "ongoing")  # the listings read to their end; the ended one is read down to the window
 
 
 class Probed(Protocol):
@@ -121,6 +137,7 @@ class TransferLog:
         self._pages = 0
         self._offsets: dict[str, list[float | None]] = {}  # provider -> each listing answer's clock offset, or None
         self._seen: set[str] = set()  # every job id any observation of the current reading showed
+        self._cutoff = 0.0  # the earliest finish time the ended listing is read down to, this host's clock
 
     def _dated_page(self, path: str, provider: str, params: Mapping[str, Any]) -> Any:
         """Read one page of a provider's listing and keep the provider's clock offset its Date header gives."""
@@ -128,49 +145,71 @@ class TransferLog:
         self._offsets.setdefault(provider, []).append(offset_of(date, self._now()))
         return answer
 
-    def _listed_on(self, provider: str) -> dict[str, str]:
-        """List one provider's transfers in every state, page by page; return each id with the furthest state that
-        provider listed it in. Raise Unreadable when that fails."""
-        listed: dict[str, str] = {}
+    def _page(self, provider: str, state: str, token: str | None) -> tuple[list[str], str | None]:
+        """Read one page of a provider's listing in one state through the probe; raise Unreadable when it fails."""
         path = f"/spaces/{self._provisioner.space_id}/transfers"
+        params = {"state": state, "limit": self._page_limit, **({"page_token": token} if token else {})}
+        found = self._probe(lambda: self._dated_page(path, provider, params))
+        self._pages += 1
+        if not found.ok:
+            where = self._client.provider_label(provider)
+            raise Unreadable(f"{where}: a page of the {state} listing could not be read: {found.error}")
+        return page_of(found.value)
+
+    def _record(self, provider: str, tid: str) -> Any:
+        """Read one job's record on a provider through the probe; raise Unreadable when it fails."""
+        found = self._probe(lambda: self._client.get(f"/transfers/{tid}", provider=provider, retry=ONE_ATTEMPT))
+        if not found.ok:
+            raise Unreadable(f"a transfer's record could not be read: {found.error}")
+        return found.value
+
+    def _listed_on(self, provider: str) -> tuple[dict[str, str], dict[str, Any]]:
+        """List one provider's transfers: the waiting and ongoing listings to their end, and the ended one newest first
+        down to the cutoff (`transferorder.newest_first`), each ended job's record read in its turn. Return each id with
+        the furthest state that provider listed it in, and the records the ended walk read. Raise Unreadable when that
+        fails, when the order does not hold, or past the bound, which counts these jobs alone."""
+        listed: dict[str, str] = {}
         max_pages = self._max_listed // self._page_limit + 1
         where = self._client.provider_label(provider)
-        for state in STATES:
+        for state in ACTIVE:
             token: str | None = None
             for _ in range(max_pages):
-                params = {"state": state, "limit": self._page_limit, **({"page_token": token} if token else {})}
-                found = self._probe(lambda q=params: self._dated_page(path, provider, q))
-                self._pages += 1
-                if not found.ok:
-                    raise Unreadable(f"{where}: a page of the {state} listing could not be read: {found.error}")
-                ids, token = page_of(found.value)
-                for tid in ids:
-                    listed[tid] = max(listed.get(tid, state), state, key=STATES.index)
+                ids, token = self._page(provider, state, token)
+                listed.update((tid, max(listed.get(tid, state), state, key=STATES.index)) for tid in ids)
                 if len(listed) > self._max_listed:
-                    raise Unreadable(
-                        f"the space lists more than {self._max_listed} transfers: the listing is unknown, not cut"
-                    )
+                    raise Unreadable(f"{where}: more than {self._max_listed} transfers are waiting or ongoing")
                 if token is None:
                     break
             else:
                 raise Unreadable(f"{where}: the {state} listing did not end within {max_pages} pages")
-        return listed
+        walk = newest_first(
+            lambda token: self._page(provider, "ended", token),
+            lambda ids: [self._record(provider, tid) for tid in ids],
+            _finished,
+            cutoff=self._cutoff,
+            bound=self._max_listed,
+            max_pages=max_pages,
+            ended=lambda body: state_of(body) in FINAL_STATES,  # one whose record has not ended may run into the window
+            where=f"{where}: ",
+        )
+        listed.update(dict.fromkeys(walk.kept, "ended"))
+        if len(listed) > self._max_listed:
+            raise Unreadable(f"{where}: more than {self._max_listed} transfers in the window: unknown, not cut")
+        return listed, walk.kept
 
     def _observe(self) -> Observation:
-        """List every tracked provider and read each id it listed on that same provider; raise Unreadable on failure."""
+        """List every tracked provider and read each id it listed on that same provider (an ended one's record is the
+        one its walk read); raise Unreadable on failure."""
         observation: Observation = {}
         for provider in self._providers:
+            listed, ended = self._listed_on(provider)
             jobs: dict[str, Job] = {}
-            for tid, state in self._listed_on(provider).items():
-                found = self._probe(
-                    lambda t=tid, p=provider: self._client.get(f"/transfers/{t}", provider=p, retry=ONE_ATTEMPT)
-                )
-                if not found.ok:
-                    raise Unreadable(f"a transfer's record could not be read: {found.error}")
-                jobs[tid] = job_of(tid, state, found.value)
+            for tid, state in listed.items():
+                body = ended[tid] if tid in ended else self._record(provider, tid)
+                jobs[tid] = job_of(tid, state, body)
             observation[provider] = jobs
         if len(set().union(*observation.values())) > self._max_listed:
-            raise Unreadable(f"the space lists more than {self._max_listed} transfers: the listing is unknown, not cut")
+            raise Unreadable(f"more than {self._max_listed} transfers in the window: the listing is unknown, not cut")
         return observation
 
     def _label(self, provider_id: str | None) -> str | None:
@@ -220,6 +259,7 @@ class TransferLog:
             "settle_s": self._provisioner.settings.transfer_settle_s,
             "settled": None,
             "polls": None,
+            "ended_since": None,
             "listed": None,
             "records": None,
             "carried_over": None,
@@ -227,12 +267,23 @@ class TransferLog:
         if window is None:
             return Reading({**section, "error": "the run's start was not read, so the run has no window"}, None)
         self._offsets = {}
+        # One cutoff for the whole reading, so that observations compare alike: the window's start on this host's
+        # clock, less the allowance and the margin (`transferorder.STOP_MARGIN_S`).
+        allowance = self._provisioner.settings.clock_skew_allowance_s
+        self._cutoff = section["ended_since"] = window.start - allowance - STOP_MARGIN_S
         try:
             observation, changed, polls = self._settled()
         except Unreadable as error:
             return Reading({**section, "pages": self._pages, "error": str(error)}, None)
         flagged = [(t, NOT_SETTLED) for t in dict.fromkeys(j.target_id for j in changed) if t]
         edges, clock = self._edges(window)
+        if edges.first < self._cutoff:
+            # The window opens before the cutoff on some provider's clock: a job of the run could lie past the stop.
+            error = (
+                f"a provider's clock runs more than {STOP_MARGIN_S:.0f} s behind this host's, beyond the margin the "
+                "ended listing is read back by, so the window may hold jobs past where the reading stopped"
+            )
+            return Reading({**section, "pages": self._pages, "clock": clock, "error": error}, None)
         section.update(settled=not changed, polls=polls, clock=clock)
         reading = self._classified(edges, observation, file_ids, harness, section, flagged)
         # A listing that never settled may still be missing a transfer that has not appeared in any reading, and such a
@@ -326,6 +377,15 @@ def _placement(edges: Edges, job: Job) -> str:
     if edges.holds(job.scheduled):
         return "inside"
     return "carried" if edges.carried_over(job) else "outside"
+
+
+def _finished(body: Any) -> float | None:
+    """An ended job's finish time from its record, or None when it gives none: such a job neither stops the walk nor
+    takes part in its order check, and is placed against the window as any other is."""
+    value = body.get("finishTime") if isinstance(body, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
 
 
 def _ids(observation: Observation, providers: Sequence[str]) -> set[str]:

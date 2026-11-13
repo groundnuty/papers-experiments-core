@@ -79,6 +79,11 @@ def _state(body: Mapping[str, Any]) -> str | None:
     return next(iter(states)) if len(states) == 1 else CONFLICTING
 
 
+def state_of(body: Any) -> str | None:
+    """A record's state as `job_of` reads it; None for a record that is not an object or carries no state."""
+    return _state(body) if isinstance(body, dict) else None
+
+
 def page_of(answer: Any) -> tuple[list[str], str | None]:
     """Read one page of the listing: its ids, and the token of the next page or None on the last.
 

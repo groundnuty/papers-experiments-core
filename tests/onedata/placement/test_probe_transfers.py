@@ -83,8 +83,9 @@ def test_o08_a_job_still_waiting_at_run_end_is_recorded_by_when_it_was_scheduled
 
 
 def test_o08_transfers_that_started_before_the_run_window_are_not_recorded(probes, provisioner, seeded, ticker):
-    """O08: the provisioner's replication before the run, and an older job, are listed but not in the run's record;
-    the harness's own job inside the window is, marked as the harness's."""
+    """O08: the provisioner's replication before the run, and an older job, are not in the run's record; the harness's
+    own job inside the window is, marked as the harness's. Since O32 the ended listing is read newest first down to
+    the window, so the two older jobs, which ended before it, are not read at all: one job is listed, not three."""
     old = seeded.add_transfer("eviction", PATH, BETA_ID, scheduled=ticker.now - 500, finished=ticker.now - 400)
     provisioner.replicate(PATH, "beta")
     before = next(t for t in seeded.transfers if t != old)
@@ -97,7 +98,7 @@ def test_o08_transfers_that_started_before_the_run_window_are_not_recorded(probe
     assert set(records) == {inside}
     assert records[inside]["scheduled_by_harness"] is True
     assert records[inside]["type"] == "eviction"
-    assert snapshot["space_transfers"]["listed"] == 3
+    assert snapshot["space_transfers"]["listed"] == 1
 
 
 def test_o08_an_unreadable_listing_is_probe_ok_false_never_zero_transfers(probes, seeded, ticker):

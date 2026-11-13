@@ -39,7 +39,7 @@ PLUMBING = {
     ("ingestbase.py", "Baseline._times", "client.get"): ["self._p.retry"],
     ("ingestbase.py", "Baseline.confirm", "consistency.wait_visible"): ["self._p.retry"],
     ("reset.py", "SpaceReset._summary", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._listed", "client.get"): ["self._p.retry"],
+    ("reset.py", "SpaceReset._page", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._requirements", "consistency.space_root"): ["self._p.retry"],
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
@@ -87,7 +87,7 @@ ONE_ATTEMPT_SITES = {
     # the placement probes: the transfer records they record, the transfer log, the block map
     ("probes.py", "PlatformProbes._transfer_records", "client.get"): ["ONE_ATTEMPT"],
     ("probes.py", "PlatformProbes._read_maps", "provisioner.blocks"): ["<default>"],
-    ("transferlog.py", "TransferLog._observe", "client.get"): ["ONE_ATTEMPT"],
+    ("transferlog.py", "TransferLog._record", "client.get"): ["ONE_ATTEMPT"],
     ("transferlog.py", "TransferLog._dated_page", "client.get_dated"): ["<one attempt>"],
     # day-0's checks, which record what each provider does
     ("day0/checks.py", "reachability", "client.get"): ["ONE_ATTEMPT", "ONE_ATTEMPT"],

@@ -223,26 +223,81 @@ def test_o11_a_cancel_the_provider_ignores_fails_the_reset_at_its_transfer_stage
 def test_o08_the_ended_history_is_recorded_with_its_count_and_newest_finish_and_never_removed(
     provisioner, stocked, ticker
 ):
-    """O08: ended transfers cannot be removed, so the record says what the listing shows the next agent, per provider
-    and together: two earlier jobs and the reset's own eviction, the newest finish among them."""
+    """O08: ended transfers cannot be removed, so the record says what the listing shows the next agent since the
+    window's start, per provider and together: here, from the clock's zero, two earlier jobs and the reset's own
+    eviction, the newest finish among them, and no older job."""
     stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=100.0, finished=150.0)
     stocked.add_transfer("replication", FILES[1], BETA_ID, scheduled=200.0, finished=260.0)
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, since=0.0)
     history = record["stages"]["history"]
     assert history["removable"] is False
     assert history["ended"] == 3  # the two, and the reset's one eviction of the directory
     assert history["newest_finish"] >= 260.0
+    assert (history["since"], history["earlier"]) == (0.0, False)
     assert set(history["providers"]) == {"providers[0]", "providers[1]"}
     assert not [c for c in stocked.provider_calls if c[1] == "DELETE" and c[2].startswith("/transfers/")]
 
 
-def test_o08_an_ended_record_without_a_finish_time_fails_the_reset_rather_than_guess_one(provisioner, stocked):
+def test_o08_an_ended_record_without_a_finish_time_fails_the_reset_rather_than_guess_one(provisioner, stocked, ticker):
     """O08: a history that cannot be read is unknown, never zero or partial: the reset fails at its history stage."""
     stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=100.0)
     stocked.transfer_omit = {"finishTime"}
     with pytest.raises(ResetFailed, match="history stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, since=0.0)
     assert caught.value.record["stages"]["history"]["ok"] is False
+
+
+# -- the history read within its window (O32) --------------------------------------------------------------------------
+
+
+def test_o32_the_history_reads_its_window_alone_past_a_bound_the_whole_history_exceeds(provisioner, stocked, ticker):
+    """O32: 120 ended jobs of earlier runs and a bound of 50 ids: the history stage reads the ended listing newest
+    first from the reset's own start and stops at the first older job, so the reset passes. Three old jobs still
+    running are all cancelled, since the waiting and ongoing listings are read whole. The history records the
+    window's jobs (those three and the reset's eviction), the newest finish, and that older ones exist."""
+    for i in range(120):
+        stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=100 + i, finished=100 + i)
+    for i in range(3):
+        stocked.add_transfer("replication", FILES[1], BETA_ID, scheduled=300 + i, ended=False)
+    ticker.sleep(10)
+    began = ticker.now
+    record = SpaceReset(provisioner, listed_max=50, now=ticker.clock).run({"beta": ["study"]})
+    assert record["stages"]["transfers"]["cancelled"] == 3
+    history = record["stages"]["history"]
+    assert (history["ended"], history["since"], history["earlier"]) == (4, began, True)
+    assert history["newest_finish"] >= began
+    assert all(row["earlier"] for row in history["providers"].values())
+
+
+def test_o32_the_history_counts_from_the_runs_start_when_the_caller_gives_it(provisioner, stocked, ticker):
+    """O32: given the run's start, the history counts the run's ended jobs and the reset's, not those before it."""
+    stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=100.0, finished=150.0)
+    start = ticker.now
+    ticker.sleep(30)
+    stocked.add_transfer("replication", FILES[1], BETA_ID, scheduled=ticker.now, finished=ticker.now)
+    ticker.sleep(30)
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, since=start)
+    history = record["stages"]["history"]
+    assert (history["ended"], history["since"], history["earlier"]) == (2, start, True)
+
+
+def test_o32_a_history_out_of_newest_first_order_fails_the_reset(provisioner, stocked, ticker):
+    """O32: an old job listed ahead of the reset's own eviction would end the walk at once; the page that holds the
+    stop is read to its end, finds a later finish after it, and the reset fails at its history stage, naming the
+    order it assumed."""
+    old = stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=100.0, finished=100.0)
+    stocked.listing_time[old] = 10**6
+    with pytest.raises(ResetFailed, match="history stage") as caught:
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
+    assert "newest first" in caught.value.record["stages"]["history"]["error"]
+
+
+@pytest.mark.parametrize("since", [float("nan"), True, "0"])
+def test_o32_a_history_start_that_is_not_a_time_is_refused_before_any_stage(provisioner, stocked, ticker, since):
+    """O32: the history's start is a finite number of seconds; anything else is refused before the reset reads."""
+    with pytest.raises(ValueError, match="since"):
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, since=since)
+    assert stocked.provider_calls == []
 
 
 def test_o09_a_reset_that_would_evict_the_data_providers_copy_is_refused_before_any_stage(provisioner, stocked):
