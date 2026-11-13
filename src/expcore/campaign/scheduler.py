@@ -260,6 +260,7 @@ class Scheduler:
                 crash_hook=self.crash_hook,
                 ledger=self.ledger,
                 reserved_capped=self._admitted_capped,
+                reply_cap_unheld=self._reply_cap_unheld,
             )
         )
 
@@ -456,6 +457,14 @@ class Scheduler:
         without a budget (C27). The attempt's row records it as it is; its spend guard takes None as yes."""
         with self._cv:
             return self._reserved_capped.get(run_key)
+
+    def _reply_cap_unheld(self, model: str) -> bool | None:
+        """Tell whether the store has taken the model off the reply maximum; None without a budget, which has none to
+        hold (C27). It reads the store as it is now, so an attempt's record gets the mark as the loop ended."""
+        if self.budget is None:
+            return None
+        assert self.store
+        return reply_cap.is_unheld(reply_cap.unheld(self.store), model)
 
     def _all_hold(self, stopped_all: bool) -> Hold | None:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
