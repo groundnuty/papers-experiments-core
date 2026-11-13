@@ -41,12 +41,14 @@ eviction and the occupancy they are read again, and once more after `quiet_wait_
 provider holding more of an affected file than before the wait fails the reset, and so does a provider other than the
 data provider holding more of the space than at the occupancy stage. That check does not wait for a requirement to be
 found: an agent can add one and remove it before the run ends, leaving the reset none to see while its replication is
-still landing, so it runs for every run that declares QoS rights, and by default, and covers the files a local
-provider held when the run ended as well (`resetheld.py`). The block maps decide: a file's distribution
-shows its provider's in-memory location at once. A replication that lands between the eviction's verification and
-the first of these readings is already in that reading, so the maps show no growth; the occupancy read after the wait,
-set against the occupancy stage's, is what catches it. The occupancy is otherwise a second sign, and a zero there is
-never taken alone as nothing having landed, because a directory's physical size lags a placement:
+still landing, so it runs unless the caller knows that no run since the last verified reset had the right to manage
+QoS, and covers the files the eviction plan evicts as well (`resetheld.py`), never a read of the whole space. The block
+maps decide: a file's distribution shows its provider's in-memory location at once. A replication that lands between
+the eviction's verification and the first of these readings is already in that reading, so the maps show no growth,
+and so is one on a file the plan does not cover, whose map is never read; the occupancy read after the wait, set
+against the occupancy stage's, is what catches them, and it is read whenever the check runs. The occupancy is otherwise
+a second sign, and a zero there is never taken alone as nothing having landed, because a directory's physical size
+lags a placement:
 
 - a placement's size change is held until the file location's flush, `blocks_flush_delay` after its first change
   (10 s, `rel/files/app.config:511`; `fslogic_cache.erl:524-530,706-715`), and only then reported to the parent
@@ -57,8 +59,10 @@ never taken alone as nothing having landed, because a directory's physical size 
   file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`). An eviction flushes at once
   (`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level above the parent.
 
-The quiet wait is twice that lag for the deepest affected file (`quiet_wait_s`), so the occupancy read after it has
-had time to show a placement that landed when the wait began. Another study measured 9.5 s for a directory after a
+The quiet wait is twice that lag for the deepest file it must cover (`quiet_wait_s`): the deepest regular file of the
+space, as the scan saw it, since a replication nothing names could reach any file, or the deepest affected file when the
+caller knows the run could set no requirement. So the occupancy read after it has had time to show a placement that
+landed when the wait began. Another study measured 9.5 s for a directory after a
 placement and 0.05 s after an eviction, which this fits. A space with directory statistics off answers no physical
 size at all, and the occupancy stage already fails on it.
 """
@@ -87,7 +91,7 @@ SETTLE_BOUND_S = 60.0  # the longest they are read before the reset fails
 # src/modules/fslogic/dir_stats_collector.erl:168 (the module docstring traces the path).
 BLOCKS_FLUSH_DELAY_S = 10.0
 DIR_STATS_FLUSH_S = 5.0
-QUIET_WAIT_FACTOR = 2.0  # the quiet wait is this many times the occupancy's longest lag for the deepest affected file
+QUIET_WAIT_FACTOR = 2.0  # the quiet wait is this many times the occupancy's longest lag for the deepest file covered
 
 
 def occupancy_lag_s(depth: int) -> float:
@@ -103,11 +107,13 @@ def quiet_wait_s(depth: int) -> float:
 @dataclass(frozen=True)
 class Found:
     """What a scan found: each requirement with the provider that showed it first, the regular files each applies to,
-    each by its id with its depth (the parts of its path below the root), and how many reads of each kind it made."""
+    each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, and the
+    depth of the deepest regular file of the space it saw (0 when it saw none), which costs no read of its own."""
 
     where: dict[str, str]
     files: dict[str, dict[str, int]]
     reads: dict[str, int] = field(default_factory=dict)
+    deepest: int = 0
 
 
 def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:
@@ -150,9 +156,10 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
     """Every requirement any provider's summaries show: on each provider, the root's and every leaf's."""
     where: dict[str, str] = {}
     files: dict[str, dict[str, int]] = {}
-    read = 0
+    read, deepest = 0, 0
     for provider in providers:
         root, leaves = tree(p, provider)
+        deepest = max([deepest, *(depth for _, kind, depth in leaves if kind != "DIR")])
         entries = [root, *(file_id for file_id, _, _ in leaves)]
         summaries = consistency.bounded_map(lambda f, q=provider: _summary(p, f, q), entries, p.settings.concurrency)
         for qid in sorted(set().union(*summaries)):
@@ -161,7 +168,7 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
             for qid in held if kind != "DIR" else ():
                 files.setdefault(qid, {})[file_id] = depth
         read += len(entries)
-    return Found(where, {q: files.get(q, {}) for q in where}, {"summaries": read})
+    return Found(where, {q: files.get(q, {}) for q in where}, {"summaries": read}, deepest)
 
 
 @dataclass(frozen=True)
@@ -256,7 +263,8 @@ def by_listing(p: Provisioner, provider: str) -> Found:
         under = (e for e in entries.values() if not e.directory and _under(e.path, top.path))
         files[qid] = {e.file_id: len(e.path.split("/")) for e in under}
     reads = {"listing_pages": pages, "summaries": len(hits), "records": len(qids)}
-    return Found(dict.fromkeys(qids, provider), files, reads)
+    deepest = max((len(e.path.split("/")) for e in entries.values() if not e.directory), default=0)
+    return Found(dict.fromkeys(qids, provider), files, reads, deepest)
 
 
 def scan(p: Provisioner, providers: Sequence[str]) -> Found:
@@ -279,10 +287,13 @@ def _gone(p: Provisioner, key: tuple[str, str]) -> bool:
     return False
 
 
-def remove(p: Provisioner, providers: Sequence[str], baseline: Iterable[str]) -> tuple[dict[str, Any], dict[str, int]]:
+def remove(
+    p: Provisioner, providers: Sequence[str], baseline: Iterable[str]
+) -> tuple[dict[str, Any], dict[str, int], int]:
     """Find every requirement, remove each one not in `baseline` through the gate, and show them gone everywhere: each
     answers that it is not there on every provider, and a second scan finds none but the baseline's. Return the
-    stage's facts and the affected files, those the removed requirements applied to, each with its depth."""
+    stage's facts, the affected files, those the removed requirements applied to, each with its depth, and the depth of
+    the deepest regular file of the space, from the first scan."""
     kept = frozenset(baseline)
     found = scan(p, providers)
     added = {qid: where for qid, where in found.where.items() if qid not in kept}
@@ -313,7 +324,7 @@ def remove(p: Provisioner, providers: Sequence[str], baseline: Iterable[str]) ->
             raise ProvisionError(f"the scan after the removals still finds {len(left)} QoS requirement(s) not kept")
         reads = {k: reads.get(k, 0) + again.reads.get(k, 0) for k in reads.keys() | again.reads.keys()}
     facts.update(removed=len(added), affected_files=len(affected), reads=reads)
-    return facts, affected
+    return facts, affected, found.deepest
 
 
 Maps = dict[tuple[str, str], tuple[Range, ...]]  # (file id, provider) -> the merged blocks that provider holds
@@ -362,7 +373,7 @@ def _held(maps: Maps, key: tuple[str, str]) -> int:
 
 def quiet(
     p: Provisioner,
-    files: Mapping[str, int],
+    files: Iterable[str],
     providers: Sequence[str],
     occupancy: Callable[[], Mapping[str, int]],
     before: Mapping[str, int],
@@ -371,8 +382,10 @@ def quiet(
 ) -> dict[str, Any]:
     """Read the block maps of `files`, wait `quiet_wait_s(depth)`, and read the maps and the occupancy again; raise
     ProvisionError when a provider holds more of a file than before the wait, or a provider other than the data
-    provider holds more of the space than at the occupancy stage (`before`). It runs whatever `files` holds: with none
-    the occupancy alone is read again, since a replication that has placed nothing yet shows in no block map."""
+    provider holds more of the space than at the occupancy stage (`before`). The occupancy is read again after the wait
+    whatever `files` holds, none included: a replication that has placed nothing yet, or one on a file that is not in
+    `files`, shows in no block map read here, and only the occupancy catches it."""
+    files = list(dict.fromkeys(files))
     wait = quiet_wait_s(depth)
     first = read_maps(p, files, providers)
     p.sleep(wait)
@@ -382,7 +395,7 @@ def quiet(
     if more:
         where = ", ".join(sorted({p.client.provider_label(provider) for _, provider in more}))
         raise ProvisionError(
-            f"{len(more)} block map(s) of files held when the run ended or a removed QoS requirement applied to grew "
+            f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to grew "
             f"after the eviction, on {where}"
         )
     over = [q for q, size in sizes.items() if q != p.settings.holder and size > before.get(q, 0)]

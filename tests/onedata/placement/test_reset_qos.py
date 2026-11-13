@@ -1,79 +1,34 @@
 """The reset's QoS stages: the run's own requirements found (by a summary per leaf, or by one recursive listing) and
-removed while the baseline's are kept, then the files they touched settled and, after the eviction, kept quiet (O33).
+removed while the baseline's are kept, then the files they touched settled (O33). The quiet stage that follows the
+eviction is in `test_reset_quiet.py`.
 """
 
-import dataclasses
 import math
 
 import pytest
-from fake_reset import FakeReset
+from qos_world import FILES, federation, provisioner_with, two_providers
 
 from expcore_onedata import resetqos
-from expcore_onedata.provision import Provisioner, resolve_provider_ids
+from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import load_placement
-from expcore_onedata.reset import STAGES, ResetFailed, SpaceReset
-from expcore_onedata.testing import (
-    ADMIN_ENV,
-    BASELINE,
-    BETA_ID,
-    DATA,
-    SPACE_NAME,
-    USERS,
-    with_placement,
-    write_platform,
-)
+from expcore_onedata.reset import ResetFailed, SpaceReset
+from expcore_onedata.testing import BETA_ID, DATA, with_placement, write_platform
 from expcore_onedata.testing.fake_data import ROOT_ID
-
-FILES = [f"study/part-{i:02d}.bin" for i in range(6)]
-WAIT_S = resetqos.quiet_wait_s(2)  # the quiet wait for files one directory below the root: twice 10 s + 5 s
 
 
 @pytest.fixture
-def fake(monkeypatch, ticker) -> FakeReset:
-    """The placement fixture's federation, with a reset's calls: beta supports the space and holds every file."""
-    federation = FakeReset(space_name=SPACE_NAME)
-    federation.clock = ticker.clock
-    federation.add_provider(BETA_ID, "beta.test")
-    monkeypatch.setenv(ADMIN_ENV, federation.admin_token)
-    for login, (password, user_id) in USERS.items():
-        federation.add_user(login, password, user_id)
-        federation.grant(user_id, BASELINE)
-    for path in FILES:
-        file_id = federation.add_file(path, DATA)
-        federation.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
-    return federation
+def fake(monkeypatch, ticker):
+    return federation(monkeypatch, ticker)
 
 
 @pytest.fixture
 def platform_file(tmp_path):
-    def document(data):
-        with_placement(data, transfer_settle_s=5.0, transfer_settle_polls=3, concurrency=4)
-        data["support"]["providers"] = ["alpha", "beta"]
-
-    return write_platform(tmp_path, document)
-
-
-def provisioner_with(client, config, platform_file, ticker, tmp_path, *, scan="summaries", sleep=None):
-    """A provisioner on the test's clock, finding QoS requirements by `scan`, sleeping through `sleep`."""
-    settings = dataclasses.replace(load_placement(platform_file, config).settings, qos_scan=scan)
-    return Provisioner(
-        client,
-        config,
-        settings,
-        provider_ids=resolve_provider_ids(config),
-        log=tmp_path / "changes.jsonl",
-        clock=ticker.clock,
-        sleep=sleep or ticker.sleep,
-    )
+    return write_platform(tmp_path, two_providers)
 
 
 @pytest.fixture(params=["summaries", "listing"])
 def scanned(request, client, config, platform_file, ticker, tmp_path, fake) -> Provisioner:
     return provisioner_with(client, config, platform_file, ticker, tmp_path, scan=request.param)
-
-
-def calls(fake, part: str) -> list:
-    return [c for c in fake.provider_calls if c[1] == "GET" and part in c[2]]
 
 
 def test_o33_the_runs_requirements_are_removed_and_the_baselines_kept(scanned, fake):
@@ -136,152 +91,6 @@ def test_o33_a_listing_page_without_its_end_marker_fails_the_qos_stage(
     with pytest.raises(ResetFailed, match=r"qos stage.*nextPageToken"):
         SpaceReset(listing).run({"beta": ["study"]})
     assert len(fake.qos) == 1
-
-
-def test_o33_a_quiet_reset_records_both_stages_and_their_seconds(scanned, fake, ticker):
-    """O33: an agent's requirement whose replication has landed: its files settle (their maps stay the same for three
-    seconds), are evicted, and stay quiet through the wait; both stages are in the record with their seconds."""
-    fake.qos_replicates_to = BETA_ID
-    fake.add_qos("study")
-    record = SpaceReset(scanned).run({"beta": ["study"]})
-    assert list(record["stages"]) == list(STAGES)
-    settled, quiet = record["stages"]["qos_settle"], record["stages"]["quiet"]
-    assert settled["files"] == quiet["files"] == len(FILES)
-    assert (quiet["ran"], quiet["why"]) == (True, "requirements")
-    assert resetqos.SETTLE_STABLE_S <= settled["seconds"] < resetqos.SETTLE_BOUND_S
-    assert quiet["seconds"] >= WAIT_S == quiet["waited_s"]
-    assert quiet["physical_bytes"]["providers[1]"] == 0
-
-
-def test_o33_with_no_requirement_and_no_qos_rights_the_settle_and_the_quiet_check_are_skipped(scanned, fake, ticker):
-    """O33: a run whose condition declares no QoS right, with no requirement of its own at the reset: nothing to settle
-    and nothing that could have been added, so neither stage reads a block map or waits, and the record says so."""
-    fake.add_qos(FILES[0])
-    reset = SpaceReset(scanned)
-    record = reset.run({"beta": ["study"]}, qos_baseline=reset.qos_requirements(), qos_rights=False)
-    assert record["stages"]["qos_settle"]["polls"] == 0
-    quiet = record["stages"]["quiet"]
-    assert (quiet["ran"], quiet["why"], quiet["waited_s"]) == (False, None, 0.0)
-    assert WAIT_S not in ticker.slept
-
-
-def test_o33_a_run_with_qos_rights_runs_the_quiet_check_with_no_requirement_left(scanned, fake, ticker):
-    """O33: an agent that may manage QoS can add a requirement and remove it before the run ends, leaving none for the
-    reset to see; the quiet check runs on the rights alone, reads the files the local provider held, waits, and
-    records why it ran and its seconds. Nothing lands, so it passes."""
-    record = SpaceReset(scanned).run({"beta": ["study"]}, qos_rights=True)
-    assert record["stages"]["qos"]["removed"] == 0
-    assert record["stages"]["qos_settle"]["polls"] == 0  # the settle stays keyed on the affected files
-    quiet = record["stages"]["quiet"]
-    assert (quiet["ran"], quiet["why"], quiet["qos_rights"]) == (True, "rights", True)
-    assert quiet["files"] == quiet["held_files"] == len(FILES)  # every file beta held when the run ended
-    assert quiet["waited_s"] == WAIT_S
-    assert quiet["seconds"] >= WAIT_S
-    assert quiet["physical_bytes"]["providers[1]"] == 0
-    assert WAIT_S in ticker.slept
-
-
-def test_o33_a_caller_that_does_not_say_gets_the_quiet_check_and_the_record_says_the_default(scanned, fake):
-    """O33: fail safe: a caller that passes no `qos_rights` has the quiet check run, recorded as the default."""
-    quiet = SpaceReset(scanned).run({"beta": ["study"]})["stages"]["quiet"]
-    assert (quiet["ran"], quiet["why"], quiet["qos_rights"]) == (True, "default", None)
-    assert quiet["waited_s"] == WAIT_S
-
-
-@pytest.mark.parametrize("rights", [False, True, None])
-def test_o33_a_requirement_found_at_the_reset_is_why_the_quiet_check_ran_whatever_the_rights(scanned, fake, rights):
-    """O33: a requirement removed at the reset is the first reason, ahead of the rights and the default."""
-    fake.add_qos("study")
-    quiet = SpaceReset(scanned).run({"beta": ["study"]}, qos_rights=rights)["stages"]["quiet"]
-    assert (quiet["ran"], quiet["why"], quiet["qos_rights"]) == (True, "requirements", rights)
-
-
-@pytest.mark.parametrize("bad", ["yes", 1, 0, [True]])
-def test_o33_qos_rights_is_true_false_or_not_said(scanned, bad):
-    """O33: the rights are a bool, or None for a caller that does not say; any other value is refused before a stage."""
-    with pytest.raises(ValueError, match="qos_rights"):
-        SpaceReset(scanned).run({"beta": ["study"]}, qos_rights=bad)
-
-
-def test_o33_a_requirement_added_and_removed_by_the_agent_fails_the_reset_when_its_replication_lands_late(
-    client, config, platform_file, ticker, tmp_path, fake
-):
-    """O33: the gap in #209: the agent adds a requirement and removes it before the run ends. Its replication creates
-    no transfer document and no requirement is left, so the reset sees nothing to settle; it lands after the eviction.
-    The run's condition declares QoS rights, so the quiet check ran, and the block maps of the files beta held when
-    the run ended, read before the eviction, show it holding them again."""
-    file_id = fake.id_of(FILES[3])
-
-    def sleep(seconds):
-        ticker.sleep(seconds)
-        if seconds == WAIT_S:  # the replication lands while the reset waits
-            fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
-
-    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
-    del fake.qos[fake.add_qos(FILES[3])]  # added, then removed: the reset finds none
-    with pytest.raises(ResetFailed, match=r"quiet stage.*grew after the eviction") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]}, qos_rights=True)
-    assert caught.value.record["stages"]["qos"]["removed"] == 0
-    assert list(caught.value.record["stages"]) == list(STAGES[:-1])
-    assert caught.value.record["stages"]["quiet"]["seconds"] >= WAIT_S
-
-
-def test_o33_a_late_replication_of_a_file_beta_did_not_hold_is_caught_by_the_occupancy(
-    client, config, platform_file, ticker, tmp_path, fake
-):
-    """O33: a replication that was still landing when the run ended has placed nothing yet, so no block map of a held
-    file shows it; it lands after the eviction, and the occupancy read after the quiet wait, set against the occupancy
-    stage's, shows beta holding bytes of the space again."""
-    file_id = fake.id_of(FILES[2])
-    fake.blocks.pop((file_id, BETA_ID))
-
-    def sleep(seconds):
-        ticker.sleep(seconds)
-        if seconds == WAIT_S:
-            fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
-
-    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
-    with pytest.raises(ResetFailed, match=r"quiet stage.*more of the space after the quiet wait"):
-        SpaceReset(provisioner).run({"beta": ["study"]}, qos_rights=True)
-
-
-def test_o33_the_wait_after_a_rights_run_reaches_the_deepest_file_of_the_space(scanned, fake):
-    """O33: with no requirement to name the files a late replication could reach, the wait is twice the occupancy's lag
-    for the deepest file of the space; a run with no QoS right waits for the files it knows alone."""
-    fake.add_file("deep/er/still/data.bin", DATA)
-    assert SpaceReset(scanned).run({"beta": ["study"]}, qos_rights=True)["stages"]["quiet"]["waited_s"] == (
-        resetqos.quiet_wait_s(4)
-    )
-
-
-def test_o33_a_run_without_qos_rights_waits_only_for_the_files_it_knows(scanned, fake):
-    """O33: a requirement found at a run that declares no QoS right names its files; beta holds the study files too, and
-    the deeper file is neither held nor affected, so the wait is that of the files the check covers."""
-    fake.add_file("deep/er/still/data.bin", DATA)
-    fake.add_qos(FILES[0])
-    quiet = SpaceReset(scanned).run({"beta": ["study"]}, qos_rights=False)["stages"]["quiet"]
-    assert quiet["waited_s"] == WAIT_S
-
-
-def test_o33_a_replication_landing_after_the_eviction_fails_the_reset_at_its_quiet_stage(
-    client, config, platform_file, ticker, tmp_path, fake
-):
-    """O33: a QoS replication has no transfer to cancel or wait for, so one still running lands its bytes after the
-    eviction: here, during the quiet wait. The files' block maps after the wait show beta holding them again, and the
-    reset fails at its quiet stage, the history never read."""
-    file_id = fake.id_of(FILES[3])
-
-    def sleep(seconds):
-        ticker.sleep(seconds)
-        if seconds == WAIT_S:  # the replication lands while the reset waits
-            fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
-
-    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
-    fake.add_qos(FILES[3])
-    with pytest.raises(ResetFailed, match=r"quiet stage.*grew after the eviction") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
-    assert list(caught.value.record["stages"]) == list(STAGES[:-1])
-    assert caught.value.record["stages"]["quiet"]["seconds"] >= WAIT_S
 
 
 def test_o33_block_maps_that_change_once_settle_and_ones_that_keep_changing_fail_within_the_bound(
@@ -399,19 +208,3 @@ def test_o33_the_settles_bound_counts_its_waits_not_its_reads(scanned, fake, tic
     fake._distribution = slow
     record = SpaceReset(scanned).run({"beta": ["study"]})
     assert record["stages"]["qos_settle"]["seconds"] > resetqos.SETTLE_BOUND_S
-
-
-@pytest.mark.parametrize(("depth", "lag"), [(1, 10.0), (2, 15.0), (3, 20.0)])
-def test_o33_the_quiet_wait_is_twice_the_occupancys_longest_lag_for_the_deepest_file(depth, lag):
-    """O33: from the source, a placement reaches the space root's physical size after the file location's flush
-    (10 s) and 5 s more for each directory level above the file's parent; the quiet wait doubles that."""
-    assert resetqos.occupancy_lag_s(depth) == lag
-    assert resetqos.quiet_wait_s(depth) == 2 * lag
-
-
-def test_o33_a_deeper_affected_file_makes_the_quiet_wait_longer(scanned, fake, ticker):
-    """O33: a requirement on a file three directories down waits for that depth's lag, not the shallow one's."""
-    fake.add_file("deep/er/still/data.bin", DATA)
-    fake.add_qos("deep")
-    record = SpaceReset(scanned).run({"beta": ["study"]})
-    assert record["stages"]["quiet"]["waited_s"] == resetqos.quiet_wait_s(4)
