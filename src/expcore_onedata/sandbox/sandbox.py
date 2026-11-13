@@ -154,7 +154,7 @@ class DockerSandbox:
         self._teardown_step: str | None = None
         self._removed: set[str] = set()
         self._net_removed = False
-        self._mounts_removed = 0
+        self._unmounted: set[Path] = set()
         self._watched: dict[str, dict[str, Any]] = {}
         self._meta: dict[str, Any] = {
             "run_key": spec.run_key,
@@ -1262,13 +1262,14 @@ class DockerSandbox:
         phase it is in (`step`), how many of the sandbox's containers it has not removed, whether its network is not,
         and how many of its mounts are not unmounted. Counts and a phase name, never a name of the configuration; read
         from what the stop has noted, so it asks the host nothing and cannot wait on it. What a step did not show
-        removed counts as left, so `containers` is an upper bound: it counts every container the start registered
-        and the stop has not yet removed, those that went by themselves (a one-shot `--rm`) included."""
+        removed counts as left: `containers` counts every container the start registered that the stop has not yet
+        shown removed, as of its last look (a one-shot `--rm` that went by itself is counted until the stop has looked
+        for it, and one a start still in flight creates after the stop looked is not)."""
         return {
             "step": self._teardown_step,
             "containers": sum(1 for c in self._containers if c not in self._removed),
             "network": self._net is not None and not self._net_removed,
-            "mounts": len(self._mounts) - self._mounts_removed,
+            "mounts": len([m for m in self._mounts if m not in self._unmounted]),
         }
 
     def _step(self, errors: list[str], fn: Callable[..., Any], *a: Any) -> bool:
@@ -1360,7 +1361,7 @@ class DockerSandbox:
         unmount_errors: list[str] = []
         for m in reversed(self._mounts):
             if self._step(unmount_errors, self.host.unmount, m):
-                self._mounts_removed += 1
+                self._unmounted.add(m)  # a set: a stop tried again asks again, and counts each mount once
         errors.extend(unmount_errors)
         if self.keep_evidence:
             with self._meta_lock:  # `metadata()` may be reading it from another thread

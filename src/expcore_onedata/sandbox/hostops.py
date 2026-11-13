@@ -30,6 +30,7 @@ import platform
 import re
 import subprocess
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -210,13 +211,19 @@ class _Pipe(threading.Thread):
         self._stream, self._cap = stream, cap
         self.kept = bytearray()
         self.produced = 0
+        self._abandoned = False
+
+    def abandon(self) -> None:
+        """The runner has taken its result and stopped waiting for this stream (a process that outlived its command
+        holds it open): from now on what is read is dropped, so a writer that goes on never grows what is held (O42)."""
+        self._abandoned = True
 
     def run(self) -> None:
         try:
             while chunk := self._stream.read1(READ_BYTES):
                 self.produced += len(chunk)
                 room = len(chunk) if self._cap is None else self._cap - len(self.kept)
-                if room > 0:
+                if room > 0 and not self._abandoned:
                     self.kept += chunk[:room]
         except (OSError, ValueError):  # the stream was closed under it: what it read stands
             pass
@@ -249,9 +256,11 @@ def run_bounded(
 
     A command past its time is killed, and its end is waited for at most `KILL_WAIT_S` more: one that does not die (a
     process in uninterruptible sleep) is left behind, and the result is the timeout all the same (returncode 124, stderr
-    `timed out after Ns`, stdout what it had written; O41). A program that cannot be run is 127. With `output_cap`, each
-    of stdout and stderr keeps at most that many bytes and the rest is read and dropped, and `stdout_count` and
-    `stderr_count` say what was written and kept (O42). `env` is added to the environment."""
+    `timed out after Ns`, stdout what it had written; O41). The limit covers the end of the command's output as well as
+    the command: a process the command left running that holds the pipes open past it is a timeout, never a success with
+    a short output, as `subprocess.run` had it. A program that cannot be run is 127. With `output_cap`, each of stdout
+    and stderr keeps at most that many bytes and the rest is read and dropped, and `stdout_count` and `stderr_count` say
+    what was written and kept (O42). `env` is added to the environment."""
     cap = _check_cap(output_cap)
     merged = None if env is None else {**os.environ, **env}
     try:
@@ -273,12 +282,19 @@ def run_bounded(
             target=_feed, args=(child.stdin, input.encode("utf-8", "replace")), daemon=True, name="command-input"
         ).start()
     timed_out = False
+    clock = time.monotonic
+    until = clock() + timeout_s
     try:
         try:
             child.wait(timeout=timeout_s)
+            for reader in readers:  # the command has ended: its output has, unless something it started holds the pipes
+                reader.join(max(until - clock(), 0))
+            timed_out = any(reader.is_alive() for reader in readers)
         except subprocess.TimeoutExpired:
             timed_out = True
-            child.kill()
+        if timed_out:
+            with contextlib.suppress(OSError):
+                child.kill()
             try:
                 child.wait(timeout=KILL_WAIT_S)
             except subprocess.TimeoutExpired:
@@ -288,7 +304,10 @@ def run_bounded(
             child.kill()
         raise
     for reader in readers:
-        reader.join(READER_JOIN_S)
+        reader.join(READER_JOIN_S if timed_out else 0)
+    for reader in readers:
+        if reader.is_alive():
+            reader.abandon()  # whatever it reads from now on is dropped, never kept
     if not any(
         reader.is_alive() for reader in readers
     ):  # nothing reads them any more: closed, not left to the collector

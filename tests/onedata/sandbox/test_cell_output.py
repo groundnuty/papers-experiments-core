@@ -33,14 +33,14 @@ def prints(stdout: str, stderr: str = "", code: int = 0):
     return lambda container, argv, stdin: CmdResult(code, stdout, stderr)
 
 
-def test_o40_the_cap_is_a_fixed_bound_of_the_core_that_a_sandbox_takes_unless_told_another(world):
+def test_o42_the_cap_is_a_fixed_bound_of_the_core_that_a_sandbox_takes_unless_told_another(world):
     default = DockerSandbox(world.host, world.s, make_spec(world, "isolated"), **start_options(world))
     assert cells.OUTPUT_CAP_BYTES == 1 << 20
     assert default._cells is None  # not started: nothing is run, the bound is what a started one gives its runner
     assert default._output_cap == cells.OUTPUT_CAP_BYTES
 
 
-def test_o40_a_cell_that_prints_more_than_the_cap_has_the_first_bytes_kept_and_the_cut_recorded(world, sbx):
+def test_o42_a_cell_that_prints_more_than_the_cap_has_the_first_bytes_kept_and_the_cut_recorded(world, sbx):
     world.host.exec_handler = prints("a" * 1000, "b" * 30)
     result = sbx.exec("print('a' * 1000)", 5)
     assert result.stdout == "a" * 100
@@ -50,14 +50,14 @@ def test_o40_a_cell_that_prints_more_than_the_cap_has_the_first_bytes_kept_and_t
     assert sbx.metadata()["cell_output_cuts"] == [{"cell": 1, **result.output_cut}]  # and so does the run's
 
 
-def test_o40_both_streams_cut_are_both_recorded(world, sbx):
+def test_o42_both_streams_cut_are_both_recorded(world, sbx):
     world.host.exec_handler = prints("é" * 80, "z" * 500, 1)
     result = sbx.exec("1/0", 5)
     assert result.stdout == "é" * 50  # 100 bytes: whole characters
     assert result.output_cut == {"stdout": {"produced": 160, "kept": 100}, "stderr": {"produced": 500, "kept": 100}}
 
 
-def test_o40_a_cell_within_the_cap_records_no_cut(world, sbx):
+def test_o42_a_cell_within_the_cap_records_no_cut(world, sbx):
     world.host.exec_handler = prints("x" * 100, "y" * 100)  # exactly the cap: nothing was dropped
     result = sbx.exec("print(1)", 5)
     assert (result.stdout, result.stderr, result.output_cut) == ("x" * 100, "y" * 100, None)
@@ -65,7 +65,7 @@ def test_o40_a_cell_within_the_cap_records_no_cut(world, sbx):
     assert "cell_output_cuts" not in sbx.metadata()
 
 
-def test_o40_a_harness_step_that_was_cut_says_so_in_its_record(world, sbx):
+def test_o42_a_harness_step_that_was_cut_says_so_in_its_record(world, sbx):
     world.host.exec_handler = prints("s" * 500)
     sbx.exec("print(1)", 5, record=False)
     (step,) = sbx.metadata()["harness_steps"]
@@ -73,7 +73,7 @@ def test_o40_a_harness_step_that_was_cut_says_so_in_its_record(world, sbx):
     assert "cell_output_cuts" not in sbx.metadata()  # it is no cell of the agent's
 
 
-def test_o40_the_cap_is_asked_of_the_host_for_every_cell_and_every_harness_step(world, sbx):
+def test_o42_the_cap_is_asked_of_the_host_for_every_cell_and_every_harness_step(world, sbx):
     asked = []
     real = world.host.docker
 
@@ -100,7 +100,7 @@ def execute(provider):
     return asyncio.run(provider.execute("python", {"code": "x"}, timeout_s=5.0, ctx=NO_WAITS))
 
 
-def test_o40_the_model_is_told_what_the_sandbox_cut_and_the_record_flags_the_source_limit():
+def test_o42_the_model_is_told_what_the_sandbox_cut_and_the_record_flags_the_source_limit():
     """O42 with L07: the notice after the kept output says how much was written and kept, and the call's
     `source_truncated` is True, apart from the harness's own cap."""
     cut = {"stdout": {"produced": 1_400_000, "kept": 1_048_576}}
@@ -110,7 +110,7 @@ def test_o40_the_model_is_told_what_the_sandbox_cut_and_the_record_flags_the_sou
     assert not got.is_error
 
 
-def test_o40_a_failed_cell_with_cut_streams_says_so_after_the_error_text():
+def test_o42_a_failed_cell_with_cut_streams_says_so_after_the_error_text():
     cut = {"stdout": {"produced": 500, "kept": 100}, "stderr": {"produced": 900, "kept": 100}}
     got = execute(scripted(stdout="out", stderr="Traceback", exit_code=1, output_cut=cut))
     assert got.is_error
@@ -123,6 +123,6 @@ def test_o40_a_failed_cell_with_cut_streams_says_so_after_the_error_text():
     assert got.source_truncated is True
 
 
-def test_o40_a_cell_that_was_not_cut_says_nothing_of_the_source_limit():
+def test_o42_a_cell_that_was_not_cut_says_nothing_of_the_source_limit():
     got = execute(scripted(stdout="all of it"))
     assert (got.text, got.source_truncated) == ("all of it", None)

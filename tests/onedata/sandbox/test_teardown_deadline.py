@@ -21,6 +21,7 @@ from sandbox_support import FAST
 
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
+from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.provider import TEARDOWN_DEADLINE_S, SandboxPlatform
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.testing import NOW
@@ -105,14 +106,14 @@ def launch(platform, body=None, *, level="via-gate", lease=None):
     return box[0], ctx
 
 
-def test_o39_the_deadline_has_a_default_and_is_a_positive_finite_number_of_seconds(world):
+def test_o41_the_deadline_has_a_default_and_is_a_positive_finite_number_of_seconds(world):
     assert TEARDOWN_DEADLINE_S == 600.0
     for bad in (0, -1, float("inf"), float("nan"), True, "600"):
         with pytest.raises(ValueError, match="teardown_deadline_s"):
             world.build(teardown_deadline_s=bad)
 
 
-def test_o39_a_teardown_that_ends_in_time_is_recorded_completed_with_its_deadline_and_its_seconds(world):
+def test_o41_a_teardown_that_ends_in_time_is_recorded_completed_with_its_deadline_and_its_seconds(world):
     sandbox, ctx = launch(world.build(teardown_deadline_s=30))
     recorded = sandbox.metadata()["teardown"]
     assert (recorded["outcome"], recorded["deadline_s"]) == ("completed", 30)
@@ -121,7 +122,7 @@ def test_o39_a_teardown_that_ends_in_time_is_recorded_completed_with_its_deadlin
     assert ctx.waits == ["sandbox_lifecycle"] * 2  # the start and the stop, as before
 
 
-def test_o39_a_teardown_that_raised_is_recorded_failed_and_is_the_runs_infrastructure_error_as_before(world):
+def test_o41_a_teardown_that_raised_is_recorded_failed_and_is_the_runs_infrastructure_error_as_before(world):
     box = []
 
     async def body(sandbox):
@@ -134,7 +135,7 @@ def test_o39_a_teardown_that_raised_is_recorded_failed_and_is_the_runs_infrastru
     assert box[0].metadata()["teardown"]["outcome"] == "failed"
 
 
-def test_o39_a_teardown_past_its_deadline_is_cut_with_what_it_left_and_the_run_is_infrastructure(world):
+def test_o41_a_teardown_past_its_deadline_is_cut_with_what_it_left_and_the_run_is_infrastructure(world):
     """O41: the run's wait ends at the deadline, whatever the host does, with `InfraError("sandbox")`, and the record
     says the teardown was cut and what it had not removed: counts and a step, never a name."""
     entered = wedge_removals(world)
@@ -161,7 +162,7 @@ def test_o39_a_teardown_past_its_deadline_is_cut_with_what_it_left_and_the_run_i
     assert error.sandbox.names.gate not in str(recorded)  # no name of the configuration is in it (O12)
 
 
-def test_o39_a_cut_never_hides_the_bodys_own_error_but_is_still_recorded(world):
+def test_o41_a_cut_never_hides_the_bodys_own_error_but_is_still_recorded(world):
     wedge_removals(world)
     platform = world.build(teardown_deadline_s=0.5)
 
@@ -173,7 +174,7 @@ def test_o39_a_cut_never_hides_the_bodys_own_error_but_is_still_recorded(world):
     assert caught.value.sandbox.metadata()["teardown"]["outcome"] == "cut"
 
 
-def test_o39_a_cancelled_run_is_still_cut_at_the_deadline_and_stays_cancelled(world):
+def test_o41_a_cancelled_run_is_still_cut_at_the_deadline_and_stays_cancelled(world):
     """O41: a cancellation does not shorten a teardown (it must finish what it removes), and it does not lengthen
     it past its deadline either."""
     removing = wedge_removals(world)
@@ -202,7 +203,31 @@ def test_o39_a_cancelled_run_is_still_cut_at_the_deadline_and_stays_cancelled(wo
     assert box[0].metadata()["teardown"]["outcome"] == "cut"
 
 
-def test_o39_a_cut_with_a_lease_keeps_the_key_quarantined_until_the_sandbox_is_shown_gone(world):
+def test_o41_a_stop_that_is_tried_again_counts_each_mount_it_unmounted_once(world):
+    """O41: a stop is idempotent and may run again after one that failed; what it shows unmounted is a set, so the
+    mounts left are never fewer than none and never forget one that failed."""
+    from pathlib import Path
+
+    platform = world.build()
+    sandbox, _ = launch(platform)
+    sandbox._stopped = False
+    sandbox._mounts = [Path("/invented/one"), Path("/invented/two")]
+    done = []
+
+    def unmount(path):
+        if path == Path("/invented/two"):
+            raise SandboxError("stuck")
+        done.append(path)
+
+    world.host.unmount = unmount
+    for _ in range(2):
+        with pytest.raises(SandboxError):
+            sandbox.stop(force=True)
+    assert done == [Path("/invented/one")] * 2  # the retry asks again, as the stop always does
+    assert sandbox.teardown_left()["mounts"] == 1
+
+
+def test_o41_a_cut_with_a_lease_keeps_the_key_quarantined_until_the_sandbox_is_shown_gone(world):
     """C19 with O41: the cut says nothing was proven; the probe still finds the sandbox's containers, so the key is not
     freed."""
     wedge_removals(world)
