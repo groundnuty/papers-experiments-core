@@ -285,8 +285,10 @@ class FakeData(FakeQos, FakeFederation):
     leniently for others. A read with no `attribute` parameter, or with `name` or `type` among the attributes, answers
     the entry as gone (`missing_answer`, 400 `posix` `enoent`); a read that asks for `size`, `parent_id` or `file_id`
     and nothing else (`LENIENT_ATTRIBUTES`) keeps answering 200 from the entry's last state, only the attributes asked
-    for, on every provider, for `tombstone_s` seconds of `clock` counted from when the delete landed. Entries under a
-    deleted directory have one each; a read of its children, content or block map is the entry as gone.
+    for, on every provider, for `tombstone_s` seconds of `clock` counted from when the delete landed: its scheduled
+    landing time (`delete_delay_s` after it was answered), never the later read that settled it, so the expiry does not
+    depend on how often the fake is read. Entries under a deleted directory have one each; a read of its children,
+    content or block map is the entry as gone.
 
     Source, at op-worker f118ed9 (ctool 8ae7baf, cluster-worker 0e9cb40): strict `name` and the `file_meta`
     attributes, `src/modules/fslogic/operations/utils/file_attr.erl:170-189,203-213,577-578,620-628` through
@@ -754,6 +756,9 @@ class FakeData(FakeQos, FakeFederation):
         if pending.file_id not in self._deleting:  # taken with a directory above it that landed first
             return
         del self._deleting[pending.file_id]
+        # The tombstone counts from when the delete was due, not from the read that settled it, so its expiry never
+        # depends on how often the fake was polled; a delete landed before its time (`land_deletes`) from now.
+        landed = min(pending.lands, self.clock())
         if pending.kind == "DIR" and self.lose_recreated:
             again = next(
                 (
@@ -766,8 +771,8 @@ class FakeData(FakeQos, FakeFederation):
                 None,
             )
             for file_id in [i for i in self._under(again) if self.nodes[i].kind == "REG"] if again else []:
-                self._delete(file_id)
-        self._delete(pending.file_id)
+                self._delete(file_id, at=landed)
+        self._delete(pending.file_id, at=landed)
 
     def _create(self, parent: str, name: str, kind: str, origin: str | None = None) -> str:
         file_id = f"fid-{next(self._ids):04d}{self.id_suffix}"
@@ -791,10 +796,12 @@ class FakeData(FakeQos, FakeFederation):
             return False
         return self._visible(node, provider)
 
-    def _delete(self, file_id: str) -> None:
+    def _delete(self, file_id: str, at: float | None = None) -> None:
+        """Remove an entry and what is under it, leaving a tombstone of each that counts from `at` (default: now)."""
+        when = self.clock() if at is None else at
         for child in [n.file_id for n in self.nodes.values() if n.parent == file_id]:
-            self._delete(child)
-        self.tombstones[file_id] = _Tombstone(self._attributes(self.nodes[file_id]), self.clock())
+            self._delete(child, at=when)
+        self.tombstones[file_id] = _Tombstone(self._attributes(self.nodes[file_id]), when)
         self._deleting.pop(file_id, None)
         del self.nodes[file_id]
         for table in (self.blocks, self.pending):
