@@ -58,10 +58,11 @@ class AgentConfig:
     - `tool_call_bound_s`: an optional bound on one tool call (L17). A call is handed `min(tool_call_bound_s, the
       agent's time left)` as its `timeout_s`. A provider that bounds its own call and runs out of the bound first (a
       tool server that hangs) fails the call as `knowledge` infrastructure, which is not the agent's time; one that
-      runs out with the agent's time, or the ceiling, the shorter is the loop's own cut as before. None, the default,
-      leaves the call bounded by the agent's time alone. A declared bound is a value of the record and is hashed with
-      the rest; an undeclared one is not written at all, so a configuration that does not declare it is what it was
-      before the field existed (its hash, its record and its fingerprint).
+      runs out with the agent's time, or the ceiling, the shorter is the loop's own cut as before, unless the bound
+      had passed by the reading that cut it (`endings.hung_past_the_bound`). None, the default, leaves the call
+      bounded by the agent's time alone. A declared bound is a value of the record and is hashed with the rest; an
+      undeclared one is not written at all, so a configuration that does not declare it is what it was before the
+      field existed (its hash, its `agent_config` in the record, and its caps in the fingerprint).
     """
 
     limits: Limits

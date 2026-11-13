@@ -27,6 +27,7 @@ SKIP_REASONS = {
     "ended": "not executed: the attempt ended at an earlier call in this turn",
     "time": "not executed: the run's time was used up before this call started",
     "cut": "not completed: the run's time was used up while this call was running",
+    "bound": "not completed: this call outlasted the bound declared for one tool call, and the attempt ended",
     "failed": "not completed: this call failed and the attempt ended",
     "cap": "not executed: the attempt ended on a cap before any call of this reply ran",
 }

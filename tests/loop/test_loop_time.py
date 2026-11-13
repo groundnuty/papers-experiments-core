@@ -352,6 +352,79 @@ def test_l17_a_declared_bound_longer_than_the_time_left_hands_the_time_left_and_
     assert result.tool_calls[0].status == "cut"
 
 
+def test_l17_a_call_the_loop_cuts_at_the_time_left_after_the_declared_bound_passed_is_the_bounds_not_the_agents(
+    run, clock, sleeper
+):
+    """L17: the bound expired first, even when the loop's cut is the one that ends the call. A provider that honours the
+    bound can still be unwinding its own expiry when the cap arrives a moment after it (here the call is held 61 s, the
+    cap is 61 and the bound 60), and the winner must not depend on which of the two the event loop runs first: the
+    bound's deadline is earlier than the cap's whenever it is the shorter, so the call is `knowledge` infrastructure,
+    cut by the loop, and never the agent's time cap."""
+    provider = FakeProvider({"stall": stalls(clock, 61)})
+    result = run(
+        StubAdapter([[("stall", {})], "never asked"]), [provider], sleep=sleeper, time_cap_s=61, tool_call_bound_s=60
+    )
+    assert [c[2] for c in provider.calls] == [60]
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "knowledge")
+    assert result.outcome.set_aside is True
+    assert "'stall'" in result.outcome.detail
+    assert "within 60 s" in result.outcome.detail
+    assert (result.tool_calls[0].status, result.tool_calls[0].elapsed_s) == ("cut", 61.0)
+    assert "outlasted the bound" in result.tool_calls[0].text
+
+
+def test_l17_a_provider_that_ignores_the_bound_and_is_cut_at_the_time_left_is_judged_by_the_bound_too(
+    run, clock, sleeper
+):
+    """L17: the loop cuts a call only at the agent's time left or the ceiling, whatever its provider does with the bound
+    it is handed. A call cut after the declared bound had passed is a hang of the tool, and not the agent's time, so it
+    is `knowledge` infrastructure for a provider that does not keep the bound as well as for one that does. A call that
+    returns after the bound and before the cap is an ordinary result."""
+    provider = FakeProvider({"stall": stalls(clock, 301)})
+    result = run(
+        StubAdapter([[("stall", {})], "never asked"]), [provider], sleep=sleeper, time_cap_s=300, tool_call_bound_s=100
+    )
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "knowledge")
+    assert result.tool_calls[0].status == "cut"
+
+
+def test_l17_a_call_cut_at_the_time_left_before_the_bound_passed_is_the_agents_time_cap(run, clock, sleeper):
+    """L17: the cut is the agent's when the bound had not passed by the reading that showed the cap reached: the time
+    left (30 s) was shorter than the bound (100 s), so the call was handed 30 s and cut at them."""
+    provider = FakeProvider({"slow": slow(clock, 270), "stall": stalls(clock, 31)})
+    result = run(
+        StubAdapter([[("slow", {})], [("stall", {})], "never asked"]),
+        [provider],
+        sleep=sleeper,
+        time_cap_s=300,
+        tool_call_bound_s=100,
+    )
+    assert [c[2] for c in provider.calls] == [100, 30]
+    assert (result.outcome.name, result.outcome.infra_kind) == ("time_cap", None)
+    assert result.tool_calls[1].status == "cut"
+
+
+def test_l17_a_call_cut_at_the_ceiling_that_was_nearer_than_the_bound_is_the_ceilings_infrastructure(
+    run, clock, sleeper
+):
+    """L17: the bound's deadline is compared with the ceiling's as with the cap's. After 250 s of waits the ceiling has
+    150 s left and the agent still has its whole cap, so the bound of 200 s is the later deadline: a call held 260 s is
+    cut at the ceiling, which is the ceiling's infrastructure kind, and not a hang the bound judged."""
+    provider = FakeProvider({"queue": slow(clock, 250, wait=250), "stall": stalls(clock, 260)})
+    result = run(
+        StubAdapter([[("queue", {})], [("stall", {})], "never asked"]),
+        [provider],
+        sleep=sleeper,
+        time_cap_s=300,
+        ceiling_s=400,
+        ceiling_kind="sandbox",
+        tool_call_bound_s=200,
+    )
+    assert [c[2] for c in provider.calls] == [200, 200]
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "sandbox")
+    assert result.tool_calls[1].status == "cut"
+
+
 def test_l17_a_call_is_handed_the_time_left_once_that_is_less_than_the_declared_bound(run, clock):
     """L17: the minimum is taken at every call. The first call takes 250 s of the 300 under a 100 s bound (its provider
     does not bound itself, so it is cut by nothing but the cap); the second is then handed the 50 s left, not 100,

@@ -26,7 +26,7 @@ from typing import Any
 
 from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
 from expcore.loop.config import AgentConfig, config_sha256_of
-from expcore.loop.endings import cannot_start, cut_ending, time_ending
+from expcore.loop.endings import cannot_start, cut_ending, hung_past_the_bound, time_ending
 from expcore.loop.leaks import leaked_tool
 from expcore.loop.outcomes import HarnessDefect, Outcome, harness_defect_of
 from expcore.loop.records import LoopResult, ToolCallRecord, TurnRecord
@@ -306,9 +306,13 @@ class _Run:
             ctx = WaitContext(self.timer)
             run = await self.watcher.run(self.toolbox.run(call, timeout_s=self._call_bound(tick), ctx=ctx), tick)
         except Cut as cut:
-            cut_run = self.toolbox.skipped(call, "cut")
-            self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", waited=self._waited(waited0))
-            return cut_run, cut_ending(f"tool {call.name!r}", cut.tick, self.config)
+            hung = hung_past_the_bound(call.name, tick, cut.tick, self.config)  # the declared bound passed first (L17)
+            ending = hung if hung is not None else cut_ending(f"tool {call.name!r}", cut.tick, self.config)
+            cut_run = self.toolbox.skipped(call, "cut" if hung is None else "bound")
+            detail = "" if hung is None else hung.detail
+            waited = self._waited(waited0)
+            self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", detail=detail, waited=waited)
+            return cut_run, ending
         except InfraError as exc:
             return self._failed(index, call, tick, f"infrastructure: {exc.kind}", waited0), Outcome(
                 "infrastructure", exc.detail, infra_kind=exc.kind, infra_target=exc.target

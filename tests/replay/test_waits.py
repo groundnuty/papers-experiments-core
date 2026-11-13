@@ -132,6 +132,21 @@ def test_l17_a_call_whose_time_left_is_shorter_than_the_declared_bound_replays_a
     assert replay_record(record).dumps() == record.dumps()
 
 
+def test_l17_a_call_cut_after_the_declared_bound_passed_replays_as_the_same_knowledge_failure():
+    """L17: the loop's cut at the time left came a moment after the bound had passed, and the loop judged it by the
+    bound: the call is `cut` with the watch reading that cut it and the attempt `knowledge` infrastructure. The ending
+    is derived from the call's two readings and the configuration, so the replay, which holds the call until that
+    reading, reaches it too."""
+    record = SCENARIOS["tool_bound_cut"][0]()
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "knowledge")
+    assert "within 60 s" in record.outcome["detail"]
+    call = record.tool_calls[0]
+    assert (call["status"], call["elapsed_s"]) == ("cut", 61)
+    assert "outlasted the bound" in call["text"]
+    assert "watch" in [label for label, _ in record.clock]
+    assert replay_record(record).dumps() == record.dumps()
+
+
 def test_l17_a_changed_declared_bound_is_a_divergence_of_the_configuration():
     """L17: the bound is part of the configuration the record pins, so replaying a record whose bound was edited fails
     before the loop runs, at the hash of the configuration."""

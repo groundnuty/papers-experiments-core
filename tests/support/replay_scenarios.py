@@ -210,6 +210,26 @@ def _tool_bound_past_the_time_left() -> RunRecord:
     )
 
 
+def _tool_bound_cut() -> RunRecord:
+    """The declared per-call bound passed, and the loop's cut at the agent's time left arrived a moment later, while the
+    call was still holding on: the loop judges the cut by the bound that passed first, as `knowledge` infrastructure
+    (L17)."""
+    clock = FakeClock()
+
+    async def holds(_args):
+        clock.advance(61)
+        await asyncio.Event().wait()
+
+    return record_run(
+        [[("echo", {"x": "1"})], "never"],
+        {"echo": holds},
+        clock=clock,
+        sleep=ClockSleep(clock),
+        time_cap_s=61,
+        tool_call_bound_s=60,
+    )
+
+
 def _model_cut() -> RunRecord:
     clock = FakeClock()
     return record_run([], HANDLERS, backend=Hangs([], clock, 400), clock=clock, sleep=ClockSleep(clock))
@@ -381,6 +401,7 @@ SCENARIOS: dict[str, tuple[Callable[[], RunRecord], str]] = {
     "tool_expiry_cut": (_tool_expiry_cut, "time_cap"),
     "tool_bound_expiry": (_tool_bound_expiry, "infrastructure"),
     "tool_bound_past_the_time_left": (_tool_bound_past_the_time_left, "time_cap"),
+    "tool_bound_cut": (_tool_bound_cut, "infrastructure"),
     "ceiling_cut": (_ceiling_cut, "infrastructure"),
     "cleanup_in_time": (_cleanup_in_time, "time_cap"),
     "cleanup_timeout": (_cleanup_timeout, "time_cap"),
