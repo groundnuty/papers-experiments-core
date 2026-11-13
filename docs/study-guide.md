@@ -46,7 +46,7 @@ All configuration is TOML in the study directory, validated when the study is lo
 |---|---|
 | `study.toml` | the study's name, its plugin, the code identity's scope, the distributions it requires, the platforms it imports and its own infrastructure kinds ([section 3](#treatment-kinds)), the side files of its records ([section 4](#side-files)), the factors, the conditions and the tasks |
 | `models.toml` | the single model table: each model once, with backend, API id, sampling, limits and context window, price (flat or in tiers, [below](#prices-and-the-budget)) and status |
-| `campaign.toml` | the plan (models, seeds, order seed), the loop's caps, the scheduler's caps and the kinds it records its failures as ([below](#the-schedulers-kinds)), and the budget |
+| `campaign.toml` | the plan (models, seeds, order seed), the loop's caps ([the time cap and the ceiling](#caps-on-a-runs-time) included), the scheduler's caps and the kinds it records its failures as ([below](#the-schedulers-kinds)), and the budget |
 | `preregistration.toml` | the named contrasts, the Holm family (or `exploratory_only = true`, [section 6](#6-what-a-conclusion-may-say)), alpha, the estimators, the bootstrap and the power settings |
 | `package.toml` | the inclusion list of the replication package ([section 8](#8-ship-a-replication-package)) |
 | `platform.toml` | a platform's own settings, read by the platform layer (`expcore_onedata`), not by the core |
@@ -149,6 +149,69 @@ accepted_fingerprints = ["fp-southern-deploy", "fp-northern-deploy"]
 assert relay.accepted_fingerprints == ("fp-northern-deploy", "fp-southern-deploy")  # a set: kept sorted
 assert study.models.resolve("alpha-stub").accepted_fingerprints == ()  # checked against a baseline, as before
 ```
+
+### Caps on a run's time
+
+Two clocks bound a run, and they count different things. Both are set in `[agent]` of `campaign.toml`.
+
+**The time cap, `time_cap_s`, counts the agent's own time:** the seconds elapsed since the loop started, minus the seconds spent in an open wait on infrastructure, minus the cleanup of a call the loop cut. A provider or a model backend opens a wait with `async with ctx.infrastructure_wait(kind)`, and the kinds are a closed list, `expcore.plugin.WAIT_KINDS`:
+
+| Wait kind | What it excludes from the agent's time |
+|---|---|
+| `model_retry` | retries of a model request and the backoff between them |
+| `lease_queue` | waiting for a slot or a lease |
+| `sandbox_lifecycle` | the start-up and the teardown of the sandbox |
+| `toolserver_lifecycle` | the start-up and the teardown of a tool server |
+
+Nothing the agent's own call does is a wait. Executing a tool, reading data and a federation operation the agent triggers count against the cap however long they take. A run that reaches the cap ends as `time_cap`, the agent's own outcome.
+
+**The ceiling, `ceiling_s`, counts wall-clock time, waits included.** A run whose elapsed time reaches it ends as an infrastructure failure of the kind `ceiling`, so a wait that hangs cannot hold a run for ever. Without a key the ceiling is 3 times the cap. `ceiling_s = 90` gives it in seconds and `ceiling_factor = 3` as a multiple of the cap; a file gives at most one, and the ceiling may not be below the cap. When one reading finds both passed, the cap decides and the run ends as `time_cap`. A `ceiling` run is set aside like any infrastructure failure: it is not scored as the agent's, it counts against `max_attempts`, and the run is attempted again.
+
+```python
+import tempfile
+
+from expcore.campaign.config import load_campaign
+from expcore.config.loading import ConfigError
+
+
+def campaign_with(*lines):
+    """The example's campaign.toml with `lines` added to its [agent] table, loaded on its own."""
+    text = Path("my-study/campaign.toml").read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as scratch:
+        file = Path(scratch) / "campaign.toml"
+        file.write_text(text.replace("time_cap_s = 30\n", "time_cap_s = 30\n" + "".join(f"{x}\n" for x in lines)), "utf-8")
+        return load_campaign(file)
+
+
+agent = study.campaign.agent
+assert (agent.limits.time_cap_s, agent.ceiling_s) == (30.0, 90.0)  # no key: 3 times the cap
+assert campaign_with("ceiling_factor = 1.5").agent.ceiling_s == 45.0
+lowered = campaign_with("ceiling_s = 45")
+assert lowered.agent.ceiling_s == 45.0
+assert lowered.caps() != study.campaign.caps()  # the ceiling is in the caps, so in the campaign's fingerprint
+for lines, reason in [(("ceiling_s = 29",), "not below time_cap_s"), (("ceiling_s = 45", "ceiling_factor = 1.5"), "give one")]:
+    try:
+        campaign_with(*lines)
+        raise AssertionError(f"{lines} was accepted")
+    except ConfigError as error:
+        assert "[agent]" in str(error) and reason in str(error)
+```
+
+The ceiling is in the campaign's fingerprint, so changing it on a campaign that has started needs a new store, like any other cap. The two spellings of one ceiling are two fingerprints, since each records what it was given: `ceiling_factor = 3` is the default and keeps its fingerprint, and `ceiling_s = 90` on a cap of 30 s does not.
+
+**On the Onedata platform, the ceiling also sets how long a run's tokens live.** The executor passes the loop's own ceiling to the platform, `platform.launch(ctx, ..., ceiling_s=study.campaign.agent.ceiling_s)`, and the run's tokens are minted to live that long plus the margins of `[tokens]` in `platform.toml`: 900 s after the ceiling, and 300 s of headroom for the start-up between the mint and the tool server's start, **the ceiling plus 1,200 s** at the defaults. The window covers the start-up, the loop up to its ceiling, and what follows it: the tool server's stop and its check of its token. The run's metadata and every line a mint writes to the slot's journal record `ttl_s` (the lifetime the tokens were minted for) and `ceiling_s`. The tool server takes the ceiling its token was minted for: `platform.tool_server(ctx, sandbox)` needs no argument, and another ceiling is refused.
+
+A slot, the pair of users a run leases, is free again only when its tokens have ended and the probe's margin of 60 s has passed. Where a run's tokens are not revoked at its end, **a slot is held for the token window plus 60 s from its mint, however short the run**. With a time cap of 600 s:
+
+| Ceiling | Token window | Slot held | Most runs a day from a group of 4 slots |
+|---|---|---|---|
+| 1,800 s (the default, 3 times the cap) | 3,000 s | 3,060 s | about 113 |
+| 900 s (`ceiling_factor = 1.5`) | 2,100 s | 2,160 s | 160 |
+| 720 s (`ceiling_factor = 1.2`) | 1,920 s | 1,980 s | about 174 |
+
+**To plan a calendar**, count the two bounds separately. A run's loop lasts at most the ceiling, and typical runs are much shorter, so the campaign's length follows how long runs usually take (the `totals.agent_s` and `totals.infra_wait_s` of a pilot's records). Where the slots of a rights group are fewer than the runs you want in flight, the table is the bound instead, because a slot waits out its window whatever its run did.
+
+**Lower the ceiling as a fallback**, when a deployment does not revoke a run's tokens at its end, or cannot confirm that it did, and slots limit the throughput: a lower ceiling shortens every window. It has two costs. It needs a new store, so decide before the first run. And a run whose agent time and waits reach the ceiling before its agent time reaches the cap ends as `ceiling` and is attempted again, so set the ceiling above the cap by the waits you will accept, which a pilot's `infra_wait_by_kind` shows. A ceiling equal to the cap (a factor of 1) ends every run that waited at all and then used up its time. Where tokens are revoked when the run ends, leave the default.
 
 ### Prices and the budget
 
@@ -417,10 +480,11 @@ assert check["code"]["dirty"] is False and "campaign-snapshot.sqlite" in check["
 
 ### Lease slots on the Onedata platform
 
-Each run that uses the platform's users leases one slot: a pair of a data-path user and a tool-server user that `platform.toml` declares under `[slots]`. A slot's tool-server user holds exactly one set of rights, which the slot declares in `[slots.<name>.toolserver] rights = [...]` (required), and a run leases only from the group of slots whose rights equal its condition's. So one campaign can interleave a read-only condition and a writing one, each run getting a slot of its own kind; a condition whose rights no slot declares is refused when the campaign is built. Two planning rules follow:
+Each run that uses the platform's users leases one slot: a pair of a data-path user and a tool-server user that `platform.toml` declares under `[slots]`. A slot's tool-server user holds exactly one set of rights, which the slot declares in `[slots.<name>.toolserver] rights = [...]` (required), and a run leases only from the group of slots whose rights equal its condition's. So one campaign can interleave a read-only condition and a writing one, each run getting a slot of its own kind; a condition whose rights no slot declares is refused when the campaign is built. Three planning rules follow:
 
 - **Declare at least two slots per rights group.** A teardown that cannot be proven holds its slot until it is cleared, so a group with one slot stops every run of its conditions until then.
 - **Size the slots of each group to the plan's mix.** The dispatcher does not look for a group with a free slot: when the next runs all belong to one group, workers wait for that group's slots even while another group's sit idle. Give each group roughly its share of the concurrent runs.
+- **Count a slot as busy for its run's token window, not for the run.** Where tokens are not revoked at a run's end, a slot is held until its tokens end and 60 s more, which is the run's ceiling plus 1,200 s plus 60 s from the mint ([Caps on a run's time](#caps-on-a-runs-time)); size the slots for that, or lower the ceiling.
 
 ### Files an agent writes
 
