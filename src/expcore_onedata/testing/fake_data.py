@@ -113,6 +113,8 @@ class Transfer:
     waiting: bool = False
     bytes_replicated: int | None = None  # the counter the record reports, when a test scripts it
     noop: bool = False  # an eviction that completed and evicted nothing (`evictions_noop_first`)
+    processed: int | None = None  # the files the record counts processed, when not the one file (a directory's)
+    evicted: int | None = None  # the files an eviction record counts evicted, when not decided by `noop`
     deleted: bool = False  # the file was deleted when the job was scheduled: it ended at once, with no file processed
 
     @property
@@ -353,6 +355,9 @@ class FakeData(FakeFederation):
     - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed;
     - `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks;
       `evictions_noop_first` does that, with `filesEvicted` 0, for the next N evictions only;
+    - `qos_covered`: `(file id, provider id)` pairs whose eviction is cancelled per file, as op-worker's is for a file
+      a QoS requirement still covers on that provider: the job completes, the file keeps its blocks, and the record
+      counts it in `filesProcessed` and not in `filesEvicted`, with `filesFailed` 0, as the platform does;
     - `onthefly_unit`: a range read through a provider lacking the bytes places at least this many from its offset;
     - `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at
       all, each answered `transfer_unseen_answer`; a fresh space root answers `root_enoent_answer` for
@@ -440,6 +445,7 @@ class FakeData(FakeFederation):
         self.evictions_remove_blocks = True
         self.evictions_noop_first = 0  # the next N evictions complete with filesEvicted 0 and remove nothing, as 25.0's
         # do when scheduled right after a provider fetched the bytes on the fly
+        self.qos_covered: set[tuple[str, str]] = set()  # (file id, provider id): its eviction there is cancelled
         self.onthefly_unit: int | None = (
             None  # a range read places [offset, offset + max(length, unit)), clipped to the
         )
@@ -1132,7 +1138,8 @@ class FakeData(FakeFederation):
             "finishTime": transfer.finished,
             "bytesReplicated": moved if transfer.ended and transfer.replicates and files else 0,
             "filesReplicated": files if transfer.ended and transfer.replicates else 0,
-            "filesEvicted": files if transfer.ended and transfer.kind != "replication" and not transfer.noop else 0,
+            "filesProcessed": (files if transfer.processed is None else transfer.processed) if transfer.ended else 0,
+            "filesEvicted": self._files_evicted(transfer, files),
             "filesFailed": 0,
         }
         view = self._view(tid, provider)
@@ -1141,6 +1148,15 @@ class FakeData(FakeFederation):
             answer[status] = {"ended": "completed", "ongoing": "active", "waiting": "scheduled"}[view["state"]]
         answer.update({k: v for k, v in view.items() if k != "state"})
         return httpx.Response(200, json={k: v for k, v in answer.items() if k not in self.transfer_omit})
+
+    @staticmethod
+    def _files_evicted(transfer: Transfer, files: int) -> int:
+        """The record's `filesEvicted`: the job's own count, else all its files for an ended eviction but a no-op."""
+        if not transfer.ended or transfer.kind == "replication":
+            return 0
+        if transfer.evicted is not None:
+            return transfer.evicted
+        return 0 if transfer.noop else files
 
     def _view(self, tid: str, provider: str) -> dict:
         """What one provider says of a job where it differs from the job itself: its listed state, record fields."""
@@ -1158,6 +1174,9 @@ class FakeData(FakeFederation):
         if transfer.kind == "eviction" and self.evictions_noop_first > 0:  # completed, and nothing evicted
             self.evictions_noop_first -= 1
             transfer.noop = True
+            return
+        if transfer.kind == "eviction" and key in self.qos_covered:  # cancelled per file: processed, not evicted
+            transfer.evicted = 0
             return
         if transfer.kind != "replication" and self.evictions_remove_blocks:
             self.blocks.pop(evicted, None)

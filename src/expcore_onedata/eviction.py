@@ -26,12 +26,24 @@ scheduled again after `EVICTION_RETRY_PAUSE_S`, the directory's as a whole for a
 up to `EVICTION_ATTEMPTS` in all; after the last the whole settle bound is waited before `NotPlaced` refuses it. Only
 the block map judges, never a transfer's counters, and the record says how many attempts it took.
 
+**The counters name the cause and are recorded; they never decide.** An eviction ends `completed` with `filesProcessed`
+above `filesEvicted` and `filesFailed` 0 when files were skipped without a failure (op-worker f118ed9,
+`replica_eviction_worker.erl:51-59, 88-96`): one the provider holds nothing of, one open, one for which it knows of no
+other copy yet (the O01 no-op above), and one **cancelled per file because a QoS requirement still covers it there**
+(`replica_deletion_master.erl:364-371`: a requirement's deletion that has not reached that provider through dbsync
+yet leaves it in force). The first three are normal, so a gap in an attempt is no failure while the block maps show
+the files empty, which the attempts, and the reset's QoS stage before them, usually bring about. When files still
+hold bytes after the last attempt, the refusal (`EvictionIncomplete`, a `NotPlaced`) names the provider, the last
+attempt's counts and, when they show files skipped without a failure, the likely cause. A success and a refusal both
+record the last attempt's counts (`files_processed`, `files_evicted`, `files_failed`), each None when a record lacks
+one: unknown is never zero.
+
 The wait for the transfers to end polls each one's record, and a poll that times out ends the eviction, so those polls
 are tried again under the provisioner's policy (O29, `readretry.py`), within the wait's own bound. The block-map reads
 of the verification are inside a poll that counts a failed read as one that did not match, and stay one attempt.
 """
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from expcore_onedata import consistency
@@ -46,6 +58,32 @@ from expcore_onedata.provision import (
     Provisioner,
     ProvisionError,
 )
+from expcore_onedata.transferrecord import eviction_counters
+
+COUNTERS = ("files_processed", "files_evicted", "files_failed")  # the record's keys of `eviction_counters`, in order
+
+
+class EvictionIncomplete(NotPlaced):
+    """Files still hold bytes after the last attempt. `facts` is what the reset's failed stage records of the provider:
+    its position label, the counts of the last attempt, the transfers and the attempts."""
+
+    def __init__(self, message: str, report: PlacementReport, facts: dict[str, Any]) -> None:
+        super().__init__(message, report)
+        self.facts = facts
+
+
+def _counted(records: Iterable[Any]) -> dict[str, int | None]:
+    """The sum of each counter over the transfers' records, all None when there is none or one lacks a counter."""
+    read = [eviction_counters(record) for record in records]
+    if not read or any(counts is None for counts in read):
+        return dict.fromkeys(COUNTERS)
+    return {key: sum(counts[i] for counts in read if counts) for i, key in enumerate(COUNTERS)}
+
+
+def sum_counts(results: Iterable[Mapping[str, Any]]) -> dict[str, int | None]:
+    """The counters of several evictions' records added up, each None when any of them is."""
+    rows = list(results)
+    return {key: None if any(r.get(key) is None for r in rows) else sum(r[key] for r in rows) for key in COUNTERS}
 
 
 def _converge_empty(
@@ -66,15 +104,48 @@ def _converge_empty(
     )
 
 
-def _not_empty(provisioner: Provisioner, ids: Sequence[str], result: consistency.EachConvergence) -> NotPlaced:
-    """The refusal of files still holding bytes, or unreadable, at the bound: their count, never a guess."""
+def _skipped_note(label: str, counts: Mapping[str, int | None]) -> str:
+    """What the last attempt's counts say, for the refusal: the counts, and when files were processed and neither
+    evicted nor failed, the likely cause; nothing when a count is unknown."""
+    processed, evicted, failed = (counts[key] for key in COUNTERS)
+    if processed is None or evicted is None or failed is None:
+        return ""
+    note = (
+        f"; on {label} the last attempt's eviction transfer(s) ended with filesProcessed {processed}, "
+        f"filesEvicted {evicted} and filesFailed {failed}"
+    )
+    if processed > evicted + failed:
+        note += (
+            f", so {processed - evicted - failed} file(s) were skipped without a failure: the likely cause is an "
+            "eviction cancelled per file, e.g. a QoS requirement still covering it there (a file open there is "
+            "skipped alike)"
+        )
+    return note
+
+
+def _not_empty(
+    provisioner: Provisioner,
+    ids: Sequence[str],
+    result: consistency.EachConvergence,
+    *,
+    provider: str | None = None,
+    last: Mapping[str, int | None] | None = None,
+    transfers: int = 0,
+    attempts: int = 0,
+) -> NotPlaced:
+    """The refusal of files still holding bytes, or unreadable, at the bound: their count, never a guess. Given the
+    provider and the last attempt's counters it is an `EvictionIncomplete`, naming them and the likely cause too."""
     held = sum(int(result.values.get(fid) or 0) for fid in result.pending)
     report = PlacementReport(len(ids), held, len(result.pending), 0, tuple(sorted(result.pending))[:50])
-    return NotPlaced(
+    message = (
         f"{provisioner.where}{len(result.pending)} of {len(ids)} file(s) still hold bytes on the provider, or "
-        "could not be read, at the bound",
-        report,
+        "could not be read, at the bound"
     )
+    if provider is None or last is None:
+        return NotPlaced(message, report)
+    label = provisioner.client.provider_label(provider)
+    facts = {"providers": {label: {**last, "transfers": transfers, "attempts": attempts}}}
+    return EvictionIncomplete(message + _skipped_note(label, last), report, facts)
 
 
 def require_empty_each(provisioner: Provisioner, provider: str, file_ids: Iterable[str]) -> dict[str, Any]:
@@ -87,10 +158,10 @@ def require_empty_each(provisioner: Provisioner, provider: str, file_ids: Iterab
     return {"files": len(ids), "polls": result.polls}
 
 
-def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]) -> dict[str, int]:
+def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]) -> consistency.TransferReport:
     """Wait for the transfers to end, together; raise WaitTimeout when one has not ended at the bound."""
     settings = provisioner.settings
-    done = consistency.require_ended(
+    return consistency.require_ended(
         consistency.wait_transfers(
             provisioner.client,
             provider,
@@ -104,7 +175,6 @@ def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]
         ),
         f"{provisioner.where}eviction",
     )
-    return done.states()
 
 
 def _evict_verified(
@@ -117,14 +187,17 @@ def _evict_verified(
     """Schedule the evictions (`schedule` takes the files still holding bytes and returns the transfer ids), wait for
     them to end, and judge them by the block maps alone, scheduling again what still holds bytes after
     `EVICTION_CHECK_S`, up to `EVICTION_ATTEMPTS` in all; the last attempt waits the whole settle bound. Return the
-    transfers, their end states, the polls and the attempts; raise NotPlaced when files still hold bytes then."""
+    transfers, their end states, the last attempt's counters, the polls and the attempts; raise `EvictionIncomplete`
+    when files still hold bytes then."""
     pending, transfers, polls = list(files), 0, 0
     states: dict[str, int] = {}
     for attempt in range(1, EVICTION_ATTEMPTS + 1):
         tids = schedule(pending)
         transfers += len(tids)
-        for state, count in _wait_ended(provisioner, provider, tids).items():
+        done = _wait_ended(provisioner, provider, tids)
+        for state, count in done.states().items():
             states[state] = states.get(state, 0) + count
+        counts = _counted(done.records.values())  # only the last attempt's are kept: an earlier gap is what it retried
         if quiet is not None:
             quiet()  # before each round of block-map reads: a running job could still change a map
         last = attempt == EVICTION_ATTEMPTS
@@ -132,9 +205,11 @@ def _evict_verified(
         result = _converge_empty(provisioner, provider, pending, bound)
         polls += result.polls
         if result.converged:
-            return {"transfers": transfers, "transfer_states": states, "polls": polls, "attempts": attempt}
+            return {"transfers": transfers, "transfer_states": states, **counts, "polls": polls, "attempts": attempt}
         if last:
-            raise _not_empty(provisioner, files, result)
+            raise _not_empty(
+                provisioner, files, result, provider=provider, last=counts, transfers=transfers, attempts=attempt
+            )
         pending = list(result.pending)  # completed, and these still hold bytes: never evicted; schedule them again
         provisioner.sleep(EVICTION_RETRY_PAUSE_S)
     raise AssertionError("unreachable")  # pragma: no cover - the loop returns or raises
@@ -156,6 +231,9 @@ def evict_ids(
             "files": 0,
             "transfers": 0,
             "transfer_states": {},
+            "files_processed": 0,
+            "files_evicted": 0,
+            "files_failed": 0,
             "empty": True,
             "polls": 0,
             "attempts": 0,
@@ -202,4 +280,4 @@ def evict_tree(
     return {"files": len(files), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 
 
-__all__ = ["evict_ids", "evict_tree", "require_empty_each"]
+__all__ = ["EvictionIncomplete", "evict_ids", "evict_tree", "require_empty_each", "sum_counts"]

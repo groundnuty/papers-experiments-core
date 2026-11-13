@@ -25,7 +25,11 @@ read and every check is made on each provider that supports the space, since eac
    after the transfers ended (an eviction on 25.0 can complete having evicted nothing), up to `EVICTION_ATTEMPTS`.
    Once the eviction's transfers have ended, the listings must show no transfer running on any provider before the
    block maps are read, so a map is never read while a job still changes it (O01); and once every eviction is verified,
-   the listings must show none running again.
+   the listings must show none running again. The block maps judge; the transfers' counters (`filesProcessed`,
+   `filesEvicted`, `filesFailed` of the last attempt) are recorded per provider, and when files still hold bytes at
+   the bound the failure names the provider, those counts and the likely cause: an eviction cancelled per file, e.g. a
+   QoS requirement still covering the file there (O01). A gap with every map empty is no failure: a file the provider
+   holds nothing of is processed, never evicted.
 4. **occupancy**: with no transfer running on any provider (the listings are read first, as above), the space root's
    distribution gives each provider's physical size, the bytes its storage holds of the space; never the logical
    figures, which lag. A provider other than the data provider that holds more than the caller allows (nothing by
@@ -62,7 +66,7 @@ from typing import Any
 
 from expcore_onedata import consistency
 from expcore_onedata.client import NotSent, PlatformError, answered_absent
-from expcore_onedata.eviction import evict_ids, evict_tree
+from expcore_onedata.eviction import evict_ids, evict_tree, sum_counts
 from expcore_onedata.occupancy import physical_sizes
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.readretry import ONE_ATTEMPT
@@ -146,7 +150,8 @@ class SpaceReset:
                 facts = steps[stage]()
             except _FAILURES as error:
                 detail = NOT_IN_SPACE if isinstance(error, KeyError) else str(error)
-                record["stages"][stage] = {"ok": False, "seconds": round(self._p.clock() - started, 3)}
+                seconds = round(self._p.clock() - started, 3)
+                record["stages"][stage] = {"ok": False, "seconds": seconds, **getattr(error, "facts", {})}
                 record["stages"][stage]["error"] = detail
                 record["seconds"] = round(self._p.clock() - began, 3)
                 record["reads_retried"] = self._p.reads_retried - retried
@@ -342,6 +347,7 @@ class SpaceReset:
                 "transfers": sum(r["transfers"] for r in results),
                 "polls": max((r["polls"] for r in results), default=0),
                 "attempts": max((r["attempts"] for r in results), default=0),
+                **sum_counts(results),
             }
         self._require_quiet()
         return {"providers": out}

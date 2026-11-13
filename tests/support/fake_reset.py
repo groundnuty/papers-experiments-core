@@ -15,8 +15,11 @@ and with these changes to the calls it inherits:
   a file's parent links end, and the transfer listing of the space holds only the jobs on its files; `add_file`,
   `id_of`, `held` and `exists` take `space=` (the study space by default);
 - a job's record has the `spaceId` of its file's space, and a cancelled job reports `cancelled`;
-- an eviction scheduled on a directory evicts every file under it when it ends, unless `evictions_noop_first` makes
-  it one that evicted nothing, as FakeData's file evictions are;
+- an eviction scheduled on a directory evicts every file under it that the provider holds when it ends, unless
+  `evictions_noop_first` makes it one that evicted nothing, as FakeData's file evictions are, or `qos_covered` names a
+  file under it, which keeps its blocks; its record counts every file under the directory in `filesProcessed` and
+  the files it removed in `filesEvicted`, so a file the provider did not hold, or one cancelled per file, is processed
+  and not evicted, with `filesFailed` 0, as op-worker counts them;
 - every provider call is answered under one lock, so a bulk operation's threads never interleave inside the fake.
 
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
@@ -208,7 +211,7 @@ class FakeReset(FakeData):
             body["spaceId"] = self.space_of(transfer.file_id)
         if getattr(transfer, "cancelled", False):
             body["evictionStatus" if transfer.kind == "eviction" else "replicationStatus"] = "cancelled"
-            body.update(bytesReplicated=0, filesReplicated=0, filesEvicted=0)
+            body.update(bytesReplicated=0, filesReplicated=0, filesEvicted=0, filesProcessed=0)
         return httpx.Response(200, json=body)
 
     def _list_transfers(self, space: str, query: httpx.QueryParams, provider: str) -> httpx.Response:
@@ -249,14 +252,19 @@ class FakeReset(FakeData):
                 "replication", transfer.file_id, self.spawn_on_evict, scheduled=now, started=now
             )
         if transfer.kind == "eviction" and node is not None and node.kind == "DIR":
+            files = self._files_under(node.file_id)
+            transfer.processed = len(files)
             if self.evictions_noop_first > 0:  # completed, and nothing evicted
                 self.evictions_noop_first -= 1
                 transfer.noop = True
                 return
+            keys = [(f, transfer.provider_id) for f in files]
+            held = [key for key in keys if self.blocks.get(key) and key not in self.qos_covered]
+            transfer.evicted = len(held) if self.evictions_remove_blocks else len(files)  # a lying job claims them all
             if self.evictions_remove_blocks:
-                for file_id in self._files_under(node.file_id):
-                    self.blocks.pop((file_id, transfer.provider_id), None)
-                    self.pending.pop((file_id, transfer.provider_id), None)
+                for key in (k for k in keys if k not in self.qos_covered):
+                    self.blocks.pop(key, None)
+                    self.pending.pop(key, None)
             return
         super()._finish(transfer)
 
