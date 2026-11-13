@@ -212,7 +212,8 @@ class FakeData(FakeFederation):
     waits before it uses the name again. In between, by what is recorded (`DELETE_FACTS`):
 
     - Recorded. The provider the DELETE went to answers the entry as a deleted one at once (`missing_answer`), except
-      a read of its `size`, `parent_id` or `file_id` alone, which its tombstone answers ("Tombstones"). A provider
+      a read of its `parent_id` alone, which kept answering live (12 Nov facts); by the source, not live, the same
+      holds for `file_id` alone, and for `size` alone of a directory ("Tombstones"). A provider
       finishes deleting a directory after the call returns, and a directory made again under the same name before
       then loses its files when it does (the reason a federation reset never deletes a directory and makes it again).
       So the create of the name is accepted there, and when the delete lands the files under the directory made again
