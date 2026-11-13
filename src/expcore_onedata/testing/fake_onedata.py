@@ -173,6 +173,11 @@ class MockOnedata:
                         )
                     )
                 if self.command == "POST" and u.path.endswith("/onezone/tokens/infer_access_token_scope"):
+                    # Onezone serves the inference to anyone (oz-worker token_routes.erl, `scope = public`), but it
+                    # first authenticates a token sent in a header, and the token this mock accepts stands for a
+                    # data-path token, whose data-access caveats fail that: a 401, as recorded live on 13 Nov
+                    if tok is not None:
+                        return self._err(401, "unauthorized")
                     sent = json.loads(body or b"{}").get("token")
                     if not outer._accepts(sent):
                         return self._err(401, "unauthorized")
