@@ -2,7 +2,9 @@
 so an escalation that stalls never holds the cell, its `exec` or a worker thread for ever; an outcome not decided in
 that time is `survived_kill`, which is `cell_unkillable`. A listing or kill of the escalation that raises ends in the
 sandbox's quiesce: every process shown gone is the clean kill it would have been, the agent's `time_limit`; anything
-else is `cell_unkillable`, ends the run and orders the sandbox's stop. Nothing but a clean kill is a time limit."""
+else is `cell_unkillable`, ends the run and orders the sandbox's stop. Nothing but a clean kill is a time limit, and
+an escalation's outcome never gets less severe than a step it has taken: once the mount was aborted or the stop
+ordered, whatever a later fallback finds, the cell is not the agent's."""
 
 import threading
 import time
@@ -69,6 +71,84 @@ def test_o34_a_kill_that_raises_with_no_fallback_that_answers_is_survived_kill(f
     assert record["outcome"] == deadline.SURVIVED
     assert record["outcome"] in deadline.STOPS
     assert steps(record)[-1] == "stop"
+
+
+# ------------------------------------------------------ an outcome never gets less severe than a step already taken
+LATE = {"pid": 21, "comm": "worker", "state": "R", "start": "21"}  # a process that appears once the mount is aborted
+
+
+class KillRaisesForALateProcess(Processes):
+    """A fake tracker whose kill raises for the process that appeared after the abort, as a failed `sudo kill` does."""
+
+    def kill(self, procs: list[dict], timeout_s: float) -> None:
+        if any(p["pid"] == LATE["pid"] for p in procs):
+            raise OSError("the host's kill could not run")
+        super().kill(procs, timeout_s)
+
+
+@pytest.mark.parametrize(
+    ("left", "outcome", "after"),
+    [
+        pytest.param([], deadline.MOUNT_ABORTED, ["ended"], id="the fallback shows every process gone"),
+        pytest.param([{"pid": 21, "state": "R"}], deadline.SURVIVED, ["survived", "stop"], id="a process is left"),
+        pytest.param(None, deadline.SURVIVED, ["survived", "stop"], id="the fallback could not list them"),
+    ],
+)
+def test_o34_a_kill_that_raises_after_the_mount_was_aborted_is_never_a_clean_kill(left, outcome, after):
+    """O34: the abort succeeds (the wedged process goes), then the kill of a process found while waiting for it raises,
+    and the fallback finds nothing. The mount is dead all the same: the outcome is `mount_aborted`, which ends the run
+    and is not the agent's `time_limit`, and not `killed`, as it was before: the cell was the agent's and later cells
+    were allowed on the dead mount. A process the fallback leaves, or cannot list, is `survived_kill` with the stop
+    ordered. `mount_aborted` orders no stop, as without a raise: the outputs are collected as evidence."""
+    clock, procs = Clock(), KillRaisesForALateProcess({12: "reader"}, wedged=(12,))
+
+    def abort(timeout_s: float) -> dict:
+        procs.release()
+        procs.procs[LATE["pid"]] = dict(LATE)
+        return {"ok": True, "connections": 1}
+
+    record = deadline.enforce(procs, escalation(clock, abort=abort)[0], fallback=lambda: left)
+    assert record["outcome"] == outcome
+    assert outcome in deadline.ESCALATED
+    assert (outcome in deadline.STOPS) is (outcome == deadline.SURVIVED)
+    assert steps(record) == ["kill", "survived", "abort", "raised", *after]
+    assert record["steps"][3]["during"] == "kill"
+
+
+def test_o34_the_severity_order_puts_a_clean_kill_below_every_step_of_the_escalation():
+    """O34: `killed` < `mount_aborted` < `sandbox_stopped` < `survived_kill` (the outcome nothing shows to be gone,
+    above all), every outcome is ranked, and `killed` is the only one that is not an escalation."""
+    assert deadline.SEVERITY == (deadline.KILLED, deadline.MOUNT_ABORTED, deadline.SANDBOX_STOPPED, deadline.SURVIVED)
+    assert sorted(deadline.SEVERITY) == sorted(deadline.OUTCOMES)
+    assert deadline.SEVERITY[0] == deadline.KILLED
+    assert set(deadline.SEVERITY[1:]) == set(deadline.ESCALATED)
+
+
+@pytest.mark.parametrize("decided", deadline.OUTCOMES)
+@pytest.mark.parametrize("reached", deadline.OUTCOMES)
+def test_o34_a_decided_outcome_is_never_less_severe_than_a_step_already_taken(reached, decided):
+    """O34: the rule on the one place that decides an outcome, for every pair: what a later step decides, a fallback's
+    clean kill among them, is at least what an earlier step reached. It is tested on the rule, not through `enforce`:
+    once the stop is ordered nothing of the escalation runs after it, so no path of it raises there. A clean kill with
+    nothing reached stays `killed`, the agent's own time limit."""
+    run = deadline._Run(Processes({}), escalation(Clock())[0])
+    run.reach(reached)
+    outcome = run.done(decided)["outcome"]
+    assert deadline.SEVERITY.index(outcome) == max(deadline.SEVERITY.index(reached), deadline.SEVERITY.index(decided))
+    assert (outcome == deadline.KILLED) is (reached == decided == deadline.KILLED)
+    assert ("stop" in steps(run.record)) is (outcome in deadline.STOPS)  # a stop outcome has its stop ordered
+
+
+@pytest.mark.parametrize("reached", [deadline.MOUNT_ABORTED, deadline.SANDBOX_STOPPED])
+def test_o34_a_fallback_that_finds_nothing_after_an_abort_or_a_stop_is_not_a_clean_kill(reached):
+    """O34: a step that raised after the mount was aborted, or after the sandbox's stop was reached, and a fallback that
+    shows every process gone: the outcome is the step reached, never `killed`; a stop outcome has its stop ordered."""
+    run = deadline._Run(Processes({}), escalation(Clock())[0])
+    run.reach(reached)
+    record = deadline._fall_back(run, lambda: [])
+    assert record["outcome"] == reached
+    assert record["outcome"] in deadline.ESCALATED
+    assert ("stop" in steps(record)) is (reached in deadline.STOPS)
 
 
 # --------------------------------------------------------------------------------- the cell's own wait, bounded
@@ -221,3 +301,73 @@ def test_o34_a_kill_that_raises_and_a_quiesce_that_kills_every_process_is_the_ag
     assert mounted._cells.ended is None
     assert mounted.stopped is False
     assert mounted.exec("print(1)", 30).exit_code == 0
+
+
+# ------------------------------------------------------------- the same, through the sandbox: the abort, then a raise
+LATE_PID = 7005  # a worker that starts as the aborted read ends
+
+
+def test_o34_a_kill_that_raises_after_a_successful_abort_ends_the_run_as_cell_unkillable(world, mounted):
+    """O34: the mount's abort succeeds and frees the wedged process; a worker that started meanwhile is found while the
+    deadline waits for the cell to go, and its kill raises (its `HostOps` call fails, once); the quiesce the deadline
+    falls back on kills it and finds nothing left. The mount is dead all the same: the outcome is `mount_aborted`, the
+    cell `kill_survived`, its attempt `cell_unkillable`, the run is ended and a later cell refused. Before, the
+    fallback's empty answer made it `killed`: the cell was the agent's `time_limit`, `ended` stayed unset and later
+    cells ran on the dead mount. The sandbox is not stopped: after an abort alone the outputs are collected as
+    evidence."""
+    pids = cell_processes(world, mounted, wedged=True)
+    agent = world.host.containers[mounted.names.agent]
+    raises = iter([True])
+
+    def sidecar(container, argv, stdin):  # the abort: the pending SIGKILL takes, and a worker starts as the read ends
+        world.host.unkillable.discard(pids["python"])
+        world.host.files.pop(f"/proc/{pids['python']}/stat", None)
+        world.host.add_stat(LATE_PID, "worker", pids["child"])
+        world.host.add_cgroup(agent, [agent.pid, *pids.values(), LATE_PID])
+        return CmdResult(0)
+
+    def kill(argv):  # the deadline's kill of the late worker raises once; the quiesce's, then, is the real one
+        if str(LATE_PID) in argv and next(raises, False):
+            raise OSError("the host's kill could not run")
+        return world.host._run_default(argv)
+
+    world.host.exec_handler, world.host.run_handlers["kill"] = sidecar, kill
+    result, _ = run_to_the_cap(mounted, world, CODE)
+    assert (result.kill["reason"], result.kill["category"]) == ("kill_survived", "infrastructure")
+    assert kinds.deadline_error(result.kill).kind == kinds.CELL_UNKILLABLE
+    record = result.kill["deadline"]
+    assert record["outcome"] == deadline.MOUNT_ABORTED
+    assert steps(record) == ["kill", "survived", "abort", "raised", "ended"]
+    assert record["steps"][3]["during"] == "kill"
+    assert LATE_PID in killed_pids(world)  # by the quiesce
+    assert mounted._cells.ended is record
+    assert mounted.metadata()["mount"]["aborted"] is True
+    assert mounted.stopped is False
+    with pytest.raises(InfraError) as refused:
+        mounted.exec("print(1)", 30)
+    assert refused.value.kind == kinds.CELL_UNKILLABLE
+
+
+# ---------------------------------------------------------------------- the run's end is never replaced by a lesser one
+def test_o34_an_outcome_that_comes_late_never_replaces_a_worse_end_of_the_run(world, mounted, monkeypatch):
+    """O34: the cell's own wait gave up on an escalation that had not decided and ended the run as `survived_kill`; the
+    escalation then finishes, as `mount_aborted`, in its thread. Its record is published, as a record of the cell's
+    deadline, but the run's end stays the worse one: a later reader that lets a mount_aborted run's outputs be collected
+    as evidence must not read the end of a run whose outcome was unknown as one that was only aborted."""
+    clock = Clock()
+    by_the_clock(monkeypatch, clock)
+    release = hang_the_kill(mounted, world.host)
+    try:
+        result = mounted.exec(CODE, CELL_S)
+    finally:
+        release.set()
+    assert result.kill["deadline"]["outcome"] == deadline.SURVIVED
+    ended = mounted._cells.ended
+    assert ended["outcome"] == deadline.SURVIVED
+    mounted._cells._publish(1, {"outcome": deadline.MOUNT_ABORTED, "steps": []})
+    assert mounted._cells.ended is ended
+    assert [d["outcome"] for d in mounted.metadata()["cell_deadlines"]] == [deadline.SURVIVED, deadline.MOUNT_ABORTED]
+    with pytest.raises(InfraError) as refused:
+        mounted.exec("print(1)", 30)
+    assert refused.value.kind == kinds.CELL_UNKILLABLE
+    assert deadline.SURVIVED in str(refused.value)

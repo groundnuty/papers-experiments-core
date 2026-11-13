@@ -129,6 +129,7 @@ For readers of the commits before this release:
 
 - A cell's hard deadline (#212, O34) had no bound on the cell's own wait for its outcome: an escalation that stalled held the cell's `exec`, and the worker thread under it, for ever, and so `asyncio.run`'s shutdown. Every wait for the outcome now lasts at most the margin and 30 s, and an outcome not decided by then is `survived_kill`, the attempt `cell_unkillable`.
 - At a cell's deadline, a kill whose `HostOps` call raised fell back on the quiesce, ignored what it found and recorded nothing, so the cell was the agent's own `time_limit` and later cells still ran. The escalation now records the step that raised and its error, and the cell is `killed` only when the quiesce shows every process gone; otherwise it is `survived_kill`, `cell_unkillable`, the run is ended and the sandbox's stop ordered (O34).
+- An escalation's outcome at a cell's deadline never gets less severe than a step it already took (`killed` < `mount_aborted` < `sandbox_stopped` < `survived_kill`, O34). A kill that raised after a successful abort, with a quiesce that then found nothing left, was `killed` again: the agent's own `time_limit`, with the run's `ended` unset and later cells allowed on the dead mount. It is now `mount_aborted` at least, `cell_unkillable`, with the run ended and later cells refused; an outcome that comes late never replaces a worse end of the run.
 
 ### Security
 
