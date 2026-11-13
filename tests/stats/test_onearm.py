@@ -144,10 +144,42 @@ def test_s14_no_run_with_the_outcome_gives_no_estimate_and_counts_why():
 
 def test_s14_the_arms_planned_runs_include_its_absent_runs_and_no_other_conditions():
     """S14: the finish rate is over the arm's own planned runs."""
-    gone = [absent("task-b", "cond-a", "unfinished"), absent("task-b", "cond-c", "exhausted")]
+    gone = [absent("task-d", "cond-a", "unfinished"), absent("task-d", "cond-c", "exhausted")]
     result = describe(rate_rows(), rate(), SETTINGS, absent=gone)
     assert (result.runs.planned, result.runs.finished) == (6, 5)
     assert result.runs.finish_rate == pytest.approx(5 / 6)
+
+
+def test_s14_totals_far_apart_in_size_give_every_defined_replicate_its_exact_ratio():
+    """S14: grp-b's totals are 1e-200 over 1e-200, a ratio of 1; no scaling may underflow its denominator to 0 and
+    leave the draw of grp-b twice undefined."""
+    rows = [
+        row("task-a", "model-a", 1, {"queries": 1e-200, "placements": 1e200}),
+        row("task-c", "model-a", 1, {"queries": 1e-200, "placements": 1e-200}, cluster="grp-b"),
+    ]
+    result = describe(rows, per_placement(), EstimatorSettings(1000, 0.95, (3,)))
+    assert result.n_undefined_replicates == 0
+    assert result.ci_high == pytest.approx(1.0)
+    assert result.ci_low == pytest.approx(0.0, abs=1e-300)
+    assert result.per_model[0].n_undefined_replicates == 0
+
+
+def test_s14_a_rate_of_huge_values_is_refused_rather_than_overflowing_to_infinity():
+    """S14: a mean of values past 1e300 can overflow a float sum; it is refused naming the run, never infinite."""
+    rows = [row("task-a", "model-a", 1, {"waited": 1e308}), row("task-c", "model-a", 1, {"waited": 1e308}, cluster="b")]
+    with pytest.raises(ValueError, match=r"outcome 'waited' of run .* is beyond"):
+        describe(rows, rate(), SETTINGS)
+    assert describe([row("task-a", "model-a", 1, {"waited": 1e300})], rate(), SETTINGS).estimate == 1e300
+
+
+def test_s14_an_absent_run_that_repeats_or_is_analysed_is_refused():
+    """S14: a run key absent twice, or absent and analysed, would count one run twice in the finish rate."""
+    analysed = [row("task-a", "model-a", 1, {"waited": 1.0})]
+    with pytest.raises(ValueError, match="two runs of the arm share one run key"):
+        describe(analysed, rate(), SETTINGS, absent=[absent("task-a", "cond-a", "unfinished")])
+    twice = [absent("task-b", "cond-a", "unfinished"), absent("task-b", "cond-a", "exhausted")]
+    with pytest.raises(ValueError, match="two runs of the arm share one run key"):
+        describe(analysed, rate(), SETTINGS, absent=twice)
 
 
 def test_a_single_cluster_gives_a_point_interval():

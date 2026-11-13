@@ -17,10 +17,14 @@ every model, S04) at the bootstrap seed and a digest of its name, so it draws th
   of the arm that has both, every cluster, task, model and seed together, so a cluster weighs by its runs. A run whose
   denominator is 0 still adds its numerator. Each replicate is the ratio of the drawn clusters' totals; a replicate
   whose drawn denominators sum to 0 is undefined (NaN, S05), never 0 or an infinity, and is counted. With every
-  denominator 0 the estimate is NaN. The totals are summed exactly and the replicates scaled, so no sum overflows.
+  denominator 0 the estimate is NaN. The totals, and each replicate's sums of them, are exact (integers over one
+  denominator) until the final rounding, so nothing overflows or underflows on the way; a ratio past the float range
+  is refused, never infinite.
 
-Every planned run of the arm is measured or lost, for exactly one cause (`expcore.stats.armruns`). A value that is not
-a number, is infinite, or is negative in a ratio of totals, is refused naming the run and the outcome.
+Every planned run of the arm is measured or lost, for exactly one cause (`expcore.stats.armruns`); a run key held twice
+(analysed twice, absent twice, or both) is refused. A value that is not a number, is infinite, is negative in a ratio
+of totals, or is beyond `RATE_BOUND` in magnitude in a rate (whose float means it could overflow), is refused naming
+the run and the outcome.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ from expcore.stats.estimators import EstimatorSettings, ModelEstimate
 from expcore.stats.rows import AbsentRun, Row
 
 RATE, RATIO_OF_TOTALS = "rate", "ratio_of_totals"
+# A rate's values are averaged in floats; below this magnitude a sum of up to 1e8 of them cannot overflow.
+RATE_BOUND = 1e300
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,11 @@ def _number(row: Row, spec: DescriptiveSpec, outcome: str) -> float | None:
         return None
     if spec.kind == RATIO_OF_TOTALS and value < 0:
         raise ValueError(f"descriptive {spec.name!r}: outcome {outcome!r} of {row.describe()} is negative")
+    if spec.kind == RATE and abs(value) > RATE_BOUND:  # a float mean of such values can overflow to infinity
+        raise ValueError(
+            f"descriptive {spec.name!r}: outcome {outcome!r} of {row.describe()} is beyond {RATE_BOUND:g} in "
+            "magnitude, past what a mean of floats can hold without overflowing"
+        )
     return float(value)
 
 
@@ -157,27 +168,38 @@ def _rate(used: list[tuple[str, Row, float]], settings: EstimatorSettings) -> tu
     return boot.point, low, high, len(clusters), settings.replicates - defined, per_model
 
 
-def _scaled(totals: np.ndarray) -> tuple[np.ndarray, Fraction]:
-    """Exact totals as floats in [0, 1] and the scale that restores them, so no float sum of them overflows."""
-    top = max(totals.flat, default=Fraction(0))
-    if top == 0:
-        return np.zeros(totals.shape), Fraction(0)
-    return np.vectorize(lambda value: float(value / top), otypes=[float])(totals), top
+def _integers(totals: np.ndarray) -> tuple[list[int], int]:
+    """Exact totals as integers over one common denominator, so sums of them are exact big-integer sums."""
+    common = math.lcm(*(total.denominator for total in totals)) if len(totals) else 1
+    return [total.numerator * (common // total.denominator) for total in totals], common
 
 
-def _ratio_draws(numerator: np.ndarray, denominator: np.ndarray, indices: np.ndarray) -> np.ndarray:
-    """The ratio of the drawn clusters' totals in each replicate, NaN where the drawn denominators sum to 0."""
-    scaled_n, scale_n = _scaled(numerator)
-    scaled_d, scale_d = _scaled(denominator)
-    sums_d = scaled_d[indices].sum(axis=1)
-    if scale_d == 0:
-        return np.full(indices.shape[0], math.nan)
-    factor = float(scale_n / scale_d)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.where(sums_d > 0, scaled_n[indices].sum(axis=1) / sums_d * factor, math.nan)
+def _as_float(ratio: Fraction, what: str) -> float:
+    """A ratio of exact totals as the nearest float; one past the float range is refused, never infinite."""
+    try:
+        return float(ratio)
+    except OverflowError:
+        raise ValueError(f"{what}: a ratio of totals is beyond the float range") from None
 
 
-def _ratio_of_totals(used: list[tuple[str, Row, tuple[float, float]]], settings: EstimatorSettings) -> tuple:
+def _ratio_draws(numerator: np.ndarray, denominator: np.ndarray, indices: np.ndarray, what: str) -> np.ndarray:
+    """The ratio of the drawn clusters' totals in each replicate, exact until the final rounding: NaN where the drawn
+    denominators sum to 0. A replicate is the sum over clusters of how often it drew each, times its totals."""
+    nums, num_scale = _integers(numerator)
+    dens, den_scale = _integers(denominator)
+    draws = np.empty(indices.shape[0])
+    for replicate, drawn in enumerate(indices):
+        counts = np.bincount(drawn, minlength=len(nums))
+        total_d = sum(int(k) * d for k, d in zip(counts, dens, strict=True) if k)
+        if total_d == 0:
+            draws[replicate] = math.nan
+            continue
+        total_n = sum(int(k) * n for k, n in zip(counts, nums, strict=True) if k)
+        draws[replicate] = _as_float(Fraction(total_n * den_scale, total_d * num_scale), what)
+    return draws
+
+
+def _ratio_of_totals(used: list[tuple[str, Row, tuple[float, float]]], settings: EstimatorSettings, what: str) -> tuple:
     """Exact totals per (cluster, model), the ratio of their sums, and the cluster bootstrap of that ratio."""
     clusters = sorted({cluster for cluster, _, _ in used})
     models = sorted({row.model for _, row, _ in used})
@@ -188,15 +210,15 @@ def _ratio_of_totals(used: list[tuple[str, Row, tuple[float, float]]], settings:
         numerator[place] += Fraction(n)
         denominator[place] += Fraction(d)
     indices = kernel.draw_clusters(np.random.default_rng(list(settings.seed)), settings.replicates, len(clusters))
-    draws = _ratio_draws(numerator.sum(axis=1), denominator.sum(axis=1), indices)
+    draws = _ratio_draws(numerator.sum(axis=1), denominator.sum(axis=1), indices, what)
     low, high, defined = kernel.percentile_interval(draws, settings.level)
     points, by_model = [], np.empty((settings.replicates, len(models)))
     for column in range(len(models)):
         total_d = denominator[:, column].sum()
-        points.append(float(numerator[:, column].sum() / total_d) if total_d else math.nan)
-        by_model[:, column] = _ratio_draws(numerator[:, column], denominator[:, column], indices)
+        points.append(_as_float(numerator[:, column].sum() / total_d, what) if total_d else math.nan)
+        by_model[:, column] = _ratio_draws(numerator[:, column], denominator[:, column], indices, what)
     total_d = denominator.sum()
-    point = float(numerator.sum() / total_d) if total_d else math.nan
+    point = _as_float(numerator.sum() / total_d, what) if total_d else math.nan
     per_model = _model_estimates(models, points, by_model, settings)
     return point, low, high, len(clusters), settings.replicates - defined, per_model
 
@@ -209,20 +231,29 @@ def describe(
     analysed, used, keys = [], [], set()
     for row in sorted((r for r in rows if r.condition in spec.conditions), key=lambda r: r.run_key):
         if row.run_key in keys:
-            raise ValueError(f"descriptive {spec.name!r}: two rows share one run key ({row.describe()})")
+            raise ValueError(f"descriptive {spec.name!r}: two runs of the arm share one run key ({row.describe()})")
         keys.add(row.run_key)
         cluster, value = _cluster(row, spec, known), _value(row, spec)
         analysed.append((row.treatment, value is not None))
         if value is not None:
             used.append((cluster, row, value))
-    gone = [run.reason for run in absent if run.condition in spec.conditions]
+    gone = []
+    for run in absent:
+        if run.condition not in spec.conditions:
+            continue
+        if run.run_key in keys:  # analysed, or absent already: one run counted twice in the finish rate
+            raise ValueError(f"descriptive {spec.name!r}: two runs of the arm share one run key ({run.describe()})")
+        keys.add(run.run_key)
+        gone.append(run.reason)
     runs = count_arm(" + ".join(spec.conditions), analysed, gone)
     if not used:  # nothing to estimate and nothing drawn
         estimate, low, high, n_clusters, undefined, per_model = math.nan, math.nan, math.nan, 0, 0, ()
     elif spec.kind == RATE:
         estimate, low, high, n_clusters, undefined, per_model = _rate(used, settings)
     else:
-        estimate, low, high, n_clusters, undefined, per_model = _ratio_of_totals(used, settings)
+        estimate, low, high, n_clusters, undefined, per_model = _ratio_of_totals(
+            used, settings, f"descriptive {spec.name!r}"
+        )
     return DescriptiveResult(
         name=spec.name,
         kind=spec.kind,
