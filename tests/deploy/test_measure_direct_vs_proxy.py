@@ -90,6 +90,39 @@ def test_o37_a_file_whose_replay_is_not_complete_in_both_passes_is_incomplete_ne
     assert found["same"] is None
 
 
+def test_o37_the_same_reads_with_a_different_final_placement_are_not_the_same(script):
+    """O37: each read gained the same, but a late prefetch placed more under one mode before the final read of the map:
+    the sequence did not place the same bytes."""
+    base = {TAG: replay([(0, 10)], placed=[[0, 10]])}
+    other = {TAG: replay([(0, 10)], placed=[[0, 20]])}
+    [found] = script.compare(base, other)
+    assert found["differing_reads"] == []
+    assert found["placed_same"] is False
+    assert found["same"] is False
+
+
+def test_o37_every_file_of_the_measurement_is_compared_even_when_both_passes_failed_to_start(script):
+    """O37: a round whose two passes both failed gives nothing to compare; its files are still each incomplete, so the
+    round can never vanish from the verdict and leave a yes."""
+    found = script.compare({}, {}, [TAG, "pread-A"])
+    assert [(f["file"], f["incomplete"]) for f in found] == [
+        (TAG, "missing in a pass"),
+        ("pread-A", "missing in a pass"),
+    ]
+    good = script.compare({TAG: replay([(0, 10)])}, {TAG: replay([(0, 10)])}, [TAG])
+    assert script.verdict(good + script.compare({}, {}, [TAG]))["same_placed_bytes_per_read_sequence"] is None
+
+
+def test_o37_a_direct_pass_whose_reads_went_through_the_provider_is_incomplete_never_the_same(script):
+    """O37: a direct pass whose sidecar logged a fallback (or whose log could not be read) after its reads did not
+    read directly, so its files compare as incomplete, never as the same placement."""
+    base = {TAG: replay([(0, 10)])}
+    other = {TAG: {**replay([(0, 10)]), "not_direct": ["proxy_fallback"]}}
+    [found] = script.compare(base, other)
+    assert found["same"] is None
+    assert found["incomplete"] == "a direct pass did not read directly, or could not be shown to"
+
+
 def test_o37_the_verdict_is_yes_only_when_every_file_compared_and_none_differs(script):
     """O37: unknown is never yes, and one difference is a no."""
     same = {"file": "a", "same": True, "incomplete": None}

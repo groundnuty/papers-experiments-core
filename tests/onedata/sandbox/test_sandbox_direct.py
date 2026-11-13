@@ -164,6 +164,51 @@ def test_o37_a_start_whose_check_does_not_show_direct_io_is_refused_and_leaves_n
     assert not direct.host.mounts
 
 
+def test_o37_a_direct_run_whose_log_stays_clean_is_collected_and_records_it(direct, tmp_path):
+    """O37: at collection the sidecar's log is read again; with no detection or fallback line since the start, the
+    run is collected and its record says so (`mount.direct.during_run`, the names of the lines found: none)."""
+    sbx = start(direct)
+    sbx.collect(tmp_path / "evidence")
+    written = json.loads((tmp_path / "evidence" / "metadata.json").read_text())
+    assert written["mount"]["direct"]["during_run"] == []
+    sbx.stop()
+
+
+@pytest.mark.parametrize(
+    ("change", "words"),
+    [
+        (lambda d: setattr(d, "log", d.log + FALLBACK), "proxy_fallback"),
+        (lambda d: setattr(d, "log_readable", False), "could not be read"),
+    ],
+)
+def test_o37_a_direct_run_that_read_through_the_provider_is_set_aside_at_collection(direct, tmp_path, change, words):
+    """O37: a file of the study's data whose direct read is refused for permissions falls back to the provider after
+    the start's check passed (`fsLogic.cc`, `readInternal`); the run then did not read directly, so its collection
+    fails as the harness's (`output_collection`) and it is never scored as a direct run. An unreadable log is the
+    same: unknown is never direct."""
+    from expcore.errors import InfraError
+
+    sbx = start(direct)
+    change(direct.direct)
+    with pytest.raises(InfraError) as caught:
+        sbx.collect(tmp_path / "evidence")
+    assert caught.value.kind == "output_collection"
+    assert words in str(caught.value)
+    sbx.stop()
+
+
+def test_o37_the_lines_of_a_direct_mount_can_be_read_at_any_time_and_none_means_unknown(direct):
+    """O37: `direct_io_lines` gives the names of the marker lines the sidecar's log holds now, for a harness that checks
+    a pass after its reads, and None when the log could not be read."""
+    sbx = start(direct)
+    assert sbx.direct_io_lines() == []
+    direct.direct.log += FALLBACK
+    assert sbx.direct_io_lines() == ["proxy_fallback"]
+    direct.direct.log_readable = False
+    assert sbx.direct_io_lines() is None
+    sbx.stop()
+
+
 def test_o37_a_proxy_mount_runs_no_direct_check(world):
     """O37: proxy reads through the provider; the start reads no oneclient log and runs no probe of a check file."""
     handled = []

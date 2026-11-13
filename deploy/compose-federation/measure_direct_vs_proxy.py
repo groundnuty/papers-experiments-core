@@ -29,13 +29,18 @@ host, by default the Compose layout's `<federation root>/<local provider>/storag
 3. Each pass: every fixture evicted from the local provider and shown held by the holder alone; a fresh sandbox (a new
    oneclient process, so nothing is cached) with the pass's `io_mode`; for direct, the storage mapped read-only into
    the sidecar and the start's check, whose facts are logged; each file's reads replayed by one resident process,
-   settled after each read on the local provider's block map, as the sweep does; the sandbox stopped.
+   settled after each read on the local provider's block map, as the sweep does; for direct, the sidecar's log read
+   again after the reads (a read refused for permissions goes through the provider, and only the log says so); the
+   sandbox stopped.
 4. The comparison (`compare`, `verdict`): for each file, each read's gained ranges under the one pass against the
-   other's, and the ranges placed at the end. A file whose replay is not complete in both passes (a failed read, a
-   block map that did not settle, a replay that did not end, a pass that did not start) is incomplete, never the same.
+   other's, and the ranges placed at the end; a file is the same only when both agree. A file whose replay is not
+   complete in both passes (a failed read, a block map that did not settle, a replay that did not end, a pass that did
+   not start, a direct pass whose log shows a read through the provider or cannot be read) is incomplete, never the
+   same, and every file of the measurement is compared in every round, even when neither pass has it.
 
-Every event is one JSON line in `measure.jsonl`, and the verdict is `verdict.json`: offsets, lengths, bytes, counts,
-seconds and tags, never a token, an address, a name or a path. Every file is deleted at the end.
+Every event is one JSON line in `measure.jsonl`, and the verdict is `verdict.json`, which says whether the measurement
+ran to its end (`complete`): offsets, lengths, bytes, counts, seconds and tags, never a token, an address, a name or a
+path. Every file is deleted at the end.
 """
 
 import argparse
@@ -112,6 +117,8 @@ def _incomplete(base: Mapping[str, Any] | None, other: Mapping[str, Any] | None)
     """Why one file's two replays cannot be compared, or None when both are complete."""
     if base is None or other is None:
         return "missing in a pass"
+    if base.get("not_direct") or other.get("not_direct"):
+        return "a direct pass did not read directly, or could not be shown to"
     if len(base["reads"]) != len(other["reads"]):
         return "read counts differ"
     if not (base.get("ended") and other.get("ended")):
@@ -128,12 +135,16 @@ def _ranges(value: Sequence[Sequence[int]]) -> list[tuple[int, int]]:
     return merged((int(offset), int(length)) for offset, length in value)
 
 
-def compare(base: Mapping[str, Mapping[str, Any]], other: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
+def compare(
+    base: Mapping[str, Mapping[str, Any]], other: Mapping[str, Mapping[str, Any]], tags: Sequence[str] = ()
+) -> list[dict[str, Any]]:
     """Each file's replay under one pass (`base`) against the other's, by its tag: every read whose gained ranges
     differ, with the bytes each gained and the bytes only one of them gained, and the same for the ranges placed at the
-    end. `same` is None for a file that is incomplete (`incomplete` says why), else whether no read differed."""
+    end. `tags` are the measurement's files, each compared even when neither pass has it (both failed to start), so a
+    file never vanishes from the verdict. `same` is None for a file that is incomplete (`incomplete` says why), else
+    whether no read differed and the placement at the end is the same."""
     out = []
-    for tag in sorted(set(base) | set(other)):
+    for tag in sorted(set(tags) | set(base) | set(other)):
         b, o = base.get(tag), other.get(tag)
         why = _incomplete(b, o)
         found: dict[str, Any] = {"file": tag, "same": None, "incomplete": why}
@@ -149,7 +160,8 @@ def compare(base: Mapping[str, Mapping[str, Any]], other: Mapping[str, Mapping[s
                     })  # fmt: skip
             pb, po = _ranges(b["placed"]), _ranges(o["placed"])
             found.update(
-                same=not differing, reads_compared=len(b["reads"]), differing_reads=differing, placed_same=pb == po,
+                same=not differing and pb == po, reads_compared=len(b["reads"]), differing_reads=differing,
+                placed_same=pb == po,
                 placed_base_bytes=held_bytes(pb), placed_other_bytes=held_bytes(po),
                 placed_only_base_bytes=held_bytes(uncovered(po, pb)),
                 placed_only_other_bytes=held_bytes(uncovered(pb, po)),
@@ -298,6 +310,11 @@ def run_pass(ctx: dict, entry: dict, fixtures: list[dict], log: Log) -> dict[str
         errors = sandbox.sidecar_errors() or {}
         log("sidecar", **{"pass": label}, round=entry["round"], total=errors.get("total"),
             by_kind=errors.get("by_kind"), signatures=errors.get("signatures"))  # fmt: skip
+        if entry["mode"] == "direct":  # a read refused for permissions went through the provider: not a direct pass
+            lines = sandbox.direct_io_lines()
+            log("direct_after_reads", **{"pass": label}, round=entry["round"], lines=lines)
+            if lines is None or lines:
+                results = {tag: {**result, "not_direct": lines or ["log unread"]} for tag, result in results.items()}
         return results
     finally:
         try:
@@ -355,6 +372,7 @@ def measure(args: argparse.Namespace, sequences: list[dict], images: dict, log: 
                            "space": proxy.space.name, "limit": args.limit or None, "round": None,
                            "mount": proxy.sandbox.mount.path, "agent_uid": proxy.sandbox.agent_uid}  # fmt: skip
     comparisons: dict[str, list] = {}
+    finished = False
     try:
         ctx["top"] = files.make(local, files.root(local), run, "DIR")
         seen = consistency.converge(
@@ -368,15 +386,18 @@ def measure(args: argparse.Namespace, sequences: list[dict], images: dict, log: 
         passes: dict[tuple[int, str], dict | None] = {}
         for entry in pass_plan(args.rounds, control=args.control):
             passes[(entry["round"], entry["label"])] = run_pass(ctx, entry, fixtures, log)
+        tags = [f"{f['mode']}-{f['id']}" for f in fixtures]  # every file, even of a round whose passes both failed
         for r in range(args.rounds):
             pairs = [("proxy", "direct")] + ([("proxy", "proxy-control")] if args.control else [])
             for a, b in pairs:
-                found = compare(passes[(r, a)] or {}, passes[(r, b)] or {})
+                found = compare(passes[(r, a)] or {}, passes[(r, b)] or {}, tags)
                 comparisons.setdefault(f"{a}~{b}", []).extend(found)
                 for c in found:
                     log("compare", round=r, pair=f"{a}~{b}", **c)
+        finished = True
     finally:
-        result = {pair: verdict(found) for pair, found in comparisons.items()}
+        # a measurement that stopped early has no verdict: `complete` false, whatever the pairs compared so far say
+        result = {"complete": finished, **{pair: verdict(found) for pair, found in comparisons.items()}}
         (args.out / "verdict.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         log("verdict", **result)
         log("cleanup", failures=files.remove_all())
