@@ -122,7 +122,16 @@ BAD_EDITS = {
         lambda d: d.update(tokens={"max_excess_s": 10, "mint_headroom_s": 20}),
         "mint_headroom_s",
     ),
+    "negative revocation settle": (lambda d: d.update(tokens={"revocation_settle_s": -1}), "revocation_settle_s"),
 }
+
+
+def test_c19_the_revocation_settle_is_330_seconds_unless_the_file_says_otherwise(tmp_path, monkeypatch):
+    """C19: a revoked slot is free once the revocation has had time to reach every provider: a pushed change in
+    seconds, and at most the provider's purge after a lost connection (300 s) plus a session's recheck (15 s)."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    assert load(tmp_path).tokens.revocation_settle_s == 330
+    assert load(tmp_path, lambda d: d.update(tokens={"revocation_settle_s": 600})).tokens.revocation_settle_s == 600
 
 
 @pytest.mark.parametrize("name", sorted(BAD_EDITS))

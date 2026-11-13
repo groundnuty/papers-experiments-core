@@ -39,6 +39,7 @@ margin_s = 900                  # a token outlives the run's whole-time ceiling 
 max_excess_s = 600              # and by at most this much more
 mint_headroom_s = 300           # the lifetime asked for beyond the minimum, for the seconds before examination
 max_ttl_s = 86400               # optional: the longest lifetime the platform grants
+revocation_settle_s = 330       # a slot's revoked tokens count as gone this long after the revocation is confirmed
 
 [principals.data_path]          # optional fixed users for runs that lease none (day-0, health, live checks)
 username = "..."                # the login name whose credential file is read
@@ -129,12 +130,17 @@ class Provider:
 
 @dataclass(frozen=True)
 class TokenSettings:
-    """The lifetime rule's numbers (O06)."""
+    """The lifetime rule's numbers (O06), and how long a confirmed revocation takes to settle (C19).
+
+    `revocation_settle_s` covers its propagation to the providers: pushed at once over Graph Sync, and at worst the
+    300 s after which a provider whose connection to Onezone broke purges its cache, plus the 15 s an open session
+    waits before it checks its token again (`users.py`)."""
 
     margin_s: int = 900
     max_excess_s: int = 600
     mint_headroom_s: int = 300
     max_ttl_s: int | None = None
+    revocation_settle_s: int = 330
 
 
 @dataclass(frozen=True)
@@ -372,7 +378,7 @@ def _providers(root: Section) -> dict[str, Provider]:
 
 def _tokens(section: Section) -> TokenSettings:
     """Read the optional [tokens] table."""
-    section.reject_unknown(("margin_s", "max_excess_s", "mint_headroom_s", "max_ttl_s"))
+    section.reject_unknown(("margin_s", "max_excess_s", "mint_headroom_s", "max_ttl_s", "revocation_settle_s"))
     base = TokenSettings()
     max_ttl = _number(section, "max_ttl_s", 0, minimum=1, integer=True) if "max_ttl_s" in section.data else None
     settings = TokenSettings(
@@ -380,6 +386,7 @@ def _tokens(section: Section) -> TokenSettings:
         int(_number(section, "max_excess_s", base.max_excess_s, minimum=0, integer=True)),
         int(_number(section, "mint_headroom_s", base.mint_headroom_s, minimum=0, integer=True)),
         None if max_ttl is None else int(max_ttl),
+        int(_number(section, "revocation_settle_s", base.revocation_settle_s, minimum=0, integer=True)),
     )
     if settings.mint_headroom_s > settings.max_excess_s:
         raise section.fail("mint_headroom_s", "must not exceed max_excess_s, or a fresh token fails its examination")

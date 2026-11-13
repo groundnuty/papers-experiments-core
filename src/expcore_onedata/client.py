@@ -30,10 +30,12 @@ Reads and mutations are separate calls:
   else, a path of a provider among it, resolves to no space and is refused, so a mistaken or hostile target cannot
   reach a space outside the study's. What remains is the interval between the name's read and the platform acting on
   the request, which a client cannot close;
-- `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
-  password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
+- `mint_own_token`, `own_temporary_generation` and `revoke_own_temporary_tokens` are the operations on credentials,
+  each sent as one platform user with its own password (HTTP Basic), on that user's own temporary tokens alone: the
+  user mints one, as the earlier code did, reads their generation, or revokes all of them, which needs no privilege
+  and reaches no other user's (C19). They act on no space, so they have calls of their own; the password is
   registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
-  the client itself uses, when the client is built. Tokens are not revoked: they end with their lifetime.
+  the client itself uses, when the client is built.
 
 **The space of a file.** Onedata 25.0 gives a file no path and no space attribute, so the gate walks the file's
 parent links: `GET /data/{id}?attribute=parent_id` through the provider the request is for, from the file up, until it
@@ -107,6 +109,21 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   has made it, so it is in `UNVERIFIED_ENDPOINTS`.
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
+- The revocation of a run's tokens at its end (`users.SlotTokens.revoke`, C19): `own_temporary_generation` is `GET
+  /user/tokens/temporary` and `revoke_own_temporary_tokens` is `DELETE /user/tokens/temporary`, each with
+  `Authorization: Basic` of the user itself, the path `mint_own_token` posts to. The DELETE gives the user a new
+  secret and a generation one higher, which revokes every temporary token of that user, and answers 204; the GET
+  answers `{"generation": N}`. Neither needs a privilege. A temporary token is checked by its generation, so this is
+  the only revocation of one; per-token revocation exists for named tokens alone. `query` sends `POST
+  /tokens/verify_access_token`, body `{"token"}`, with no header, as the scope inference is sent: it compares the
+  token's generation with its user's before any caveat and answers an older one 400 `tokenRevoked`, while
+  `/tokens/examine` only decodes a token and never shows it revoked. All three are named by onedata/oz-worker at
+  14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55: src/http/rest/routes/token_routes.erl:163-176 (the two routes, "does not
+  require any specific privileges"), src/logic/token_logic_plugin.erl:165-176 (the verification), 330-331 and
+  379-380 (the revocation, authorised for the user itself), src/datastore/models/temporary_token_secret.erl:72-89 and
+  199-224 (the new generation, and its read), src/auth/token_auth.erl:357-364 (generations compared first); and
+  onedata/ctool's `tokenRevoked`, HTTP 400 (src/errors/types/auth/token/od_error_token_revoked.erl:50-52). No live
+  run has made them, so they are in `UNVERIFIED_ENDPOINTS`.
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
 - Step 4b2 sends to a provider (all confirmed by [S8], whose code sends them and reads the answers as the layer does):
   `GET /spaces/{space}` (the key `fileId` is the space's root; [L1] shows it the same on every provider),
@@ -166,11 +183,12 @@ caller that measures the platform leaves the default, one attempt. The request t
 gate stays closed: each attempt that is answered is read afresh and decides, and after the last timeout the mutation
 or the range read is refused as not sent (`ScopeUnread`).
 
-No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
-which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, the
-reads of a user's Onezone admin privileges and of the clusters a token's user is a member of, and Onezone's reading of
-the global clock, since [L1] confirmed every other call and detail the layer relies on.
+A token ends with the lifetime it was minted with, which derives from the attempt's whole-time ceiling (O06), unless
+its user revokes it first: the one revocation this client sends is a slot user's own, of all its temporary tokens, at
+the end of a run that held the slot (C19). `UNVERIFIED_ENDPOINTS` lists what neither a source nor [L1] confirms: only
+the reset's QoS calls and its cancel, the truncation by a write of content without an offset, the reads of a user's
+Onezone admin privileges and of the clusters a token's user is a member of, Onezone's reading of the global clock, and
+the three calls of a run's revocation, since [L1] confirmed every other call and detail the layer relies on.
 Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
 """
@@ -202,8 +220,16 @@ AUTH_HEADER = "X-Auth-Token"  # [S2]
 MUTATING = ("POST", "PUT", "PATCH", "DELETE")
 UPLOAD_CONTENT_TYPE = "application/octet-stream"  # of every raw body a mutation sends; [L1]: 25.0 refuses one without
 # POSTs that only read, and whether they are sent with the admin credential: the examination is [S4], [S5], called as
-# an admin; the scope inference is [S6], called without a header.
-READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_access_token_scope": False}
+# an admin; the scope inference is [S6], called without a header, and so is the verification of an access token, which
+# a revocation is confirmed by (C19).
+VERIFY_TOKEN_PATH = "/tokens/verify_access_token"
+READING_POSTS: Mapping[str, bool] = {
+    "/tokens/examine": True,
+    "/tokens/infer_access_token_scope": False,
+    VERIFY_TOKEN_PATH: False,
+}
+# A user's own temporary tokens: POST mints one, GET reads their generation, DELETE revokes all of them (HTTP Basic).
+TEMPORARY_TOKENS_PATH = "/user/tokens/temporary"
 # Onezone's reading of the global clock, which a job's times are stamped on: a GET it answers to anyone, so `get_dated`
 # sends it with no credential header when asked to (`anonymous`), and for this path alone.
 ZONE_TIME_PATH = "/provider/public/get_current_time"
@@ -275,6 +301,27 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "a Onezone call sent with no credential: the global clock, which a job's times are stamped on, in epoch "
         "milliseconds under timeMillis, which the transfer log and the reset's history place their window by; named "
         "only by oz-worker's source (14b5bda, provider_routes.erl:192-198), which says it needs no privilege",
+    ),
+    (
+        "GET",
+        TEMPORARY_TOKENS_PATH,
+        "a Onezone call sent as the user itself (HTTP Basic): the generation of its temporary tokens under "
+        "generation, read before and after a revocation, which must make it rise; named only by oz-worker's source "
+        "(14b5bda, token_routes.erl:163-169, temporary_token_secret.erl:199-224)",
+    ),
+    (
+        "DELETE",
+        TEMPORARY_TOKENS_PATH,
+        "a Onezone call sent as the user itself (HTTP Basic), with no privilege: revokes every temporary token of "
+        "that user by a new generation, answered 204, at the end of a run that held the user's slot; named only by "
+        "oz-worker's source (14b5bda, token_routes.erl:170-176, token_logic_plugin.erl:330-331, 379-380)",
+    ),
+    (
+        "POST",
+        VERIFY_TOKEN_PATH,
+        "a Onezone call sent with no credential, as the scope inference is: a token older than its user's generation "
+        "answered 400 tokenRevoked before any caveat is checked, which confirms a revocation; named only by "
+        "oz-worker's source (14b5bda, token_logic_plugin.erl:165-176, token_auth.erl:357-364) and ctool's error",
     ),
 )
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
@@ -1300,23 +1347,45 @@ class OnezoneClient:
         The user authenticates with its own password (HTTP Basic), read from its credential file the moment it is
         needed and registered as a secret, and the minted value is registered before it is returned (R12). [S1]
         """
-        users = self._config.users
-        if users is None:
-            raise MintNotSent("zone: platform.toml declares no [credentials.users], so no user can mint a token")
-        try:
-            password = users.read(principal.username, self._environ)
-        except ConfigError as error:
-            raise MintNotSent(f"zone: a user's credential cannot be used ({error})") from None
-        basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
         body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}
-        answer = self._send(
-            "POST", "/user/tokens/temporary", provider=None, headers={"Authorization": f"Basic {basic}"}, json=body
-        )
+        headers = self._as_user(principal, MintNotSent, "mint a token")
+        answer = self._send("POST", TEMPORARY_TOKENS_PATH, provider=None, headers=headers, json=body)
         value = answer.get("token") if isinstance(answer, dict) else None
         if not isinstance(value, str) or not value:
             raise PlatformError("zone: the answer to a token request holds no token")
         register_secret(value)
         return value
+
+    def own_temporary_generation(self, principal: Principal) -> int:
+        """Read, as the user itself, the generation of its temporary tokens: a whole number that a revocation raises.
+
+        An answer without one is a PlatformError; a user whose credential cannot be read is `NotSent`.
+        """
+        headers = self._as_user(principal, NotSent, "read its tokens")
+        answer = self._send("GET", TEMPORARY_TOKENS_PATH, provider=None, headers=headers)
+        generation = answer.get("generation") if isinstance(answer, dict) else None
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise PlatformError("zone: the answer to a read of a user's temporary tokens holds no generation")
+        return generation
+
+    def revoke_own_temporary_tokens(self, principal: Principal) -> None:
+        """Revoke, as the user itself, every temporary token of that user, and of no other: Onezone gives the user a
+        new generation, so each token of an older one is refused. It needs no privilege; a failure is a PlatformError
+        (`NotSent` when the user's credential cannot be read), and only a later read of the generation confirms it."""
+        headers = self._as_user(principal, NotSent, "revoke its tokens")
+        self._request("DELETE", TEMPORARY_TOKENS_PATH, provider=None, headers=headers)
+
+    def _as_user(self, principal: Principal, refused: type[NotSent], what: str) -> dict[str, str]:
+        """The header that logs in as the user (HTTP Basic), its password read now; `refused` when it cannot be."""
+        users = self._config.users
+        if users is None:
+            raise refused(f"zone: platform.toml declares no [credentials.users], so no user can {what}")
+        try:
+            password = users.read(principal.username, self._environ)
+        except ConfigError as error:
+            raise refused(f"zone: a user's credential cannot be used ({error})") from None
+        basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
+        return {"Authorization": f"Basic {basic}"}
 
 
 def tcp_connect(host: str, port: int, timeout_s: float) -> float:
