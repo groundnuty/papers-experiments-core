@@ -310,6 +310,60 @@ def test_o03_the_mount_live_test_puts_the_sidecar_on_the_federation_network_dial
         derive_platform(own / "platform.toml", tmp_path, table)
 
 
+@needs_openssl
+def test_o03_the_rest_live_test_puts_the_gate_on_the_federation_network_dialling_names_the_certificates_hold(
+    fed, tmp_path
+):
+    """O30 (#203): the live REST-path test runs with a copy of the federation's platform.toml and a `[sandbox]` table
+    of one REST level, whose `[sandbox.federation]` names the project's network, the zone's domain and the local
+    provider's. The gate then serves and dials those domains on port 443, never the loopback ports the platform file's
+    URLs give, and each is a name the certificate the federation issues that service holds, so the gate's check of it
+    against the federation's CA passes."""
+    from mount_live import derive_platform, federation_network
+    from rest_live import REST_LEVEL, rest_sandbox_table
+
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.sandbox.api import DataPathMode, Endpoint
+    from expcore_onedata.sandbox.containers import gate_network, gate_upstreams
+
+    root, own = tmp_path / "root", tmp_path / "own"
+    root.mkdir()
+    own.mkdir()
+    layout = fed.layout.Layout(root)
+    fed.facts.write_facts(layout, fake_boot(fed, layout))
+    ca, ca_key = root / "ca" / "federation-ca.pem", tmp_path / "ca.key"
+    ca.parent.mkdir()
+    fed.pki.make_ca(ca, ca_key, "test CA")
+    facts = json.loads(layout.facts.read_text(encoding="utf-8"))
+    local = layout.spec.holder
+    table = rest_sandbox_table(
+        work_root=own / "work",
+        images={"agent": ("agent:1", "sha256:" + "a" * 64), "gate": ("gate:1", "sha256:" + "b" * 64)},
+        pool="10.77.0.0/24",
+        network=federation_network(facts),
+        zone_address=facts["zone"]["domain_on_project_network"],
+        local=local,
+        local_address=facts["providers"][local]["domain_on_project_network"],
+        content_check_file="hello.txt",
+    )
+    config = load_platform(derive_platform(layout.platform, own, table), require_secrets=False)
+    s = config.sandbox
+    assert s.mode_of(REST_LEVEL) is DataPathMode.REST
+    assert gate_network(s) == f"{layout.spec.project}_fed"
+    zone, provider = Endpoint.from_url(config.zone.url), Endpoint.from_url(config.local_provider.url)
+    assert (zone.host, provider.host) == ("127.0.0.1", "127.0.0.1")  # what the host reaches; no container can
+    upstreams = gate_upstreams(s, zone, provider)
+    services = {"onezone": layout.spec.zone, "oneprovider": layout.spec.provider(local)}
+    assert {h["role"]: (name, h["addr"], h["port"]) for name, h in upstreams.items()} == {
+        role: (service.domain, service.domain, 443) for role, service in services.items()
+    }
+    for role, service in services.items():
+        key, cert = tmp_path / f"{role}.key", tmp_path / f"{role}.pem"
+        sans = fed.pki.subject_alt_names(service.domain, "node1", ["127.0.0.1"])  # as up issues them
+        fed.pki.make_leaf(ca, ca_key, key, cert, service.domain, sans, tmp_path)
+        fed.pki.verify_leaf(ca, cert, service.domain)
+
+
 def test_a_layout_without_a_template_writes_facts_and_says_there_is_no_platform_file(fed, minimal_layout, tmp_path):
     layout = fed.layout.Layout(tmp_path, spec=fed.spec.load_spec(minimal_layout))
     assert "no platform.toml" in fed.facts.write_facts(layout, fake_boot(fed, layout))
