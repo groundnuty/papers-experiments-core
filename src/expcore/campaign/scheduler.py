@@ -133,6 +133,13 @@ class Scheduler:
         missing = [m for m in self.plan_models if m not in self.endpoints]
         if missing:
             raise ValueError(f"the plan runs model(s) {', '.join(missing)} that have no admitted endpoint")
+        # The lease groups of the plan's runs, asked of the platform once, before the store is opened or a model probed:
+        # a platform that can name no group for a run (O30: no slot holds its condition's rights) refuses it here.
+        self.plan_groups: tuple[str, ...] = (
+            tuple(sorted({g for row in manifest.rows if (g := lease_group(row.key.factors)) is not None}))
+            if leases is not None
+            else ()
+        )
         self.settings.check_kinds(schema)
         exclusive = [name for name, value in schema.exclusive.items() if value]
         if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
@@ -353,8 +360,7 @@ class Scheduler:
         assert self.store
         if self.leases is None:
             return
-        groups = {g for row in self.manifest.rows if (g := self.lease_group(row.key.factors)) is not None}
-        held_back = self.leases.sweep_dead_holders(groups)
+        held_back = self.leases.sweep_dead_holders(self.plan_groups)
         if held_back:
             self.store.event(
                 self.stamp(),

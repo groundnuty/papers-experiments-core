@@ -39,11 +39,15 @@ def declare(data, *, second_data="slot-two-data", second_tool="slot-two-tool"):
     data["slots"] = {
         "one": {
             "data_path": {"username": "slot-one-data", "user_id": "u-1d"},
-            "toolserver": {"username": "slot-one-tool", "user_id": "u-1t"},
+            "toolserver": {"username": "slot-one-tool", "user_id": "u-1t", "rights": BASELINE},
         },
         "two": {
             "data_path": {"username": second_data, "user_id": LOGINS.get(second_data, ("", second_data))[1]},
-            "toolserver": {"username": second_tool, "user_id": LOGINS.get(second_tool, ("", second_tool))[1]},
+            "toolserver": {
+                "username": second_tool,
+                "user_id": LOGINS.get(second_tool, ("", second_tool))[1],
+                "rights": BASELINE,
+            },
         },
     }
 

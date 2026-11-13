@@ -17,13 +17,24 @@ user_id = "..."                # the id Onezone gives the user
 [slots.<name>.toolserver]      # the user whose token the tool server gets; never the data path's
 username = "..."
 user_id = "..."
+rights = ["space_view", ...]    # required: the rights this user holds, exactly; a condition's vocabulary and rules
 ```
 
-The leases are the core's (`expcore.campaign.lease`): the plugin hands the scheduler `lease_group` (the constant `GROUP`)
-and `lease_keys` (`Slots.keys_of`), and the scheduler takes, holds and releases the key. `Slots.users_of(lease)` then says
-which two users the run has. The slots are the only pool of leased users: the sandbox platform
-(`sandbox/provider.py`) leases a slot for every run that needs a data-path token or a tool server, mints both through
-`SlotTokens`, and its probe is a `SlotProbe` whose `sandbox_gone` is the sandbox's own probe.
+The leases are the core's (`expcore.campaign.lease`): the plugin hands the scheduler `lease_group` and `lease_keys`
+(`Slots.keys_of`), and the scheduler takes, holds and releases the key. `Slots.users_of(lease)` then says which two users
+the run has. The slots are the only pool of leased users: the sandbox platform (`sandbox/provider.py`) leases a slot for
+every run that needs a data-path token or a tool server, mints both through `SlotTokens`, and its probe is a `SlotProbe`
+whose `sandbox_gone` is the sandbox's own probe.
+
+**A slot serves the conditions whose rights its tool-server user holds (O30).** That user must hold exactly the rights
+of the condition its token is minted for (`tokens.py`), so each set of rights the slots declare is a lease group of its
+own, `group_of(rights)`, holding the slots that declare it in the order of the file; conditions with the same rights
+share it. A run with a tool server leases from its condition's group, so one campaign can interleave conditions of
+different rights, each run on a slot whose user holds its condition's, and waits only for a slot of that group. A run
+with a data path and no tool server needs only a data-path user, which every slot has with the baseline rights, so it
+leases from `GROUP`, every slot. A condition whose rights no slot declares has no group: asking for it is refused
+(`Slots.group_for`), which the platform does for every run of the plan when the campaign is built. `SlotTokens.mint`
+refuses, before it journals or mints anything, a slot that declares other rights than the condition's.
 
 **A slot is free again only when its tokens have ended.** No token is ever revoked, so a token minted for a slot stays
 good until its lifetime ends, and a run that died may have left a sandbox using it. `SlotTokens.mint` fixes the end of
@@ -80,7 +91,7 @@ import math
 import os
 import secrets
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -89,24 +100,32 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.config import NAME, PlatformConfig
 from expcore_onedata.credentials import Principal
+from expcore_onedata.rights import rights_problem
 from expcore_onedata.tokens import DroppedToken, RunTokens, TokenIssuer, token_window
 
 if TYPE_CHECKING:
     from expcore_onedata.toolserver import EventSink
 
-GROUP = "platform_users"
+GROUP = "platform_users"  # every slot: the group of a run with a data path and no tool server
 EVENT_EXPIRY_BEYOND_REQUEST = "token_expiry_beyond_request"
 JOURNAL = "tokens.jsonl"
 SAFETY_MARGIN_S = 60.0  # seconds past a journalled end before a slot counts as free: clock skew and whole-second expiry
 
 
+def group_of(rights: Iterable[str]) -> str:
+    """The lease group of the slots whose tool-server user holds these rights: `GROUP`, a colon and the rights, sorted
+    and joined by '+'. The privilege vocabulary names no federation (O12), so the group can be logged as it is."""
+    return f"{GROUP}:{'+'.join(sorted(rights))}"
+
+
 @dataclass(frozen=True)
 class Slot:
-    """One lease key and the two platform users it gives a run."""
+    """One lease key, the two platform users it gives a run, and the rights its tool-server user holds (sorted)."""
 
     name: str
     data_path: Principal
     tool_server: Principal
+    rights: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -115,11 +134,33 @@ class Slots:
 
     slots: tuple[Slot, ...]
 
+    @property
+    def groups(self) -> tuple[str, ...]:
+        """The lease groups the slots declare: `GROUP`, then one per set of rights, in the order the file first has it."""
+        return (GROUP, *dict.fromkeys(group_of(slot.rights) for slot in self.slots))
+
     def keys_of(self, group: str) -> list[str]:
-        """Return the lease keys of the group; refuse a group this layer does not declare, so a typo is not an empty pool."""
-        if group != GROUP:
-            raise ValueError(f"the platform declares the lease group {GROUP!r}, not {group!r}")
-        return [slot.name for slot in self.slots]
+        """Return the lease keys of the group, in the order of the file: every slot for `GROUP`, and for a group of rights
+        the slots whose tool-server user declares them. Refuse a group the slots do not declare, so a typo, or rights no
+        slot holds, is never an empty pool."""
+        if group == GROUP:
+            return [slot.name for slot in self.slots]
+        keys = [slot.name for slot in self.slots if group_of(slot.rights) == group]
+        if not keys:
+            raise ValueError(
+                f"the slots declare the lease group {GROUP!r} and one per set of tool-server rights "
+                f"({', '.join(map(repr, self.groups[1:]))}), not {group!r}"
+            )
+        return keys
+
+    def group_for(self, rights: Iterable[str]) -> str:
+        """Return the lease group of a condition with these rights; raise ValueError when no slot's tool-server user
+        declares them, since its runs could lease no slot."""
+        wanted = sorted(rights)
+        group = group_of(wanted)
+        if group not in self.groups:
+            raise ValueError(f"no slot's tool-server user declares the rights {', '.join(wanted)}")
+        return group
 
     def label(self, key: str) -> str:
         """Name a slot for a message or an event by its position in the file, `slots[i]`, never by its name (O12)."""
@@ -133,20 +174,37 @@ class Slots:
         raise KeyError(f"no slot is named by the lease key {key!r}")
 
     def users_of(self, lease: Lease) -> Slot:
-        """Return the slot a held lease gives; refuse a lease of another group or one that has been released."""
-        if lease.group != GROUP or not lease.held:
+        """Return the slot a held lease gives; refuse a lease that has been released or is of a group the slots do not
+        declare (ValueError), whose key names no slot (KeyError), or whose slot is not of its group (ValueError)."""
+        if not lease.held or lease.group not in self.groups:
             raise ValueError("the lease is not a held lease of the platform users")
-        return self.get(lease.key)
+        slot = self.get(lease.key)
+        if slot.name not in self.keys_of(lease.group):
+            raise ValueError("the lease's slot is not one of its lease group's")
+        return slot
 
 
-def _principal(section: Section, key: str) -> Principal:
-    """Read one user of a slot."""
+def _principal(section: Section, key: str, *, extra: tuple[str, ...] = ()) -> tuple[Principal, Section]:
+    """Read one user of a slot, and return it with its table, which may hold the keys `extra` too."""
     user = section.section(key)
-    user.reject_unknown(("username", "user_id"))
+    user.reject_unknown(("username", "user_id", *extra))
     try:
-        return Principal(user.string("username"), user.string("user_id"))
+        return Principal(user.string("username"), user.string("user_id")), user
     except ValueError as error:
         raise user.fail(None, str(error)) from None
+
+
+def _rights(user: Section) -> tuple[str, ...]:
+    """Read the rights a slot's tool-server user holds: required, by a condition's rules, kept sorted as a condition's."""
+    if "rights" not in user.data:
+        raise user.fail(
+            "rights", "is required: the rights the user holds decide the conditions that may lease the slot"
+        )
+    rights = user.strings("rights")
+    problem = rights_problem(rights)
+    if problem is not None:
+        raise user.fail("rights", problem)
+    return tuple(sorted(rights))
 
 
 def load_slots(
@@ -174,7 +232,9 @@ def load_slots(
             raise table.fail(None, f"{where} must be a table")
         section = Section(raw, file, where)
         section.reject_unknown(("data_path", "toolserver"))
-        slot = Slot(name, _principal(section, "data_path"), _principal(section, "toolserver"))
+        data_path, _ = _principal(section, "data_path")
+        tool_server, tool_table = _principal(section, "toolserver", extra=("rights",))
+        slot = Slot(name, data_path, tool_server, _rights(tool_table))
         for plane, user in (("data_path", slot.data_path), ("toolserver", slot.tool_server)):
             if user.username in names or user.user_id in ids:
                 raise section.fail(plane, "names a user that another slot, plane or fixed principal already uses")
@@ -337,10 +397,18 @@ class SlotTokens:
         journalled as a provisional line (durably), and both tokens are minted with exactly that expiry. A token whose
         examined expiry differs is refused and the expiry it has is journalled. When both pass, the exact line settles
         the provisional one before the tokens are returned. Any other failure leaves the provisional line.
+
+        A slot whose tool-server user declares other rights than the condition's is refused before anything is
+        journalled or minted (O30): its user would fail the privilege check, and the run leased the wrong group.
         """
         slot = self._slots.users_of(lease)
         if interface is None and condition is None:
             raise ValueError("a run with neither a data path nor a tool server takes no slot and mints no token")
+        if condition is not None and slot.rights != tuple(sorted(self._config.condition(condition).rights)):
+            raise ValueError(
+                f"{self._slots.label(slot.name)}: its tool-server user declares other rights than "
+                f"[toolserver] {self._config.condition_label(condition)}; lease a slot of the condition's group"
+            )
         window = token_window(ceiling_s, self._config.tokens)
         mint = secrets.token_hex(8)
         valid_until = int(self._clock()) + window.mint_ttl_s
