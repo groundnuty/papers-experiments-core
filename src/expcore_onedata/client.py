@@ -141,8 +141,11 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   (`day0/2026-11-11-federation-facts-posix-and-fuse.md`). Its other calls no source sends and no live run has made yet,
   named only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET
   /data/{id}/qos/summary` (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}`
-  (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only) and `DELETE
-  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended). A cancel's and a removal's space is read from the
+  (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only), `DELETE
+  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"`, the
+  recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`; answer
+  `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`). A cancel's and a
+  removal's space is read from the
   record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
   requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
   provisioner's own) has every target checked against that space alone, its id, its name and its own prefixes.
@@ -231,6 +234,13 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "/qos_requirements/{qid}",
         "a provider call: the removal of a requirement, answered 204, after which reading it answers that it is not "
         "there; named only by the provider's API description (25.0)",
+    ),
+    (
+        "GET",
+        "/data/{id}/files",
+        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, with "
+        "include_directories, which the provider's API description omits, and effQosInheritancePath; read from the "
+        "source of the federation's build (resetqos.py), never sent by a live run, and not the default until it is",
     ),
     (
         "GET",
