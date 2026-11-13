@@ -19,6 +19,7 @@ from expcore_onedata.tokens import (
     DroppedToken,
     ExpiryMismatch,
     Plane,
+    RevocationUnconfirmed,
     Secret,
     TokenIssuer,
     data_path_spec,
@@ -448,3 +449,31 @@ def test_o05_a_federation_that_answers_privileges_as_a_dict_of_booleans_mints_no
     with pytest.raises(TokenRefused, match="direct privileges could not be read"):
         issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
     assert fake.issued == {}
+
+
+def test_c19_a_user_revokes_its_own_tokens_and_the_generation_must_rise(issuer, fake):
+    """C19: the generation before and after the user's own revocation; a token minted before it is revoked."""
+    token = issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
+    assert issuer.revoke_own(DATA) == (1, 2)
+    issuer.require_revoked(token.reveal())  # answered 400 tokenRevoked
+    fake.revoke_bumps = False
+    with pytest.raises(RevocationUnconfirmed, match="did not rise"):
+        issuer.revoke_own(DATA)
+
+
+def test_c19_only_token_revoked_confirms_a_revocation(issuer, fake):
+    """C19: examining a token only decodes it, and verifying refuses the caveated data-path token for its caveats
+    anyway, so neither a clean answer nor any other error shows the token revoked: only 400 `tokenRevoked` does."""
+    token = issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
+    with pytest.raises(RevocationUnconfirmed, match="tokenCaveatUnverified") as caught:
+        issuer.require_revoked(token.reveal())  # not revoked: refused for its data-access caveats
+    assert token.reveal() not in str(caught.value)
+    for answer in ((200, None), (400, "badValueToken"), (403, "tokenRevoked"), (500, "internalServerError")):
+        fake.verify_override = answer
+        with pytest.raises(RevocationUnconfirmed):
+            issuer.require_revoked(token.reveal())
+    fake.verify_override = (400, "tokenRevoked")
+    issuer.require_revoked(token.reveal())
+    assert [r.path for r in fake.requests if "examine" in r.path] == [
+        "/api/v3/onezone/tokens/examine"
+    ]  # only the mint's own examination: a revocation is never confirmed by one
