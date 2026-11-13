@@ -201,8 +201,8 @@ def test_o43_an_agent_cap_that_the_kept_text_fits_but_its_note_does_not_shows_th
 
 def test_o43_a_cap_a_few_characters_short_of_the_kept_text_and_its_note_leaves_a_piece_of_the_note(big_cell):
     """O43: the note is part of the text the cap counts, and the loop's notice takes room from the cap too, so a cap
-    below the whole text by fewer than the note is longer than the loop's notice (14 characters: 1,048,650 to
-    1,048,663) cuts the note in the middle. It is the same piece on every run, and a study keeps its cap away."""
+    1 to 14 characters below the whole text (1,048,650 to 1,048,663) cuts the note in the middle. It is the same
+    piece on every run, and a study keeps its cap away."""
     run = model_sees(big_cell, 1_048_663)
     assert run.result.text == (
         "a" * KEPT + "\n[output cut by\n[output truncated: 73 of 1048664 characters dropped by the harness cap]"
