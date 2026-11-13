@@ -216,6 +216,9 @@ def test_o05_the_gates_tls_keys_are_given_to_its_user_read_only_as_its_token_fil
         assert ["chown", "0:0", str(key)] in world.host.sudo_commands
         assert stat.S_IMODE(cert.stat().st_mode) == 0o444
     assert stat.S_IMODE(tls.stat().st_mode) == 0o755
+    assert stat.S_IMODE((tls / "ca.pem").stat().st_mode) == 0o444  # mounted into the agent, whatever the umask
+    for bundle in tls.glob("trust-*.pem"):
+        assert stat.S_IMODE(bundle.stat().st_mode) == 0o444
     assert stat.S_IMODE((sbx.dir / "gate.json").stat().st_mode) == 0o444
     gate = world.host.containers[sbx.names.gate].options
     assert (gate["--user"], gate["--cap-drop"], gate["--cap-add"]) == ("0", ["ALL"], ["NET_BIND_SERVICE"])

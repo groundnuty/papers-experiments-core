@@ -351,6 +351,7 @@ class DockerSandbox:
         stays the driver's, owner-only: the gate never reads it."""
         tls = self.dir / "tls"
         tls.chmod(0o755)
+        (tls / "ca.pem").chmod(0o444)  # the run's CA certificate, bind-mounted into the agent: no secret
         for name in names:
             (tls / f"{name}.pem").chmod(0o444)
             key = tls / f"{name}.key"
@@ -628,6 +629,7 @@ class DockerSandbox:
             ).stdout
             bundle = self.dir / "tls" / f"trust-{n}.pem"
             bundle.write_text(base + "\n" + ca, encoding="utf-8")
+            bundle.chmod(0o444)  # certificates only, mounted into the agent: readable whatever the driver's umask
             out[path] = bundle
         return out
 
