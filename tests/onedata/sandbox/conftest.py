@@ -15,6 +15,8 @@ from sandbox_support import (
     add_federation,
     add_sandbox,
     configured_sandbox_values,
+    make_spec,
+    start_options,
 )
 
 from expcore.config.loading import ConfigError
@@ -59,6 +61,15 @@ def world(tmp_path):
         host.add_image(ref.name, ref.id)
     host.oneclient_images.add(s.oneclient.id)
     return SimpleNamespace(host=host, config=config, s=s, registry=Registry(), tmp_path=tmp_path)
+
+
+@pytest.fixture
+def mounted(world):
+    """A sandbox of the mount data path on the `world`'s host; any process a test wedged is released before it stops."""
+    sandbox = DockerSandbox.start(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
+    yield sandbox
+    world.host.unkillable.clear()
+    sandbox.stop()
 
 
 @pytest.fixture

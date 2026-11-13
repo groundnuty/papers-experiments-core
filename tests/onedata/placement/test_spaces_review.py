@@ -149,7 +149,7 @@ def test_o09_a_reset_plan_naming_a_provider_that_does_not_support_its_space_is_r
 
     owned = bound(tmp_path, fake, ticker, edit, SPACE_LABELS[1])
     with pytest.raises(Refused, match="does not support the space"):
-        SpaceReset(owned).run({"beta": ["study"]})
+        SpaceReset(owned, now=ticker.clock).run({"beta": ["study"]})
     assert fake.requests == []
 
 

@@ -6,6 +6,7 @@ import pytest
 from expcore_onedata.client import (
     MAX_KEPT_LINKS,
     MAX_SPACE_DEPTH,
+    ZONE_TIME_PATH,
     NotSent,
     OnezoneClient,
     OutOfScope,
@@ -549,3 +550,26 @@ def test_get_sends_repeated_query_parameters(config):
 def test_the_content_of_a_range_read_is_the_files_own_bytes(config, seeded, client):
     file_id = seeded.id_of(PATH)
     assert client.read_range(f"/data/{file_id}/content", provider="beta", offset=2000, length=500) == DATA[2000:2500]
+
+
+def test_o32_an_anonymous_dated_read_sends_no_credential_and_only_to_a_public_path_of_onezone(config):
+    """O32: Onezone's current-time endpoint needs no privilege, so the dated read sends it with no credential header
+    when asked (`anonymous`), where a token's caveats could refuse a header; the answer comes back with its Date
+    header. No other path, and no provider's, is ever sent so: the call is refused, unsent, and the default read still
+    carries the admin credential."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"timeMillis": 5}, headers={"Date": "Thu, 01 Jan 1970 00:16:44 GMT"})
+
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert client.get_dated(ZONE_TIME_PATH, anonymous=True) == ({"timeMillis": 5}, "Thu, 01 Jan 1970 00:16:44 GMT")
+    assert seen[0].url.path == f"{ZONE}{ZONE_TIME_PATH}"
+    assert "x-auth-token" not in seen[0].headers
+    for path, provider in (("/spaces", None), (ZONE_TIME_PATH, "alpha")):
+        with pytest.raises(OutOfScope, match="only a public read"):
+            client.get_dated(path, provider=provider, anonymous=True)
+    assert len(seen) == 1  # nothing was sent for either refusal
+    client.get_dated(ZONE_TIME_PATH)
+    assert "x-auth-token" in seen[1].headers

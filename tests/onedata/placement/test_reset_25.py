@@ -95,10 +95,10 @@ def test_o01_an_eviction_the_block_map_never_shows_done_fails_after_the_last_att
     assert len(posted_transfers(stocked)) == EVICTION_ATTEMPTS
 
 
-def test_o11_a_reset_whose_eviction_evicted_nothing_at_first_still_ends_with_beta_empty(provisioner, stocked):
+def test_o11_a_reset_whose_eviction_evicted_nothing_at_first_still_ends_with_beta_empty(provisioner, stocked, ticker):
     """O11: the reset's eviction stage follows the same rule, and records the attempts per provider."""
     stocked.evictions_noop_first = 1
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert on_beta(stocked) == []
     assert record["stages"]["eviction"]["providers"]["providers[1]"]["attempts"] == 2
 
@@ -223,25 +223,25 @@ def test_o07_a_directory_the_evicting_provider_does_not_see_yet_is_waited_for_no
 
 
 def test_o11_a_federation_answering_absence_as_25_does_has_its_requirements_removed_and_shown_gone(
-    provisioner, stocked
+    provisioner, stocked, ticker
 ):
     """O11: a removed requirement read on 25.0 answers 400 posix enoent, which is absence, so the qos stage passes
     and the whole reset with it."""
     stocked.answer_missing_as_25()
     stocked.add_qos(FILES[1])
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert record["ok"] is True
     assert stocked.qos == {}
     assert record["stages"]["qos"]["removed"] == 1
 
 
-def test_o11_a_removed_requirement_answered_with_another_400_fails_the_qos_stage_closed(provisioner, stocked):
+def test_o11_a_removed_requirement_answered_with_another_400_fails_the_qos_stage_closed(provisioner, stocked, ticker):
     """O11: a 400 that is not posix enoent is no absence: the requirement is never shown gone, so the reset fails at
     its qos stage and evicts nothing."""
     stocked.missing_answer = (400, "badValueNotAllowed", None)
     stocked.add_qos(FILES[1])
     with pytest.raises(ResetFailed, match="qos stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert caught.value.stage == "qos"
     assert all(stocked.held(path, BETA_ID) for path in FILES)
 
@@ -254,7 +254,7 @@ def test_o09_a_cancel_the_gate_refused_unsent_is_never_taken_for_an_ended_job(pr
     tid = stocked.add_transfer("replication", "other/left.bin", BETA_ID, scheduled=ticker.now, ended=False)
     stocked.statuses = [[f"/transfers/{tid}", 1, 400]]
     with pytest.raises(ResetFailed, match="transfers stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert "ScopeUnread" in str(caught.value)
     assert not [c for c in stocked.provider_calls if c[1] == "DELETE" and c[2] == f"/transfers/{tid}"]
     assert not stocked.transfers[tid].ended

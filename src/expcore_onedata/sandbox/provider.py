@@ -524,20 +524,13 @@ class SandboxPlatform:
             raise
         try:
             yield sandbox
-        except Exception:
-            refused = await self._gate_refused(sandbox)
-            await self._stop(ctx, sandbox, quiet=True)
-            if refused is not None:  # the gate cut the condition's read: that, not the body's failure, ends the run
-                raise refused from None
+        except Exception as error:
+            await self._end_run(ctx, sandbox, error)
             raise
-        except BaseException:
+        except BaseException:  # a cancellation: the stop waits for a deadline under way, and the run is not classified
             await self._stop(ctx, sandbox, quiet=True)
             raise
-        refused = await self._gate_refused(sandbox)
-        if refused is not None:  # a refusal no cell reported (a read the agent's code left running): the same end
-            await self._stop(ctx, sandbox, quiet=True)
-            raise refused
-        await self._stop(ctx, sandbox, quiet=False)
+        await self._end_run(ctx, sandbox, None)
 
     @contextlib.asynccontextmanager
     async def tool_server(
@@ -559,6 +552,31 @@ class SandboxPlatform:
             ctx, plane.condition, plane.token, ceiling_s=ceiling_s, extra_env=extra_env, principal=plane.principal
         ) as provider:
             yield provider
+
+    async def _end_run(self, ctx: CallContext, sandbox: DockerSandbox, error: Exception | None) -> None:
+        """Stop a run whose body ended, by returning (`error` None) or raising `error`, and raise how it ended; return
+        only when the body's own error stands, for the caller to raise. First any cell's deadline is settled
+        (`settle_deadline`): the loop gives a cell the agent's remaining time, so it cuts the call at the cell's own cap
+        and would score the agent's `time_cap` while the escalation still runs. A deadline that went past a clean kill
+        ends the run as `cell_unkillable` (O34), before anything else: the gate's log, gone with a stopped sandbox, is
+        then not the run's evidence. Then the gate's refusals: the gate cut the condition's read, which ends the run,
+        not the body's own failure, and a refusal no cell reported (a read the agent's code left running) the same
+        (O05, C01). A run with neither stops, and one whose body returned must be shown gone."""
+        try:  # after the body, as the gate's refusals are read: no agent's time runs any more
+            ended = await asyncio.to_thread(sandbox.settle_deadline)
+            refused = None if ended is not None else await self._gate_refused(sandbox)
+        except BaseException:
+            await self._stop(ctx, sandbox, quiet=True)
+            raise
+        if ended is not None:
+            await self._stop(ctx, sandbox, quiet=True)
+            if isinstance(error, InfraError) and error.kind == kinds.CELL_UNKILLABLE:
+                return  # the cell's own report of it
+            raise kinds.run_ended_error(ended) from None
+        if refused is not None:
+            await self._stop(ctx, sandbox, quiet=True)
+            raise refused from None
+        await self._stop(ctx, sandbox, quiet=error is not None)
 
     @staticmethod
     async def _gate_refused(sandbox: DockerSandbox) -> InfraError | None:

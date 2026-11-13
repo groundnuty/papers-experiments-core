@@ -47,6 +47,7 @@ import dataclasses
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -243,24 +244,56 @@ def _cgroup_procs(host: HostOps, cid: str) -> list[int] | None:
     return None
 
 
+def init_sleep(host: HostOps, agent: dict) -> dict | None:
+    """The init's `sleep infinity` of an agent container that has just started, by its pid and start time (/proc/<pid>/stat
+    field 22): the one process of its cgroup besides the init, a child of the init named `sleep`. None while that is not
+    what the cgroup holds (the init has not started it yet), or when it cannot be read (O34)."""
+    procs = _cgroup_procs(host, agent["id"])
+    others = [pid for pid in procs or [] if pid != agent["pid"]]
+    if len(others) != 1:
+        return None
+    st = _stat(host, others[0])
+    if not isinstance(st, dict) or st["ppid"] != agent["pid"] or st["comm"] != "sleep":
+        return None
+    return {"pid": st["pid"], "start": st["start"]}
+
+
+def _ticks(start: str) -> float:
+    return int(start) if start.isdigit() else math.inf
+
+
+def _the_init_sleep(procs: list[dict], agent: dict) -> dict | None:
+    """Which of the container's processes is its init's `sleep`: the one `agent["sleep"]` names by its pid and start
+    time, as `init_sleep` read them when the container started. A process of the agent's can name itself `sleep`
+    (/proc/self/comm is its own to write) and, orphaned, be reparented to the init; it cannot take that start time
+    (O34). Without that record (the orphan reaper's teardown, `fuse_first`, knows nothing of the start) it is the
+    init's child of that name that started first, which no process of the agent's can predate."""
+    known = agent.get("sleep")
+    if known is not None:
+        return next((p for p in procs if (p["pid"], p["start"]) == (known["pid"], known["start"])), None)
+    named = [p for p in procs if p["ppid"] == agent["pid"] and p["comm"] == "sleep"]
+    return min(named, key=lambda p: _ticks(p["start"]), default=None)
+
+
 def _readers(host: HostOps, agent: dict) -> list[dict] | None:
-    """The agent container's processes except its init and the init's `sleep infinity` (keeping those keeps the container,
-    and with it its mount namespace, alive until step 4). None when the container's cgroup cannot be read, or the state
-    of one of its processes cannot: it could be a reader as well as the init's `sleep`, so the list is unknown (O15)."""
+    """The agent container's processes except its init and the init's `sleep infinity` (`_the_init_sleep`; keeping those
+    keeps the container, and with it its mount namespace, alive until step 4). None when the container's cgroup cannot
+    be read, or the state of one of its processes cannot: it could be a reader as well as the init's `sleep`, so the
+    list is unknown (O15)."""
     procs = _cgroup_procs(host, agent["id"])
     if procs is None:
         return None
-    out = []
+    found = []
     for pid in procs:
         if pid == agent["pid"]:
             continue
         st = _stat(host, pid)
         if st == UNKNOWN:
             return None
-        if not isinstance(st, dict) or (st["ppid"] == agent["pid"] and st["comm"] == "sleep"):
-            continue
-        out.append(st)
-    return out
+        if isinstance(st, dict):
+            found.append(st)
+    spared = _the_init_sleep(found, agent)
+    return [st for st in found if st is not spared]
 
 
 def _alive(host: HostOps, procs: list[dict]) -> list[dict]:
@@ -488,10 +521,13 @@ def ordered_fuse_teardown(
     waits: Waits | None = None,
     log_path: Path | None = None,
     extra_readers: tuple[str, ...] | list[str] = (),
+    agent_sleep: dict | None = None,
 ) -> TeardownResult:
     """Stop the readers, unmount, stop the sidecar, remove the agent container (module docstring). Never raises for a
     failed step: each is logged and recorded in `errors`, and the next step runs, except that no container is removed
-    while the FUSE mount may still be live (`fuse_safe` False: the caller must leave the sidecar and the agent)."""
+    while the FUSE mount may still be live (`fuse_safe` False: the caller must leave the sidecar and the agent).
+    `agent_sleep` is the agent's init's `sleep` as `init_sleep` identified it at the container's start, the one process
+    the readers' step spares besides the init (`_the_init_sleep`)."""
     waits = waits or WAITS
     mp = host_path(mountpoint)
     L = _StepLog(log_path, {"sidecar": hostops.name_digest(sidecar)})
@@ -499,6 +535,8 @@ def ordered_fuse_teardown(
     removed: list[str] = []
     try:
         ai = _inspect(host, agent, waits) if agent else None
+        if ai is not None and agent_sleep is not None:
+            ai = {**ai, "sleep": agent_sleep}
         si = _inspect(host, sidecar, waits)
         fuse0 = _fuse_at(host, mp, waits)
         targets = [(w, i["pid"]) for w, i in (("agent", ai), ("sidecar", si)) if i and i["running"] and i["pid"] > 0]

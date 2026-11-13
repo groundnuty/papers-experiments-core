@@ -5,6 +5,7 @@ HTTP requests it answers, and use the public names of `expcore_onedata.testing` 
 """
 
 import base64
+from email.utils import parsedate_to_datetime
 
 import httpx
 import pytest
@@ -326,3 +327,96 @@ def test_asked_for_a_path_a_file_answers_400_as_in_25_0_and_its_attributes_name_
     file_id = fake.add_file("study/data.bin", DATA)
     assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}", params={"attribute": "path"}).status_code == 400
     assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").json()["parent_id"] == fake.id_of("study")
+
+
+# -- the transfer listing's order (O32) ------------------------------------------------------------------------------
+
+
+def listed(fake: FakeData, state: str, limit: int, token: str | None = None) -> dict:
+    """One page of the space's transfer listing in one state, as alpha answers it."""
+    params = {"state": state, "limit": limit, **({"page_token": token} if token else {})}
+    return call(fake, ALPHA_ID, "GET", f"/spaces/{fake.SPACE_ID}/transfers", params=params).json()
+
+
+def test_o32_the_transfer_listing_is_newest_first_and_a_page_resumes_after_its_token():
+    """O32: as on the 25.0 build (op-worker f118ed9, transfer_links.erl:160-164), an ended job is listed by its finish
+    time and a waiting or ongoing one by its schedule time, the newest first, whatever order they were made in; a full
+    page's token resumes the listing right after the last job it gave, and a short page ends it."""
+    fake = make_federation(clock=Ticker().clock)
+    fake.add_file("study/data.bin", DATA)
+    middle = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=100, finished=300)
+    oldest = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=150, finished=200)
+    newest = fake.add_transfer("eviction", "study/data.bin", BETA_ID, scheduled=50, finished=400)
+    late = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=90, ended=False)
+    early = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=500, ended=False)
+    first = listed(fake, "ended", 2)
+    assert first["transfers"] == [newest, middle]
+    assert listed(fake, "ended", 2, first["nextPageToken"]) == {"transfers": [oldest], "nextPageToken": None}
+    assert listed(fake, "ongoing", 10)["transfers"] == [early, late]
+
+
+def test_o32_a_listing_time_puts_a_job_out_of_its_order_for_a_test_of_a_readers_check():
+    """O32: `listing_time` gives the time a job's listing key is built from in place of its record's, so a test can
+    list an old job ahead of newer ones while its record keeps its own finish time."""
+    fake = make_federation(clock=Ticker().clock)
+    fake.add_file("study/data.bin", DATA)
+    old = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=100, finished=100)
+    new = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=200, finished=200)
+    fake.listing_time[old] = 300
+    assert listed(fake, "ended", 10)["transfers"] == [old, new]
+    assert call(fake, ALPHA_ID, "GET", f"/transfers/{old}").json()["finishTime"] == 100
+
+
+# -- Onezone's reading of the global clock, and the Date header of its answers -------------------------------------
+
+ZONE_TIME = "https://onezone.test/api/v3/onezone/provider/public/get_current_time"
+
+
+def zone_time(fake: FakeData, **headers) -> httpx.Response:
+    """Ask Onezone for the global clock, as anyone may: with no credential unless the test names a header."""
+    return fake.respond(httpx.Request("GET", ZONE_TIME, headers=headers))
+
+
+def test_o32_onezones_current_time_answers_the_fakes_clock_in_milliseconds_with_no_credential():
+    """O32: as oz-worker's `get_current_time` does (14b5bda, `provider_routes.erl:192-198`, no privilege needed;
+    `provider_rest_translator.erl:128-129`, the body), the public call answers `{"timeMillis": N}`, the global clock,
+    which is the fake's `clock`, the one a job's times are stamped on. A credential is not needed, and one is
+    accepted."""
+    fake = make_federation(clock=lambda: 1234.5)
+    assert zone_time(fake).status_code == 200
+    assert zone_time(fake).json() == {"timeMillis": 1234500}
+    assert zone_time(fake, **{"X-Auth-Token": fake.admin_token}).json() == {"timeMillis": 1234500}
+    assert [r.token for r in fake.requests if r.path.endswith("get_current_time")] == [None, None, fake.admin_token]
+
+
+def test_o32_the_date_header_of_the_answer_is_onezones_node_clock_not_the_global_one():
+    """O32: the header is the answering node's system clock, which `zone_skew` moves and the global clock does not: a
+    node 8 s ahead dates its answer 1008 while `timeMillis` still says 1000, as a node whose global-clock bias is -8 s
+    does. `zone_date` replaces the header, and None removes it."""
+    fake = make_federation(clock=lambda: 1000.0)
+    fake.zone_skew = 8.0
+    answer = zone_time(fake)
+    assert parsedate_to_datetime(answer.headers["Date"]).timestamp() == 1008.0
+    assert answer.json() == {"timeMillis": 1000000}
+    fake.zone_date = None
+    assert "Date" not in zone_time(fake).headers
+    fake.zone_date = "not a date"
+    assert zone_time(fake).headers["Date"] == "not a date"
+
+
+def test_o32_a_test_can_fail_or_reshape_the_current_time_answer_alone():
+    """O32: `time_status` makes the current-time call alone fail with that status and `time_hook` replaces its body,
+    while every other call of Onezone's goes on answering; `status_override` still fails every call."""
+    fake = make_federation(clock=lambda: 1000.0)
+    fake.time_status = 503
+    assert zone_time(fake).status_code == 503
+    assert (
+        fake.respond(
+            httpx.Request("GET", ZONE_TIME.replace("/provider/public/get_current_time", "/spaces/x"))
+        ).status_code
+        == 401
+    )
+    fake.time_status, fake.time_hook = None, lambda answer: {"timeMillis": answer["timeMillis"] + 5000}
+    assert zone_time(fake).json() == {"timeMillis": 1005000}
+    fake.status_override = 500
+    assert zone_time(fake).status_code == 500

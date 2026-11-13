@@ -7,6 +7,7 @@ import itertools
 import json
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.utils import formatdate
 
@@ -16,7 +17,10 @@ from expcore_onedata.testing.fake_federation import FakeFederation
 from expcore_onedata.testing.fake_onedata import Request
 
 PROVIDER = "/api/v3/oneprovider"
+ZONE_TIME = "/api/v3/onezone/provider/public/get_current_time"  # Onezone's reading of the global clock, public
 ROOT_ID = "root-0001"
+EPOCH_INFINITY = 9_999_999_999  # the transfer listing's keys count down from it (`expcore_onedata.transferorder`)
+ZONE_CLOCK = "<the zone's clock>"  # `FakeData.zone_date`'s default: Onezone dates an answer by its clock
 
 # The shapes of the data API's errors a `FakeData` can answer with (`FakeData.error_shape`).
 ERRORS_25_0 = "25.0"  # as seen live on Onedata 25.0: an entry that is gone answers 400 posix/enoent, and so on
@@ -186,7 +190,7 @@ class FakeData(FakeFederation):
       DELETE /data/{id}                             remove a file or a directory with what is under it
       POST   /transfers, GET /transfers/{id}        replication, eviction and migration jobs
       GET    /spaces/{space}/transfers              the ids of the space's jobs in one state (`limit`, `page_token`),
-                                                    ending as 25.0's do
+                                                    newest first and ending as 25.0's do
 
     and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, and where a delay is in
     seconds it is seconds of the fake's own `clock`, never of the wall, so a test never waits.
@@ -202,7 +206,11 @@ class FakeData(FakeFederation):
     the token is a non-empty string on every page, the last included, so a page the directory's last entries fill is
     followed by an empty page with `isLast` true, and the page after a last page answers 400 `posix` `eagain`. A
     transfer page has `transfers` and `nextPageToken`, no `isLast`: the token is a string on a full page and null on
-    the last, so a full page is followed by an empty one with a null token.
+    the last, so a full page is followed by an empty one with a null token. A state's jobs are listed as the 25.0
+    build lists them (`expcore_onedata.transferorder`): newest first, by the finish time of an ended job and the
+    schedule time of a waiting or an ongoing one, each as the listing provider's record gives it, and a full page's
+    token is the key of its last job, after which the next page resumes. The key is `9999999999 - T` and the job's
+    whole id, where the build takes six characters of it: the fake's ids are not random, and six would tie.
 
     **Per-reader views.** A file or a directory is made on one provider, and every other provider shows it only
     after `visibility_delay_s` seconds of `clock` (`visibility_delay_by_provider` gives a reader its own; the default is
@@ -394,8 +402,22 @@ class FakeData(FakeFederation):
       list it is in, and its record's status) and record fields such as `bytesReplicated`;
     - `listing_lag`: job id to how many listing answers, counted from the first, leave the job out (its record is read
       at once, as a real provider's is while its listing lags);
+    - `listing_time`: job id to the time its listing key is built from in place of its record's, which lists it out
+      of the newest-first order while its record keeps its own times (a broken order, for a reader's check);
     - every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
-      negative when behind); `date_override` (provider id to a header value, or None for none) replaces it.
+      negative when behind); `date_override` (provider id to a header value, or None for none) replaces it. A job's
+      times are `clock`'s, the platform's global clock, so a provider's skew moves its Date headers alone, as a
+      provider's system clock does;
+    - every answer of Onezone's has a `Date` header of `clock` moved by `zone_skew` (seconds ahead, negative when
+      behind; 0 by default, Onezone's system clock agreeing with the global one), and `zone_date` replaces it as
+      `date_override` does a provider's (`ZONE_CLOCK`, the default, sends the clock's). The header is Onezone's
+      answering node's system clock: `zone_skew` 8 with the global clock agreeing with this host's is a multi-node
+      Onezone whose node runs 8 s ahead with a bias of -8 s;
+    - `GET /provider/public/get_current_time`, Onezone's reading of the global clock, answers with no credential (and
+      with any) `{"timeMillis": N}`, `clock` in epoch milliseconds: `clock` is the global clock, the one a job's times
+      are stamped on, so a test that wants this host to disagree with it gives the code under test a clock of its own.
+      `time_status` makes that call alone fail with that status, `time_hook` replaces its answer's body (a shape that
+      cannot be read), and its `Date` header is Onezone's like any other's.
 
     `add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with
     the times and the state a test gives it. `provider_calls` lists `(provider id, method, route)` of every provider
@@ -479,8 +501,13 @@ class FakeData(FakeFederation):
         self.transfer_list_body: dict | None = None  # replaces every answer of the listing
         self.provider_view: dict[tuple[str, str], dict] = {}  # (job, provider id) -> its listed state, record fields
         self.listing_lag: dict[str, int] = {}  # job id -> listing answers it is left out of, from the first one
+        self.listing_time: dict[str, float] = {}  # job id -> the time its listing key is built from (a broken order)
         self.provider_skew: dict[str, float] = {}  # provider id -> seconds its clock runs ahead (negative: behind)
         self.date_override: dict[str, str | None] = {}  # provider id -> the Date header it sends (None: none)
+        self.zone_skew = 0.0  # seconds Onezone's Date headers run ahead of `clock` (negative: behind)
+        self.zone_date: str | None = ZONE_CLOCK  # the Date header Onezone sends (None: none; ZONE_CLOCK: its clock's)
+        self.time_status: int | None = None  # makes Onezone's current-time read alone fail with this status
+        self.time_hook: Callable[[dict], object] | None = None  # replaces the body of Onezone's current-time answer
         self.listings = 0  # the listing answers given
         self._ids = itertools.count(1)
         self._root_polls = 0
@@ -796,9 +823,11 @@ class FakeData(FakeFederation):
         return self._error(status, error_id, errno)
 
     def respond(self, request: httpx.Request) -> httpx.Response:
-        """Answer a provider call here and anything else as the federation does."""
+        """Answer a provider call here and anything else as the federation does, dated by Onezone's clock."""
+        if request.method == "GET" and request.url.path == ZONE_TIME:
+            return self._zone_dated(self._current_time(request))
         if not request.url.path.startswith(PROVIDER):
-            return super().respond(request)
+            return self._zone_dated(super().respond(request))
         route = request.url.path.removeprefix(PROVIDER)
         provider = self.provider_of(request.url.host)
         with self._lock:
@@ -832,6 +861,27 @@ class FakeData(FakeFederation):
             answer = self._provider_route(request, provider, route)
         return self._dated(answer, provider)
 
+    def _current_time(self, request: httpx.Request) -> httpx.Response:
+        """Onezone's reading of the global clock, `clock`, in epoch milliseconds, which anyone may ask for: the request
+        is recorded, and the answer is the one `time_status` or `time_hook` gives instead when a test sets either."""
+        with self._lock:
+            self.requests.append(
+                Request(
+                    request.method,
+                    request.url.path,
+                    dict(request.url.params),
+                    request.headers.get("Range"),
+                    request.headers.get("X-Auth-Token"),
+                    request.content,
+                )
+            )
+        if self.status_override is not None:
+            return self._error(self.status_override, "internalServerError")
+        if self.time_status is not None:
+            return self._error(self.time_status, "internalServerError")
+        answer = {"timeMillis": int(self.clock() * 1000)}
+        return httpx.Response(200, json=self.time_hook(answer) if self.time_hook else answer)
+
     def _dated(self, response: httpx.Response, provider: str) -> httpx.Response:
         """Give an answer the Date header of the provider's clock: the fake's clock moved by the provider's skew, in
         whole seconds as HTTP has it, or the override a test set (None: no header at all)."""
@@ -840,6 +890,14 @@ class FakeData(FakeFederation):
                 response.headers["Date"] = self.date_override[provider]
             return response
         response.headers["Date"] = formatdate(self.clock() + self.provider_skew.get(provider, 0.0), usegmt=True)
+        return response
+
+    def _zone_dated(self, response: httpx.Response) -> httpx.Response:
+        """Give an answer of Onezone's the Date header of its clock (`clock` moved by `zone_skew`), or `zone_date`."""
+        if self.zone_date == ZONE_CLOCK:
+            response.headers["Date"] = formatdate(self.clock() + self.zone_skew, usegmt=True)
+        elif self.zone_date is not None:
+            response.headers["Date"] = self.zone_date
         return response
 
     def _admin_route(self, method: str, route: str, sent: dict) -> httpx.Response:
@@ -1103,16 +1161,38 @@ class FakeData(FakeFederation):
         self.listings += 1
         if self.transfer_list_body is not None:
             return httpx.Response(200, json=self.transfer_list_body)
-        ids = [
-            tid
+        return self._transfer_page(query, provider, lambda tid, transfer: True)
+
+    def _listing_key(self, tid: str, transfer: Transfer, provider: str, state: str) -> str:
+        """A job's key in a provider's listing: `9999999999 - T`, ten digits, then its id, where T is the finish time
+        of an ended job and the schedule time of another, as that provider's record gives them (`listing_time` in
+        their place)."""
+        view = self._view(tid, provider)
+        if tid in self.listing_time:
+            moment = self.listing_time[tid]
+        elif state == "ended":
+            moment = view.get("finishTime", transfer.finished)
+        else:
+            moment = view.get("scheduleTime", transfer.scheduled)
+        return f"{EPOCH_INFINITY - int(moment or 0):010d}{tid}"
+
+    def _transfer_page(
+        self, query: httpx.QueryParams, provider: str, include: Callable[[str, Transfer], bool]
+    ) -> httpx.Response:
+        """One page of a provider's listing of the jobs `include` admits in the state asked for: newest first, in the
+        keys' order, from just after the `page_token`'s key; a full page's token is its last job's key."""
+        state = query["state"]
+        keyed = sorted(
+            (self._listing_key(tid, t, provider, state), tid)
             for tid, t in self.transfers.items()
-            if self._view(tid, provider).get("state", t.state) == query["state"]
+            if include(tid, t)
+            and self._view(tid, provider).get("state", t.state) == state
             and self.listings > self.listing_lag.get(tid, 0)
-        ]
-        start = int(query.get("page_token") or "0")
-        end = start + int(query.get("limit", "100"))
-        token = str(end) if end <= len(ids) else None  # a full page gets a token, so an empty last page can follow
-        return httpx.Response(200, json={"transfers": ids[start:end], "nextPageToken": token})
+        )
+        after = query.get("page_token")
+        page = [(key, tid) for key, tid in keyed if not after or key > after][: int(query.get("limit", "100"))]
+        token = page[-1][0] if page and len(page) == int(query.get("limit", "100")) else None  # an empty last page
+        return httpx.Response(200, json={"transfers": [tid for _, tid in page], "nextPageToken": token})
 
     def _transfer(self, tid: str, provider: str) -> httpx.Response:
         transfer = self.transfers.get(tid)
