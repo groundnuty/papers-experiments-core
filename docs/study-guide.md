@@ -284,6 +284,19 @@ Which network the sidecar and the gate are on depends on how containers can reac
 
 The sandbox never creates, changes or removes the federation's network: a mount or REST run whose network is not on the host is refused before anything exists, and removing the sidecar or the gate at teardown takes it off the network. The agent never joins it. Each mount run's metadata records the kind of network the sidecar was on (`mount.network`: `default bridge` or `federation`), never its name.
 
+### Collecting a run's evidence
+
+**Never run `docker cp` from a running sidecar or gate.** `docker cp` re-mounts a running container's binds. A bind written `-v` makes a missing source as a directory owned by root, so after the host's copy of a data-path token was removed, one such copy left an empty directory at the token's path, and the run's teardown refused to finish. The sandbox now binds each secret with `--mount type=bind,...,readonly`, which refuses a missing source, but a copy out of a running container is still the wrong way to read its files. Read them on the host instead, under the run's directory (`sandbox.work_root`, the directory whose name ends in the run's id):
+
+| Evidence | Where |
+|---|---|
+| the data gate's request log | `gatelog/requests.jsonl` |
+| oneclient's log, from the mount sidecar | `oneclient-log/` (its `oneclient.INFO` is the INFO log) |
+
+`oneclient-log` is owner-only (mode 0700) and kept with the run's evidence when a run is kept. oneclient is started with `--log-dir` pointing at it, unless `[sandbox.mount] extra_args` gives its own `--log-dir`, in which case the run's directory is bound at that path. oneclient takes the token from its environment, never its command line, and the INFO log read on 11 Nov was 17 lines of start-up settings (version, provider, TLS verification, I/O modes, the mountpoint) with no token in them (`deploy/compose-federation/day0/2026-11-11-federation-facts-mount.md`). The sandbox does not redact the directory, though: it replaces the token with `<token>` only in the copy `sidecar_errors` summarises, so the directory is owner-only like the rest of the run's evidence.
+
+When a teardown finds something at a token's path that `rm -f` cannot remove, `metadata()["teardown"]["token_files"]` lists it, never its content: its path in the run's directory, its kind (file, directory, symlink or other), size and owner's uid, and what was done. An empty directory is removed (`empty directory left by a bind; removed`) and the teardown goes on; a file, a link or a directory with an entry in it fails the teardown, and the error names its path and kind. The run's directory is then found by the id in `teardown.run_directory`.
+
 ## 3. Declare the design
 
 ### Factors and conditions
