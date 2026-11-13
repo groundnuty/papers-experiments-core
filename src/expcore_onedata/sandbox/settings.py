@@ -49,7 +49,7 @@ gate_memory_bytes = 1073741824  # optional
 path = "/data"                  # where the agent sees the space, read-only
 io_mode = "proxy"               # required, no default: "proxy" or "direct" (O36)
 extra_args = []                 # further oneclient arguments, never one that sets the TLS mode, the I/O mode, the
-                                # config file, a storage override or oneclient's environment
+                                # config file, a storage override, oneclient's environment or its log directory
 direct_check_file = "space/f"   # "direct" only, and required with it: a space's directory under the mount, then a file
                                 # in it that the local provider holds in full; read at every start (O40)
 [sandbox.mount.storages]        # "direct" only, and required with it: each storage the sidecar reads directly

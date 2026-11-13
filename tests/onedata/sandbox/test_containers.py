@@ -18,6 +18,7 @@ from expcore_onedata.tls import TlsSettings
 LABELS = ["--label", "org.test.sandbox=1"]
 TOKEN_FILE = Path("/w/secrets/oneclient-token")  # where a run keeps the mount's token for its sidecar
 GATE_TOKEN_FILE = Path("/w/secrets/gate-token")  # and the REST path's for its gate
+LOG_DIR = Path("/w/oneclient-log")  # the run's directory for the sidecar's oneclient log
 
 
 @pytest.fixture
@@ -48,6 +49,17 @@ def agent(s, names, mode, **kw):
 def pairs(args):
     """Flag, value pairs of a docker command line (for flags that take a value)."""
     return [(a, args[i + 1]) for i, a in enumerate(args[:-1]) if a.startswith("-")]
+
+
+def mounts(args):
+    """The `--mount` specs of a docker command line."""
+    return [v for f, v in pairs(args) if f == "--mount"]
+
+
+def sidecar_args(s, names, **kw):
+    """`docker run` of the sidecar for provider `p.test`, with the run's token file and log directory unless given."""
+    given = {"token_file": TOKEN_FILE, "log_dir": LOG_DIR} | kw
+    return C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", **given)
 
 
 def test_names_are_derived_from_the_prefix_and_the_sandbox_id(s, names):
@@ -94,11 +106,12 @@ def test_o05_the_sidecar_is_the_only_container_with_fuse_and_takes_its_token_fro
     `docker inspect` shows it to anyone with access to the daemon). It is a file bound into the sidecar read-only,
     which the sidecar's shell reads into oneclient's environment as it starts oneclient."""
     token_file = Path("/w/secrets/oneclient-token")
-    args = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=token_file)
+    args = sidecar_args(s, names, token_file=token_file)
     assert ("--device", "/dev/fuse") in pairs(args)
     assert C.ENV_ACCESS_TOKEN not in [v for f, v in pairs(args) if f == "-e"]
     assert [a for a in args if C.ENV_ACCESS_TOKEN in a] == [C.SIDECAR_START]  # named only where the file is read
-    assert f"{token_file}:{C.SIDECAR_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
+    assert f"type=bind,src={token_file},dst={C.SIDECAR_TOKEN_PATH},readonly" in mounts(args)
+    assert not [v for f, v in pairs(args) if f == "-v" and str(token_file) in v]  # `-v` makes a directory of a gone one
     assert dict(pairs(args))["--entrypoint"] == "sh"
     script = args[args.index("-c") + 1]
     assert f'{C.ENV_ACCESS_TOKEN}="$(cat {C.SIDECAR_TOKEN_PATH})"' in script  # read from the file, in the container
@@ -141,7 +154,17 @@ def test_o05_the_gate_takes_its_token_from_a_read_only_file_and_docker_is_given_
     gate_token = Path("/w/run-secrets/gate-token")
     args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=gate_token)
     assert "-e" not in args
-    assert f"{gate_token}:{C.GATE_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
+    assert f"type=bind,src={gate_token},dst={C.GATE_TOKEN_PATH},readonly" in mounts(args)
+    assert not [v for f, v in pairs(args) if f == "-v" and str(gate_token) in v]  # `-v` makes a directory of a gone one
+
+
+def test_o05_the_gates_tls_keys_are_bound_with_mount_so_a_missing_directory_is_refused_not_made(s, names):
+    """O05: the gate's TLS keys are a secret, bound read-only with `--mount`, which refuses a missing source. Its
+    configuration, which holds none, stays a `-v` bind."""
+    args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=GATE_TOKEN_FILE)
+    assert "type=bind,src=/w/tls,dst=/etc/gate/tls,readonly" in mounts(args)
+    assert not [v for f, v in pairs(args) if f == "-v" and "/w/tls" in v]
+    assert "/w/gate.json:/etc/gate/gate.json:ro" in [v for f, v in pairs(args) if f == "-v"]
 
 
 STORAGES = (("0a1b2c3d4e5f", "/srv/invented/one"), ("6a7b8c9d0e1f", "/srv/invented/two"))  # invented, in file order
@@ -171,9 +194,7 @@ def test_o36_the_sidecar_is_always_told_how_to_reach_storage_by_exactly_one_forc
     command = C.sidecar_command("p.test", declared)
     assert command.count(flag) == 1
     assert other not in command
-    args = C.sidecar_run_args(
-        declared, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
-    )
+    args = sidecar_args(declared, names)
     assert args[args.index("-c") + 1 :].count(flag) == 1
 
 
@@ -190,7 +211,10 @@ def test_o36_the_options_the_sandbox_sets_are_the_commands_own(s):
     declared = with_io_mode(s, "direct", extra_args=("--provider-timeout", "30"))
     options = C.sidecar_options(declared)
     command = C.sidecar_command("p.test", declared)
-    assert options == ["-o", "ro,allow_other", "--force-direct-io", "--config", "/dev/null", "--disable-log-buffering"]
+    assert options == [
+        *("-o", "ro,allow_other", "--force-direct-io", "--log-dir", C.SIDECAR_LOG_DIR, "--config", "/dev/null"),
+        "--disable-log-buffering",
+    ]
     at = command.index(options[0])
     assert command[at : at + len(options)] == options
     assert command[-3:-1] == ["--provider-timeout", "30"]
@@ -219,8 +243,8 @@ def test_o36_oneclients_other_inputs_are_closed_in_the_command(s):
 def test_o36_the_token_still_reaches_oneclient_through_its_own_variable_and_the_file(s, names):
     """O36: closing the environment keeps the one path the token takes (O05): the file bound into the sidecar alone,
     read into `ONECLIENT_ACCESS_TOKEN` by the entrypoint, which `env -u` leaves alone."""
-    args = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE)
-    assert f"{TOKEN_FILE}:{C.SIDECAR_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
+    args = sidecar_args(s, names)
+    assert f"type=bind,src={TOKEN_FILE},dst={C.SIDECAR_TOKEN_PATH},readonly" in mounts(args)
     script = args[args.index("-c") + 1]
     assert f'{C.ENV_ACCESS_TOKEN}="$(cat {C.SIDECAR_TOKEN_PATH})"' in script
     assert f"export {C.ENV_ACCESS_TOKEN}" in script
@@ -286,9 +310,7 @@ def test_o40_o12_the_options_a_record_keeps_hold_no_storage_id_or_path(s):
 def test_o40_each_storage_is_bound_read_only_into_the_sidecar_at_its_place(s, names):
     """O40: each mapped storage's host directory is a `--mount` bind, read-only, into the sidecar, at the path its
     override names; `--mount` refuses a source that is not there, where `-v` would create it."""
-    args = C.sidecar_run_args(
-        with_io_mode(s, "direct"), names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
-    )
+    args = sidecar_args(with_io_mode(s, "direct"), names)
     binds = [v for f, v in pairs(args) if f == "--mount" and "/srv/invented" in v]
     assert binds == [
         f"type=bind,src=/srv/invented/one,dst={C.DIRECT_STORAGE_ROOT}/0,readonly",
@@ -303,7 +325,7 @@ def test_o40_a_proxy_mount_binds_no_storage_and_passes_no_override_or_log_switch
     command = C.sidecar_command("p.test", s)
     assert "--override" not in command
     assert "--disable-log-buffering" not in command
-    args = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE)
+    args = sidecar_args(s, names)
     assert not any(C.DIRECT_STORAGE_ROOT in word for word in args)
 
 
@@ -330,7 +352,7 @@ def test_o40_the_command_refuses_a_direct_mount_whose_mapping_was_removed_past_i
     with pytest.raises(ValueError, match="storages"):
         C.sidecar_run_args(
             dataclasses.replace(s, mount=proxy), C.Names.make("sbx", "k"), LABELS, Path("/w/mount"), "img", "p.test",
-            token_file=TOKEN_FILE,
+            token_file=TOKEN_FILE, log_dir=LOG_DIR,
         )  # fmt: skip
 
 
@@ -486,13 +508,11 @@ def test_o03_with_a_federation_network_the_sidecar_starts_on_it_and_dials_the_lo
     default bridge, and dials the local provider by its name there, not the host of the URL the host reaches.
     Without the table it starts as it always has: on the default bridge, dialling the URL's host."""
     federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL))
-    args = C.sidecar_run_args(
-        federated, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
-    )
+    args = sidecar_args(federated, names)
     assert [v for f, v in pairs(args) if f == "--network"] == [FED_NETWORK]
     assert args[args.index("-H") + 1] == FED_LOCAL
     assert "p.test" not in args
-    plain = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE)
+    plain = sidecar_args(s, names)
     assert [v for f, v in pairs(plain) if f == "--network"] == ["bridge"]
     assert plain[plain.index("-H") + 1] == "p.test"
 
@@ -502,9 +522,7 @@ def test_o05_the_federation_network_is_the_sidecars_alone_and_the_agent_never_jo
     """O05: the sidecar is on the federation network and the agent is not: it stays on its own internal network in
     every data path, so it reaches the federation through the mount and nothing else."""
     federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL))
-    sidecar = C.sidecar_run_args(
-        federated, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
-    )
+    sidecar = sidecar_args(federated, names)
     assert dict(pairs(sidecar))["--network"] == FED_NETWORK
     extra = {
         DataPathMode.REST: {"gate_ip": "10.1.0.2", "gate_hosts": ["h.test"], "ca": Path("/w/ca.pem"), "zone_host": "z"},
@@ -576,10 +594,70 @@ def test_o05_on_the_federation_network_the_gate_joins_it_and_the_rest_agent_neve
     assert env[C.ENV_ZONE_HOST] == FED_ZONE
 
 
-def test_the_oneclient_log_directory_is_the_last_one_given():
-    assert C.effective_log_dir(["-f"]) == C.ONECLIENT_LOG_DIR
-    assert C.effective_log_dir(["--log-dir", "/a", "--log-dir=/b"]) == "/b"
-    assert C.effective_log_dir(["-l", "/c"]) == "/c"
+def test_o05_the_sidecar_declares_oneclients_log_directory_and_binds_the_runs_own_directory_there(s, names):
+    """O05: oneclient is told where to log (`--log-dir`, once, as its option takes one value) and the run's own
+    owner-only directory is bound read-write at that path, so the log is read from the host and collecting it never
+    needs `docker cp` from a running sidecar."""
+    args = sidecar_args(s, names)
+    command = args[args.index("-c") + 3 :]  # what the sidecar's shell hands to `env`
+    assert command.count("--log-dir") == 1
+    assert command[command.index("--log-dir") + 1] == C.SIDECAR_LOG_DIR
+    assert command.index("--log-dir") < command.index(C.SIDECAR_MOUNT)
+    assert f"type=bind,src={LOG_DIR},dst={C.SIDECAR_LOG_DIR}" in mounts(args)  # no `readonly`: it writes there
+    assert [a for a in command if a.startswith("-l") or a.startswith("--l")] == ["--log-dir"]
+
+
+@pytest.mark.parametrize(
+    ("extra", "option"),
+    [
+        (("-l/var/lib/oc-log",), "-l"),
+        (("-l", "/var/lib/oc-log"), "-l"),
+        (("-fl/var/lib/oc-log",), "-l"),
+        (("--log-dir", "/var/lib/oc-log"), "--log-dir"),
+        (("--log-dir=/var/lib/oc-log",), "--log-dir"),
+        (("--log-d=/var/lib/oc-log",), "--log-d"),  # an abbreviation oneclient accepts
+        (("--log", "/var/lib/oc-log"), "--log"),  # one it refuses as ambiguous: refused here all the same
+        (("-f", "--log-dir"), "--log-dir"),  # no value: oneclient would take the mountpoint
+    ],
+)
+def test_o05_the_sidecars_command_refuses_a_log_directory_in_extra_args_in_every_form(s, names, extra, option):
+    """O05: the sandbox owns oneclient's log directory, whatever `[sandbox.mount] extra_args` holds when the settings
+    are built in code rather than loaded: the mount refuses it where it is built, and one whose fields were set past
+    that check (`object.__setattr__`) still never yields a command with a second `--log-dir`, which oneclient takes
+    once and would fail to start on."""
+    with pytest.raises(ValueError, match="log directory") as built:
+        dataclasses.replace(s.mount, extra_args=extra)
+    assert f"({option})" in str(built.value)
+    assert "oc-log" not in str(built.value)
+    mount = dataclasses.replace(s.mount)
+    object.__setattr__(mount, "extra_args", extra)
+    given = dataclasses.replace(s, mount=mount)
+    with pytest.raises(ValueError, match="log directory") as e:
+        C.sidecar_command("p.test", given)
+    assert f"({option})" in str(e.value)
+    assert "oc-log" not in str(e.value)
+    with pytest.raises(ValueError, match="log directory"):
+        sidecar_args(given, names)
+
+
+def test_o05_other_extra_args_follow_the_log_directory_the_sandbox_declares(s):
+    """O05: the arguments the operator may give come after the sandbox's own, with the one `--log-dir`."""
+    given = dataclasses.replace(s, mount=dataclasses.replace(s.mount, extra_args=("--provider-timeout=30", "-d")))
+    command = C.sidecar_command("p.test", given)
+    assert command.count("--log-dir") == 1
+    assert command[command.index("--log-dir") + 1] == C.SIDECAR_LOG_DIR
+    assert command[-3:-1] == ["--provider-timeout=30", "-d"]
+    assert command[-1] == C.SIDECAR_MOUNT
+
+
+@pytest.mark.parametrize("path", ["/w/a,b/token", '/w/a"b/token', "/w/a\nb/token"])
+def test_o05_a_path_that_mount_would_read_as_syntax_is_refused_not_bound_as_something_else(s, names, path):
+    """O05: `--mount` takes comma-separated fields: a path with a comma, a quote or a line break would end the field or
+    open another, so the bind of a secret is refused."""
+    with pytest.raises(ValueError, match="comma"):
+        sidecar_args(s, names, token_file=Path(path))
+    with pytest.raises(ValueError, match="comma"):
+        C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=Path(path))
 
 
 def test_o23_the_certifi_question_answers_with_the_interpreters_bundle_or_none_and_is_read_back_exactly():

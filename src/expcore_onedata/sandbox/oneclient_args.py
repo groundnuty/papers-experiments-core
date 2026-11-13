@@ -3,13 +3,14 @@
 
 The core declares everything oneclient would otherwise decide at run time: the I/O mode (`io_mode`), the TLS check (the
 platform's `[tls]`), the configuration file (never read: `--config /dev/null`), the environment (`env -u` of the
-three variables of the image and of oneclient's own that could set an option) and, for direct I/O, where each storage
-is (one `--override` per entry of `[sandbox.mount.storages]`) and the log's buffering. A study's `extra_args` reach the
+three variables of the image and of oneclient's own that could set an option), the log directory (`--log-dir`, where
+the run's own directory is bound so the log is part of its evidence, O05) and, for direct I/O, where each storage is
+(one `--override` per entry of `[sandbox.mount.storages]`) and the log's buffering. A study's `extra_args` reach the
 same argv, so none of them may set what the core sets. `mount_problem` also holds a mount's direct-I/O keys to its mode:
 a direct mount needs its storage mapping and its check file, a proxy mount may have neither (O40). `extra_arg_problem`
-names the reason an argument is refused, and the same check runs where the settings are built (`MountSettings`), where
-the platform file is loaded and where the command is made, so settings built in code cannot give oneclient two
-force-I/O options or a second configuration.
+is the one check of the extra arguments: it names the reason an argument is refused, and it runs where the settings
+are built (`MountSettings`), where the platform file is loaded and where the command is made, so settings built in
+code cannot give oneclient two force-I/O options, a second configuration or a second log directory.
 
 `LONG_OPTIONS` and `SHORT_OPTIONS` are the option names oneclient 25.0 (tag `bb8a63e3`) accepts on its command line,
 read from `src/options/options.cc`. A run's metadata keeps an extra argument's name only when it is one of them
@@ -32,6 +33,7 @@ DIRECT = "direct"
 CONFIG_OPTION = "--config"
 CONFIG_NULL = "/dev/null"  # an empty file: boost's parser reads no option from it, so no configuration file is parsed
 INSECURE_OPTION = "--insecure"
+LOG_DIR_OPTION = "--log-dir"  # the sandbox's own (`containers.sidecar_command`); oneclient takes it once
 OVERRIDE_OPTION = "--override"  # `-r`: one helper parameter of one storage, `<storage id>:<name>:<value>` (O40)
 # With direct I/O the sidecar passes it, so glog writes each INFO line as it is logged and the start check sees every
 # line its test read caused (`logging.cc`: FLAGS_logbuflevel -1; otherwise INFO waits up to 30 s in a buffer, O40)
@@ -89,6 +91,14 @@ HOST_PATH_UNSAFE = re.compile(r'[,"\x00-\x1f\x7f]')  # in a `--mount` value a co
 SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under the mount
 
 
+def log_dir_refusal(option: str) -> str:
+    """Why `[sandbox.mount] extra_args` may not carry `option`, the log directory's, as written without its value."""
+    return (
+        f"must not carry oneclient's log directory ({option}): the sandbox sets it, and binds the run's own directory "
+        "there so the log is part of the run's evidence"
+    )
+
+
 def abbreviates(argument: str, option: str) -> bool:
     """Whether a long option `argument` (with or without `=value`) is `option` or a prefix of it, which boost's parser
     takes for it when it is unique among oneclient's options. Every such prefix of more than the dashes is counted: a
@@ -116,13 +126,24 @@ def short_letters(argument: str) -> str:
 
 def extra_arg_problem(argument: str) -> str | None:
     """Why a study's extra argument may not reach oneclient, or None when it may: it sets the TLS check, the I/O mode,
-    the configuration file or oneclient's environment, which the core declares. The reason never holds the argument."""
+    the configuration file, the log directory, a storage's place (O40) or oneclient's environment, which the core
+    declares. The reason never holds a value: the log directory's names the option as written (`-l`, `--log-d`), its
+    value dropped.
+
+    oneclient reads its command line with boost::program_options in its default style, so the log directory has more
+    forms than `-l` and `--log-dir`: an attached value (`-l/x`), switches clustered before it (`-fl /x`, which
+    `short_letters` reads) and any prefix of the long name (`--log-d`; `--l`, `--lo`, `--log` and `--log-` also start
+    `--log-read-write-perf`, which oneclient refuses as ambiguous, and are refused here all the same)."""
     if abbreviates(argument, INSECURE_OPTION) or "i" in short_letters(argument):
         return TLS_REFUSAL
     if any(abbreviates(argument, flag) for flag in IO_MODE_FLAGS.values()):
         return IO_MODE_ARGS_REFUSAL
     if abbreviates(argument, CONFIG_OPTION) or "c" in short_letters(argument):
         return CONFIG_REFUSAL
+    if abbreviates(argument, LOG_DIR_OPTION):
+        return log_dir_refusal(argument.split("=", 1)[0])
+    if "l" in short_letters(argument):
+        return log_dir_refusal("-l")
     if abbreviates(argument, OVERRIDE_OPTION) or "r" in short_letters(argument):
         return OVERRIDE_REFUSAL
     if ENV_SETTING.match(argument):

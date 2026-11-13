@@ -10,7 +10,7 @@ from sandbox_support import make_spec, start_options
 
 from expcore_onedata.sandbox import directio as D
 from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefused
-from expcore_onedata.sandbox.containers import DIRECT_STORAGE_ROOT
+from expcore_onedata.sandbox.containers import DIRECT_STORAGE_ROOT, SIDECAR_LOG_DIR
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
 
@@ -77,7 +77,8 @@ def test_o40_a_direct_mount_starts_once_its_check_shows_direct_io_and_records_it
     meta = sbx.metadata()["mount"]
     assert meta["io_mode"] == "direct"
     assert meta["options"] == [
-        "-o", "ro,allow_other", "--force-direct-io", "--config", "/dev/null", "--disable-log-buffering",
+        "-o", "ro,allow_other", "--force-direct-io", "--log-dir", SIDECAR_LOG_DIR, "--config", "/dev/null",
+        "--disable-log-buffering",
     ]  # fmt: skip
     assert meta["direct"]["storages"] == 2
     assert meta["direct"]["check"] == {
@@ -101,7 +102,7 @@ def test_o40_the_probe_runs_in_the_agent_on_the_check_file_and_the_log_is_read_i
     assert [name for name, argv in direct.direct.calls if D.PROBE_MARK in json.dumps(argv)] == []  # code is on stdin
     log_reads = [(name, argv) for name, argv in direct.direct.calls if argv[:1] == ["cat"]]
     assert [name for name, _ in log_reads] == [sbx.names.sidecar]  # the start's one read
-    assert log_reads[0][1][-1] == f"/tmp/oneclient/0/{D.LOG_FILE}"
+    assert log_reads[0][1][-1] == f"{SIDECAR_LOG_DIR}/{D.LOG_FILE}"  # the sandbox's own log directory (O05)
     sbx.stop()
 
 

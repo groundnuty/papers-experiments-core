@@ -44,7 +44,9 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
     and the clusters its token acts in, the current user's read sent as the token, named by that description and the
     route of oz-worker. And, since a job's times are stamped on the platform's global clock, Onezone's reading of it
     that the transfer log and the reset's history place their window by (#207), a public call named by oz-worker's
-    source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it."""
+    source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it. And the three calls of a
+    run's revocation at its end (C19): a user's read of its generation of temporary tokens, its own revocation of them,
+    and the verification that answers a revoked token `tokenRevoked`, all named by oz-worker's source alone."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
@@ -57,11 +59,24 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
         ("GET", "/users/{id}/effective_privileges"),
         ("GET", "/user/effective_clusters"),
         ("GET", "/provider/public/get_current_time"),
+        ("GET", "/user/tokens/temporary"),  # a run's revocation at its end (C19), from the source only
+        ("DELETE", "/user/tokens/temporary"),
+        ("POST", "/tokens/verify_access_token"),
     }
     what = " ".join(w for _, _, w in client.UNVERIFIED_ENDPOINTS)
     assert all(
         field in what
-        for field in ("fileId", "requirements", "400", "truncates", "oz_view_privileges", "clusters", "timeMillis")
+        for field in (
+            "fileId",
+            "requirements",
+            "400",
+            "truncates",
+            "oz_view_privileges",
+            "clusters",
+            "timeMillis",
+            "generation",
+            "tokenRevoked",
+        )
     )
     assert "14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55" in client.__doc__  # the source that names the clock's endpoint
     assert "provider_routes.erl:192-198" in client.__doc__

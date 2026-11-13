@@ -121,6 +121,20 @@ def test_the_per_run_reset_evicts_every_mirrors_replicas_and_keeps_every_owners_
     assert "; nothing to evict;" in str(beta)
 
 
+def test_the_per_run_reset_leaves_the_link_checks_probe_space_alone(fed, quick, tmp_path):
+    """O35: each link probe is held by the source that wrote it, here a mirror of the probe space, so it is no replica:
+    the reset neither refuses for it nor evicts it, and resets every other space as before."""
+    files = {**DEFAULT_FILES, "link-probes": {"expcore-link-probe-0123456789abcdef": 4096}}
+    fake = FakeProviders(fed, fed.spec.load_spec(), files, tmp_path)
+    probe = "expcore-link-probe-0123456789abcdef"
+    fake.hold("link-probes", probe, "pine", [])  # written through birch, not the owner
+    fake.hold("link-probes", probe, "birch", [[0, 4096]])
+    done = quick.evict_replicas(fake, timeout_s=5)
+    assert set(done) == {"alpha-space", "beta-space"}
+    assert fake.held("link-probes", probe, "birch") == [[0, 4096]]
+    assert all(body["fileId"] != "root-link-probes" for _, body in fake.transfers)
+
+
 def test_a_provider_that_owns_one_space_keeps_it_while_its_mirror_of_another_owners_space_is_emptied(
     fed, quick, tmp_path
 ):
