@@ -1,5 +1,5 @@
 # Provenance: new
-"""The reset's QoS requirements: found, the run's own removed, and the files they touched settled and kept quiet (O33).
+"""The reset's QoS requirements: found, and the files the run's own touched settled and kept quiet (O33).
 
 Sources are op-worker `f118ed9` (paths below are its own) and ctool `8ae7baf` (`ctool:`), read for #209.
 
@@ -39,21 +39,22 @@ qos_scan` chooses how the reset finds them:
   `src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`), which the reset itself no longer
   needs to find a requirement; until the first has passed on the federation, `summaries` stays the default.
 
-**The run's own.** A requirement present at the run's start (`SpaceReset.qos_requirements()`, the caller's baseline)
-is kept; every other one is the run's and is removed. The regular files at or under a removed requirement's entry are
-the affected files.
+**The run's own** are removed by `resetremove.py`: each waited on until it is fulfilled or impossible on every
+provider, deleted, and its deletion waited on until every provider has processed it. The regular files at or under a
+removed requirement's entry are the affected files.
 
-**Settled, then quiet.** A QoS replication has no transfer to wait for, and one still running when its requirement is
-removed can go on placing bytes. So after the removal the affected files' block maps, on every provider, must stay
-the same for `SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND_S`, or the reset fails. After the
-eviction and the occupancy the quiet stage reads, at one instant T, the block maps of the files the eviction plan
-evicted, on the providers it evicted them from, and of the files a removed requirement applied to, on every provider.
-Each may hold no more than it should: nothing where the eviction verified it empty, what the settle saw elsewhere.
-Then it waits `quiet_wait_s` from T and reads the occupancy: no provider other than the data provider may hold more of
-the space than at the occupancy stage. That check does not wait for a requirement to be found: an agent can add one
-and remove it before the run ends, leaving the reset none to see while its replication is still landing, so it runs
-unless the caller knows that no run since the last verified reset had the right to manage QoS, and covers the files
-the eviction plan evicts as well (`resetheld.py`), never a read of the whole space.
+**Settled, then quiet.** A QoS replication has no transfer to wait for, and a cancel can still place the blocks it had
+in flight. So after the removal the affected files' block maps, on every provider, must stay the same for
+`SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND_S`, or the reset fails. After the eviction and the
+occupancy the quiet stage reads, at one instant T, the block maps of the files the eviction plan evicted, on the
+providers it evicted them from, and of the files a removed requirement applied to, on every provider. Each may hold no
+more than it should: nothing where the eviction verified it empty, what the settle saw elsewhere. Then it waits
+`quiet_wait_s` from T and reads the occupancy: no provider other than the data provider may hold more of the space than
+at the occupancy stage. That check does not wait for a requirement to be found: an agent can add one and remove it
+before the run ends, and a cancel that missed leaves one file replicating with no requirement for the reset to see
+(the residual, `resetremove.py`), so it runs unless the caller knows that no run since the last verified reset had the
+right to manage QoS, and covers the files the eviction plan evicts as well (`resetheld.py`), never a read of the whole
+space.
 
 **What the quiet stage proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T.** T is
 the instant the last block map was read. The block maps decide for the plan's files (a file's distribution shows its
@@ -89,10 +90,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.placement import Range, held_bytes, merged
 from expcore_onedata.provision import Listings, Provisioner, ProvisionError
-from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferrecord import Unreadable
 
 _PLAIN_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a requirement or entry id the client accepts as one path segment
@@ -135,16 +134,20 @@ class Found:
 
 def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:
     """The ids of the QoS requirements on an entry and its ancestors, from its summary on one provider."""
-    answer = p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=p.retry)
+    return requirements_of(p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=p.retry))
+
+
+def requirements_of(answer: Any) -> set[str]:
+    """The requirement ids a summary answer holds; refuse one not in its shape, or an id that is not plain."""
     requirements = answer.get("requirements") if isinstance(answer, dict) else None
     if not isinstance(requirements, Mapping) or not all(isinstance(q, str) for q in requirements):
         raise Unreadable("a QoS summary holds no table of requirements keyed by id")
-    if not all(_plain(q) for q in requirements):  # an id becomes a path segment of the next calls
+    if not all(plain_id(q) for q in requirements):  # an id becomes a path segment of the next calls
         raise Unreadable("a QoS summary holds a requirement id that is not one plain path segment")
     return set(requirements)
 
 
-def _plain(value: str) -> bool:
+def plain_id(value: str) -> bool:
     """Whether an id is one plain path segment, as the client accepts one."""
     return _PLAIN_ID.fullmatch(value) is not None
 
@@ -229,7 +232,7 @@ def _entries_of(answer: Any) -> tuple[list[_Listed], str | None]:
     for item in answer["files"]:
         file_id, path = (item.get("fileId"), item.get("path")) if isinstance(item, dict) else (None, None)
         inheritance, kind = (item.get("effQosInheritancePath"), item.get("type")) if isinstance(item, dict) else (0, 0)
-        if not isinstance(file_id, str) or not _plain(file_id) or not isinstance(path, str) or not path:
+        if not isinstance(file_id, str) or not plain_id(file_id) or not isinstance(path, str) or not path:
             raise Unreadable("an entry of the recursive listing has no plain fileId or no path")
         if inheritance not in INHERITANCE or not isinstance(kind, str):
             raise Unreadable("an entry of the recursive listing has no effQosInheritancePath or no type")
@@ -312,59 +315,6 @@ def scan(p: Provisioner, providers: Sequence[str]) -> Found:
     if p.settings.qos_scan == "listing":
         return by_listing(p, providers)
     return by_summaries(p, providers)
-
-
-def _gone(p: Provisioner, key: tuple[str, str]) -> bool:
-    """Whether a removed requirement answers on one provider that it is not there (`answered_absent`: a 404, or
-    25.0's 400 posix enoent); any other failure, another 400 included, propagates and does not count."""
-    provider, qid = key
-    try:
-        p.client.get(f"/qos_requirements/{qid}", provider=provider, retry=ONE_ATTEMPT)
-    except PlatformError as error:
-        if answered_absent(error):
-            return True
-        raise
-    return False
-
-
-def remove(
-    p: Provisioner, providers: Sequence[str], baseline: Iterable[str]
-) -> tuple[dict[str, Any], dict[str, int], int]:
-    """Find every requirement, remove each one not in `baseline` through the gate, and show them gone everywhere: each
-    answers that it is not there on every provider, and a second scan finds none but the baseline's. Return the
-    stage's facts, the affected files, those the removed requirements applied to, each with its depth, and the depth of
-    the deepest regular file of the space, from the first scan."""
-    kept = frozenset(baseline)
-    found = scan(p, providers)
-    added = {qid: where for qid, where in found.where.items() if qid not in kept}
-    facts: dict[str, Any] = {"scan": p.settings.qos_scan, "found": len(found.where)}
-    facts["kept"] = len(found.where) - len(added)
-    affected = {file_id: depth for qid in added for file_id, depth in found.files[qid].items()}
-    for qid, provider in added.items():
-        p.mutate("DELETE", f"/qos_requirements/{qid}", provider=provider)
-    reads = dict(found.reads)
-    if added:
-        settings = p.settings
-        gone = consistency.converge_each(
-            [(provider, qid) for provider in providers for qid in added],
-            lambda key: _gone(p, key),
-            bool,
-            timeout_s=settings.settle_timeout_s,
-            poll_s=settings.poll_s,
-            consecutive=settings.consecutive_polls,
-            workers=settings.concurrency,
-            clock=p.clock,
-            sleep=p.sleep,
-        )
-        if not gone.converged:
-            raise ProvisionError(f"{len(gone.pending)} QoS requirement reading(s) still answer after the removals")
-        again = scan(p, providers)
-        left = [qid for qid in again.where if qid not in kept]
-        if left:
-            raise ProvisionError(f"the scan after the removals still finds {len(left)} QoS requirement(s) not kept")
-        reads = {k: reads.get(k, 0) + again.reads.get(k, 0) for k in reads.keys() | again.reads.keys()}
-    facts.update(removed=len(added), affected_files=len(affected), reads=reads)
-    return facts, affected, found.deepest
 
 
 Pair = tuple[str, str]  # (file id, provider)
@@ -464,9 +414,10 @@ __all__ = [
     "SETTLE_STABLE_S",
     "Found",
     "occupancy_lag_s",
+    "plain_id",
     "quiet",
     "quiet_wait_s",
-    "remove",
+    "requirements_of",
     "scan",
     "settle",
     "tree",

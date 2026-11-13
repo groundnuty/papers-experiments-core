@@ -57,9 +57,10 @@ def test_o11_a_requirement_only_one_provider_has_seen_is_found_there_removed_and
     provisioner, stocked, ticker
 ):
     """O11: a requirement the data provider has not seen yet is still in the space: the walk on the other provider
-    finds it, it is removed there, and every provider then shows it gone."""
-    qid = stocked.add_qos(FILES[2])
-    stocked.qos_hidden_on[qid] = {ALPHA_ID}
+    finds it, it is waited for until dbsync has brought it to the data provider, removed there, and every provider
+    then shows it gone."""
+    stocked.qos_sync_s = 8.0
+    qid = stocked.add_qos(FILES[2], through=BETA_ID)
     record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert stocked.qos == {}
     assert record["stages"]["qos"]["removed"] == 1

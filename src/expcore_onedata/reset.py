@@ -9,13 +9,19 @@ read and every check is made on each provider that supports the space, since eac
 
 1. **qos**: every QoS requirement in the space is found (there is no listing of a space's requirements; how they are
    found, a summary per leaf or one recursive listing, is `[placement] qos_scan`, `resetqos.py`), and each one not in
-   the caller's baseline (`qos_baseline`, the run's start's, from `qos_requirements()`) is removed through the
-   mutation gate (bound to this space, its record's `fileId` resolved by its parent links), must then answer that it is
-   not there (`client.answered_absent`: a 404, or 25.0's 400 posix enoent; any other 400 fails closed) on consecutive
-   reads on every provider, and a second scan must find none but the baseline's (O33).
-   **qos_settle**: a QoS replication creates no transfer to wait for, so the block maps of the files a removed
-   requirement applied to must stay the same on every provider for `resetqos.SETTLE_STABLE_S`, within
-   `resetqos.SETTLE_BOUND_S`.
+   the caller's baseline (`qos_baseline`, the run's start's, from `qos_requirements()`) is removed (`resetremove.py`):
+   first its record is read on every provider until its status is `fulfilled` or `impossible` there, within
+   `[placement] qos_fulfil_timeout_s` (120 s), or the reset fails and deletes nothing, since a deletion cancels the
+   replication only on the provider that processes it, best-effort, and the replicating provider goes on until dbsync
+   brings it the deletion; it is then deleted through the mutation gate (bound to this space, its record's `fileId`
+   resolved by its parent links); then the deletion barrier: on every provider the summary of its entry must no longer
+   list it and its record must answer that it is not there (`client.answered_absent`: a 404, or 25.0's 400 posix
+   enoent; any other 400 fails closed) on consecutive reads, within `resetremove.BARRIER_BOUND_S` (60 s), so no file is
+   settled or evicted before every provider has processed the deletion; and a second scan must find none but the
+   baseline's (O33). `pending` does not prove that bytes are moving, and no REST answer shows bytes in flight.
+   **qos_settle**: a QoS replication creates no transfer to wait for, and a cancel can still place the blocks it had in
+   flight, so the block maps of the files a removed requirement applied to must stay the same on every provider for
+   `resetqos.SETTLE_STABLE_S`, within `resetqos.SETTLE_BOUND_S`.
 2. **transfers**: every waiting and ongoing transfer, on every provider that lists it, is cancelled there through the
    gate (bound to this space, its record's `spaceId` resolved); a cancel answered 400 is a job that has ended, never
    one the gate refused unsent. Each must then report an ended state on that provider, and the listings must show
@@ -46,8 +52,10 @@ read and every check is made on each provider that supports the space, since eac
    occupancy read, and the stage then passes. The block maps decide for the plan's files; a zero occupancy is never
    taken alone as nothing having landed, since it lags. The stage runs unless the caller knows that no run since the
    last verified reset could have set a QoS requirement (`run(qos_rights=...)`, below), whether or not a requirement is
-   left at the reset, since an agent can add a requirement and remove it before the run ends while its replication,
-   which creates no transfer document, is still landing. The record gives `ran`, `why` (`requirements`, `rights` or
+   left at the reset. **The residual:** an agent's add-then-remove during the run whose cancel missed may still be
+   replicating one file, with no requirement left and no transfer document to show it; it is at most one file's size,
+   and rare, since it needs a missed cancel; it may land after T, and is then caught by the next start's reset. The
+   record gives `ran`, `why` (`requirements`, `rights` or
    `default`, `resetheld.py`), `held_files` and `held_source` (`"eviction plan"`), `files`, `block_maps` and the stage's
    seconds. It costs the wait, 20 s for files one directory below the root and 5 s more per further level (the depth
    of the deepest file of the space, as the QoS scan saw it), and one block-map read per evicted (file, provider) pair
@@ -106,7 +114,7 @@ from functools import partial
 from math import isfinite
 from typing import Any
 
-from expcore_onedata import consistency, resetheld, resetqos
+from expcore_onedata import consistency, resetheld, resetqos, resetremove
 from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError
 from expcore_onedata.eviction import evict_ids, evict_tree
 from expcore_onedata.occupancy import physical_sizes
@@ -193,7 +201,7 @@ class SpaceReset:
         reset runs at the start of each run and clears what earlier runs left, so this is not the rights of the run
         about to start: a read-only run that follows a writing one would skip the quiet check exactly when it is
         needed. `True` or `None` (the fail-safe default) runs the check, whether or not a requirement is left at the
-        reset, since an agent can add one and remove it before the run ends while its replication is still landing; pass
+        reset, since an agent's add-then-remove whose cancel missed may still be replicating one file; pass
         `False` only when you know that no run since the last verified reset had the right to manage QoS, and then
         only a reset that removed no requirement skips it. `Condition.manages_qos` describes one condition: combine it
         over every run since the last verified reset (O33)."""
@@ -267,8 +275,9 @@ class SpaceReset:
         return frozenset(resetqos.scan(self._p, self._providers).where)
 
     def _qos(self, baseline: Collection[str], run: dict[str, Any]) -> dict[str, Any]:
-        """Remove every requirement not in the baseline and show them gone; keep the files they applied to."""
-        facts, run["affected"], run["deepest"] = resetqos.remove(self._p, self._providers, baseline)
+        """Remove every requirement not in the baseline, each fulfilled first and its deletion processed everywhere
+        after (`resetremove.py`), and show them gone; keep the files they applied to."""
+        facts, run["affected"], run["deepest"] = resetremove.remove(self._p, self._providers, baseline)
         run["why"] = resetheld.quiet_reason(facts["removed"], run["qos_rights"])
         return facts
 

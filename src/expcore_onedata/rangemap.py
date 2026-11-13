@@ -28,6 +28,7 @@ transfer_settle_polls = 4       # the most observations of the listing before it
 clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that widen the run's window (O08)
 concurrency = 16                # the most requests a bulk operation has in flight at once (eviction, block maps, reset)
 qos_scan = "summaries"          # how the reset finds QoS requirements: "summaries" (a read per leaf) or "listing" (O33)
+qos_fulfil_timeout_s = 120      # the longest the reset waits for a run's QoS requirement to be fulfilled before deleting it
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -86,6 +87,7 @@ class PlacementSettings:
     clock_skew_allowance_s: float = 5.0  # beyond the providers' estimated clock offsets
     concurrency: int = 16  # the named bound on a bulk operation's requests in flight (eviction, block maps, reset)
     qos_scan: str = QOS_SCANS[0]  # how the reset finds QoS requirements (`resetqos.py`); see QOS_SCANS
+    qos_fulfil_timeout_s: float = 120.0  # the reset's wait for a requirement to be fulfilled (`resetremove.py`)
 
 
 @dataclass(frozen=True)
@@ -248,6 +250,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "clock_skew_allowance_s",
             "concurrency",
             "qos_scan",
+            "qos_fulfil_timeout_s",
         )
     )
     holder = table.string("holder")
@@ -274,6 +277,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         clock_skew_allowance_s=_number(table, "clock_skew_allowance_s", 5.0, minimum=0),
         concurrency=_number(table, "concurrency", 16, minimum=1, integer=True),
         qos_scan=qos_scan,
+        qos_fulfil_timeout_s=_number(table, "qos_fulfil_timeout_s", 120.0, minimum=0),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))

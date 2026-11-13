@@ -117,7 +117,10 @@ ONE_ATTEMPT_SITES = {
     ("provision.py", "Provisioner.require_empty", "provisioner.holds"): ["<default>"],
     ("eviction.py", "_converge_empty", "provisioner.blocks"): ["<default>"],
     ("ingestbase.py", "Baseline._absent_everywhere", "client.get"): ["ONE_ATTEMPT"],
-    ("resetqos.py", "_gone", "client.get"): ["ONE_ATTEMPT"],
+    # the reset's removal (O33): the wait for a requirement to be fulfilled, and the deletion barrier
+    ("resetremove.py", "_record", "client.get"): ["ONE_ATTEMPT"],
+    ("resetremove.py", "_gone", "client.get"): ["ONE_ATTEMPT"],
+    ("resetremove.py", "_processed", "client.get"): ["ONE_ATTEMPT"],
 }
 
 # The client's own calls: a request it sends, the gate's reads and what each call into the gate says about them. The
@@ -217,7 +220,8 @@ HELPER_USERS = {
         "layer.evict_ids",
         "layer.evict_tree",
     },
-    "resetqos.py": {"provisioner.children", "provisioner.mutate"},
+    "resetqos.py": {"provisioner.children"},
+    "resetremove.py": {"provisioner.mutate"},
 }
 
 # Calls that have a provisioner helper's name and are the method of another object (module, function, receiver).

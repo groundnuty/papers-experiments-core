@@ -76,14 +76,16 @@ def test_o33_the_listing_costs_a_page_per_thousand_entries_on_each_provider_and_
 
 
 def test_o33_a_requirement_only_the_provider_it_was_added_through_has_is_found_and_removed(scanned, fake, ticker):
-    """O33: an agent adds a requirement through beta just before the reset; alpha, the data provider, has not received
-    it through dbsync. The scan of alpha finds nothing, so the reset reads every supporting provider, finds it on
-    beta, removes it through beta, and shows it gone on both."""
-    qid = fake.add_qos("study")
-    fake.qos_hidden_on[qid] = {fake.PROVIDER_ID}
+    """O33: an agent adds a requirement through beta just before the reset; alpha, the data provider, receives it
+    through dbsync 8 s later. The scan of alpha finds nothing, so the reset reads every supporting provider, finds it
+    on beta, waits until alpha has it too and it is fulfilled on both, removes it through beta, and shows it gone on
+    both."""
+    fake.qos_sync_s = 8.0
+    qid = fake.add_qos("study", through=BETA_ID)
     record = SpaceReset(scanned, now=ticker.clock).run({"beta": ["study"]})
     stage = record["stages"]["qos"]
     assert (stage["found"], stage["removed"], stage["affected_files"]) == (1, 1, len(FILES))
+    assert stage["fulfil_s"] >= 8.0
     assert qid not in fake.qos
 
 

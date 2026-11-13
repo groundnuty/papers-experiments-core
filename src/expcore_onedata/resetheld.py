@@ -2,9 +2,10 @@
 """When the reset's quiet check runs, and the files it reads beyond a removed requirement's (O33, #209).
 
 A removed requirement names the files a QoS replication may still be placing, but an agent that may manage QoS can add
-a requirement and remove it before the run ends. Its replication creates no transfer document and no requirement is
-left, so at reset time nothing shows that one is landing, and it can land after the eviction. So the quiet check does
-not wait for a requirement to be found. **It runs, and why is recorded**, in this order:
+a requirement and remove it before the run ends, and a cancel that missed leaves one file replicating whole
+(`resetremove.py`, the residual). That replication creates no transfer document and no requirement is left, so at
+reset time nothing shows that it is landing, and it can land after the eviction: at most one file's size, and rare. So
+the quiet check does not wait for a requirement to be found. **It runs, and why is recorded**, in this order:
 
 - `requirements`: the reset removed a requirement;
 - `rights`: the caller says (`qos_rights=True`) that a run since the last verified reset could have set one;
