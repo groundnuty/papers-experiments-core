@@ -8,15 +8,14 @@
 
 The data path and the tool server are separate planes (architecture.md, "Tokens and permissions"): each has its own
 platform user and its own token, and nothing is shared. The data path is read-only on the study space and its user holds
-exactly view and read. The tool server's user holds the condition's declared rights, no more and no less; its token is
-read-only and path-scoped, as the data path's is, when the condition declares no write right, and carries no
-data-access caveat when it declares one (`tool_server_spec`).
+exactly view and read. The tool server's user holds the condition's declared rights, no more and no less, and its token
+carries no data-access caveat, whether the condition declares a write right or none (`tool_server_spec`, O39).
 
 What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
 1. derives the lifetime from the run's whole-time ceiling and checks it against the platform's limit, before anything is minted
    (O06: `token_window`);
 2. reads the principal's privileges back, direct and effective, and requires exactly the plane's set (O05), and, for a
-   token without a data-access caveat, no Onezone admin privilege (`tokenscope`);
+   token without a data-access caveat (every tool-server token), no Onezone admin privilege (`tokenscope`);
 3. mints with the plane's exact caveats (`CaveatSpec`, shared with the examination);
 4. examines the token fail-closed, against that exact set and the lifetime window, and, for a token without a
    data-access caveat, requires Onezone's scope of it to be exactly the plane's spaces and the clusters it acts in to
@@ -178,19 +177,27 @@ def data_path_spec(space_id: str | Sequence[str], interface: str = "rest") -> Pl
 def tool_server_spec(space_id: str | Sequence[str], condition: Condition) -> PlaneSpec:
     """The tool server of a condition, reaching its spaces with its declared rights in each.
 
-    A condition that declares no write right gets the data path's caveats: read-only, and scoped by `data.path` to its
-    spaces. A writing condition's token carries no data-access caveat, only its expiry and the `rest` interface. On
-    Onedata 25.0 a token with any data-access caveat (`data.path`, `data.objectid`, `data.readonly`) is a data-access
-    token, usable for data access alone, so it can neither schedule a transfer nor add a QoS requirement (#177: `POST
-    /transfers` answered `tokenCaveatUnverified`).
+    Every condition's token carries no data-access caveat, only its expiry and the `rest` interface, whether the
+    condition declares a write right or none. On Onedata 25.0 a token with any data-access caveat (`data.path`,
+    `data.objectid`, `data.readonly`) is a data-access token, usable for data access alone: a writing condition's could
+    neither schedule a transfer nor add a QoS requirement (#177: `POST /transfers` answered `tokenCaveatUnverified`),
+    and a read-only condition's was refused its views, `GET /transfers/{id}`, `GET /spaces/{id}/transfers` and `GET
+    /qos_requirements/{id}`, with the same 401, as was the tool server's own examination of it (#181, the live run of
+    12 Nov). Only reads under `/data/{id}` served on it.
 
-    **The boundary of a writing token is therefore its principal**, the slot's leased tool-server user (C19, O09), and
-    four reads hold it, before the token is minted (the scope and the clusters just after) and again at the tool
-    server's launch and teardown: the user's rights, direct and effective, in each of the plane's spaces must be
-    exactly the condition's; Onezone's scope of the token, which lists every space the user is an effective member of,
-    must be exactly the plane's spaces, so a space of another study or one declared for the data path alone is
-    refused; the user must hold no Onezone admin privilege; and the clusters the token acts in, read as the token, must
-    be none, since a member of a provider's cluster can act through that provider (`tokenscope`).
+    **The boundary of the token is therefore its principal**, the slot's leased tool-server user (C19, O09), and four
+    reads hold it, before the token is minted (the scope and the clusters just after) and again at the tool server's
+    launch and teardown: the user's rights, direct and effective, in each of the plane's spaces must be exactly the
+    condition's; Onezone's scope of the token, which lists every space the user is an effective member of, must be
+    exactly the plane's spaces, so a space of another study or one declared for the data path alone is refused; the
+    user must hold no Onezone admin privilege; and the clusters the token acts in, read as the token, must be none,
+    since a member of a provider's cluster can act through that provider (`tokenscope`).
+
+    **A read-only condition stays read-only through its user (O39).** Its declared rights hold no write right
+    (`rights.declares_write`), and the user must hold exactly those, so it holds none of `rights.WRITE_RIGHTS` and,
+    since the set is exact, no other privilege either, `space_write_data` among them: Onedata refuses its replication,
+    eviction and QoS requirement for the missing privilege, where it refused them for the caveat before. The data path
+    keeps its caveats; only the tool server's token changes.
 
     Onedata's `api` caveat is not a data-access caveat and could narrow the token to named operations, but which
     operations the tool server's calls map to is not in the source its format was read from, and one missing entry
@@ -198,9 +205,7 @@ def tool_server_spec(space_id: str | Sequence[str], condition: Condition) -> Pla
     call the tool server makes, and what the agent can ask for is the condition's tool allow-list (its frozen manifest).
     """
     return PlaneSpec(
-        Plane.TOOL_SERVER,
-        condition.rights,
-        CaveatSpec(_scope(space_id), readonly=not condition.writes, interface="rest"),
+        Plane.TOOL_SERVER, condition.rights, CaveatSpec(_scope(space_id), readonly=False, interface="rest")
     )
 
 
@@ -270,8 +275,9 @@ class TokenIssuer:
             require_no_admin(admin_privileges(self._client, user_id))
 
     def check_scope(self, spec: PlaneSpec, value: str) -> None:
-        """For a token without a data-access caveat, require Onezone's scope of it to be exactly the plane's spaces
-        (`tokenscope.require_scope`); a read-only token's scope is its `data.path` caveat, so it is not read.
+        """For a token without a data-access caveat (every tool-server token), require Onezone's scope of it to be
+        exactly the plane's spaces (`tokenscope.require_scope`); the data path's scope is its `data.path` caveat, so it
+        is not read.
 
         A scope read that gets no answer raises `ExaminationFailed`; an answer that cannot be read raises `TokenRefused`;
         a scope with another space, or without one of the plane's, raises `tokenscope.ScopeMismatch`.
@@ -281,9 +287,9 @@ class TokenIssuer:
         require_scope(scope_spaces(self._client, value), spec.caveats.space_ids, self._config)
 
     def check_clusters(self, spec: PlaneSpec, value: str) -> None:
-        """For a token without a data-access caveat, require its user to be an effective member of no cluster, read as
-        the token itself (`GET /user/effective_clusters` answers for the user it is sent as); a read-only token's
-        boundary is its `data.path` caveat, so it is not read.
+        """For a token without a data-access caveat (every tool-server token), require its user to be an effective
+        member of no cluster, read as the token itself (`GET /user/effective_clusters` answers for the user it is sent
+        as); the data path's boundary is its `data.path` caveat, so it is not read.
 
         A read that gets no answer raises `ExaminationFailed`; an answer that cannot be read raises `TokenRefused`; a
         member of a cluster raises `tokenscope.ClusterMember`, counting the clusters and never naming one.

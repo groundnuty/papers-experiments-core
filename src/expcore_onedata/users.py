@@ -97,12 +97,12 @@ Users are created by the operator, not by this layer: there is no unscoped user 
 a slot's users hold are checked, direct and effective, before every token is minted (`tokens.py`).
 
 **A slot's tool-server user must be a member of no space outside the tool-server plane's, hold no Onezone admin
-privilege, and be a member of no cluster.** A writing condition's token carries no data-access caveat
-(`tokens.tool_server_spec`), so what it can reach is what its user's memberships and admin privileges give, and a user
-who is a member of a provider's cluster can act through that provider: with `cluster_update` it can mint that provider's
-tokens and change its configuration, with `cluster_delete` delete it. Setting the user up so is the operator's part of
-the slot; the harness reads all three (`tokenscope`) when it mints a writing token and at the tool server's launch and
-teardown, and refuses a user that is set up otherwise. Onezone has no read of another user's clusters, so the harness
+privilege, and be a member of no cluster.** A tool-server token carries no data-access caveat, a read-only condition's
+as a writing one's (`tokens.tool_server_spec`, O39), so what it can reach is what its user's memberships and admin
+privileges give, and a user who is a member of a provider's cluster can act through that provider: with
+`cluster_update` it can mint that provider's tokens and change its configuration, with `cluster_delete` delete it.
+Setting the user up so is the operator's part of the slot; the harness reads all three (`tokenscope`) when it mints a
+tool-server token and at the tool server's launch and teardown, and refuses a user that is set up otherwise. Onezone has no read of another user's clusters, so the harness
 reads them as the token itself, `GET /user/effective_clusters`, which answers the clusters that token acts in.
 """
 

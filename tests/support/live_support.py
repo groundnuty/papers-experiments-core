@@ -1,9 +1,11 @@
 """What the live contract tests share with the offline tests that check them: minting a condition's token."""
 
 from collections.abc import Mapping
+from typing import Any
 
 import pytest
 
+from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.day0.outage import prerequisite as outage_prerequisite
@@ -118,3 +120,63 @@ def require_cleaned(entry: Entry) -> None:
     for facts in per_space_facts(entry):
         assert "cleanup_verified" in facts, f"the {entry.name} check reports no cleanup result"
         assert facts["cleanup_verified"] is True, f"the {entry.name} check did not show its scratch entry gone"
+
+
+# -- a read-only condition's tool server, live (O39) -------------------------------------------------------------------
+
+VIEW_TOOLS = (
+    "get_transfer",
+    "list_space_transfers",
+    "get_qos_requirement",
+    "get_file_qos_summary",
+    "get_file_distribution",
+)
+WRITE_TOOLS = ("schedule_file_replication", "add_file_qos_requirement")
+# What an argument is, from a word its name holds, tried in this order, so that a name holding two words is the more
+# specific one's: a state before a transfer (`transfer_state`), a transfer or a requirement before a file, and a
+# provider before a count of replicas (Onedata names a replication's target `replicatingProviderId`).
+ARGUMENT_KINDS = (
+    ("state", "state"),
+    ("transfer", "transfer"),
+    ("requirement", "requirement"),
+    ("expression", "expression"),
+    ("provider", "provider"),
+    ("replica", "replicas"),
+    ("file", "file"),
+    ("space", "space"),
+)
+
+
+def argument_kind(name: str) -> str | None:
+    """What a tool's argument is, from its name; None when its name says none of `ARGUMENT_KINDS`."""
+    word = name.lower()
+    return next((kind for key, kind in ARGUMENT_KINDS if key in word), None)
+
+
+def tool_arguments(schema: Mapping[str, Any] | None, values: Mapping[str, Any]) -> dict[str, Any] | str:
+    """The arguments of a call from the tool's own input schema: each property whose name says a kind `values` has
+    gets that value, as text when the schema types it a string. The tools' names, descriptions and arguments are the
+    server's and are never assumed here. Return the reason, naming the properties, when a required one cannot be
+    filled: such a tool is unmeasured, never called with a guess."""
+    properties = (schema or {}).get("properties") or {}
+    required = list((schema or {}).get("required") or [])
+    filled: dict[str, Any] = {}
+    for name, spec in properties.items():
+        kind = argument_kind(name)
+        if kind not in values:
+            continue
+        value = values[kind]
+        if isinstance(spec, Mapping) and spec.get("type") == "string" and not isinstance(value, str):
+            value = str(value)
+        filled[name] = value
+    unfilled = sorted(name for name in required if name not in filled)
+    if unfilled:
+        return f"its input schema requires {', '.join(unfilled)}, which the test cannot fill"
+    return filled
+
+
+def refused(error: PlatformError) -> bool:
+    """Whether a platform error is the refusal of a request, as Onedata 25.0 answers one: 401, 403, or 400 `posix`
+    `eacces` (`.claude/rules/onedata-25.md`). Any other answer, another 400 or a 404 among them, is not one, so a
+    write that fails for another reason is never taken for a refused one."""
+    return error.status in (401, 403) or (error.status, error.code, error.errno) == (400, "posix", "eacces")

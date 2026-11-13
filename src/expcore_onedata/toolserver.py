@@ -13,11 +13,12 @@ Before it spawns anything the launcher verifies the pinned checkout, when the co
 again against the condition's exact caveat set, and reads the token's principal's privileges again, direct and
 effective, requiring exactly the condition's declared rights, no more and no less. An unexamined or drifted token, a
 token minted for another condition's rights, and a principal whose privileges changed since the token was minted
-cannot start the plane: the caveats of two conditions that both write are the same, so only the privileges tell them
-apart. A writing condition's token carries no data-access caveat, so its user is its boundary: the launcher also reads
-Onezone's scope of the token, which must be exactly the tool-server plane's spaces, the user's Onezone admin
-privileges, which must be none, and the clusters the user is an effective member of, read as the token, which must be
-none (`tokenscope`), and reads all three again at teardown.
+cannot start the plane: every condition's token carries the same caveats, a read-only condition's as a writing one's
+(O39), so only the privileges tell them apart, and only they keep a read-only condition from writing. The token carries
+no data-access caveat, so its user is its boundary: the launcher also reads Onezone's scope of the token, which must be
+exactly the tool-server plane's spaces, the user's Onezone admin privileges, which must be none, and the clusters the
+user is an effective member of, read as the token, which must be none (`tokenscope`), and reads all three again at
+teardown.
 
 What the launcher can and cannot prevent. The privileges of the principal can change between the launch-time reread and
 the spawn, and again while the run goes on; a client cannot prevent that, so the design detects it:
@@ -162,8 +163,8 @@ def _prepare(
 ) -> None:
     """The checks before a spawn: the pinned checkout, the token examined again against the condition's caveats, and
     the principal's privileges read again against the condition's rights. Each must equal the condition's set exactly.
-    A writing condition's token, which has no data-access caveat, also has its scope read again, which must be the
-    plane's spaces, its principal must still hold no Onezone admin privilege, and be a member of no cluster
+    The token, which has no data-access caveat whatever the condition's rights, also has its scope read again, which
+    must be the plane's spaces, its principal must still hold no Onezone admin privilege, and be a member of no cluster
     (`tokenscope`)."""
     if token.plane is not Plane.TOOL_SERVER:
         raise ValueError("the tool server takes the tool-server plane's token, not another plane's")
@@ -196,8 +197,8 @@ def _recheck(
     issuer: TokenIssuer, config: PlatformConfig, condition: Condition, token: MintedToken, ceiling_s: float
 ) -> None:
     """The checks at teardown: the token examined again and the principal's privileges read again, against the
-    condition's exact set, and a writing token's scope, its principal's admin privileges and its clusters, as at
-    launch. The run is over, so the token only has to be unexpired, not to outlast a run."""
+    condition's exact set, and the token's scope, its principal's admin privileges and its clusters, as at launch.
+    The run is over, so the token only has to be unexpired, not to outlast a run."""
     spec = tool_server_spec(config.space_ids(Plane.TOOL_SERVER), condition)
     window = dataclasses.replace(token_window(ceiling_s, config.tokens), min_ttl_s=0)
     issuer.examine(token.reveal(), spec, token.subject, window)

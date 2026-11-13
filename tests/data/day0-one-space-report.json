@@ -76,8 +76,6 @@
           },
           "tool_server:read": {
             "caveats": {
-              "data.path": 1,
-              "data.readonly": 1,
               "interface": 1,
               "time": 1
             },

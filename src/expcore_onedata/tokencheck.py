@@ -10,10 +10,9 @@ caveat with a field it should not have. Any doubt is a refusal, including an exa
 parsed ("unknown is not a pass"). The same `CaveatSpec` builds the caveats at mint time (tokens.py), so what is asked for
 and what is accepted have one source.
 
-The two planes differ only in their spec: the data path is read-only on the space and its principal holds exactly view
-and read; the tool-server plane's principal privileges equal the condition's declared rights, its token is read-only
-with the data path's caveats when the condition declares no write right, and otherwise it carries no data-access caveat
-at all (`CaveatSpec`).
+The two planes differ only in their spec: the data path is read-only on the space by its caveats and its principal holds
+exactly view and read; the tool-server plane's principal privileges equal the condition's declared rights, and its token
+carries no data-access caveat at all, whether the condition declares a write right or none (`CaveatSpec`, O39).
 
 A message names the caveat type or the right that was wrong and never a path, an id or a token value.
 """
@@ -68,11 +67,13 @@ class CaveatSpec:
     """The exact caveat set of one plane's token for the spaces its plane reaches: one space's id, or the ids of
     several (`[[spaces]]`).
 
-    A read-only token is a data-access token: its caveats are the expiry, `data.readonly`, the interface and a
-    `data.path` whitelist with each space's subtree as one entry. A writable token carries no data-access caveat, only
-    the expiry and the interface: on Onedata 25.0 a token with any of `DATA_ACCESS_CAVEATS` is usable for data access
-    alone, and its request to schedule a transfer is refused (`tokenCaveatUnverified`, #177). Its spaces are then not a
-    caveat but the scope its principal's rights are read in (`tokens.TokenIssuer.check_user`).
+    `readonly` makes the token read-only by its caveats, a data-access token, as the data path's is: its caveats are
+    the expiry, `data.readonly`, the interface and a `data.path` whitelist with each space's subtree as one entry.
+    Without it the token carries no data-access caveat, only the expiry and the interface, as every tool-server token
+    does, a read-only condition's included (O39): on Onedata 25.0 a token with any of `DATA_ACCESS_CAVEATS` is usable
+    for data access alone, and its request to schedule a transfer (#177) or to view one or a QoS requirement (#181) is
+    refused (`tokenCaveatUnverified`). Its spaces are then not a caveat but the scope its principal's rights are read
+    in (`tokens.TokenIssuer.check_user`), and whether it writes is its principal's rights.
     """
 
     space_id: str | tuple[str, ...]
@@ -81,18 +82,20 @@ class CaveatSpec:
 
     def __post_init__(self) -> None:
         """Refuse an interface the platform does not have, a set of spaces that is empty or names one twice, and a
-        writable token on the oneclient interface, which 25.0 counts as a data-access caveat."""
+        token without data-access caveats on the oneclient interface, which 25.0 counts as a data-access caveat."""
         if self.interface not in INTERFACES:
             raise ValueError(f"unknown interface {self.interface!r}; known: {', '.join(INTERFACES)}")
         if not self.space_ids or len(set(self.space_ids)) != len(self.space_ids):
             raise ValueError("a token's caveats reach at least one space, each once")
         if not self.readonly and self.interface == "oneclient":
-            raise ValueError("a writable token cannot have the oneclient interface, a data-access caveat on 25.0")
+            raise ValueError(
+                "a token without data-access caveats cannot have the oneclient interface, a data-access caveat on 25.0"
+            )
 
     @property
     def data_access(self) -> bool:
         """Whether the token carries the data-access caveats, `data.readonly` and `data.path`: exactly when it is
-        read-only."""
+        read-only by its caveats, as the data path's token is."""
         return self.readonly
 
     @property
@@ -161,8 +164,9 @@ def _parse(info: Any) -> tuple[str, str, list[Mapping[str, Any]]]:
 
 
 def _check_shape(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> None:
-    """Require exactly the caveat types of the spec, each once, and no field a caveat should not have; a writable
-    token with a data-access caveat is refused as such, since that caveat would leave it unable to write."""
+    """Require exactly the caveat types of the spec, each once, and no field a caveat should not have; a token whose
+    spec has no data-access caveat (a tool-server token) that carries one is refused as such, since that caveat would
+    leave it unable to write or to view a transfer or a QoS requirement."""
     found, wanted = Counter(c["type"] for c in caveats), spec.shape()
     for name in sorted(wanted):
         if found[name] == 0:
@@ -171,7 +175,7 @@ def _check_shape(caveats: list[Mapping[str, Any]], spec: CaveatSpec) -> None:
         carried = sorted(name for name in found if name in DATA_ACCESS_CAVEATS)
         if carried:
             raise TokenRefused(
-                f"the writable token carries a data-access caveat ({_shown(carried[0])}), which limits it to data access"
+                f"the token carries a data-access caveat ({_shown(carried[0])}), which limits it to data access"
             )
     for name in sorted(found):
         if name not in wanted:

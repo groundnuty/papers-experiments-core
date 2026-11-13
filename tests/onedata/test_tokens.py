@@ -11,10 +11,11 @@ from expcore.records.redact import REDACTED
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import TokenSettings
 from expcore_onedata.credentials import Principal
+from expcore_onedata.rights import WRITE_RIGHTS
 from expcore_onedata.testing import ALPHA_ID, BASELINE, CEILING_S, MANAGE, NOW
 from expcore_onedata.testing import DATA_PATH_USER as DATA
 from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
-from expcore_onedata.tokencheck import ExaminationFailed, TokenRefused
+from expcore_onedata.tokencheck import ExaminationFailed, PrivilegesMismatch, TokenRefused
 from expcore_onedata.tokens import (
     DroppedToken,
     ExpiryMismatch,
@@ -119,34 +120,41 @@ def test_o05_a_principal_that_cannot_be_read_gets_no_token(issuer, fake):
     assert fake.issued == {}
 
 
-def test_o05_the_tool_server_token_has_the_conditions_caveats_no_more_and_no_less(issuer, fake, config):
-    """O05: read-only and path-scoped when the condition declares no write right; with no data-access caveat at all
-    when it does, since on Onedata 25.0 one would make the token usable for data access alone (#177)."""
-    reading = issuer.mint(tool_server_spec("spmock0001", config.condition("read")), TOOLS, ceiling_s=CEILING_S)
-    assert types(fake, reading) == ["time", "data.readonly", "interface", "data.path"]
+RIGHTS = {"read": BASELINE, "manage": MANAGE}  # each default condition's declared rights: read-only, and writing
+BOTH_KINDS = pytest.mark.parametrize("condition", list(RIGHTS), ids=["read-only", "writing"])
+
+
+def tool_spec(config, condition):
+    """The tool-server spec of a default condition on the study space."""
+    return tool_server_spec("spmock0001", config.condition(condition))
+
+
+def test_o39_a_read_only_conditions_tool_server_token_carries_no_data_access_caveat(issuer, fake, config):
+    """O39: a read-only condition's tool-server token is its expiry and the rest interface, as a writing condition's
+    is. On Onedata 25.0 a data-access caveat limits a token to data access, and the 12 Nov live run saw the read-only
+    token's `data.readonly` and `data.path` refuse its transfer and QoS-requirement views (#181)."""
+    reading = issuer.mint(tool_spec(config, "read"), TOOLS, ceiling_s=CEILING_S)
+    assert types(fake, reading) == ["time", "interface"]
     fake.grant(TOOLS.user_id, MANAGE)
-    managing = issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    managing = issuer.mint(tool_spec(config, "manage"), TOOLS, ceiling_s=CEILING_S)
     assert types(fake, managing) == ["time", "interface"]
 
 
 def test_o05_each_plane_and_condition_kind_mints_exactly_its_caveat_list(issuer, fake, config):
-    """O05: the data path and a read-only condition mint the same list they did before writing tokens changed, byte
-    for byte; a writing condition mints its expiry and the rest interface alone."""
+    """O05: the data path mints the same list it did before the tool-server tokens changed, byte for byte; a
+    read-only condition and a writing one each mint their expiry and the rest interface alone (O39)."""
     expiry = int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
-    read_only = (
+    data_path = (
         f'[{{"type": "time", "validUntil": {expiry}}}, {{"type": "data.readonly"}}, '
         '{"type": "interface", "interface": "rest"}, {"type": "data.path", "whitelist": ["L3NwbW9jazAwMDE="]}]'
     )
     data = issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
-    reading = issuer.mint(tool_server_spec("spmock0001", config.condition("read")), TOOLS, ceiling_s=CEILING_S)
+    reading = issuer.mint(tool_spec(config, "read"), TOOLS, ceiling_s=CEILING_S)
     fake.grant(TOOLS.user_id, MANAGE)
-    writing = issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
-    minted = {name: json.dumps(fake.issued[t.reveal()]["caveats"]) for name, t in (("data", data), ("read", reading))}
-    assert minted == {"data": read_only, "read": read_only}
-    assert fake.issued[writing.reveal()]["caveats"] == [
-        {"type": "time", "validUntil": expiry},
-        {"type": "interface", "interface": "rest"},
-    ]
+    writing = issuer.mint(tool_spec(config, "manage"), TOOLS, ceiling_s=CEILING_S)
+    assert json.dumps(fake.issued[data.reveal()]["caveats"]) == data_path
+    tool_server = [{"type": "time", "validUntil": expiry}, {"type": "interface", "interface": "rest"}]
+    assert fake.issued[reading.reveal()]["caveats"] == fake.issued[writing.reveal()]["caveats"] == tool_server
 
 
 @pytest.mark.parametrize(
@@ -158,13 +166,32 @@ def test_o05_each_plane_and_condition_kind_mints_exactly_its_caveat_list(issuer,
     ],
     ids=lambda caveat: caveat["type"],
 )
-def test_o05_a_writing_token_that_comes_back_with_a_data_access_caveat_is_dropped(added, issuer, fake, config):
-    """O05: a server that adds a data-access caveat to a writing condition's token hands out a token whose transfers
-    and QoS requirements Onedata 25.0 refuses; it is dropped, not returned."""
-    fake.grant(TOOLS.user_id, MANAGE)
+@BOTH_KINDS
+def test_o05_a_tool_server_token_that_comes_back_with_a_data_access_caveat_is_dropped(
+    added, condition, issuer, fake, config
+):
+    """O05: a server that adds a data-access caveat to a tool-server token, a read-only condition's or a writing one's,
+    hands out a token whose transfers and QoS requirements Onedata 25.0 refuses; it is dropped, not returned."""
+    fake.grant(TOOLS.user_id, RIGHTS[condition])
     fake.mint_hook = lambda user, caveats: [*caveats, added]
     with pytest.raises(TokenRefused, match="data-access caveat"):
-        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+        issuer.mint(tool_spec(config, condition), TOOLS, ceiling_s=CEILING_S)
+
+
+WRITES = [*WRITE_RIGHTS, "space_write_data"]  # every write right a condition can declare, and the data write
+
+
+@pytest.mark.parametrize("right", WRITES)
+@pytest.mark.parametrize("held", ["direct", "effective"])
+def test_o39_a_read_only_conditions_user_who_holds_any_write_right_gets_no_token(right, held, issuer, fake, config):
+    """O39: with no data-access caveat, what keeps a read-only condition's token from writing is its user, who must
+    hold exactly the condition's rights: one write right more, held directly or only through a group, and nothing is
+    minted. `space_write_data` is no right a condition can declare, so no read-only condition admits it either."""
+    effective = [*BASELINE, right]
+    fake.grant(TOOLS.user_id, effective if held == "direct" else BASELINE, effective)
+    with pytest.raises(PrivilegesMismatch, match=rf"the principal's {held} privileges.*has also {right}$"):
+        issuer.mint(tool_spec(config, "read"), TOOLS, ceiling_s=CEILING_S)
+    assert fake.issued == {}
 
 
 OUTSIDE = "sp-outside-0009"  # a space Onezone knows that the configuration does not declare
@@ -174,28 +201,34 @@ CLUSTERS = "/api/v3/onezone/user/effective_clusters"
 PROVIDER_CLUSTER = "cl-provider-0001"  # the id of a provider's cluster, which no message may hold
 
 
-def test_o09_a_writing_token_whose_user_is_a_member_of_a_space_outside_the_plane_is_dropped(issuer, fake, config):
-    """O09: a writing token carries no data-access caveat, so Onezone's scope of it is every space its user is a member
-    of. After minting, a scope with one space more than the plane's is refused: the token is dropped with the expiry it
-    is known to have, and the message counts the space without naming it or giving its id."""
-    fake.grant(TOOLS.user_id, MANAGE)
+@BOTH_KINDS
+def test_o09_a_tool_server_token_whose_user_is_a_member_of_a_space_outside_the_plane_is_dropped(
+    condition, issuer, fake, config
+):
+    """O09: a tool-server token carries no data-access caveat, a read-only condition's (O39) as a writing one's, so
+    Onezone's scope of it is every space its user is a member of. After minting, a scope with one space more than the
+    plane's is refused, so another study's space is out of reach: the token is dropped with the expiry it is known to
+    have, and the message counts the space without naming it or giving its id."""
+    fake.grant(TOOLS.user_id, RIGHTS[condition])
     fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
     with pytest.raises(DroppedToken, match="has also 1 space the configuration does not declare") as refused:
-        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+        issuer.mint(tool_spec(config, condition), TOOLS, ceiling_s=CEILING_S)
     assert refused.value.expires_at == int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
     assert OUTSIDE not in str(refused.value)
     assert "unrelated" not in str(refused.value)
     assert len(fake.issued) == 1  # it was minted, and dropped once its scope was read
 
 
-def test_o09_a_writing_conditions_user_with_a_onezone_admin_privilege_gets_no_token(issuer, fake, config):
+@BOTH_KINDS
+def test_o09_a_tool_server_user_with_a_onezone_admin_privilege_gets_no_token(condition, issuer, fake, config):
     """O09: an admin privilege of Onezone is live on a token without a data-access caveat, whatever the plane's spaces,
-    so the writing condition's user must hold none. It is read, with the admin credential, before anything is minted,
-    and the refusal names the privileges, which are no value of the federation."""
-    fake.grant(TOOLS.user_id, MANAGE)
+    so a tool-server user, a read-only condition's as a writing one's, must hold none. It is read, with the admin
+    credential, before anything is minted, and the refusal names the privileges, which are no value of the
+    federation."""
+    fake.grant(TOOLS.user_id, RIGHTS[condition])
     fake.admin_privileges[TOOLS.user_id] = ["oz_spaces_add_relationships", "oz_groups_view"]
     with pytest.raises(AdminPrivileged, match="holds Onezone admin privileges: oz_groups_view, oz_spaces_add_rel"):
-        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+        issuer.mint(tool_spec(config, condition), TOOLS, ceiling_s=CEILING_S)
     assert fake.issued == {}
     assert [r.token for r in fake.requests if r.path == ADMIN_READ] == [fake.ADMIN]
 
@@ -205,16 +238,19 @@ def test_o09_a_writing_conditions_user_with_a_onezone_admin_privilege_gets_no_to
     [([PROVIDER_CLUSTER], "1 cluster"), ([PROVIDER_CLUSTER, "cl-provider-0002"], "2 clusters")],
     ids=["one cluster", "two clusters"],
 )
-def test_o09_a_writing_tokens_user_who_is_a_member_of_a_cluster_is_dropped(clusters, count, issuer, fake, config):
+@BOTH_KINDS
+def test_o09_a_tool_server_tokens_user_who_is_a_member_of_a_cluster_is_dropped(
+    clusters, count, condition, issuer, fake, config
+):
     """O09: a member of a provider's cluster (cluster_update, cluster_delete) can mint that provider's tokens and change
     or delete the provider, so it acts through it beyond the plane's spaces whatever its scope is. Onezone answers the
     current user's clusters only, so the read is sent as the minted token itself, never as the admin, and a member of
-    any is refused: the token is dropped with the expiry it is known to have, and the message counts the clusters
-    without naming one."""
-    fake.grant(TOOLS.user_id, MANAGE)
+    any is refused, for a read-only condition as for a writing one: the token is dropped with the expiry it is known
+    to have, and the message counts the clusters without naming one."""
+    fake.grant(TOOLS.user_id, RIGHTS[condition])
     fake.clusters[TOOLS.user_id] = clusters
     with pytest.raises(DroppedToken, match=f"the principal is an effective member of {count}$") as refused:
-        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+        issuer.mint(tool_spec(config, condition), TOOLS, ceiling_s=CEILING_S)
     assert refused.value.expires_at == int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
     assert PROVIDER_CLUSTER not in str(refused.value)
     (minted,) = fake.issued  # it was minted, and dropped once the clusters it acts in were read
@@ -223,12 +259,13 @@ def test_o09_a_writing_tokens_user_who_is_a_member_of_a_cluster_is_dropped(clust
     assert fake.ADMIN not in [r.token for r in reads]
 
 
-def test_o09_a_writing_token_without_a_cluster_is_minted_after_its_scope_and_before_it_is_returned(
-    issuer, fake, config
+@BOTH_KINDS
+def test_o09_a_tool_server_token_without_a_cluster_is_minted_after_its_scope_and_before_it_is_returned(
+    condition, issuer, fake, config
 ):
     """O09: a user who is a member of no cluster gets its token; the clusters are read once, after the scope."""
-    fake.grant(TOOLS.user_id, MANAGE)
-    token = issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    fake.grant(TOOLS.user_id, RIGHTS[condition])
+    token = issuer.mint(tool_spec(config, condition), TOOLS, ceiling_s=CEILING_S)
     paths = [r.path for r in fake.requests if r.path in (SCOPE, CLUSTERS)]
     assert paths == [SCOPE, CLUSTERS]
     assert [r.token for r in fake.requests if r.path == CLUSTERS] == [token.reveal()]
@@ -245,16 +282,32 @@ def test_o09_a_scope_that_is_refused_is_refused_before_the_clusters_are_read(iss
     assert not [r for r in fake.requests if r.path == CLUSTERS]
 
 
-def test_o05_the_data_path_and_a_read_only_condition_read_no_scope_admin_privileges_or_clusters(issuer, fake, config):
-    """O05: a read-only token's boundary is its data.path caveat, so its mint is what it was: no scope is read for it,
-    no admin privilege of its user and no cluster, even with a space outside the plane, an admin privilege and a
-    cluster present. A data-access caveat would refuse a clusters read anyway."""
+def test_o05_the_data_path_reads_no_scope_admin_privileges_or_clusters(issuer, fake, config):
+    """O05: the data path's boundary is its data.path caveat, so its mint is what it was: no scope is read for it, no
+    admin privilege of its user and no cluster, even with a space outside the plane, an admin privilege and a cluster
+    present. A data-access caveat would refuse a clusters read anyway."""
     fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
-    fake.admin_privileges[TOOLS.user_id] = ["oz_groups_view"]
-    fake.clusters[TOOLS.user_id] = fake.clusters[DATA.user_id] = [PROVIDER_CLUSTER]
+    fake.admin_privileges[DATA.user_id] = ["oz_groups_view"]
+    fake.clusters[DATA.user_id] = [PROVIDER_CLUSTER]
     issuer.mint(data_path_spec("spmock0001"), DATA, ceiling_s=CEILING_S)
-    issuer.mint(tool_server_spec("spmock0001", config.condition("read")), TOOLS, ceiling_s=CEILING_S)
-    assert not [r for r in fake.requests if r.path in (SCOPE, ADMIN_READ, CLUSTERS)]
+    admin_read = f"/api/v3/onezone/users/{DATA.user_id}/effective_privileges"
+    assert not [r for r in fake.requests if r.path in (SCOPE, admin_read, CLUSTERS)]
+
+
+def test_o39_a_read_only_condition_reads_its_scope_admin_privileges_and_clusters_as_a_writing_one_does(
+    issuer, fake, config
+):
+    """O39: a read-only condition's token has no data.path caveat to keep it to the plane, so its mint reads what a
+    writing condition's does, in the same order: its user's privileges and admin privileges as the admin, and the
+    token's scope and clusters, the clusters as the token itself."""
+    reading = issuer.mint(tool_spec(config, "read"), TOOLS, ceiling_s=CEILING_S)
+    read_requests = [(r.method, r.path) for r in fake.requests]
+    boundary = [(r.path, r.token) for r in fake.requests if r.path in (ADMIN_READ, SCOPE, CLUSTERS)]
+    assert boundary == [(ADMIN_READ, fake.ADMIN), (SCOPE, None), (CLUSTERS, reading.reveal())]
+    fake.requests.clear()
+    fake.grant(TOOLS.user_id, MANAGE)
+    issuer.mint(tool_spec(config, "manage"), TOOLS, ceiling_s=CEILING_S)
+    assert read_requests == [(r.method, r.path) for r in fake.requests]
 
 
 def scope_without_spaces(answer):
@@ -280,15 +333,17 @@ def scope_without_spaces(answer):
         "clusters that are no ids",
     ],
 )
-def test_o05_a_writing_tokens_scope_admin_privileges_or_clusters_that_cannot_be_read_give_no_token(
-    bend, outage, reason, issuer, fake, config
+@BOTH_KINDS
+def test_o05_a_tool_server_tokens_scope_admin_privileges_or_clusters_that_cannot_be_read_give_no_token(
+    bend, outage, reason, condition, issuer, fake, config
 ):
-    """O05: unknown is not a pass. A scope, admin or clusters read that fails is an `ExaminationFailed` carrying the
-    outage, so a caller can tell one apart; an answer that cannot be read is a refusal; neither gives a token."""
-    fake.grant(TOOLS.user_id, MANAGE)
+    """O05: unknown is not a pass, for a read-only condition's token as for a writing one's. A scope, admin or clusters
+    read that fails is an `ExaminationFailed` carrying the outage, so a caller can tell one apart; an answer that
+    cannot be read is a refusal; neither gives a token."""
+    fake.grant(TOOLS.user_id, RIGHTS[condition])
     bend(fake)
     with pytest.raises(TokenRefused, match=reason) as refused:
-        issuer.mint(tool_server_spec("spmock0001", config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+        issuer.mint(tool_spec(config, condition), TOOLS, ceiling_s=CEILING_S)
     cause = refused.value.__cause__ if isinstance(refused.value, DroppedToken) else refused.value
     assert isinstance(cause, ExaminationFailed) is outage
     if outage:
