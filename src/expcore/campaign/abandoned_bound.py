@@ -57,9 +57,10 @@ class AbandonedBound:
 
 def held_to_reply_maximum(totals: Mapping[str, Any]) -> bool:
     """Tell whether an attempt was held to its reply maximum, from the totals of its record (C27): the budget gate
-    reserved it by the reply maximum and the campaign had not taken its model off it when the loop ended. A record that
-    holds neither field (no budget, or one written before them) is not held, which can only charge more."""
-    return totals.get("reserved_capped") is True and totals.get("reply_cap_unheld") is not True
+    reserved it by the reply maximum and the totals say the campaign had not taken its model off it when the loop
+    ended. A record that says less (no budget, one written before the fields, one with only the first) is not held,
+    which can only charge more."""
+    return totals.get("reserved_capped") is True and totals.get("reply_cap_unheld") is False
 
 
 def _count(entry: Mapping[str, Any], name: str) -> int | None:

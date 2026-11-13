@@ -26,9 +26,10 @@ template writes around each message:
     P(n) <= in_k + out_k + bytes(messages appended after k) + bytes(growth of the system prompt, tools, extras)
             + FRAMING_MARGIN_TOKENS x (1 + messages appended)
 
-`bytes` is the length in UTF-8 of each message as the adapter sends it, as JSON (`message_bytes`): the reply as it
-goes back (with its reasoning when the entry echoes it, its thinking blocks and signatures, a malformed call wrapped as
-`{"_raw": ...}`) and every tool result. Both `out_k` and the bytes of the reply are added although they describe the
+`bytes` is the length of each message as the adapter sends it, as JSON written the way a chat template writes it
+(`message_bytes`, below): the reply as it goes back (with its reasoning when the entry echoes it, its thinking blocks
+and signatures, a malformed call wrapped as `{"_raw": ...}`) and every tool result. Both `out_k` and the bytes of the
+reply are added although they describe the
 same message, because each sees what the other cannot: the completion count includes tokens the returned message does
 not show (reasoning that comes back only as a signature), and the bytes cover the reply as it is written again, which
 need not tokenize as it was generated. Only one reply is added twice, because the anchor moves with every reply.
@@ -53,7 +54,13 @@ abandoned request keeps the entry the retrier makes, which a scorer prices by th
    tokenizers whose tokens cover whole characters, of one byte or more each. A token that stands for no text is
    framing (a chat template's role and separator tokens, a tool call's wrapper), which `FRAMING_MARGIN_TOKENS` covers
    beyond the JSON structure the bytes already pay for (a message's keys, quotes and ids come to 30 bytes or more, a
-   tool call's to 70).
+   tool call's to 70). The text is the text the template writes, which for a tool call's arguments is not the text
+   the adapter sent: an OpenAI-compatible server parses the arguments and a template writes them again with Jinja's
+   `tojson`, which escapes every non-ASCII character as `\\uXXXX` (6 bytes, 12 for one past the Basic Multilingual
+   Plane) and `<`, `>`, `&` and `'` as `\\u003c` and its kin (6 bytes for 1). `message_bytes` counts a message as that
+   escaped ASCII JSON, which is never fewer bytes than the UTF-8 the wire carries, and adds 5 for each of the four
+   characters, wherever they stand in the message. A template that writes arguments in more bytes than that (indented
+   JSON of a large nested object, say) breaks the assumption, and the tripwire below is what shows it.
 2. A reply's reported prompt count is the tokens of the whole prompt it was billed, the assumption the token cap makes
    (C25), and its completion count is every token it generated.
 3. The history only grows, and the part of a request outside its messages (system prompt, tool list, extras) is the
@@ -81,14 +88,23 @@ BOUND_BASES = (BY_BYTES, BY_WINDOW, BY_NONE)
 FRAMING_MARGIN_TOKENS = 32
 
 
+# The characters Jinja's `tojson` (the filter chat templates write tool-call arguments with) escapes so its output is
+# safe in HTML: each is one byte in the arguments the adapter sends and six, `<` and its kin, in the template's text.
+_TEMPLATE_ESCAPED = "<>&'"
+_TEMPLATE_ESCAPE_EXTRA = 5
+
+
 def message_bytes(value: Any) -> int:
-    """Return the bytes of a message, or of any part of a request, as the adapter sends it: its JSON text in UTF-8.
+    """Return the bytes of a message, or of any part of a request, as a chat template can write it: its JSON text with
+    every non-ASCII character as the `\\uXXXX` escapes (6 bytes, 12 past the Basic Multilingual Plane, never fewer than
+    its UTF-8), and 5 more for each `<`, `>`, `&` and `'`, which `tojson` writes as 6 (see the module docstring).
 
     Bytes and not characters, because a character of several bytes can cost several tokens. A lone surrogate, which a
-    tool result decoded with errors kept can hold, counts as the three bytes it is written with. Raises ValueError or
-    TypeError for a value that cannot be written as JSON at all (a circular reference).
+    tool result decoded with errors kept can hold, is escaped like any other. Raises ValueError or TypeError for a
+    value that cannot be written as JSON at all (a circular reference).
     """
-    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8", "surrogatepass"))
+    text = json.dumps(value, ensure_ascii=True, default=str)
+    return len(text) + _TEMPLATE_ESCAPE_EXTRA * sum(text.count(c) for c in _TEMPLATE_ESCAPED)
 
 
 @dataclass(frozen=True)

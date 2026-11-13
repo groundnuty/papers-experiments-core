@@ -218,7 +218,7 @@ def test_b19_the_tight_bound_is_never_above_the_loose_one_for_any_held_flat_entr
     ("totals", "held"),
     [
         ({"reserved_capped": True, "reply_cap_unheld": False}, True),
-        ({"reserved_capped": True}, True),
+        ({"reserved_capped": True}, False),  # whether the model was taken off it is not said: not held
         ({"reserved_capped": True, "reply_cap_unheld": True}, False),
         ({"reserved_capped": False, "reply_cap_unheld": False}, False),
         ({"reserved_capped": False}, False),
@@ -227,6 +227,6 @@ def test_b19_the_tight_bound_is_never_above_the_loose_one_for_any_held_flat_entr
     ],
 )
 def test_b19_whether_an_attempt_was_held_to_its_reply_maximum_is_read_from_its_totals_and_never_assumed(totals, held):
-    """B19 and C27: the attempt was held only when the gate reserved it by the reply maximum and the campaign had not
-    taken its model off it; a record that says neither is not held, which can only charge more."""
+    """B19 and C27: the attempt was held only when the gate reserved it by the reply maximum and the totals say the
+    campaign had not taken its model off it; a record that says less is not held, which can only charge more."""
     assert held_to_reply_maximum(totals) is held

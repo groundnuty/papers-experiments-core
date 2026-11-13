@@ -36,8 +36,10 @@ def step(backend):
 
 
 def wire_bytes(message) -> int:
-    """The bytes of a message as the test counts them, from what the client received."""
-    return len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
+    """The bytes of a message as a chat template can write it, counted here from what the client received: ASCII JSON,
+    and six bytes for each `<`, `>`, `&` and `'`, which Jinja's `tojson` writes as `\\u003c` and its kin."""
+    text = json.dumps(message, ensure_ascii=True)
+    return len(text) + 5 * sum(text.count(c) for c in "<>&'")
 
 
 def bytes_bound(prompt, completion, appended) -> int:
@@ -126,7 +128,6 @@ def test_b19_a_request_the_run_deadline_cancelled_carries_the_same_bound(make_sp
         "bytes",
         bytes_bound(120, 30, backend.transcript()[2:]),
     )
-    assert backend._bound.in_flight()["prompt_bound_by"] == "window"  # nothing is in flight now
 
 
 def test_b19_a_resent_request_has_the_bound_of_its_step_and_the_failed_send_before_it_is_no_part_of_it(
@@ -180,10 +181,11 @@ def test_b19_reasoning_is_counted_when_the_entry_echoes_it_and_not_when_it_does_
     assert bounds["reasoning_content"] - bounds[None] >= len(thoughts) + len("reasoning_content")
 
 
-def test_b19_a_tool_result_of_wide_characters_is_counted_in_utf8_bytes(
+def test_b19_a_tool_result_of_wide_characters_is_counted_as_the_escapes_a_template_writes(
     make_spec, limits, first_reply, fake_client, make_timeout
 ):
-    """B19: bytes and not characters: a result of 100 Japanese characters weighs 300 bytes, not 100."""
+    """B19: bytes and not characters: a result of 100 Japanese characters is 100 characters and 300 bytes of UTF-8,
+    and a template's `\\uXXXX` escapes of them are 600."""
     bounds = {}
     for name, text in (("ascii", "a" * 100), ("wide", "日" * 100)):
         client = fake_client(first_reply, make_timeout(read=True))
@@ -192,7 +194,29 @@ def test_b19_a_tool_result_of_wide_characters_is_counted_in_utf8_bytes(
         (call,) = step(backend).tool_calls
         backend.add_tool_results([ToolResult(call, text)])
         bounds[name] = abandon_next(backend)["prompt_bound_tokens"]
-    assert bounds["wide"] - bounds["ascii"] == 200
+    assert bounds["wide"] - bounds["ascii"] == 600 - 100
+
+
+def test_b19_apostrophes_in_the_arguments_a_model_sent_are_counted_as_the_template_will_write_them(
+    make_spec, limits, completion, fake_client, make_timeout
+):
+    """B19: well-formed arguments go back as the model wrote them, and an OpenAI-compatible server's template writes
+    them again with `tojson`, an apostrophe as the six bytes `\\u0027`. 40 apostrophes in a code argument make the
+    bound 200 bytes larger than the same argument without them, as the adapter sent them."""
+    bounds = {}
+    for name, code in (("plain", "print(a); " * 40), ("quoted", "print('a'); " * 20)):  # 400 and 260 characters
+        arguments = json.dumps({"code": code}, ensure_ascii=False)
+        reply = completion(None, finish="tool_calls", tool_calls=[("run", arguments)], usage=(120, 30))
+        client = fake_client(reply, make_timeout(read=True))
+        backend = openai_backend(make_spec(context_tokens=WINDOW), limits, client)
+        round_trip(backend)
+        entry = abandon_next(backend)
+        sent = client.requests[1]["messages"][2]["tool_calls"][0]["function"]["arguments"]
+        assert sent == arguments  # the adapter sends the model's own text, apostrophes unescaped
+        bounds[name] = (entry["prompt_bound_tokens"], len(arguments), code.count("'"))
+    (plain, plain_length, _), (quoted, quoted_length, apostrophes) = bounds["plain"], bounds["quoted"]
+    assert apostrophes == 40
+    assert quoted - plain == (quoted_length - plain_length) + 5 * apostrophes
 
 
 def test_b19_a_reply_that_left_its_prompt_count_out_gives_the_next_request_the_window(

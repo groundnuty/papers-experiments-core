@@ -23,9 +23,12 @@ WINDOW = 100_000
 REPLY = 4096
 
 
-def utf8(message) -> int:
-    """The bytes of a message as the test counts them, independently of the module."""
-    return len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
+def rendered(message) -> int:
+    """The bytes of a message as a chat template can write it, counted here independently of the module: ASCII JSON
+    (every non-ASCII character an escape), and six bytes for each `<`, `>`, `&` and `'`, which `tojson` writes as
+    `\\u003c` and its kin."""
+    text = json.dumps(message, ensure_ascii=True)
+    return len(text) + 5 * sum(text.count(c) for c in "<>&'")
 
 
 def request(messages, **fixed):
@@ -52,7 +55,7 @@ def tracker(window=WINDOW):
 
 def expected(prompt, completion, appended) -> int:
     """The bound the derivation gives: both reported counts, the bytes appended after them and a margin each."""
-    return prompt + completion + sum(utf8(m) for m in appended) + FRAMING_MARGIN_TOKENS * (1 + len(appended))
+    return prompt + completion + sum(rendered(m) for m in appended) + FRAMING_MARGIN_TOKENS * (1 + len(appended))
 
 
 def test_b19_the_first_request_has_no_previous_reply_so_the_window_bounds_it():
@@ -83,9 +86,10 @@ def test_b19_the_next_request_is_the_reported_counts_plus_the_bytes_appended_sin
     assert (sent.prompt_tokens, sent.by) == (expected(1_000, 40, appended), BY_BYTES)
 
 
-def test_b19_bytes_are_utf8_bytes_and_not_characters():
-    """B19: a token may be as short as one byte but not shorter, and a character of four bytes can take several tokens,
-    so characters would undercount: the same number of characters in Japanese and emoji weighs more than in ASCII."""
+def test_b19_wide_characters_are_counted_as_the_escapes_a_template_writes_and_not_as_characters():
+    """B19: a token may be as short as one byte but not shorter, and a template writes a tool call's non-ASCII
+    characters as `\\uXXXX` escapes: 6 bytes for one of the Basic Multilingual Plane, 12 for one past it. The same
+    number of characters in Japanese and emoji weighs far more than in ASCII, and never less than its UTF-8."""
     results = {}
     wide = "日本語🙂日本語🙂"
     for name, text in (("ascii", "a" * 8), ("wide", wide)):
@@ -94,7 +98,43 @@ def test_b19_bytes_are_utf8_bytes_and_not_characters():
         bound.replied(100, 5)
         results[name] = bound.sent(request([user(), assistant(), tool(text)])).prompt_tokens
     assert len("a" * 8) == len(wide)
-    assert results["wide"] - results["ascii"] == len(wide.encode()) - 8
+    assert results["wide"] - results["ascii"] == 6 * 6 + 2 * 12 - 8
+    assert message_bytes(tool(wide)) >= len(json.dumps(tool(wide), ensure_ascii=False).encode("utf-8"))
+
+
+@pytest.mark.parametrize("character", ["<", ">", "&", "'"])
+def test_b19_the_four_characters_a_template_escapes_weigh_six_bytes_each(character):
+    """B19: Jinja's `tojson` writes `<`, `>`, `&` and `'` as `\\u003c`, `\\u003e`, `\\u0026` and `\\u0027`, so each
+    costs six bytes of the template's text where the adapter sent one."""
+    plain, escaped = message_bytes(tool("x" * 10)), message_bytes(tool("x" * 5 + character * 5))
+    assert escaped - plain == 5 * 5
+    assert rendered(tool(character)) - rendered(tool("x")) == 5
+
+
+def test_b19_a_code_argument_with_many_apostrophes_is_covered_by_the_bound():
+    """B19: the case a margin alone misses. A code tool's `arguments` hold single-quoted Python: 60 apostrophes and a
+    few non-ASCII characters, which the adapter sends as the model wrote them. A template parses the arguments and
+    writes them with `tojson`: apostrophes as `\\u0027` and the non-ASCII as `\\uXXXX`. The prompt the endpoint reads
+    is at least the bytes of that text, one token per byte at the worst, and the bound covers it."""
+    code = "print('a')\n" * 30 + "# 日本語 🙂"
+    arguments = json.dumps({"code": code}, ensure_ascii=False)  # as the model sent it, and as the adapter sends it
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "call_9", "type": "function", "function": {"name": "run", "arguments": arguments}}],
+    }
+    template_text = json.dumps(json.loads(arguments), ensure_ascii=True)  # what `tojson` writes, before its escapes
+    for character, escape in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"), ("'", "\\u0027")):
+        template_text = template_text.replace(character, escape)
+    assert len(template_text.encode()) > len(arguments.encode()) + 5 * 60  # the apostrophes alone add 300
+    bound = tracker()
+    bound.sent(request([user()]))
+    bound.replied(100, 50)
+    sent = bound.sent(request([user(), message, tool("ok", "call_9")]))
+    reply_tokens = len(template_text.encode()) + 27 + 20  # the arguments, a header and a call's wrapper
+    tool_tokens = len("ok") + len("call_9") + 27
+    assert sent.by == BY_BYTES
+    assert sent.prompt_tokens >= 100 + reply_tokens + tool_tokens
 
 
 def test_b19_a_lone_surrogate_is_counted_and_never_raises():
@@ -303,29 +343,41 @@ def test_b19_the_entry_names_its_basis_the_reply_maximum_the_window_and_what_it_
 
 def random_text(rng: random.Random, size: int) -> str:
     """Text that costs a tokenizer the most: quotes, backslashes, newlines, control characters and wide characters."""
-    alphabet = ['"', "\\", "\n", "\t", "\x01", "{", "}", "日", "🙂", "é", "a", " ", chr(0x2028)]
+    alphabet = ['"', "\\", "\n", "\t", "\x01", "{", "}", "日", "🙂", "é", "a", " ", chr(0x2028), "'", "<", ">", "&"]
     return "".join(rng.choice(alphabet) for _ in range(size))
 
 
+def tojson(text: str) -> str:
+    """What Jinja's `tojson` writes for a JSON text that a template renders again: the parsed value dumped as ASCII,
+    with `<`, `>`, `&` and `'` as `\\u003c` and its kin, as markupsafe's `htmlsafe_json_dumps` does."""
+    written = json.dumps(json.loads(text), ensure_ascii=True)
+    for character, escape in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"), ("'", "\\u0027")):
+        written = written.replace(character, escape)
+    return written
+
+
 def rendered_tokens(messages) -> int:
-    """The prompt as the worst tokenizer reads it: every byte of the rendered text, and of a template's own words
-    around each message, a token. No real tokenizer does worse than one token per byte."""
+    """The prompt as the worst tokenizer reads it: every byte of the text a chat template writes, and of the
+    template's own words around each message, a token. No real tokenizer does worse than one token per byte. A tool
+    call's arguments are written by `tojson` from the parsed arguments, as common open-model templates do."""
     total = 0
     for message in messages:
         total += 27  # `<|start_header_id|>assistant<|end_header_id|>\n\n` and its end, as a template might write them
         total += len(str(message.get("content") or "").encode("utf-8", "surrogatepass"))
         total += len(str(message.get("tool_call_id") or "").encode())
         for call in message.get("tool_calls", ()):
-            total += len(json.dumps(call["function"], ensure_ascii=False).encode("utf-8", "surrogatepass")) + 20
+            total += len(call["function"]["name"]) + len(tojson(call["function"]["arguments"])) + 20
     return total + 27  # the header of the reply asked for
 
 
 @pytest.mark.parametrize("seed", range(8))
 def test_b19_the_bound_is_never_below_what_a_one_token_per_byte_tokenizer_reads(seed):
-    """B19: the soundness of the byte bound as a property. A conversation of random rounds, with tool calls whose raw
-    arguments went back wrapped in `_raw`, escapes and wide characters in every result, and an endpoint that reads the
-    prompt one token per byte of the rendered text (the most any tokenizer can) with a template of its own around each
-    message: every request's bound is at least the prompt it was read as, and nothing was counted as exceeded."""
+    """B19: the soundness of the byte bound as a property. A conversation of random rounds, with tool calls whose
+    arguments are well-formed and carry apostrophes, angle brackets and wide characters as the model wrote them, or went
+    back wrapped in `_raw`, escapes and wide characters in every result, and an endpoint that reads the prompt one token
+    per byte of what its template writes (`tojson` for the arguments, the most any tokenizer can) with words of its own
+    around each message: every request's bound is at least the prompt it was read as, and nothing was counted as
+    exceeded."""
     rng = random.Random(seed)
     bound = tracker(window=10_000_000)
     history = [{"role": "system", "content": random_text(rng, 40)}, user(random_text(rng, 60))]
@@ -336,17 +388,17 @@ def test_b19_the_bound_is_never_below_what_a_one_token_per_byte_tokenizer_reads(
         assert sent.prompt_tokens >= actual
         bound.replied(actual, rng.randint(1, 200))
         previous_prompt = actual
-        raw = random_text(rng, rng.randint(0, 120))
+        text = random_text(rng, rng.randint(0, 120))
+        if rng.random() < 0.5:  # code that is mostly single-quoted strings, the case a margin alone cannot cover
+            text += "".join(rng.choice("'''<>&") for _ in range(rng.randint(100, 400)))
+        # well-formed arguments go back as the model wrote them, raw characters and all; malformed ones wrapped
+        arguments = json.dumps({"code": text}, ensure_ascii=False) if rng.random() < 0.6 else json.dumps({"_raw": text})
         history.append(
             {
                 "role": "assistant",
                 "content": random_text(rng, rng.randint(0, 80)) or None,
                 "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "run", "arguments": json.dumps({"_raw": raw})},
-                    }
+                    {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": arguments}}
                 ],
             }
         )
