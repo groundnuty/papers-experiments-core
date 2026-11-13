@@ -38,6 +38,9 @@ PLUMBING = {
     ("provision.py", "Provisioner.fetch", "client.read_range"): ["self._retry"],
     ("ingestbase.py", "Baseline._times", "client.get"): ["self._p.retry"],
     ("ingestbase.py", "Baseline.confirm", "consistency.wait_visible"): ["self._p.retry"],
+    # the preallocated ingest (O44): its visibility wait, the block map before a part and the one its reset completes
+    ("ingestsparse.py", "SparseBaseline.confirm_state", "consistency.wait_visible"): ["self._p.retry"],
+    ("ingestsparse.py", "SparseBaseline._complete", "provisioner.blocks"): ["self._p.retry"],
     ("reset.py", "SpaceReset._page", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._dated_page", "client.get_dated"): ["self._p.retry"],  # the history's, with its Date
     ("reset.py", "SpaceReset._zone_clock", "client.get_dated"): [
@@ -77,6 +80,7 @@ CALLER_CHOOSES = {
     ("provision.py", "Provisioner._list_pages", "client.get"): ["reads"],  # `children` decides, below
     ("provision.py", "Provisioner.blocks", "client.get"): ["retry"],  # one attempt unless the caller says: place_ranges
     ("provision.py", "Provisioner.holds", "provisioner.blocks"): ["retry"],
+    ("ingestsparse.py", "SparseBaseline.layout", "client.get"): ["retry"],  # a poll's one attempt, or the part's check
 }
 
 # Plumbing unless it is an instrument's read: `children` and `root` say so by their own arguments.
@@ -202,6 +206,7 @@ HELPER_USERS = {
         "provisioner.replicate",
     },
     "ingest.py": {"provisioner.verify_space"},
+    "ingestsparse.py": {"provisioner.resolve", "provisioner.read_file"},
     "ingestbase.py": {
         "provisioner.resolve",
         "provisioner.mutate",

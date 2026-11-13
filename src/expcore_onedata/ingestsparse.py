@@ -1,7 +1,7 @@
 # Provenance: new
 """The preallocated mode of a progressive ingest: each planned file at its final size from the start, with only a
 declared prefix written at the owner, the rest written in parts, and the reset completing the file in place (#107,
-O36). `ingest.py` drives it; `ingestbase.Baseline` holds the journal, the id records and the removal it builds on.
+O44). `ingest.py` drives it; `ingestbase.Baseline` holds the journal, the id records and the removal it builds on.
 
 **The platform's facts.** A range nobody wrote reads as zeros, at its full length, through the REST content endpoint
 (a 206) and through the mount, and the block map holds only written ranges (measured on 10 and 11 Nov,
@@ -51,7 +51,7 @@ from expcore_onedata.ingestbase import FAILURES, Baseline, plain
 from expcore_onedata.ingestplan import PlannedFile, Step
 from expcore_onedata.placement import Range, merged, provider_blocks, uncovered
 from expcore_onedata.provision import Entry, NotPlaced, ProvisionError
-from expcore_onedata.readretry import ONE_ATTEMPT
+from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
 from expcore_onedata.streamed import Digest
 
 
@@ -78,10 +78,11 @@ class SparseBaseline(Baseline):
         self.written: dict[str, int] = {}  # label -> the end of what the ingest has written and confirmed
 
     # -- the block maps ------------------------------------------------------------------------------------------------
-    def layout(self, file_id: str, reader: str) -> Layout:
-        """The file's distribution through `reader`, once; a PlatformError when it cannot be read or lists a provider
-        of the space as unknown."""
-        answer = self._p.client.get(f"/data/{plain(file_id)}/distribution", provider=reader, retry=ONE_ATTEMPT)
+    def layout(self, file_id: str, reader: str, *, retry: ReadRetry = ONE_ATTEMPT) -> Layout:
+        """The file's distribution through `reader`; a PlatformError when it cannot be read or lists a provider of the
+        space as unknown. One attempt, as a poll reads it, unless the caller names a policy: the check before a part,
+        whose failure ends the schedule, passes the provisioner's (O29)."""
+        answer = self._p.client.get(f"/data/{plain(file_id)}/distribution", provider=reader, retry=retry)
         try:
             blocks = {p: tuple(merged(provider_blocks(answer, self._p.provider_id(p)))) for p in self.providers}
         except ValueError as error:
@@ -190,7 +191,7 @@ class SparseBaseline(Baseline):
             raise ProvisionError(
                 f"{self._p.where}{planned.label}: part {step.part} is out of order; nothing was written"
             )
-        before = self.layout(file_id, self.holder)
+        before = self.layout(file_id, self.holder, retry=self._p.retry)
         self._beyond(planned.label, before, step.start, self.holder)
         if before.virtual_size != planned.size or before.blocks[self.holder] != written_ranges(step.start):
             raise ProvisionError(

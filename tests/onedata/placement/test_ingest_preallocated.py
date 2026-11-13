@@ -1,6 +1,6 @@
 """The preallocated mode of the progressive ingest: each planned file at its final size from the start with only its
 declared prefix written, the rest written in parts from the agent's first turn, each state confirmed on the block map,
-and the reset completing the file in place without removing it (O36, #107)."""
+and the reset completing the file in place without removing it (O44, #107)."""
 
 import json
 import time
@@ -115,8 +115,8 @@ def first_turn(ingest, ticker, after_s=50.0):
 # -- the start state ---------------------------------------------------------------------------------------------------
 
 
-def test_o36_the_namespace_shows_the_file_at_its_final_size_from_the_start_with_only_its_prefix_held(make, fake):
-    """O36: after the start the day is at its final size on both providers, its first bytes written and the rest
+def test_o44_the_namespace_shows_the_file_at_its_final_size_from_the_start_with_only_its_prefix_held(make, fake):
+    """O44: after the start the day is at its final size on both providers, its first bytes written and the rest
     zeros, the data provider holds exactly the prefix and no provider holds more; the new file was extended before
     any byte of it was written, so its size was never another, and the dataset's other day is untouched."""
     old = fake.id_of(DAY_PATH)
@@ -138,8 +138,8 @@ def test_o36_the_namespace_shows_the_file_at_its_final_size_from_the_start_with_
     assert events[:3] == [("restored", old, old), ("removed", old, None), ("created", old, new)]
 
 
-def test_o36_the_parts_fall_due_from_the_first_turn_and_the_block_map_grows_by_exactly_each(make, fake, ticker):
-    """O36: the schedule waits for the agent's first turn, 50 s after the start, and counts from there; at each part's
+def test_o44_the_parts_fall_due_from_the_first_turn_and_the_block_map_grows_by_exactly_each(make, fake, ticker):
+    """O44: the schedule waits for the agent's first turn, 50 s after the start, and counts from there; at each part's
     time the data provider holds exactly the prefix and the parts so far, the size stays final, and every write of
     content the run sends names its offset."""
     ingest = make(ROW)
@@ -173,10 +173,10 @@ def test_o36_the_parts_fall_due_from_the_first_turn_and_the_block_map_grows_by_e
     assert all(word not in shown for word in ("records/", "alpha", "beta", "staged", ".csv"))
 
 
-def test_o36_the_first_turn_hook_is_called_by_the_core_and_the_arrival_mode_has_none(
+def test_o44_the_first_turn_hook_is_called_by_the_core_and_the_arrival_mode_has_none(
     make, fake, ticker, provisioner, config, tmp_path
 ):
-    """O36: `first_turn_instruments` finds the hook of a preallocated ingest and gives it the run's clock reading; an
+    """O44: `first_turn_instruments` finds the hook of a preallocated ingest and gives it the run's clock reading; an
     arrival ingest has none, so no reading is taken for it and its runs are as they were."""
     ingest = make(ROW)
     ingest.start({})
@@ -192,8 +192,8 @@ def test_o36_the_first_turn_hook_is_called_by_the_core_and_the_arrival_mode_has_
 # -- fail closed -------------------------------------------------------------------------------------------------------
 
 
-def test_o36_a_part_with_the_wrong_hash_fails_closed_and_the_reset_still_completes_the_file(make, fake, ticker):
-    """O36: the platform stores other bytes than the part's; the hash read back differs, so the part fails, the later
+def test_o44_a_part_with_the_wrong_hash_fails_closed_and_the_reset_still_completes_the_file(make, fake, ticker):
+    """O44: the platform stores other bytes than the part's; the hash read back differs, so the part fails, the later
     parts are abandoned and the post-run check refuses the attempt as `ingest_failure`. The reset writes what the block
     map lacks, finds the hash still wrong and writes the file whole again at its offsets, never removing it."""
     ingest = make(ROW)
@@ -213,8 +213,8 @@ def test_o36_a_part_with_the_wrong_hash_fails_closed_and_the_reset_still_complet
     assert (bytes(node(fake).content), fake.held(DAY_PATH, ALPHA_ID)) == (DAY, [[0, len(DAY)]])
 
 
-def test_o36_a_block_beyond_the_written_ranges_fails_the_next_part_with_nothing_written(make, fake, ticker):
-    """O36: another writer put bytes into the gap, so before the next part the data provider's block map is not the
+def test_o44_a_block_beyond_the_written_ranges_fails_the_next_part_with_nothing_written(make, fake, ticker):
+    """O44: another writer put bytes into the gap, so before the next part the data provider's block map is not the
     plan's ranges: the part is refused with nothing sent, and the attempt is refused as `ingest_failure`."""
     ingest = make(ROW)
     ingest.start({})
@@ -232,8 +232,8 @@ def test_o36_a_block_beyond_the_written_ranges_fails_the_next_part_with_nothing_
     assert bytes(node(fake).content) == DAY
 
 
-def test_o36_a_part_out_of_order_is_refused_before_anything_is_written(provisioner, config, fake, tmp_path):
-    """O36: a part that does not start where the written ranges end is out of order: refused, nothing sent."""
+def test_o44_a_part_out_of_order_is_refused_before_anything_is_written(provisioner, config, fake, tmp_path):
+    """O44: a part that does not start where the written ranges end is out of order: refused, nothing sent."""
     plan = load_ingest_plan(write_plan(tmp_path, [ROW]), config)
     sparse = SparseBaseline(provisioner, plan, tmp_path / "journal.jsonl", time.time)
     states = sparse.start_state()
@@ -245,8 +245,8 @@ def test_o36_a_part_out_of_order_is_refused_before_anything_is_written(provision
     assert fake.held(DAY_PATH, ALPHA_ID) == [[0, PREFIX]]
 
 
-def test_o36_a_run_whose_first_turn_never_came_is_refused_and_still_restored(make, fake):
-    """O36: an executor that never calls the hook leaves every part not written; that is no manipulation, so the
+def test_o44_a_run_whose_first_turn_never_came_is_refused_and_still_restored(make, fake):
+    """O44: an executor that never calls the hook leaves every part not written; that is no manipulation, so the
     post-run check refuses the attempt, and the reset completes the file all the same."""
     ingest = make(ROW)
     ingest.start({})
@@ -258,8 +258,8 @@ def test_o36_a_run_whose_first_turn_never_came_is_refused_and_still_restored(mak
     assert bytes(node(fake).content) == DAY
 
 
-def test_o36_a_file_at_the_path_that_is_neither_the_ingests_nor_its_staged_source_refuses_the_start(make, fake):
-    """O36: the dataset's file has other bytes than its staged copy and the ingest did not make it, so nothing is
+def test_o44_a_file_at_the_path_that_is_neither_the_ingests_nor_its_staged_source_refuses_the_start(make, fake):
+    """O44: the dataset's file has other bytes than its staged copy and the ingest did not make it, so nothing is
     removed or written and the start is refused as `ingest_failure`."""
     fake.nodes[fake.id_of(DAY_PATH)].content[5] ^= 0xFF
     before = bytes(node(fake).content)
@@ -274,8 +274,8 @@ def test_o36_a_file_at_the_path_that_is_neither_the_ingests_nor_its_staged_sourc
 # -- the reset ---------------------------------------------------------------------------------------------------------
 
 
-def test_o36_the_reset_completes_the_file_in_place_and_removes_nothing(make, fake, ticker):
-    """O36: the run ends after the first part; the reset writes the rest at its offsets into the same file, sends no
+def test_o44_the_reset_completes_the_file_in_place_and_removes_nothing(make, fake, ticker):
+    """O44: the run ends after the first part; the reset writes the rest at its offsets into the same file, sends no
     DELETE, and leaves it whole: the staged bytes, the data provider's block map covering it, its id kept."""
     ingest = make(ROW)
     ingest.start({})
@@ -294,8 +294,8 @@ def test_o36_the_reset_completes_the_file_in_place_and_removes_nothing(make, fak
     ingest.check()
 
 
-def test_o36_a_crash_mid_run_ends_with_the_complete_file_after_the_next_start(make, fake, ticker):
-    """O36: a run's process dies after the first part, its reset never run; the next start completes the file the
+def test_o44_a_crash_mid_run_ends_with_the_complete_file_after_the_next_start(make, fake, ticker):
+    """O44: a run's process dies after the first part, its reset never run; the next start completes the file the
     ingest made in place (no DELETE before the start state), then sets the start state again."""
     crashed = make(ROW)
     crashed.start({})
@@ -314,8 +314,8 @@ def test_o36_a_crash_mid_run_ends_with_the_complete_file_after_the_next_start(ma
     assert bytes(node(fake).content) == DAY
 
 
-def test_o36_a_crash_between_the_removal_and_the_new_file_ends_complete_after_the_next_start(make, fake, ticker):
-    """O36: the start removed the complete day and could not make it again (creations refused); its own recovery
+def test_o44_a_crash_between_the_removal_and_the_new_file_ends_complete_after_the_next_start(make, fake, ticker):
+    """O44: the start removed the complete day and could not make it again (creations refused); its own recovery
     cannot either, so the attempt is set aside with the day missing. The next start finds the name empty, waits until
     every provider answers the old id absent, writes the day back whole from its staged copy, then sets the start
     state."""
@@ -337,8 +337,8 @@ def test_o36_a_crash_between_the_removal_and_the_new_file_ends_complete_after_th
     again.check()
 
 
-def test_o36_an_empty_preallocated_plan_records_the_same_steps_and_passes(make, fake, ticker):
-    """O36: a sham control: nothing to arrive, the hook anchors nothing to write, and the check passes."""
+def test_o44_an_empty_preallocated_plan_records_the_same_steps_and_passes(make, fake, ticker):
+    """O44: a sham control: nothing to arrive, the hook anchors nothing to write, and the check passes."""
     ingest = make()
     ingest.start({})
     first_turn(ingest, ticker)

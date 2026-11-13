@@ -192,10 +192,10 @@ def test_o35_a_probe_is_written_once_and_written_again_when_it_is_gone(fake, con
     assert [p.provisioned for p in third.pairs] == [False, True]
 
 
-def test_o36_a_probe_with_other_bytes_is_written_again_at_offset_0_and_a_longer_one_gives_way(
+def test_o44_a_probe_with_other_bytes_is_written_again_at_offset_0_and_a_longer_one_gives_way(
     fake, config, client, ticker
 ):
-    """O35, O36: a probe of the right size whose bytes differ is written again over them at offset 0; a longer probe
+    """O35, O44: a probe of the right size whose bytes differ is written again over them at offset 0; a longer probe
     could only be cut by a write without an offset, which is never sent, so a fresh file under the next generation
     replaces it and the passing check deletes the old one. Every write of content carries an offset."""
     assert run(config, client, ticker).ok

@@ -1,4 +1,4 @@
-"""The preallocated progressive ingest (O36, #107) against a real deployment, for the next live slot.
+"""The preallocated progressive ingest (O44, #107) against a real deployment, for the next live slot.
 
     EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_PLATFORM=<root>/platform.toml \
         uv run pytest tests/live/test_ingest_preallocated.py
@@ -88,8 +88,8 @@ def remove_scratch(seed: Provisioner, directory: str | None) -> list[str]:
     return [entry["reason"] for entry in seed.teardown().left]
 
 
-def test_o36_an_empty_write_extends_a_new_file_and_the_gap_reads_as_zeros_placing_nothing(platform, tmp_path):
-    """O36: create, extend by an empty write at the final size (the size reads back, no block anywhere), write the
+def test_o44_an_empty_write_extends_a_new_file_and_the_gap_reads_as_zeros_placing_nothing(platform, tmp_path):
+    """O44: create, extend by an empty write at the final size (the size reads back, no block anywhere), write the
     prefix at 0 (the data provider holds exactly it), then read the gap through every provider: zeros at its full
     length, and no provider's block map gains a byte."""
     p = provisioner(platform, tmp_path / "changes.jsonl")
@@ -119,10 +119,10 @@ def test_o36_an_empty_write_extends_a_new_file_and_the_gap_reads_as_zeros_placin
     assert not left, left
 
 
-def test_o36_the_instrument_sets_the_start_state_writes_its_parts_from_the_first_turn_and_completes_in_place(
+def test_o44_the_instrument_sets_the_start_state_writes_its_parts_from_the_first_turn_and_completes_in_place(
     platform, tmp_path
 ):
-    """O36: a seeded baseline file is taken to its prefix at its final size (confirmed by the instrument on every
+    """O44: a seeded baseline file is taken to its prefix at its final size (confirmed by the instrument on every
     provider's block map), its two parts arrive after the first turn, and the reset completes it in place: the staged
     bytes, the data provider's map covering it, the id the start made kept, and the post-run check passing."""
     seed = provisioner(platform, tmp_path / "seed.jsonl")

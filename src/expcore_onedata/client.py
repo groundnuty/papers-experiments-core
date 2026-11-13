@@ -139,7 +139,7 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   hashed as it comes (O25).
 - A write of content always names its `offset`: without one the provider truncates the file to 0 first (op-worker
   f118ed9, file_content_rest_handler.erl:224-228), so `mutate` refuses it unsent
-  (`TruncatingWrite`, O36). An empty body at an offset past the file's end extends its size to that offset and writes
+  (`TruncatingWrite`, O44). An empty body at an offset past the file's end extends its size to that offset and writes
   no block: measured on the Compose federation (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A
   file at its final size with only a prefix written": a 204, the size read back, the block map the prefix alone), and
   traced in op-worker f118ed9 (file_upload_utils.erl:136-150, read_write_req.erl:58-86, replica_updater.erl:187-192,
@@ -410,7 +410,7 @@ class OutOfScope(NotSent):
 
 class TruncatingWrite(OutOfScope):
     """A write of content without a whole `offset` of 0 or more, which truncates the file to 0 before it writes
-    (op-worker f118ed9, file_content_rest_handler.erl:224-228); refused before anything is read or sent (O36)."""
+    (op-worker f118ed9, file_content_rest_handler.erl:224-228); refused before anything is read or sent (O44)."""
 
 
 class ScopeUnread(NotSent):
@@ -471,7 +471,7 @@ def _check_path(path: str) -> str:
 def _refuse_truncation(method: str, path: str, params: Mapping[str, Any] | None) -> None:
     """Refuse a write of content (a PUT to a path that ends in `/content`) unless it names a whole offset of 0 or more:
     without one, the provider truncates the file to 0 first, which would drop the blocks of a file that is still
-    arriving and of any baseline file (O36). An empty body at an offset is a write too, and is sent."""
+    arriving and of any baseline file (O44). An empty body at an offset is a write too, and is sent."""
     if method != "PUT" or not path.rstrip("/").endswith("/content"):
         return
     offset = (params or {}).get("offset")
@@ -1256,7 +1256,7 @@ class OnezoneClient:
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
         size and the SHA-256 of what was read (O25). With `stop`, only the first `stop` bytes are read, each answer
-        still checked against the file's `size`: the prefix of a file at its final size (O36).
+        still checked against the file's `size`: the prefix of a file at its final size (O44).
 
         Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
         delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of

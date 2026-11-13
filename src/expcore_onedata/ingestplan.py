@@ -28,7 +28,7 @@ other condition reads, so the instrument removes it before the run and restores 
 data, removed again after the run. Either way its staged source is the copy the study keeps.
 
 **The two modes.** In the arrival mode a file is absent at the start and appears at `at_s`, the schedule anchored at
-the instrument's start. In the preallocated mode (#107, O36) every file is in the dataset's baseline (`baseline` must
+the instrument's start. In the preallocated mode (#107, O44) every file is in the dataset's baseline (`baseline` must
 be "complete") and exists at its final size from the start, with only its first `prefix` bytes written (0 or more,
 below its size); its parts write the rest, the schedule anchored at the agent's first model turn. A file of `parts`
 parts has its k-th part written at `at_s + over_s * (k - 1) / (parts - 1)`, starting where the one before it ended (the

@@ -1,5 +1,5 @@
 """A file at its final size with only some ranges written: preallocated by an empty write, written at explicit offsets
-and read back by its prefix, never with a write that truncates (O36, #107)."""
+and read back by its prefix, never with a write that truncates (O44, #107)."""
 
 import hashlib
 
@@ -32,8 +32,8 @@ def directory(fake):
     return fake
 
 
-def test_o36_a_preallocated_file_has_its_final_size_at_once_and_no_block_anywhere(provisioner, directory):
-    """O36: the file is created and extended in one step, an empty body at offset FINAL marked as an octet stream, so
+def test_o44_a_preallocated_file_has_its_final_size_at_once_and_no_block_anywhere(provisioner, directory):
+    """O44: the file is created and extended in one step, an empty body at offset FINAL marked as an octet stream, so
     its size is FINAL before any byte is written and no provider holds a block of it; the change log holds it."""
     file_id = provisioner.preallocate(TARGET, FINAL)
     node = directory.nodes[file_id]
@@ -47,8 +47,8 @@ def test_o36_a_preallocated_file_has_its_final_size_at_once_and_no_block_anywher
     assert [line["id"] for line in provisioner.logged()] == [file_id]
 
 
-def test_o36_a_preallocation_over_an_existing_name_or_into_a_missing_directory_is_refused(provisioner, directory):
-    """O36: a preallocation makes a new file and nothing else: an existing entry at the path and a directory that is
+def test_o44_a_preallocation_over_an_existing_name_or_into_a_missing_directory_is_refused(provisioner, directory):
+    """O44: a preallocation makes a new file and nothing else: an existing entry at the path and a directory that is
     not there are refused before anything is written."""
     with pytest.raises(ProvisionError, match="exists"):
         provisioner.preallocate("study/kept.bin", FINAL)
@@ -57,8 +57,8 @@ def test_o36_a_preallocation_over_an_existing_name_or_into_a_missing_directory_i
     assert [c for c in directory.provider_calls if c[1] in ("POST", "PUT", "DELETE")] == []
 
 
-def test_o36_a_range_is_written_at_its_offsets_and_holds_exactly_its_blocks(provisioner, directory, tmp_path):
-    """O36: the range's bytes go chunk by chunk, each at its offset, and the block map holds exactly the written
+def test_o44_a_range_is_written_at_its_offsets_and_holds_exactly_its_blocks(provisioner, directory, tmp_path):
+    """O44: the range's bytes go chunk by chunk, each at its offset, and the block map holds exactly the written
     ranges while the size stays FINAL; the digest is that of the bytes sent."""
     file_id = provisioner.preallocate(TARGET, FINAL)
     staged = local(tmp_path)
@@ -72,10 +72,10 @@ def test_o36_a_range_is_written_at_its_offsets_and_holds_exactly_its_blocks(prov
     assert bytes(directory.nodes[file_id].content) == SOURCE[: 3 * CHUNK] + bytes(FINAL - 3 * CHUNK)
 
 
-def test_o36_a_range_into_a_file_the_provisioner_did_not_make_or_outside_the_source_is_refused(
+def test_o44_a_range_into_a_file_the_provisioner_did_not_make_or_outside_the_source_is_refused(
     provisioner, seeded, tmp_path
 ):
-    """O36 with O09: writing into a file adopts it, so one the change log does not hold is refused; so is a range that
+    """O44 with O09: writing into a file adopts it, so one the change log does not hold is refused; so is a range that
     is empty, reversed or past the local file's end. Nothing is written."""
     stranger = seeded.id_of("study/data.bin")
     with pytest.raises(ProvisionError, match="did not create"):
@@ -88,8 +88,8 @@ def test_o36_a_range_into_a_file_the_provisioner_did_not_make_or_outside_the_sou
     assert bytes(seeded.nodes[stranger].content) == DATA
 
 
-def test_o36_a_prefix_of_a_longer_file_is_read_back_by_its_hash_and_nothing_past_it(provisioner, directory, tmp_path):
-    """O36: the prefix of a file of FINAL bytes is read by ranges that stop at its end, each answer checked against
+def test_o44_a_prefix_of_a_longer_file_is_read_back_by_its_hash_and_nothing_past_it(provisioner, directory, tmp_path):
+    """O44: the prefix of a file of FINAL bytes is read by ranges that stop at its end, each answer checked against
     the file's size, so the gap after it is never read."""
     file_id = provisioner.preallocate(TARGET, FINAL)
     provisioner.write_range(file_id, local(tmp_path), 0, CHUNK + 10)

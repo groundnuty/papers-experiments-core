@@ -25,7 +25,7 @@ else: every write goes through the provisioner, so through the mutation gate bou
   again, whatever the executor does. **`raise_if_failed`** is the same check, a second guard for the executor to call
   once the record is written.
 
-**The preallocated mode** (`[ingest] mode = "preallocated"`, #107, O36; `ingestsparse.py`) takes each planned file,
+**The preallocated mode** (`[ingest] mode = "preallocated"`, #107, O44; `ingestsparse.py`) takes each planned file,
 part of the baseline, from complete to its final size with only its declared prefix written, at the start: the
 complete file is removed (confirmed absent everywhere), made again under its name, extended to its final size by an
 empty write and given its prefix, each step confirmed. The schedule starts at the agent's first model turn, through the

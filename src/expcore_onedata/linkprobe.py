@@ -6,7 +6,7 @@ the SHA-256 of the source's provider id, `probe_bytes` long, its bytes derived f
 file of known bytes, so a fetch can be checked byte for byte, and never a file of the study's data. It is written
 through the source when it is missing (the Compose federation's `reset --clean` empties the probe space) or is not the
 probe's bytes, at offset 0, and kept otherwise; a probe file longer than the probe's bytes gives way to the next
-generation, since only a write without an offset could shorten it and none is ever sent (O36).
+generation, since only a write without an offset could shorten it and none is ever sent (O44).
 
 **Generations.** A probe has a generation, in its name: generation 0 is the name above, generation N is that name and
 `-gN`. The probe a check uses is the highest generation the source's listing shows among the files not retired (below),
@@ -200,7 +200,7 @@ class ProbeFiles:
     def _write(self, provider: str, file_id: str, data: bytes) -> None:
         """Write the probe's bytes through `provider` at offset 0, over a file no longer than them, so it holds them
         whole, and read them back through it, which holds them. No write goes without an offset, which would truncate
-        the file (O36): a longer file is replaced by the next generation instead (`provision`)."""
+        the file (O44): a longer file is replaced by the next generation instead (`provision`)."""
         self._client.mutate(
             "PUT",
             f"/data/{file_id}/content",
@@ -265,7 +265,7 @@ class ProbeFiles:
             return Probe(file_id, newest + 1, True, tuple(e.file_id for e in probes.values()), (), newest + 1)
         generation = max(usable)
         entry = usable[generation]
-        if entry.size > len(data):  # only a truncating write could shorten it, and none is sent (O36)
+        if entry.size > len(data):  # only a truncating write could shorten it, and none is sent (O44)
             every = tuple(e.file_id for _, e in sorted(probes.items()))
             file_id = self._create(source, root, probe_name(self._ids[source], newest + 1), data)
             return Probe(file_id, newest + 1, True, every, tuple(f for f in every if f not in retired), newest + 1)

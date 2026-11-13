@@ -931,6 +931,58 @@ del os.environ[ADMIN_ENV]
 shutil.rmtree(workdir)
 ```
 
+**A file that is there but still being written.** When the agent must not tell from the namespace that anything is missing, set `mode = "preallocated"` under `[ingest]` and give each file a `prefix`, the bytes written at the start. Every planned file must then be `"complete"`: at the start the instrument makes it again at its final size with only the prefix written, so a listing and a `stat` show the file as in your baseline, while the rest reads as zeros (through REST and the mount alike) until its parts arrive. Only the block map tells the gap from written zeros. The parts' times count from the agent's first model turn, not from the instrument's start, so the setup before the loop does not eat into the agent's window: call `first_turn_instruments` in your executor just before the loop starts, as for any instrument with a first-turn hook ([An instrument that refuses an attempt](#an-instrument-that-refuses-an-attempt)); a run whose first turn never came is refused. After the run the instrument completes each file in place from its staged copy and never removes it, so the files every other condition reads stay in the dataset. Each start makes the files again, so their ids change every run: the snapshot's `ids` and `start.files` give the old and the new one.
+
+The block runs a preallocated plan of one file in three parts against the fakes. The run ends after the first part, and the finish completes the day.
+
+```python
+ticker = Ticker()
+fake = make_federation(clock=ticker.clock)
+fake.add_provider(BETA_ID, "beta.test")
+fake.add_file("records/day-13.csv", DAY)  # the dataset's last day, held whole by its owner
+
+workdir = Path(tempfile.mkdtemp())
+os.environ[ADMIN_ENV] = fake.admin_token
+platform = write_platform(workdir, both_providers)
+config = load_platform(platform)
+client = OnezoneClient(config, http=fake.client_http())
+own = Provisioner(
+    client,
+    config,
+    load_placement(platform, config).settings,
+    provider_ids=resolve_provider_ids(config),
+    log=workdir / "ingest-changes.jsonl",
+    clock=ticker.clock,
+    sleep=ticker.sleep,
+)
+(workdir / "staged").mkdir()
+(workdir / "staged" / "day-13.csv").write_bytes(DAY)
+(workdir / "ingest.toml").write_text(
+    '[ingest]\nstaging = "staged"\nmode = "preallocated"\n\n[[ingest.files]]\nlabel = "day-13"\n'
+    'path = "records/day-13.csv"\nsource = "day-13.csv"\nat_s = 60\nbaseline = "complete"\nprefix = 150\n'
+    "parts = 3\nover_s = 60\n",
+    encoding="utf-8",
+)
+plan = load_ingest_plan(workdir / "ingest.toml", config)
+ingest = ProgressiveIngest(own, plan, journal=workdir / "ingest-journal.jsonl", max_wait_s=0.001)
+
+ingest.start({})  # the day is at its full size with its first 150 bytes written: the namespace is the baseline's
+assert len(fake.nodes[fake.id_of("records/day-13.csv")].content) == len(DAY)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 150]]
+ingest.at_first_turn({"clock_s": 0.0})  # what first_turn_instruments calls just before the loop: the schedule's zero
+ticker.sleep(60)
+while ingest.progress < 1:
+    time.sleep(0.001)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 300]]  # the prefix and the first part, nothing beyond
+snapshot = ingest.finish()  # the run ended before the rest: the day is completed in place, never removed
+ingest.check()
+assert (snapshot["anchor"], snapshot["files"]["day-13"]["state"]) == ("first_turn", "partial")
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]
+
+del os.environ[ADMIN_ENV]
+shutil.rmtree(workdir)
+```
+
 ## 6. What a conclusion may say
 
 Every contrast ends in one of five words, `difference`, `trivial_difference`, `equivalent`, `not_detected` or `untestable`, and never in "no difference". Only `equivalent` may be read as no difference, and only a contrast with an `equivalence_margin` in the preregistration can reach it: the interval at 1 - 2 alpha lies inside plus or minus the margin and the test is not significant. `not_detected` is the absence of evidence, never evidence of absence; without a margin, it is the most a non-significant result can say. Both contrast tables of the report show the margin and the interval at 1 - 2 alpha beside the conclusion, so a reader can check `equivalent` and `trivial_difference` without `analysis.json`.

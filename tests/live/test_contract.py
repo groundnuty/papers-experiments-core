@@ -726,7 +726,7 @@ def copy_prefix(source, dest, size):
 def test_a_large_file_resumes_by_offset_writes_refuses_a_shorter_one_and_reads_back_by_its_hash(
     config, client, tmp_path
 ):
-    """O25, O36: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
+    """O25, O44: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
     nothing, a shorter file over the longer target is refused with nothing written (only a write without an offset,
     which truncates and is never sent, could shorten it), and the streamed read gives each file's SHA-256.
     Everything is under a fresh scratch directory and torn down; skipped without a [placement] table."""

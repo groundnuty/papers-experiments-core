@@ -46,7 +46,7 @@ def test_o09_only_the_resets_calls_the_tool_server_user_reads_and_the_clock_are_
     source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it. And the three calls of a
     run's revocation at its end (C19): a user's read of its generation of temporary tokens, its own revocation of them,
     and the verification that answers a revoked token `tokenRevoked`, all named by oz-worker's source alone. The write
-    of content without an offset, which truncates the file, left the list when the client began to refuse it (O36):
+    of content without an offset, which truncates the file, left the list when the client began to refuse it (O44):
     nothing sends it, so nothing relies on it."""
     from expcore_onedata import client
 

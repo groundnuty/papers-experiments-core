@@ -221,7 +221,7 @@ class FakeData(FakeQos, FakeFederation):
     replication places the whole file on its target, and an eviction removes all of the evicting provider's blocks of
     the file (a migration does both); no provider's map changes another's.
 
-    **Sparse files** (#107, O36), as op-worker f118ed9's source has them and the Compose federation measured
+    **Sparse files** (#107, O44), as op-worker f118ed9's source has them and the Compose federation measured
     (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A file at its final size with only a prefix
     written"): a write past the end leaves the bytes before it unwritten, read as zeros, and an empty body at an offset
     past the end extends the size to it with no block (read_write_req.erl:58-86; fslogic_blocks.erl:125-126 drops the

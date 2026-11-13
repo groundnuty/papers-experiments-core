@@ -182,8 +182,8 @@ over_s = 60
 """
 
 
-def test_o36_a_preallocated_plan_writes_its_parts_after_the_declared_prefix(tmp_path, platform):
-    """O36: in the preallocated mode each file declares the prefix written at the start, and its parts split the rest:
+def test_o44_a_preallocated_plan_writes_its_parts_after_the_declared_prefix(tmp_path, platform):
+    """O44: in the preallocated mode each file declares the prefix written at the start, and its parts split the rest:
     part k ends at `prefix + ceil((size - prefix) * k / parts)`, starts where the one before it ended, and carries the
     hash of everything before its end."""
     staged(tmp_path)
@@ -200,8 +200,8 @@ def test_o36_a_preallocated_plan_writes_its_parts_after_the_declared_prefix(tmp_
     assert plan.summary()["files"][0]["prefix"] == 1024
 
 
-def test_o36_an_arrival_plan_keeps_its_mode_its_steps_and_its_hash(tmp_path, platform):
-    """O36: a plan without `mode` is an arrival plan, as before: its parts start at the byte the one before ended (the
+def test_o44_an_arrival_plan_keeps_its_mode_its_steps_and_its_hash(tmp_path, platform):
+    """O44: a plan without `mode` is an arrival plan, as before: its parts start at the byte the one before ended (the
     first at 0), and its hash, which a running campaign's fingerprint holds, is the one it had before the keys came."""
     staged(tmp_path)
     plan = load_ingest_plan(plan_file(tmp_path, PLAN), platform)
@@ -221,8 +221,8 @@ def test_o36_an_arrival_plan_keeps_its_mode_its_steps_and_its_hash(tmp_path, pla
     assert plan.sha256 == hashlib.sha256(before).hexdigest()
 
 
-def test_o36_the_fingerprint_follows_the_mode_and_the_prefix(tmp_path, platform):
-    """O36: a resume after the prefix changed is refused, and so is one after the mode did."""
+def test_o44_the_fingerprint_follows_the_mode_and_the_prefix(tmp_path, platform):
+    """O44: a resume after the prefix changed is refused, and so is one after the mode did."""
     staged(tmp_path)
     first = load_ingest_plan(plan_file(tmp_path, PREALLOCATED), platform).sha256
     longer = load_ingest_plan(plan_file(tmp_path, PREALLOCATED.replace("prefix = 1024", "prefix = 2048")), platform)
@@ -230,8 +230,8 @@ def test_o36_the_fingerprint_follows_the_mode_and_the_prefix(tmp_path, platform)
     assert len({first, longer.sha256, load_ingest_plan(plan_file(tmp_path, arrival), platform).sha256}) == 3
 
 
-def test_o36_an_empty_preallocated_plan_is_allowed(tmp_path, platform):
-    """O36: a preallocated plan with no files loads, for a sham control, and has no steps."""
+def test_o44_an_empty_preallocated_plan_is_allowed(tmp_path, platform):
+    """O44: a preallocated plan with no files loads, for a sham control, and has no steps."""
     staged(tmp_path)
     plan = load_ingest_plan(plan_file(tmp_path, '[ingest]\nstaging = "staged"\nmode = "preallocated"\n'), platform)
     assert (plan.mode, plan.files, plan.steps()) == ("preallocated", (), ())
@@ -252,8 +252,8 @@ def test_o36_an_empty_preallocated_plan_is_allowed(tmp_path, platform):
         (lambda t: t.replace("parts = 3", "parts = 9217"), "parts"),
     ],
 )
-def test_o36_a_preallocated_plan_that_cannot_be_carried_out_is_refused_naming_the_key(tmp_path, platform, edit, key):
-    """O36: the mode is one of the two, a preallocated file declares a whole prefix below its size and belongs to the
+def test_o44_a_preallocated_plan_that_cannot_be_carried_out_is_refused_naming_the_key(tmp_path, platform, edit, key):
+    """O44: the mode is one of the two, a preallocated file declares a whole prefix below its size and belongs to the
     baseline (the reset completes it and never removes it), an arrival file declares no prefix, and the parts fit in
     the bytes after the prefix; each is refused at load, naming the plan's file and the key."""
     staged(tmp_path)

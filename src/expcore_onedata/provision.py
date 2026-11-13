@@ -14,7 +14,7 @@ configured name or lies outside the prefixes. On top of that gate:
 - **A large file is never held whole** (O25). `upload` sends a local file a chunk at a time, skips a target that
   already holds its bytes, resumes one that holds a prefix, and reports success only once the size and SHA-256 read
   back match; `read_file` reads a file back by streamed ranges, hashing as it goes. Every write carries a content type.
-- **No write truncates** (O36): every write of content names its offset, since one without truncates the file to 0
+- **No write truncates** (O44): every write of content names its offset, since one without truncates the file to 0
   first. `preallocate` makes a file at its final size with no block written (an empty write at that offset), and
   `write_range` writes a range of a local file into the same range of one, so a file can be at its final size with
   only some of its ranges written; `read_file(stop=)` reads and hashes its prefix.
@@ -554,7 +554,7 @@ class Provisioner:
           first byte, every write at its offset, so the writes cover the whole target and leave it the local file's
           size (`restarted`);
         - a file it created that is longer than the local file: refused before anything is written. Only a write
-          without an offset could shorten it, by truncating it to 0 first, and none is ever sent (O36): remove the file
+          without an offset could shorten it, by truncating it to 0 first, and none is ever sent (O44): remove the file
           first;
         - anything else in a file it did not create: refused before anything is written, as `put_file` refuses (O09).
 
@@ -627,7 +627,7 @@ class Provisioner:
 
     def preallocate(self, path: str, size: int, *, content_type: str = OCTET_STREAM) -> str:
         """Create a file at a path of the space, in a directory that exists, at `size` bytes with no byte written; log
-        it and return its id (O36, #107).
+        it and return its id (O44, #107).
 
         The file is created, then extended by an empty write at offset `size`, which on 25.0 sets the size and writes
         no block (measured on 10 Nov, `deploy/compose-federation/day0/2026-11-10-federation-facts.md`; op-worker
@@ -664,7 +664,7 @@ class Provisioner:
         self, file_id: str, source: Path | str, start: int, stop: int, *, content_type: str = OCTET_STREAM
     ) -> Digest:
         """Write bytes `start` to `stop` of a local file into the same range of a file this provisioner made, chunk by
-        chunk, each at its offset; return the size and SHA-256 of the bytes sent (O36, #107). Nothing else of the file
+        chunk, each at its offset; return the size and SHA-256 of the bytes sent (O44, #107). Nothing else of the file
         is touched: no write truncates, and a write inside the file's size leaves the size as it was.
 
         A file the change log does not hold is refused, since writing into it adopts it (O09), and so is a range that
@@ -697,7 +697,7 @@ class Provisioner:
     def _put(self, file_id: str, block: bytes, offset: int, media: str) -> None:
         """One write of content at `offset`, bound to this provisioner's space. There is no write without an offset,
         which would truncate the file to 0 first: one is refused here and by the client's gate, before it is sent
-        (O36). A body of `fresh_connection_bytes` or more goes on a connection of its own (#186)."""
+        (O44). A body of `fresh_connection_bytes` or more goes on a connection of its own (#186)."""
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ProvisionError(f"{self._where}a write of content needs a whole offset of 0 or more; nothing was sent")
         self.mutate(
@@ -728,7 +728,7 @@ class Provisioner:
     ) -> Digest:
         """Read a file's whole content through a provider (the data provider unless named), hashing it as it comes,
         and write it to `dest` when one is given; return its size and SHA-256 (O25). With `stop`, only its first `stop`
-        bytes are read and hashed, of a file of `size` bytes (O36): the prefix of a file at its final size.
+        bytes are read and hashed, of a file of `size` bytes (O44): the prefix of a file at its final size.
 
         The read is the client's `read_content`: by ranges of `chunk_bytes`, each gated as a range read and streamed,
         so the file is never held. It is bounded in bytes by `size`, or else by the size the file's attributes give,

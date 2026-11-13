@@ -9,7 +9,7 @@ of a provider's answer on as it comes (`OnezoneClient.read_content`), both hashi
 - `skipped`: the target already held the same size and SHA-256; nothing was sent;
 - `resumed`: the target held a strict prefix of the file; the rest was sent from where it ended;
 - `restarted`: the target held something else and was no longer; it was written again from its first byte, every
-  write at its offset (a longer target is refused: no write that truncates is ever sent, O36).
+  write at its offset (a longer target is refused: no write that truncates is ever sent, O44).
 
 A write of content names its media type (`media_type`): Onedata 25.0 answers 415 to a write without one, and the
 default is `application/octet-stream`.

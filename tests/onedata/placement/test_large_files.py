@@ -246,10 +246,10 @@ def test_o25_a_stop_outside_the_local_file_is_refused_before_anything_is_sent(pr
     assert changes(fake) == []
 
 
-def test_o36_a_target_this_provisioner_made_that_differs_and_is_no_longer_is_written_again_at_explicit_offsets(
+def test_o44_a_target_this_provisioner_made_that_differs_and_is_no_longer_is_written_again_at_explicit_offsets(
     provisioner, fake, tmp_path
 ):
-    """O25, O36: a target as long as the local file but with other bytes, or shorter with bytes that are no prefix, is
+    """O25, O44: a target as long as the local file but with other bytes, or shorter with bytes that are no prefix, is
     written again from its first byte, every write at its offset: no write goes without one, which would truncate."""
     made = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
 
@@ -267,8 +267,8 @@ def test_o36_a_target_this_provisioner_made_that_differs_and_is_no_longer_is_wri
 
 
 @pytest.mark.parametrize("local", [BULKY[:-1], b""])
-def test_o36_a_target_longer_than_the_local_file_is_refused_and_nothing_is_written(provisioner, fake, tmp_path, local):
-    """O36: only a write without an offset could shorten a file (to 0, then the bytes it sends), and none is sent, so
+def test_o44_a_target_longer_than_the_local_file_is_refused_and_nothing_is_written(provisioner, fake, tmp_path, local):
+    """O44: only a write without an offset could shorten a file (to 0, then the bytes it sends), and none is sent, so
     an upload over a longer target the provisioner made is refused before anything is written, an empty local file
     included; the target keeps its bytes. The caller removes the file first."""
     made = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
