@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 from shard_support import (
     IDENTITY,
+    MERGE_TIMES,
+    MERGED_ONLY,
     json_meta,
     keys_of_shard,
     make_study,
@@ -25,6 +27,7 @@ from shard_support import (
     plant_run,
     run_shard,
     without_run,
+    without_shard_section,
     write_meta,
 )
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, table
@@ -290,21 +293,15 @@ def test_c29_the_merged_batch_gives_the_scores_of_one_unsharded_driver(whole, me
     assert (merged.root / "out" / "scores.json").read_bytes() == (whole.root / "out" / "scores.json").read_bytes()
     assert (merged.root / "out" / "analysis.json").read_bytes() == (whole.root / "out" / "analysis.json").read_bytes()
     one, many = read(whole, "export.json"), read(merged, "export.json")
-    own = {"shard", "dispatch_seq", "started_at", "lease_wait_s", "wall_s", "turn_latency_s"}
+    own = {"shard", "dispatch_seq", "started_at", "lease_wait_s", *MERGE_TIMES}
     for key in one:
         if key == "analysed_attempts":
             continue
         assert many[key] == one[key], key
     plain = lambda entries: [{k: v for k, v in e.items() if k not in own} for e in entries]  # noqa: E731
     assert plain(many["analysed_attempts"]) == plain(one["analysed_attempts"])  # the same rows, in the same order
-    assert set(many) - set(one) == {"shards", "shard_retries_by_kind"}
+    assert set(many) - set(one) == set(MERGED_ONLY)
     assert _report_differs_only_in_positions(without_shard_section(merged.report), whole.report)
-
-
-def without_shard_section(report: str) -> str:
-    """The report without its `## Shards` section: from that heading up to the next `## ` one."""
-    head, rest = report.split("## Shards\n", 1)
-    return head + "## " + rest.split("\n## ", 1)[1]
 
 
 def _report_differs_only_in_positions(merged: str, whole: str) -> bool:
@@ -339,14 +336,13 @@ ENTRY_KEYS = [  # what every export's analysed entry holds, in order: nothing of
     "lease_outcome",
     "admission",
 ]
-MERGED_ONLY = {"shards", "shard_retries_by_kind"}  # top-level keys only a merged batch's export has
 
 
 def test_c29_the_export_of_an_unmerged_batch_has_none_of_a_merged_batchs_keys_and_is_byte_for_byte_its_own(whole):
     """C29: an unsharded campaign's export and its run entries carry no shard, no shard's set-asides and no run time,
     its check no merge; its bytes are exactly what the export of its snapshot gives, as before shards existed."""
     export = read(whole, "export.json")
-    assert not MERGED_ONLY & set(export)
+    assert set(MERGED_ONLY).isdisjoint(export)
     assert "shard" not in export
     for name in LISTS:
         assert all("shard" not in e for e in export.get(name, [])), name
@@ -366,7 +362,7 @@ def test_c29_a_shards_own_export_has_its_shard_key_and_none_of_a_merged_batchs_k
     assert alone.codes == {"check": 0, "analyze": 0, "report": 0}
     text = (alone.root / "out" / "export.json").read_text(encoding="utf-8")
     export = json.loads(text)
-    assert not MERGED_ONLY & set(export)
+    assert set(MERGED_ONLY).isdisjoint(export)
     assert list(export)[-1] == "shard"
     assert export["analysed_attempts"]
     assert all(list(e) == ENTRY_KEYS for e in export["analysed_attempts"])

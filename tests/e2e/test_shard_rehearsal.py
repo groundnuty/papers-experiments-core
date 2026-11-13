@@ -33,7 +33,15 @@ from shard_rehearsal_support import (
     wait_for,
     without_dispatch_positions,
 )
-from shard_support import json_meta, keys_of_shard, merge_into, meta_of, plant_run, without_run
+from shard_support import (
+    json_meta,
+    keys_of_shard,
+    merge_into,
+    meta_of,
+    plant_run,
+    without_run,
+    without_shard_section,
+)
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.campaign.resume import FINGERPRINT_KEY
@@ -247,10 +255,12 @@ def test_c29_the_merged_export_and_report_equal_those_of_one_driver_apart_from_w
     drivers, merged
 ):
     """C29: the export (how each run ended, each run's tallies, the accounting) and the report are the unsharded
-    campaign's, but for the shard tags and what is per driver: dispatch positions, start times and lease waits."""
+    campaign's, but for what is per driver (dispatch positions, start times and lease waits) and what only a merge has:
+    the shard tags, `shard_retries_by_kind`, each analysed entry's `wall_s` and `turn_latency_s`, and the report's
+    `## Shards` section."""
     one, two = drivers.unsharded, merged
     assert apart_from_where_and_when(two.read("export.json")) == apart_from_where_and_when(one.read("export.json"))
-    assert without_dispatch_positions(two.report) == without_dispatch_positions(one.report)
+    assert without_dispatch_positions(without_shard_section(two.report)) == without_dispatch_positions(one.report)
 
 
 # --- the refusals --------------------------------------------------------------------------------------------------
