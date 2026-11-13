@@ -790,7 +790,7 @@ class Upload:      # file_id: str, digest: Digest, action: "created" | "skipped"
 
 ## Estimator
 
-`expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers one, `wilcoxon_cluster_bootstrap`.
+`expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers two, `wilcoxon_cluster_bootstrap` and `ratio` ([below](#a-ratio-contrast)).
 
 ```python
 class Estimator(Protocol):
@@ -820,7 +820,8 @@ class EstimatorResult:
     per_model: tuple[ModelEstimate, ...] = ()  # ModelEstimate(model, estimate, ci_low, ci_high, n_undefined_replicates)
     counts: Mapping[str, int] = field(default_factory=dict)  # the estimator's own counts, such as zero_dropped
 
-def register(name: str, *, check_params=None, p_values=None)  # a decorator: @register("name") above the function
+def register(name: str, *, check_params=None, p_values=None, form="difference")  # a decorator above the function
+def form(name: str) -> str     # the form of contrast an estimator reads: "difference" or "ratio" (FORMS)
 ```
 
 How pairs become the matrix's cells is in [the study guide's section 5](study-guide.md#how-pairs-become-a-contrasts-input).
@@ -830,13 +831,56 @@ Core guarantees:
 - `check_params(params)`, given at registration, is called when the preregistration is loaded, so a bad parameter is refused naming `[estimators.<name>]`; without one, any parameter is refused.
 - For a contrast with an `equivalence_margin` the analysis calls the estimator a second time with `level` at 1 - 2 alpha and the same seed. A NaN p-value counts as p = 1 in the Holm family.
 - `p_values`, given at registration, is used to simulate the minimum detectable effect with the contrast's own parameters (S06, S09). Without it the contrast's minimum detectable effect is NaN (`null` in `analysis.json`).
+- An estimator reads one form of contrast, `form` at registration, "difference" unless given. A contrast of one outcome needs an estimator of the difference form, a ratio contrast one of the ratio form; the loader refuses any other pairing, naming the key, and `run_contrast` refuses a spec built past the loader.
 
 Implementer must guarantee:
 - The estimator is a pure function of its arguments: called twice with equal settings, it returns equal results, whatever ran in between. NaN, never a guess, where it cannot compute a value.
 - `p_values(studies, params)` returns, for each row of a studies x clusters array of cluster differences, exactly the p-value the estimator reports for that row.
 - The name is lower-case letters, digits and underscores, registered once: a second registration of a name is refused.
 
-**Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
+**Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap, ratio`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
+
+### A ratio contrast
+
+`expcore.stats.ratio` (S13, #138). A contrast of an outcome per unit of another, such as tokens per correct result, names an estimator of the ratio form and two outcomes in place of `outcome`:
+
+```toml
+[contrasts.cost-per-success]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "tokens"
+denominator = "success"
+zero_denominator = "exclude"   # or "continuity", with continuity_correction = c > 0 (required with it, refused without)
+cluster = "group"
+equivalence_margin = 0.2231    # optional: a natural-log ratio, here within a factor of 1.25 either way
+```
+
+```python
+@dataclass(frozen=True)
+class RatioForm:                # ContrastSpec.ratio, and ContrastResult.ratio (None for a contrast of one outcome)
+    numerator: str
+    denominator: str
+    zero_denominator: str       # "exclude" or "continuity" (ZERO_RULES)
+    continuity_correction: float | None = None
+    label: str                  # a property, "numerator/denominator": the contrast's `outcome`
+
+def log_ratio(arm_a: Totals, arm_b: Totals, form: RatioForm) -> tuple[str | None, float]  # (cause, NaN) or (None, value)
+def aggregate(cells: Mapping[str, Sequence[tuple[Totals, Totals]]], form) -> tuple[PairedDifferences, dict[str, int]]
+RATIO_CAUSES = ("numerator_none_at_zero", "zero_denominator", "zero_numerator")
+POOLED = "pooled"               # the one column of a ratio contrast's input
+```
+
+**The estimand.** theta = the mean over clusters c of ln((N_cA / D_cA) / (N_cB / D_cB)), where N_ca and D_ca are the sums of the numerator and of the denominator over the runs of arm a in cluster c that belong to a used pair, every task, model and seed of the cluster together. It is a ratio of sums, not a mean of per-run ratios: a run whose denominator is 0, a failed run, has no ratio of its own and still adds its numerator. exp(theta) is the geometric mean over clusters of arm A's ratio over arm B's, so "x2" and "x1/2" are symmetric on this scale. Each cluster pools its models, so a model with no correct result in a cluster still adds its cost there, and within a cluster the sums weigh runs, not tasks or models (a contrast of one outcome weighs each task and each model alike). The value is computed in exact rational arithmetic up to the logarithm, so arms with one ratio give 0.0, never float noise, and no ratio of sums can overflow.
+
+**The inference.** The input is a `PairedDifferences` with one row per cluster and one column, `POOLED`. The `ratio` estimator is the kernel's on those log ratios: the estimate is their mean, the p-value the two-sided Wilcoxon signed-rank test (float noise snapped, zero log ratios dropped and counted as `zero_dropped`, all zeros p = 1; it tests the centre of symmetry of the cluster log ratios, as the difference estimator tests that of the differences), and the interval the cluster bootstrap's percentile interval at the contrast's seed. Its parameters are the Wilcoxon cluster bootstrap's (`[estimators.ratio]`, `snap_decimals` and `method`), it registers the same p-value function, so the minimum detectable effect is simulated with the test it reports, and it has no estimate by model (`per_model` is empty). The estimate, both intervals, the margin and the minimum detectable effect are natural-log ratios; the Holm family and the conclusion words take it as any contrast.
+
+**A zero sum.** A cluster whose numerator or denominator sums to 0 in either arm has an undefined or infinite log ratio, and the preregistration's `zero_denominator` decides; it has no default:
+- `"exclude"`: the cluster leaves the contrast; each of its pairs is counted under `zero_denominator` (a denominator sum of 0 in either arm, 0 / 0 included) or else `zero_numerator`, not in `n_pairs`, and the cluster in `n_clusters_dropped`. A contrast left with no cluster is `untestable`.
+- `"continuity"`: `continuity_correction` c is added to all four sums of every cluster, a zero or not, in each outcome's own units, so every cluster stays and every log ratio is pulled toward 0, more for small sums.
+
+**A failed run's missing numerator.** A pair whose run has a None numerator and a denominator of 0 is counted under `numerator_none_at_zero` (after a treatment attempt's None, before any other None, which is `outcome_none`): leaving a failed run's cost out makes the ratio one over successful runs. A member of the Holm family with any is refused (`analysis.RatioNumeratorRefused`, naming the contrast, the count and the fix); an exploratory contrast reports it. `TreatmentOutcomesRefused` and `RatioNumeratorRefused` are both `analysis.ContrastRefused`, which `analyze` reports as a refusal. A negative numerator or denominator is refused naming the run and the outcome.
+
+**In the outputs.** `analysis.json` gives every contrast `ratio` (the form, or null) and a ratio contrast's `pairs_missing` the three `RATIO_CAUSES` after the five others, zeros included; `n_pairs_missing` counts the None causes, `numerator_none_at_zero` among them. `report.md` shows a ratio contrast's outcome as `ln(numerator/denominator)`, adds a section "Ratio contrasts" (each one's two outcomes, its rule, and exp of its estimate and interval) and the three causes as columns of the pairs tables, `-` in the row of a contrast of one outcome, and the terminal summary marks its estimate `(ln ratio)`. A report with no ratio contrast has none of these, byte for byte as before.
 
 ## The platform layer's spaces and reset
 

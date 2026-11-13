@@ -48,7 +48,9 @@ def test_the_first_registered_estimator_is_the_wilcoxon_cluster_bootstrap():
 
 def test_an_unknown_estimator_is_refused_with_the_registered_names():
     """A name nobody registered raises and lists what exists."""
-    with pytest.raises(UnknownEstimator, match="unknown estimator 'bayes'; registered: wilcoxon_cluster_bootstrap"):
+    with pytest.raises(
+        UnknownEstimator, match=r"unknown estimator 'bayes'; registered: wilcoxon_cluster_bootstrap, ratio$"
+    ):
         estimators.get("bayes")
     with pytest.raises(UnknownEstimator, match="unknown estimator"):
         estimators.check_params("bayes", {})

@@ -550,6 +550,6 @@ def test_s13_a_ratio_key_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
 
 
 def test_s13_a_ratio_contrast_may_declare_an_equivalence_margin_on_the_log_scale(tmp_path):
-    """S13: its margin, like its estimate, is a natural-log ratio (ln 1.25 for a quarter either way)."""
+    """S13: its margin, like its estimate, is a natural-log ratio (ln 1.25: within a factor of 1.25 either way)."""
     text = with_ratio('cluster = "group"', 'cluster = "group"\nequivalence_margin = 0.2231')
     assert load(write(tmp_path, text)).contrasts["spend-per-win"].equivalence_margin == 0.2231

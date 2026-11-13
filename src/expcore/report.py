@@ -346,7 +346,6 @@ def _ratios(results: Sequence[ContrastResult]) -> list[str]:
             f"[{_num(_exp(r.ci_low))}, {_num(_exp(r.ci_high))}]",
         ]
         for r in ratios
-        if r.ratio is not None
     ]
     header = ["Contrast", "Numerator", "Denominator", "Zero total", "Ratio (A / B)", "Ratio interval"]
     return ["## Ratio contrasts", "", *_table(header, rows), "", *RATIO_NOTES, ""]
