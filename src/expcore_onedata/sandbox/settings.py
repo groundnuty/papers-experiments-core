@@ -47,8 +47,9 @@ gate_memory_bytes = 1073741824  # optional
 
 [sandbox.mount]                 # required when a data path is a mount
 path = "/data"                  # where the agent sees the space, read-only
-io_mode = "direct"              # optional: "direct" or "proxy"
-extra_args = []                 # further oneclient arguments, never one that changes the TLS mode
+io_mode = "proxy"               # required, no default: "proxy" (O36); "direct" is refused until #223 maps the storage
+extra_args = []                 # further oneclient arguments, never one that sets the TLS mode, the I/O mode, the
+                                # config file or oneclient's environment
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
@@ -66,6 +67,18 @@ zone = "host"                   # the zone's host name on that network, the one 
 providers.<local> = "host"      # the local provider's host name on that network, the one its certificate holds;
                                 # keyed by [support] local, the only provider accepted (the agent is pinned to it)
 ```
+
+`io_mode` is declared, never detected (O36). oneclient 25.0 started with neither force option detects each storage's
+access type at the first read of each space, and for a second space on a storage already detected as proxied it takes a
+plain mutex it already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`, the recursion at the end of
+its `!forceProxyIO` branch), so the read waits for ever and nothing is logged. `proxy` (`--force-proxy-io`) reads every
+space through the provider. `direct` (`--force-direct-io`) reads the storage itself and so needs the providers' storage
+mapped into the sidecar, which the sandbox does not do yet: it is refused at load (#223), and the command's code for it
+stays for the mapping to lift the refusal. There is no third word for oneclient's own detection, and the extra
+arguments may not carry either force option. The sidecar's oneclient reads no configuration file (`--config
+/dev/null`) and its environment holds the token alone (`env -u` of `ONECLIENT_INSECURE`, `ONECLIENT_OVERRIDE` and
+`ONECLIENT_CONFIG`), so its effective options are the argv and the token. The I/O mode is in the campaign fingerprint,
+for each mount level, as the listing is for a REST level.
 
 `listing` is a REST data path's option (O21): `paged`, the default, passes the server's page of a listing as it comes,
 and `complete` has the data gate answer every listing with all of the directory's entries (`gatepolicy`). It is refused
@@ -111,6 +124,7 @@ from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
 from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED
 from expcore_onedata.sandbox.hostops import strict_networks
+from expcore_onedata.sandbox.oneclient_args import IO_MODES, extra_arg_problem, mount_problem
 from expcore_onedata.tls import TlsSettings, moved
 
 PREFIX_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
@@ -122,8 +136,6 @@ SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under t
 # drops it, so it is printable ASCII without white space; the default is a plain word no one takes for a real token.
 PLACEHOLDER_TOKEN = "placeholder"
 PLACEHOLDER_RE = re.compile(r"[!-~]{1,128}")
-IO_MODES = ("direct", "proxy")
-FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by the platform's [tls] only
 NETWORK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a docker network's name; no `container:<id>`
 NOT_A_FEDERATION_NETWORK = ("bridge", "default", "host", "none")  # docker's own: no name resolves, or no isolation
 HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
@@ -131,6 +143,19 @@ KILL_GRACE_S = 5.0  # [sandbox] kill_grace_s unless declared: a few seconds, so 
 # a cell's whole escalation past its cap is bounded by `deadline.margin_s`: two graces (after the kill, after an
 # abort) and `deadline.COMMANDS_S` for its commands; 30 s at the default grace, 140 s at this maximum
 KILL_GRACE_MAX_S = 60.0
+
+
+IO_MODE_REFUSAL = (
+    'is required and must be "proxy" or "direct": a mount never leaves the storage access to oneclient\'s own '
+    "detection, which hangs the first read of a second space backed by the same storage (oneclient 25.0, "
+    'src/cache/helpersCache.h, performAutoIOStorageDetection takes its access-type mutex twice). "proxy" reads every '
+    'space through the provider; "direct" is not supported yet (see #223)'
+)
+DIRECT_REFUSAL = (
+    'is "direct", which is not supported yet: direct I/O reads the providers\' storage itself, so it needs that '
+    'storage mapped into the sidecar, which the sandbox does not do (see #223). Declare "proxy", which reads every '
+    "space through the provider"
+)
 
 
 @dataclass(frozen=True)
@@ -169,8 +194,15 @@ class MountSettings:
     """How the oneclient sidecar mounts the space and where the agent sees it; its TLS is `SandboxSettings.tls`."""
 
     path: str
-    io_mode: str | None = None
+    io_mode: str  # "proxy" or "direct", declared, never left to oneclient's detection (O36)
     extra_args: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Settings built in code are held to what the loader holds a file to: a known mode and no extra argument that
+        sets what the core declares (O36). `ValueError`; the message never holds an argument."""
+        problem = mount_problem(self.io_mode, self.extra_args)
+        if problem is not None:
+            raise ValueError(problem)
 
 
 @dataclass(frozen=True)
@@ -223,12 +255,23 @@ class SandboxSettings:
             return None
         return self.listings.get(level, PAGED)
 
+    def io_mode_of(self, level: str) -> str | None:
+        """The I/O mode of a level (O36): the mount's `io_mode` for a mount data path, None for any other."""
+        if self.mode_of(level) is not DataPathMode.MOUNT or self.mount is None:
+            return None
+        return self.mount.io_mode
+
     def data_path_record(self) -> dict[str, dict[str, str]]:
-        """Every level's data path as the campaign fingerprint holds it: its kind and, for REST, its listing mode."""
+        """Every level's data path as the campaign fingerprint holds it: its kind, for REST its listing mode and for a
+        mount the I/O mode it runs with."""
         out: dict[str, dict[str, str]] = {}
         for level, mode in self.data_paths.items():
-            listing = self.listing_of(level)
-            out[level] = {"kind": mode.value} | ({"listing": listing} if listing is not None else {})
+            listing, io_mode = self.listing_of(level), self.io_mode_of(level)
+            out[level] = (
+                {"kind": mode.value}
+                | ({"listing": listing} if listing is not None else {})
+                | ({"io_mode": io_mode} if io_mode is not None else {})
+            )
         return out
 
     def label(self, name: str) -> str:
@@ -319,12 +362,16 @@ def _mount(section: Section) -> MountSettings:
     path = section.string("path")
     if not path.startswith("/") or path == "/" or ".." in path.split("/") or any(c.isspace() for c in path):
         raise section.fail("path", "must be an absolute path inside the agent, not the root")
-    io_mode = section.optional_string("io_mode")
-    if io_mode is not None and io_mode not in IO_MODES:
-        raise section.fail("io_mode", f"must be one of: {', '.join(IO_MODES)}")
+    io_mode = section.data.get("io_mode")
+    if io_mode not in IO_MODES:
+        raise section.fail("io_mode", IO_MODE_REFUSAL)
+    if io_mode == "direct":  # the argv code for it stays; #223 adds the storage mapping and lifts this
+        raise section.fail("io_mode", DIRECT_REFUSAL)
     extra = section.strings("extra_args") if "extra_args" in section.data else ()
-    if any(a in FORBIDDEN_ARGS or (a.startswith("-") and not a.startswith("--") and "i" in a[1:]) for a in extra):
-        raise section.fail("extra_args", "must not carry the TLS flag: the platform's [tls] alone sets it")
+    for argument in extra:
+        problem = extra_arg_problem(argument)
+        if problem is not None:
+            raise section.fail("extra_args", problem)
     return MountSettings(path, io_mode, tuple(extra))
 
 

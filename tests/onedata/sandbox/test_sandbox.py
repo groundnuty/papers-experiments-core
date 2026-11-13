@@ -1,5 +1,6 @@
 """The sandbox over an in-memory host: the three data paths, images pinned by id, read-only at every point, teardown."""
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -8,7 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fake_host import CERTIFI_BUNDLE
+from fake_host import CERTIFI_BUNDLE, ONECLIENT_CONFIG_PATH, ONECLIENT_CONFIG_SHA256
 from sandbox_support import (
     COMPLETE_LEVEL,
     FED_LOCAL,
@@ -764,13 +765,92 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     sbx = start(world, "mounted")
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
-    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "network", "wait_s"}
+    assert set(meta["mount"]) == {
+        "io_mode", "options", "extra_args", "image_config", "log_dir_from", "network", "wait_s",
+    }  # fmt: skip
     assert meta["mount"]["log_dir_from"] == "default"
     assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)
     assert world.s.network.pools[0] not in text
     assert str(world.s.work_root) not in text
     assert world.s.mount.path not in text
+    sbx.stop()
+
+
+def test_o36_the_metadata_records_the_io_mode_the_mount_runs_with_and_the_options_the_sandbox_set(world):
+    """O36: the mount's I/O mode is the one the table declares, never None, and the run's options are recorded as the
+    sandbox set them: the mode's force option, the read-only mount options and no TLS flag by default."""
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()["mount"]
+    assert meta["io_mode"] == "proxy"
+    assert meta["options"] == ["-o", "ro,allow_other", "--force-proxy-io", "--config", "/dev/null"]
+    assert meta["extra_args"] == {"names": [], "sha256": hashlib.sha256(b"").hexdigest()}
+    sbx.stop()
+
+
+def test_o36_a_direct_mount_records_direct_and_the_study_extra_arguments_only_by_name_and_hash(world):
+    """O36: the effective mode is `direct` when declared; the study's extra arguments are recorded by their option
+    names and the SHA-256 of the whole list, never by value (a value may be a path or an identifier, O12)."""
+    from dataclasses import replace
+
+    extra = ("--provider-timeout", "45", "--log-dir=/somewhere/private", "-l/attached/private")
+    world.s = replace(world.s, mount=replace(world.s.mount, io_mode="direct", extra_args=extra))
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()
+    assert meta["mount"]["io_mode"] == "direct"
+    assert meta["mount"]["options"] == ["-o", "ro,allow_other", "--force-direct-io", "--config", "/dev/null"]
+    assert meta["mount"]["extra_args"] == {
+        "names": ["--provider-timeout", "--log-dir", "-l"],  # a short option's attached value is never kept
+        "sha256": hashlib.sha256("\0".join(extra).encode()).hexdigest(),
+    }
+    text = json.dumps(meta, default=str)
+    assert "/somewhere/private" not in text
+    assert "/attached/private" not in text
+    assert "45" not in meta["mount"]["extra_args"]["names"]
+    sbx.stop()
+
+
+def test_o36_a_word_of_the_extra_arguments_that_starts_with_a_dash_and_is_no_option_is_never_recorded(world):
+    """O36: the loader accepts `["--log-dir", "--private/path"]` (the second word is a value), and the metadata held
+    `--private/path` as an option name. It holds `<value>` for it and the hash of the whole list."""
+    from dataclasses import replace
+
+    extra = ("--log-dir", "--private/path")
+    world.s = replace(world.s, mount=replace(world.s.mount, extra_args=extra))
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()
+    assert meta["mount"]["extra_args"] == {
+        "names": ["--log-dir", "<value>"],
+        "sha256": hashlib.sha256("\0".join(extra).encode()).hexdigest(),
+    }
+    assert "private" not in json.dumps(meta, default=str)
+    sbx.stop()
+
+
+def test_o36_the_metadata_records_the_image_config_files_hash_though_oneclient_never_parses_it(world):
+    """O36: the file the image's oneclient would read by default is ignored (`--config /dev/null` is in the options),
+    and its path in the image and SHA-256 are still in the record, read from the sidecar's own output before oneclient
+    started, so the record shows what the image carried."""
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()["mount"]
+    assert meta["image_config"] == {"path": ONECLIENT_CONFIG_PATH, "sha256": ONECLIENT_CONFIG_SHA256}
+    assert meta["options"][-2:] == ["--config", "/dev/null"]
+    sbx.stop()
+
+
+def test_o36_a_config_file_the_sidecar_could_not_read_is_recorded_unread_and_the_start_goes_on(world):
+    """O36: the sidecar's output holds no usable record (the docker call for it fails here): the record says
+    `unread`, with no path, and the sandbox starts as it would."""
+    docker = world.host.docker
+
+    def without_logs(*args, **kwargs):
+        if args[:1] == ("logs",):
+            return CmdResult(1, "", "Error response from daemon")
+        return docker(*args, **kwargs)
+
+    world.host.docker = without_logs
+    sbx = start(world, "mounted")
+    assert sbx.metadata()["mount"]["image_config"] == {"path": None, "sha256": "unread"}
     sbx.stop()
 
 
