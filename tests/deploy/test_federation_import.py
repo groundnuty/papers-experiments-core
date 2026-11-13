@@ -263,3 +263,115 @@ def test_a_space_that_is_not_imported_has_no_source_and_no_copy(fed, tmp_path):
         layout.import_source("alpha-space", {})
     with pytest.raises(ValueError, match="alpha-space"):
         layout.import_dir("alpha-space")
+
+
+# -- the bind an import adds ------------------------------------------------------------------------------------------
+
+
+def volumes(fed, spec, service: str) -> dict[str, dict]:
+    """A service's binds by target."""
+    return {v["target"]: v for v in fed.compose.model(spec)["services"][service]["volumes"]}
+
+
+def test_a_read_only_import_binds_its_source_by_the_variable_read_only_into_the_owners_service(fed, tmp_path):
+    spec = fed.spec.load_spec(write(tmp_path, WITH_WRITABLE_IMPORT))
+    mount = volumes(fed, spec, "elm")["/volumes/import/fern-space"]
+    assert mount["source"] == "${EXPCORE_FED_IMPORT_FERN:?set by federation.py}"
+    assert mount["read_only"] is True
+    assert mount["bind"] == {"create_host_path": False}
+
+
+def test_a_writable_import_binds_its_copy_in_the_root_read_write_into_the_owners_service(fed, tmp_path):
+    spec = fed.spec.load_spec(write(tmp_path, WITH_WRITABLE_IMPORT))
+    mount = volumes(fed, spec, "oak")["/volumes/import/moss-space"]
+    assert mount["source"] == f"{fed.compose.ROOT}/oak/import/moss-space"
+    assert "read_only" not in mount
+    assert mount["bind"] == {"create_host_path": False}
+
+
+def test_an_import_is_bound_into_its_owners_service_only(fed, tmp_path):
+    """A mirror keeps its regular storage: it never sees the dataset's directory."""
+    spec = fed.spec.load_spec(write(tmp_path, WITH_WRITABLE_IMPORT))
+    for service, space in (("oak", "fern-space"), ("elm", "moss-space")):
+        assert f"/volumes/import/{space}" not in volumes(fed, spec, service)
+    assert "/volumes/import/fern-space" not in volumes(fed, spec, "zone")
+    assert "/volumes/import/moss-space" not in volumes(fed, spec, "zone")
+
+
+def test_a_service_with_no_imported_space_keeps_the_binds_it_always_had(fed, tmp_path):
+    spec = fed.spec.load_spec(write(tmp_path, MINIMAL))
+    assert [v["target"] for v in fed.compose.model(spec)["services"]["oak"]["volumes"]] == [
+        "/volumes/persistence",
+        "/volumes/storage",
+        "/expcore/registration-token",
+        "/expcore/federation-ca.pem",
+        "/expcore/start.sh",
+    ]
+
+
+def test_an_owner_of_two_imported_spaces_gets_one_bind_each(fed, tmp_path):
+    text = WITH_IMPORT + '\n[spaces.reed-space]\nowner = "elm"\nbaseline = false\nimport = { readonly = false'
+    text += ', source_env = "EXPCORE_FED_IMPORT_REED" }\n'
+    spec = fed.spec.load_spec(write(tmp_path, text))
+    targets = [t for t in volumes(fed, spec, "elm") if t.startswith("/volumes/import/")]
+    assert targets == ["/volumes/import/fern-space", "/volumes/import/reed-space"]
+
+
+class FakeDocker:
+    """subprocess.run as docker compose is run through it: every command and the environment it got."""
+
+    def __init__(self) -> None:
+        self.runs: list[tuple[list[str], dict[str, str]]] = []
+
+    def run(self, command, *, env, **options):
+        self.runs.append((command, env))
+        return type("Done", (), {"returncode": 0, "stdout": ""})()
+
+
+@pytest.fixture
+def docker(fed, monkeypatch):
+    fake = FakeDocker()
+    monkeypatch.setattr(fed.docker.subprocess, "run", fake.run)
+    for name in ("EXPCORE_FED_IMPORT_FERN", "EXPCORE_FED_IMPORT_MOSS"):
+        monkeypatch.delenv(name, raising=False)
+    return fake
+
+
+def test_compose_gets_the_checked_source_of_a_read_only_import_in_its_environment(fed, tmp_path, docker, monkeypatch):
+    layout, data = import_layout(fed, tmp_path)
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_FERN", str(data))
+    fed.docker.compose(layout, "up", "--detach")
+    ((_, env),) = docker.runs
+    assert env["EXPCORE_FED_IMPORT_FERN"] == str(data)
+    assert env["EXPCORE_FED_ROOT"] == str(layout.root)
+
+
+def test_compose_refuses_a_read_only_import_whose_variable_is_not_set_before_it_runs_docker(fed, tmp_path, docker):
+    layout, _ = import_layout(fed, tmp_path)
+    with pytest.raises(RuntimeError, match="EXPCORE_FED_IMPORT_FERN is not set"):
+        fed.docker.compose(layout, "down")
+    assert docker.runs == []
+
+
+def test_compose_refuses_a_read_only_source_the_layout_would_not_take(fed, tmp_path, docker, monkeypatch):
+    layout, _ = import_layout(fed, tmp_path)
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_FERN", "relative/data")
+    with pytest.raises(RuntimeError, match="EXPCORE_FED_IMPORT_FERN must be an absolute path"):
+        fed.docker.compose(layout, "ps")
+    assert docker.runs == []
+
+
+def test_compose_needs_no_source_for_a_writable_import_whose_copy_is_in_the_root(fed, tmp_path, docker, monkeypatch):
+    """The source of a writable import is read once, when up makes the copy; down and the rest never need it again."""
+    layout, data = import_layout(fed, tmp_path)
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_FERN", str(data))
+    fed.docker.compose(layout, "down")
+    ((_, env),) = docker.runs
+    assert "EXPCORE_FED_IMPORT_MOSS" not in env
+
+
+def test_compose_of_a_layout_without_an_import_needs_no_variable(fed, tmp_path, docker):
+    layout = fed.layout.Layout(tmp_path / "fed", spec=fed.spec.load_spec(write(tmp_path, MINIMAL)))
+    fed.docker.compose(layout, "ps")
+    ((_, env),) = docker.runs
+    assert not [name for name in env if name.startswith("EXPCORE_FED_IMPORT_")]
