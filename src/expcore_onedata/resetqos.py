@@ -46,18 +46,25 @@ the affected files.
 **Settled, then quiet.** A QoS replication has no transfer to wait for, and one still running when its requirement is
 removed can go on placing bytes. So after the removal the affected files' block maps, on every provider, must stay
 the same for `SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND_S`, or the reset fails. After the
-eviction and the occupancy they are read again, and once more after `quiet_wait_s`, together with the occupancy: a
-provider holding more of an affected file than before the wait fails the reset, and so does a provider other than the
-data provider holding more of the space than at the occupancy stage. That check does not wait for a requirement to be
-found: an agent can add one and remove it before the run ends, leaving the reset none to see while its replication is
-still landing, so it runs unless the caller knows that no run since the last verified reset had the right to manage
-QoS, and covers the files the eviction plan evicts as well (`resetheld.py`), never a read of the whole space. The block
-maps decide: a file's distribution shows its provider's in-memory location at once. A replication that lands between
-the eviction's verification and the first of these readings is already in that reading, so the maps show no growth,
-and so is one on a file the plan does not cover, whose map is never read; the occupancy read after the wait, set
-against the occupancy stage's, is what catches them, and it is read whenever the check runs. The occupancy is otherwise
-a second sign, and a zero there is never taken alone as nothing having landed, because a directory's physical size
-lags a placement:
+eviction and the occupancy the quiet stage reads, at one instant T, the block maps of the files the eviction plan
+evicted, on the providers it evicted them from, and of the files a removed requirement applied to, on every provider.
+Each may hold no more than it should: nothing where the eviction verified it empty, what the settle saw elsewhere.
+Then it waits `quiet_wait_s` from T and reads the occupancy: no provider other than the data provider may hold more of
+the space than at the occupancy stage. That check does not wait for a requirement to be found: an agent can add one
+and remove it before the run ends, leaving the reset none to see while its replication is still landing, so it runs
+unless the caller knows that no run since the last verified reset had the right to manage QoS, and covers the files
+the eviction plan evicts as well (`resetheld.py`), never a read of the whole space.
+
+**What the quiet stage proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T.** T is
+the instant the last block map was read. The block maps decide for the plan's files (a file's distribution shows its
+provider's in-memory location at once), read against what the eviction and the settle left, so a replica that landed
+between the eviction's verification and its map's reading is in the map. The occupancy, read at T + the lag + a margin,
+shows every placement that landed by T, whichever file it is on, plan or not, since a directory's physical size lags a
+placement by at most that lag; so growth in it is a landing before T, one on a file after its map was read included,
+and a zero there is never taken alone as nothing having landed, because it lags. **It does not prove that nothing lands
+after T.** A placement after T may or may not show in the occupancy read, so a replication still running at T can place
+its bytes later and the stage still passes; nothing read at the end of a wait can exclude it. The occupancy lags a
+placement:
 
 - a placement's size change is held until the file location's flush, `blocks_flush_delay` after its first change
   (10 s, `rel/files/app.config:511`; `fslogic_cache.erl:524-530,706-715`), and only then reported to the parent
@@ -68,12 +75,12 @@ lags a placement:
   file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`). An eviction flushes at once
   (`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level above the parent.
 
-The quiet wait is twice that lag for the deepest file it must cover (`quiet_wait_s`): the deepest regular file of the
-space, as the scan saw it, since a replication nothing names could reach any file, or the deepest affected file when the
-caller knows the run could set no requirement. So the occupancy read after it has had time to show a placement that
-landed when the wait began. Another study measured 9.5 s for a directory after a
-placement and 0.05 s after an eviction, which this fits. A space with directory statistics off answers no physical
-size at all, and the occupancy stage already fails on it.
+The quiet wait is that lag for the deepest file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest
+regular file of the space, as the scan saw it, since a replication nothing names could reach any file, or the deepest
+affected file when the caller knows the run could set no requirement. So the occupancy is read when every placement
+that landed by T shows in it. Another study measured 9.5 s for a directory after a placement and 0.05 s after an
+eviction, which this fits. A space with directory statistics off answers no physical size at all, and the occupancy
+stage already fails on it.
 """
 
 import re
@@ -100,7 +107,7 @@ SETTLE_BOUND_S = 60.0  # the longest they are read before the reset fails
 # src/modules/fslogic/dir_stats_collector.erl:168 (the module docstring traces the path).
 BLOCKS_FLUSH_DELAY_S = 10.0
 DIR_STATS_FLUSH_S = 5.0
-QUIET_WAIT_FACTOR = 2.0  # the quiet wait is this many times the occupancy's longest lag for the deepest file covered
+QUIET_MARGIN_S = 5.0  # seconds added to the lag: one collector flush, for what the bound does not count (an assumption)
 
 
 def occupancy_lag_s(depth: int) -> float:
@@ -109,8 +116,9 @@ def occupancy_lag_s(depth: int) -> float:
 
 
 def quiet_wait_s(depth: int) -> float:
-    """The quiet re-check's wait for affected files at most `depth` path parts below the root."""
-    return QUIET_WAIT_FACTOR * occupancy_lag_s(depth)
+    """The quiet stage's wait from T to the occupancy read, for files at most `depth` path parts below the root: the
+    lag, by which every placement that landed by T shows, and `QUIET_MARGIN_S`."""
+    return occupancy_lag_s(depth) + QUIET_MARGIN_S
 
 
 @dataclass(frozen=True)
@@ -359,25 +367,32 @@ def remove(
     return facts, affected, found.deepest
 
 
-Maps = dict[tuple[str, str], tuple[Range, ...]]  # (file id, provider) -> the merged blocks that provider holds
+Pair = tuple[str, str]  # (file id, provider)
+Maps = dict[Pair, tuple[Range, ...]]  # (file id, provider) -> the merged blocks that provider holds
 
 
-def read_maps(p: Provisioner, files: Iterable[str], providers: Sequence[str]) -> Maps:
-    """Each provider's block map of each file, read on that provider, under the provisioner's policy."""
-    keys = [(file_id, provider) for file_id in sorted(files) for provider in providers]
+def read_pairs(p: Provisioner, pairs: Iterable[Pair]) -> Maps:
+    """The block map of each (file, provider) pair, read on that provider, under the provisioner's policy."""
+    keys = list(dict.fromkeys(pairs))
     maps = consistency.bounded_map(
         lambda key: tuple(merged(p.blocks(key[0], key[1], retry=p.retry))), keys, p.settings.concurrency
     )
     return dict(zip(keys, maps, strict=True))
 
 
-def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -> dict[str, Any]:
+def read_maps(p: Provisioner, files: Iterable[str], providers: Sequence[str]) -> Maps:
+    """Each provider's block map of each file."""
+    return read_pairs(p, [(file_id, provider) for file_id in sorted(files) for provider in providers])
+
+
+def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -> tuple[dict[str, Any], Maps]:
     """Read the affected files' block maps every `SETTLE_POLL_S` until they have stayed the same for
-    `SETTLE_STABLE_S`; raise ProvisionError when they are still changing after `SETTLE_BOUND_S` of waiting. The bound
-    counts the waits alone, never the reads: a requirement on a large directory makes one reading of every file's map
-    on every provider take long, and that is no change."""
+    `SETTLE_STABLE_S`; raise ProvisionError when they are still changing after `SETTLE_BOUND_S` of waiting. Return the
+    stage's facts and the maps it ended on, which the quiet stage holds the files to. The bound counts the waits alone,
+    never the reads: a requirement on a large directory makes one reading of every file's map on every provider take
+    long, and that is no change."""
     if not files:
-        return {"files": 0, "polls": 0}
+        return {"files": 0, "polls": 0}, {}
     last, since, polls, waited = read_maps(p, files, providers), p.clock(), 1, 0.0
     while p.clock() - since < SETTLE_STABLE_S:
         if waited >= SETTLE_BOUND_S:
@@ -391,56 +406,60 @@ def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -
         polls += 1
         if current != last:
             last, since = current, p.clock()
-    return {"files": len(files), "polls": polls}
+    return {"files": len(files), "polls": polls}, last
 
 
-def grown(before: Maps, after: Maps) -> list[tuple[str, str]]:
+def grown(before: Maps, after: Maps) -> list[Pair]:
     """The (file, provider) pairs whose block map holds bytes after that it did not hold before."""
     return [key for key, now in after.items() if held_bytes(merged([*before.get(key, ()), *now])) > _held(before, key)]
 
 
-def _held(maps: Maps, key: tuple[str, str]) -> int:
+def _held(maps: Maps, key: Pair) -> int:
     return held_bytes(list(maps.get(key, ())))
 
 
 def quiet(
     p: Provisioner,
-    files: Iterable[str],
-    providers: Sequence[str],
+    expected: Maps,
     occupancy: Callable[[], Mapping[str, int]],
     before: Mapping[str, int],
     *,
     depth: int,
 ) -> dict[str, Any]:
-    """Read the block maps of `files`, wait `quiet_wait_s(depth)`, and read the maps and the occupancy again; raise
-    ProvisionError when a provider holds more of a file than before the wait, or a provider other than the data
-    provider holds more of the space than at the occupancy stage (`before`). The occupancy is read again after the wait
-    whatever `files` holds, none included: a replication that has placed nothing yet, or one on a file that is not in
-    `files`, shows in no block map read here, and only the occupancy catches it."""
-    files = list(dict.fromkeys(files))
-    wait = quiet_wait_s(depth)
-    first = read_maps(p, files, providers)
-    p.sleep(wait)
-    second = read_maps(p, files, providers)
-    sizes = occupancy()
-    more = grown(first, second)
+    """Read the block map of each (file, provider) pair of `expected`, wait `quiet_wait_s(depth)` from T, the instant
+    the last was read, and read the occupancy. Raise ProvisionError when a map holds more than `expected` says it should
+    (nothing, for a pair the eviction emptied; what the settle saw, for a file a removed requirement applied to), or
+    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`). The
+    occupancy is read whatever `expected` holds, none included: a replication on a file nothing here names shows in no
+    block map read, and only the occupancy shows it.
+
+    What this proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The occupancy
+    read at T + the lag + a margin shows every placement that landed by T. A landing after T is not proved absent: it
+    may not show in the occupancy yet, and no map is read again."""
+    maps = read_pairs(p, expected)
+    more = grown(expected, maps)
     if more:
         where = ", ".join(sorted({p.client.provider_label(provider) for _, provider in more}))
         raise ProvisionError(
-            f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to grew "
-            f"after the eviction, on {where}"
+            f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to "
+            f"hold more than the eviction or the settle left them, on {where}: a replica had landed by the quiet stage"
         )
+    wait = quiet_wait_s(depth)
+    p.sleep(wait)
+    sizes = occupancy()
     over = [q for q, size in sizes.items() if q != p.settings.holder and size > before.get(q, 0)]
     if over:
         where = ", ".join(p.client.provider_label(q) for q in over)
         raise ProvisionError(f"{where} hold(s) more of the space after the quiet wait than at the occupancy stage")
     physical = {p.client.provider_label(q): n for q, n in sizes.items()}
-    return {"files": len(files), "waited_s": wait, "physical_bytes": physical}
+    files = {file_id for file_id, _ in expected}
+    return {"files": len(files), "block_maps": len(maps), "waited_s": wait, "physical_bytes": physical}
 
 
 __all__ = [
     "BLOCKS_FLUSH_DELAY_S",
     "DIR_STATS_FLUSH_S",
+    "QUIET_MARGIN_S",
     "SETTLE_BOUND_S",
     "SETTLE_STABLE_S",
     "Found",

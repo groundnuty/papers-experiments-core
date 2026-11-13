@@ -23,21 +23,28 @@ condition, so a caller that passes it combines it over every run since the last 
 
 **What it covers.** The block maps of the files a removed requirement applied to, and of **the eviction plan's own
 files**: the files the reset is about to evict from a provider other than the data provider, the ones a file path of
-the plan names and every file the eviction itself lists under a directory path (`SOURCE`). They are read after the
-eviction and again after the wait, since the eviction empties them and a replication that puts one back shows in its
-map. No block map of the rest of the space is read, so the cost is bounded by the plan, one read per planned file on
-each provider, twice, and not by the size of the space. **The occupancy is read again after the wait whenever the
-stage runs**, a plan with no file included, and set against the occupancy stage's: a replication that lands on a file
-that is not in the plan has no map read here, and only the occupancy shows it.
+the plan names and every file the eviction itself lists under a directory path (`SOURCE`). They are read once, at one
+instant T after the eviction: each (file, provider) pair the eviction emptied must still show nothing, and each file a
+removed requirement applied to must show no more than the settle saw. No block map of the rest of the space is read, so
+the cost is bounded by the plan, one read per evicted pair, and not by the size of the space. **The occupancy is read
+whenever the stage runs**, a plan with no file included, and set against the occupancy stage's: a replication that
+lands on a file that is not in the plan has no map read here, and only the occupancy shows it.
 
-**How long it waits.** Twice the occupancy's lag (`resetqos.quiet_wait_s`) for the deepest file a late replication
-could reach: the deepest regular file of the space, which the QoS scan already saw and costs no read of its own, since
-a replication nothing names could reach any file; or, for a caller that knows no run could have set a requirement
-(`qos_rights=False`), the deepest file a removed requirement applied to. The wait is 20 s for files directly under the
-root, 30 s one directory down, and 10 s more for each further level.
+**What it proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T.** The occupancy
+is read at T + the lag + a margin, when every placement that landed by T shows in it. A landing after T is not
+certified: it may not show in the occupancy yet, and no map is read again.
+
+**How long it waits.** From T, the occupancy's lag (`resetqos.occupancy_lag_s`) plus a margin
+(`resetqos.QUIET_MARGIN_S`, 5 s) for the deepest file a late replication could reach: the deepest regular file of the
+space, which the QoS scan already saw and costs no read of its own, since a replication nothing names could reach any
+file; or, for a caller that knows no run could have set a requirement (`qos_rights=False`), the deepest file a removed
+requirement applied to. The wait is 15 s for files directly under the root, 20 s one directory down, and 5 s more for
+each further level.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+
+from expcore_onedata.placement import Range
 
 REQUIREMENTS, RIGHTS, DEFAULT = "requirements", "rights", "default"  # the reasons the quiet check runs, in order
 SOURCE = "eviction plan"  # where the files whose block maps the quiet check reads come from, as the record says
@@ -53,6 +60,14 @@ def quiet_reason(removed: int, qos_rights: bool | None) -> str | None:
     return RIGHTS if qos_rights else None
 
 
+def expected_maps(
+    settled: Mapping[tuple[str, str], tuple[Range, ...]], evicted: Iterable[tuple[str, str]]
+) -> dict[tuple[str, str], tuple[Range, ...]]:
+    """The block maps the quiet stage holds the files to, by (file id, provider): what the settle ended on for a file
+    a removed requirement applied to, and nothing for each pair the eviction verified empty."""
+    return {**settled, **dict.fromkeys(evicted, ())}
+
+
 def quiet_depth(affected: Mapping[str, int], deepest: int, qos_rights: bool | None) -> int:
     """The depth the quiet wait is for: the deepest regular file of the space (`deepest`, from the scan), which a
     replication nothing names could reach, unless the caller said no run could have set a requirement, and then the
@@ -61,4 +76,4 @@ def quiet_depth(affected: Mapping[str, int], deepest: int, qos_rights: bool | No
     return max(depths, default=1)
 
 
-__all__ = ["DEFAULT", "REQUIREMENTS", "RIGHTS", "SOURCE", "quiet_depth", "quiet_reason"]
+__all__ = ["DEFAULT", "REQUIREMENTS", "RIGHTS", "SOURCE", "expected_maps", "quiet_depth", "quiet_reason"]

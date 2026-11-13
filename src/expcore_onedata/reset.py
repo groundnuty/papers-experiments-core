@@ -33,21 +33,26 @@ read and every check is made on each provider that supports the space, since eac
    distribution gives each provider's physical size, the bytes its storage holds of the space; never the logical
    figures, which lag. A provider other than the data provider that holds more than the caller allows (nothing by
    default) fails the reset, so a reset without an eviction plan still shows that only the owner holds data.
-   **quiet**: the block maps of the files a removed requirement applied to, and of the eviction plan's own files (the
-   files the reset evicts from a provider other than the data provider), are read, again after
-   `resetqos.quiet_wait_s` (twice the occupancy's longest lag for the deepest file a late replication could reach, from
-   the source), and the occupancy with them: a provider holding more of one of those files, or a provider other than
-   the data provider holding more of the space than at the occupancy stage, fails the reset (a replication that landed
-   after the eviction). The block maps decide; the occupancy, which grows late, is a second sign and never alone the
-   proof. The occupancy is read again whenever the stage runs, a plan with no file included, and it alone catches a
-   replication that lands late on a file that is not in the plan, since no block map of the rest of the space is read.
-   It runs unless the caller knows that no run since the last verified reset could have set a QoS requirement
-   (`run(qos_rights=...)`, below), whether or not a requirement is left at the reset, since an agent can add a
-   requirement and remove it before the run ends while its replication, which creates no transfer document, is still
-   landing. The record gives `ran`, `why` (`requirements`, `rights` or `default`, `resetheld.py`), `held_files` and
-   `held_source` (`"eviction plan"`) and the stage's seconds. It costs the wait, 30 s for files one directory below the
-   root and 10 s more per further level (the depth of the deepest file of the space, as the QoS scan saw it), and one
-   block-map read per file of the plan on each provider, twice: bounded by the plan, never by the size of the space.
+   **quiet**: the block maps of the eviction plan's own files (the files the reset evicts from a provider other than
+   the data provider, each on the providers it evicted it from) and of the files a removed requirement applied to are
+   read at one instant T, and none may hold more than the eviction (nothing, where it verified them empty) or the
+   settle (what it saw) left. The stage then waits `resetqos.quiet_wait_s` from T, the occupancy's longest lag for the
+   deepest file a late replication could reach, from the source, plus a margin, and reads the occupancy, which no
+   provider other than the data provider may have grown over the occupancy stage's. **What it proves, exactly: no
+   replica of the plan's files, and no occupancy growth, had landed by T.** The occupancy read at T + the lag + the
+   margin shows every placement that landed by T, whichever file it is on, so it alone catches a replication that lands
+   before T on a file that is not in the plan, since no block map of the rest of the space is read. **It does not prove
+   that nothing lands after T:** a replication still running at T can place its bytes later, may not show in the
+   occupancy read, and the stage then passes. The block maps decide for the plan's files; a zero occupancy is never
+   taken alone as nothing having landed, since it lags. The stage runs unless the caller knows that no run since the
+   last verified reset could have set a QoS requirement (`run(qos_rights=...)`, below), whether or not a requirement is
+   left at the reset, since an agent can add a requirement and remove it before the run ends while its replication,
+   which creates no transfer document, is still landing. The record gives `ran`, `why` (`requirements`, `rights` or
+   `default`, `resetheld.py`), `held_files` and `held_source` (`"eviction plan"`), `files`, `block_maps` and the stage's
+   seconds. It costs the wait, 20 s for files one directory below the root and 5 s more per further level (the depth
+   of the deepest file of the space, as the QoS scan saw it), and one block-map read per evicted (file, provider) pair
+   of the plan and per (file, provider) of a removed requirement's files, once: bounded by the plan, never by the size
+   of the space.
 5. **history**: ended transfers cannot be removed. The 25.0 REST description offers, for a transfer, only `GET` and
    `DELETE /transfers/{tid}`, a cancel that answers 400 for a job that has ended, and `POST .../rerun`; the space's
    listing (`GET /spaces/{sid}/transfers`) only reads. So the next agent sees every ended transfer, the reset's own
@@ -200,13 +205,14 @@ class SpaceReset:
             raise ValueError("qos_rights is True, False, or None for a caller that does not say")
         history_since = float(self._now() if since is None else since)
         # what one stage hands a later one: the files a removed requirement applied to, why the quiet check runs (None:
-        # it is skipped), the depth of the deepest file of the space, the files the eviction plan covers (collected as
-        # the eviction lists them), the occupancy
+        # it is skipped), the depth of the deepest file of the space, the (file, provider) pairs the eviction emptied
+        # (collected as it lists them), the maps the settle ended on, the occupancy
         run: dict[str, Any] = {
             "affected": {},
             "why": resetheld.quiet_reason(0, qos_rights),
             "deepest": 0,
-            "planned": set(),
+            "evicted": set(),
+            "settled": {},
             "occupancy": {},
             "qos_rights": qos_rights,
         }
@@ -267,26 +273,28 @@ class SpaceReset:
         return facts
 
     def _qos_settle(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Wait for the affected files' block maps to stay the same, within the bound."""
-        return resetqos.settle(self._p, run["affected"], self._providers)
+        """Wait for the affected files' block maps to stay the same, within the bound; keep what they ended on."""
+        facts, run["settled"] = resetqos.settle(self._p, run["affected"], self._providers)
+        return facts
 
     def _quiet(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Show that nothing reappeared after the eviction, by the block maps of the files a removed requirement
-        applied to and of the eviction plan's own files, read again after a wait, and that the occupancy did not grow,
-        which it is read again for whatever those files are. Skipped, and recorded so, for a caller that knows no run
-        could have set a requirement, when none was removed."""
-        why, planned = run["why"], run["planned"]
+        """Read, at one instant, the block maps of the eviction plan's files and of the files a removed requirement
+        applied to, against what the eviction and the settle left; wait; read the occupancy and set it against the
+        occupancy stage's. It proves that no replica of the plan's files, and no occupancy growth, had landed by that
+        instant, and not that nothing lands after it. Skipped, and recorded so, for a caller that knows no run could
+        have set a requirement, when none was removed."""
+        why, evicted = run["why"], run["evicted"]
         if why is None:
             return {"ran": False, "why": None, "qos_rights": run["qos_rights"], "files": 0, "waited_s": 0.0}
         sizes = partial(physical_sizes, self._p, self._providers, retry=self._p.retry)  # read after the wait
         depth = resetheld.quiet_depth(run["affected"], run["deepest"], run["qos_rights"])
-        files = [*planned, *run["affected"]]
-        facts = resetqos.quiet(self._p, files, self._providers, sizes, run["occupancy"], depth=depth)
+        expected = resetheld.expected_maps(run["settled"], evicted)
+        facts = resetqos.quiet(self._p, expected, sizes, run["occupancy"], depth=depth)
         return {
             "ran": True,
             "why": why,
             "qos_rights": run["qos_rights"],
-            "held_files": len(planned),
+            "held_files": len({file_id for file_id, _ in evicted}),
             "held_source": resetheld.SOURCE,
             **facts,
         }
@@ -393,23 +401,30 @@ class SpaceReset:
     def _evict(self, plan: Mapping[str, list[str]], run: dict[str, Any]) -> dict[str, Any]:
         """Evict each provider's paths: a directory in one transfer, the files together, each verified on the block
         maps only once no transfer runs on any provider; then require that no transfer runs again. The files it
-        evicts, the ones the plan names and those it lists under a directory, are kept for the quiet check
-        (`run["planned"]`), which reads their block maps again after its wait and never lists the tree again."""
+        evicts, the ones the plan names and those it lists under a directory, each with the provider it evicted it
+        from, are kept for the quiet check (`run["evicted"]`), which holds their block maps there to the empty map the
+        eviction verified, and never lists the tree again."""
         try:
             resolved = self._p.resolve_many(path for paths in plan.values() for path in paths)
         except KeyError:
             raise ProvisionError(NOT_IN_SPACE) from None
         out: dict[str, Any] = {}
-        planned: set[str] = run["planned"]  # mutated on purpose: what this stage hands the quiet stage
+        evicted: set[tuple[str, str]] = run["evicted"]  # mutated on purpose: what this stage hands the quiet stage
         for provider, paths in plan.items():
             entries = [resolved[path] for path in paths]
             results = [
-                evict_tree(self._p, entry, provider, quiet=self._require_quiet, listed=planned.update)
+                evict_tree(
+                    self._p,
+                    entry,
+                    provider,
+                    quiet=self._require_quiet,
+                    listed=lambda ids, q=provider: evicted.update((file_id, q) for file_id in ids),
+                )
                 for entry in entries
                 if entry.kind == "DIR"
             ]
             files = [entry.file_id for entry in entries if entry.kind != "DIR"]
-            planned.update(files)
+            evicted.update((file_id, provider) for file_id in files)
             if files:
                 results.append(evict_ids(self._p, files, provider, quiet=self._require_quiet))
             out[self._label(provider)] = {

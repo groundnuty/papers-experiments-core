@@ -642,8 +642,8 @@ def test_a_requirement_added_through_one_provider_is_found_by_the_listing_throug
 def test_the_space_roots_occupancy_follows_a_placement_within_the_sources_bound(scratch):
     """O33: a scratch file one directory below the root is replicated to the receiver, and the space root's physical
     size there is read every quarter second until it has grown by the file's bytes. The seconds are printed, and must
-    be within the source's bound for that depth (`resetqos.occupancy_lag_s(2)`, half the quiet wait), plus a second
-    for the reads themselves."""
+    be within the source's bound for that depth (`resetqos.occupancy_lag_s(2)`, the quiet wait less its margin), plus a
+    second for the reads themselves."""
     from expcore_onedata import resetqos
     from expcore_onedata.occupancy import physical_sizes
 

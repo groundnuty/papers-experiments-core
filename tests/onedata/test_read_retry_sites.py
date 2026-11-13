@@ -47,14 +47,14 @@ PLUMBING = {
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
     ("reset.py", "SpaceReset._occupancy", "physical_sizes"): ["self._p.retry"],
     ("reset.py", "SpaceReset._quiet", "physical_sizes"): ["self._p.retry"],
-    # the reset's QoS stages (O33): the scans, each requirement's record, and the settle's and the quiet re-check's
+    # the reset's QoS stages (O33): the scans, each requirement's record, and the settle's and the quiet stage's
     # block maps, whose failure fails the stage (a read that fails is no poll that did not match)
     ("resetqos.py", "_summary", "client.get"): ["p.retry"],
     ("resetqos.py", "tree", "consistency.space_root"): ["p.retry"],
     ("resetqos.py", "listed", "consistency.space_root"): ["p.retry"],
     ("resetqos.py", "_listing_page", "client.get"): ["p.retry"],
     ("resetqos.py", "_requirement_entry", "client.get"): ["p.retry"],
-    ("resetqos.py", "read_maps", "provisioner.blocks"): ["p.retry"],
+    ("resetqos.py", "read_pairs", "provisioner.blocks"): ["p.retry"],
     ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["provisioner.retry"],
     # the placement's block-map reads outside a poll: a stall there ends the placement
     ("ranges.py", "_held", "provisioner.blocks"): ["provisioner.retry"],
