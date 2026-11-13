@@ -338,7 +338,7 @@ def test_o29_a_poll_of_the_resets_eviction_stage_that_times_out_does_not_fail_th
     again, the reset passes, and its record counts the retry."""
     on_beta(seeded)
     flaky.hang(RECORD)
-    record = SpaceReset(provisioner).run(evict={"beta": [PATH]})
+    record = SpaceReset(provisioner, now=ticker.clock).run(evict={"beta": [PATH]})
     assert record["ok"] is True
     assert (record["reads_retried"], len(flaky.timed_out)) == (1, 1)
 
@@ -462,14 +462,14 @@ def test_o29_a_reset_read_that_times_out_is_asked_again_and_its_record_counts_it
     """O29: a transfer listing hangs once during the reset; it is asked again, the reset passes, and its record says
     `reads_retried` 1, the provisioner's own count over the reset."""
     flaky.hang(TRANSFERS)
-    record = SpaceReset(provisioner).run()
+    record = SpaceReset(provisioner, now=ticker.clock).run()
     assert record["ok"] is True
     assert (record["reads_retried"], provisioner.reads_retried, len(flaky.timed_out)) == (1, 1, 1)
 
 
-def test_o29_a_reset_that_retried_nothing_says_zero(provisioner, seeded, flaky):
+def test_o29_a_reset_that_retried_nothing_says_zero(provisioner, seeded, flaky, ticker):
     """O29: the key is always in the record, so that a reader sees a count of zero, not an absent field."""
-    assert SpaceReset(provisioner).run()["reads_retried"] == 0
+    assert SpaceReset(provisioner, now=ticker.clock).run()["reads_retried"] == 0
 
 
 def test_o29_a_failed_reset_still_says_how_many_reads_it_retried(provisioner, seeded, flaky, ticker):
@@ -477,7 +477,7 @@ def test_o29_a_failed_reset_still_says_how_many_reads_it_retried(provisioner, se
     the two retries it made, since a failed reset's evidence is the one that is read."""
     flaky.hang(TRANSFERS, times=None)
     with pytest.raises(ResetFailed) as caught:
-        SpaceReset(provisioner).run()
+        SpaceReset(provisioner, now=ticker.clock).run()
     assert caught.value.stage == "transfers"
     assert caught.value.record["reads_retried"] == 2
     assert len(flaky.timed_out) == 3
@@ -486,6 +486,6 @@ def test_o29_a_failed_reset_still_says_how_many_reads_it_retried(provisioner, se
 def test_o29_the_count_of_a_second_reset_is_its_own(provisioner, seeded, flaky, ticker):
     """O29: the reset reports the retries made during it, not the provisioner's total since it was built."""
     flaky.hang(TRANSFERS)
-    first = SpaceReset(provisioner).run()
-    second = SpaceReset(provisioner).run()
+    first = SpaceReset(provisioner, now=ticker.clock).run()
+    second = SpaceReset(provisioner, now=ticker.clock).run()
     assert (first["reads_retried"], second["reads_retried"], provisioner.reads_retried) == (1, 0, 1)
