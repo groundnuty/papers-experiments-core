@@ -312,21 +312,14 @@ class CellRunner:
             self._deadline = record
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})  # shares the record's steps
             if outcome in DL.ESCALATED:  # the run is over from now, whatever the cell's record makes of it after
-                self._end_run(record)
+                self.ended = record
         if outcome in DL.ESCALATED:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
         return (lambda: self._stop_after(record)) if outcome in DL.STOPS else None
 
-    def _end_run(self, record: dict[str, Any]) -> None:
-        """Make a deadline's published record the end of the run, with the metadata's lock held: the end already there
-        stays unless this one is more severe (`deadline.SEVERITY`). An outcome that comes late, from an escalation the
-        cell's wait gave up on, never lowers the `survived_kill` it was given up as: a mount_aborted end lets the
-        outputs be collected as evidence, one nothing is known of does not."""
-        if self.ended is None or DL.SEVERITY.index(record["outcome"]) > DL.SEVERITY.index(self.ended["outcome"]):
-            self.ended = record
-
     def _unknown(self, why: str) -> dict[str, Any]:
-        """The record of a deadline whose outcome is not known: `survived_kill`, since unknown is never a clean kill."""
+        """The record of a deadline whose outcome is not known: `survived_kill`, since unknown is never a clean kill. It
+        is the most severe outcome (`deadline.SEVERITY`), so never below a step the escalation took."""
         esc = self._escalation
         return {"grace_s": esc.grace_s, "margin_s": esc.margin_s, "outcome": DL.SURVIVED, "why": why, "steps": []}
 

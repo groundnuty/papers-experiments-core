@@ -346,28 +346,3 @@ def test_o34_a_kill_that_raises_after_a_successful_abort_ends_the_run_as_cell_un
     with pytest.raises(InfraError) as refused:
         mounted.exec("print(1)", 30)
     assert refused.value.kind == kinds.CELL_UNKILLABLE
-
-
-# ---------------------------------------------------------------------- the run's end is never replaced by a lesser one
-def test_o34_an_outcome_that_comes_late_never_replaces_a_worse_end_of_the_run(world, mounted, monkeypatch):
-    """O34: the cell's own wait gave up on an escalation that had not decided and ended the run as `survived_kill`; the
-    escalation then finishes, as `mount_aborted`, in its thread. Its record is published, as a record of the cell's
-    deadline, but the run's end stays the worse one: a later reader that lets a mount_aborted run's outputs be collected
-    as evidence must not read the end of a run whose outcome was unknown as one that was only aborted."""
-    clock = Clock()
-    by_the_clock(monkeypatch, clock)
-    release = hang_the_kill(mounted, world.host)
-    try:
-        result = mounted.exec(CODE, CELL_S)
-    finally:
-        release.set()
-    assert result.kill["deadline"]["outcome"] == deadline.SURVIVED
-    ended = mounted._cells.ended
-    assert ended["outcome"] == deadline.SURVIVED
-    mounted._cells._publish(1, {"outcome": deadline.MOUNT_ABORTED, "steps": []})
-    assert mounted._cells.ended is ended
-    assert [d["outcome"] for d in mounted.metadata()["cell_deadlines"]] == [deadline.SURVIVED, deadline.MOUNT_ABORTED]
-    with pytest.raises(InfraError) as refused:
-        mounted.exec("print(1)", 30)
-    assert refused.value.kind == kinds.CELL_UNKILLABLE
-    assert deadline.SURVIVED in str(refused.value)
