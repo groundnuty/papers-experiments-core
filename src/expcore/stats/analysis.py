@@ -100,6 +100,13 @@ class ContrastResult:
     )
     conclusion: str  # one of CONCLUSIONS
     minimum_detectable_effect: float | None  # None without power settings, NaN when it cannot be reached
+    # An equivalence family's member (S15): `equivalent` is Holm's decision over the family's TOST p-values, not the
+    # 1 - 2 alpha interval's; the interval at 1 - 2 x the level Holm compared it with is beside it. None outside one.
+    in_equivalence_family: bool = False
+    tost_p: float | None = None  # the larger of the two one-sided p-values; NaN for an untestable member
+    tost_p_holm: float | None = None  # Holm-adjusted over the equivalence family, for reports; NaN when untestable
+    equivalence_level: float | None = None  # 1 - 2 x the member's Holm level
+    equivalence_interval_adjusted: tuple[float, float] | None = None  # the interval at equivalence_level
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -131,6 +138,7 @@ class AnalysisResult:
     alpha: float
     manifest: Mapping[str, str]
     exploratory_only: bool = False
+    equivalence_holm: tuple[HolmDecision, ...] = ()  # Holm over the equivalence family's TOST p-values (S15)
 
     def contrast(self, name: str) -> ContrastResult:
         """Return the result of the contrast with this name."""
@@ -165,6 +173,29 @@ def _equivalence(
     result = estimators.get(spec.estimator)(differences, settings)
     interval = (result.ci_low, result.ci_high)
     return interval, bool(-margin <= result.ci_low and result.ci_high <= margin)
+
+
+def _tost_p(spec: ContrastSpec, prereg: Preregistration, differences: PairedDifferences, untestable: bool) -> float:
+    """An equivalence family member's TOST p-value (S15), from its estimator's own resamples; NaN with no pair."""
+    tost = estimators.tost_function(spec.estimator)
+    if tost is None or spec.equivalence_margin is None:  # the loader refuses both for a member
+        raise ValueError(
+            f"contrast {spec.name!r}: a member of the equivalence family needs a margin and a TOST p-value"
+        )
+    return (
+        math.nan if untestable else float(tost(differences, prereg.estimator_settings(spec), spec.equivalence_margin))
+    )
+
+
+def _adjusted_interval(
+    spec: ContrastSpec, prereg: Preregistration, differences: PairedDifferences, level: float, untestable: bool
+) -> tuple[float, float]:
+    """The member's interval at 1 - 2 x its Holm level, from the same resamples (S15); NaN with no pair."""
+    if untestable:
+        return math.nan, math.nan
+    settings = dataclasses.replace(prereg.estimator_settings(spec), level=1 - 2 * level)
+    result = estimators.get(spec.estimator)(differences, settings)
+    return result.ci_low, result.ci_high
 
 
 def _minimum_detectable_effect(
@@ -253,7 +284,21 @@ def run_contrast(
     analysed attempt, which say why a pair is missing. A member of the family that loses a pair to a treatment
     attempt scored None is refused (`TreatmentOutcomesRefused`), unless it declares `treatment_outcomes = "excluded"`
     or the loss is within a "scored" contrast's preregistered `max_unscored_treatment`.
+
+    A member of the equivalence family gets its TOST p-value (S15), and, called alone, `equivalent` is that p-value
+    at alpha, with nothing adjusting for the family; `analyse` replaces it with Holm's decision over the family.
     """
+    return _run_contrast(rows, spec, prereg, significant, absent)[0]
+
+
+def _run_contrast(
+    rows: Iterable[Row],
+    spec: ContrastSpec,
+    prereg: Preregistration,
+    significant: bool | None = None,
+    absent: Iterable[AbsentRun] = (),
+) -> tuple[ContrastResult, Pairing]:
+    """`run_contrast`, with the pairing it estimated from, which an equivalence family's adjusted interval reads."""
     pairing = pair_rows(rows, spec, absent)
     _refuse_lost_treatment_pairs(spec, prereg, pairing)
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
@@ -268,8 +313,12 @@ def run_contrast(
         interval, equivalent = (None if spec.equivalence_margin is None else (math.nan, math.nan)), False
     else:
         interval, equivalent = _equivalence(spec, prereg, pairing.differences)
+    member = spec.name in prereg.equivalence_family
+    tost = _tost_p(spec, prereg, pairing.differences, untestable) if member else None
+    if member:  # the family decides, and alone its raw TOST p-value at alpha does (S15)
+        equivalent = bool(rejects(tost, prereg.alpha))  # False for a NaN p-value
     mde = None if untestable else _minimum_detectable_effect(spec, prereg, pairing.differences, in_family)
-    return ContrastResult(
+    result = ContrastResult(
         name=spec.name,
         outcome=spec.outcome,
         estimator=spec.estimator,
@@ -299,16 +348,56 @@ def run_contrast(
         equivalent=equivalent,
         conclusion=conclude(significant, equivalent, untestable),
         minimum_detectable_effect=mde,
+        in_equivalence_family=member,
+        tost_p=tost,
     )
+    return result, pairing
+
+
+def _equivalence_family(
+    results: tuple[ContrastResult, ...], pairings: Mapping[str, Pairing], prereg: Preregistration
+) -> tuple[tuple[ContrastResult, ...], tuple[HolmDecision, ...]]:
+    """Holm over the equivalence family's TOST p-values (S15): each member is equivalent only when Holm rejects its
+    two one-sided nulls, and carries the interval at 1 - 2 x the level Holm compared it with. An untestable member's
+    NaN counts as p = 1, so the family keeps its size and it is never equivalent (S02)."""
+    if not prereg.equivalence_family:
+        return results, ()
+    by_name = {result.name: result for result in results}
+    names = prereg.equivalence_family
+    p_values = [by_name[name].tost_p for name in names]
+    outcome = kernel.holm(p_values, prereg.alpha)
+    decisions = tuple(
+        HolmDecision(name, p, adjusted, level, reject)
+        for name, p, adjusted, level, reject in zip(
+            names, p_values, outcome.adjusted, outcome.levels, outcome.reject, strict=True
+        )
+    )
+    decided = {}
+    for d in decisions:
+        r, spec = by_name[d.name], prereg.contrasts[d.name]
+        untestable = r.n_pairs == 0
+        decided[d.name] = dataclasses.replace(
+            r,
+            equivalent=d.reject,
+            tost_p_holm=d.p_holm,
+            equivalence_level=1 - 2 * d.level,
+            equivalence_interval_adjusted=_adjusted_interval(
+                spec, prereg, pairings[d.name].differences, d.level, untestable
+            ),
+            conclusion=conclude(r.significant, d.reject, untestable=untestable),
+        )
+    return tuple(decided.get(r.name, r) for r in results), decisions
 
 
 def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[AbsentRun] = ()) -> AnalysisResult:
-    """Run every declared contrast, then Holm over the declared family at the preregistered alpha.
+    """Run every declared contrast, then Holm over the declared family at the preregistered alpha, and Holm over the
+    equivalence family's TOST p-values when one is declared (S15).
 
     `absent` are the planned runs with no analysed attempt (exhausted, unfinished, left out), from the export.
     """
     rows, absent = list(rows), list(absent)
-    results = tuple(run_contrast(rows, spec, prereg, absent=absent) for spec in prereg.contrasts.values())
+    runs = {spec.name: _run_contrast(rows, spec, prereg, absent=absent) for spec in prereg.contrasts.values()}
+    results = tuple(result for result, _ in runs.values())
     by_name = {result.name: result for result in results}
     p_values = [by_name[name].p_value for name in prereg.holm_family]
     outcome = kernel.holm(p_values, prereg.alpha)
@@ -329,7 +418,9 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
         else r
         for r in results
     )
-    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest(), prereg.exploratory_only)
+    pairings = {name: pairing for name, (_, pairing) in runs.items()}
+    decided, equivalence = _equivalence_family(decided, pairings, prereg)
+    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest(), prereg.exploratory_only, equivalence)
 
 
 @dataclasses.dataclass(frozen=True)

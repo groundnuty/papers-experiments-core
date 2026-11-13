@@ -1032,3 +1032,131 @@ def test_s11_untestable_overrides_whatever_the_test_and_the_margin_say():
         for equivalent in (True, False):
             assert conclude(significant=significant, equivalent=equivalent, untestable=True) == "untestable"
     assert conclude(significant=False, equivalent=False) == "not_detected"
+
+
+# --- an equivalence family: Holm over the two one-sided tests (S15) ---------------------------------------------------
+
+EQUIVALENCE_TEXT = """\
+alpha = 0.05
+holm_family = ["a-vs-b", "x-vs-y"]
+equivalence_family = ["a-vs-b", "x-vs-y"]
+
+[bootstrap]
+replicates = 400
+seed = 17
+
+[contrasts.a-vs-b]
+conditions = ["cond-a", "cond-b"]
+outcome = "score"
+estimator = "ESTIMATOR"
+cluster = "group"
+equivalence_margin = 0.2
+
+[contrasts.x-vs-y]
+conditions = ["cond-x", "cond-y"]
+outcome = "score"
+estimator = "ESTIMATOR"
+cluster = "group"
+equivalence_margin = 0.2
+"""
+
+
+def equivalence_prereg(estimator="wilcoxon_cluster_bootstrap", family='["a-vs-b", "x-vs-y"]'):
+    """Two confirmatory contrasts with a margin of 0.2, in one equivalence family unless told otherwise."""
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", estimator)
+    text = text.replace('equivalence_family = ["a-vs-b", "x-vs-y"]', f"equivalence_family = {family}")
+    return parse(tomllib.loads(text), "inline", "e" * 64, ARMS)
+
+
+def near_zero_rows(arms=(("cond-a", "cond-b"), ("cond-x", "cond-y")), spread=0.01):
+    """Eight clusters per contrast whose differences lie within plus or minus `spread` of 0."""
+    rows = []
+    for a, b in arms:
+        for i in range(8):
+            difference = spread * (1 if i % 2 else -1) * (i + 1) / 8
+            rows.append(make_row(f"t{i}", "model-a", 1, 0.5 + difference, condition=a, cluster=f"c{i}"))
+            rows.append(make_row(f"t{i}", "model-a", 1, 0.5, condition=b, cluster=f"c{i}"))
+    return rows
+
+
+@pytest.fixture
+def planted_tost(monkeypatch):
+    """An estimator that is the Wilcoxon cluster bootstrap with a TOST p planted: the first cluster's difference."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    wilcoxon = estimators.get(estimators.WILCOXON)
+    estimators.register(
+        "planted_tost", check_params=lambda params: None, tost=lambda paired, settings, margin: paired.matrix[0, 0]
+    )(wilcoxon)
+
+
+def rows_with_tost(p_a, p_b):
+    """Rows whose first cluster's difference is the TOST p the planted estimator reports, the rest near 0."""
+    rows = near_zero_rows()
+    rows[0] = make_row("t0", "model-a", 1, 0.5 + p_a, condition="cond-a", cluster="c0")
+    rows[16] = make_row("t0", "model-a", 1, 0.5 + p_b, condition="cond-x", cluster="c0")
+    return rows
+
+
+def test_s15_holm_over_the_tost_p_values_decides_equivalent_not_each_interval_alone(planted_tost):
+    """S15: TOST p 0.04 for both is below alpha, and each 90% interval lies inside the margin, but Holm's first level
+    is 0.025, so neither is equivalent; each alone in a family of one would be."""
+    result = analyse(rows_with_tost(0.04, 0.04), equivalence_prereg("planted_tost"))
+    for name in ("a-vs-b", "x-vs-y"):
+        contrast = result.contrast(name)
+        assert contrast.in_equivalence_family
+        assert contrast.tost_p == pytest.approx(0.04)
+        lo, hi = contrast.equivalence_interval  # inside the margin at 1 - 2 alpha, which no longer decides
+        assert lo >= -0.2
+        assert hi <= 0.2
+        assert (contrast.equivalent, contrast.conclusion) == (False, "not_detected")
+    assert [d.name for d in result.equivalence_holm] == ["a-vs-b", "x-vs-y"]
+    assert [d.reject for d in result.equivalence_holm] == [False, False]
+    alone = analyse(rows_with_tost(0.04, 0.04), equivalence_prereg("planted_tost", family='["a-vs-b"]'))
+    assert (alone.contrast("a-vs-b").equivalent, alone.contrast("a-vs-b").conclusion) == (True, "equivalent")
+
+
+def test_s15_the_family_steps_down_and_reports_each_members_level_and_adjusted_interval(planted_tost):
+    """S15: 0.01 meets 0.025, then 0.04 meets 0.05; each interval is at 1 - 2 x its own level, 95% and 90%."""
+    result = analyse(rows_with_tost(0.01, 0.04), equivalence_prereg("planted_tost"))
+    first, second = result.contrast("a-vs-b"), result.contrast("x-vs-y")
+    assert (first.equivalent, second.equivalent) == (True, True)
+    assert first.equivalence_level == pytest.approx(1 - 2 * 0.025)
+    assert second.equivalence_level == pytest.approx(1 - 2 * 0.05)
+    assert first.tost_p_holm == pytest.approx(0.02)
+    assert second.tost_p_holm == pytest.approx(0.04)
+    assert second.equivalence_interval_adjusted == pytest.approx(second.equivalence_interval)
+    lo, hi = first.equivalence_interval_adjusted  # wider at 95% than at 90%
+    assert lo <= first.equivalence_interval[0]
+    assert first.equivalence_interval[1] <= hi
+
+
+def test_s15_a_member_with_the_real_estimator_is_equivalent_when_its_draws_lie_inside_the_margin():
+    """S15: eight clusters within 0.01 of 0 and a margin of 0.2: every draw is inside, TOST p = 1 / 401."""
+    result = analyse(near_zero_rows(), equivalence_prereg())
+    contrast = result.contrast("a-vs-b")
+    assert contrast.tost_p == pytest.approx(1 / 401)
+    assert (contrast.equivalent, contrast.conclusion) == (True, "equivalent")
+
+
+def test_s15_s02_an_untestable_member_keeps_its_place_in_the_equivalence_family():
+    """S15, S02: no pair, no TOST p; it counts as p = 1, so the other member is judged at alpha / 2, and it is never
+    equivalent."""
+    result = analyse(near_zero_rows(arms=(("cond-a", "cond-b"),)), equivalence_prereg())
+    dry = result.contrast("x-vs-y")
+    assert (dry.conclusion, dry.equivalent) == ("untestable", False)
+    assert math.isnan(dry.tost_p)
+    decisions = {d.name: d for d in result.equivalence_holm}
+    assert decisions["a-vs-b"].level == 0.05 / 2
+    assert decisions["x-vs-y"].reject is False
+
+
+def test_s15_a_margin_outside_the_equivalence_family_keeps_the_interval_rule():
+    """S15: a contrast with a margin that no family names is judged by its 1 - 2 alpha interval, as before."""
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", "wilcoxon_cluster_bootstrap").replace(
+        'equivalence_family = ["a-vs-b", "x-vs-y"]\n', ""
+    )
+    result = analyse(near_zero_rows(), parse(tomllib.loads(text), "inline", "e" * 64, ARMS))
+    contrast = result.contrast("a-vs-b")
+    assert (contrast.in_equivalence_family, contrast.tost_p, contrast.equivalence_level) == (False, None, None)
+    assert (contrast.equivalent, contrast.conclusion) == (True, "equivalent")
+    assert result.equivalence_holm == ()

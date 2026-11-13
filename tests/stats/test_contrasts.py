@@ -19,6 +19,7 @@ from expcore.stats.contrasts import (
     resample,
     snap,
     supports,
+    tost_p,
     wilcoxon_input,
     wilcoxon_p,
     wilcoxon_p_studies,
@@ -295,3 +296,44 @@ def test_s06_the_level_is_multiplied_first():
     """S06: alpha * weight / total in that order, the one expression for every level."""
     assert level(0.05, 3, 7) == 0.05 * 3 / 7
     assert level(0.05, 1, 3) == 0.05 / 3
+
+
+# --- two one-sided tests from the cluster bootstrap (S15) -------------------------------------------------------------
+
+
+def test_s15_the_tost_p_is_the_larger_of_the_two_one_sided_bootstrap_p_values():
+    """S15: of 9 draws, 1 is at or below -0.5 and 2 at or above 0.5: p_lower = 2 / 10, p_upper = 3 / 10, TOST 0.3."""
+    draws = np.array([-0.6, -0.4, -0.1, 0.0, 0.1, 0.2, 0.3, 0.5, 0.7])
+    assert tost_p(draws, 0.5) == pytest.approx(0.3)
+
+
+def test_s15_a_draw_on_the_margin_does_not_support_equivalence():
+    """S15: a draw exactly at -margin is inside H0 (theta <= -margin), so it counts against equivalence."""
+    assert tost_p(np.array([-0.5, 0.0, 0.0]), 0.5) == pytest.approx(2 / 4)
+
+
+def test_s15_s05_an_undefined_draw_never_supports_equivalence():
+    """S15, S05: a NaN replicate counts against both one-sided alternatives, so it can only raise the TOST p."""
+    assert tost_p(np.array([0.0, 0.0, math.nan]), 0.5) == pytest.approx(2 / 4)
+    assert tost_p(np.array([0.0, 0.0, 0.0]), 0.5) == pytest.approx(1 / 4)
+
+
+def test_s15_no_draw_gives_no_tost_p():
+    """S15: nothing resampled, nothing tested."""
+    assert math.isnan(tost_p(np.array([]), 0.5))
+
+
+@pytest.mark.parametrize("margin", [0.0, -1.0, math.inf, math.nan])
+def test_s15_a_margin_that_is_not_positive_and_finite_is_refused(margin):
+    """S15: an equivalence margin is a positive finite distance."""
+    with pytest.raises(ValueError, match="positive finite"):
+        tost_p(np.array([0.0]), margin)
+
+
+def test_s15_the_tost_p_agrees_with_the_percentile_interval_it_inverts():
+    """S15: on many draws, TOST p <= a exactly when the 1 - 2a percentile interval lies inside the margin, up to the
+    +1 of the p-value and the interpolation of the percentiles: away from the boundary they agree."""
+    draws = np.random.default_rng(3).normal(0.1, 0.2, 20000)
+    for margin, a in ((0.5, 0.05), (0.3, 0.05), (0.42, 0.01)):
+        low, high, _ = percentile_interval(draws, 1 - 2 * a)
+        assert (tost_p(draws, margin) <= a) == (-margin <= low and high <= margin)

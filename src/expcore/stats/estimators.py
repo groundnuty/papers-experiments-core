@@ -115,6 +115,8 @@ class ParamError(ValueError):
 
 
 PValuesFunction = Callable[[np.ndarray, Mapping[str, Any]], np.ndarray]  # (studies x clusters), params -> p per study
+# (paired, settings, margin) -> the two one-sided tests' p-value for equivalence within plus or minus the margin (S15)
+TostFunction = Callable[["PairedDifferences", EstimatorSettings, float], float]
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,7 @@ class _Entry:
     function: Estimator
     check_params: Callable[[Mapping[str, Any]], None]
     p_values: PValuesFunction | None = None
+    tost: TostFunction | None = None
 
 
 _REGISTRY: dict[str, _Entry] = {}
@@ -138,12 +141,15 @@ def register(
     *,
     check_params: Callable[[Mapping[str, Any]], None] | None = None,
     p_values: PValuesFunction | None = None,
+    tost: TostFunction | None = None,
 ):
     """Register the decorated function under `name`.
 
     `check_params` raises ParamError for a bad parameter table. `p_values`, when given, is the estimator's p-value
     for a whole (studies x clusters) array of cluster differences under a parameter table; row by row it must equal
-    the p-value the estimator itself reports for those differences.
+    the p-value the estimator itself reports for those differences. `tost`, when given, is its two one-sided tests'
+    p-value for a margin, from the same resamples as its interval (S15); an estimator without one cannot be a member
+    of an equivalence family.
     """
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"estimator name {name!r} must be lower-case letters, digits and underscores")
@@ -151,7 +157,7 @@ def register(
     def decorate(function: Estimator) -> Estimator:
         if name in _REGISTRY:
             raise ValueError(f"estimator {name!r} is already registered")
-        _REGISTRY[name] = _Entry(function, check_params or _no_params, p_values)
+        _REGISTRY[name] = _Entry(function, check_params or _no_params, p_values, tost)
         return function
 
     return decorate
@@ -167,6 +173,12 @@ def get(name: str) -> Estimator:
     if name not in _REGISTRY:
         raise UnknownEstimator(f"unknown estimator {name!r}; registered: {', '.join(_REGISTRY) or 'none'}")
     return _REGISTRY[name].function
+
+
+def tost_function(name: str) -> TostFunction | None:
+    """The two one-sided tests' p-value the estimator `name` registered (S15), or None; raise UnknownEstimator."""
+    get(name)
+    return _REGISTRY[name].tost
 
 
 def check_params(name: str, params: Mapping[str, Any]) -> None:
@@ -217,7 +229,16 @@ def _wilcoxon_p_values(studies: np.ndarray, params: Mapping[str, Any]) -> np.nda
     return kernel.wilcoxon_p_studies(studies, merged["snap_decimals"], merged["method"])
 
 
-@register(WILCOXON, check_params=_check_wilcoxon_params, p_values=_wilcoxon_p_values)
+def _wilcoxon_tost(paired: PairedDifferences, settings: EstimatorSettings, margin: float) -> float:
+    """The TOST p-value of the mean cluster difference, from the cluster bootstrap its interval reads (S15)."""
+    _check_wilcoxon_params({**_WILCOXON_DEFAULTS, **settings.params})
+    if not paired.clusters:
+        return math.nan
+    boot = kernel.cluster_bootstrap(paired.matrix, settings.replicates, np.random.default_rng(list(settings.seed)))
+    return kernel.tost_p(boot.overall, margin)
+
+
+@register(WILCOXON, check_params=_check_wilcoxon_params, p_values=_wilcoxon_p_values, tost=_wilcoxon_tost)
 def wilcoxon_cluster_bootstrap(paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult:
     """Wilcoxon signed-rank test on the cluster differences, with a cluster-bootstrap percentile interval.
 

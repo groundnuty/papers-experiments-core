@@ -148,6 +148,25 @@ def one_sided_bootstrap_p(draws, theta0: float = 0.0, tolerance: float = TIE_TOL
     return float((1 + values.size - supports(values, theta0, tolerance).sum()) / (values.size + 1))
 
 
+def tost_p(draws, margin: float, tolerance: float = TIE_TOLERANCE) -> float:
+    """The two one-sided tests' p-value for equivalence within plus or minus `margin` (S15): the larger of the
+    bootstrap p-values of theta > -margin and of theta < margin, each (1 + draws not supporting) / (B + 1).
+
+    It is the p-value the percentile interval inverts: TOST p <= a when the 1 - 2a interval lies inside the margin,
+    up to the +1 and the percentiles' interpolation. A draw on or within the tolerance of a margin, and an undefined
+    draw (NaN), supports neither alternative, so it can only raise p (S05). No draw gives NaN.
+    """
+    number = isinstance(margin, int | float) and not isinstance(margin, bool)
+    if not (number and math.isfinite(margin) and margin > 0):
+        raise ValueError(f"an equivalence margin must be a positive finite number, got {margin!r}")
+    values = np.asarray(draws, dtype=float)
+    if values.size == 0:
+        return math.nan
+    above_lower = one_sided_bootstrap_p(values, -margin, tolerance)
+    below_upper = one_sided_bootstrap_p(-values, -margin, tolerance)
+    return max(above_lower, below_upper)
+
+
 def _snap_differences(values, decimals: int) -> np.ndarray:
     """Float noise snapped away from differences of any shape: tiny values are exact zeros, the rest are rounded."""
     values = np.asarray(values, dtype=float)

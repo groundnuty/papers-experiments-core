@@ -5,6 +5,7 @@ import math
 import numpy as np
 import pytest
 
+from expcore.stats import contrasts as kernel
 from expcore.stats import estimators
 from expcore.stats.estimators import (
     WILCOXON,
@@ -221,6 +222,24 @@ def test_s06_the_registered_p_values_follow_the_method_parameter():
     study = np.array([[0.1, 0.2, 0.3, 0.4, 0.5]])
     assert estimators.p_values_function(WILCOXON, {"method": "exact"})(study) == pytest.approx([0.0625])
     assert estimators.p_values_function(WILCOXON, {"method": "approx"})(study) == pytest.approx([0.04311444678])
+
+
+def test_s15_the_wilcoxon_estimators_tost_p_comes_from_the_draws_of_its_own_interval():
+    """S15: the kernel's TOST p on the cluster bootstrap at the contrast's seed, the draws its interval reads."""
+    data = paired([[0.1], [-0.05], [0.02], [0.08], [-0.01], [0.04]])
+    tost = estimators.tost_function(WILCOXON)
+    boot = kernel.cluster_bootstrap(data.matrix, 300, np.random.default_rng([7, 11]))
+    assert tost(data, settings(), 0.2) == kernel.tost_p(boot.overall, 0.2)
+    assert tost(data, settings(), 0.2) == pytest.approx(1 / 301)  # every draw lies inside plus or minus 0.2
+    assert math.isnan(tost(PairedDifferences((), (), np.empty((0, 0))), settings(), 0.2))
+
+
+def test_s15_an_estimator_registers_no_tost_p_unless_it_gives_one(scratch_registry):
+    """S15: an estimator without one cannot be in an equivalence family; the loader says so."""
+    estimators.register("no_tost")(lambda paired, settings: None)
+    assert estimators.tost_function("no_tost") is None
+    with pytest.raises(UnknownEstimator, match="unknown estimator 'bayes'"):
+        estimators.tost_function("bayes")
 
 
 def test_an_estimator_without_a_p_values_function_has_none_and_a_bad_parameter_is_refused(scratch_registry):
