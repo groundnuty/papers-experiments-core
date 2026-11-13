@@ -162,8 +162,10 @@ class Condition:
 
     @property
     def manages_qos(self) -> bool:
-        """Whether the condition declares the right to manage QoS requirements: what a caller of `SpaceReset.run`
-        passes as `qos_rights` (O33)."""
+        """Whether this one condition declares the right to manage QoS requirements (O33). It is not what a caller of
+        `SpaceReset.run` passes as `qos_rights` on its own: a study's reset runs at the start of a run and clears what
+        earlier runs left, so `qos_rights` is whether any run since the last verified reset could have set a
+        requirement, and a caller combines this over every such run, never the next run's alone."""
         return declares_qos(self.rights)
 
 

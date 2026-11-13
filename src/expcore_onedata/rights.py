@@ -22,8 +22,9 @@ MANAGE_QOS = "space_manage_qos"
 
 
 def declares_qos(rights: Iterable[str]) -> bool:
-    """Tell whether a set of rights holds the right to manage QoS requirements (O33): the reset's quiet check runs for
-    every run whose condition declares it, whether or not a requirement is left to see when the run ends."""
+    """Tell whether a set of rights holds the right to manage QoS requirements (O33): a run that holds it can leave a
+    replication landing with no requirement to see, so the reset's quiet check must run for the runs since the last
+    verified reset when any of them held it (`SpaceReset.run(qos_rights=)`)."""
     return MANAGE_QOS in rights
 
 
