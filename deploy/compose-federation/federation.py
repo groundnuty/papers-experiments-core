@@ -77,6 +77,7 @@ from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
 SUPPORT_TIMEOUT_S = 600.0
+IMPORT_TIMEOUT_S = 1800.0  # in all, for every imported space's one scan to complete
 TRANSFER_TIMEOUT_S = 600.0
 GUI_CHECK_OFF = """[
     {oz_worker, [
@@ -201,11 +202,14 @@ def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     boot.wait_providers(PROVIDER_TIMEOUT_S)
     timer.mark("providers")
     boot.ensure_spaces()
+    boot.ensure_import_storages()
     boot.ensure_support(SUPPORT_TIMEOUT_S)
     for space in spec.spaces:
         if spec.members(space.name):
             boot.ensure_members(space.name)
     timer.mark("spaces")
+    boot.wait_import(IMPORT_TIMEOUT_S)
+    timer.mark("import")
 
 
 def up(layout: Layout) -> str:

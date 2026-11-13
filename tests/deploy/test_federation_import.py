@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from federation_support import MINIMAL, WITH_IMPORT, WITH_WRITABLE_IMPORT
+from federation_support import MINIMAL, WITH_IMPORT, WITH_WRITABLE_IMPORT, import_layout
 
 
 def write(tmp_path: Path, text: str) -> Path:
@@ -144,14 +144,6 @@ def test_a_layout_with_no_import_still_loads_with_every_space_unimported(fed, tm
 
 
 # -- where an import's directories are ---------------------------------------------------------------------------------
-
-
-def import_layout(fed, tmp_path: Path, text: str = WITH_WRITABLE_IMPORT):
-    """A layout over a root and a source directory of its own, both below a resolved temp directory."""
-    base = tmp_path.resolve()
-    (base / "data").mkdir()
-    spec = fed.spec.load_spec(write(base, text))
-    return fed.layout.Layout(base / "fed", spec=spec), base / "data"
 
 
 def test_an_imported_space_has_a_storage_named_after_it_mounted_under_the_import_directory(fed):

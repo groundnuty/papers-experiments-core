@@ -15,7 +15,7 @@ import json
 import re
 from typing import Any
 
-from fedlayout import IMAGES, IMPORT_MOUNT, NODE, ROOT_MARKER
+from fedlayout import IMAGES, IMPORT_MOUNT, NODE, REGULAR_STORAGE, ROOT_MARKER
 from fedspec import LOOPBACK, ZONE, Service, Space, Spec
 
 ROOT = "${EXPCORE_FED_ROOT:?set by federation.py}"  # no default: a file run by hand binds no root by accident
@@ -67,7 +67,7 @@ def provider_config(spec: Spec, service: Service) -> str:
     return (
         cluster(service.domain)
         + "  storages:\n"
-        + "    posix:\n"
+        + f"    {REGULAR_STORAGE}:\n"
         + '      type: "posix"\n'
         + '      mountPoint: "/volumes/storage"\n'
         + "oneprovider:\n"

@@ -82,3 +82,12 @@ baseline = false
 import = { readonly = false, source_env = "EXPCORE_FED_IMPORT_MOSS" }
 """
 )
+
+
+def import_layout(fed, tmp_path: Path, text: str = WITH_WRITABLE_IMPORT):
+    """A layout over a root and a source directory of its own, both below a resolved temp directory (the source's path
+    may hold no symbolic link, and a temp directory may be one); return the layout and the source."""
+    base = tmp_path.resolve()
+    (base / "data").mkdir()
+    (base / "federation.toml").write_text(text, encoding="utf-8")
+    return fed.layout.Layout(base / "fed", spec=fed.spec.load_spec(base / "federation.toml")), base / "data"

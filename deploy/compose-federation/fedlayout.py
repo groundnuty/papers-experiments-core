@@ -26,6 +26,7 @@ IMAGES = (  # pinned by the deployment: a layout cannot name another
     "docker.onedata.org/oneprovider:ID-765309c84f",
 )
 NODE = "node1"  # each service's one cluster node
+REGULAR_STORAGE = "posix"  # the name of every provider's batch-mode storage (fedcompose.provider_config): its own disk
 IMPORT_MOUNT = "/volumes/import"  # where an owner's service sees its imported spaces' directories, one below it each
 
 
