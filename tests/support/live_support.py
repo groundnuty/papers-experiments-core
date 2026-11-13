@@ -6,6 +6,8 @@ import pytest
 
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
+from expcore_onedata.day0.outage import prerequisite as outage_prerequisite
+from expcore_onedata.day0.outage_agent import mount_levels
 from expcore_onedata.day0.registry import Context
 from expcore_onedata.day0.report import Entry
 from expcore_onedata.tokencheck import PrivilegesMismatch
@@ -52,7 +54,12 @@ def prerequisite_missing(name: str, ctx: Context) -> str | None:
         if any(p not in ctx.provider_ids for p in (holder, receiver)):
             return "the round_trip check needs the id of the data provider and of the receiving provider"
         return None
-    raise ValueError("this helper knows the read_only and round_trip checks only")
+    if name == "provider_outage":
+        missing = outage_prerequisite(ctx)
+        if missing is None and not mount_levels(ctx):  # the issue asks for the mount's answers: a live run needs one
+            return "the provider_outage check's live run needs a [sandbox.data_paths] level that maps to the mount"
+        return missing
+    raise ValueError("this helper knows the read_only, round_trip and provider_outage checks only")
 
 
 def require_passed(entry: Entry) -> None:
@@ -71,7 +78,43 @@ def require_every_provider_refused(entry: Entry) -> None:
     assert all(row.get("cleaned") is not False for row in rows.values()), f"the {entry.name} check left a scratch entry"
 
 
+def per_space_facts(entry: Entry) -> list[Mapping]:
+    """A check's facts for each space it ran in: under `spaces` with several spaces (`per_space`), else its own."""
+    spaces = entry.facts.get("spaces")
+    if isinstance(spaces, Mapping):
+        assert spaces, f"the {entry.name} check reports no space it ran in"
+        return list(spaces.values())
+    return [entry.facts]
+
+
+def require_restored(entry: Entry) -> None:
+    """Fail unless the check shows the provider back in every space it ran in: the injector's restore cleared and
+    verified by a changed identity, and its REST answering again. A pass that does not say so is no pass."""
+    for facts in per_space_facts(entry):
+        restore = facts.get("restore")
+        assert isinstance(restore, Mapping), f"the {entry.name} check reports no restore"
+        assert restore.get("cleared") is True, f"the {entry.name} check did not bring the provider back"
+        assert restore.get("verified") is True, f"the {entry.name} check did not verify the restore"
+        assert restore.get("how") in ("restored", "found_restored"), (
+            f"the {entry.name} check found the provider never down"
+        )
+        assert restore.get("rest_answers_again") is True, (
+            f"the {entry.name} check did not see the provider answer again"
+        )
+
+
+def require_measured(entry: Entry) -> None:
+    """Fail unless the outage check measured, in every space, the mount (the platform must declare one) and the
+    agent's knowledge tools: the issue asks for both, and a pass without them would be the REST path's alone."""
+    for facts in per_space_facts(entry):
+        assert (facts.get("mount") or {}).get("measured") is True, f"the {entry.name} check did not read the mount"
+        knowledge = facts.get("knowledge") or {}
+        assert knowledge.get("measured") is True, f"the {entry.name} check did not call the knowledge tools"
+
+
 def require_cleaned(entry: Entry) -> None:
-    """Fail unless the check reports, explicitly, that what it created is gone: an absent result is not a true one."""
-    assert "cleanup_verified" in entry.facts, f"the {entry.name} check reports no cleanup result"
-    assert entry.facts["cleanup_verified"] is True, f"the {entry.name} check did not show its scratch entry gone"
+    """Fail unless the check reports, explicitly, in every space it ran in, that what it created is gone: an absent
+    result is not a true one."""
+    for facts in per_space_facts(entry):
+        assert "cleanup_verified" in facts, f"the {entry.name} check reports no cleanup result"
+        assert facts["cleanup_verified"] is True, f"the {entry.name} check did not show its scratch entry gone"
