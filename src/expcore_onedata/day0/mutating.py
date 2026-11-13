@@ -20,7 +20,7 @@ from typing import Any
 from expcore_onedata import consistency
 from expcore_onedata.client import NotSent, PlatformError, answered_absent
 from expcore_onedata.config import StudySpace
-from expcore_onedata.day0.registry import Context, Result, failed, passed, per_space, register, unknown
+from expcore_onedata.day0.registry import Context, Result, failed, holder_of, passed, per_space, register, unknown
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.rangemap import RangeRow
 from expcore_onedata.ranges import place_ranges
@@ -180,13 +180,6 @@ def _enforced_in(ctx: Context, entry: StudySpace, token: str) -> Result:
     return passed(f"the write was refused on all {len(rows)} supporting provider(s)", providers=rows)
 
 
-def _holder(ctx: Context, entry: StudySpace) -> str | None:
-    """A space's data provider, as its provisioner takes it: a `[[spaces]]` entry's own, else `[placement] holder`."""
-    if ctx.config.spaces_table:
-        return entry.holder
-    return ctx.placement.settings.holder if ctx.placement else None
-
-
 @register("round_trip", "Placement round trip on a scratch file", mutates=True)
 def round_trip(ctx: Context) -> Result:
     """Create a scratch file, place half of it on another provider by range reads, confirm it by the block map, read it
@@ -208,7 +201,7 @@ def round_trip(ctx: Context) -> Result:
 
 def _round_trip_in(ctx: Context, entry: StudySpace) -> Result:
     """The round trip in one declared space."""
-    holder = _holder(ctx, entry)
+    holder = holder_of(ctx, entry)
     receiver = next((p for p in entry.support.providers if p != holder), None)
     if receiver is None:
         return unknown("the support set has no provider besides the data provider to place bytes on")
@@ -242,7 +235,7 @@ def _round_trip_in(ctx: Context, entry: StudySpace) -> Result:
     except (ProvisionError, PlatformError, consistency.WaitTimeout) as error:
         failure = f"{type(error).__name__} after {steps[-1] if steps else 'nothing'}"
     finally:
-        cleanup = _clean_up(provisioner, path)
+        cleanup = clean_up(provisioner, path)
     facts["cleanup_verified"] = cleanup
     if failure is not None:
         return failed(f"the round trip failed ({failure}); scratch {'removed' if cleanup else 'NOT removed'}", **facts)
@@ -253,7 +246,7 @@ def _round_trip_in(ctx: Context, entry: StudySpace) -> Result:
     return passed("placed by range reads, confirmed by the block map, read back, evicted and removed", **facts)
 
 
-def _clean_up(provisioner: Provisioner, path: str) -> bool:
+def clean_up(provisioner: Provisioner, path: str) -> bool:
     """Tear down what the provisioner logged and verify that the scratch is gone and the log holds nothing."""
     try:
         report = provisioner.teardown()

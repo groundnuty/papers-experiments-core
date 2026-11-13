@@ -1,6 +1,8 @@
 """Day-0 checks as code: a registry, a dated report, unknown that is not a pass, and clean-up that is verified (O11)."""
 
 import json
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -16,6 +18,7 @@ from expcore_onedata.day0.runner import (
     EXIT_UNKNOWN,
     build_context,
     exit_code,
+    faults_allowed,
     mutation_allowed,
     run,
     run_checks,
@@ -23,7 +26,7 @@ from expcore_onedata.day0.runner import (
 from expcore_onedata.testing import BETA_ID, with_placement, write_platform
 from expcore_onedata.testing.fake_federation import ZONE
 
-NAMES = ("reachability", "health", "tokens", "content_type", "listing", "read_only", "round_trip")
+NAMES = ("reachability", "health", "tokens", "content_type", "listing", "read_only", "round_trip", "provider_outage")
 
 
 def edit(data):
@@ -66,9 +69,22 @@ def mutating_calls(fake):
     return [c for c in fake.provider_calls if c[1] in ("POST", "PUT", "DELETE")]
 
 
+@pytest.mark.parametrize("first", ["outage", "mutating", "registry", "runner"])
+def test_the_registry_order_is_the_same_whichever_module_of_the_package_is_imported_first(first):
+    """The report lists the checks in one order, whatever a test session or a study imports first: in a fresh
+    interpreter, importing the outage check's module (or another) before the runner gives the runner's order."""
+    code = (
+        f"import expcore_onedata.day0.{first}\n"
+        "from expcore_onedata.day0.runner import REGISTRY\n"
+        "print(','.join(REGISTRY))\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=True)
+    assert done.stdout.strip().split(",") == list(NAMES)
+
+
 def test_the_registry_holds_the_checks_the_brief_names_and_marks_those_that_change_state():
     assert set(NAMES) <= set(REGISTRY)
-    assert {name for name, check in REGISTRY.items() if check.mutates} == {"read_only", "round_trip"}
+    assert {name for name, check in REGISTRY.items() if check.mutates} == {"read_only", "round_trip", "provider_outage"}
     assert all(isinstance(check, Check) for check in REGISTRY.values())
 
 
@@ -196,6 +212,7 @@ def test_a_study_space_with_no_baseline_files_fails_no_check_and_passes_none_tha
         "listing": None,
         "read_only": True,
         "round_trip": True,
+        "provider_outage": None,  # it takes a provider down, which needs EXPCORE_LIVE_FAULTS and a sanctioned [faults]
     }
     assert [n for n in fake.nodes.values() if n.name.startswith("day0-")] == []
 
@@ -212,6 +229,14 @@ def test_the_consent_is_the_variable_set_to_exactly_one():
     assert mutation_allowed({"EXPCORE_LIVE_MUTATE": "1"})
     assert not mutation_allowed({"EXPCORE_LIVE_MUTATE": "true"})
     assert not mutation_allowed({})
+
+
+def test_o28_the_consent_to_take_a_provider_down_is_its_own_variable_set_to_exactly_one():
+    """O28: EXPCORE_LIVE_FAULTS is a second consent beside EXPCORE_LIVE_MUTATE; neither stands for the other."""
+    assert faults_allowed({"EXPCORE_LIVE_FAULTS": "1"})
+    assert not faults_allowed({"EXPCORE_LIVE_FAULTS": "true"})
+    assert not faults_allowed({"EXPCORE_LIVE_MUTATE": "1"})
+    assert not faults_allowed({})
 
 
 def test_read_only_enforcement_passes_when_every_write_is_refused(context, fake):
@@ -480,7 +505,7 @@ def test_run_writes_a_dated_report_in_json_and_markdown_with_unknown_apart(platf
     assert md_path.name == "day0-20270115T080000Z.md"
     report = json.loads(json_path.read_text())
     # content_type is unknown: no data path is REST, so it measured nothing, which is never a pass (O08)
-    assert report["counts"] == {"pass": 3, "fail": 0, "unknown": 4}
+    assert report["counts"] == {"pass": 3, "fail": 0, "unknown": 5}
     assert [c["name"] for c in report["checks"]] == list(NAMES)
     text = md_path.read_text()
     assert "## Blocked or unknown" in text
@@ -545,4 +570,5 @@ def test_list_names_the_checks_and_marks_those_that_change_state(capsys):
     assert cli.main(["--list"]) == 0
     out = capsys.readouterr().out
     assert "round_trip (changes state)" in out
+    assert "provider_outage (changes state)" in out
     assert "reachability:" in out
