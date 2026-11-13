@@ -17,8 +17,8 @@ from expcore.stats.power import (
     power_sim,
     power_table,
     signed_rank_p_values,
+    tost_t_p_values,
 )
-from expcore.stats.power import tost_p as power_tost_p
 
 SETTINGS = PowerSettings(seed=5, n_simulations=40, target_clusters=25, target_difference=0.2, sd_grid=(0.1, 0.3))
 
@@ -239,32 +239,45 @@ def test_the_minimum_detectable_effect_refuses_parameters_it_cannot_search(kwarg
 # --- the feasibility of an equivalence claim (S15) --------------------------------------------------------------------
 
 
-def feasibility(sd, n=20, margin=0.2, alpha=0.05, deltas=(0.0, 0.1), n_sim=200, replicates=200, seed=1):
+def feasibility(sd, n=20, margin=0.2, alpha=0.05, deltas=(0.0, 0.1), n_sim=400, seed=1, p_values=None):
     """The probability of concluding equivalent at each true difference, with small simulation settings."""
-    return equivalence_feasibility(sd, n, margin, alpha, n_sim, replicates, np.random.default_rng(seed), deltas)
+    return equivalence_feasibility(sd, n, margin, alpha, n_sim, np.random.default_rng(seed), deltas, p_values)
 
 
 def test_s15_a_tight_spread_reaches_equivalence_at_zero_and_a_wide_one_never_does():
-    """S15: SD 0.05 over 20 clusters puts the mean's draws well inside 0.2; SD 2 puts them far outside."""
+    """S15: SD 0.05 over 20 clusters puts the mean's t-interval well inside 0.2; SD 2 puts it far outside."""
     tight, wide = feasibility(0.05), feasibility(2.0)
     assert tight[0] == pytest.approx(1.0)
     assert tight[1] > 0.9  # half the margin is still inside with that spread
     assert wide == [0.0, 0.0]
 
 
+def test_s15_the_chance_at_zero_is_the_two_one_sided_t_tests_power():
+    """S15, a reference: with SD 0.3, 20 clusters and margin 0.2 at alpha 0.05, the TOST's power at a true 0 is
+    about 0.74 (the closed form 1 - 2 T(t_{0.95,19} - 0.2 / (0.3 / sqrt 20)) with T the t distribution, which the
+    noncentral form refines); the simulation lands near it."""
+    closed = 1 - 2 * stats.t.cdf(stats.t.ppf(0.95, 19) - 0.2 / (0.3 / math.sqrt(20)), 19)
+    [simulated] = feasibility(0.3, deltas=(0.0,), n_sim=4000, seed=6)
+    assert simulated == pytest.approx(closed, abs=0.05)
+
+
 def test_s15_at_the_margin_equivalence_is_concluded_at_most_about_alpha_of_the_time():
-    """S15: a true difference on the margin is the boundary of the null, so the rule's error rate is near alpha."""
-    [at_margin] = feasibility(0.3, n=30, deltas=(0.2,), n_sim=600, replicates=400, seed=4)
-    assert at_margin <= 0.05 + 3 * math.sqrt(0.05 * 0.95 / 600)
+    """S15: a true difference on the margin is the null's boundary; the t-tests hold their error rate there, for few
+    clusters as for many (the bootstrap rule did not, with one or two)."""
+    for n in (2, 3, 30):
+        [at_margin] = feasibility(0.3, n=n, deltas=(0.2,), n_sim=4000, seed=4)
+        assert at_margin <= 0.05 + 3 * math.sqrt(0.05 * 0.95 / 4000)
+    assert feasibility(0.01, n=1, deltas=(0.0,)) == [0.0]  # one cluster can never show equivalence
 
 
 def test_s15_the_simulation_judges_each_study_by_the_rule_the_analysis_uses():
-    """S15, S09: the simulation's own TOST p-value equals the kernel's on the same draws, though neither imports the
-    other."""
-    means = np.random.default_rng(9).normal(0.05, 0.1, 500)
+    """S15, S09: the power module's own t-tests equal the kernel's on the same studies, though neither imports the
+    other; and a study's estimator-registered test, when passed, is the one used."""
+    studies = np.random.default_rng(9).normal(0.05, 0.1, (300, 7))
     for margin in (0.1, 0.2, 0.3):
-        assert power_tost_p(means, margin) == kernel.tost_p(means, margin)
-    assert power_tost_p(np.array([-0.2, 0.0, 0.2]), 0.2) == kernel.tost_p(np.array([-0.2, 0.0, 0.2]), 0.2)
+        assert tost_t_p_values(studies, margin) == pytest.approx(kernel.tost_t_studies(studies, margin), rel=1e-9)
+    never = feasibility(0.01, p_values=lambda studies, margin: np.ones(studies.shape[0]))
+    assert never == [0.0, 0.0]
 
 
 def test_s15_the_feasibility_is_a_function_of_its_seed():
@@ -277,7 +290,7 @@ def test_s15_the_feasibility_is_a_function_of_its_seed():
     [
         ({"sd": 0.0}, "sd must be a positive number"),
         ({"sd": math.nan}, "sd must be a positive number"),
-        ({"n": 0}, "n, n_sim and replicates must be at least 1"),
+        ({"n": 0}, "n and n_sim must be at least 1"),
         ({"margin": 0.0}, "margin must be a positive finite number"),
         ({"alpha": 0.5}, "alpha must be strictly between 0 and 0.5"),
     ],

@@ -60,13 +60,15 @@ def equivalence_family_notes(alpha: float) -> list[str]:
     """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces."""
     return [
         "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two",
-        "one-sided cluster-bootstrap p-values, for an effect above minus the margin and for one below the margin, from",
-        "the same resamples as the contrast's interval. Holm TOST p: Holm-adjusted over the family, for reading; the",
-        "decision compares each raw TOST p with its step's level. A member is `equivalent` only when Holm rejects, so",
-        f"for these contrasts the conclusion rests on this table, not the {equivalence_header(alpha)} beside it,",
-        "which can lie inside the margin while the family's decision is no. Adjusted interval: the interval at 1 - 2",
-        "times the level Holm compared the member with (Interval level); an untestable member has none and counts as",
-        "p = 1.",
+        "one-sided tests' p-values, for an effect above minus the margin and for one below the margin (for the",
+        "Wilcoxon cluster bootstrap, t-tests of the mean cluster difference on clusters - 1 degrees of freedom; n/a",
+        "with fewer than two clusters or no spread between them). Holm TOST p: Holm-adjusted over the family, for",
+        "reading; the decision compares each raw TOST p with its step's level. A member is `equivalent` only when Holm",
+        "rejects,",
+        f"so for these contrasts the conclusion rests on this table, not the {equivalence_header(alpha)} beside it,",
+        "which can lie inside the margin while the family's decision is no. Adjusted interval: the test's own interval",
+        "at 1 - 2 times the level Holm compared the member with (Interval level), inside the margin exactly when the",
+        "TOST p is at most that level; an untestable member has none and counts as p = 1.",
     ]
 
 

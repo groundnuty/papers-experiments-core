@@ -143,19 +143,25 @@ def minimum_detectable_effect(
     return high
 
 
-TOST_TIE_TOLERANCE = 1e-9  # a draw this close to a margin is on it, as in the pipeline's rule (S15)
+TostPValues = Callable[[np.ndarray, float], np.ndarray]  # (studies x clusters), margin -> TOST p per study
 
 
-def tost_p(means: np.ndarray, margin: float) -> float:
-    """The two one-sided tests' p-value of a set of bootstrap means, by the pipeline's rule written again here (S09):
-    the larger of (1 + draws not above -margin) / (B + 1) and (1 + draws not below margin) / (B + 1)."""
-    values = np.asarray(means, dtype=float)
-    if values.size == 0:
-        return math.nan
-    with np.errstate(invalid="ignore"):
-        not_above = values.size - int(np.count_nonzero(values > -margin + TOST_TIE_TOLERANCE))
-        not_below = values.size - int(np.count_nonzero(values < margin - TOST_TIE_TOLERANCE))
-    return float(max(1 + not_above, 1 + not_below) / (values.size + 1))
+def tost_t_p_values(samples: np.ndarray, margin: float) -> np.ndarray:
+    """Two one-sided t-tests (Schuirmann) of every row's mean against plus or minus `margin`, written again here from
+    scipy's t distribution (S09): the larger of the one-sided p-values, on n - 1 degrees of freedom; NaN with fewer
+    than two clusters or no spread. It is the rule the core's estimator registers, so the default."""
+    x = np.asarray(samples, dtype=float)
+    if x.ndim != 2:
+        raise ValueError("samples must be a (studies x clusters) array")
+    n = x.shape[1]
+    if n < 2:
+        return np.full(x.shape[0], math.nan)
+    sd = x.std(axis=1, ddof=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        se = np.where(sd > 0, sd / math.sqrt(n), math.nan)
+        lower = stats.t.sf((x.mean(axis=1) + margin) / se, n - 1)
+        upper = stats.t.cdf((x.mean(axis=1) - margin) / se, n - 1)
+    return np.maximum(lower, upper)
 
 
 def equivalence_feasibility(
@@ -164,34 +170,30 @@ def equivalence_feasibility(
     margin: float,
     alpha: float,
     n_sim: int,
-    replicates: int,
     rng: np.random.Generator,
     deltas: Sequence[float],
+    p_values: TostPValues | None = None,
 ) -> list[float]:
     """The probability of concluding "equivalent" within plus or minus `margin`, for each true difference (S15).
 
-    Each simulated study draws n cluster differences from N(delta, sd^2), resamples its clusters `replicates` times
-    with replacement as the cluster bootstrap does, and concludes equivalent when the TOST p-value of the resampled
-    means is at most alpha (see `rejects`, S06), the rule the analysis applies to a member at its Holm level. Pass
-    alpha divided by the equivalence family's size for its first, hardest step. The probability at delta = 0 is the
-    power to show equivalence; at delta = margin the rule's error rate, which should not pass alpha by much.
+    Each simulated study draws n cluster differences from N(delta, sd^2), one set of standard normal draws shared by
+    every delta, and concludes equivalent when its TOST p-value is at most alpha (see `rejects`, S06); an undefined p
+    (one cluster, no spread) never does. `p_values` is the test the studies are judged by, the contrast's estimator's
+    own (`Tost.p_values`), as the minimum detectable effect is; by default the two one-sided t-tests above. Pass alpha
+    divided by the equivalence family's size for its first, hardest Holm step. The chance at delta = 0 is the power to
+    show equivalence; at delta = margin it is the rule's error rate, at most about alpha.
     """
     if not (math.isfinite(sd) and sd > 0):
         raise ValueError(f"sd must be a positive number, got {sd}")
-    if min(n, n_sim, replicates) < 1:
-        raise ValueError(f"n, n_sim and replicates must be at least 1, got {n}, {n_sim} and {replicates}")
+    if min(n, n_sim) < 1:
+        raise ValueError(f"n and n_sim must be at least 1, got {n} and {n_sim}")
     if not (math.isfinite(margin) and margin > 0):
         raise ValueError(f"margin must be a positive finite number, got {margin}")
     if not 0.0 < alpha < 0.5:
         raise ValueError(f"alpha must be strictly between 0 and 0.5, got {alpha}")
-    probabilities = []
-    for delta in deltas:
-        hits = 0
-        for study in rng.normal(delta, sd, size=(n_sim, n)):
-            means = study[rng.integers(0, n, size=(replicates, n))].mean(axis=1)
-            hits += bool(rejects(tost_p(means, margin), alpha))
-        probabilities.append(hits / n_sim)
-    return probabilities
+    test = p_values if p_values is not None else tost_t_p_values
+    noise = rng.standard_normal((n_sim, n))
+    return [float(rejects(np.asarray(test(delta + sd * noise, margin), dtype=float), alpha).mean()) for delta in deltas]
 
 
 def pilot_cluster_sd(differences: Sequence[float]) -> float:

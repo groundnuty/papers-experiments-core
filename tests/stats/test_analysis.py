@@ -6,6 +6,7 @@ import tomllib
 
 import numpy as np
 import pytest
+from scipy import stats
 from stats_support import both_arms, make_row
 
 from expcore.campaign.factors import FactorSchema
@@ -1084,10 +1085,9 @@ def near_zero_rows(arms=(("cond-a", "cond-b"), ("cond-x", "cond-y")), spread=0.0
 def planted_tost(monkeypatch):
     """An estimator that is the Wilcoxon cluster bootstrap with a TOST p planted: the first cluster's difference."""
     monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
-    wilcoxon = estimators.get(estimators.WILCOXON)
-    estimators.register(
-        "planted_tost", check_params=lambda params: None, tost=lambda paired, settings, margin: paired.matrix[0, 0]
-    )(wilcoxon)
+    wilcoxon, real = estimators.get(estimators.WILCOXON), estimators.tost_function(estimators.WILCOXON)
+    planted = estimators.Tost(lambda paired, settings, margin: paired.matrix[0, 0], real.interval, real.p_values)
+    estimators.register("planted_tost", check_params=lambda params: None, tost=planted)(wilcoxon)
 
 
 def rows_with_tost(p_a, p_b):
@@ -1125,18 +1125,33 @@ def test_s15_the_family_steps_down_and_reports_each_members_level_and_adjusted_i
     assert second.equivalence_level == pytest.approx(1 - 2 * 0.05)
     assert first.tost_p_holm == pytest.approx(0.02)
     assert second.tost_p_holm == pytest.approx(0.04)
-    assert second.equivalence_interval_adjusted == pytest.approx(second.equivalence_interval)
-    lo, hi = first.equivalence_interval_adjusted  # wider at 95% than at 90%
-    assert lo <= first.equivalence_interval[0]
-    assert first.equivalence_interval[1] <= hi
+    prereg = equivalence_prereg("planted_tost")
+    for contrast, level in ((first, 0.025), (second, 0.05)):  # the t-tests' dual interval at its own Holm level
+        cells = pair_rows(rows_with_tost(0.01, 0.04), prereg.contrasts[contrast.name]).differences
+        assert contrast.equivalence_interval_adjusted == kernel.tost_t_interval(cells.cluster_differences, level)
 
 
-def test_s15_a_member_with_the_real_estimator_is_equivalent_when_its_draws_lie_inside_the_margin():
-    """S15: eight clusters within 0.01 of 0 and a margin of 0.2: every draw is inside, TOST p = 1 / 401."""
+def test_s15_a_member_with_the_real_estimator_is_judged_by_the_t_tests_of_its_cluster_differences():
+    """S15: eight clusters within 0.01 of 0 and a margin of 0.2 give a TOST p far below alpha / 2: scipy's two
+    one-sided t-tests of the same differences."""
     result = analyse(near_zero_rows(), equivalence_prereg())
     contrast = result.contrast("a-vs-b")
-    assert contrast.tost_p == pytest.approx(1 / 401)
+    differences = pair_rows(near_zero_rows(), equivalence_prereg().contrasts["a-vs-b"]).differences.cluster_differences
+    lower = stats.ttest_1samp(differences, -0.2, alternative="greater").pvalue
+    upper = stats.ttest_1samp(differences, 0.2, alternative="less").pvalue
+    assert contrast.tost_p == pytest.approx(max(lower, upper), rel=1e-9)
     assert (contrast.equivalent, contrast.conclusion) == (True, "equivalent")
+
+
+def test_s15_a_member_with_one_cluster_is_never_equivalent():
+    """S15: one cluster inside the margin has no spread estimated, so no evidence: TOST p is NaN, as p = 1 in Holm."""
+    rows = [
+        make_row("t0", "model-a", 1, 0.51, condition="cond-a"),
+        make_row("t0", "model-a", 1, 0.5, condition="cond-b"),
+    ]
+    contrast = analyse(rows, equivalence_prereg()).contrast("a-vs-b")
+    assert math.isnan(contrast.tost_p)
+    assert (contrast.equivalent, contrast.conclusion) == (False, "not_detected")
 
 
 def test_s15_s02_an_untestable_member_keeps_its_place_in_the_equivalence_family():
@@ -1190,12 +1205,25 @@ def test_s15_the_feasibility_from_pilot_rows_uses_each_contrasts_own_spread():
 
 
 def test_s15_the_feasibility_refuses_what_it_cannot_run():
-    """S15: no power settings, or no contrast with a margin, is an error naming the preregistration."""
+    """S15: no power settings, or no equivalence family, is an error naming the preregistration; a margin outside a
+    family is judged by the interval rule, which this does not simulate."""
     with pytest.raises(ValueError, match=r"inline: has no \[power\] section"):
         equivalence_feasibility(equivalence_prereg())
-    text = TEXT + "\n"
-    with pytest.raises(ValueError, match="inline: no contrast declares an equivalence_margin"):
-        equivalence_feasibility(parse(tomllib.loads(text), "inline", "a" * 64, SCHEMA))
+    with pytest.raises(ValueError, match="inline: declares no equivalence_family"):
+        equivalence_feasibility(parse(tomllib.loads(TEXT), "inline", "a" * 64, SCHEMA))
+
+
+def test_s15_the_feasibility_judges_a_member_by_its_estimators_own_tost(monkeypatch):
+    """S15: an estimator whose TOST never concludes equivalence is never reachable, whatever the spread."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    wilcoxon, real = estimators.get(estimators.WILCOXON), estimators.tost_function(estimators.WILCOXON)
+    never = estimators.Tost(real.p, real.interval, lambda studies, margin, params: np.ones(studies.shape[0]))
+    estimators.register("never_equivalent", check_params=lambda params: None, tost=never)(wilcoxon)
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", "never_equivalent").replace(
+        "[contrasts.a-vs-b]", FEASIBILITY_POWER + "sd_grid = [0.01]\n\n[contrasts.a-vs-b]"
+    )
+    result = equivalence_feasibility(parse(tomllib.loads(text), "inline", "e" * 64, ARMS))
+    assert {(row["probability"], row["reachable"]) for row in result.rows} == {(0.0, False)}
 
 
 def test_s15_a_margin_outside_the_equivalence_family_keeps_the_interval_rule():

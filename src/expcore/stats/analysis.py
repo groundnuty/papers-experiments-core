@@ -50,6 +50,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -187,20 +188,20 @@ def _tost_p(spec: ContrastSpec, prereg: Preregistration, differences: PairedDiff
         raise ValueError(
             f"contrast {spec.name!r}: a member of the equivalence family needs a margin and a TOST p-value"
         )
-    return (
-        math.nan if untestable else float(tost(differences, prereg.estimator_settings(spec), spec.equivalence_margin))
-    )
+    if untestable:
+        return math.nan
+    return float(tost.p(differences, prereg.estimator_settings(spec), spec.equivalence_margin))
 
 
 def _adjusted_interval(
     spec: ContrastSpec, prereg: Preregistration, differences: PairedDifferences, level: float, untestable: bool
 ) -> tuple[float, float]:
-    """The member's interval at 1 - 2 x its Holm level, from the same resamples (S15); NaN with no pair."""
-    if untestable:
+    """The member's TOST interval at 1 - 2 x its Holm level, the test's dual (S15); NaN with no pair."""
+    tost = estimators.tost_function(spec.estimator)
+    if untestable or tost is None:
         return math.nan, math.nan
-    settings = dataclasses.replace(prereg.estimator_settings(spec), level=1 - 2 * level)
-    result = estimators.get(spec.estimator)(differences, settings)
-    return result.ci_low, result.ci_high
+    low, high = tost.interval(differences, prereg.estimator_settings(spec), level)
+    return float(low), float(high)
 
 
 def _minimum_detectable_effect(
@@ -465,29 +466,41 @@ def pilot_power(rows: Iterable[Row], prereg: Preregistration, names: Sequence[st
     return PowerResult(tuple(power.pilot_power(pilot, prereg.power, prereg.alpha)), prereg.manifest())
 
 
-def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None = None) -> PowerResult:
-    """Whether each equivalence claim can be reached before the campaign (S15): for each contrast with a margin, the
-    chance of concluding equivalent when the true difference is 0 and when it is half the margin.
+def _studies_test(tost: estimators.Tost, params: Mapping[str, Any]) -> power.TostPValues:
+    """An estimator's TOST of many studies under its preregistered parameters, as the power module calls it."""
+    return lambda studies, margin: tost.p_values(studies, margin, params)
 
-    The simulation (`power.equivalence_feasibility`) has the [power] section's target clusters, simulations and seed
-    (with a digest of the contrast's name), and the [bootstrap] replicates. The SD is each of the [power] sd_grid's,
-    declared; or, given pilot rows, the contrast's own between-cluster SD of its paired differences, estimated. The
-    level is alpha divided by the equivalence family's size for a member (Holm's first and hardest step, so the figure
-    is conservative for every member but the one with the smallest p-value) and alpha for a contrast outside it, whose
-    interval rule is the same test at alpha. A claim is `reachable` when its chance at 0 meets the target power; a
-    preregistration should state an equivalence hypothesis only if it is, and say so if it is not.
+
+def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None = None) -> PowerResult:
+    """Whether each equivalence claim can be reached before the campaign (S15): for each member of the equivalence
+    family, the chance of concluding equivalent when the true difference is 0 and when it is half the margin.
+
+    The simulation (`power.equivalence_feasibility`) judges each simulated study by the member's estimator's own TOST
+    (`Tost.p_values`, with the estimator's preregistered parameters), the test the analysis decides it by, at the
+    [power] section's target clusters, simulations and seed (with a digest of the contrast's name). The SD is each of
+    the [power] sd_grid's, declared; or, given pilot rows, the contrast's own between-cluster SD of its paired
+    differences, estimated. The level is alpha divided by the family's size, Holm's first and hardest step, so the
+    figure is conservative for every member but the one with the smallest p-value. A claim is `reachable` when its
+    chance at 0 meets the target power; a preregistration should state an equivalence hypothesis only if it is, and
+    say so if it is not. Only members are simulated: a contrast whose margin no family names is judged by the 1 - 2
+    alpha bootstrap interval, another rule.
     """
     if prereg.power is None:
         raise ValueError(f"{prereg.source}: has no [power] section, so there is no feasibility study to run")
-    margined = [spec for spec in prereg.contrasts.values() if spec.equivalence_margin is not None]
-    if not margined:
-        raise ValueError(f"{prereg.source}: no contrast declares an equivalence_margin, so no equivalence is claimed")
+    family = prereg.equivalence_family
+    if not family:
+        raise ValueError(f"{prereg.source}: declares no equivalence_family, so no equivalence claim is decided by TOST")
     pilot = list(rows) if rows is not None else None
-    settings, family = prereg.power, prereg.equivalence_family
+    settings = prereg.power
     table = []
-    for spec in margined:
+    for name in family:
+        spec = prereg.contrasts[name]
         margin = float(spec.equivalence_margin or 0.0)
-        alpha = prereg.alpha / len(family) if spec.name in family else prereg.alpha
+        alpha = prereg.alpha / len(family)
+        tost = estimators.tost_function(spec.estimator)
+        if tost is None:  # the loader refuses such a member
+            raise ValueError(f"{prereg.source}: contrast {name!r} has an estimator with no TOST")
+        test = _studies_test(tost, prereg.estimator_settings(spec).params)
         if pilot is None:
             sds = list(settings.sd_grid)
         else:
@@ -497,9 +510,8 @@ def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None 
             deltas = (0.0, margin / 2)
             if math.isfinite(sd) and sd > 0:
                 chances = power.equivalence_feasibility(
-                    sd, settings.target_clusters, margin, alpha, settings.n_simulations, prereg.bootstrap.replicates,
-                    rng, deltas,
-                )  # fmt: skip
+                    sd, settings.target_clusters, margin, alpha, settings.n_simulations, rng, deltas, test
+                )
             else:  # a pilot with fewer than two clusters, or no spread: nothing to simulate, and a gap shows
                 chances = [math.nan, math.nan]
             for delta, chance in zip(deltas, chances, strict=True):

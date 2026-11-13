@@ -17,6 +17,8 @@ Rules kept here, each with a regression test:
 - S03: an empty or all-zero set of differences has defined values, and dropped zeros are counted.
 - S04: one cluster resample is shared by all models.
 - S05: an undefined resample is NaN, never 0, and never supports a hypothesis.
+- S15: an equivalence claim is Schuirmann's two one-sided t-tests of the cluster differences, dual to a 1 - 2L
+  interval; fewer than two clusters, or no spread between them, gives NaN, never evidence of equivalence.
 """
 
 from __future__ import annotations
@@ -148,23 +150,68 @@ def one_sided_bootstrap_p(draws, theta0: float = 0.0, tolerance: float = TIE_TOL
     return float((1 + values.size - supports(values, theta0, tolerance).sum()) / (values.size + 1))
 
 
-def tost_p(draws, margin: float, tolerance: float = TIE_TOLERANCE) -> float:
-    """The two one-sided tests' p-value for equivalence within plus or minus `margin` (S15): the larger of the
-    bootstrap p-values of theta > -margin and of theta < margin, each (1 + draws not supporting) / (B + 1).
-
-    It is the p-value the percentile interval inverts: TOST p <= a when the 1 - 2a interval lies inside the margin,
-    up to the +1 and the percentiles' interpolation. A draw on or within the tolerance of a margin, and an undefined
-    draw (NaN), supports neither alternative, so it can only raise p (S05). No draw gives NaN.
-    """
+def _check_margin(margin: float) -> None:
+    """Refuse a margin that is not a positive finite number (a boolean is not a number here)."""
     number = isinstance(margin, int | float) and not isinstance(margin, bool)
     if not (number and math.isfinite(margin) and margin > 0):
         raise ValueError(f"an equivalence margin must be a positive finite number, got {margin!r}")
-    values = np.asarray(draws, dtype=float)
-    if values.size == 0:
-        return math.nan
-    above_lower = one_sided_bootstrap_p(values, -margin, tolerance)
-    below_upper = one_sided_bootstrap_p(-values, -margin, tolerance)
-    return max(above_lower, below_upper)
+
+
+def _mean_and_se(studies: np.ndarray, decimals: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """Per row of snapped cluster differences: the mean and its standard error, NaN where there is no spread."""
+    snapped = _snap_differences(studies, decimals)
+    n = snapped.shape[1]
+    if n < 2:
+        nan = np.full(snapped.shape[0], math.nan)
+        return nan, nan, n
+    mean = snapped.mean(axis=1)
+    sd = snapped.std(axis=1, ddof=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        se = np.where(sd > 0, sd / math.sqrt(n), math.nan)
+    return mean, se, n
+
+
+def tost_t_studies(studies, margin: float, decimals: int = DEFAULT_SNAP_DECIMALS) -> np.ndarray:
+    """`tost_t` of every row of a (studies x clusters) array, by one vectorised computation."""
+    _check_margin(margin)
+    values = np.asarray(studies, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("studies must be a (studies x clusters) array")
+    mean, se, n = _mean_and_se(values, decimals)
+    if n < 2:
+        return mean  # NaN for every study
+    with np.errstate(invalid="ignore"):
+        lower = stats.t.sf((mean + margin) / se, n - 1)  # H0: theta <= -margin
+        upper = stats.t.cdf((mean - margin) / se, n - 1)  # H0: theta >= margin
+    return np.maximum(lower, upper)  # NaN where there is no spread
+
+
+def tost_t(differences, margin: float, decimals: int = DEFAULT_SNAP_DECIMALS) -> float:
+    """The two one-sided t-tests' p-value for equivalence of the mean cluster difference within plus or minus `margin`
+    (Schuirmann's TOST, S15): the larger of the one-sided p-values of theta > -margin and of theta < margin, each a
+    t-test on n - 1 degrees of freedom with the standard error sd / sqrt(n) of the n cluster differences.
+
+    The clusters are the unit: independent, their differences roughly normal (the test is robust to that for a few
+    dozen clusters). Undefined clusters (NaN) are left out; float noise is snapped first (S01). Fewer than two clusters,
+    or clusters with no spread between them (a standard error of 0), give NaN, never a p-value of 0: with no spread
+    estimated there is no evidence, and a NaN counts as p = 1 in Holm (S02).
+    """
+    values = np.asarray(differences, dtype=float)
+    values = values[~np.isnan(values)]
+    return float(tost_t_studies(values.reshape(1, -1), margin, decimals)[0])
+
+
+def tost_t_interval(differences, level: float, decimals: int = DEFAULT_SNAP_DECIMALS) -> tuple[float, float]:
+    """The interval dual to `tost_t` at `level` L: mean plus or minus the t quantile at 1 - L times the standard error,
+    a 1 - 2L interval. TOST p <= L exactly when it lies within plus or minus the margin. NaN where `tost_t` is."""
+    if not 0.0 < level < 0.5:
+        raise ValueError(f"the level of a TOST interval must be strictly between 0 and 0.5, got {level}")
+    values = np.asarray(differences, dtype=float)
+    mean, se, n = _mean_and_se(values[~np.isnan(values)].reshape(1, -1), decimals)
+    if n < 2 or math.isnan(se[0]):
+        return math.nan, math.nan
+    half = float(stats.t.ppf(1 - level, n - 1) * se[0])
+    return float(mean[0]) - half, float(mean[0]) + half
 
 
 def _snap_differences(values, decimals: int) -> np.ndarray:
