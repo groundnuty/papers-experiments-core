@@ -22,7 +22,7 @@ from expcore_onedata.testing import (
 )
 from expcore_onedata.testing.world import SPACE_IDS, SPACE_NAMES, with_spaces
 from expcore_onedata.tokencheck import CaveatSpec, PrivilegesMismatch, TokenRefused, require_examined
-from expcore_onedata.tokens import Plane, TokenIssuer, data_path_spec, tool_server_spec
+from expcore_onedata.tokens import DroppedToken, Plane, TokenIssuer, data_path_spec, tool_server_spec
 
 
 def configure(tmp_path, fake, *, count=2, edit=None):
@@ -58,19 +58,40 @@ def test_o05_a_one_space_token_is_minted_as_before_whichever_way_its_space_is_na
     assert whitelist(fake, token) == ["/spmock0001"]
 
 
+def without_spaces(*space_ids):
+    """A scope hook: Onezone's scope of a token, as for a user who is a member of none of these spaces."""
+
+    def narrowed(answer):
+        for space_id in space_ids:
+            del answer["dataAccessScope"]["spaces"][space_id]
+        return answer
+
+    return narrowed
+
+
 def test_o05_each_planes_token_reaches_exactly_the_spaces_it_is_scoped_to(tmp_path, fake):
-    """O05: with three spaces, the data path's token is scoped to the two its plane names and the tool server's to the
-    two its plane names, one data.path entry each; neither reaches a space its plane is not scoped to."""
+    """O05: with three spaces, the data path's token is scoped to the two its plane names, one data.path entry each.
+    The tool server's, a read-only condition's, has no data.path (O37): it reaches the two its plane names through its
+    user's memberships, which Onezone's scope of it must equal, so a user who is also a member of the space declared
+    for the data path alone gets no token, the refusal naming that space by its position."""
 
     def planes(data):
         data["spaces"][1]["tokens"] = ["data_path"]
         data["spaces"][2]["tokens"] = ["tool_server"]
 
     config, _, issuer = configure(tmp_path, fake, count=3, edit=planes)
+    fake.scope_hook = without_spaces(SPACE_IDS[1])  # the tool-server user is no member of the data path's own space
     tokens = issuer.mint_run_tokens(data=DATA_PATH_USER, ceiling_s=CEILING_S, tool_server=(TOOL_SERVER_USER, "read"))
     assert whitelist(fake, tokens.data_path) == [f"/{SPACE_IDS[0]}", f"/{SPACE_IDS[1]}"]
-    assert whitelist(fake, tokens.tool_server) == [f"/{SPACE_IDS[0]}", f"/{SPACE_IDS[2]}"]
+    assert [c["type"] for c in fake.issued[tokens.tool_server.reveal()]["caveats"]] == ["time", "interface"]
     assert config.space_ids(Plane.DATA_PATH) == SPACE_IDS[:2]
+    fake.scope_hook = None  # a member of every space: the data path's own one reaches the tool server's token
+    with pytest.raises(DroppedToken, match=r"has also spaces\[1\]$"):
+        issuer.mint(
+            tool_server_spec(config.space_ids(Plane.TOOL_SERVER), config.condition("read")),
+            TOOL_SERVER_USER,
+            ceiling_s=CEILING_S,
+        )
 
 
 def test_o05_the_examination_refuses_a_token_that_misses_or_adds_a_space(tmp_path, fake):
@@ -161,12 +182,15 @@ def test_o09_a_writing_token_whose_scope_lacks_one_of_the_planes_spaces_is_refus
 
 def test_o05_the_tool_server_launch_checks_its_token_against_every_space_of_its_plane(tmp_path, fake):
     """O05: the launch-time check builds the condition's spec from the tool-server plane's spaces, so a token minted
-    for the first space alone does not pass it, and one minted for the plane's spaces does."""
+    for the first space alone, by a user who was a member of that space alone, does not pass it once that holds no
+    more for the plane: its scope lacks the second space. One minted for the plane's spaces does."""
     config, _, issuer = configure(tmp_path, fake)
     condition = config.condition("read")
+    fake.scope_hook = without_spaces(SPACE_IDS[1])
     narrow = issuer.mint(tool_server_spec(SPACE_IDS[0], condition), TOOL_SERVER_USER, ceiling_s=CEILING_S)
-    with pytest.raises(TokenRefused, match=r"data\.path caveat"):
+    with pytest.raises(TokenRefused, match=r"lacks spaces\[1\]$"):
         toolserver._prepare(issuer, config, condition, narrow, CEILING_S)
+    fake.scope_hook = None
     scoped = issuer.mint(
         tool_server_spec(config.space_ids(Plane.TOOL_SERVER), condition), TOOL_SERVER_USER, ceiling_s=CEILING_S
     )

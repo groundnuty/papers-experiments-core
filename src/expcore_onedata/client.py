@@ -93,7 +93,8 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   the token's data-access caveats, every one of them for a token with none: onedata/oz-worker, release/25.0 at
   03af698e5759f9db97a003047eb4e29e4ba7507f, src/logic/token_logic_plugin.erl, `infer_access_token_scope/2`, and
   onedata/ctool, release/25.0 at 019fee12a1638ca516da97a931a2d6138fa25279, src/auth/data_access_caveats.erl,
-  `match_available_spaces/2`. The tool server's writing token is checked by its keys (`tokenscope.py`).
+  `match_available_spaces/2`. The tool server's token, which has no data-access caveat, is checked by its keys
+  (`tokenscope.py`).
 - `get`: `GET /users/{id}/effective_privileges` with the admin token, the answer key `privileges`, a user's Onezone
   admin privileges, its own and its groups': named by Onezone's REST description, onedata/onezone-swagger, release/25.0
   at 58c697695fd73ff480f4a6e5fdbf733036465398, paths/users/id/effective_privileges.yaml, which says its reader needs

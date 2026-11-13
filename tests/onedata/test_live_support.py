@@ -38,7 +38,10 @@ def refuse_by_dropping(type_):
 @pytest.mark.parametrize(
     ("break_it", "reason"),
     [
-        (lambda fake: setattr(fake, "mint_hook", refuse_by_dropping("data.readonly")), r"no data\.readonly caveat"),
+        (
+            lambda fake: setattr(fake, "mint_hook", lambda user, caveats: [*caveats, {"type": "data.readonly"}]),
+            r"data-access caveat \('data\.readonly'\)",
+        ),
         (lambda fake: setattr(fake, "mint_hook", refuse_by_dropping("interface")), "no interface caveat"),
         (lambda fake: setattr(fake, "mint_hook", refuse_by_dropping("time")), "no time caveat"),
         (
@@ -56,11 +59,20 @@ def refuse_by_dropping(type_):
             "another principal",
         ),
     ],
-    ids=["no read-only", "no interface", "no time", "expired", "unparsable", "caveats not a list", "other subject"],
+    ids=[
+        "data-access caveat",
+        "no interface",
+        "no time",
+        "expired",
+        "unparsable",
+        "caveats not a list",
+        "other subject",
+    ],
 )
 def test_o05_any_other_refusal_is_a_failure_not_a_skip(break_it, reason, config, issuer, fake):
-    """O05: a missing caveat, an expiry, a malformed examination or another principal's token is a TokenRefused that
-    the live test lets through as a failure, whatever the rights the user holds."""
+    """O05: a missing caveat, a data-access caveat on a tool-server token (O37), an expiry, a malformed examination or
+    another principal's token is a TokenRefused that the live test lets through as a failure, whatever the rights the
+    user holds."""
     break_it(fake)
     with pytest.raises(TokenRefused, match=reason) as caught:
         mint_for_condition(issuer, config, "read", TOOLS, CEILING_S)

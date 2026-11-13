@@ -28,6 +28,7 @@ from expcore.tools.manifest import FrozenManifest, ManifestError, live_manifest
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.pin import PinError
+from expcore_onedata.rights import WRITE_RIGHTS
 from expcore_onedata.testing import ALPHA_ID, BASELINE, CEILING_S, MANAGE, NOW, TOOL_SERVER_ARGS, write_platform
 from expcore_onedata.testing import DATA_PATH_USER as DATA
 from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
@@ -293,19 +294,23 @@ def test_o05_o06_a_change_of_privileges_between_minting_and_launch_does_not_star
 
 
 def test_o05_o06_the_plane_is_checked_before_the_spawn_and_again_after_the_stop(world, fake, tmp_path):
-    """O05, O06: the launch reads the token's examination and then the principal's two privilege lists before the
-    server starts, as admin reads, and the same three at teardown, so a run that held reads the plane twice."""
+    """O05, O06: the launch reads the token's examination, the principal's two privilege lists and its Onezone admin
+    privileges, as admin reads, then the token's scope and the clusters it acts in, before the server starts, and the
+    same six at teardown, so a run that held reads the plane twice. A read-only condition's token has no data-access
+    caveat (O37), so its plane is read as a writing condition's is."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
     before = len(fake.requests)
     start(launcher, RecordingContext(), "read", token, tmp_path)
     one_check = [
-        ("POST", "/api/v3/onezone/tokens/examine"),
-        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/users/{TOOLS.user_id}/privileges"),
-        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/effective_users/{TOOLS.user_id}/privileges"),
+        ("POST", "/api/v3/onezone/tokens/examine", fake.ADMIN),
+        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/users/{TOOLS.user_id}/privileges", fake.ADMIN),
+        ("GET", f"/api/v3/onezone/spaces/{fake.SPACE_ID}/effective_users/{TOOLS.user_id}/privileges", fake.ADMIN),
+        ("GET", f"/api/v3/onezone/users/{TOOLS.user_id}/effective_privileges", fake.ADMIN),
+        ("POST", "/api/v3/onezone/tokens/infer_access_token_scope", None),
+        ("GET", "/api/v3/onezone/user/effective_clusters", token.reveal()),
     ]
-    assert [(r.method, r.path) for r in fake.requests[before:]] == one_check * 2
-    assert {r.token for r in fake.requests[before:]} == {fake.ADMIN}
+    assert [(r.method, r.path, r.token) for r in fake.requests[before:]] == one_check * 2
 
 
 def test_o05_o06_a_principal_whose_privileges_cannot_be_read_does_not_start_the_server(world, fake, tmp_path):
@@ -543,8 +548,18 @@ CLUSTERS = "/api/v3/onezone/user/effective_clusters"
 
 def manage_token(issuer, config, fake):
     """A writing condition's token, minted while its user is a member of the plane's space alone and no admin."""
-    fake.grant(TOOLS.user_id, MANAGE)
-    return issuer.mint(tool_server_spec(config.space.id, config.condition("manage")), TOOLS, ceiling_s=CEILING_S)
+    return tool_token(issuer, config, fake, "manage")
+
+
+RIGHTS = {"read": BASELINE, "manage": MANAGE}  # each default condition's declared rights: read-only, and writing
+BOTH_KINDS = pytest.mark.parametrize("condition", list(RIGHTS), ids=["read-only", "writing"])
+
+
+def tool_token(issuer, config, fake, condition):
+    """A condition's token, minted while its user holds the condition's rights, is a member of the plane's space alone,
+    no admin and a member of no cluster."""
+    fake.grant(TOOLS.user_id, RIGHTS[condition])
+    return issuer.mint(tool_server_spec(config.space.id, config.condition(condition)), TOOLS, ceiling_s=CEILING_S)
 
 
 def joins_outside(fake):
@@ -564,17 +579,19 @@ BOUNDARY_IDS = ["joined an outside space", "became an admin", "joined a cluster"
 
 
 @pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=BOUNDARY_IDS)
-def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_starts_no_server(
-    change, reason, world, fake, tmp_path
+@BOTH_KINDS
+def test_o09_a_tool_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_starts_no_server(
+    change, reason, condition, world, fake, tmp_path
 ):
-    """O09: a writing token is bounded by its user alone, so the launch reads its scope, the user's admin privileges and
-    the clusters the token acts in again: a user who became a member of a space outside the plane, or of a provider's
-    cluster, or an admin of Onezone, after the mint starts nothing, and the refusal names no space and no cluster."""
+    """O09: a tool-server token, a read-only condition's (O37) as a writing one's, is bounded by its user alone, so the
+    launch reads its scope, the user's admin privileges and the clusters the token acts in again: a user who became a
+    member of a space outside the plane, another study's say, or of a provider's cluster, or an admin of Onezone,
+    after the mint starts nothing, and the refusal names no space and no cluster."""
     config, issuer, launcher = world
-    token = manage_token(issuer, config, fake)
+    token = tool_token(issuer, config, fake, condition)
     change(fake)()
     with pytest.raises(InfraError, match=re.escape(f"failed its check before the start: {reason}")) as caught:
-        start(launcher, RecordingContext(), "manage", token, tmp_path)
+        start(launcher, RecordingContext(), condition, token, tmp_path)
     assert caught.value.kind == "tool_plane_integrity"
     assert OUTSIDE not in str(caught.value)
     assert PROVIDER_CLUSTER not in str(caught.value)
@@ -583,15 +600,17 @@ def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_adm
 
 
 @pytest.mark.parametrize(("change", "reason"), BOUNDARY_CHANGES, ids=BOUNDARY_IDS)
-def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_during_the_run_is_set_aside(
-    change, reason, world, fake, events
+@BOTH_KINDS
+def test_o09_a_tool_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_during_the_run_is_set_aside(
+    change, reason, condition, world, fake, events
 ):
-    """O09: the same reads at teardown find a boundary that changed while the server ran; the run is set aside as
-    infrastructure of the tool-plane kind. Its declared space rights did not change, so no rights event is recorded."""
+    """O09: the same reads at teardown find a boundary that changed while the server ran, for a read-only condition as
+    for a writing one; the run is set aside as infrastructure of the tool-plane kind. Its declared space rights did not
+    change, so no rights event is recorded."""
     config, issuer, launcher = world
-    token = manage_token(issuer, config, fake)
+    token = tool_token(issuer, config, fake, condition)
     with pytest.raises(InfraError, match=re.escape(f"failed its check at teardown: {reason}")) as caught:
-        run_with(launcher, RecordingContext(), "manage", token, change(fake))
+        run_with(launcher, RecordingContext(), condition, token, change(fake))
     assert caught.value.kind == "tool_plane_integrity"
     assert OUTSIDE not in str(caught.value)
     assert PROVIDER_CLUSTER not in str(caught.value)
@@ -601,9 +620,10 @@ def test_o09_a_writing_planes_user_who_joined_a_space_a_cluster_or_became_an_adm
 def test_o09_a_writing_plane_is_read_for_its_scope_admin_privileges_and_clusters_before_the_spawn_and_after_the_stop(
     world, fake, tmp_path
 ):
-    """O09: a writing condition's launch adds three reads to the read-only plane's three: the user's admin privileges,
-    as an admin read, the token's scope, which Onezone answers to the token in the body and no header, and the clusters
-    the token acts in, which the token reads itself, so it is the credential of that request and the admin is not."""
+    """O09: a writing condition's launch adds three reads to the examination and the two privilege reads: the user's
+    admin privileges, as an admin read, the token's scope, which Onezone answers to the token in the body and no
+    header, and the clusters the token acts in, which the token reads itself, so it is the credential of that request
+    and the admin is not. A read-only condition's launch makes the same six (O37)."""
     config, issuer, launcher = world
     token = manage_token(issuer, config, fake)
     before = len(fake.requests)
@@ -619,21 +639,34 @@ def test_o09_a_writing_plane_is_read_for_its_scope_admin_privileges_and_clusters
     assert [(r.method, r.path, r.token) for r in fake.requests[before:]] == one_check * 2
 
 
-def test_o09_a_read_only_plane_is_read_for_neither_its_scope_nor_admin_privileges_nor_clusters(world, fake, tmp_path):
-    """O09: a read-only condition's token is kept to the plane by its data.path caveat, so its launch and teardown make
-    none of the three reads, with an outside space, an admin privilege and a cluster all present."""
+WRITES = [*WRITE_RIGHTS, "space_write_data"]  # every write right a condition can declare, and the data write
+
+
+@pytest.mark.parametrize("right", WRITES)
+def test_o37_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_starts_no_server(
+    right, world, fake, tmp_path
+):
+    """O37: a read-only condition's token has no data-access caveat, so its user's rights are what keep it from writing;
+    a user who gained any write right between the mint and the launch, if only through a group, starts nothing."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
-    fake.add_space(OUTSIDE, "unrelated-space", [ALPHA_ID])
-    fake.admin_privileges[TOOLS.user_id] = ["oz_spaces_add_relationships"]
-    fake.clusters[TOOLS.user_id] = [PROVIDER_CLUSTER]
-    before = len(fake.requests)
-    start(launcher, RecordingContext(), "read", token, tmp_path)
-    after = [r.path for r in fake.requests[before:]]
-    assert after
-    assert not [
-        p for p in after if p.endswith(("/effective_privileges", "/infer_access_token_scope", "/effective_clusters"))
-    ]
+    fake.grant(TOOLS.user_id, BASELINE, [*BASELINE, right])
+    with pytest.raises(InfraError, match=rf"failed its check before the start: .*has also {right}") as caught:
+        start(launcher, RecordingContext(), "read", token, tmp_path)
+    assert caught.value.kind == "tool_plane_integrity"
+    assert not (tmp_path / "seen.json").exists()
+
+
+@pytest.mark.parametrize("right", WRITES)
+def test_o37_a_read_only_planes_user_who_gained_a_write_right_during_the_run_is_set_aside(right, world, fake, events):
+    """O37: a write right granted to a read-only condition's user while its server ran is found at teardown: the run is
+    set aside as infrastructure of the tool-plane kind, with the rights event, whatever the body did."""
+    config, issuer, launcher = world
+    token = read_token(issuer, config)
+    with pytest.raises(InfraError, match=rf"rights changed during the run: .*has also {right}") as caught:
+        run_with(launcher, RecordingContext(), "read", token, lambda: fake.grant(TOOLS.user_id, [*BASELINE, right]))
+    assert caught.value.kind == "tool_plane_integrity"
+    assert [kind for kind, _ in events] == ["tool_plane_rights_changed"]
 
 
 def admin_read_fails(fake, monkeypatch):
@@ -657,18 +690,20 @@ def admin_read_fails(fake, monkeypatch):
     ids=["scope outage", "admin read outage", "scope unreadable", "clusters outage", "clusters unreadable"],
 )
 @pytest.mark.parametrize("when", ["before the start", "at teardown"])
-def test_o05_a_writing_planes_scope_admin_or_clusters_read_that_fails_is_an_outage_never_a_pass(
-    bend, words, when, world, fake, tmp_path, monkeypatch, events
+@BOTH_KINDS
+def test_o05_a_tool_planes_scope_admin_or_clusters_read_that_fails_is_an_outage_never_a_pass(
+    bend, words, when, condition, world, fake, tmp_path, monkeypatch, events
 ):
-    """O05: unknown is not a pass. An outage of Onezone while the scope, the admin privileges or the clusters are
-    read, at launch or at teardown, sets the run aside in the outage's words; an unreadable answer fails the check."""
+    """O05: unknown is not a pass, for a read-only condition's plane as for a writing one's. An outage of Onezone while
+    the scope, the admin privileges or the clusters are read, at launch or at teardown, sets the run aside in the
+    outage's words; an unreadable answer fails the check."""
     config, issuer, launcher = world
-    token = manage_token(issuer, config, fake)
+    token = tool_token(issuer, config, fake, condition)
     if when == "before the start":
         bend(fake, monkeypatch)()
-        run = lambda: start(launcher, RecordingContext(), "manage", token, tmp_path)  # noqa: E731
+        run = lambda: start(launcher, RecordingContext(), condition, token, tmp_path)  # noqa: E731
     else:
-        run = lambda: run_with(launcher, RecordingContext(), "manage", token, bend(fake, monkeypatch))  # noqa: E731
+        run = lambda: run_with(launcher, RecordingContext(), condition, token, bend(fake, monkeypatch))  # noqa: E731
     with pytest.raises(InfraError, match=re.escape(f"{words} {when}")) as caught:
         run()
     assert caught.value.kind == "tool_plane_integrity"
