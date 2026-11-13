@@ -354,8 +354,11 @@ KNOWLEDGE_MANIFEST = "knowledge.manifest.json"
 def with_agent(data: dict[str, Any], relay_url: str, *, allow: tuple[str, ...] = KNOWLEDGE_TOOLS) -> None:
     """An `edit` for `write_platform`: the default `[sandbox]` (its level `mounted` maps to the mount) and `[slots]`,
     and a `[toolserver]` that runs the stand-in tool server against `relay_url`, with a condition `knowledge` that
-    allows the tools in `allow` (the four knowledge tools by default)."""
+    allows the tools in `allow` (the four knowledge tools by default). Each slot's tool-server user declares the
+    knowledge condition's rights, which `add_slot_users` gives it."""
     add_sandbox(data)
+    for slot in data["slots"].values():
+        slot["toolserver"]["rights"] = list(KNOWLEDGE_RIGHTS)
     data["toolserver"]["args"] = [str(TOOLS_SERVER), "--relay", relay_url]
     condition = {"allow": list(allow), "rights": KNOWLEDGE_RIGHTS, "manifest": KNOWLEDGE_MANIFEST}
     data["toolserver"]["conditions"]["knowledge"] = condition

@@ -6,10 +6,12 @@
 
 Per run (never per campaign) the run leases one slot of `[slots.<name>]` (`users.py`) when it needs a data-path token or
 a tool server, and none when it needs neither. A slot gives the run both planes' users, so there is one pool of leased
-users and one lease key per run. `users.SlotTokens` mints the run's tokens on the slot's users at once, with one
-journalled expiry: the data path's (read-only and scoped to the study space, with the interface of the run's data path)
-and, for a condition with a tool server, the tool server's, each with a lifetime from the run's whole-time ceiling. The
-sandbox starts with the first; the tool server (`tool_server`) starts with the second, on the same slot's tool-server
+users and one lease key per run. A run with a tool server leases from its condition's group, the slots whose tool-server
+user declares the condition's rights (`users.group_of`, O31), so conditions of different rights interleave in one
+campaign; a run with a data path alone leases from every slot. `users.SlotTokens` mints the run's tokens on the slot's
+users at once, with one journalled expiry: the data path's (read-only and scoped to the study space, with the interface
+of the run's data path) and, for a condition with a tool server, the tool server's, each with a lifetime from the run's
+whole-time ceiling. The sandbox starts with the first; the tool server (`tool_server`) starts with the second, on the same slot's tool-server
 user. The core's lease pool (C19) holds the key for the attempt. The `ResourceProbe` (`probe`) is
 `users.SlotProbe(journal, sandbox_gone=SandboxProbe(...).resource_gone)`: a key is freed only when no container,
 network or mount of the sandbox is left and the slot's tokens have ended, by their journalled expiry plus a margin.
@@ -41,6 +43,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.lease import Lease, process_gone
+from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
 from expcore_onedata.admission import require_admission, retain_admission
@@ -288,12 +291,32 @@ class SandboxPlatform:
         return self._s.mode_of(str(factors[DATA_PATH_FACTOR]))
 
     def lease_group(self, factors: Mapping[str, Any]) -> str | None:
-        """The lease group of a run: the slots, when it needs a data-path token or a tool server; None when neither."""
-        needs = self.mode(factors) is not DataPathMode.NONE or self._tool_condition(factors) is not None
-        return GROUP if needs else None
+        """The lease group of a run (O31): with a tool server, its condition's (`condition_group`), the slots whose
+        tool-server user holds exactly the condition's rights; with a data path alone, `GROUP`, every slot; None when
+        it needs neither. The scheduler asks it of every run of the plan when the campaign is built, so a condition
+        whose rights no slot declares is refused then, never at a run's mint."""
+        mode = self.mode(factors)
+        condition = self._tool_condition(factors)
+        if condition is not None:
+            return self.condition_group(condition)
+        return GROUP if mode is not DataPathMode.NONE else None
+
+    def condition_group(self, condition: str) -> str:
+        """The lease group of a tool-server condition: the slots whose tool-server user declares its rights. Raise
+        ConfigError, naming the condition by its position and the rights, when it is not declared or no slot declares
+        its rights."""
+        rights = self._config.condition(condition).rights
+        try:
+            return self._slots.group_for(rights)
+        except ValueError:
+            raise ConfigError(
+                f"{self._config.file}: [slots]: no slot's tool-server user declares the rights of [toolserver] "
+                f"{self._config.condition_label(condition)} ({', '.join(rights)}), so its runs could lease no slot"
+            ) from None
 
     def lease_keys(self, group: str) -> Sequence[str]:
-        """The keys of a lease group: the names of `[slots]`; a group this layer does not declare is refused."""
+        """The keys of a lease group: every slot of `[slots]` for `GROUP`, those of one set of tool-server rights for its
+        group; a group the slots do not declare is refused."""
         return self._slots.keys_of(group)
 
     def sandbox_probe(self) -> SandboxProbe:
@@ -501,20 +524,13 @@ class SandboxPlatform:
             raise
         try:
             yield sandbox
-        except Exception:
-            refused = await self._gate_refused(sandbox)
-            await self._stop(ctx, sandbox, quiet=True)
-            if refused is not None:  # the gate cut the condition's read: that, not the body's failure, ends the run
-                raise refused from None
+        except Exception as error:
+            await self._end_run(ctx, sandbox, error)
             raise
-        except BaseException:
+        except BaseException:  # a cancellation: the stop waits for a deadline under way, and the run is not classified
             await self._stop(ctx, sandbox, quiet=True)
             raise
-        refused = await self._gate_refused(sandbox)
-        if refused is not None:  # a refusal no cell reported (a read the agent's code left running): the same end
-            await self._stop(ctx, sandbox, quiet=True)
-            raise refused
-        await self._stop(ctx, sandbox, quiet=False)
+        await self._end_run(ctx, sandbox, None)
 
     @contextlib.asynccontextmanager
     async def tool_server(
@@ -536,6 +552,31 @@ class SandboxPlatform:
             ctx, plane.condition, plane.token, ceiling_s=ceiling_s, extra_env=extra_env, principal=plane.principal
         ) as provider:
             yield provider
+
+    async def _end_run(self, ctx: CallContext, sandbox: DockerSandbox, error: Exception | None) -> None:
+        """Stop a run whose body ended, by returning (`error` None) or raising `error`, and raise how it ended; return
+        only when the body's own error stands, for the caller to raise. First any cell's deadline is settled
+        (`settle_deadline`): the loop gives a cell the agent's remaining time, so it cuts the call at the cell's own cap
+        and would score the agent's `time_cap` while the escalation still runs. A deadline that went past a clean kill
+        ends the run as `cell_unkillable` (O34), before anything else: the gate's log, gone with a stopped sandbox, is
+        then not the run's evidence. Then the gate's refusals: the gate cut the condition's read, which ends the run,
+        not the body's own failure, and a refusal no cell reported (a read the agent's code left running) the same
+        (O05, C01). A run with neither stops, and one whose body returned must be shown gone."""
+        try:  # after the body, as the gate's refusals are read: no agent's time runs any more
+            ended = await asyncio.to_thread(sandbox.settle_deadline)
+            refused = None if ended is not None else await self._gate_refused(sandbox)
+        except BaseException:
+            await self._stop(ctx, sandbox, quiet=True)
+            raise
+        if ended is not None:
+            await self._stop(ctx, sandbox, quiet=True)
+            if isinstance(error, InfraError) and error.kind == kinds.CELL_UNKILLABLE:
+                return  # the cell's own report of it
+            raise kinds.run_ended_error(ended) from None
+        if refused is not None:
+            await self._stop(ctx, sandbox, quiet=True)
+            raise refused from None
+        await self._stop(ctx, sandbox, quiet=error is not None)
 
     @staticmethod
     async def _gate_refused(sandbox: DockerSandbox) -> InfraError | None:
