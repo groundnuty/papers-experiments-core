@@ -44,9 +44,11 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   transfers are not touched: the platform layer's per-run reset (#118) is to take them, and to replace the directory
   eviction and the sweep behind the same function, `evict_replicas(boot, timeout_s)`.
 - A bare **reset** is refused with a message naming both, so nobody wipes ingested datasets by accident.
-- **down** reads each service's peak memory, runs `docker compose down` for the project, then removes the root with
+- **down** reads each service's peak memory, runs `docker compose down --volumes` for the project (all the data is
+  bind-mounted under the root, so no volume holds anything the federation needs), then removes the root with
   everything in it, through a container of the project with no network (the services write their data as root), and
-  checks that no container, network or file of the project is left. It runs Compose only over a root that exists and
+  checks that no container, network, Docker volume labelled with the project (`com.docker.compose.project`) or file
+  of the project is left; a volume left fails the command, naming it. It runs Compose only over a root that exists and
   carries the project's mark: with the root gone and nothing of the project left it does nothing, and with the root
   gone while containers or networks of the project remain it refuses.
 

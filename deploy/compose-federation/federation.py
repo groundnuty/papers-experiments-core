@@ -16,8 +16,11 @@ declares it.
 - reset --replicas: start whatever is stopped, check every step again, keep every owner's data, and evict only what
   the mirrors hold, verified on the block maps (fedreplicas.py). For between runs. A bare `reset` is refused, naming
   both, so nobody wipes ingested datasets by accident.
-- down: remove the project's containers and network, then the root with everything in it, the CA and the secrets
-  included. Nothing of the federation is left on disk, and the next up makes everything anew.
+- down: remove the project's containers, network and volumes (`compose down --volumes`; the federation's data is
+  all bind-mounted under the root, so no volume holds anything it needs), then the root with everything in it, the CA
+  and the secrets included. It then checks that no container, network or Docker volume labelled with the project is
+  left, and fails naming the volumes if one is. Nothing of the federation is left on disk, and the next up makes
+  everything anew.
 - status: the project's containers, the root's allowed parent, and whether facts.json exists.
 - memory: each service's declared limit, and what its cgroup reads now and at its peak since the container started.
 - describe: the declared layout and the root, as the table the day-0 report records.
@@ -45,6 +48,7 @@ from feddocker import (
     memory_usage,
     project_containers,
     project_networks,
+    project_volumes,
     require_images,
     require_memory_fits,
     require_own,
@@ -293,12 +297,20 @@ def down(layout: Layout) -> str:
     if layout.inner_roots:
         raise RuntimeError("the root holds another federation's root; nothing stopped or deleted")
     peaks = memory_usage(containers)
-    compose(layout, "down", "--remove-orphans", "--timeout", "120")
+    # `--volumes`: any anonymous or project volume goes with the containers. The federation's data is all bind-mounted
+    # under its root, so nothing it needs is lost.
+    compose(layout, "down", "--volumes", "--remove-orphans", "--timeout", "120")
     timer.mark("containers")
     compose(layout, "--profile", "janitor", "run", "--rm", "--no-deps", "janitor")
     layout.root.rmdir()
     timer.mark("data")
     left = project_containers(project) + project_networks(project)
+    volumes = project_volumes(project)
+    if volumes:
+        raise RuntimeError(
+            f"down left {len(volumes)} volume(s) labelled with the project {project} behind ({', '.join(volumes)}); "
+            "docker compose down --volumes did not remove them, and nothing else removes them"
+        )
     if left or layout.root.exists():
         raise RuntimeError(f"down left {len(left)} container(s) or network(s), or the root, behind")
     summary = timer.summary("down")
