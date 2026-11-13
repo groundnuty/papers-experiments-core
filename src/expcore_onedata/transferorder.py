@@ -25,12 +25,21 @@ they are few, and any job in them matters, so the readers read them to their end
 are allowed, since the listing orders one second's jobs by id. The page that holds the stop is read to its end for the
 check, so an older job listed out of place ahead of newer ones on that page, which would end the walk early, is caught
 there. One that fills the page alone, or ends it, is caught past it: when the stop's page is not the last, the walk
-reads the next page and its first job's record, and that job must have finished no later than the last finish read.
-The check costs one page more and, as a rule, one record (a record without a finish time passes the check to the job
-after it on that page), and it is the only read past the stop's page; the jobs beyond that first one rest on the order.
-A time later than the one before it raises `OrderBroken`, an `Unreadable`: the reader fails closed, naming the
-assumption, and never stops early on a listing it cannot trust. A record that gives no finish time neither stops the
-walk nor takes part in the check, and is kept; a reader that needs the time says so in `finish`.
+reads the next page and every record on it, in the reader's chunks, and keeps none of them; each must have finished no
+later than the one before it, the last finish read on the stop's page first. So a job of the window anywhere on that
+page, behind an older one (cutoff 985, pages `[100]` and `[90, 1010]`), is caught. The check costs one page and the
+records on it (up to a page's `limit`, as many reads as the stop's page cost at most), and it is the only read past the
+stop's page. A time later than the one before it raises `OrderBroken`, an `Unreadable`: the reader fails closed,
+naming the assumption, and never stops early on a listing it cannot trust. A record that gives no finish time neither
+stops the walk nor takes part in the check, and is kept; a reader that needs the time says so in `finish`.
+
+**The residual.** A job of the window listed two or more pages past the stop is not seen, and nothing reports it:
+catching it would take reading the whole listing, the space's history, which is what the walk exists to avoid. The
+walk rests there on the order holding by construction: an ended job's link is added with its finish time as the
+timestamp (`transfer_links.erl:83-95`, `add_ended`) and its key is `9999999999 - T` ahead of the id
+(`:160-164`, `link_key`), so the listing cannot put a job that finished later after one that finished earlier while
+the source is what runs. The check past the stop guards that assumption where its failure would cost a job of the
+window, at the stop; it is not a proof of the order beyond it.
 
 **Never** a page token built by hand to start at a time: the token's form is undocumented. The walk starts at the
 first page and follows the tokens the platform gives.
@@ -41,7 +50,7 @@ second-level times of the listing clear of rounding at the edge.
 """
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -87,70 +96,82 @@ def newest_first(
     reads the records of a few ids in their order, `chunk` at a time; `finish` gives a record's finish time, None when
     it has none, and `ended` whether the record says the job ended (every record, by default). Past `bound` kept jobs,
     or `max_pages` pages without an end, the listing is unknown: raise Unreadable. Raise OrderBroken when a finish time
-    is later than the one before it, the first job past the stop's page included, which the walk reads for that check
-    alone (one page more than `max_pages` at most). `where` starts every message."""
+    is later than the one before it, through the page past the stop's, whose every record the walk reads for that check
+    alone and keeps none of (one page more than `max_pages` at most). An order broken only further on is not seen: the
+    module docstring has the residual. `where` starts every message."""
     if bound < 1 or max_pages < 1 or chunk < 1:
         raise ValueError("a walk keeps at least one job, reads at least one page and one record at a time")
     kept: dict[str, Any] = {}
-    newest = last = None
+    order = _Order(where)
     stopped = False
     token: str | None = None
     for pages in range(1, max_pages + 1):
         ids, token = page(token)
-        for start in range(0, len(ids), chunk):
-            part = ids[start : start + chunk]
-            for tid, record in zip(part, read(part), strict=True):
-                moment = finish(record)
-                if moment is not None:
-                    if last is not None and moment > last:
-                        raise OrderBroken(
-                            f"{where}the ended listing is not newest first: a job's finishTime is later than that of "
-                            "the job listed before it, and reading only a window assumes that order; the listing is "
-                            "unknown, not cut"
-                        )
-                    last = moment
-                    newest = moment if newest is None else newest
-                    if moment < cutoff and ended(record):
-                        stopped = True
-                        continue  # ended before the window: the walk ends with this page, which is read for the check
-                kept[tid] = record
-                if len(kept) > bound:
-                    raise Unreadable(
-                        f"{where}the ended listing holds more than {bound} transfers in the window: the listing is "
-                        "unknown, not cut"
-                    )
-        if stopped and token is not None and last is not None:
-            _check_past_stop(page, read, finish, token, last, where)
-            return Walk(kept, newest, stopped, pages + 1)
+        for tid, record in _records(ids, read, chunk):
+            moment = finish(record)
+            if moment is not None:
+                order.check(moment, "a job's finishTime is later than that of the job listed before it")
+                if moment < cutoff and ended(record):
+                    stopped = True
+                    continue  # ended before the window: the walk ends with this page, which is read for the check
+            kept[tid] = record
+            if len(kept) > bound:
+                raise Unreadable(
+                    f"{where}the ended listing holds more than {bound} transfers in the window: the listing is "
+                    "unknown, not cut"
+                )
+        if stopped and token is not None:
+            _check_past_stop(page(token)[0], read, finish, chunk, order)
+            return Walk(kept, order.newest, stopped, pages + 1)
         if stopped or token is None:
-            return Walk(kept, newest, stopped, pages)
+            return Walk(kept, order.newest, stopped, pages)
     raise Unreadable(f"{where}the ended listing did not end within {max_pages} pages")
 
 
+class _Order:
+    """The running check of a walk: each finish time read is no later than the one before it. `check` updates `last`
+    and `newest` in place, since the walk's pages and the page past its stop are one sequence."""
+
+    def __init__(self, where: str) -> None:
+        self.where = where
+        self.last: float | None = None  # the last finish time read
+        self.newest: float | None = None  # the first one read
+
+    def check(self, moment: float, what: str) -> None:
+        """Take the next finish time read, or raise OrderBroken, saying `what` broke the order."""
+        if self.last is not None and moment > self.last:
+            raise OrderBroken(
+                f"{self.where}the ended listing is not newest first: {what}, and reading only a window assumes that "
+                "order; the listing is unknown, not cut"
+            )
+        self.last = moment
+        self.newest = moment if self.newest is None else self.newest
+
+
+def _records(
+    ids: Sequence[str], read: Callable[[Sequence[str]], Sequence[Any]], chunk: int
+) -> Iterator[tuple[str, Any]]:
+    """Each id of a page with its record, the records read `chunk` at a time in the page's order."""
+    for start in range(0, len(ids), chunk):
+        part = ids[start : start + chunk]
+        yield from zip(part, read(part), strict=True)
+
+
 def _check_past_stop(
-    page: Callable[[str | None], tuple[list[str], str | None]],
+    ids: Sequence[str],
     read: Callable[[Sequence[str]], Sequence[Any]],
     finish: Callable[[Any], float | None],
-    token: str,
-    last: float,
-    where: str,
+    chunk: int,
+    order: _Order,
 ) -> None:
-    """Raise OrderBroken when the first job past the stop, on the page after `token`, finished later than `last`, the
-    last finish read: the jobs past the stop are taken to be older and never read, so an older job alone ahead of newer
-    ones would otherwise end the walk unseen. The page's records are read one at a time, in their order, until one
-    gives a finish time, so as a rule the check costs one page and one record; none that gives one passes."""
-    ids, _ = page(token)
-    for tid in ids:
-        moment = finish(read([tid])[0])
-        if moment is None:
-            continue  # no time to compare: the next job on the page is the one checked
-        if moment > last:
-            raise OrderBroken(
-                f"{where}the ended listing is not newest first: the first job past the page that ends the walk "
-                "finished later than the last job read on it, and reading only a window assumes that order; the "
-                "listing is unknown, not cut"
-            )
-        return
+    """Read every record of the page past the stop (`ids`) and raise OrderBroken when a finish time on it is later
+    than the one before it, the last read on the stop's page first: the jobs past the stop are taken to be older and
+    are never kept, so an older job ahead of newer ones, alone on the stop's page or anywhere on this one, would
+    otherwise end the walk with a job of the window unseen. A record without a finish time takes no part."""
+    for _, record in _records(ids, read, chunk):
+        moment = finish(record)
+        if moment is not None:
+            order.check(moment, "a job on the page past the one that ends the walk finished later than one before it")
 
 
 def window_opens(

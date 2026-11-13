@@ -46,15 +46,25 @@ def test_o32_an_order_violation_across_the_stopping_pages_boundary_fails_closed(
         walk(listing)
 
 
-def test_o32_the_check_past_the_stop_costs_one_page_and_one_record():
-    """O32: past the page that holds the stop, the walk reads one more page and the record of its first job, finds it
-    no later than the last finish read, and returns what it kept, saying older jobs exist. The page after that is
-    never read."""
+def test_o32_a_job_of_the_window_behind_an_older_one_past_the_stop_fails_closed():
+    """O32: an old job alone on the first page ends the walk there; on the next page an older job comes first and the
+    run's job after it, so the first record past the stop is in order and the run's job is not. Every record of the
+    page past the stop is checked, so the walk raises rather than return an empty window (cutoff 985)."""
+    listing = Listing([("old", 100.0)], [("older", 90.0), ("run", 1010.0)])
+    with pytest.raises(OrderBroken, match="newest first"):
+        walk(listing)
+    assert listing.records_read == ["old", "older", "run"]
+
+
+def test_o32_the_check_past_the_stop_costs_one_page_and_its_records():
+    """O32: past the page that holds the stop, the walk reads one more page and every record on it, finds each no
+    later than the one before it, keeps none, and returns what it kept, saying older jobs exist. The page after that
+    is never read."""
     listing = Listing([("run", 1010.0), ("old", 100.0)], [("older", 90.0), ("oldest", 80.0)], [("ancient", 10.0)])
-    found = walk(listing)
+    found = walk(listing, chunk=2)
     assert (list(found.kept), found.newest, found.earlier, found.pages) == (["run"], 1010.0, True, 2)
     assert listing.pages_read == [0, 1]
-    assert listing.records_read == ["run", "old", "older"]
+    assert listing.records_read == ["run", "old", "older", "oldest"]
 
 
 def test_o32_an_equal_finish_time_past_the_stop_is_in_order():
@@ -64,9 +74,9 @@ def test_o32_an_equal_finish_time_past_the_stop_is_in_order():
 
 
 @pytest.mark.parametrize(("then", "broken"), [(1010.0, True), (50.0, False)])
-def test_o32_a_record_past_the_stop_without_a_finish_time_passes_the_check_to_the_next(then, broken):
-    """O32: a record that gives no finish time takes no part in the check, so the job after it on that page is the
-    one compared: a later finish there still breaks the order, and an earlier one keeps it."""
+def test_o32_a_record_past_the_stop_without_a_finish_time_takes_no_part_in_the_check(then, broken):
+    """O32: a record that gives no finish time takes no part in the check, so the job after it on that page is
+    compared with the last finish read: a later finish there still breaks the order, and an earlier one keeps it."""
     listing = Listing([("old", 100.0)], [("unknown", None), ("then", then)])
     if broken:
         with pytest.raises(OrderBroken):

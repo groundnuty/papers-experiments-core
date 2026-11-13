@@ -39,8 +39,8 @@ def test_o32_thousands_of_ended_jobs_from_earlier_runs_leave_the_runs_reading_kn
     """O32: 3000 ended jobs of earlier runs, more than `MAX_LISTED`, and the run's own replication: the probes read
     the ended listing newest first and stop at the first job older than the window, so the reading is known, holds
     the run's job alone, and the bound on bytes fetched on demand is known. At most the page that holds the stop and
-    the first record of the page after it, which checks the order across the stop, are read past the window, never
-    the history."""
+    the page after it, whose every record checks the order across the stop, are read past the window, never the
+    history."""
     seeded.clock = ticker.clock
     history = earlier_runs(seeded, 3000)
     assert len(history) > MAX_LISTED
@@ -55,7 +55,7 @@ def test_o32_thousands_of_ended_jobs_from_earlier_runs_leave_the_runs_reading_kn
     assert [r["transfer_id"] for r in section["records"]] == [tid]
     assert section["listed"] == 1
     assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] == 0
-    assert len(record_reads(seeded)) <= 2 * section["polls"] * (100 + 1)  # each provider, each observation
+    assert len(record_reads(seeded)) <= 2 * section["polls"] * (100 + 100)  # each provider, each observation
 
 
 @pytest.mark.parametrize(("inside", "known"), [(2, True), (3, False)])
@@ -89,7 +89,7 @@ def test_o32_a_listing_out_of_newest_first_order_fails_closed_naming_the_assumpt
     """O32: the stop rests on the order, so a finish time later than the one before it makes the reading unknown,
     with the assumption named, rather than ending the walk early and missing the run's jobs. Moving an older job ahead
     of the run's is caught by the page that holds the stop, which is read to its end for the check, or, when that job
-    fills its page alone, by the first job of the page after it, which the walk reads for the check."""
+    fills its page alone, by the page after it, whose every record the walk reads for the check."""
     seeded.clock = ticker.clock
     old = earlier_runs(seeded, 5)[-1]
     probes = made_with(client, provisioner, ticker, page_limit=page_limit)
