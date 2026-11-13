@@ -39,9 +39,10 @@ walk rests there on the order holding by construction: an ended job's link is ad
 timestamp (`transfer_links.erl:83-95`, `add_ended`) and its key is `9999999999 - T` ahead of the id
 (`:160-164`, `link_key`), so the listing cannot put a job that finished later after one that finished earlier while
 the source is what runs. The check past the stop guards that assumption where its failure would cost a job of the
-window, at the stop; it is not a proof of the order beyond it. A job cancelled while still waiting is given no finish
-time (`replication_status.erl:264-271`, `replica_eviction_status.erl:257-262`): its `finishTime` stays 0, so the ended
-listing puts it last, past every stop, and no walk reads it.
+window, at the stop; it is not a proof of the order beyond it. A job cancelled while still scheduled, before it was
+enqueued, is given no finish time (`replication_status.erl:264-271`, `replica_eviction_status.erl:257-262`; one
+cancelled once enqueued is stamped): its `finishTime` stays 0, so the ended listing puts it last, past every stop, and
+no walk reads it.
 
 **Never** a page token built by hand to start at a time: the token's form is undocumented. The walk starts at the
 first page and follows the tokens the platform gives.
