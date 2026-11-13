@@ -6,6 +6,7 @@ Every test runs against `FakeServices`, whose `never_serves` knob is a provider 
 
 import asyncio
 import json
+import threading
 
 import pytest
 from fault_support import OUTAGE_TARGET, SERVICES, FakeServices, injector_for, write_faults
@@ -230,6 +231,61 @@ def test_o11_a_cancelled_run_stays_cancelled_and_carries_the_failed_restore_as_a
 
     cancelled = asyncio.run(scenario())
     assert any(OUTAGE_TARGET in note and "not_serving" in note for note in cancelled.__notes__)
+    assert len(open_injections(tmp_path)) == 1
+
+
+def cancelled_during_the_clear(tmp_path, *, cancel_wait_s=None, body_raises=False):
+    """Run `running` over a provider that never serves, with the clear held in its worker thread by the driver, cancel
+    the task while the clear runs, let the clear go (after the cancellation's wait, when it is bounded), and return the
+    cancellation raised and the injector."""
+    release, held = threading.Event(), threading.Event()
+    services = FakeServices(never_serves=True)
+
+    def hold(service):
+        held.set()
+        release.wait(10)
+
+    services.on_serves = hold
+    injector = injector_for(write_faults(tmp_path), services)
+
+    async def scenario():
+        async def run():
+            async with injector.running(RUN, cancel_wait_s=cancel_wait_s):
+                if body_raises:
+                    raise RuntimeError("the trial broke")
+
+        task = asyncio.create_task(run())
+        await asyncio.to_thread(held.wait, 10)
+        task.cancel()
+        if cancel_wait_s is None:
+            threading.Timer(0.2, release.set).start()  # the clear finishes only after the cancellation
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        release.set()
+        return caught.value
+
+    return asyncio.run(scenario()), injector
+
+
+def test_o11_a_run_cancelled_while_it_clears_carries_the_failed_restore_as_a_note(tmp_path):
+    """O11: the body returned and the task was cancelled during the clear, which finished inside the wait with the
+    restore not verified: the cancellation is raised as it was, with the restore failure in its notes."""
+    cancelled, _ = cancelled_during_the_clear(tmp_path)
+    assert any(OUTAGE_TARGET in note and "not_serving" in note for note in cancelled.__notes__)
+    assert len(open_injections(tmp_path)) == 1
+
+
+def test_o11_a_second_cancellation_during_the_clear_of_a_cancelled_body_carries_the_failed_restore_too(tmp_path):
+    """O11: the body raised, and the clear that follows is cancelled too: the second cancellation notes the failure."""
+    cancelled, _ = cancelled_during_the_clear(tmp_path, body_raises=True)
+    assert any(OUTAGE_TARGET in note and "not_serving" in note for note in cancelled.__notes__)
+
+
+def test_o11_a_clear_still_running_when_the_wait_for_it_ends_is_noted_as_not_verified(tmp_path):
+    """O11: the wait for the clear is bounded; when it ends with the clear still running, the cancellation says so
+    without taking the injector's lock, and the injection stays open."""
+    cancelled, _ = cancelled_during_the_clear(tmp_path, cancel_wait_s=0.05)
+    assert any(OUTAGE_TARGET in note and "still running" in note for note in cancelled.__notes__)
     assert len(open_injections(tmp_path)) == 1
 
 

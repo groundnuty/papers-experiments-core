@@ -418,13 +418,26 @@ class FaultInjector:
         self.check()
 
     async def _clear_for(self, bound: float) -> None:
-        """Clear in a worker thread, shielded: a cancellation waits for it for at most `bound` and is raised again."""
+        """Clear in a worker thread, shielded: a cancellation waits for it for at most `bound` and is raised again, with
+        in its notes what the clear found (a restore not verified), or that it was still running when the wait ended."""
         clearing = asyncio.ensure_future(asyncio.to_thread(self.clear))
         try:
             await asyncio.shield(clearing)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             await _outlast(clearing, bound)
+            self._note_clear(cancelled, clearing)
             raise
+
+    def _note_clear(self, error: BaseException, clearing: "asyncio.Future[Any]") -> None:
+        """Add to `error`, a cancellation that interrupted the clear's wait, the restore failure the clear left, or that
+        the clear was still running (then the injector's lock is not taken, so the bound holds)."""
+        if not clearing.done():
+            error.add_note(f"the clear of {self.target} was still running when the wait for it ended: not verified")
+            return
+        with self._mutex:
+            failure = self._unrestored()
+        if failure is not None:
+            error.add_note(str(failure))
 
     def finish(self) -> dict[str, Any]:
         """Bring the target back and verify it (`clear`), then return the snapshot of every step. It never raises for
