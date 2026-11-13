@@ -39,15 +39,17 @@ read and every check is made on each provider that supports the space, since eac
    `since` (`uncertain`), the newest finish time, read from the records, whether older ended jobs are listed too
    (`earlier`), and `removable` false, its limit stated. The history grows with every run, so the listing is read
    newest first down to the window less the clock-skew allowance and `transferorder.STOP_MARGIN_S`, its order checked
-   as it goes, never whole (O32); `LISTED_MAX` counts the jobs read down to there. A finish time is on the platform's
-   global clock and a listing answer's Date header on the provider's system clock (`transferorder.py` has the source),
-   so no provider's offset places a job by itself: the Date headers of those answers give the band at the window's
-   start (`transferorder.start_band`, recorded under `clock`), from `since` moved by the least offset less the
-   allowance to `since` moved by the greatest plus it, the band in which the probes flag a job near the window's edge.
-   A job counts in `ended` when every provider's record puts its finish after the band; one in the band, or put on
-   both sides, counts in `uncertain` alone; one before it is an older job, as is one read in the margin. `ended` is
-   exact when `uncertain` is 0, and a lower bound otherwise. A Date that cannot be read, or a provider clock more than
-   the margin behind this host's, fails the stage.
+   as it goes, never whole (O32); `LISTED_MAX` counts the jobs read down to there. A finish time is stamped on the
+   platform's global clock, Onezone's, and a provider's Date header gives its system clock (`transferorder.py` has the
+   source), so the band at the window's start is placed on Onezone's clock: the Date headers of Onezone's answers to a
+   read of the space, made before and after the listings, give its offset from this host, and the band runs from
+   `since` moved by the least offset less the allowance to `since` moved by the greatest plus it
+   (`transferorder.start_band`, recorded under `clock`, with each provider's Date offsets beside it, a diagnostic that
+   places nothing), the band in which the probes flag a job near the window's edge. A job counts in `ended` when every
+   provider's record puts its finish after the band; one in the band, or put on both sides, counts in `uncertain`
+   alone; one before it is an older job, as is one read in the margin. `ended` is exact when `uncertain` is 0, and a
+   lower bound otherwise. A Date of Onezone's that cannot be read, or Onezone's clock more than the margin behind this
+   host's, fails the stage.
 
 **Before any stage** the plan is checked (no provider to evict from or allowed to hold bytes is the data provider, by
 name or id, or one that does not support the space) and the space's live name is verified (`verify_space`).
@@ -416,9 +418,16 @@ class SpaceReset:
             raise Unreadable("an ended transfer's record has no finishTime that is a number")
         return float(value)
 
+    def _zone_offset(self) -> float | None:
+        """Onezone's clock offset from this host, the clock finish times are stamped on, from the Date header of its
+        answer to a read of the space (the read `space_name` makes); None when the header cannot be read."""
+        _, date = self._p.client.get_dated(f"/spaces/{self._p.space_id}", retry=self._p.retry)
+        return offset_of(date, self._now())
+
     def _dated_page(self, provider: str, token: str | None) -> tuple[list[str], str | None, float | None]:
         """One page of a provider's ended listing (its ids and the next page's token, None on the last) with the
-        provider's clock offset from this host that the answer's Date header gives, None when it cannot be read."""
+        provider's system-clock offset from this host that the answer's Date header gives, None when it cannot be read:
+        a diagnostic, since a finish time is on Onezone's clock."""
         params = {"state": "ended", "limit": PAGE_LIMIT, **({"page_token": token} if token else {})}
         path = f"/spaces/{self._p.space_id}/transfers"
         answer, date = self._p.client.get_dated(path, provider=provider, params=params, retry=self._p.retry)
@@ -452,15 +461,18 @@ class SpaceReset:
         """What the ended listing shows the next agent since `since`, per provider and together: the count of the jobs
         that surely ended since then, the count of those that may have ended on either side of it, the newest finish,
         and whether older jobs are listed too. Each provider's listing is read newest first down to `since` less the
-        allowance and the margin, never the whole history; the Date headers of those answers place the band at the
-        window's start (`transferorder.start_band`), and a clock that cannot be read, or that puts the band below where
-        the reading stops, fails the stage."""
+        allowance and the margin, never the whole history; Onezone's Date headers, read before and after the listings,
+        place the band at the window's start (`transferorder.start_band`), and a clock of Onezone's that cannot be read,
+        or that puts the band below where the reading stops, fails the stage."""
         allowance = self._p.settings.clock_skew_allowance_s
         cutoff = since - allowance - STOP_MARGIN_S
         walks, offsets = {}, {}
+        zone = [self._zone_offset()]
         for provider in self._providers:
             walks[self._label(provider)], offsets[self._label(provider)] = self._walk_ended(provider, cutoff)
-        band, clock = start_band(since, offsets, allowance)
+        zone.append(self._zone_offset())
+        band, clock = start_band(since, zone, allowance)
+        clock["provider_offsets_s"] = {label: _span(samples) for label, samples in offsets.items()}
         per: dict[str, Any] = {}
         places: dict[str, set[str]] = {}  # job id -> where each provider's record puts it
         for label, walk in walks.items():
@@ -487,6 +499,12 @@ class SpaceReset:
             "clock": clock,
             "providers": per,
         }
+
+
+def _span(samples: Sequence[float | None]) -> list[float] | None:
+    """The least and greatest of a provider's Date offsets, a diagnostic; None when no answer's Date could be read."""
+    seen = [round(offset, 3) for offset in samples if offset is not None]
+    return [min(seen), max(seen)] if seen else None
 
 
 __all__ = ["STAGES", "ResetFailed", "SpaceReset"]

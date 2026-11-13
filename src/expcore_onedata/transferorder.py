@@ -48,8 +48,8 @@ no walk reads it.
 first page and follows the tokens the platform gives.
 
 `STOP_MARGIN_S` widens a reader's cutoff below its window's start (and below the clock-skew allowance it adds): it is
-how far behind this host a provider's clock may run before the probes fail closed (`transferlog.py`), and it keeps the
-second-level times of the listing clear of rounding at the edge.
+how far behind this host Onezone's clock may run before the readers fail closed, and it keeps the second-level times
+of the listing clear of rounding at the edge.
 
 **The clock a finish time is on, from the source.** The provider that runs a job stamps its finish: a replication's
 (`replicatingProviderId` in the record), an eviction's (`evictingProviderId`), and for a migration the evicting one
@@ -59,21 +59,36 @@ finish to its eviction (`replication_status.erl:222-231`; `replica_eviction_stat
 `global_clock:monotonic_timestamp_seconds`, which ctool (op-worker's pin `8ae7baf`, `global_clock.erl:8-46`) defines
 as Onezone's cluster time: the provider's system clock moved by a bias measured against Onezone, with an error "below
 a second" that "can grow to a couple of seconds", or the system clock itself while it is not synchronised; by default a
-provider connects to Onezone only once it is (`gs_channel_service.erl:41-46`). A listing answer's `Date` header is
-cowboy's `erlang:universaltime()` (cowboy 2.9.0, ctool's pin, `cowboy_clock.erl:61,74,97`), the system clock. So the
-offset a provider's Date header gives is not the offset of the clock its finish times are on, and a record cannot say
-which offset applies: no job can be placed by its stamping provider's offset alone.
+provider connects to Onezone only once it is (`gs_channel_service.erl:41-46`). A provider's answer's `Date` header is
+cowboy's `erlang:universaltime()` (cowboy 2.9.0, ctool's pin, `cowboy_clock.erl:61,74,97`), its system clock, so a
+provider's Date offset says nothing of the clock its finish times are on: providers 8 s ahead by their Date headers
+may stamp on a global clock that agrees with this host's.
+
+**Onezone's clock places a finish time.** On Onezone the global clock is its own: `global_clock`'s time is the node's
+system clock plus a bias that is 0 until a synchronisation sets one, "identical to Onezone's cluster time" (ctool
+`8ae7baf`, `global_clock.erl:9-10,86-87,259-262`), and the providers synchronise theirs to Onezone's public
+`GET /provider/public/get_current_time`, which needs no privilege and answers `global_clock:timestamp_millis()` as
+`timeMillis` (oz-worker `14b5bda`, which pins the same ctool: `provider_routes.erl:192-198`,
+`provider_logic_plugin.erl:304-305,491-492`, `provider_rest_translator.erl:128-129`; `provider_logic.erl:548-554`,
+"used by providers to synchronize clocks with onezone"). So a reader places its window on Onezone's clock: the `Date`
+header of Onezone's answer to a read of the space (`GET /spaces/{space}`, the read `space_name` makes, confirmed live)
+gives Onezone's offset from this host (`transferwindow.offset_of`), read before and after the listings. The clock-skew
+allowance covers what lies between that offset and a stamp: a provider's synchronisation error to Onezone, the
+header's whole second, and on a Onezone of several nodes the answering node's own synchronisation to the cluster's
+(`global_clock.erl:28-32`). A provider that is not synchronised stamps on its own system clock, which Onezone's offset
+does not bound; the places rest on the providers being synchronised, as the cutoff does. The providers' Date offsets
+are recorded beside Onezone's, a diagnostic that places nothing.
 
 **The band at the window's start.** A reader that counts the jobs that ended since a window's start places each finish
-time against a band, `start_band`: from the start moved by the least offset less the clock-skew allowance to the start
-moved by the greatest offset plus the allowance, in whole seconds (`transferwindow.Edges.opening`, the band in which
-the probes flag a job `transfer_near_window_edge`). A finish before the band ended before the start (`EARLIER`), one
-after it ended after the start (`INSIDE`), and one in it may lie on either side (`UNCERTAIN`), which the reader reports
-apart and never counts as either. The places are exact when the clock that stamped each finish lies within the
-allowance of the offsets the Date headers gave, the assumption the cutoff rests on as well.
+time against a band, `start_band`: from the start moved by Onezone's least offset less the clock-skew allowance to the
+start moved by its greatest offset plus the allowance, in whole seconds (`transferwindow.Edges.opening`, the band in
+which the probes flag a job `transfer_near_window_edge`). A finish before the band ended before the start (`EARLIER`),
+one after it ended after the start (`INSIDE`), and one in it may lie on either side (`UNCERTAIN`), which the reader
+reports apart and never counts as either. The places are exact when every stamp lies within the allowance of
+Onezone's clock as its Date headers gave it.
 """
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,39 +230,38 @@ class Band:
         return UNCERTAIN if moment <= self.last else INSIDE
 
 
-def start_band(since: float, offsets: Mapping[str, Sequence[float | None]], allowance: float) -> tuple[Band, dict]:
-    """The band at a window that starts at `since` on this host's clock, from the offsets the Date headers of the
-    listing answers gave (`offsets`, by provider label; `transferwindow.offset_of`), with the record of the clock:
-    `since` moved by the least offset less `allowance` to `since` moved by the greatest plus it, in whole seconds
-    (`transferwindow.Edges.opening`). A Date header gives the provider's system clock and a finish time is on the
-    platform's global clock (the module docstring has the source), so no one provider's offset places a job: the band
-    holds every place the start may have on the clock that stamped it, within the allowance.
+ZONE_UNREAD = (
+    "zone: an answer of Onezone's carried no Date header that could be read, so the clock finish times are stamped on "
+    "is unknown and the window cannot be placed on it"
+)
+ZONE_BEHIND = (
+    f"Onezone's clock, the one finish times are stamped on, runs more than {STOP_MARGIN_S:.0f} s behind this host's, "
+    "beyond the margin the ended listing is read back by, so the window may hold jobs past where the reading stopped"
+)
 
-    A reader walks down to `since` less `allowance` and `STOP_MARGIN_S` on this host's clock, so the check is the
-    probes' (`transferlog.py`): the band must not open below that cutoff, which a provider clock more than the margin
-    behind would make it do, leaving jobs that may be the window's past the stop. Raise Unreadable, naming the clock,
-    when it would, and when an answer's Date could not be read, since the band cannot then be placed. The margin decides
-    where reading stops, never what counts."""
-    if not offsets:
-        raise ValueError("a window is placed from one provider's listing answers at least")
-    unread = [label for label, samples in offsets.items() if not samples or None in samples]
-    if unread:
-        raise Unreadable(
-            f"{', '.join(unread)}: a listing answer carried no Date header that could be read, so the provider's clock "
-            "is unknown and the window cannot be placed on it"
-        )
-    seen = [offset for samples in offsets.values() for offset in samples if offset is not None]
+
+def start_band(since: float, zone: Sequence[float | None], allowance: float) -> tuple[Band, dict]:
+    """The band at a window that starts at `since` on this host's clock, from Onezone's clock offsets the Date headers
+    of its answers gave (`zone`; `transferwindow.offset_of`), with the record of the clock: `since` moved by the least
+    offset less `allowance` to `since` moved by the greatest plus it, in whole seconds (`transferwindow.Edges.opening`).
+    A finish time is stamped on the global clock, Onezone's, and the allowance covers what lies between (the module
+    docstring has the source); a provider's Date offset places nothing.
+
+    A reader walks down to `since` less `allowance` and `STOP_MARGIN_S` on this host's clock, so the band must not open
+    below that cutoff, which Onezone's clock more than the margin behind would make it do, leaving jobs that may be the
+    window's past the stop. Raise Unreadable, naming the clock, when it would, and when an answer's Date could not be
+    read, since the band cannot then be placed. The margin decides where reading stops, never what counts."""
+    seen = [offset for offset in zone if offset is not None]
+    if not seen or len(seen) < len(zone):
+        raise Unreadable(ZONE_UNREAD)
     low, high = min(seen), max(seen)
     first, last = Edges(Window(since, since), low, high, allowance).opening
     if first < since - allowance - STOP_MARGIN_S:
-        raise Unreadable(
-            f"a provider's clock runs more than {STOP_MARGIN_S:.0f} s behind this host's, beyond the margin the ended "
-            "listing is read back by, so the window may hold jobs past where the reading stopped"
-        )
+        raise Unreadable(ZONE_BEHIND)
     band = Band(int(first), int(last))
     clock = {
-        "least_offset_s": round(low, 3),
-        "greatest_offset_s": round(high, 3),
+        "zone_least_offset_s": round(low, 3),
+        "zone_greatest_offset_s": round(high, 3),
         "allowance_s": allowance,
         "band": [band.first, band.last],
     }
@@ -259,6 +273,8 @@ __all__ = [
     "INSIDE",
     "STOP_MARGIN_S",
     "UNCERTAIN",
+    "ZONE_BEHIND",
+    "ZONE_UNREAD",
     "Band",
     "OrderBroken",
     "Walk",

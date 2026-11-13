@@ -19,6 +19,7 @@ from expcore_onedata.testing.fake_onedata import Request
 PROVIDER = "/api/v3/oneprovider"
 ROOT_ID = "root-0001"
 EPOCH_INFINITY = 9_999_999_999  # the transfer listing's keys count down from it (`expcore_onedata.transferorder`)
+ZONE_CLOCK = "<the zone's clock>"  # `FakeData.zone_date`'s default: Onezone dates an answer by its clock
 
 # The shapes of the data API's errors a `FakeData` can answer with (`FakeData.error_shape`).
 ERRORS_25_0 = "25.0"  # as seen live on Onedata 25.0: an entry that is gone answers 400 posix/enoent, and so on
@@ -398,7 +399,12 @@ class FakeData(FakeFederation):
     - `listing_time`: job id to the time its listing key is built from in place of its record's, which lists it out
       of the newest-first order while its record keeps its own times (a broken order, for a reader's check);
     - every data-API answer has a `Date` header of `clock` moved by `provider_skew` (provider id to seconds ahead,
-      negative when behind); `date_override` (provider id to a header value, or None for none) replaces it.
+      negative when behind); `date_override` (provider id to a header value, or None for none) replaces it. A job's
+      times are `clock`'s, the platform's global clock, so a provider's skew moves its Date headers alone, as a
+      provider's system clock does;
+    - every answer of Onezone's has a `Date` header of `clock` moved by `zone_skew` (seconds ahead, negative when
+      behind; 0 by default, Onezone's clock being the global one), and `zone_date` replaces it as `date_override` does
+      a provider's (`ZONE_CLOCK`, the default, sends the clock's).
 
     `add_transfer` makes a job that no request to `/transfers` made, as a QoS requirement or another client does, with
     the times and the state a test gives it. `provider_calls` lists `(provider id, method, route)` of every provider
@@ -484,6 +490,8 @@ class FakeData(FakeFederation):
         self.listing_time: dict[str, float] = {}  # job id -> the time its listing key is built from (a broken order)
         self.provider_skew: dict[str, float] = {}  # provider id -> seconds its clock runs ahead (negative: behind)
         self.date_override: dict[str, str | None] = {}  # provider id -> the Date header it sends (None: none)
+        self.zone_skew = 0.0  # seconds Onezone's Date headers run ahead of `clock` (negative: behind)
+        self.zone_date: str | None = ZONE_CLOCK  # the Date header Onezone sends (None: none; ZONE_CLOCK: its clock's)
         self.listings = 0  # the listing answers given
         self._ids = itertools.count(1)
         self._root_polls = 0
@@ -799,9 +807,9 @@ class FakeData(FakeFederation):
         return self._error(status, error_id, errno)
 
     def respond(self, request: httpx.Request) -> httpx.Response:
-        """Answer a provider call here and anything else as the federation does."""
+        """Answer a provider call here and anything else as the federation does, dated by Onezone's clock."""
         if not request.url.path.startswith(PROVIDER):
-            return super().respond(request)
+            return self._zone_dated(super().respond(request))
         route = request.url.path.removeprefix(PROVIDER)
         provider = self.provider_of(request.url.host)
         with self._lock:
@@ -843,6 +851,14 @@ class FakeData(FakeFederation):
                 response.headers["Date"] = self.date_override[provider]
             return response
         response.headers["Date"] = formatdate(self.clock() + self.provider_skew.get(provider, 0.0), usegmt=True)
+        return response
+
+    def _zone_dated(self, response: httpx.Response) -> httpx.Response:
+        """Give an answer of Onezone's the Date header of its clock (`clock` moved by `zone_skew`), or `zone_date`."""
+        if self.zone_date == ZONE_CLOCK:
+            response.headers["Date"] = formatdate(self.clock() + self.zone_skew, usegmt=True)
+        elif self.zone_date is not None:
+            response.headers["Date"] = self.zone_date
         return response
 
     def _admin_route(self, method: str, route: str, sent: dict) -> httpx.Response:

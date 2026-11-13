@@ -1,5 +1,5 @@
 """The walk of the ended-transfer listing, newest first down to a cutoff, its order checked as it goes, and the band
-at a window's start on the clocks that stamp finish times (O32).
+at a window's start on Onezone's clock, the one that stamps finish times (O32).
 
 Each test of the walk hands `newest_first` a listing of its own: pages of ids with the next token, and each id's finish
 time as its record. The walk reads pages through `page` and records through `read`, so a test sees each read made."""
@@ -112,47 +112,56 @@ def test_o32_a_listing_that_ends_inside_the_window_says_no_older_job_exists():
 # -- the band at the window's start ----------------------------------------------------------------------------------
 
 
-def test_o32_the_band_runs_from_the_least_offset_less_the_allowance_to_the_greatest_plus_it():
-    """O32: a finish time is on the platform's global clock, not the system clock a Date header gives, so the band at
-    the window's start spans every place the start may have: the least offset less the allowance, rounded down, to the
-    greatest plus it, rounded up, in the listing's whole seconds."""
-    band, clock = start_band(1000.0, {"providers[0]": [0.2, -0.4], "providers[1]": [-3.5]}, 5.0)
+def test_o32_the_band_runs_from_onezones_least_offset_less_the_allowance_to_its_greatest_plus_it():
+    """O32: a finish time is stamped on the global clock, Onezone's, so the band at the window's start spans every
+    place the start may have on it: Onezone's least offset less the allowance, rounded down, to its greatest plus it,
+    rounded up, in the listing's whole seconds."""
+    band, clock = start_band(1000.0, [0.2, -3.5], 5.0)
     assert (band.first, band.last) == (991, 1006)
-    assert clock == {"least_offset_s": -3.5, "greatest_offset_s": 0.2, "allowance_s": 5.0, "band": [991, 1006]}
+    assert clock == {
+        "zone_least_offset_s": -3.5,
+        "zone_greatest_offset_s": 0.2,
+        "allowance_s": 5.0,
+        "band": [991, 1006],
+    }
 
 
-def test_o32_a_job_one_provider_stamped_before_the_window_is_uncertain_never_inside():
-    """O32: the delta review's case: offsets A 0 and B -8 and a job finishing at 995, which A's clock puts before a
-    window that starts at 1000. The least offset alone would open the window at 992 and count it; the record cannot
-    say whose clock stamped it, so it lies in the band and is uncertain, never inside."""
-    band, _ = start_band(1000.0, {"providers[0]": [0.0], "providers[1]": [-8.0]}, 5.0)
-    assert band.place(995.0) == UNCERTAIN
+@pytest.mark.parametrize(("moment", "place"), [(994.0, EARLIER), (1001.0, UNCERTAIN), (1006.0, INSIDE)])
+def test_o32_codexs_case_providers_ahead_and_onezone_agreeing_place_a_job_at_1001_never_earlier(moment, place):
+    """O32: the second delta review's case: both providers' Date headers run 8 s ahead, Onezone agrees with this host,
+    the allowance is 5 s. The providers' offsets gave the band 1003 to 1013, so a job that truly finished at 1001, on
+    Onezone's clock, was placed before the window: neither ended nor uncertain. On Onezone's offset the band is 995 to
+    1005, so it is uncertain, and one at 1006 is inside where the old band left it uncertain."""
+    band, clock = start_band(1000.0, [0.0, 0.0], 5.0)
+    assert clock["band"] == [995, 1005]
+    assert band.place(moment) == place
 
 
 @pytest.mark.parametrize(
     ("moment", "place"), [(986.0, EARLIER), (987.0, UNCERTAIN), (1005.0, UNCERTAIN), (1006.0, INSIDE)]
 )
 def test_o32_the_bands_edges_are_uncertain_and_a_second_past_either_is_not(moment, place):
-    """O32: with offsets A 0 and B -8 and an allowance of 5 s, the band at a start of 1000 is 987 to 1005, both ends
-    included: a finish a second before it ended before the start, and one a second after it ended after the start."""
-    band, clock = start_band(1000.0, {"providers[0]": [0.0], "providers[1]": [-8.0]}, 5.0)
+    """O32: with Onezone's offsets 0 and -8 and an allowance of 5 s, the band at a start of 1000 is 987 to 1005, both
+    ends included: a finish a second before it ended before the start, and one a second after it ended after it."""
+    band, clock = start_band(1000.0, [0.0, -8.0], 5.0)
     assert clock["band"] == [987, 1005]
     assert band.place(moment) == place
 
 
 @pytest.mark.parametrize(("behind", "fails"), [(STOP_MARGIN_S, False), (STOP_MARGIN_S + 1, True)])
-def test_o32_a_clock_more_than_the_margin_behind_leaves_the_window_unplaced(behind, fails):
-    """O32: a reader walks down to the start less the allowance and the margin; a provider clock behind by the margin
+def test_o32_onezones_clock_more_than_the_margin_behind_leaves_the_window_unplaced(behind, fails):
+    """O32: a reader walks down to the start less the allowance and the margin; Onezone's clock behind by the margin
     still opens the band at that cutoff, and one a second further behind opens it below, past the stop."""
-    offsets = {"providers[0]": [0.0], "providers[1]": [-behind]}
     if fails:
-        with pytest.raises(Unreadable, match="clock runs more than"):
-            start_band(1000.0, offsets, 5.0)
+        with pytest.raises(Unreadable, match="Onezone's clock, the one finish times are stamped on, runs more than"):
+            start_band(1000.0, [0.0, -behind], 5.0)
     else:
-        assert start_band(1000.0, offsets, 5.0)[0].first == 1000 - 5 - STOP_MARGIN_S
+        assert start_band(1000.0, [0.0, -behind], 5.0)[0].first == 1000 - 5 - STOP_MARGIN_S
 
 
-def test_o32_an_answer_without_a_readable_date_leaves_the_window_unplaced():
-    """O32: one listing answer whose Date could not be read leaves its provider's clock unknown, named by its label."""
-    with pytest.raises(Unreadable, match=r"providers\[1\]: a listing answer carried no Date"):
-        start_band(1000.0, {"providers[0]": [0.0], "providers[1]": [0.0, None]}, 5.0)
+@pytest.mark.parametrize("zone", [[], [0.0, None]])
+def test_o32_onezones_clock_unread_leaves_the_window_unplaced(zone):
+    """O32: no answer of Onezone's read, or one whose Date could not be read, leaves the clock that stamps finish
+    times unknown: the band is not placed."""
+    with pytest.raises(Unreadable, match="zone: an answer of Onezone's carried no Date"):
+        start_band(1000.0, zone, 5.0)

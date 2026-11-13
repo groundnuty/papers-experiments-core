@@ -2,18 +2,20 @@
 """The run's window on the transfer log, and the split of a provider's gained bytes into transfer bytes and the rest.
 
 **The window.** The run's window runs from its start to just after the block maps were read at its end, on this
-host's clock. A job's times are a provider's clock, so the window is moved onto the providers' clocks (`Edges`): every
-listing answer's `Date` header gives that provider's offset from this host (`offset_of`, the header's whole second
-less this host's time when the answer came), and the window is widened by the least and the greatest offset seen and
-by `[placement] clock_skew_allowance_s` (5 s by default) on each side. A job is in the window when its `scheduleTime`
+host's clock. A job's times are stamped on the platform's global clock, Onezone's (`transferorder.py` has the source),
+so the window is moved onto Onezone's clock (`Edges`): the `Date` header of each answer of Onezone's that the transfer
+log reads gives its offset from this host (`offset_of`, the header's whole second less this host's time when the
+answer came), and the window is widened by the least and the greatest offset seen and by `[placement]
+clock_skew_allowance_s` (5 s by default) on each side, which covers a provider's synchronisation error to Onezone and
+the header's whole second. A job is in the window when its `scheduleTime`
 lies in the widened one; the schedule time is the one every job has, a waiting one included, and it says when someone
 (the harness, the agent through the tool plane, a QoS requirement) started it. A job scheduled before the widened
 window that had not ended by its start (listed as waiting or ongoing, ended at or after it, or with no finish time) is
 not in the record, but it may have placed bytes during the run, so it is counted as carried over.
 
 Each edge of the window has a band of the same width on either side of it. A job whose schedule, start or finish time
-falls in a band may lie on either side of the edge, so it is ambiguous. A `Date` header that is missing or that cannot
-be read leaves that provider's offset unknown, and with it the window on the providers' clocks.
+falls in a band may lie on either side of the edge, so it is ambiguous. A `Date` header of Onezone's that is missing
+or that cannot be read leaves its offset unknown, and with it the window on its clock.
 
 **The split.** `split_gained` gives, per tracked receiving provider, `transfer_bytes_in`: the `bytesReplicated` of every
 job in the window that replicates into it (a replication's or a migration's `replicatingProviderId`; an eviction moves
@@ -29,7 +31,7 @@ or not, so the bound only errs low; `difference` keeps the unfloored value so th
 `listings_disagree` (the tracked providers do not list and answer a job into it alike, `transferlog.py`),
 `listing_not_settled` (a job into it still changed between the last two observations of the listing),
 `transfer_near_window_edge` (a job into it has a time in a band at an edge of the window), and
-`clock_offset_unknown` (a provider's clock could not be read, which leaves every bound unknown).
+`clock_offset_unknown` (Onezone's clock could not be read, which leaves every bound unknown).
 """
 
 import math
@@ -53,8 +55,8 @@ LISTING_DROPPED = "transfer_left_listing"
 
 
 def offset_of(date: str | None, host_now: float) -> float | None:
-    """Return a provider's clock offset from this host, in seconds, from the `Date` header of an answer that arrived at
-    `host_now`: positive when the provider's clock is ahead. None when the header is missing or cannot be read."""
+    """Return a server's clock offset from this host, in seconds, from the `Date` header of an answer that arrived at
+    `host_now`: positive when the server's clock is ahead. None when the header is missing or cannot be read."""
     if not isinstance(date, str):
         return None
     try:
@@ -79,8 +81,8 @@ class Window:
 
 @dataclass(frozen=True)
 class Edges:
-    """The run's window on the providers' clocks: widened by the least (`low`) and greatest (`high`) clock offsets
-    seen and the allowance, with a band of that width on either side of each edge."""
+    """The run's window on the clock a job's times are stamped on, Onezone's: widened by the least (`low`) and
+    greatest (`high`) of its offsets seen and the allowance, with a band of that width on either side of each edge."""
 
     window: Window
     low: float

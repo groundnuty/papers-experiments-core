@@ -147,16 +147,24 @@ def test_o32_the_ended_listing_is_read_back_to_the_allowance_and_the_margin_befo
     assert section["ended_since"] == cutoff
 
 
-def test_o32_a_provider_clock_behind_by_more_than_the_margin_fails_closed(client, provisioner, seeded, ticker):
-    """O32: the cutoff is on this host's clock; a provider whose clock runs more than `STOP_MARGIN_S` behind would put
-    the window's start before the cutoff, so a job it holds in the window could lie past the stop: the reading is
-    unknown, naming the clock, never read short."""
+@pytest.mark.parametrize(("clock", "fails"), [("zone", True), ("provider", False)])
+def test_o32_onezones_clock_behind_by_more_than_the_margin_fails_closed(
+    client, provisioner, seeded, ticker, clock, fails
+):
+    """O32: the cutoff is on this host's clock; Onezone's clock, the one a job's times are stamped on, running more
+    than `STOP_MARGIN_S` behind would put the window's start before the cutoff, so a job of the window could lie past
+    the stop: the reading is unknown, naming the clock, never read short. A provider's Date header that far behind is
+    its system clock, which places nothing."""
     seeded.clock = ticker.clock
-    seeded.provider_skew[BETA_ID] = -(STOP_MARGIN_S + 2)
+    if clock == "zone":
+        seeded.zone_skew = -(STOP_MARGIN_S + 2)
+    else:
+        seeded.provider_skew[BETA_ID] = -(STOP_MARGIN_S + 2)
     probes = made_with(client, provisioner, ticker)
     probes.start({})
     ticker.sleep(10)
     section = probes.finish()["space_transfers"]
-    assert section["probe_ok"] is False
-    assert "clock" in section["error"]
-    assert section["records"] is None
+    assert section["probe_ok"] is not fails
+    if fails:
+        assert "Onezone's clock" in section["error"]
+        assert section["records"] is None
