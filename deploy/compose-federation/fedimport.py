@@ -14,6 +14,8 @@ times and the modes of the source are not kept, files get 0664 and directories 0
 
 The copy is made beside its final directory and renamed into place, so a copy that stops midway is never mistaken for a
 finished one by the next up, which would otherwise leave the space short of files for good.
+
+`reset --clean` is refused for a layout with an imported space (`require_resettable`): it deletes through the providers.
 """
 
 import os
@@ -88,6 +90,21 @@ def pending_copies(layout: Layout, environ: Mapping[str, str]) -> list[tuple[str
             check_tree(space.name, source)
             pending.append((space.name, source))
     return pending
+
+
+def require_resettable(layout: Layout) -> None:
+    """Refuse `reset --clean` for a layout with an imported space, before anything is touched.
+
+    The reset deletes through the providers' REST interface, and a delete in an imported space unlinks the file from
+    the import directory on a writable storage, which no reset can put back, and on a read-only storage leaves the file
+    there, so a later scan imports it again under a new id. Down, then up, brings such a layout back to clean."""
+    imported = [space.name for space in layout.spec.spaces if space.imported is not None]
+    if imported:
+        raise RuntimeError(
+            f"reset --clean refuses a layout with an imported space ({', '.join(imported)}): a delete in an imported "
+            "space unlinks the file from the import directory on a writable storage, and on a read-only one leaves it "
+            "there for a later scan to import again under a new id; run down, then up, to bring it back to clean"
+        )
 
 
 def copy_tree(space: str, source: Path, target: Path) -> None:

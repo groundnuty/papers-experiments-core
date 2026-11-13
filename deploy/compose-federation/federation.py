@@ -59,7 +59,7 @@ from feddocker import (
     require_ports_free,
 )
 from fedfacts import baseline_left_behind, describe, root_parent, write_facts
-from fedimport import copy_imports, pending_copies
+from fedimport import copy_imports, pending_copies, require_resettable
 from fedlayout import NODE, ROOT_MARKER, Layout
 from fedpki import (
     ensure_secret,
@@ -251,7 +251,10 @@ def require_up(layout: Layout) -> None:
 
 
 def reset_clean(layout: Layout) -> str:
-    """Back to clean: every space emptied and its baseline written again, whatever a run or a study ingested."""
+    """Back to clean: every space emptied and its baseline written again, whatever a run or a study ingested.
+
+    Refused first, touching nothing, for a layout with an imported space (fedimport.require_resettable)."""
+    require_resettable(layout)
     timer = Timer()
     require_up(layout)
     rest = Rest(layout.ca_pem)
