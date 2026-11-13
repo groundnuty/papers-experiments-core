@@ -136,7 +136,7 @@ def test_o09_a_bulk_eviction_from_the_data_provider_is_refused_before_anything_i
 def test_o11_a_clean_space_resets_with_every_stage_verified_and_timed(provisioner, stocked, ticker):
     """O11: no requirement, no running job: each stage passes, the files leave beta, and the record has each stage's
     seconds on the provisioner's clock, the transfer stage at least the settle time it waits."""
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert record["ok"] is True
     assert list(record["stages"]) == list(STAGES)
     assert all(isinstance(stage["seconds"], float) for stage in record["stages"].values())
@@ -146,26 +146,28 @@ def test_o11_a_clean_space_resets_with_every_stage_verified_and_timed(provisione
     assert on_beta(stocked) == []
 
 
-def test_o11_every_qos_requirement_in_the_space_is_found_removed_and_shown_gone(provisioner, stocked):
+def test_o11_every_qos_requirement_in_the_space_is_found_removed_and_shown_gone(provisioner, stocked, ticker):
     """O11: requirements on a file, on a directory and on the root are found from the summaries of the root and the
     leaves, removed through the gate, each answers that it is not there after, and a second walk finds none."""
     for where in (FILES[3], "study"):
         stocked.add_qos(where)
     stocked.qos["qos-root"] = {"qosRequirementId": "qos-root", "fileId": "root-0001", "expression": "anyStorage"}
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert stocked.qos == {}
     assert record["stages"]["qos"]["found"] == record["stages"]["qos"]["removed"] == 3
     deletes = [c for c in stocked.provider_calls if c[1] == "DELETE" and c[2].startswith("/qos_requirements/")]
     assert len(deletes) == 3
 
 
-def test_o11_a_removal_the_provider_accepts_and_ignores_fails_the_reset_and_runs_no_later_stage(provisioner, stocked):
+def test_o11_a_removal_the_provider_accepts_and_ignores_fails_the_reset_and_runs_no_later_stage(
+    provisioner, stocked, ticker
+):
     """O11: a 204 is not believed: the requirement still answers, so the reset fails at its qos stage, the record
     holds that stage with its seconds, and no transfer listing is read after it."""
     stocked.add_qos(FILES[0])
     stocked.ignore_qos_deletes = True
     with pytest.raises(ResetFailed, match="qos stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert caught.value.stage == "qos"
     assert caught.value.record["stages"]["qos"]["ok"] is False
     assert "seconds" in caught.value.record["stages"]["qos"]
@@ -173,13 +175,15 @@ def test_o11_a_removal_the_provider_accepts_and_ignores_fails_the_reset_and_runs
     assert all(stocked.held(path, BETA_ID) for path in FILES)  # nothing was evicted
 
 
-def test_o09_a_requirement_id_that_is_not_one_plain_segment_fails_the_reset_before_any_removal(provisioner, stocked):
+def test_o09_a_requirement_id_that_is_not_one_plain_segment_fails_the_reset_before_any_removal(
+    provisioner, stocked, ticker
+):
     """O09: an id from a summary becomes a path of the next calls, so one with a separator is refused as unreadable
     and nothing is removed, not even the plain requirements beside it."""
     stocked.add_qos(FILES[0])
     stocked.qos["zz/inner"] = {"qosRequirementId": "zz/inner", "fileId": "root-0001", "expression": "anyStorage"}
     with pytest.raises(ResetFailed, match="qos stage"):
-        SpaceReset(provisioner).run()
+        SpaceReset(provisioner, now=ticker.clock).run()
     assert len(stocked.qos) == 2
     assert not [c for c in stocked.provider_calls if c[1] == "DELETE"]
 
@@ -191,7 +195,7 @@ def test_o11_a_running_transfer_is_cancelled_and_the_settle_count_of_observation
     show nothing waiting or ongoing `transfer_settle_polls` times in a row; it never placed its blocks."""
     stocked.add_file("other/left.bin", DATA)
     tid = stocked.add_transfer("replication", "other/left.bin", BETA_ID, scheduled=ticker.now, ended=False)
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert stocked.transfers[tid].ended
     assert record["stages"]["transfers"] == {**record["stages"]["transfers"], "cancelled": 1, "observations": 4}
     assert stocked.held("other/left.bin", BETA_ID) == []
@@ -203,7 +207,7 @@ def test_o07_a_job_the_listing_shows_late_is_caught_by_a_later_observation(provi
     stocked.add_file("other/late.bin", DATA)
     tid = stocked.add_transfer("replication", "other/late.bin", BETA_ID, scheduled=ticker.now, ended=False)
     stocked.listing_lag[tid] = 4  # all four listings of the first observation (two states, two providers) miss it
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert record["stages"]["transfers"]["cancelled"] == 1
     assert stocked.transfers[tid].cancelled
 
@@ -215,7 +219,7 @@ def test_o11_a_cancel_the_provider_ignores_fails_the_reset_at_its_transfer_stage
     stocked.add_transfer("replication", "other/stuck.bin", BETA_ID, scheduled=ticker.now, ended=False)
     stocked.ignore_cancels, stocked.transfer_flip_after = True, 10**6
     with pytest.raises(ResetFailed, match="transfers stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert list(caught.value.record["stages"]) == ["qos", "transfers"]
     assert all(stocked.held(path, BETA_ID) for path in FILES)
 
@@ -300,11 +304,11 @@ def test_o32_a_history_start_that_is_not_a_time_is_refused_before_any_stage(prov
     assert stocked.provider_calls == []
 
 
-def test_o09_a_reset_that_would_evict_the_data_providers_copy_is_refused_before_any_stage(provisioner, stocked):
+def test_o09_a_reset_that_would_evict_the_data_providers_copy_is_refused_before_any_stage(provisioner, stocked, ticker):
     """O09: the plan is checked first, so a refused plan changes nothing: no requirement removed, no listing read."""
     stocked.add_qos(FILES[0])
     with pytest.raises(Refused, match="own copy"):
-        SpaceReset(provisioner).run({"alpha": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"alpha": ["study"]})
     assert stocked.qos
     assert stocked.provider_calls == []
 
