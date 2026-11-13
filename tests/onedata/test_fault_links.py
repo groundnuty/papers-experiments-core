@@ -29,6 +29,7 @@ def step(injector, name):
 
 
 def test_o35_a_restore_whose_links_do_not_transfer_fails_and_a_later_clear_verifies_it(tmp_path):
+    """O35: A restore whose links do not transfer fails and a later clear verifies it."""
     services = LinkedServices()
     injector = injector_for(write_faults(tmp_path), services, clock=FakeClock())
     injector.start(RUN)
@@ -43,6 +44,7 @@ def test_o35_a_restore_whose_links_do_not_transfer_fails_and_a_later_clear_verif
 
 
 def test_o35_a_link_check_that_raises_fails_the_restore_closed(tmp_path):
+    """O35: A link check that raises fails the restore closed."""
     services = LinkedServices()
 
     def broken(service):
@@ -56,6 +58,8 @@ def test_o35_a_link_check_that_raises_fails_the_restore_closed(tmp_path):
 
 
 def test_o35_the_compose_driver_asks_its_probes_link_check_and_none_without_one(tmp_path):
+    """O35: The compose driver asks its probes link check and none without one."""
+
     class Probe:
         def __call__(self, service):
             return True

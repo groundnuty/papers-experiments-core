@@ -37,6 +37,7 @@ def write(tmp_path: Path, text: str, *, template: bool = True) -> Path:
 
 
 def test_a_layouts_probe_space_is_loaded(fed, tmp_path):
+    """O35: A layouts probe space is loaded."""
     spec = fed.spec.load_spec(write(tmp_path, PROBED))
     assert spec.probe_space == "link-probes"
 
@@ -54,6 +55,7 @@ def test_a_layouts_probe_space_is_loaded(fed, tmp_path):
 def test_a_probe_space_an_agent_could_see_or_that_cannot_test_a_pair_is_refused_at_load(
     fed, tmp_path, change, template, words
 ):
+    """O35: A probe space an agent could see or that cannot test a pair is refused at load."""
     text = PROBED.replace(change[0], change[1], 1) if change[0] else PROBED
     with pytest.raises(fed.spec.LayoutError) as refused:
         fed.spec.load_spec(write(tmp_path, text, template=template))
@@ -87,6 +89,7 @@ def up_stubbed(fed, monkeypatch, tmp_path, check):
 
 
 def test_up_runs_the_link_check_last_and_reports_it(fed, monkeypatch, tmp_path):
+    """O35: Up runs the link check last and reports it."""
     layout, calls = up_stubbed(fed, monkeypatch, tmp_path, lambda: "link check: every pair transferred")
     out = fed.cli.up(layout)
     assert calls[-2:] == ["links", "closed"]
@@ -95,6 +98,8 @@ def test_up_runs_the_link_check_last_and_reports_it(fed, monkeypatch, tmp_path):
 
 
 def test_up_fails_when_a_pair_does_not_transfer(fed, monkeypatch, tmp_path, capsys):
+    """O35: Up fails when a pair does not transfer."""
+
     def stuck():
         raise RuntimeError("the link check failed: no transfer from providers[1] to providers[0] within 30 s")
 
@@ -131,17 +136,20 @@ def two_providers(data, *, link_check=True):
 
 
 def test_without_a_template_up_checks_nothing_and_says_why(fed, fedlinks, tmp_path):
+    """O35: Without a template up checks nothing and says why."""
     layout = fed.layout.Layout(tmp_path, spec=fed.spec.load_spec(write(tmp_path, MINIMAL, template=False)))
     assert "no platform_template" in fedlinks.check_after_up(layout, {})
 
 
 def test_pairs_and_no_link_check_refuse_up(fed, fedlinks, tmp_path, monkeypatch):
+    """O35: Pairs and no link check refuse up."""
     layout = layout_with(fed, tmp_path, monkeypatch, lambda d: two_providers(d, link_check=False), probe=False)
     with pytest.raises(RuntimeError, match=r"1 provider pair\(s\) and no \[link_check\]"):
         fedlinks.check_after_up(layout, {})
 
 
 def test_up_runs_the_layers_check_and_writes_its_report_beside_the_facts(fed, fedlinks, tmp_path, monkeypatch):
+    """O35: Up runs the layers check and writes its report beside the facts."""
     layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
     passed = PairResult("providers[0]", "providers[1]", True, 0.25, 65536)
     monkeypatch.setattr(fedlinks, "check_links", lambda config, client: LinkReport(True, "ok", (passed,), 1.0, 2.0))
@@ -152,6 +160,7 @@ def test_up_runs_the_layers_check_and_writes_its_report_beside_the_facts(fed, fe
 
 
 def test_a_stuck_pair_fails_up_naming_it(fed, fedlinks, tmp_path, monkeypatch):
+    """O35: A stuck pair fails up naming it."""
     layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
     stuck = PairResult("providers[0]", "providers[1]", False, 30.0, reason="no transfer from providers[1]")
     report = LinkReport(False, "a provider link is stuck: no transfer from providers[1]", (stuck,), 1.0, 2.0)
@@ -162,6 +171,7 @@ def test_a_stuck_pair_fails_up_naming_it(fed, fedlinks, tmp_path, monkeypatch):
 
 
 def test_a_link_check_of_another_space_than_the_probe_space_refuses_up(fed, fedlinks, tmp_path, monkeypatch):
+    """O35: A link check of another space than the probe space refuses up."""
     layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
     with pytest.raises(RuntimeError, match="does not name the layout's probe_space"):
         fedlinks.check_after_up(layout, {"link-probes": "sid-another"})

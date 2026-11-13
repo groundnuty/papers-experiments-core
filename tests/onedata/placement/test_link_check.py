@@ -59,6 +59,7 @@ def held(fake, file_id, provider_id):
 
 
 def test_o35_every_pair_is_checked_and_recorded_with_its_seconds_and_bytes(fake, config, client, ticker):
+    """O35: Every pair is checked and recorded with its seconds and bytes."""
     report = run(config, client, ticker)
     assert report.ok, report.detail
     assert [(p.local, p.source) for p in report.pairs] == [
@@ -89,6 +90,7 @@ def test_o35_every_pair_is_checked_and_recorded_with_its_seconds_and_bytes(fake,
 
 
 def test_o35_the_probe_is_evicted_from_the_local_provider_afterwards(fake, config, client, ticker):
+    """O35: The probe is evicted from the local provider afterwards."""
     report = run(config, client, ticker)
     assert report.ok
     for pair, source in zip(report.pairs, (BETA_ID, GAMMA_ID), strict=True):
@@ -103,6 +105,7 @@ def test_o35_the_probe_is_evicted_from_the_local_provider_afterwards(fake, confi
 
 
 def test_o35_a_hanging_pair_fails_within_the_bound_and_is_named(fake, config, client, ticker):
+    """O35: A hanging pair fails within the bound and is named."""
     fake.links[(ALPHA_ID, BETA_ID)] = "hang"
     fake.hang_hook = ticker.sleep  # the read's wait runs out on the test's clock
     report = run(config, client, ticker)
@@ -122,6 +125,7 @@ def test_o35_a_hanging_pair_fails_within_the_bound_and_is_named(fake, config, cl
 
 
 def test_o35_a_link_that_fails_fails_the_check_naming_the_pair(fake, config, client, ticker):
+    """O35: A link that fails fails the check naming the pair."""
     fake.links[(ALPHA_ID, GAMMA_ID)] = "fail"
     report = run(config, client, ticker)
     assert not report.ok
@@ -130,7 +134,7 @@ def test_o35_a_link_that_fails_fails_the_check_naming_the_pair(fake, config, cli
 
 
 def test_o35_a_probe_left_on_the_local_provider_never_hides_a_stuck_link(fake, config, client, ticker):
-    """A probe still warm on the local provider (an eviction that took nothing) would let the read pass without the
+    """O35: A probe still warm on the local provider (an eviction that took nothing) would let the read pass without the
     link: the next check evicts it first, and the stuck link is found."""
     fake.evictions_remove_blocks = False
     first = run(config, client, ticker)
@@ -151,6 +155,7 @@ def test_o35_a_probe_left_on_the_local_provider_never_hides_a_stuck_link(fake, c
 
 
 def test_o35_a_probe_is_written_once_and_written_again_when_it_is_gone(fake, config, client, ticker):
+    """O35: A probe is written once and written again when it is gone."""
     assert all(p.provisioned for p in run(config, client, ticker).pairs)
     again = run(config, client, ticker)
     assert again.ok
@@ -162,6 +167,7 @@ def test_o35_a_probe_is_written_once_and_written_again_when_it_is_gone(fake, con
 
 
 def test_o35_pairs_and_no_probe_space_refuse_and_no_pairs_pass_without_one(tmp_path, fake, client, ticker):
+    """O35: Pairs and no probe space refuse and no pairs pass without one."""
     unprobed = load_platform(write_platform(tmp_path, lambda d: three_providers(d, link_check=False)))
     report = run(unprobed, client, ticker)
     assert not report.ok
@@ -172,6 +178,7 @@ def test_o35_pairs_and_no_probe_space_refuse_and_no_pairs_pass_without_one(tmp_p
 
 
 def test_o35_platform_health_runs_the_check_at_its_first_call_and_keeps_the_report(fake, config, client, ticker):
+    """O35: Platform health runs the check at its first call and keeps the report."""
     fake.links[(ALPHA_ID, BETA_ID)] = "fail"
     issuer = TokenIssuer(client, config, clock=lambda: 1_800_000_000.0)
     health = PlatformHealth(config, client, issuer, monotonic=ticker.clock, sleep=ticker.sleep)
@@ -187,6 +194,7 @@ def test_o35_platform_health_runs_the_check_at_its_first_call_and_keeps_the_repo
 
 
 def test_o35_platform_health_passes_and_answers_as_the_space_check_once_every_link_works(fake, config, client, ticker):
+    """O35: Platform health passes and answers as the space check once every link works."""
     issuer = TokenIssuer(client, config, clock=lambda: 1_800_000_000.0)
     health = PlatformHealth(config, client, issuer, monotonic=ticker.clock, sleep=ticker.sleep)
     verdict = health()
@@ -196,6 +204,7 @@ def test_o35_platform_health_passes_and_answers_as_the_space_check_once_every_li
 
 
 def test_o35_only_a_request_bound_to_the_probe_space_reaches_it(fake, config, client, ticker):
+    """O35: Only a request bound to the probe space reaches it."""
     assert run(config, client, ticker).ok
     probe = probe_of(fake, BETA_ID)
     sent = len(fake.requests)
@@ -225,6 +234,7 @@ def test_o35_only_a_request_bound_to_the_probe_space_reaches_it(fake, config, cl
 def test_o35_a_probe_space_that_is_agent_visible_or_cannot_test_a_pair_is_refused_at_load(
     tmp_path, fake, change, key, words
 ):
+    """O35: A probe space that is agent visible or cannot test a pair is refused at load."""
     path = write_platform(tmp_path, lambda d: (three_providers(d), d["link_check"].update(change)))
     with pytest.raises(ConfigError) as refused:
         load_platform(path)
@@ -236,6 +246,7 @@ def test_o35_a_probe_space_that_is_agent_visible_or_cannot_test_a_pair_is_refuse
 
 
 def test_o35_a_failed_pair_names_the_remedy_and_records_that_it_needs_one(fake, config, client, ticker):
+    """O35: A failed pair names the remedy and records that it needs one."""
     fake.links[(ALPHA_ID, BETA_ID)] = "fail"
     report = run(config, client, ticker)
     stuck, other = report.pairs
@@ -248,7 +259,7 @@ def test_o35_a_failed_pair_names_the_remedy_and_records_that_it_needs_one(fake, 
 
 
 def test_o35_every_probe_read_and_every_eviction_is_of_a_file_in_the_probe_space(fake, config, client, ticker):
-    """The probe is never a file another reader may have open: everything the check reads, writes or evicts lies in
+    """O35: The probe is never a file another reader may have open: everything the check reads, writes or evicts lies in
     the probe space, and no study space's file is touched."""
     assert run(config, client, ticker).ok
     probe_root = fake.space_roots[PROBE_SPACE_ID]
@@ -266,6 +277,7 @@ def test_o35_every_probe_read_and_every_eviction_is_of_a_file_in_the_probe_space
 
 
 def test_o35_after_a_restore_only_the_pairs_the_provider_is_in_are_checked(fake, config, client, ticker):
+    """O35: After a restore only the pairs the provider is in are checked."""
     source = check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, workers=1, involving="gamma")
     assert [(p.local, p.source) for p in source.pairs] == [("providers[0]", "providers[2]")]
     local = check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, workers=1, involving="alpha")
@@ -275,7 +287,7 @@ def test_o35_after_a_restore_only_the_pairs_the_provider_is_in_are_checked(fake,
 def test_o35_the_health_gate_checks_the_links_again_every_every_s_and_a_stuck_link_closes_it(
     fake, config, client, ticker
 ):
-    """A link that sticks mid-campaign fails the first call once `every_s` (600 s) has passed since the last check:
+    """O35: A link that sticks mid-campaign fails the first call once `every_s` (600 s) has passed since the last check:
     the gate closes, naming the pair and the remedy, and its re-checks pass again once the link transfers."""
     issuer = TokenIssuer(client, config, clock=lambda: 1_800_000_000.0)
     health = PlatformHealth(config, client, issuer, monotonic=ticker.clock, sleep=ticker.sleep)

@@ -122,7 +122,7 @@ def test_the_per_run_reset_evicts_every_mirrors_replicas_and_keeps_every_owners_
 
 
 def test_the_per_run_reset_leaves_the_link_checks_probe_space_alone(fed, quick, tmp_path):
-    """#221: each link probe is held by the source that wrote it, here a mirror of the probe space, so it is no replica:
+    """O35: each link probe is held by the source that wrote it, here a mirror of the probe space, so it is no replica:
     the reset neither refuses for it nor evicts it, and resets every other space as before."""
     files = {**DEFAULT_FILES, "link-probes": {"expcore-link-probe-0123456789abcdef": 4096}}
     fake = FakeProviders(fed, fed.spec.load_spec(), files, tmp_path)

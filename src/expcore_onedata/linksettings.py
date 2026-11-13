@@ -99,7 +99,7 @@ def _providers(section: Section, declared: Collection[str]) -> tuple[str, ...]:
     return names
 
 
-def _not_a_study_space(section: Section, space: Space, spaces: Sequence[StudySpace]) -> None:
+def _not_a_declared_space(section: Section, space: Space, spaces: Sequence[StudySpace]) -> None:
     for entry in spaces:
         for key, mine, theirs in (("id", space.id, entry.space.id), ("name", space.name, entry.space.name)):
             if mine == theirs:
@@ -149,7 +149,7 @@ def load_link_check(
     space = parse_space(section)
     order = list(providers)
     names = _providers(section, order)
-    _not_a_study_space(section, space, spaces)
+    _not_a_declared_space(section, space, spaces)
     _every_pair_testable(section, names, spaces, order)
     probe_bytes = int(_number(section, "probe_bytes", 65536, 1, integer=True))
     if probe_bytes > MAX_PROBE_BYTES:
