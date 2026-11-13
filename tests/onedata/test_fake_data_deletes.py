@@ -24,7 +24,7 @@ from expcore_onedata.testing import (
     Ticker,
     make_federation,
 )
-from expcore_onedata.testing.fake_data import DELETE_FACTS
+from expcore_onedata.testing.fake_data import DELETE_FACTS, TOMBSTONE_FACTS, TOMBSTONE_S
 
 HOSTS = {ALPHA_ID: "https://alpha.test", BETA_ID: "https://beta.test"}
 TYPED = {"Content-Type": "application/octet-stream"}
@@ -124,7 +124,8 @@ def test_a_deleted_directory_pends_with_what_is_under_it():
     ticker.sleep(5)
     assert all(absent(fake, BETA_ID, gone) for gone in (study, deep, inner))
     assert names(fake, BETA_ID) == []
-    assert fake.deleted_parents[inner] == deep  # and each keeps the parent it had
+    # and each keeps the parent it had, read by `parent_id` alone, which a deleted entry still answers
+    assert call(fake, BETA_ID, "GET", f"/data/{inner}", params={"attribute": "parent_id"}).json() == {"parent_id": deep}
 
 
 def test_a_directory_name_reused_during_its_delete_loses_the_files_made_in_it_when_the_delete_lands():
@@ -358,3 +359,147 @@ def test_the_nodes_of_a_fake_still_hold_an_entry_whose_delete_is_under_way_thoug
     ticker.sleep(DELAY_S)
     fake.exists("a.bin")  # a read of the tree lands what is due
     assert file_id not in fake.nodes
+
+
+# -- tombstones: what a deleted entry answers by id, per attribute selection -----------------------------------------
+
+LENIENT = [("size",), ("parent_id",), ("guid",), ("size", "parent_id"), ("guid", "size", "parent_id")]
+STRICT = [(), ("name",), ("type",), ("name", "size", "parent_id"), ("size", "type"), ("mode",), ("size", "mode")]
+TOMBSTONE_NOTE = "deploy/compose-federation/day0/2026-11-13-federation-facts-deleted-entries-by-id.md"
+
+
+def read(fake: FakeData, provider: str, file_id: str, *attributes: str) -> httpx.Response:
+    """`GET /data/{id}` asking for the attributes given, as repeated `attribute` parameters; none: no parameter."""
+    params = {"attribute": list(attributes)} if attributes else None
+    return call(fake, provider, "GET", f"/data/{file_id}", params=params)
+
+
+def test_the_default_tombstone_is_the_14_days_the_platform_keeps_one_which_no_test_waits_out():
+    assert TOMBSTONE_S == 14 * 24 * 3600  # cluster-worker's `document_expiry`, 1 209 600 s
+    assert make_federation().tombstone_s == FakeData().tombstone_s == TOMBSTONE_S
+    assert FakeData(tombstone_s=5.0).tombstone_s == 5.0
+
+
+def test_the_tombstone_names_the_facts_it_models():
+    own, live = TOMBSTONE_FACTS
+    assert own == TOMBSTONE_NOTE
+    assert (REPO / own).is_file()
+    assert live == "deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md"  # merges with #192
+
+
+@pytest.mark.parametrize("attributes", LENIENT, ids="+".join)
+@pytest.mark.parametrize("provider", [ALPHA_ID, BETA_ID])
+def test_a_deleted_entry_read_for_size_parent_or_guid_alone_keeps_answering_from_its_last_state(provider, attributes):
+    fake = make_federation(clock=Ticker().clock)
+    file_id = fake.add_file("study/data.bin", DATA)
+    study = fake.id_of("study")
+    delete(fake, ALPHA_ID, file_id)
+    assert file_id not in fake.nodes  # the delete has landed everywhere
+    answer = read(fake, provider, file_id, *attributes)
+    assert answer.status_code == 200
+    body = answer.json()
+    assert (body.get("size"), body.get("parent_id")) == (
+        len(DATA) if "size" in attributes else None,
+        study if "parent_id" in attributes else None,
+    )
+    assert body.get("fileId") == (file_id if "guid" in attributes else None)
+    assert set(body) <= {"size", "parent_id", "fileId", "file_id"}  # only what was asked, as the platform resolves
+
+
+@pytest.mark.parametrize("attributes", STRICT, ids=lambda a: "+".join(a) or "no-attribute")
+@pytest.mark.parametrize("provider", [ALPHA_ID, BETA_ID])
+def test_a_deleted_entry_read_with_no_attribute_or_a_strict_one_among_them_answers_enoent(provider, attributes):
+    fake = make_federation(clock=Ticker().clock)
+    file_id = fake.add_file("study/data.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    answer = read(fake, provider, file_id, *attributes)
+    assert (answer.status_code, answer.json()) == (400, GONE_25_0)
+
+
+def test_a_deleted_directory_and_what_was_under_it_keep_their_last_state_for_a_lenient_read_and_not_a_strict_one():
+    fake = make_federation(clock=Ticker().clock)
+    inner = fake.add_file("study/deep/b.bin", DATA)
+    study, deep = fake.id_of("study"), fake.id_of("study/deep")
+    delete(fake, ALPHA_ID, study)
+    for gone, parent in ((study, ROOT_ID), (deep, study), (inner, deep)):
+        assert read(fake, BETA_ID, gone, "parent_id").json() == {"parent_id": parent}
+        assert read(fake, BETA_ID, gone, "size").status_code == 200
+        assert read(fake, BETA_ID, gone).json() == GONE_25_0
+    assert read(fake, BETA_ID, inner, "size").json() == {"size": len(DATA)}
+
+
+def test_a_tombstone_keeps_the_size_the_entry_had_when_it_was_deleted():
+    fake = make_federation(clock=Ticker().clock)
+    file_id = fake.add_file("a.bin", DATA)
+    write(fake, ALPHA_ID, file_id, DATA + b"more")  # written past the end: the size it has when it is deleted
+    delete(fake, ALPHA_ID, file_id)
+    assert read(fake, ALPHA_ID, file_id, "size").json() == {"size": len(DATA) + 4}
+
+
+def test_a_lenient_read_answers_only_the_bare_entry_and_never_its_children_content_or_block_map():
+    fake = make_federation(clock=Ticker().clock)
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    for part in ("/children", "/content", "/distribution"):
+        answer = call(fake, ALPHA_ID, "GET", f"/data/{file_id}{part}", params={"attribute": "size"})
+        assert (answer.status_code, answer.json()) == (400, GONE_25_0)
+
+
+def test_a_tombstone_answers_until_its_time_is_up_and_then_the_entry_is_gone_for_every_read():
+    ticker = Ticker()
+    fake = make_federation(clock=ticker.clock)
+    fake.tombstone_s = 60.0
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    ticker.sleep(59.0)
+    assert read(fake, BETA_ID, file_id, "size").status_code == 200
+    ticker.sleep(1.0)
+    assert read(fake, BETA_ID, file_id, "size").json() == GONE_25_0
+    assert read(fake, ALPHA_ID, file_id, "parent_id").json() == GONE_25_0
+
+
+def test_a_tombstone_of_no_time_makes_a_lenient_read_answer_enoent_at_once():
+    fake = make_federation()  # a frozen clock: the time is up the moment it is 0 s long
+    fake.tombstone_s = 0.0
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    assert read(fake, ALPHA_ID, file_id, "size").json() == GONE_25_0
+
+
+def test_the_default_tombstone_needs_no_moving_clock():
+    fake = make_federation()  # the frozen clock never moves, so the 14 days never pass
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    assert read(fake, ALPHA_ID, file_id, "size").status_code == 200
+
+
+def test_during_a_delete_that_is_under_way_the_provider_it_went_to_answers_lenient_reads_and_the_others_everything():
+    fake, ticker = delayed()
+    fake.tombstone_s = 10.0
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    assert read(fake, ALPHA_ID, file_id).json() == GONE_25_0  # recorded: strict reads answer as for a deleted entry
+    assert read(fake, ALPHA_ID, file_id, "size", "parent_id").json() == {"size": len(DATA), "parent_id": ROOT_ID}
+    assert read(fake, BETA_ID, file_id).status_code == 200  # assumed: the others still show the whole entry
+    ticker.sleep(DELAY_S)  # it lands everywhere, and its tombstone counts from then
+    assert read(fake, BETA_ID, file_id).json() == GONE_25_0
+    assert read(fake, BETA_ID, file_id, "size").status_code == 200
+    ticker.sleep(9.0)
+    assert read(fake, BETA_ID, file_id, "size").status_code == 200
+    ticker.sleep(1.0)
+    assert read(fake, BETA_ID, file_id, "size").json() == GONE_25_0
+
+
+@pytest.mark.parametrize("attributes", [("size",), ("parent_id",), ("guid",)])
+def test_the_legacy_shape_keeps_no_tombstone(attributes):
+    fake = make_federation(clock=Ticker().clock, error_shape=ERRORS_LEGACY)
+    file_id = fake.add_file("a.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    assert read(fake, ALPHA_ID, file_id, *attributes).status_code == 404
+
+
+def test_a_live_entry_is_unchanged_by_the_attributes_asked_for():
+    fake = make_federation(clock=Ticker().clock)
+    file_id = fake.add_file("a.bin", DATA)
+    assert read(fake, BETA_ID, file_id, "size").json() == read(fake, BETA_ID, file_id).json()
+    assert read(fake, BETA_ID, file_id, "size").json()["size"] == len(DATA)
