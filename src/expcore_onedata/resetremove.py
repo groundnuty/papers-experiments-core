@@ -2,7 +2,7 @@
 """The reset's removal of the run's own QoS requirements: each waited on until it is fulfilled, deleted, and its
 deletion waited on until every provider has processed it, before the files are settled and evicted (O33, #209).
 
-Sources are op-worker `f118ed9` (paths below are its own) and cluster-worker `0e9cb40` (`cw:`), read for #209.
+Sources are op-worker `f118ed9` (paths below are its own), read for #209.
 
 **The run's own.** A requirement present at the run's start (`SpaceReset.qos_requirements()`, the caller's baseline)
 is kept; every other one the scan finds (`resetqos.scan`) is the run's and is removed, in this order.
@@ -10,16 +10,17 @@ is kept; every other one the scan finds (`resetqos.scan`) is the run's and is re
 **1. Fulfilled before it is deleted.** A deletion cancels a requirement's replication only on the provider that
 processes it, and best-effort: its traverses are cancelled and its in-flight synchronizer requests aborted by an
 asynchronous cast (`qos_traverse.erl:88-93`, `replica_synchronizer.erl:224-231`), both on lists that provider keeps for
-itself. The provider that replicates learns of a deletion sent through another only when dbsync delivers it (about 8 s
-on a quiet space, 15 s more when a batch must be asked for again, `dbsync_in_stream_worker.erl:445-452`;
-`dbsync_events.erl:124-129`), and replicates whole files until then. So each requirement is first read on every
-provider, its record (`GET /qos_requirements/{qid}`), until its `status` is `fulfilled` or `impossible` there on
-`consecutive_polls` readings in a row, every `poll_s`, within `[placement] qos_fulfil_timeout_s` (120 s by default);
-one still `pending` at the bound fails the reset, and nothing is deleted. A provider that answers that the requirement
-is not there has not received it yet and is waited for: the build reports a requirement `pending` while a provider
-that supports the space does not know it (`qos_status.erl:107-137,122-127`). `impossible` is settled: no storage can
-hold the copy, and nothing replicates. **`pending` does not prove that bytes are moving:** it says that a traverse has
-not finished or a reconciliation is outstanding (`qos_status.erl:224-234`), and no REST answer shows bytes in flight.
+itself. The provider that replicates learns of a deletion sent through another only when dbsync delivers it (by the
+timers' sum, an inference, about 8 s on a quiet space and 15 s more when a batch must be asked for again,
+`dbsync_in_stream_worker.erl:445-452`; `dbsync_events.erl:124-129`), and replicates whole files until then. So each
+requirement is first read on every provider, its record (`GET /qos_requirements/{qid}`), until its `status` is
+`fulfilled` or `impossible` there on `consecutive_polls` readings in a row, every `poll_s`, within `[placement]
+qos_fulfil_timeout_s` (120 s by default); one still `pending` at the bound fails the reset, and nothing is deleted. A
+provider that answers that the requirement is not there has not received it yet and is waited for: the build reports a
+requirement `pending` while a provider that supports the space does not know it (`qos_status.erl:107-137,122-127`).
+`impossible` is settled: no storage can hold the copy, and nothing replicates. **`pending` does not prove that bytes
+are moving:** it says that a traverse has not finished or a reconciliation is outstanding (`qos_status.erl:224-234`),
+and no REST answer shows bytes in flight.
 
 **2. Deleted, then the deletion barrier.** Each is deleted through the gate on the provider whose scan showed it first.
 Then, on every provider, the summary of the requirement's entry (`GET /data/{id}/qos/summary`) must no longer list it

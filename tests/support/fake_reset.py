@@ -1,6 +1,7 @@
 """The fake federation's data API with what a complete reset meets: several data spaces, transfers that can be
 cancelled, directory evictions, and concurrent callers. QoS requirements are `FakeData`'s (`add_qos`, `qos`,
-`ignore_qos_deletes`, `qos_hidden_on`, `qos_replicates_to`).
+`ignore_qos_deletes`, `qos_hidden_on`, `qos_replicates_to`), with `FakeQos`'s dbsync, status and replication model
+(`qos_sync_s`, `qos_land_every_s`, `qos_missed_cancel`, `qos_status_of`, `qos_removed`, `qos_landed`).
 
 `FakeReset` extends `fake_data.FakeData` with this provider call (25.0's REST description is the reference):
 
