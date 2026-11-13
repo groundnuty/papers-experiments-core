@@ -51,7 +51,7 @@ WRITES = {
 
 
 @pytest.mark.parametrize("case", list(WRITES))
-def test_o37_a_read_only_imported_space_is_never_written_and_the_refusal_sends_nothing(case, provisioner, fake, tmp_path):
+def test_o37_a_read_only_imported_space_is_never_written_and_a_refusal_sends_nothing(case, provisioner, fake, tmp_path):
     """O37: op-worker refuses a write, a creation and a replication onto a read-only storage (EROFS), and a delete there
     leaves the file on the storage while removing it from the space; a write through another provider takes the data
     provider's blocks from it for good. So the provisioner refuses every such request before anything is sent."""

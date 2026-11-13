@@ -174,6 +174,14 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
   requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
   provisioner's own) has every target checked against that space alone, its id, its name and its own prefixes.
+- A space held on an imported storage (O37, `storageimport.py`) is checked through the data provider's Onepanel, under
+  `/api/v3/onepanel` on the provider's own address, as the Compose federation's bootstrap calls it, with the admin
+  token, which must be a member of that provider's cluster: `panel_get` reads `GET /provider/spaces/{space}` (answer
+  `storageId`, `storageImport`), `GET /provider/storages/{id}` (answer `importedStorage`, `readonly`, `mountPoint`) and
+  `GET /provider/spaces/{space}/storage-import/auto/info` (answer `status` and the scan's counters), and nothing
+  else; `force_scan` sends `POST /provider/spaces/{space}/storage-import/auto/force-start`, gated as a mutation bound
+  to its space. All four are named only by onepanel 25.0 (e0de555b, `src/http/rest/api/rest_model.erl`), so they are in
+  `UNVERIFIED_ENDPOINTS`, covered by `tests/live/test_storage_import.py`.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 The gate's own reads, the ones that find a target's space, are plumbing: a caller that is the harness's own passes its
@@ -187,10 +195,10 @@ A token ends with the lifetime it was minted with, which derives from the attemp
 its user revokes it first: the one revocation this client sends is a slot user's own, of all its temporary tokens, at
 the end of a run that held the slot (C19). `UNVERIFIED_ENDPOINTS` lists what neither a source nor [L1] confirms: only
 the reset's QoS calls and its cancel, the truncation by a write of content without an offset, the reads of a user's
-Onezone admin privileges and of the clusters a token's user is a member of, Onezone's reading of the global clock, and
-the three calls of a run's revocation, since [L1] confirmed every other call and detail the layer relies on.
-Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
-deployment answers otherwise.
+Onezone admin privileges and of the clusters a token's user is a member of, Onezone's reading of the global clock, the
+three calls of a run's revocation, and the four panel calls of an imported space, since [L1] confirmed every other call
+and detail the layer relies on. Each entry, and each call [L1] confirmed, keeps its live test (`tests/live/`, marked
+`covers:`), which fails if a deployment answers otherwise.
 """
 
 import base64
@@ -216,6 +224,17 @@ from expcore_onedata.streamed import Digest, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
+# A provider's Onepanel, served on the provider's own address, as the Compose federation's bootstrap calls it
+# (deploy/compose-federation/fedrest.py, PANEL_API): the storage import's state lives there alone (O37).
+API_PANEL = "/api/v3/onepanel"
+# The Onepanel reads the layer sends, for a space held on an imported storage (`storageimport.py`): the support's
+# storage and import mode, the storage's flags, and the state of the space's auto import scan. No other panel read is.
+PANEL_READS = (
+    re.compile(r"/provider/spaces/[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}"),
+    re.compile(r"/provider/spaces/[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}/storage-import/auto/info"),
+    re.compile(r"/provider/storages/[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}"),
+)
+FORCE_SCAN_PATH = "/provider/spaces/{space}/storage-import/auto/force-start"  # the one panel mutation (`force_scan`)
 AUTH_HEADER = "X-Auth-Token"  # [S2]
 MUTATING = ("POST", "PUT", "PATCH", "DELETE")
 UPLOAD_CONTENT_TYPE = "application/octet-stream"  # of every raw body a mutation sends; [L1]: 25.0 refuses one without
@@ -322,6 +341,34 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "a Onezone call sent with no credential, as the scope inference is: a token older than its user's generation "
         "answered 400 tokenRevoked before any caveat is checked, which confirms a revocation; named only by "
         "oz-worker's source (14b5bda, token_logic_plugin.erl:165-176, token_auth.erl:357-364) and ctool's error",
+    ),
+    (
+        "GET",
+        "/provider/spaces/{space}",
+        "a panel call with the admin token: a supported space's storageId and its storageImport (mode and auto "
+        "config), which an imported space's check reads; named only by onepanel's REST model (e0de555b, "
+        "rest_model.erl, space_details_model)",
+    ),
+    (
+        "GET",
+        "/provider/storages/{id}",
+        "a panel call with the admin token: a storage's importedStorage, readonly and mountPoint, which an imported "
+        "space's check compares with its declaration; named only by onepanel's REST model (e0de555b, rest_model.erl, "
+        "posix_model)",
+    ),
+    (
+        "GET",
+        "/provider/spaces/{space}/storage-import/auto/info",
+        "a panel call with the admin token: the state of a space's auto import scan (status, start, stop, "
+        "createdFiles, modifiedFiles, deletedFiles, unmodifiedFiles, failedFiles, totalScans), which an import's "
+        "wait reads; named only by onepanel's routes and REST model (e0de555b, storage_import_rest_routes.erl:57-58, "
+        "rest_model.erl, auto_storage_import_info_model)",
+    ),
+    (
+        "POST",
+        FORCE_SCAN_PATH,
+        "a panel call with the admin token: starts a new scan of a space's auto import, which the re-scan check "
+        "sends; named only by onepanel's routes (e0de555b, storage_import_rest_routes.erl:35-36)",
     ),
 )
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
@@ -582,16 +629,20 @@ class OnezoneClient:
         """Name the client without its credential."""
         return f"OnezoneClient(zone={self._config.zone.name!r})"
 
-    def _base(self, provider: str | None) -> tuple[str, str]:
-        """Return the base URL and the label used in messages: `zone`, or `providers[i]` for the i-th declared one.
+    def _base(self, provider: str | None, *, panel: bool = False) -> tuple[str, str]:
+        """Return the base URL and the label used in messages: `zone`, or `providers[i]` for the i-th declared one;
+        with `panel`, the provider's Onepanel (`API_PANEL`) on the same address.
 
         The label is a role or a position in the file, never the provider's name, so a message holds no federation name.
         """
         if provider is None:
+            if panel:
+                raise OutOfScope("a panel request names no provider")
             return self._config.zone.url + API_ZONE, "zone"
         if provider not in self._config.providers:
             raise OutOfScope("the request names a provider that is not declared")
-        return self._config.providers[provider].url + API_PROVIDER, self._config.provider_label(provider)
+        api = API_PANEL if panel else API_PROVIDER
+        return self._config.providers[provider].url + api, self._config.provider_label(provider)
 
     def provider_label(self, provider: str) -> str:
         """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
@@ -626,15 +677,17 @@ class OnezoneClient:
         retry: ReadRetry = ONE_ATTEMPT,
         deadline_s: float | None = None,
         fresh: bool = False,
+        panel: bool = False,
     ) -> httpx.Response:
         """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError.
 
         A transport failure (a reset, a refusal, a timeout) has `transport` set and a real answer has its status, so
         a caller that retries can tell the two apart (O08). Only a GET under a policy of more than one attempt is
         retried, and only when it timed out (`readretry.py`); anything else is sent once. With `fresh` the request,
-        sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
+        sent once, goes on a connection of its own, as a retry does, when the client owns its pool. With `panel` it
+        goes to the provider's Onepanel (`_base`).
         """
-        base, label = self._base(provider)
+        base, label = self._base(provider, panel=panel)
         url = base + _check_path(path)
         wait = timeout_s if timeout_s is not None else self._timeout_s
 
@@ -732,6 +785,7 @@ class OnezoneClient:
         retry: ReadRetry = ONE_ATTEMPT,
         deadline_s: float | None = None,
         fresh: bool = False,
+        panel: bool = False,
     ) -> Any:
         """Send one request and return the decoded JSON; map every failure to a PlatformError without detail."""
         response = self._request(
@@ -746,8 +800,47 @@ class OnezoneClient:
             retry=retry,
             deadline_s=deadline_s,
             fresh=fresh,
+            panel=panel,
         )
         return self._decoded(response, method, provider)
+
+    def panel_get(self, provider: str, path: str, *, retry: ReadRetry = ONE_ATTEMPT) -> Any:
+        """GET one of the Onepanel reads the layer knows (`PANEL_READS`) from a declared provider's panel, with the
+        admin credential: a space's support (its `storageId` and `storageImport`), a storage's flags
+        (`importedStorage`, `readonly`, `mountPoint`) and the state of a space's auto import scan (O37). Any other
+        panel path, and an undeclared provider, is refused unsent (`OutOfScope`). The admin credential must be a
+        member of the provider's cluster for the panel to answer; a refusal is the panel's 401 or 403, raised as it
+        came. `retry` is as for `get`."""
+        path = _check_path(path)
+        if any(mark in path for mark in "%?#") or not any(read.fullmatch(path) for read in PANEL_READS):
+            raise OutOfScope("the panel path is not one of the reads the layer sends; nothing was sent")
+        return self._send("GET", path, provider=provider, headers=self._admin, retry=retry, panel=True)
+
+    def force_scan(self, provider: str, space: Space, *, gate_retry: ReadRetry = ONE_ATTEMPT) -> Any:
+        """Force a new auto storage import scan of `space` on a provider's Onepanel (`FORCE_SCAN_PATH`), gated as a
+        mutation bound to that space: the space's live name is read on Onezone right before, and the request is
+        refused unsent unless the id, the name and the prefixes are the space's own and the name lies under a declared
+        prefix (`OutOfScope`), or when that read fails (`ScopeUnread`). With a scan's detection of modifications and
+        deletions off, a forced scan only adds what is new on the storage (op-worker f118ed9,
+        `storage_import_engine.erl`, `maybe_update_file`)."""
+        self._base(provider, panel=True)  # an undeclared provider is refused before anything is read
+        if not _SPACE_ID.fullmatch(space.id):
+            raise OutOfScope("the space's id is not a plain path segment; nothing was sent")
+        try:
+            name = self._space_name(space.id, _GateReads(gate_retry))
+        except NotSent:
+            raise
+        except PlatformError as error:
+            raise ScopeUnread(
+                f"the gate could not read the target's space ({error}); nothing was sent",
+                status=error.status,
+                code=error.code,
+                errno=error.errno,
+                transport=error.transport,
+            ) from None
+        self._require_in_scope((space.id, name), space)
+        path = FORCE_SCAN_PATH.format(space=space.id)
+        return self._send("POST", path, provider=provider, headers=dict(self._admin), panel=True)
 
     def _decoded(self, response: httpx.Response, method: str, provider: str | None) -> Any:
         """Return an answer's decoded JSON, or a PlatformError without detail when it is not JSON."""

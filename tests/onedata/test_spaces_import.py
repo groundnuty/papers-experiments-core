@@ -83,5 +83,6 @@ def test_c06_an_imported_storage_enters_the_fingerprint_and_its_absence_leaves_t
     assert writable["storage_import"] == {"readonly": False}
     several = load(tmp_path / "d", lambda d: with_spaces(d, 2)).fingerprint()["spaces"]
     marked = load(tmp_path / "e", second_entry({"readonly": True})).fingerprint()["spaces"]
-    assert several[0] == marked[0] and several[1] != marked[1]
+    assert several[0] == marked[0]
+    assert several[1] != marked[1]
     assert leaked_values(json.dumps(marked), tmp_path / "e") == []
