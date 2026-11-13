@@ -151,9 +151,9 @@ def newest_first(
     stops the walk as a job older than the cutoff does, and is not kept, nor is any record after a stop, whatever its
     finish time: past the stop a record is read for the order check alone. Past `bound` kept jobs, or `max_pages` pages
     without an end, the listing is unknown: raise Unreadable. Raise OrderBroken when a finish time is later than the
-    one before it, or follows a record with none, through the page past the stop's, whose every record the walk reads for that check alone and keeps none of (one
-    page more than `max_pages` at most). An order broken only further on is not seen: the module docstring has the
-    residual. `where` starts every message."""
+    one before it, or follows a record with none, through the page past the stop's, whose every record the walk reads
+    for that check alone and keeps none of (one page more than `max_pages` at most). An order broken only further on is
+    not seen: the module docstring has the residual. `where` starts every message."""
     if bound < 1 or max_pages < 1 or chunk < 1:
         raise ValueError("a walk keeps at least one job, reads at least one page and one record at a time")
     kept: dict[str, Any] = {}
