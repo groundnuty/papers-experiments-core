@@ -22,9 +22,12 @@ from typing import Any
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.day0.report import status
+from expcore_onedata.fault_recovery import FaultDriver
+from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.rangemap import Placement
 from expcore_onedata.readretry import ReadRetry
+from expcore_onedata.sandbox.hostops import HostOps
 from expcore_onedata.tokens import TokenIssuer
 
 
@@ -54,7 +57,18 @@ def unknown(summary: str, **facts: Any) -> Result:
 
 @dataclass
 class Context:
-    """Everything a check may use: the loaded configuration, the client, and the permission to change state."""
+    """Everything a check may use: the loaded configuration, the client, and the permission to change state.
+
+    Taking a provider down is a second permission, `allow_faults` (`EXPCORE_LIVE_FAULTS=1`), beside `allow_mutation`
+    and beside `sanctioned = true` in `[faults]` of platform.toml (`fault_settings`, `fault_settings.load_faults`).
+    `fault_driver` is the fault injector's driver (`compose.ComposeDriver` by default), and `outage_bound_s` the
+    longest a read or a call of the outage check waits for an answer. `agent_host` is where the outage check may start
+    a sandbox and the tool server (`DockerHost` with `EXPCORE_LIVE_DOCKER=1`; None starts nothing), `agent_options` the
+    keywords its `SandboxPlatform` gets (a registry, the sandbox's options), `tool_condition` the tool-server condition
+    whose tools it calls (else the first that allows the four knowledge tools), and `outage_ceiling_s` the ceiling the
+    agent's tokens are minted for (None, the default, mints them for the scenario's worst case,
+    `outage_budget.scenario_s`).
+    """
 
     config: PlatformConfig
     client: OnezoneClient
@@ -69,6 +83,14 @@ class Context:
     sleep: Callable[[float], None] = lambda seconds: None
     now: Callable[[], float] = lambda: 0.0
     provider_ids: dict[str, str] = field(default_factory=dict)
+    allow_faults: bool = False
+    fault_settings: FaultSettings | None = None
+    fault_driver: FaultDriver | None = None
+    outage_bound_s: float = 60.0
+    agent_host: HostOps | None = None
+    agent_options: dict[str, Any] = field(default_factory=dict)
+    tool_condition: str | None = None
+    outage_ceiling_s: float | None = None
     _provisioners: dict[str, Provisioner] = field(default_factory=dict, repr=False)  # by the label of their space
     _retry: ReadRetry | None = field(default=None, repr=False)
 
@@ -101,6 +123,13 @@ class Context:
                 sleep=self.sleep,
             )
         return self._provisioners[entry.label]
+
+
+def holder_of(ctx: Context, entry: StudySpace) -> str | None:
+    """A space's data provider, as its provisioner takes it: a `[[spaces]]` entry's own, else `[placement] holder`."""
+    if ctx.config.spaces_table:
+        return entry.holder
+    return ctx.placement.settings.holder if ctx.placement else None
 
 
 def worst(verdicts: Iterable[bool | None]) -> bool | None:
