@@ -50,9 +50,9 @@ STATE_FIELDS = ("transferStatus", "replicationStatus", "evictionStatus")
 VISIBLE_TIMEOUT_S = 120.0
 VISIBLE_POLL_S = 0.5
 # What the visibility reads ask for. On 25.0 `GET /data/{id}` resolves only the attributes asked for: `name` reads the
-# entry's document strictly and answers 400 posix enoent once it is deleted, while `size`, `parent_id` and `guid` read
-# it including a deleted one, so each alone keeps answering from a tombstone (14 days by default). A read that includes
-# `name` is gone when the entry is (day0/2026-11-13-federation-facts-deleted-entries-by-id.md).
+# entry's document strictly and answers 400 posix enoent once it is deleted, while `size`, `parent_id` and `file_id`
+# read it including a deleted one, so each alone keeps answering from a tombstone (14 days by default). A read that
+# includes `name` is gone when the entry is (day0/2026-11-13-federation-facts-deleted-entries-by-id.md).
 VISIBLE_ATTRIBUTES = ("name", "size", "parent_id")
 
 

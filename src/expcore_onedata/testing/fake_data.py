@@ -143,7 +143,12 @@ class _Tombstone:
 
 # The attributes that, asked for alone, a deleted entry keeps answering (`FakeData`, "Tombstones"): the ones the
 # platform resolves without reading the entry's document strictly. Any other, `name` and `type` included, is enoent.
-LENIENT_ATTRIBUTES = frozenset({"size", "parent_id", "guid"})
+# The id attribute is `file_id` on 25.0.
+LENIENT_ATTRIBUTES = frozenset({"size", "parent_id", "file_id"})
+
+# Names the `attribute` parameter does not take on 25.0, refused before any lookup: `guid` is the internal name of the
+# id, which the REST API calls `file_id` (ctool `onedata_file.erl`, no clause for it).
+UNKNOWN_ATTRIBUTES = frozenset({"guid"})
 
 
 def _merge(blocks: list[list[int]]) -> list[list[int]]:
@@ -206,7 +211,7 @@ class FakeData(FakeFederation):
     waits before it uses the name again. In between, by what is recorded (`DELETE_FACTS`):
 
     - Recorded. The provider the DELETE went to answers the entry as a deleted one at once (`missing_answer`), except
-      a read of its `size`, `parent_id` or `guid` alone, which its tombstone answers ("Tombstones"). A provider
+      a read of its `size`, `parent_id` or `file_id` alone, which its tombstone answers ("Tombstones"). A provider
       finishes deleting a directory after the call returns, and a directory made again under the same name before
       then loses its files when it does (the reason a federation reset never deletes a directory and makes it again).
       So the create of the name is accepted there, and when the delete lands the files under the directory made again
@@ -226,8 +231,8 @@ class FakeData(FakeFederation):
     **Tombstones** (`tombstone_s`, `keep_deleted_parents`; `TOMBSTONE_FACTS`). On Onedata 25.0, `GET /data/{id}`
     resolves only the attributes it is asked for, and a deleted entry's document is read strictly for some and
     leniently for others. A read with no `attribute` parameter, or with `name` or `type` among the attributes, answers
-    the entry as gone (`missing_answer`, 400 `posix` `enoent`); a read that asks for `size`, `parent_id` or `guid` and
-    nothing else (`LENIENT_ATTRIBUTES`) keeps answering 200 from the entry's last state, only the attributes asked
+    the entry as gone (`missing_answer`, 400 `posix` `enoent`); a read that asks for `size`, `parent_id` or `file_id`
+    and nothing else (`LENIENT_ATTRIBUTES`) keeps answering 200 from the entry's last state, only the attributes asked
     for, on every provider, for `tombstone_s` seconds of `clock` counted from when the delete landed. Entries under a
     deleted directory have one each; a read of its children, content or block map is the entry as gone. Source, at
     op-worker f118ed9 (ctool 8ae7baf, cluster-worker 0e9cb40): strict `name` and the `file_meta` attributes,
@@ -243,11 +248,14 @@ class FakeData(FakeFederation):
     alone still answered at 2.0 s (`deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md`,
     merged with #192), and another study's `size` alone answered on every provider for 120 s. The default
     `tombstone_s` is `TOMBSTONE_S`, the platform's 14 days, so no test that advances the fake's clock reaches the
-    expiry: a check of presence by `size`, `parent_id` or `guid` alone never sees the entry go, and fails in a test as
-    it does live. A test of the expiry itself sets a short `tombstone_s`. `ERRORS_LEGACY` keeps no tombstone. Assumed,
-    not recorded: that a file's tombstone answers as a directory's does (the source read was of a directory's), that
-    `size` is the entry's size when it was deleted, and that `guid` answers `fileId` and `file_id` as a live entry
-    does.
+    expiry: a check of presence by `size`, `parent_id` or `file_id` alone never sees the entry go, and fails in a test
+    as it does live. A test of the expiry itself sets a short `tombstone_s`. `ERRORS_LEGACY` keeps no tombstone. The id
+    attribute is `file_id` on 25.0 and `file_id` alone answers the one key (a live read of `parent_id` and `file_id`
+    answered those two keys and nothing else); `guid` is no name the parameter takes, so `?attribute=guid` answers 400
+    `badValueNotAllowed`, with no `errno`, for every entry, deleted or not, before any lookup (`UNKNOWN_ATTRIBUTES`;
+    ctool `src/onedata_file.erl:253-270` has no clause for it, and `sanitize_attr_names`, `:134-153`, refuses it).
+    Assumed, not recorded: that a file's tombstone answers as a directory's does (the source read was of a
+    directory's), and that `size` is the entry's size when it was deleted.
 
     A delay needs a `clock` that moves. The default never does, so a delete would never land and a test of a name used
     again would pass for no reason: the first DELETE that would pend with it raises `ValueError` naming
@@ -266,8 +274,8 @@ class FakeData(FakeFederation):
     - `ERRORS_25_0` (the default), as measured live on Onedata 25.0 (the dated facts in
       `deploy/compose-federation/day0/`): an entry that is deleted or not visible yet, and a space root that is not
       there yet, answer 400 with error id `posix` and `errno` `enoent`, while a deleted entry's tombstone still
-      answers a read of its `size`, `parent_id` or `guid` alone ("Tombstones"); a write made with a token that has the
-      read-only caveat answers 400 `posix`/`eacces`; an
+      answers a read of its `size`, `parent_id` or `file_id` alone ("Tombstones"); a write made with a token that has
+      the read-only caveat answers 400 `posix`/`eacces`; an
       upload (`PUT` of content) without `Content-Type: application/octet-stream` answers 415. The statuses and the
       `posix` errors are what was seen. A 415 was seen for an upload with no Content-Type at all; that this fake
       refuses any other type too, and the error id of its 415, `unsupportedMediaType`, are its own.
@@ -321,7 +329,7 @@ class FakeData(FakeFederation):
     - `unseen` (`(provider id, file id)` to reads) and `unseen_after_create` (provider id to reads, for every file made
       from then on): a provider that sees a new file only after so many reads of it, each answered `unseen_answer`;
     - `missing_answer`: how a file or directory that is not there is answered; `keep_deleted_parents`: a deleted
-      entry still answers a read of its `size`, `parent_id` or `guid` alone from its tombstone (the name is kept from
+      entry still answers a read of its `size`, `parent_id` or `file_id` alone from its tombstone (the name is kept from
       when only the parent link did); `tombstone_s` (also a constructor argument): how long, in seconds of `clock`
       from the delete landing (default `TOMBSTONE_S`, 14 days); `answer_missing_as_25(answer)` sets the first two, as
       25.0 has them;
@@ -658,7 +666,8 @@ class FakeData(FakeFederation):
 
     def answer_missing_as_25(self, answer: Answer = (400, "posix", "enoent")) -> None:
         """Answer what is not there as Onedata 25.0 does: 400 posix enoent instead of a 404, while a deleted entry still
-        answers a read of its size, parent link or id alone from its tombstone (both read on the Compose federation).
+        answers a read of its size, parent link or `file_id` alone from its tombstone (the parent link was read on the
+        Compose federation).
         `answer` replaces the 400."""
         self.missing_answer = answer
         self.keep_deleted_parents = True
@@ -684,10 +693,7 @@ class FakeData(FakeFederation):
             if tombstone is None or self.clock() >= tombstone.deleted + self.tombstone_s:
                 return None
             attributes = tombstone.attributes
-        answer = {name: attributes[name] for name in ("size", "parent_id") if name in asked}
-        if "guid" in asked:
-            answer.update(fileId=attributes["fileId"], file_id=attributes["file_id"])
-        return answer
+        return {name: attributes[name] for name in ("size", "parent_id", "file_id") if name in asked}
 
     def _answer(self, answer: Answer) -> httpx.Response:
         """An error answer from (status, error id, errno); an error id of None is a body that is no error object."""
@@ -769,6 +775,8 @@ class FakeData(FakeFederation):
             return self._space_root(found.group(1))
         found = re.fullmatch(r"/data/([^/]+)(/children|/content|/distribution)?", route)
         if found:
+            if method == "GET" and not found.group(2) and UNKNOWN_ATTRIBUTES & set(query.get_list("attribute")):
+                return self._error(400, "badValueNotAllowed")  # the names are checked before the entry is looked up
             node = self.nodes.get(found.group(1))
             if node is None or self._hidden(node, provider):  # a delete through this provider that is under way: gone
                 return self._missing(found.group(1), query, method, found.group(2) or "")

@@ -363,7 +363,7 @@ def test_the_nodes_of_a_fake_still_hold_an_entry_whose_delete_is_under_way_thoug
 
 # -- tombstones: what a deleted entry answers by id, per attribute selection -----------------------------------------
 
-LENIENT = [("size",), ("parent_id",), ("guid",), ("size", "parent_id"), ("guid", "size", "parent_id")]
+LENIENT = [("size",), ("parent_id",), ("file_id",), ("size", "parent_id"), ("file_id", "size", "parent_id")]
 STRICT = [(), ("name",), ("type",), ("name", "size", "parent_id"), ("size", "type"), ("mode",), ("size", "mode")]
 TOMBSTONE_NOTE = "deploy/compose-federation/day0/2026-11-13-federation-facts-deleted-entries-by-id.md"
 
@@ -389,7 +389,9 @@ def test_the_tombstone_names_the_facts_it_models():
 
 @pytest.mark.parametrize("attributes", LENIENT, ids="+".join)
 @pytest.mark.parametrize("provider", [ALPHA_ID, BETA_ID])
-def test_a_deleted_entry_read_for_size_parent_or_guid_alone_keeps_answering_from_its_last_state(provider, attributes):
+def test_a_deleted_entry_read_for_size_parent_or_file_id_alone_keeps_answering_from_its_last_state(
+    provider, attributes
+):
     fake = make_federation(clock=Ticker().clock)
     file_id = fake.add_file("study/data.bin", DATA)
     study = fake.id_of("study")
@@ -402,8 +404,49 @@ def test_a_deleted_entry_read_for_size_parent_or_guid_alone_keeps_answering_from
         len(DATA) if "size" in attributes else None,
         study if "parent_id" in attributes else None,
     )
-    assert body.get("fileId") == (file_id if "guid" in attributes else None)
-    assert set(body) <= {"size", "parent_id", "fileId", "file_id"}  # only what was asked, as the platform resolves
+    assert body.get("file_id") == (file_id if "file_id" in attributes else None)
+    assert set(body) <= {"size", "parent_id", "file_id"}  # only what was asked, as the platform resolves
+
+
+@pytest.mark.parametrize("provider", [ALPHA_ID, BETA_ID])
+def test_file_id_alone_answers_200_from_a_deleted_entrys_tombstone_and_names_the_id_by_file_id(provider):
+    """25.0 names the id attribute `file_id`; asked for alone it needs no strict read of the document."""
+    fake = make_federation(clock=Ticker().clock)
+    file_id = fake.add_file("study/data.bin", DATA)
+    delete(fake, ALPHA_ID, file_id)
+    answer = read(fake, provider, file_id, "file_id")
+    assert (answer.status_code, answer.json()) == (200, {"file_id": file_id})
+
+
+GUID = {"error": {"id": "badValueNotAllowed", "details": {}}}  # posix-free: no errno, as the fake answers that error id
+
+
+@pytest.mark.parametrize("others", [(), ("size",), ("name",), ("parent_id", "file_id")], ids="+".join)
+@pytest.mark.parametrize("provider", [ALPHA_ID, BETA_ID])
+def test_guid_is_no_attribute_name_on_25_0_and_answers_400_badvaluenotallowed_for_every_entry(provider, others):
+    """The deprecated names the `attribute` parameter takes have `file_id` and no `guid`; the names are checked before
+    any lookup, so a live entry, a deleted one, one not shown yet and one that never was all answer the same 400, and a
+    `guid` among other attributes fails the whole request."""
+    fake = make_federation(clock=Ticker().clock)
+    live = fake.add_file("study/live.bin", DATA)
+    deleted = fake.add_file("study/deleted.bin", DATA)
+    unseen = fake.add_file("study/unseen.bin", DATA)
+    fake.unseen[(BETA_ID, unseen)] = 3
+    delete(fake, ALPHA_ID, deleted)
+    for file_id in (live, deleted, unseen, "no-such-id"):
+        answer = read(fake, provider, file_id, "guid", *others)
+        assert (answer.status_code, answer.json()) == (400, GUID), file_id
+    assert fake.unseen[(BETA_ID, unseen)] == 3  # refused before the provider looked the entry up
+
+
+def test_guid_is_refused_in_the_legacy_shape_too():
+    fake = make_federation(clock=Ticker().clock, error_shape=ERRORS_LEGACY)
+    file_id = fake.add_file("a.bin", DATA)
+    live = read(fake, ALPHA_ID, file_id, "guid")
+    assert (live.status_code, live.json()) == (400, GUID)
+    delete(fake, ALPHA_ID, file_id)
+    gone = read(fake, ALPHA_ID, file_id, "guid")
+    assert (gone.status_code, gone.json()) == (400, GUID)  # not the 404 a gone entry answers there
 
 
 @pytest.mark.parametrize("attributes", STRICT, ids=lambda a: "+".join(a) or "no-attribute")
@@ -490,7 +533,7 @@ def test_during_a_delete_that_is_under_way_the_provider_it_went_to_answers_lenie
     assert read(fake, BETA_ID, file_id, "size").json() == GONE_25_0
 
 
-@pytest.mark.parametrize("attributes", [("size",), ("parent_id",), ("guid",)])
+@pytest.mark.parametrize("attributes", [("size",), ("parent_id",), ("file_id",)])
 def test_the_legacy_shape_keeps_no_tombstone(attributes):
     fake = make_federation(clock=Ticker().clock, error_shape=ERRORS_LEGACY)
     file_id = fake.add_file("a.bin", DATA)

@@ -2,9 +2,11 @@
 
 On the **25.0 development build (op-worker f118ed9)**, `GET /data/{id}` for a deleted entry answers by the attributes it
 is asked for. A read with no `attribute` parameter, or with `name` or `type` among them, answers 400 `posix` `enoent`.
-A read for `size`, `parent_id` or `guid` alone, one or more of them and nothing else, keeps answering 200 from the
+A read for `size`, `parent_id` or `file_id` alone, one or more of them and nothing else, keeps answering 200 from the
 entry's last state for **14 days by default**, on every provider that holds the tombstone. An entry is gone only when a
-read that includes a strict attribute answers `enoent`; never decide that from `size`, `parent_id` or `guid` alone.
+read that includes a strict attribute answers `enoent`; never decide that from `size`, `parent_id` or `file_id` alone.
+The id attribute is named `file_id` on 25.0: `?attribute=guid` answers 400 `badValueNotAllowed` for every entry, deleted
+or not, before any lookup.
 
 This file explains observations already recorded and amends two earlier files by naming them; neither is edited:
 
@@ -26,10 +28,12 @@ repository's own tree.
 |---|---|---|
 | no `attribute` parameter | 400 `posix` `enoent` | the default list holds `name` and `type` (ctool `include/onedata_file.hrl:142-145`) |
 | `name`, `type`, or either among others (`mode`, `shares`, `owner_id`, ...) | 400 `posix` `enoent` | read through the strict getter |
-| `size`, `parent_id`, `guid`, or any of the three together | 200 from the last state | read through the lenient getter, or no getter (`guid`) |
+| `size`, `parent_id`, `file_id`, or any of the three together | 200 from the last state | read through the lenient getter, or no getter (`file_id`) |
+| `guid`, alone or among any others | 400 `badValueNotAllowed`, for a live entry too | not a name the parameter takes: refused before any lookup |
 
-Deprecated names map `parent_id` to `parent_guid` (ctool `src/onedata_file.erl:255,260,266`). A request with a strict
-and a lenient attribute fails as a whole: no partial answer is returned.
+Deprecated names map `parent_id` to `parent_guid` and `file_id` to the id (ctool `src/onedata_file.erl:253-270`, which
+has no clause for `guid`). A request with a strict and a lenient attribute fails as a whole: no partial answer is
+returned.
 
 ## How the read resolves
 
@@ -40,6 +44,10 @@ and a lenient attribute fails as a whole: no partial answer is returned.
   `src/modules/fslogic/operations/attr_req.erl:297-304`). It runs only the stages whose attributes were asked for
   (`src/modules/fslogic/operations/utils/file_attr.erl:127-139`, stage filter `359-365`). With none asked, the default
   is every deprecated attribute.
+- **The `attribute` parameter takes the deprecated names** (`file_middleware_get_handler.erl:95-104`), so the id is
+  `file_id`. `sanitize_attr_names` (ctool `src/onedata_file.erl:134-153`) checks the names before the route looks
+  anything up, and answers 400 `badValueNotAllowed` for `guid`, which ctool's mapping (`src/onedata_file.erl:253-270`)
+  has no clause for. That holds for a live entry, a deleted one and one that never existed alike.
 - **The route looks no file up.** `fetch_entity` returns `{undefined, 1}` and validation checks only that the space is
   supported (`file_middleware_get_handler.erl:237-239,310-333`), so nothing fails before the stages run.
 - **Two getters of the `file_meta` document.**
@@ -50,7 +58,7 @@ and a lenient attribute fails as a whole: no partial answer is returned.
   - *Lenient*: `file_ctx:get_file_doc_including_deleted/1` (`file_ctx.erl:425-431`) reads through
     `file_meta:get_including_deleted` (`file_meta.erl:236-264`) and returns the tombstone.
 - **Stage by stage** (`file_attr.erl`; attribute groups in ctool `include/onedata_file.hrl:75-114`):
-  - `guid` is implicit (`file_attr.erl:138`) and reads no document.
+  - `file_id`, the id (internally `guid`), is implicit (`file_attr.erl:138`) and reads no document.
   - `parent_id` goes through `resolve_parent_attrs` (`file_attr.erl:193-199`) to `file_tree:get_parent_internal`
     (`src/modules/fslogic/file_tree/file_tree.erl:118-139,236-240`), lenient.
   - `size` of a directory goes through `resolve_location_attrs` (`file_attr.erl:234-242`) and
@@ -108,7 +116,7 @@ and a lenient attribute fails as a whole: no partial answer is returned.
 - **Gone:** `GET /data/{id}` with no `attribute` parameter, or with `name` or `type` among the attributes, answers 400
   `posix` `enoent`. A caller that waits for it bounds the wait by the size of the tree and expects a failed traverse
   to retry after 16 s or more.
-- **Not a test of absence:** `size`, `parent_id` or `guid` alone, however many of them. They answer for about 14 days
+- **Not a test of absence:** `size`, `parent_id` or `file_id` alone, however many of them. They answer for about 14 days
   after the delete.
 - **Deletion accepted, not finished:** the name is out of the old parent's listing and `parent_id` is the space's trash
   directory, which is the same for every directory of the space **[inference]**. An empty trash listing shows only that
