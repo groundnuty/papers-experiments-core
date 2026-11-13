@@ -4,7 +4,7 @@ and the layouts every check of a generated Compose file runs over."""
 from pathlib import Path
 
 import pytest
-from federation_support import DEPLOY, EXAMPLE, MINIMAL, WITH_WRITABLE_IMPORT
+from federation_support import DEPLOY, EXAMPLE, MINIMAL, STORAGE_IMPORT, WITH_WRITABLE_IMPORT
 
 
 @pytest.fixture(scope="session")
@@ -52,8 +52,14 @@ def imports_layout(tmp_path_factory) -> Path:
     return path
 
 
-@pytest.fixture(params=["default", "five-providers", "minimal", "imports"])
+@pytest.fixture(params=["default", "five-providers", "minimal", "imports", "storage-import"])
 def any_spec(request, fed, minimal_layout, imports_layout):
     """Every layout a check of the generated Compose file must hold for."""
-    path = {"default": None, "five-providers": EXAMPLE, "minimal": minimal_layout, "imports": imports_layout}
+    path = {
+        "default": None,
+        "five-providers": EXAMPLE,
+        "minimal": minimal_layout,
+        "imports": imports_layout,
+        "storage-import": STORAGE_IMPORT,
+    }
     return fed.spec.load_spec(path[request.param])

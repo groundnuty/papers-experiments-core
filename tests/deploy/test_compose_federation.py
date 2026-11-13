@@ -15,7 +15,7 @@ import shutil
 import subprocess
 
 import pytest
-from federation_support import DEPLOY, EXAMPLE
+from federation_support import DEPLOY, EXAMPLE, STORAGE_IMPORT
 
 from expcore_onedata.fault_settings import FaultSettings
 
@@ -147,7 +147,11 @@ def test_the_janitor_has_no_network_runs_only_when_asked_and_deletes_only_under_
 
 @pytest.mark.parametrize(
     ("layout", "committed"),
-    [(None, DEPLOY / "compose.yaml"), (EXAMPLE, EXAMPLE.with_suffix(".compose.yaml"))],
+    [
+        (None, DEPLOY / "compose.yaml"),
+        (EXAMPLE, EXAMPLE.with_suffix(".compose.yaml")),
+        (STORAGE_IMPORT, STORAGE_IMPORT.with_suffix(".compose.yaml")),
+    ],
 )
 def test_the_committed_compose_files_are_what_the_generator_makes(fed, layout, committed):
     """compose.yaml and the example's file are generated, never edited: a change to the generator shows in them."""
