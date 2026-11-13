@@ -80,6 +80,7 @@ from expcore_onedata.sandbox.containers import (
     extra_args_record,
     gate_run_args,
     gate_upstreams,
+    image_config_record,
     sidecar_abort_args,
     sidecar_command,
     sidecar_options,
@@ -603,6 +604,8 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
+        started = self.host.docker("logs", names.sidecar, check=False, timeout=30)  # the entrypoint's one line, first
+        self._meta["mount"]["image_config"] = image_config_record(started.stdout if started.returncode == 0 else None)
         self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
         self.watch_container("sidecar", names.sidecar)
         return share

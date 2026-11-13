@@ -1,5 +1,5 @@
 """One sandbox reads a small file from each of several spaces through one oneclient process (O36), skipped unless every
-gate below is set.
+gate below is set. The same run shows that the effective configuration is exactly argv plus the token.
 
     EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_PLATFORM=<root>/platform.toml \\
     EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range the host routes nowhere> \\
@@ -21,6 +21,13 @@ table into a directory of its own (`mount_live.derive_platform`), as `test_mount
 `io_mode = "proxy"`. It skips, naming the reason, when the file declares fewer than two spaces, and never writes into a
 space the file does not declare. The failure it guards needs the spaces on one storage of the local provider, which the
 Compose federation arranges (each provider has one storage, which supports every space it supports).
+
+The same sandbox is then asked what its oneclient runs with. oneclient logs its effective options at its start, and its
+environment names are readable from outside: every logged option must say what the argv sets (or oneclient's default for
+one it does not set), and no variable of the environment may be one oneclient reads an option from but the token's
+(`mount_effective`). With `--config /dev/null` and `env -u` of the image's own flag, `ONECLIENT_OVERRIDE` and
+`ONECLIENT_CONFIG`, a line that differs, or a variable that is there, shows an input the core did not close: the check
+fails and names it. The image's own configuration file is recorded by its SHA-256 (or `unread`), though never parsed.
 
 The attempt runs once, in a fixture: one file is written into each space through the local provider, one sandbox
 mounts them all, and the agent reads the files one after another, each in a child process given `READ_DEADLINE_S`.
@@ -44,7 +51,8 @@ if any(os.environ.get(gate) != "1" for gate in GATES) or not os.environ.get("EXP
         allow_module_level=True,
     )
 
-from mount_live import (  # noqa: E402 -- only once the module is known to run
+from mount_effective import effective_facts  # noqa: E402 -- only once the module is known to run
+from mount_live import (  # noqa: E402
     AGENT_IMAGE,
     LEASE_KEY,
     ONECLIENT_IMAGE,
@@ -164,7 +172,14 @@ def attempt(tmp_path_factory):
         spec = mount_spec(config, run)
         sandbox = DockerSandbox.start(host, s, spec)
         try:
-            facts["mount"] = {k: sandbox.metadata()["mount"].get(k) for k in ("io_mode", "options", "network")}
+            mounted = sandbox.metadata()["mount"]
+            facts["mount"] = {k: mounted.get(k) for k in ("io_mode", "options", "network")}
+            config = mounted.get("image_config") or {}  # the file's hash or `unread`, never its path
+            facts["mount"]["image_config"] = {
+                "sha256": config.get("sha256"),
+                "path_known": config.get("path") is not None,
+            }
+            facts["effective"] = effective_facts(host, sandbox.names.sidecar, s, spec.provider.host)
             result = sandbox.exec(
                 spaces_cell(written, READ_DEADLINE_S, APPEAR_S),
                 spaces_cell_timeout(len(written), READ_DEADLINE_S, APPEAR_S),
@@ -218,3 +233,27 @@ def test_o36_the_sandbox_that_read_several_spaces_leaves_nothing_behind(attempt)
     assert attempt["gone"] is True
     assert attempt["fixture_cleanup_failures"] == []
     assert attempt["federation_network_present"] is True
+
+
+def test_o36_the_effective_configuration_is_exactly_the_argv_and_the_token(attempt):
+    """O36: every start line oneclient logged says what the sandbox's argv sets, or its own default for an option the
+    argv leaves alone (`--config /dev/null` and the closed environment leave no other input), and the only variable
+    of the sidecar's environment that oneclient reads an option from is the token's. A failure names the line or the
+    variable."""
+    effective = attempt["effective"]
+    assert effective["log_read"] is True, "the sidecar's oneclient log could not be read"
+    assert effective["logged"] >= effective["expected"]
+    assert effective["mismatched"] == [], effective["problems"]
+    assert effective["env_read"] is True, "the sidecar's environment could not be read"
+    assert effective["option_env_names"] == ["ONECLIENT_ACCESS_TOKEN"], effective["option_env_names"]
+    assert effective["token_variable_present"] is True
+    assert effective["unset_present"] == []
+
+
+def test_o36_the_config_file_is_the_empty_one_and_the_images_own_is_recorded_by_hash(attempt):
+    """O36: `--config /dev/null` is among the options the sandbox passed, and the metadata holds the SHA-256 of the file
+    the image's oneclient would otherwise have parsed (or `unread`, when the sidecar could not read it: a failure of
+    this record is a fact to look at, not of the run)."""
+    assert attempt["mount"]["options"][-2:] == ["--config", "/dev/null"]
+    digest = attempt["mount"]["image_config"]["sha256"]
+    assert digest == "unread" or (len(digest) == 64 and set(digest) <= set("0123456789abcdef")), digest

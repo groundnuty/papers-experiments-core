@@ -1,7 +1,9 @@
 """The docker arguments of each container: read-only everywhere, images by id, no secret in an argument (O05, O13)."""
 
 import dataclasses
+import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -109,7 +111,7 @@ def test_o05_the_sidecar_is_the_only_container_with_fuse_and_takes_its_token_fro
 def test_o05_the_sidecars_shell_hands_the_files_token_to_oneclient_and_refuses_an_empty_one(tmp_path):
     """O05: run by a real shell, the sidecar's start script puts the token file's value, and nothing else, into the
     environment of the program `env` starts, with every argument passed through as given (spaces included), and
-    exits without starting it when the file is empty or missing."""
+    exits without starting it when the file is empty or missing. The one line before it is the config record (O36)."""
     token = tmp_path / "token"
     script = C.SIDECAR_START.replace(C.SIDECAR_TOKEN_PATH, str(token))
     show = ["sh", "-c", f'printf "%s|%s|%s" "${C.ENV_ACCESS_TOKEN}" "$1" "$2"', "show", "a b", "-u"]
@@ -121,7 +123,11 @@ def test_o05_the_sidecars_shell_hands_the_files_token_to_oneclient_and_refuses_a
 
     token.write_text("tok-invented-0123", encoding="utf-8")
     done = run()
-    assert (done.returncode, done.stdout) == (0, "tok-invented-0123|a b|-u")
+    assert done.returncode == 0
+    assert done.stdout.splitlines()[-1].endswith("tok-invented-0123|a b|-u")
+    assert (
+        "tok-invented-0123" not in done.stdout.split("\n", 1)[0]
+    )  # the record line is written before the token is read
     token.write_text("", encoding="utf-8")
     assert run().returncode == 97
     token.unlink()
@@ -180,11 +186,135 @@ def test_o36_the_options_the_sandbox_sets_are_the_commands_own(s):
     )
     options = C.sidecar_options(declared)
     command = C.sidecar_command("p.test", declared)
-    assert options == ["-o", "ro,allow_other", "--force-direct-io"]
+    assert options == ["-o", "ro,allow_other", "--force-direct-io", "--config", "/dev/null"]
     at = command.index(options[0])
     assert command[at : at + len(options)] == options
     assert command[-3:-1] == ["--provider-timeout", "30"]
     assert command[-1] == C.SIDECAR_MOUNT
+
+
+def unset_names(command):
+    """The environment variables `env` removes in a sidecar command: each `-u NAME` before the program."""
+    program = command.index(C.ONECLIENT_BIN)
+    return [command[i + 1] for i, word in enumerate(command[:program]) if word == "-u"]
+
+
+def test_o36_oneclients_other_inputs_are_closed_in_the_command(s):
+    """O36: nothing but argv and the token sets an option of the sidecar's oneclient: `env -u` removes the three
+    variables that could (the image's own skip-verification flag, `ONECLIENT_OVERRIDE` and `ONECLIENT_CONFIG`), and
+    `--config /dev/null` means no configuration file is parsed. The token's own variable is not removed."""
+    command = C.sidecar_command("p.test", s)
+    assert unset_names(command) == ["ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG"]
+    assert C.ENV_ACCESS_TOKEN not in unset_names(command)
+    at = command.index("--config")
+    assert command[at : at + 2] == ["--config", "/dev/null"]
+    assert command.count("--config") == 1
+    assert command.index(C.ONECLIENT_BIN) < at < command.index(C.SIDECAR_MOUNT)
+
+
+def test_o36_the_token_still_reaches_oneclient_through_its_own_variable_and_the_file(s, names):
+    """O36: closing the environment keeps the one path the token takes (O05): the file bound into the sidecar alone,
+    read into `ONECLIENT_ACCESS_TOKEN` by the entrypoint, which `env -u` leaves alone."""
+    args = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE)
+    assert f"{TOKEN_FILE}:{C.SIDECAR_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
+    script = args[args.index("-c") + 1]
+    assert f'{C.ENV_ACCESS_TOKEN}="$(cat {C.SIDECAR_TOKEN_PATH})"' in script
+    assert f"export {C.ENV_ACCESS_TOKEN}" in script
+    assert C.ENV_ACCESS_TOKEN not in unset_names(args)
+    assert "-e" not in args  # and docker is given no environment for it
+
+
+def test_o36_the_command_refuses_settings_that_would_give_oneclient_two_force_options_or_a_second_config(s):
+    """O36: settings reach the command by `dataclasses.replace` and by direct assignment alike; the command is where the
+    exactly-one invariant is held, whatever built the settings. A mount whose fields were set past its own check
+    (`object.__setattr__`, as a copy of a frozen object may be) still raises here and never yields an argv."""
+    for extra in (("--force-direct-io",), ("--force-p",), ("--config", "/other.conf"), ("ONECLIENT_CONFIG=/other",)):
+        mount = dataclasses.replace(s.mount)
+        object.__setattr__(mount, "extra_args", extra)
+        broken = dataclasses.replace(s, mount=mount)
+        with pytest.raises(ValueError, match="extra_args"):
+            C.sidecar_command("p.test", broken)
+        with pytest.raises(ValueError, match="extra_args"):
+            C.sidecar_options(broken)
+    mount = dataclasses.replace(s.mount)
+    object.__setattr__(mount, "io_mode", "auto")
+    with pytest.raises(ValueError, match="io_mode"):
+        C.sidecar_command("p.test", dataclasses.replace(s, mount=mount))
+
+
+def test_o36_a_direct_mount_still_has_its_argv_for_the_storage_mapping_that_will_lift_the_refusal(s):
+    """O36: the loader refuses `direct` until the providers' storage is mapped into the sidecar (#223), but the command
+    for it stays: exactly one force option, the config file and the closed environment as for proxy."""
+    declared = with_io_mode(s, "direct")
+    command = C.sidecar_command("p.test", declared)
+    assert command.count("--force-direct-io") == 1
+    assert "--force-proxy-io" not in command
+    assert unset_names(command) == ["ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG"]
+
+
+HELP = """General options:
+  -h [ --help ] (=0)                    Show this help and exit.
+  -c [ --config ] <path> (={path})
+                                        Specify path to config file.
+  --ignore-env                          Ignore options from environment variables.
+"""
+needs_tools = pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("sh", "sed", "sha256sum", "cut", "head")),
+    reason="the record is made by the sidecar's shell with these tools",
+)
+
+
+def run_record(tmp_path, help_text):
+    """The sidecar's record step, run by a real shell with a stand-in for oneclient whose `--help` prints
+    `help_text`."""
+    binary = tmp_path / "oneclient"
+    binary.write_text(f"#!/bin/sh\ncat <<'END'\n{help_text}END\n", encoding="utf-8")
+    binary.chmod(0o755)
+    script = C.SIDECAR_RECORD.replace(C.ONECLIENT_BIN, str(binary))
+    done = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False, timeout=30)
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+@needs_tools
+def test_o36_the_sidecar_hashes_the_image_config_file_the_binary_names_and_the_record_reads_it(tmp_path):
+    """O36: the file the image's oneclient would parse by default is found by asking the binary (`--help` names it), and
+    its SHA-256 is printed before oneclient starts; `image_config_record` reads that line. The file is not parsed:
+    this is only what the record shows."""
+    conf = tmp_path / "ones3.conf"
+    conf.write_bytes(b"# an invented configuration file\nforce_direct_io = true\n")
+    out = run_record(tmp_path, HELP.format(path=conf))
+    assert out == f"expcore-oneclient-config sha256={hashlib.sha256(conf.read_bytes()).hexdigest()} path={conf}\n"
+    assert C.image_config_record(out) == {"path": str(conf), "sha256": hashlib.sha256(conf.read_bytes()).hexdigest()}
+
+
+@needs_tools
+def test_o36_a_file_the_sidecar_cannot_hash_is_recorded_unread_with_its_path_when_the_binary_named_one(tmp_path):
+    """O36: an absent file (oneclient then runs with no options from it) is `unread`, with the path the binary named;
+    a help that names none is `unread` with no path. Neither stops the start."""
+    out = run_record(tmp_path, HELP.format(path=tmp_path / "absent.conf"))
+    assert C.image_config_record(out) == {"path": str(tmp_path / "absent.conf"), "sha256": "unread"}
+    nameless = run_record(tmp_path, "General options:\n  -h [ --help ]  Show this help.\n")
+    assert C.image_config_record(nameless) == {"path": None, "sha256": "unread"}
+
+
+@pytest.mark.parametrize(
+    "logs",
+    [
+        None,
+        "",
+        "Oneclient has been successfully mounted in '/mnt/oneclient'.\n",
+        "expcore-oneclient-config sha256=nothex path=/etc/oneclient.conf\n",
+    ],
+)
+def test_o36_a_log_without_a_usable_record_gives_unread(logs):
+    """O36: the sandbox's start never fails on the record: no output, no line or a line that is not a SHA-256 is
+    `unread` (and a path that is not one absolute path of the image is dropped)."""
+    assert C.image_config_record(logs)["sha256"] == "unread"
+    assert C.image_config_record("expcore-oneclient-config sha256=" + "a" * 64 + " path=../../host/x\n") == {
+        "path": None,
+        "sha256": "a" * 64,
+    }
 
 
 def test_the_sidecar_command_sets_tls_from_the_settings_alone(s):

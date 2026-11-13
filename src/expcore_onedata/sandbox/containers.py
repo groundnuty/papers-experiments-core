@@ -23,7 +23,15 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
-from expcore_onedata.sandbox.settings import IO_MODE_FLAGS, IO_MODES, SandboxSettings
+from expcore_onedata.sandbox.oneclient_args import (
+    CONFIG_NULL,
+    CONFIG_OPTION,
+    IO_MODE_FLAGS,
+    UNSET_ENV,
+    mount_problem,
+    option_name,
+)
+from expcore_onedata.sandbox.settings import SandboxSettings
 from expcore_onedata.sandbox.teardown import SIDECAR_MOUNT, SIDECAR_SUFFIX
 
 AGENT_OOM_SCORE_ADJ = 1000  # the host's out-of-memory killers take the agent's processes before anything else
@@ -46,11 +54,27 @@ ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
 ENV_TOKEN = "ONEDATA_TOKEN"
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
-# The sidecar's entrypoint: read the token file into oneclient's variable, refuse an empty one, then become `env` with
-# the arguments of `sidecar_command`. The value lives in oneclient's own environment, never in docker's configuration.
+# The sidecar's entrypoint: print the one line that records the image's own oneclient configuration file (never parsed:
+# `--config /dev/null`), read the token file into oneclient's variable, refuse an empty one, then become `env` with the
+# arguments of `sidecar_command`. The value lives in oneclient's own environment, never in docker's configuration.
+#
+# The record asks the binary where its default configuration file is (`oneclient --help` prints `-c [ --config ] <path>
+# (=<default>)`, which is the path `Options::getConfigFilePath` falls back to, so it is never guessed from the image's
+# layout), then hashes that file. The help runs before the token is read, so it never holds it. A failure of any step
+# prints `unread` for the hash: the record shows what could not be read, and the start goes on.
+CONFIG_RECORD = "expcore-oneclient-config"  # the word the line starts with; `image_config_record` reads it from the log
+HELP_DEFAULT = (
+    "s/.*--config *] *<path> *(=\\([^)]*\\)).*/\\1/p"  # the `sed` program that takes the path out of the help
+)
+SIDECAR_RECORD = (
+    f"c=\"$({ONECLIENT_BIN} --help 2>/dev/null | sed -n '{HELP_DEFAULT}' | head -n 1)\"; "
+    'h="$(sha256sum "$c" 2>/dev/null | cut -d" " -f1)"; '
+    f'printf "{CONFIG_RECORD} sha256=%s path=%s\\n" "${{h:-unread}}" "$c"; '
+)
 SIDECAR_START = (
-    f'{ENV_ACCESS_TOKEN}="$(cat {SIDECAR_TOKEN_PATH})" && [ -n "${ENV_ACCESS_TOKEN}" ] || exit 97; '
-    f'export {ENV_ACCESS_TOKEN}; exec env "$@"'
+    SIDECAR_RECORD
+    + f'{ENV_ACCESS_TOKEN}="$(cat {SIDECAR_TOKEN_PATH})" && [ -n "${ENV_ACCESS_TOKEN}" ] || exit 97; '
+    + f'export {ENV_ACCESS_TOKEN}; exec env "$@"'
 )
 SIDECAR_SHELL_NAME = "oneclient-sidecar"  # the shell's $0, before the arguments it hands to `env`
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
@@ -120,30 +144,54 @@ class Names:
 
 def sidecar_options(settings: SandboxSettings) -> list[str]:
     """The oneclient options the sandbox itself sets, in the order it passes them: the read-only mount options, the
-    mode's force-I/O option, and `--insecure` when the platform's `[tls]` says so. The study's `extra_args` are not
-    here.
+    mode's force-I/O option, `--config /dev/null` and `--insecure` when the platform's `[tls]` says so. The study's
+    `extra_args` are not here.
 
     The I/O mode is always declared (O36): oneclient 25.0 started with neither force option detects each storage's
     access type at the first read of each space, and its detection for a second space on one storage waits on a mutex
     its own thread already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`), so that read never
-    returns. A mount without a known `io_mode` raises here rather than start oneclient without one."""
+    returns. The configuration file is always the empty one, so the image's own is never parsed. A mount with an
+    unknown `io_mode`, or an extra argument that sets what the core declares, raises here rather than start oneclient
+    with two force options, a second configuration or none (settings built in code never met the loader's check)."""
     mount = settings.mount
     if mount is None:
         raise ValueError("a mount data path needs [sandbox.mount]")
-    if mount.io_mode not in IO_MODE_FLAGS:
-        raise ValueError(f"[sandbox.mount] io_mode must be one of: {', '.join(IO_MODES)}")
+    problem = mount_problem(mount.io_mode, mount.extra_args)
+    if problem is not None:
+        raise ValueError(problem)
     return [
-        *("-o", "ro,allow_other", IO_MODE_FLAGS[mount.io_mode]),
+        *("-o", "ro,allow_other", IO_MODE_FLAGS[mount.io_mode], CONFIG_OPTION, CONFIG_NULL),
         *(["--insecure"] if settings.tls.insecure else []),
     ]
 
 
 def extra_args_record(extra_args: Sequence[str]) -> dict[str, Any]:
-    """The study's extra oneclient arguments as a run's metadata keeps them: the option names, and the SHA-256 of the
-    whole list, never a value (a value may be a path or an identifier, O12). A short option's value may be attached to
-    it (`-l/path`), so only its two characters are kept; a long option's name ends at an `=`."""
-    names = [a.split("=", 1)[0] if a.startswith("--") else a[:2] for a in extra_args if a.startswith("-")]
+    """The study's extra oneclient arguments as a run's metadata keeps them: the names of the options oneclient has, and
+    the SHA-256 of the whole list, never a value (a value may be a path or an identifier, O12). A word that starts
+    with a dash and is not one of oneclient's options may be a value, so it is kept as `<value>`; a short option's
+    value may be attached to it (`-l/path`), so only its two characters are kept; a long option's name ends at an
+    `=`."""
+    names = [name for a in extra_args if (name := option_name(a)) is not None]
     return {"names": names, "sha256": hashlib.sha256("\0".join(extra_args).encode()).hexdigest()}
+
+
+UNREAD = "unread"  # the hash of a file the sidecar could not read
+CONFIG_LINE = re.compile(rf"^{CONFIG_RECORD} sha256=(\S+) path=(.*)$", re.MULTILINE)
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def image_config_record(logs: str | None) -> dict[str, str | None]:
+    """The image's own oneclient configuration file as a run's metadata keeps it, from the sidecar's container output:
+    its path in the image and its SHA-256, or `unread` when the sidecar could not hash it. The file is not parsed by
+    oneclient (`--config /dev/null`); this shows what the image carried. The first line of the record wins; an output
+    with none, or whose line is not in the form the entrypoint prints, gives no path and `unread`. The path is the
+    image's, never the host's, and is kept only as one absolute path without dot segments."""
+    found = CONFIG_LINE.search(logs or "")
+    if found is None:
+        return {"path": None, "sha256": UNREAD}
+    digest, path = found.group(1), found.group(2)
+    clean = CERTIFI_PATH.fullmatch(path) is not None and not ({".", ".."} & set(path.split("/")))
+    return {"path": path if clean else None, "sha256": digest if SHA256_HEX.fullmatch(digest) else UNREAD}
 
 
 def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
@@ -156,13 +204,19 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     no option of its own for a CA, and `tests/live/test_sandbox.py` checks the image honours it); `--insecure` is passed
     only with `insecure_tls`. `-f` keeps the client in the foreground. The mount is read-only (`-o ro`), and how the
     client reaches storage is the table's `io_mode`, always passed (`sidecar_options`, O36).
+
+    Nothing else sets an option of oneclient (O36): `env -u` also removes `ONECLIENT_OVERRIDE` and `ONECLIENT_CONFIG`,
+    and `--config /dev/null` means the image's own configuration file is never parsed. The token arrives in
+    `ONECLIENT_ACCESS_TOKEN` (`SIDECAR_START`) and stays, so the effective options are this argv and the token.
     """
     mount = settings.mount
     if mount is None:
         raise ValueError("a mount data path needs [sandbox.mount]")
     trust = [f"{ENV_SSL_CERT_FILE}={SIDECAR_CA_PATH}"] if settings.tls.ca_file is not None else []
     return [
-        *("-u", "ONECLIENT_INSECURE", *trust, ONECLIENT_BIN, "-f", "-H", provider_host),
+        *(arg for name in UNSET_ENV for arg in ("-u", name)),
+        *trust,
+        *(ONECLIENT_BIN, "-f", "-H", provider_host),
         *sidecar_options(settings),
         *mount.extra_args,
         SIDECAR_MOUNT,
