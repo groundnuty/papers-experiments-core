@@ -26,8 +26,11 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   until each is online, makes the spaces, has each supported by exactly its owner and its mirrors, makes the users
   members of their spaces with exactly their privileges, writes the baseline files into every space that keeps them (all
   but those declared `baseline = false`), and writes `facts.json` and, from the layout's platform template,
-  `platform.toml`. Run on a federation that is up, it starts what is stopped and checks every step again, and writes
-  no baseline file (see "The baseline" for changing a space's `baseline` key).
+  `platform.toml`. Last, it runs the platform layer's link check through that `platform.toml` (`fedlinks.py`, #221):
+  each (local, source) pair must fetch a probe from the layout's `probe_space` within the bound, or up fails naming the
+  pair and the remedy; the report is written as `link-check.json` beside `facts.json`. Run on a federation that is up,
+  it starts what is stopped and checks every step again, the links included, and writes no baseline file (see "The
+  baseline" for changing a space's `baseline` key).
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
   everything in every space, ingested datasets included, and writes the baseline files again into the spaces that keep
   them; a space declared `baseline = false` is left empty. The providers, spaces and users keep their ids, so
@@ -42,7 +45,8 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   still holding each whole, on two sweeps in a row. No file is removed. After it, the default layout's `birch` no
   longer holds its replica of `replicated.bin`; the ended transfer record stays. QoS requirements and running
   transfers are not touched: the platform layer's per-run reset (#118) is to take them, and to replace the directory
-  eviction and the sweep behind the same function, `evict_replicas(boot, timeout_s)`.
+  eviction and the sweep behind the same function, `evict_replicas(boot, timeout_s)`. The `probe_space` is left alone:
+  each link probe is held by the provider that wrote it, owner or not.
 - A bare **reset** is refused with a message naming both, so nobody wipes ingested datasets by accident.
 - **down** reads each service's peak memory, runs `docker compose down --volumes` for the project (all the data is
   bind-mounted under the root, so no volume holds anything the federation needs), then removes the root with
@@ -55,8 +59,8 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
 ## Declaring a layout
 
 A layout is a TOML file; `federation.toml` is the default and the reference, and `layouts/five-providers.toml` is an
-example with five providers and four spaces, one provider mirroring a second owner's space. Its generated Compose file
-is `layouts/five-providers.compose.yaml`.
+example with five providers and four spaces the agent may reach, one provider mirroring a second owner's space, beside
+its probe space. Its generated Compose file is `layouts/five-providers.compose.yaml`.
 
 | Key | Holds |
 |---|---|
@@ -66,6 +70,7 @@ is `layouts/five-providers.compose.yaml`.
 | `memory_limit` | each service's memory limit (default `6g`); `[zone]` and `[providers.<name>]` may set their own |
 | `support_bytes` | each provider's support of each space (default 10 GiB); `[spaces.<name>]` may set its own |
 | `platform_template` | optional: the template of `platform.toml`, a relative path to a file inside the layout file's directory or this deploy directory, with no symbolic link on the way, since up copies it into the root |
+| `probe_space` | the space the link check writes its probes into (#221): declared `agent_visible = false`, supported by every provider of a space the agent may reach, in a layout with a `platform_template` whose `[link_check]` names it; both committed layouts declare one |
 | `[zone] port`, `[providers.<name>] port` | each service's port on `127.0.0.1` |
 | `[spaces.<name>] owner`, `mirrors` | the provider the space's data is written through and kept on, and the other providers that support it |
 | `[spaces.<name>] baseline` | `false` for a space that up leaves empty and `reset --clean` empties, the study space included (default `true`: the baseline files, see "The baseline") |
@@ -88,8 +93,8 @@ files are not agent-visible material and need no deleting after `up`, which woul
 the ingest. The space is still made, supported by its owner and mirrors, and given its members and tokens; only the files
 are left out. The study space may be one of them: a check that reads a baseline file then finds none, and says so
 (see "The baseline"). A layout declares `agent_visible = false` and `baseline = false` independently, and the study
-space is refused only for the first. The key sits in the space's table, beside its owner and mirrors; neither committed
-layout sets it, so both keep every baseline file:
+space is refused only for the first. The key sits in the space's table, beside its owner and mirrors; the committed
+layouts set it on their probe space alone, so every other space keeps its baseline files:
 
 ```toml
 [spaces.alpha-space]             # the study space, left empty by up and by reset --clean
