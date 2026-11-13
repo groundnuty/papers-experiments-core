@@ -8,7 +8,8 @@ use. The core imports no platform, so these tests hand the reading over as the p
 import pytest
 from record_support import hand_made
 
-from expcore.errors import register_infra_kind
+from expcore.errors import CORE_KINDS, POST_CHECK_UNVERIFIED, register_infra_kind
+from expcore.records import injections
 from expcore.records.injections import FAULT_NAMESPACE, INJECTOR_FAILURE, restore_refusal
 from expcore.records.rescore import rescore
 
@@ -34,6 +35,18 @@ def test_o11_a_reading_that_records_the_restore_not_verified_is_refused_as_the_i
     assert "not_serving" in refusal["detail"]
     assert "changed" in refusal["detail"]
     assert "did not serve" in refusal["detail"]
+
+
+def test_o11_a_process_that_does_not_know_the_injectors_kind_refuses_as_the_core_kind_for_an_unverified_result(
+    monkeypatch,
+):
+    """O11: the platform that writes the reading registers `injector_failure`; a core-only process that has not
+    registered it is refused as `post_check_unverified` (untreatable, a core kind), never as a kind its vocabulary
+    does not hold, which would raise where the refusal is applied."""
+    monkeypatch.setattr(injections, "infra_kinds", lambda: CORE_KINDS)
+    refusal = restore_refusal({FAULT_NAMESPACE: NOT_VERIFIED})
+    assert refusal is not None
+    assert refusal["infra_kind"] == POST_CHECK_UNVERIFIED
 
 
 @pytest.mark.parametrize(

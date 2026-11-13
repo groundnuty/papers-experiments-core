@@ -15,7 +15,9 @@ from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key
 
 from expcore.campaign.executor import record_run
 from expcore.campaign.healthgate import Health
-from expcore.errors import InfraError, register_infra_kind
+from expcore.errors import CORE_KINDS, POST_CHECK_UNVERIFIED, InfraError, register_infra_kind
+from expcore.loop import outcomes
+from expcore.records import injections
 from expcore.records.injections import FAULT_NAMESPACE, INJECTOR_FAILURE
 from expcore.records.instruments import finish_instruments
 
@@ -136,6 +138,22 @@ def test_o11_a_scored_treatment_attempt_is_set_aside_too_when_its_record_says_th
         assert (first["state"], first["charged"], first["treatment"]) == ("infra_fail", 1, 0)
         assert first["infra_kind"] == INJECTOR_FAILURE
         assert (second["state"], second["treatment"], second["infra_kind"]) == ("done", 1, "knowledge")
+
+
+def test_o11_a_process_that_does_not_know_the_injectors_kind_still_sets_the_attempt_aside(tmp_path, monkeypatch):
+    """O11: an executor in a core-only process files the injector's reading by hand, and the kind the platform would
+    register is not in the vocabulary. Refusing as that kind would raise where the refusal is applied, outside the
+    executor's handler, and stop the campaign before the attempt is recorded; the attempt is set aside as the core's own
+    untreatable kind for an unverified result, charged and run again, and the rerun is scored."""
+    monkeypatch.setattr(injections, "infra_kinds", lambda: CORE_KINDS)
+    monkeypatch.setattr(outcomes, "infra_kinds", lambda: CORE_KINDS)
+    schema = make_schema()
+    key = key_of(schema, "api-none")
+    executor = FakeExecutor({key: [running_the_injector(verified=False), running_the_injector(verified=True)]})
+    with build(tmp_path, schema=schema, executor=executor, plan=SMALL, health=passing_gate) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+        assert attempts_of(scheduler.store, key) == [("infra_fail", 1, 1), ("done", 0, 2)]
+        assert rows(scheduler.store, key)[0]["infra_kind"] == POST_CHECK_UNVERIFIED
 
 
 def test_o11_an_attempt_whose_restore_was_verified_is_scored_as_before(tmp_path):

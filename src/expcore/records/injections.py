@@ -22,14 +22,18 @@ when it was not. The provider may then still be down or half restored, so whatev
 the manipulation. A record that carries `restore_verified` as anything but `true`, in any instrument's reading, is set
 aside (`RunRecord.set_aside`) and the campaign sets its attempt aside as infrastructure of `INJECTOR_FAILURE`, a kind no
 condition can declare as its treatment, whatever its outcome was and whatever the post-run health check decides
-(`restore_refusal`). The field is optional and additive: a reading from before it has none, and is refused for nothing.
+(`restore_refusal`); an attempt the health check or an outage already set aside stands as that, and is not scored
+either. The platform that writes the reading registers the kind. A process that has not registered it (the core alone,
+with a reading filed by hand) is refused as `post_check_unverified`, the core's own untreatable kind for a result whose
+post-run state nobody verified, so the refusal never raises for an unknown kind. The field is optional and additive: a
+reading from before it has none, and is refused for nothing.
 """
 
 import re
 from collections.abc import Mapping
 from typing import Any
 
-from expcore.errors import TARGET_LABEL
+from expcore.errors import POST_CHECK_UNVERIFIED, TARGET_LABEL, infra_kinds
 
 FAULT_NAMESPACE = "fault_injector"
 # The fault injector's own kind of failure: it could not inject, clear or verify its fault. The platform that writes
@@ -72,8 +76,15 @@ def restore_refusal(instruments: Mapping[str, Any]) -> dict[str, Any] | None:
     for namespace in sorted(instruments):
         reading = instruments[namespace]
         if isinstance(reading, Mapping) and RESTORE_VERIFIED in reading and reading[RESTORE_VERIFIED] is not True:
-            return {"namespace": namespace, "infra_kind": INJECTOR_FAILURE, "detail": _detail(reading)}
+            return {"namespace": namespace, "infra_kind": _kind(), "detail": _detail(reading)}
     return None
+
+
+def _kind() -> str:
+    """The kind the refusal has: the injector's own when the platform that wrote the reading has registered it, which
+    it does when its module is imported, else the core's untreatable kind for a result nobody verified, so that an
+    attempt is set aside in a process that does not know the injector's kind and never fails for it."""
+    return INJECTOR_FAILURE if INJECTOR_FAILURE in infra_kinds() else POST_CHECK_UNVERIFIED
 
 
 def _detail(reading: Mapping[str, Any]) -> str:

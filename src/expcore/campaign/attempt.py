@@ -406,10 +406,11 @@ class AttemptRunner:
         failure or defect, keeps its outcome and the refusal is noted.
 
         A record whose fault injector's reading says the restore was not verified (`restore_verified` not true) is
-        refused the same way, as `injector_failure`, whether or not an instrument's own check refused it and whatever
-        the health check decided before: the record carries the failure itself (O11), because the executor that holds
-        it inside `FaultInjector.running` keeps its record when the restore fails. It takes precedence over a refusal
-        of the record's own, so the kind is the injector's.
+        refused the same way, as `injector_failure` (`post_check_unverified` in a process that has not registered it),
+        whether or not an instrument's own check refused it: the record carries the failure itself (O11), because the
+        executor that holds it inside `FaultInjector.running` keeps its record when the restore fails. It takes
+        precedence over a refusal of the record's own, so the kind is the injector's. The health check decides before,
+        and nothing after this step can score what it set aside.
         """
         p, refusal = self.p, restore_refusal(record.instruments) or record.instrument_refusal
         if refusal is None:
