@@ -106,7 +106,7 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   `list_user_effective_clusters`, "on behalf of the current user only", the `Clusters` definition with its required
   `clusters`), and the route `/user/effective_clusters` of onedata/oz-worker, release/25.0 at
   03af698e5759f9db97a003047eb4e29e4ba7507f, src/http/rest/routes/user_routes.erl, which needs no specific privilege.
-  A writing tool-server token's user must be a member of none (`tokenscope.py`). No source sends it and no live run
+  A tool-server token's user must be a member of none (`tokenscope.py`). No source sends it and no live run
   has made it, so it is in `UNVERIFIED_ENDPOINTS`.
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
@@ -240,7 +240,7 @@ PUBLIC_READS: tuple[str, ...] = (ZONE_TIME_PATH,)
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a writing
+# live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a
 # tool-server user's Onezone admin privileges and of the clusters its token's user is a member of, and Onezone's
 # reading of the global clock, which the transfer log and the reset's history place their window by.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
@@ -286,14 +286,14 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "GET",
         "/users/{id}/effective_privileges",
         "a Onezone call with the admin token: a user's effective admin privileges in Onezone under privileges, which "
-        "a writing tool-server user must have none of; named only by Onezone's REST description (25.0), which says "
+        "a tool-server user must have none of; named only by Onezone's REST description (25.0), which says "
         "the reader needs oz_view_privileges",
     ),
     (
         "GET",
         "/user/effective_clusters",
         "a Onezone call sent as the token being checked: the clusters its user is an effective member of under "
-        "clusters, which a writing tool-server user must have none of; named only by Onezone's REST description "
+        "clusters, which a tool-server user must have none of; named only by Onezone's REST description "
         "(25.0), which says it is for the current user, and by oz-worker's route of that path",
     ),
     (
