@@ -11,10 +11,17 @@ file bound read-only into the one container that holds it, the sidecar's read by
 (`sidecar_run_args`) and the gate's by the gate (`gate_run_args`), so `docker inspect` shows no token. Docker is given
 an environment variable (`-e NAME`, whose value it keeps in the container's configuration) for the agent's settings
 alone.
+
+Every bind of a secret (the sidecar's and the gate's token files, the gate's TLS keys) is written `--mount
+type=bind,...,readonly`, never `-v SOURCE:PATH:ro` (`bind`). With `-v`, a source that is not there is created by the
+daemon as a directory owned by root, and a `docker cp` from a running container re-mounts its binds: after the host's
+copy of a token was removed, that left an empty directory at the token's path, which the teardown could not remove
+(O05). `--mount` refuses a missing source instead.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -22,6 +29,15 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
+from expcore_onedata.sandbox.oneclient_args import (
+    CONFIG_NULL,
+    CONFIG_OPTION,
+    IO_MODE_FLAGS,
+    LOG_DIR_OPTION,
+    UNSET_ENV,
+    mount_problem,
+    option_name,
+)
 from expcore_onedata.sandbox.settings import SandboxSettings
 from expcore_onedata.sandbox.teardown import SIDECAR_MOUNT, SIDECAR_SUFFIX
 
@@ -37,7 +53,10 @@ SIDECAR_TOKEN_PATH = "/run/expcore/oneclient-token"  # the mount's token, bound 
 GATE_TOKEN_PATH = "/etc/gate/token"  # the REST path's token, bound into the gate alone, read-only; gate.json names it
 ENV_SSL_CERT_FILE = "SSL_CERT_FILE"  # OpenSSL's setting of the CA file its default verify paths load
 ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image's binary
-ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
+# Where the sidecar's oneclient writes its log, by `--log-dir` (`sidecar_command`, always: `extra_args` may not give
+# one), and where the run's own directory for it is bound (`sidecar_run_args`): the log is then part of the run's
+# evidence, read from the host, never copied out of a running container with `docker cp` (O05).
+SIDECAR_LOG_DIR = "/var/log/oneclient"
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
 # The client refuses to start without a token, so a REST agent's holds the configured placeholder (O23), never a
@@ -45,11 +64,27 @@ ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
 ENV_TOKEN = "ONEDATA_TOKEN"
 ENV_VERIFY_SSL = "ONEDATA_VERIFY_SSL"
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
-# The sidecar's entrypoint: read the token file into oneclient's variable, refuse an empty one, then become `env` with
-# the arguments of `sidecar_command`. The value lives in oneclient's own environment, never in docker's configuration.
+# The sidecar's entrypoint: print the one line that records the image's own oneclient configuration file (never parsed:
+# `--config /dev/null`), read the token file into oneclient's variable, refuse an empty one, then become `env` with the
+# arguments of `sidecar_command`. The value lives in oneclient's own environment, never in docker's configuration.
+#
+# The record asks the binary where its default configuration file is (`oneclient --help` prints `-c [ --config ] <path>
+# (=<default>)`, which is the path `Options::getConfigFilePath` falls back to, so it is never guessed from the image's
+# layout), then hashes that file. The help runs before the token is read, so it never holds it. A failure of any step
+# prints `unread` for the hash: the record shows what could not be read, and the start goes on.
+CONFIG_RECORD = "expcore-oneclient-config"  # the word the line starts with; `image_config_record` reads it from the log
+HELP_DEFAULT = (
+    "s/.*--config *] *<path> *(=\\([^)]*\\)).*/\\1/p"  # the `sed` program that takes the path out of the help
+)
+SIDECAR_RECORD = (
+    f"c=\"$({ONECLIENT_BIN} --help 2>/dev/null | sed -n '{HELP_DEFAULT}' | head -n 1)\"; "
+    'h="$(sha256sum "$c" 2>/dev/null | cut -d" " -f1)"; '
+    f'printf "{CONFIG_RECORD} sha256=%s path=%s\\n" "${{h:-unread}}" "$c"; '
+)
 SIDECAR_START = (
-    f'{ENV_ACCESS_TOKEN}="$(cat {SIDECAR_TOKEN_PATH})" && [ -n "${ENV_ACCESS_TOKEN}" ] || exit 97; '
-    f'export {ENV_ACCESS_TOKEN}; exec env "$@"'
+    SIDECAR_RECORD
+    + f'{ENV_ACCESS_TOKEN}="$(cat {SIDECAR_TOKEN_PATH})" && [ -n "${ENV_ACCESS_TOKEN}" ] || exit 97; '
+    + f'export {ENV_ACCESS_TOKEN}; exec env "$@"'
 )
 SIDECAR_SHELL_NAME = "oneclient-sidecar"  # the shell's $0, before the arguments it hands to `env`
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
@@ -67,7 +102,8 @@ CERTIFI_PROBE = (
     "    print('certifi:' + certifi.where())\n"
 )
 CERTIFI_NONE = "none"
-CERTIFI_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,4095}")  # an absolute path `-v SOURCE:PATH:ro` can mount over
+CERTIFI_PATH = re.compile(r"/[A-Za-z0-9._+/-]{1,4095}")  # an absolute path a bind can be mounted over
+MOUNT_FIELD_UNSAFE = re.compile(r'[,"\r\n]')  # in a `--mount` value a comma starts the next field and a quote opens one
 
 
 def certifi_probe_args(s: SandboxSettings, name: str, labels: Sequence[str], image_id: str) -> list[str]:
@@ -117,6 +153,60 @@ class Names:
         return cls(sid, agent, agent + "-net", agent + "-gate", agent + SIDECAR_SUFFIX)
 
 
+def sidecar_options(settings: SandboxSettings) -> list[str]:
+    """The oneclient options the sandbox itself sets, in the order it passes them: the read-only mount options, the
+    mode's force-I/O option, `--log-dir SIDECAR_LOG_DIR` (O05), `--config /dev/null` and `--insecure` when the
+    platform's `[tls]` says so. The study's `extra_args` are not here.
+
+    The I/O mode is always declared (O36): oneclient 25.0 started with neither force option detects each storage's
+    access type at the first read of each space, and its detection for a second space on one storage waits on a mutex
+    its own thread already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`), so that read never
+    returns. The configuration file is always the empty one, so the image's own is never parsed. A mount with an
+    unknown `io_mode`, or an extra argument that sets what the core declares, raises here rather than start oneclient
+    with two force options, a second configuration, a second log directory or none (settings built in code never met
+    the loader's check)."""
+    mount = settings.mount
+    if mount is None:
+        raise ValueError("a mount data path needs [sandbox.mount]")
+    problem = mount_problem(mount.io_mode, mount.extra_args)
+    if problem is not None:
+        raise ValueError(problem)
+    return [
+        *("-o", "ro,allow_other", IO_MODE_FLAGS[mount.io_mode]),
+        *(LOG_DIR_OPTION, SIDECAR_LOG_DIR, CONFIG_OPTION, CONFIG_NULL),
+        *(["--insecure"] if settings.tls.insecure else []),
+    ]
+
+
+def extra_args_record(extra_args: Sequence[str]) -> dict[str, Any]:
+    """The study's extra oneclient arguments as a run's metadata keeps them: the names of the options oneclient has, and
+    the SHA-256 of the whole list, never a value (a value may be a path or an identifier, O12). A word that starts
+    with a dash and is not one of oneclient's options may be a value, so it is kept as `<value>`; a short option's
+    value may be attached to it (`-l/path`), so only its two characters are kept; a long option's name ends at an
+    `=`."""
+    names = [name for a in extra_args if (name := option_name(a)) is not None]
+    return {"names": names, "sha256": hashlib.sha256("\0".join(extra_args).encode()).hexdigest()}
+
+
+UNREAD = "unread"  # the hash of a file the sidecar could not read
+CONFIG_LINE = re.compile(rf"^{CONFIG_RECORD} sha256=(\S+) path=(.*)$", re.MULTILINE)
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def image_config_record(logs: str | None) -> dict[str, str | None]:
+    """The image's own oneclient configuration file as a run's metadata keeps it, from the sidecar's container output:
+    its path in the image and its SHA-256, or `unread` when the sidecar could not hash it. The file is not parsed by
+    oneclient (`--config /dev/null`); this shows what the image carried. The first line of the record wins; an output
+    with none, or whose line is not in the form the entrypoint prints, gives no path and `unread`. The path is the
+    image's, never the host's, and is kept only as one absolute path without dot segments."""
+    found = CONFIG_LINE.search(logs or "")
+    if found is None:
+        return {"path": None, "sha256": UNREAD}
+    digest, path = found.group(1), found.group(2)
+    clean = CERTIFI_PATH.fullmatch(path) is not None and not ({".", ".."} & set(path.split("/")))
+    return {"path": path if clean else None, "sha256": digest if SHA256_HEX.fullmatch(digest) else UNREAD}
+
+
 def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     """The arguments the sidecar's shell hands to `env` once it has read the token file (`sidecar_run_args`).
 
@@ -125,17 +215,25 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     check: by default oneclient verifies against the image's CAs; with `ca_file`, `env` sets `SSL_CERT_FILE` to the
     run's copy that `sidecar_run_args` mounts read-only, the CA file OpenSSL's default verify paths load (oneclient has
     no option of its own for a CA, and `tests/live/test_sandbox.py` checks the image honours it); `--insecure` is passed
-    only with `insecure_tls`. `-f` keeps the client in the foreground. The mount is read-only (`-o ro`).
+    only with `insecure_tls`. `-f` keeps the client in the foreground. The mount is read-only (`-o ro`), and how the
+    client reaches storage is the table's `io_mode`, always passed (`sidecar_options`, O36). The log directory is always
+    the sandbox's, `--log-dir SIDECAR_LOG_DIR` (`sidecar_run_args` binds the run's own directory there, O05).
+
+    Nothing else sets an option of oneclient (O36): `env -u` also removes `ONECLIENT_OVERRIDE` and `ONECLIENT_CONFIG`,
+    and `--config /dev/null` means the image's own configuration file is never parsed. The token arrives in
+    `ONECLIENT_ACCESS_TOKEN` (`SIDECAR_START`) and stays, so the effective options are this argv and the token.
+    `[sandbox.mount] extra_args` that set any of these, the log directory in any form included, are refused here as at
+    load (`sidecar_options`, `oneclient_args.extra_arg_problem`), which settings built in code would otherwise bypass.
     """
     mount = settings.mount
     if mount is None:
         raise ValueError("a mount data path needs [sandbox.mount]")
-    io = {"direct": ["--force-direct-io"], "proxy": ["--force-proxy-io"]}.get(mount.io_mode or "", [])
     trust = [f"{ENV_SSL_CERT_FILE}={SIDECAR_CA_PATH}"] if settings.tls.ca_file is not None else []
     return [
-        *("-u", "ONECLIENT_INSECURE", *trust, ONECLIENT_BIN, "-f", "-H", provider_host),
-        *("-o", "ro,allow_other", *io),
-        *(["--insecure"] if settings.tls.insecure else []),
+        *(arg for name in UNSET_ENV for arg in ("-u", name)),
+        *trust,
+        *(ONECLIENT_BIN, "-f", "-H", provider_host),
+        *sidecar_options(settings),
         *mount.extra_args,
         SIDECAR_MOUNT,
     ]
@@ -205,15 +303,16 @@ def gate_upstreams(settings: SandboxSettings, zone: Endpoint, provider: Endpoint
     return {name: {"role": role, "addr": name, "port": port, "tls": tls} for role, name, port, tls in named}
 
 
-def effective_log_dir(args: Sequence[str], default: str = ONECLIENT_LOG_DIR) -> str:
-    """The log directory oneclient was started with: the last --log-dir / -l in its arguments, else the default."""
-    out = default
-    for i, a in enumerate(args):
-        if a in ("--log-dir", "-l") and i + 1 < len(args):
-            out = args[i + 1]
-        elif a.startswith("--log-dir="):
-            out = a.split("=", 1)[1]
-    return out
+def bind(source: Path, destination: str, *, readonly: bool = True) -> tuple[str, str]:
+    """`--mount type=bind,src=SOURCE,dst=DESTINATION[,readonly]`: the bind of a secret, or of the run's own directory.
+
+    `--mount` refuses a source that is not there, where `-v` creates it as a directory owned by root (see the module's
+    docstring). A path that holds a character `--mount` reads as syntax (a comma, a quote, a line break) is refused
+    rather than bound as something else."""
+    for part in (str(source), destination):
+        if MOUNT_FIELD_UNSAFE.search(part):
+            raise ValueError("a bind's path holds a comma, a quote or a line break, which `--mount` reads as syntax")
+    return ("--mount", f"type=bind,src={source},dst={destination}" + (",readonly" if readonly else ""))
 
 
 def _ca_mount(s: SandboxSettings, ca_copy: Path | None, destination: str) -> tuple[str, ...]:
@@ -245,7 +344,8 @@ def gate_run_args(
 
     The gate holds the data-path token and adds it to the requests it forwards (O05). The token never reaches docker:
     `token_file`, the run's file of it, is bound read-only at `GATE_TOKEN_PATH` in this container alone, and the gate
-    reads it at its start (its configuration names the path). An environment variable given to `docker run` would be
+    reads it at its start (its configuration names the path). It and the directory of the TLS keys are `--mount` binds,
+    which refuse a missing source (`bind`). An environment variable given to `docker run` would be
     kept in the container's configuration, where `docker inspect` shows it. With the platform's `ca_file`, `ca_copy`,
     the run's own copy of the verified bundle, is mounted read-only at `GATE_CA_PATH`, which the gate's configuration
     names as its upstream CA file."""
@@ -253,9 +353,10 @@ def gate_run_args(
         *("run", "-d", "--name", names.gate, "--network", gate_network(s), *labels),
         *("--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges"),
         *("--read-only", "--user", "0", "--pids-limit", "512", "--memory", str(s.limits.gate_memory_bytes)),
-        *("-v", f"{sdir / 'tls'}:/etc/gate/tls:ro", "-v", f"{sdir / 'gate.json'}:/etc/gate/gate.json:ro"),
+        *bind(sdir / "tls", "/etc/gate/tls"),  # the keys it serves with
+        *("-v", f"{sdir / 'gate.json'}:/etc/gate/gate.json:ro"),  # no secret: it names the token's path
         *_ca_mount(s, ca_copy, GATE_CA_PATH),
-        *("-v", f"{token_file}:{GATE_TOKEN_PATH}:ro"),
+        *bind(token_file, GATE_TOKEN_PATH),
         *("-v", f"{gate_files}:{GATE_DIR}:ro", "-v", f"{sdir / 'gatelog'}:/var/gate"),
         *("--entrypoint", "python", image_id, f"{GATE_DIR}/gate.py", "/etc/gate/gate.json"),
     ]
@@ -270,6 +371,7 @@ def sidecar_run_args(
     provider_host: str,
     *,
     token_file: Path,
+    log_dir: Path,
     ca_copy: Path | None = None,
 ) -> list[str]:
     """`docker run` for the mount sidecar: it owns the mount and the token; the agent gets neither, nor FUSE. With the
@@ -280,18 +382,26 @@ def sidecar_run_args(
     The token never reaches docker (O05): `token_file`, the run's file of it, is bound read-only at
     `SIDECAR_TOKEN_PATH` in this container alone, and the entrypoint, `sh -c SIDECAR_START`, reads it into oneclient's
     environment before it becomes `env` with `sidecar_command`'s arguments. An environment variable given to `docker
-    run` (`-e NAME`) would be kept in the container's configuration, where `docker inspect` shows it."""
+    run` (`-e NAME`) would be kept in the container's configuration, where `docker inspect` shows it. The file is a
+    `--mount` bind, which refuses a missing source (`bind`).
+
+    `log_dir`, the run's own directory for oneclient's log (owner-only; `DockerSandbox._start_mount`), is bound
+    read-write at the directory oneclient logs to (`SIDECAR_LOG_DIR`, the sandbox's own: `sidecar_command`), so the
+    log is read from the host as part of the run's evidence, outlives the container, and is never copied out of a
+    running one (O05)."""
     lim = s.limits
     network, dialled = sidecar_route(s, provider_host)
+    command = sidecar_command(dialled, s)
     return [
         *("run", "-d", "--name", names.sidecar, "--network", network, *labels),
         *("--cpus", str(lim.cpus), "--memory", str(lim.memory_bytes), "--memory-swap", str(lim.memory_bytes)),
         *("--pids-limit", str(lim.pids), "--cap-add", "SYS_ADMIN", "--device", "/dev/fuse"),
         *("--security-opt", "apparmor:unconfined", "--tmpfs", "/root/.local:size=1g"),
         *_ca_mount(s, ca_copy, SIDECAR_CA_PATH),
-        *("-v", f"{token_file}:{SIDECAR_TOKEN_PATH}:ro"),
+        *bind(token_file, SIDECAR_TOKEN_PATH),
+        *bind(log_dir, SIDECAR_LOG_DIR, readonly=False),
         *("--mount", f"type=bind,src={share},dst={SIDECAR_MOUNT},bind-propagation=rshared"),
-        *("--entrypoint", "sh", image_id, "-c", SIDECAR_START, SIDECAR_SHELL_NAME, *sidecar_command(dialled, s)),
+        *("--entrypoint", "sh", image_id, "-c", SIDECAR_START, SIDECAR_SHELL_NAME, *command),
     ]
 
 

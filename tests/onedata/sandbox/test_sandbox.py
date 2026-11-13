@@ -1,5 +1,6 @@
 """The sandbox over an in-memory host: the three data paths, images pinned by id, read-only at every point, teardown."""
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -8,7 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fake_host import CERTIFI_BUNDLE
+from fake_host import CERTIFI_BUNDLE, ONECLIENT_CONFIG_PATH, ONECLIENT_CONFIG_SHA256
 from sandbox_support import (
     COMPLETE_LEVEL,
     FED_LOCAL,
@@ -22,9 +23,9 @@ from sandbox_support import (
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
-from expcore_onedata.sandbox.containers import ENV_TOKEN, GATE_TOKEN_PATH, SIDECAR_TOKEN_PATH
+from expcore_onedata.sandbox.containers import ENV_TOKEN, GATE_TOKEN_PATH, SIDECAR_LOG_DIR, SIDECAR_TOKEN_PATH
 from expcore_onedata.sandbox.hostops import CmdResult
-from expcore_onedata.sandbox.sandbox import GATE_TOKEN_FILE, TOKEN_FILE, DockerSandbox
+from expcore_onedata.sandbox.sandbox import GATE_TOKEN_FILE, LOG_DIR, TOKEN_FILE, DockerSandbox
 
 
 def start(world, level="via-gate", **kw):
@@ -281,7 +282,8 @@ def test_the_mount_token_belongs_to_the_sidecar_and_the_agent_has_none(world):
     sbx = start(world, "mounted")
     agent, sidecar = (world.host.containers[n] for n in (sbx.names.agent, sbx.names.sidecar))
     assert sidecar.options["_files"] == {SIDECAR_TOKEN_PATH: TOKEN}
-    assert any(spec.endswith(f":{SIDECAR_TOKEN_PATH}:ro") for spec in sidecar.options["-v"])
+    assert f"type=bind,src={sbx.dir / TOKEN_FILE},dst={SIDECAR_TOKEN_PATH},readonly" in sidecar.options["--mount"]
+    assert not [spec for spec in sidecar.options.get("-v", []) if SIDECAR_TOKEN_PATH in spec]
     assert TOKEN not in flat(sidecar)
     assert TOKEN not in json.dumps(sidecar.options["_env"])
     assert TOKEN not in json.dumps(agent.options["_env"])
@@ -400,6 +402,147 @@ def test_o05_a_run_whose_token_file_cannot_be_removed_is_not_moved_into_the_kept
     sbx.stop()
     assert kept.is_dir()
     assert not [p for p in kept.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+
+
+@pytest.mark.parametrize(("level", "relative"), [("mounted", TOKEN_FILE), ("via-gate", GATE_TOKEN_FILE)])
+def test_o05_an_empty_directory_at_a_token_path_is_removed_and_recorded_and_does_not_fail_the_teardown(
+    world, level, relative
+):
+    """O05: a bind written `-v` makes a missing source a directory owned by root, and `docker cp` from a running
+    container re-mounts its binds: so a directory can appear where the token's file was removed, and `rm -f` cannot
+    remove it. An empty one (one non-recursive listing, nothing read) is removed with `rmdir`, recorded by its path in
+    the run's directory, kind, size and owner and what was done, and the teardown goes on and succeeds."""
+    sbx = start(world, level)
+    planted = sbx.dir / relative
+    planted.mkdir()  # as the daemon's bind of a missing source would
+    found = planted.lstat()
+    sbx.stop()  # no error: the teardown is complete
+    assert not planted.exists()
+    assert ["rmdir", str(planted)] in world.host.sudo_commands
+    record = sbx.metadata()["teardown"]
+    assert record["token_files"] == [
+        {
+            "path": relative.as_posix(),
+            "type": "directory",
+            "size": found.st_size,
+            "uid": found.st_uid,
+            "action": "empty directory left by a bind; removed",
+        }
+    ]
+    assert record["run_directory"]["id"] == sbx.sid.rsplit("-", 1)[-1]  # found by its id, never by a path (O12)
+    assert str(world.s.work_root) not in json.dumps(record)
+    assert nothing_left(world)
+
+
+def test_o05_a_file_left_at_a_token_path_fails_the_teardown_naming_its_path_and_kind_and_never_its_content(world):
+    """O05: a file still there after `rm -f` may hold the token, so it still fails the teardown. The error and the
+    record name its path in the run's directory, kind, size and owner, and hold nothing of what is in it."""
+    sbx = start(world, "mounted")
+    leftover = sbx.dir / TOKEN_FILE
+    leftover.write_text(TOKEN, encoding="utf-8")
+    owner = leftover.lstat().st_uid  # the teardown removes the run's directory once it has looked
+
+    def busy(argv):
+        if "-f" in argv and argv[-1] == str(leftover):
+            return CmdResult(1, "", "busy")
+        return world.host._run_default(argv)
+
+    world.host.run_handlers["rm"] = busy
+    with pytest.raises(SandboxError, match="could not be removed") as caught:
+        sbx.stop()
+    assert "sidecar-secret/oneclient-token (file)" in str(caught.value)
+    assert sbx.sid.rsplit("-", 1)[-1] in str(caught.value)
+    assert TOKEN not in str(caught.value)
+    assert str(world.s.work_root) not in str(caught.value)
+    record = sbx.metadata()["teardown"]["token_files"]
+    assert record == [
+        {
+            "path": "sidecar-secret/oneclient-token",
+            "type": "file",
+            "size": len(TOKEN),
+            "uid": owner,
+            "action": "left in place",
+        }
+    ]
+    assert TOKEN not in json.dumps(sbx.metadata())
+    assert not [c for c in world.host.sudo_commands if c[:1] == ["rmdir"]]
+    world.host.run_handlers.clear()
+    sbx.stop()
+    assert nothing_left(world)
+
+
+def test_o05_a_directory_with_an_entry_at_a_token_path_still_fails_the_teardown_and_is_left_as_found(world):
+    """O05: only an empty directory is removed. One with an entry may hold the token or something an operator must
+    see: it fails the teardown as a file does, is not removed (no `rmdir`, no `rm -r`), and its entry is not read."""
+    sbx = start(world, "mounted")
+    planted = sbx.dir / TOKEN_FILE
+    planted.mkdir()
+    (planted / "entry").write_text(TOKEN, encoding="utf-8")
+    with pytest.raises(SandboxError, match="could not be removed") as caught:
+        sbx.stop()
+    assert "sidecar-secret/oneclient-token (directory)" in str(caught.value)
+    assert TOKEN not in str(caught.value)
+    [item] = sbx.metadata()["teardown"]["token_files"]
+    assert (item["type"], item["action"]) == ("directory", "directory with entries; left in place")
+    assert TOKEN not in json.dumps(sbx.metadata())
+    assert not [c for c in world.host.sudo_commands if c[:1] == ["rmdir"]]
+    sbx.stop()
+    assert nothing_left(world)
+
+
+def test_o05_an_empty_directory_that_rmdir_cannot_remove_fails_the_teardown(world):
+    """O05: the removal is verified, as the file's is: an empty directory that is still there after `rmdir` fails."""
+    sbx = start(world, "mounted")
+    planted = sbx.dir / TOKEN_FILE
+    planted.mkdir()
+    world.host.run_handlers["rmdir"] = lambda argv: CmdResult(1, "", "busy")
+    with pytest.raises(SandboxError, match="could not be removed") as caught:
+        sbx.stop()
+    assert "sidecar-secret/oneclient-token (directory)" in str(caught.value)
+    [item] = sbx.metadata()["teardown"]["token_files"]
+    assert item["action"] == "empty directory left by a bind; could not be removed"
+    world.host.run_handlers.clear()
+    sbx.stop()
+    assert nothing_left(world)
+
+
+def test_o05_a_token_file_that_is_gone_when_its_container_is_created_refuses_the_start(world, monkeypatch):
+    """O05: a token is bound with `--mount`, which refuses a source that is not there, where `-v` made a directory of
+    it, owned by root, at the removed token's path. The start fails at the container, naming what was refused, and the
+    teardown leaves nothing."""
+    original = DockerSandbox._write_token_file
+
+    def vanishing(self, relative, **kw):
+        path = original(self, relative, **kw)
+        path.unlink()
+        return path
+
+    monkeypatch.setattr(DockerSandbox, "_write_token_file", vanishing)
+    for level in ("mounted", "via-gate"):
+        with pytest.raises(SandboxError, match="bind source path does not exist"):
+            start(world, level)
+        assert nothing_left(world)
+
+
+def test_o05_the_sidecars_oneclient_log_is_in_an_owner_only_directory_of_the_run_and_kept_with_its_evidence(world):
+    """O05: oneclient logs where `--log-dir` says, in a directory the run binds from its own, owner-only (0700): the log
+    is read from the host and part of the run's evidence, so collecting it never needs `docker cp` from a running
+    container, which re-mounts its binds. A kept run holds it; a REST run has no sidecar and none."""
+    sbx = start(world, "mounted")
+    log_dir = sbx.dir / LOG_DIR
+    assert stat.S_IMODE(log_dir.stat().st_mode) == 0o700
+    sidecar = world.host.containers[sbx.names.sidecar]
+    assert f"type=bind,src={log_dir},dst={SIDECAR_LOG_DIR}" in sidecar.options["--mount"]
+    assert sidecar.command[sidecar.command.index("--log-dir") + 1] == SIDECAR_LOG_DIR
+    assert sbx.metadata()["mount"]["log_dir_from"] == "sandbox"  # the sandbox's own `--log-dir`, never `extra_args`'s
+    (log_dir / "oneclient.INFO").write_text("I1113 00:00:00.000000 1 main.cc:1] a start-up line\n", encoding="utf-8")
+    sbx.keep_evidence = True
+    sbx.stop()
+    kept = world.s.work_root / "_kept_evidence" / sbx.sid
+    assert (kept / LOG_DIR / "oneclient.INFO").is_file()
+    rest = start(world, "via-gate")
+    assert not (rest.dir / LOG_DIR).exists()
+    rest.stop()
 
 
 def plant_token_file(world, run_directory: str, relative: Path, *, age_s: float) -> Path:
@@ -764,13 +907,96 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     sbx = start(world, "mounted")
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
-    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "network", "wait_s"}
-    assert meta["mount"]["log_dir_from"] == "default"
+    assert set(meta["mount"]) == {
+        "io_mode", "options", "extra_args", "image_config", "log_dir_from", "network", "wait_s",
+    }  # fmt: skip
+    assert meta["mount"]["log_dir_from"] == "sandbox"
     assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)
     assert world.s.network.pools[0] not in text
     assert str(world.s.work_root) not in text
     assert world.s.mount.path not in text
+    sbx.stop()
+
+
+def test_o36_the_metadata_records_the_io_mode_the_mount_runs_with_and_the_options_the_sandbox_set(world):
+    """O36: the mount's I/O mode is the one the table declares, never None, and the run's options are recorded as the
+    sandbox set them: the mode's force option, the read-only mount options and no TLS flag by default."""
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()["mount"]
+    assert meta["io_mode"] == "proxy"
+    assert meta["options"] == [
+        *("-o", "ro,allow_other", "--force-proxy-io", "--log-dir", SIDECAR_LOG_DIR, "--config", "/dev/null"),
+    ]
+    assert meta["extra_args"] == {"names": [], "sha256": hashlib.sha256(b"").hexdigest()}
+    sbx.stop()
+
+
+def test_o36_a_direct_mount_records_direct_and_the_study_extra_arguments_only_by_name_and_hash(world):
+    """O36: the effective mode is `direct` when declared; the study's extra arguments are recorded by their option
+    names and the SHA-256 of the whole list, never by value (a value may be a path or an identifier, O12)."""
+    from dataclasses import replace
+
+    extra = ("--provider-timeout", "45", "--space=/somewhere/private", "-o/attached/private")
+    world.s = replace(world.s, mount=replace(world.s.mount, io_mode="direct", extra_args=extra))
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()
+    assert meta["mount"]["io_mode"] == "direct"
+    assert meta["mount"]["options"] == [
+        *("-o", "ro,allow_other", "--force-direct-io", "--log-dir", SIDECAR_LOG_DIR, "--config", "/dev/null"),
+    ]
+    assert meta["mount"]["extra_args"] == {
+        "names": ["--provider-timeout", "--space", "-o"],  # a short option's attached value is never kept
+        "sha256": hashlib.sha256("\0".join(extra).encode()).hexdigest(),
+    }
+    text = json.dumps(meta, default=str)
+    assert "/somewhere/private" not in text
+    assert "/attached/private" not in text
+    assert "45" not in meta["mount"]["extra_args"]["names"]
+    sbx.stop()
+
+
+def test_o36_a_word_of_the_extra_arguments_that_starts_with_a_dash_and_is_no_option_is_never_recorded(world):
+    """O36: the loader accepts `["--space", "--private/path"]` (the second word is a value), and the metadata held
+    `--private/path` as an option name. It holds `<value>` for it and the hash of the whole list."""
+    from dataclasses import replace
+
+    extra = ("--space", "--private/path")
+    world.s = replace(world.s, mount=replace(world.s.mount, extra_args=extra))
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()
+    assert meta["mount"]["extra_args"] == {
+        "names": ["--space", "<value>"],
+        "sha256": hashlib.sha256("\0".join(extra).encode()).hexdigest(),
+    }
+    assert "private" not in json.dumps(meta, default=str)
+    sbx.stop()
+
+
+def test_o36_the_metadata_records_the_image_config_files_hash_though_oneclient_never_parses_it(world):
+    """O36: the file the image's oneclient would read by default is ignored (`--config /dev/null` is in the options),
+    and its path in the image and SHA-256 are still in the record, read from the sidecar's own output before oneclient
+    started, so the record shows what the image carried."""
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()["mount"]
+    assert meta["image_config"] == {"path": ONECLIENT_CONFIG_PATH, "sha256": ONECLIENT_CONFIG_SHA256}
+    assert meta["options"][-2:] == ["--config", "/dev/null"]
+    sbx.stop()
+
+
+def test_o36_a_config_file_the_sidecar_could_not_read_is_recorded_unread_and_the_start_goes_on(world):
+    """O36: the sidecar's output holds no usable record (the docker call for it fails here): the record says
+    `unread`, with no path, and the sandbox starts as it would."""
+    docker = world.host.docker
+
+    def without_logs(*args, **kwargs):
+        if args[:1] == ("logs",):
+            return CmdResult(1, "", "Error response from daemon")
+        return docker(*args, **kwargs)
+
+    world.host.docker = without_logs
+    sbx = start(world, "mounted")
+    assert sbx.metadata()["mount"]["image_config"] == {"path": None, "sha256": "unread"}
     sbx.stop()
 
 

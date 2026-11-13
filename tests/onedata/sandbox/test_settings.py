@@ -153,12 +153,148 @@ def test_a_mount_data_path_needs_the_mount_table_and_the_sidecar_image(tmp_path)
         load(tmp_path, edit)
 
 
+def test_o36_a_mount_that_does_not_declare_its_io_mode_is_refused_naming_both_choices_and_why(tmp_path):
+    """O36: `io_mode` has no default. Without it the mount would leave the storage's access type to oneclient's own
+    detection, which hangs the first read of a second space on one storage; the load refuses, naming the two choices,
+    the reason and the source."""
+
+    def edit(data):
+        del data["sandbox"]["mount"]["io_mode"]
+
+    with pytest.raises(ConfigError, match="io_mode") as caught:
+        load(tmp_path, edit)
+    message = str(caught.value)
+    assert '"proxy"' in message
+    assert '"direct"' in message
+    assert "second space" in message
+    assert "helpersCache.h" in message
+    assert "#223" in message
+
+
+def test_o36_a_declared_io_mode_is_read_as_declared(tmp_path):
+    """O36: `proxy` loads as written."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["io_mode"] = "proxy"
+
+    assert load(tmp_path, edit).mount.io_mode == "proxy"
+
+
+def test_o36_direct_io_is_refused_at_load_until_the_storage_is_mapped_into_the_sidecar(tmp_path):
+    """O36: `io_mode = "direct"` reads the providers' storage itself, and the sidecar never gets that storage, so a
+    mount that loaded would start and then could not read: the load refuses it, naming the key, the reason and the
+    issue that lifts it. The command's code for `direct` stays (test_containers)."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["io_mode"] = "direct"
+
+    with pytest.raises(ConfigError, match="io_mode") as caught:
+        load(tmp_path, edit)
+    message = str(caught.value)
+    assert "not supported yet" in message
+    assert "storage" in message
+    assert "mapped into the sidecar" in message
+    assert "#223" in message
+    assert '"proxy"' in message
+
+
+@pytest.mark.parametrize("mode", ["auto", "detect", ""])
+def test_o36_there_is_no_mode_that_leaves_the_detection_to_oneclient(tmp_path, mode):
+    """O36: no word stands for oneclient's own detection, and an empty one is not a declaration."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["io_mode"] = mode
+
+    with pytest.raises(ConfigError, match="io_mode") as caught:
+        load(tmp_path, edit)
+    assert '"proxy"' in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "flag", ["--force-proxy-io", "--force-direct-io", "--force-proxy-io=true", "--force-direct", "--force-p"]
+)
+def test_o36_the_io_mode_cannot_be_set_or_changed_through_the_extra_arguments(tmp_path, flag):
+    """O36: the I/O mode is the table's `io_mode` alone: an extra argument naming either force option, or an
+    abbreviation of one, would give oneclient two, or the wrong one, so it is refused at load."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["extra_args"] = [flag]
+
+    with pytest.raises(ConfigError, match="io_mode"):
+        load(tmp_path, edit)
+
+
+@pytest.mark.parametrize(
+    "argument", ["--config", "--config=/other.conf", "--conf", "-c", "-cother.conf", "ONECLIENT_CONFIG=/x"]
+)
+def test_o36_the_config_file_and_the_environment_cannot_be_set_through_the_extra_arguments(tmp_path, argument):
+    """O36: the sidecar always passes `--config /dev/null` and closes oneclient's environment, so the effective options
+    are the argv and the token: an extra argument that names the config file or an `ONECLIENT_` setting is refused."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["extra_args"] = [argument]
+
+    with pytest.raises(ConfigError, match="extra_args"):
+        load(tmp_path, edit)
+
+
 def test_the_tls_flag_cannot_be_smuggled_through_the_extra_arguments(tmp_path):
     def edit(data):
         data["sandbox"]["mount"]["extra_args"] = ["--insecure"]
 
     with pytest.raises(ConfigError, match="TLS"):
         load(tmp_path, edit)
+
+
+# Every form oneclient's parser (boost::program_options, default style: abbreviations and clustered short options
+# allowed) reads as its log-directory option, as the operator may write it in `extra_args`, with the option it names.
+LOG_DIR_FORMS = [
+    (["-l/oc-log"], "-l"),
+    (["-l", "/oc-log"], "-l"),
+    (["-fl/oc-log"], "-l"),  # `-f -l/oc-log`: a cluster of switches ends in the option
+    (["-dfl", "/oc-log"], "-l"),
+    (["--log-dir", "/oc-log"], "--log-dir"),
+    (["--log-dir=/oc-log"], "--log-dir"),
+    (["--log-d", "/oc-log"], "--log-d"),  # an abbreviation oneclient accepts: nothing else starts `log-d`
+    (["--log-di=/oc-log"], "--log-di"),
+    (["--log", "/oc-log"], "--log"),  # ambiguous in oneclient, which refuses it itself: refused here all the same
+    (["-f", "--log-dir"], "--log-dir"),  # no value: oneclient would take the mountpoint
+    (["-f", "-l"], "-l"),
+]
+
+
+@pytest.mark.parametrize(("args", "option"), LOG_DIR_FORMS)
+def test_o05_the_log_directory_option_is_refused_in_every_form_oneclient_reads(tmp_path, args, option):
+    """O05: the sandbox owns oneclient's log directory (it binds the run's own there, as evidence), so `extra_args`
+    never carries the option, however it is written; the message names the option, never a value."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["extra_args"] = args
+
+    with pytest.raises(ConfigError, match="log directory") as e:
+        load(tmp_path, edit)
+    assert f"({option})" in str(e.value)
+    assert "/oc-log" not in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--provider-timeout", "30", "--storage-timeout=30"],
+        ["--log-read-write-perf"],  # another option that starts `log-`
+        ["-f", "-d", "-s"],
+        ["-o", "allow_root", "-oallow_other,nonempty"],  # an `l` inside `-o`'s value is not an option
+        ["-Hhost-l"],  # nor one in the value of `-H`
+        ["--opt=nolock"],
+    ],
+)
+def test_o05_arguments_that_are_not_the_log_directory_option_are_kept(tmp_path, args):
+    """O05: the refusal is of the log directory's option alone."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["extra_args"] = args
+
+    assert load(tmp_path, edit).mount.extra_args == tuple(args)
 
 
 @pytest.mark.parametrize(
@@ -236,7 +372,7 @@ def test_o21_a_rest_level_selects_its_listing_mode_and_one_without_it_pages(tmp_
         "mounted-too": None,
     }
     assert sandbox.data_path_record()["via-gate-full"] == {"kind": "rest", "listing": "complete"}
-    assert sandbox.data_path_record()["mounted-too"] == {"kind": "mount"}
+    assert sandbox.data_path_record()["mounted-too"] == {"kind": "mount", "io_mode": "proxy"}
 
 
 @pytest.mark.parametrize(
@@ -264,7 +400,8 @@ def test_o21_o12_a_listing_mode_where_it_cannot_apply_is_refused_naming_the_leve
 
 
 def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(tmp_path):
-    """O21, C06: the platform's half of the fingerprint holds each level's kind and a REST level's listing mode, so a
+    """O21, C06: the platform's half of the fingerprint holds each level's kind, a REST level's listing mode and a mount
+    level's I/O mode, so a
     campaign started with one listing mode for a level is refused a resume with the other; the same mode resumes."""
     from campaign_support import make_fingerprint, make_manifest, make_schema
 
@@ -280,7 +417,7 @@ def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
 
     paged, complete = platform("paged"), platform("complete")
     assert paged["data_paths"] == {
-        "mounted": {"kind": "mount"},
+        "mounted": {"kind": "mount", "io_mode": "proxy"},
         "via-gate": {"kind": "rest", "listing": "paged"},
         "isolated": {"kind": "none"},
         COMPLETE_LEVEL: {"kind": "rest", "listing": "complete"},
@@ -301,6 +438,73 @@ def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
     assert caught.value.differences
     assert all(line.startswith("platform.data_paths") for line in caught.value.differences)
     resume(paged)
+
+
+def mount_fingerprint(tmp_path, mode):
+    """The platform's half of the fingerprint with the mount declared as `mode`: loaded as `proxy`, then the mode set in
+    the settings, since the loader refuses `direct` until the storage mapping exists (#223)."""
+    import dataclasses
+
+    config = load_platform(write_platform(tmp_path, add_sandbox), require_secrets=False)
+    mount = dataclasses.replace(config.sandbox.mount, io_mode=mode)
+    return dataclasses.replace(config, sandbox=dataclasses.replace(config.sandbox, mount=mount)).fingerprint()
+
+
+def resume_with(path, fingerprint):
+    from campaign_support import make_fingerprint, make_manifest, make_schema
+
+    from expcore.campaign.resume import open_campaign
+
+    schema = make_schema()
+    store, _ = open_campaign(
+        path, schema, make_manifest(schema), make_fingerprint(schema, platform=fingerprint), now=NOW, max_attempts=3
+    )
+    store.close()
+
+
+def test_o36_the_io_mode_is_in_the_fingerprint_for_each_mount_level_and_for_no_other_level(tmp_path):
+    """O36, C06: a mount level's entry holds the I/O mode it runs with, as a REST level's holds its listing, so the two
+    modes are never one experiment; a REST level and a level with no data path hold none."""
+    (tmp_path / "proxy").mkdir()
+    (tmp_path / "direct").mkdir()
+    proxy, direct = mount_fingerprint(tmp_path / "proxy", "proxy"), mount_fingerprint(tmp_path / "direct", "direct")
+    assert proxy["data_paths"]["mounted"] == {"kind": "mount", "io_mode": "proxy"}
+    assert direct["data_paths"]["mounted"] == {"kind": "mount", "io_mode": "direct"}
+    assert proxy["data_paths"]["via-gate"] == {"kind": "rest", "listing": "paged"}
+    assert proxy["data_paths"]["isolated"] == {"kind": "none"}
+    assert proxy != direct
+
+
+def test_o36_a_campaign_does_not_resume_under_another_io_mode(tmp_path):
+    """O36, C06: a store started under `proxy` is refused a resume under `direct`, naming the level's `io_mode`; the
+    same mode resumes."""
+    from expcore.campaign.resume import FingerprintMismatch
+
+    (tmp_path / "proxy").mkdir()
+    (tmp_path / "direct").mkdir()
+    proxy, direct = mount_fingerprint(tmp_path / "proxy", "proxy"), mount_fingerprint(tmp_path / "direct", "direct")
+    resume_with(tmp_path / "campaign.db", proxy)
+    with pytest.raises(FingerprintMismatch) as caught:
+        resume_with(tmp_path / "campaign.db", direct)
+    assert caught.value.differences == ("platform.data_paths.mounted.io_mode: recorded 'proxy', now 'direct'",)
+    resume_with(tmp_path / "campaign.db", proxy)
+
+
+def test_o36_a_store_started_before_the_mode_was_declared_is_refused_a_resume_naming_the_field(tmp_path):
+    """O36, C06: a store that recorded a mount level with no `io_mode` (it ran under oneclient's own detection) is
+    refused a resume under any declared mode, as a store without `listing` is under one that has it: the difference
+    is the leaf `platform.data_paths.<level>.io_mode`, absent when the campaign started."""
+    from expcore.campaign.resume import FingerprintMismatch
+
+    (tmp_path / "now").mkdir()
+    now = mount_fingerprint(tmp_path / "now", "proxy")
+    before = {**now, "data_paths": {**now["data_paths"], "mounted": {"kind": "mount"}}}
+    resume_with(tmp_path / "campaign.db", before)
+    with pytest.raises(FingerprintMismatch) as caught:
+        resume_with(tmp_path / "campaign.db", now)
+    assert caught.value.differences == (
+        "platform.data_paths.mounted.io_mode: absent when the campaign started, now 'proxy'",
+    )
 
 
 def test_o22_the_caps_of_the_tables_of_the_bytes_served_are_declared_and_default_to_1000_1000_and_64(tmp_path):

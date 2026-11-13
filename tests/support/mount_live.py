@@ -147,9 +147,9 @@ class SpaceFiles:
             raise RuntimeError(f"{what} answered {answer.status_code}")  # never the body: it may name the space
         return answer
 
-    def root(self, provider: str) -> str:
-        """The space's root directory id, as `provider` answers."""
-        answer = self._call("GET", provider, f"/spaces/{self._config.space.id}")
+    def root(self, provider: str, space_id: str | None = None) -> str:
+        """The root directory id of a space, as `provider` answers: `space_id`'s, else the only configured space's."""
+        answer = self._call("GET", provider, f"/spaces/{space_id or self._config.space.id}")
         return self._ok(answer, "the space").json()["fileId"]
 
     def make(self, provider: str, parent: str, name: str, kind: str) -> str:
@@ -375,6 +375,83 @@ def unwritten_cell(files: Mapping[str, tuple[str, str]], prefix: int, size: int,
 def unwritten_cell_timeout(files: int, deadline_s: float) -> float:
     """The cell's own limit: every read blocking to its deadline and its kill's wait, with a minute to spare."""
     return files * UNWRITTEN_READS * (deadline_s + 12) + 60
+
+
+# -- one file of each of several spaces, read through one oneclient process (O36) -------------------------------------
+
+SPACES = """
+import errno, hashlib, json, os, subprocess, sys, time
+files, deadline, wait = {files!r}, {deadline!r}, {wait!r}
+child = (
+    "import errno, hashlib, sys\\n"
+    "digest, count = hashlib.sha256(), 0\\n"
+    "try:\\n"
+    "    with open(sys.argv[1], 'rb', buffering=0) as handle:\\n"
+    "        while chunk := handle.read(1 << 20):\\n"
+    "            digest.update(chunk)\\n"
+    "            count += len(chunk)\\n"
+    "except OSError as e:\\n"
+    "    sys.stderr.write(errno.errorcode.get(e.errno, str(e.errno)))\\n"
+    "    sys.exit(3)\\n"
+    "print(count, digest.hexdigest())\\n"
+)
+results = {{}}
+for label, (path, size, sha256) in files.items():
+    entry = {{}}
+    began = time.perf_counter()
+    while True:  # the entry may reach the mount a little after it was written: wait for it, outside the read's deadline
+        try:
+            entry["size"] = os.stat(path).st_size
+            break
+        except FileNotFoundError:
+            if time.perf_counter() - began > wait:
+                entry["size"], entry["stat_error"] = None, "ENOENT"
+                break
+            time.sleep(1)
+    entry["stat_seconds"] = round(time.perf_counter() - began, 3)
+    if entry["size"] is None:
+        entry["outcome"] = "error"
+        results[label] = entry
+        continue
+    began = time.perf_counter()
+    proc = subprocess.Popen([sys.executable, "-c", child, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=deadline)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=10)
+            killed = True
+        except subprocess.TimeoutExpired:
+            killed = False
+        entry.update(outcome="blocked", seconds=round(time.perf_counter() - began, 3), killed=killed)
+        results[label] = entry
+        continue
+    entry["seconds"] = round(time.perf_counter() - began, 3)
+    if proc.returncode != 0:
+        entry.update(outcome="error", error=err.decode(errors="replace")[-40:])
+    else:
+        count, digest = out.decode().split()
+        entry["bytes"] = int(count)
+        entry["matches"] = int(count) == size and digest == sha256
+        entry["outcome"] = "read" if entry["matches"] else "mismatch"
+    results[label] = entry
+print(json.dumps(results))
+"""
+
+
+def spaces_cell(files: Mapping[str, tuple[str, int, str]], deadline_s: float, wait_s: float = 120.0) -> str:
+    """For each file (label -> (path, size, the SHA-256 of its bytes)), once its entry has reached the mount (up to
+    `wait_s`, outside the deadline), read it whole in a child process given `deadline_s` seconds. Each is `read`
+    (its size and digest are the file's), `mismatch`, `error` with the errno's name, or `blocked` (the child was killed
+    at the deadline), with its seconds. No byte of a file is printed. The files are read one after another by one
+    agent, so one oneclient process serves every space (O36)."""
+    return SPACES.format(files=dict(files), deadline=deadline_s, wait=wait_s)
+
+
+def spaces_cell_timeout(files: int, deadline_s: float, wait_s: float = 120.0) -> float:
+    """The cell's own limit: every file waited for to the end and read to its deadline and its kill's wait."""
+    return files * (wait_s + deadline_s + 12) + 60
 
 
 # -- can the sidecar account for what the agent read, per file? -------------------------------------------------------
