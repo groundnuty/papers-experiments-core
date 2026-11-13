@@ -1362,7 +1362,8 @@ class OnezoneClient:
         An answer without one is a PlatformError; a user whose credential cannot be read is `NotSent`.
         """
         headers = self._as_user(principal, NotSent, "read its tokens")
-        answer = self._send("GET", TEMPORARY_TOKENS_PATH, provider=None, headers=headers)
+        # one attempt: a failed read writes no revoked line, so the slot stays held by its expiry (fail closed)
+        answer = self._send("GET", TEMPORARY_TOKENS_PATH, provider=None, headers=headers, retry=ONE_ATTEMPT)
         generation = answer.get("generation") if isinstance(answer, dict) else None
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             raise PlatformError("zone: the answer to a read of a user's temporary tokens holds no generation")
