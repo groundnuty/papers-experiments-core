@@ -136,6 +136,9 @@ class Pairing:
     n_clusters_dropped: int  # clusters seen in either arm that were left without a pair
     missing: Mapping[str, int]  # the pairs missing by each cause of MISSING_CAUSES (and RATIO_CAUSES), zeros included
     tasks_dropped: tuple[str, ...] = ()  # tasks with runs in one arm only, sorted
+    # pairs both arms analysed, not left out by a treatment declaration, that hold an ordinary run whose numerator is
+    # None at a denominator of 0, whatever single cause they are counted under (S13); 0 for a contrast of one outcome
+    n_unmeasured_failures: int = 0
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -324,11 +327,15 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
     missing = dict.fromkeys(MISSING_CAUSES + (ratio.RATIO_CAUSES if spec.ratio is not None else ()), 0)
     used_pairs: list[tuple[Row, tuple[Value, Value]]] = []
     paired, measured = first.keys() & second.keys(), 0
+    unmeasured_failures = 0
     for key in sorted(paired):
         outcome = _paired_cause(first[key], second[key], spec)
         measured += sum(r.treatment and _value(r, spec) is not None for r in (first[key], second[key]))
         if isinstance(outcome, str):
             missing[outcome] += 1
+            ordinary = (r for r in (first[key], second[key]) if not r.treatment)
+            if outcome != "treatment_excluded" and any(_failed_unmeasured(r, spec) for r in ordinary):
+                unmeasured_failures += 1  # counted apart, so a treatment tolerance cannot excuse it
             continue
         used_pairs.append((first[key], outcome))
     for key in (first.keys() | second.keys() | reasons[0].keys() | reasons[1].keys()) - paired:
@@ -349,4 +356,5 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
         n_clusters_dropped=len(seen) - len(differences.clusters),
         missing=missing,
         tasks_dropped=tuple(sorted({r.task for r in first.values()} ^ {r.task for r in second.values()})),
+        n_unmeasured_failures=unmeasured_failures,
     )

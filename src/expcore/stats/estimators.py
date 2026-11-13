@@ -302,9 +302,10 @@ def ratio(paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorRe
     noise is snapped, with zero log ratios (clusters whose arms have one ratio) dropped and counted (`zero_dropped`)
     and all-zero input giving p = 1 (S01, S03); it assumes independent clusters whose log ratios are symmetric about
     their centre, and tests that centre. The interval is the cluster bootstrap's percentile interval: clusters drawn
-    with replacement, the mean log ratio of each draw (S04, S05). One cluster gives an estimate, a point interval and
-    p = 1. Its parameters are the Wilcoxon cluster bootstrap's. There is no estimate by model, since each cluster's
-    sums pool its models.
+    with replacement, the mean log ratio of each draw (S04, S05). One cluster gives an estimate and a point interval;
+    its p-value is the test's for one difference (1 by the exact method, 0.3173 by the normal approximation, which no
+    level a study uses rejects). Its parameters are the Wilcoxon cluster bootstrap's. There is no estimate by model,
+    since each cluster's sums pool its models.
     """
     params = {**_WILCOXON_DEFAULTS, **settings.params}
     _check_ratio_params(params)

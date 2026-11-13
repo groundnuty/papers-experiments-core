@@ -255,9 +255,10 @@ def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pa
 
 
 def _refuse_unmeasured_failures(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
-    """Refuse a member of the Holm family that lost a pair to a run whose numerator is None while its denominator is
-    0 (S13): the ratio would then sum the cost of the runs that succeeded, and not of those that failed."""
-    lost = pairing.missing.get("numerator_none_at_zero", 0)
+    """Refuse a member of the Holm family that lost a pair holding an ordinary run whose numerator is None while its
+    denominator is 0 (S13): the ratio would then sum the cost of the runs that succeeded, and not of those that failed.
+    Such a pair may be counted under a treatment attempt's None, which a tolerance excuses, so the count is its own."""
+    lost = pairing.n_unmeasured_failures
     if spec.ratio is None or spec.name not in prereg.holm_family or not lost:
         return
     raise RatioNumeratorRefused(

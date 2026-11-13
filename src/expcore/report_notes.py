@@ -103,7 +103,7 @@ RATIO_NOTES = [
     "preregistered rule for a cluster whose numerator or denominator sums to 0 in either arm, whose log ratio is",
     "undefined or infinite: `exclude` (the cluster is excluded from the contrast, and its pairs are counted by",
     "cause in the pairs tables) or `continuity correction c` (c is added to both sums of both arms in every",
-    "cluster, which keeps every cluster and pulls each log ratio toward 0).",
+    "cluster, which keeps every cluster and moves each log ratio most where its sums are small).",
 ]
 
 CONDITION_NOTES = [

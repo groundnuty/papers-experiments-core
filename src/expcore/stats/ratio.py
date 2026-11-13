@@ -21,8 +21,9 @@ to 0 or an infinity and never dropped silently: the preregistration declares one
   (a denominator sum of 0 in either arm, checked first) or `zero_numerator` (a numerator sum of 0 in either arm);
 - "continuity": a declared `continuity_correction` c > 0 is added to all four sums of every cluster, a zero or not,
   so theta becomes the mean of ln( ((N_cA + c) / (D_cA + c)) / ((N_cB + c) / (D_cB + c)) ). It is one fixed
-  transformation of the data, not a choice made after seeing a zero, and it shrinks every log ratio toward 0, more
-  for small sums: c is in each outcome's own units.
+  transformation of the data, not a choice made after seeing a zero, and so a corrected estimand: c is in each
+  outcome's own units, and it moves a cluster's log ratio most where its sums are small, in either direction (arms of
+  one ratio, 100 / 10 and 10 / 1, give 0.31 with c = 0.5, not 0).
 The same rule covers a zero numerator sum, whose log ratio is minus infinity.
 
 A pair lost because a run's numerator is None while its denominator is 0 is counted under `numerator_none_at_zero`:
@@ -97,12 +98,14 @@ class RatioForm:
         return float(self.continuity_correction) if self.zero_denominator == "continuity" else 0.0
 
 
-def log_ratio(arm_a: Totals, arm_b: Totals, form: RatioForm) -> tuple[str | None, float]:
+def log_ratio(
+    arm_a: tuple[float | Fraction, float | Fraction], arm_b: tuple[float | Fraction, float | Fraction], form: RatioForm
+) -> tuple[str | None, float]:
     """One cluster's value from its arms' sums: (None, ln of the ratio of ratios), or (cause, NaN) when the rule
     excludes it.
 
     The arithmetic is exact (rationals) up to the logarithm, so arms with one ratio give 0.0 exactly, never float noise
-    a rank test would rank, and no product or quotient of sums can overflow on the way.
+    a rank test would rank, and no sum, product or quotient can overflow on the way.
     """
     c = Fraction(form.correction)
     (na, da), (nb, db) = ((Fraction(n) + c, Fraction(d) + c) for n, d in (arm_a, arm_b))
@@ -114,10 +117,12 @@ def log_ratio(arm_a: Totals, arm_b: Totals, form: RatioForm) -> tuple[str | None
     return None, math.log(ratio.numerator) - math.log(ratio.denominator)
 
 
-def _sums(pairs: Sequence[tuple[Totals, Totals]]) -> tuple[Totals, Totals]:
-    """Each arm's exact sums over the pairs, whatever their order."""
-    columns = list(zip(*(a + b for a, b in pairs), strict=True))
-    na, da, nb, db = (math.fsum(column) for column in columns)
+def _sums(pairs: Sequence[tuple[Totals, Totals]]) -> tuple[tuple[Fraction, Fraction], tuple[Fraction, Fraction]]:
+    """Each arm's sums over the pairs, exact rationals: no float sum can overflow, and the order does not matter."""
+    na, da, nb, db = (
+        sum((Fraction(value) for value in column), Fraction(0))
+        for column in zip(*(a + b for a, b in pairs), strict=True)
+    )
     return (na, da), (nb, db)
 
 

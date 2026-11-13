@@ -109,6 +109,16 @@ def test_no_cluster_left_gives_an_input_with_no_cluster():
     assert aggregate({}, EXCLUDE)[0].clusters == ()
 
 
+def test_s13_totals_past_the_float_range_are_summed_exactly():
+    """S13: two runs of 1e308 in each arm sum past the largest float, and the log ratio of equal arms is still 0."""
+    pairs = [((1e308, 1.0), (1e308, 1.0)), ((1e308, 1.0), (1e308, 1.0))]
+    differences, excluded = aggregate({"grp-a": pairs}, EXCLUDE)
+    assert differences.matrix[0, 0] == 0.0
+    assert excluded == {"zero_denominator": 0, "zero_numerator": 0}
+    _, value = log_ratio((1e308, 1.0), (1e308, 4.0), EXCLUDE)
+    assert value == pytest.approx(math.log(4.0))
+
+
 def test_the_sums_do_not_depend_on_the_order_of_the_pairs():
     """Each total is an exact sum, so a cluster's value is a function of its set of pairs."""
     pairs = [((0.1, 1.0), (0.3, 1.0)), ((0.2, 0.0), (0.7, 2.0)), ((1e16, 1.0), (1.0, 1.0)), ((-0.0, 0.0), (1.0, 0.0))]

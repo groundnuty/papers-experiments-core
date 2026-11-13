@@ -6,7 +6,7 @@ import tomllib
 
 import numpy as np
 import pytest
-from stats_support import both_arms, make_row, ratio_arms, ratio_spec
+from stats_support import both_arms, make_row, ratio_arms, ratio_row, ratio_spec
 
 from expcore.campaign.factors import FactorSchema
 from expcore.stats import contrasts as kernel
@@ -1135,6 +1135,33 @@ def test_s13_a_confirmatory_ratio_contrast_that_loses_a_failed_runs_numerator_is
     assert "Make the scorer return 'spend' for every run" in message
     assert isinstance(caught.value, ContrastRefused)
     assert issubclass(TreatmentOutcomesRefused, ContrastRefused)  # the pipeline catches both as one
+
+
+def test_s13_a_treatment_tolerance_does_not_excuse_an_ordinary_failed_runs_missing_numerator():
+    """S13: the pair is counted once, as a treatment loss, and the tolerance covers that; the ordinary run in it whose
+    spend is None at 0 wins is still a failed run's cost left out, and refuses the contrast."""
+    text = RATIO_TEXT.replace(
+        "equivalence_margin = 0.2\n",
+        'equivalence_margin = 0.2\ntreatment_outcomes = "scored"\nmax_unscored_treatment = 1\n',
+    )
+    prereg = parse(tomllib.loads(text), "inline", "d" * 64, ARMS)
+    rows = planted_ratio_rows()
+    rows += [  # a treatment attempt that was measured, so the tolerance may apply
+        ratio_row("t8", "model-a", 1, 40.0, 1.0, condition="cond-a", cluster="c0", treatment=True),
+        ratio_row("t8", "model-a", 1, 20.0, 1.0, condition="cond-b", cluster="c0"),
+    ]
+    not_a_failure = [  # A's wins are unknown, not 0: an ordinary None the tolerance's pair holds, which may go
+        ratio_row("t9", "model-a", 1, 20.0, None, condition="cond-a", cluster="c0"),
+        ratio_row("t9", "model-a", 1, None, 1.0, condition="cond-b", cluster="c0", treatment=True),
+    ]
+    tolerated = analyse([*rows, *not_a_failure], prereg)
+    assert tolerated.contrast("spend-per-win").pairs_missing["treatment_outcome_none"] == 1
+    rows += [
+        ratio_row("t9", "model-a", 1, None, 0.0, condition="cond-a", cluster="c0"),
+        ratio_row("t9", "model-a", 1, None, 1.0, condition="cond-b", cluster="c0", treatment=True),
+    ]
+    with pytest.raises(RatioNumeratorRefused, match="drops 1 pair"):
+        analyse(rows, prereg)
 
 
 def test_s13_an_exploratory_ratio_contrast_reports_a_failed_runs_missing_numerator_and_goes_on():
