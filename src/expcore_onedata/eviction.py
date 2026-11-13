@@ -259,10 +259,14 @@ def evict_tree(
     from_provider: str,
     *,
     quiet: Callable[[], None] | None = None,
+    listed: Callable[[Sequence[str]], None] | None = None,
 ) -> dict[str, Any]:
     """Evict every file under a directory from a provider with one transfer, then verify all of them together, the
     tree listed once; return the record. Never from the data provider; `path` (or the entry a caller resolved
-    already) must be a directory. An attempt that left bytes schedules the directory's eviction again."""
+    already) must be a directory. An attempt that left bytes schedules the directory's eviction again. `listed`, when
+    given, is called with the ids of the files the listing found, before the transfer: the reset's quiet check holds
+    those files' block maps on this provider to the empty map the eviction verified (O33), so it never lists the tree a
+    second time."""
     provisioner.check_eviction(from_provider)
     began = provisioner.clock()
     provisioner.verify_space()
@@ -270,6 +274,8 @@ def evict_tree(
     if directory.kind != "DIR":
         raise ProvisionError(f"{provisioner.where}a tree eviction names a directory; this path is not one")
     files = [entry.file_id for entry, _ in provisioner.walk(directory.file_id) if entry.kind != "DIR"]
+    if listed is not None:
+        listed(files)
     done = _evict_verified(
         provisioner,
         from_provider,

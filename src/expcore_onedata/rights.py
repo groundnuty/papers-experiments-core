@@ -17,6 +17,15 @@ WRITE_RIGHTS = (
     "space_cancel_eviction",
 )
 KNOWN_RIGHTS = (*READ_RIGHTS, *WRITE_RIGHTS)
+# The right to add and remove QoS requirements, so to start a replication that creates no transfer document.
+MANAGE_QOS = "space_manage_qos"
+
+
+def declares_qos(rights: Iterable[str]) -> bool:
+    """Tell whether a set of rights holds the right to manage QoS requirements (O33): a run that holds it can leave a
+    replication landing with no requirement to see, so the reset's quiet check must run for the runs since the last
+    verified reset when any of them held it (`SpaceReset.run(qos_rights=)`)."""
+    return MANAGE_QOS in rights
 
 
 def rights_problem(rights: Sequence[str]) -> str | None:

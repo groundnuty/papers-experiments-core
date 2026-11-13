@@ -91,7 +91,7 @@ from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
-from expcore_onedata.rights import declares_write, rights_problem
+from expcore_onedata.rights import declares_qos, declares_write, rights_problem
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
@@ -159,6 +159,14 @@ class Condition:
     def writes(self) -> bool:
         """Whether the condition declares any write right."""
         return declares_write(self.rights)
+
+    @property
+    def manages_qos(self) -> bool:
+        """Whether this one condition declares the right to manage QoS requirements (O33). It is not what a caller of
+        `SpaceReset.run` passes as `qos_rights` on its own: a study's reset runs at the start of a run and clears what
+        earlier runs left, so `qos_rights` is whether any run since the last verified reset could have set a
+        requirement, and a caller combines this over every such run, never the next run's alone."""
+        return declares_qos(self.rights)
 
 
 @dataclass(frozen=True)

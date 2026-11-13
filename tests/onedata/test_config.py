@@ -26,6 +26,8 @@ def test_o12_a_good_file_loads_with_every_name_from_the_file(tmp_path, monkeypat
     assert config.condition("read").rights == tuple(sorted(BASELINE))
     assert config.condition("manage").writes
     assert not config.condition("read").writes
+    assert config.condition("manage").manages_qos  # the right `SpaceReset.run(qos_rights=)` is told (O33)
+    assert not config.condition("read").manages_qos
     assert config.condition("manage").allow == ("echo", "add", "fail")
     assert config.admin == SecretSource("env", ADMIN_ENV)
 
