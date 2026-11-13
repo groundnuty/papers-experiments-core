@@ -55,6 +55,13 @@ class AgentConfig:
     - `cleanup_deadline_s`: how long, in real time, the loop waits for a call it cancelled (cut at a limit, or the whole
       run cancelled from outside) to stop. Past it the call is given up on and left pending, the result says so
       (`cleanup_timed_out`) and the ending stands, so a cancellation always terminates.
+    - `tool_call_bound_s`: an optional bound on one tool call (L17). A call is handed `min(tool_call_bound_s, the
+      agent's time left)` as its `timeout_s`. A provider that bounds its own call and runs out of the bound first (a
+      tool server that hangs) fails the call as `knowledge` infrastructure, which is not the agent's time; one that
+      runs out with the agent's time, or the ceiling, the shorter is the loop's own cut as before. None, the default,
+      leaves the call bounded by the agent's time alone. A declared bound is a value of the record and is hashed with
+      the rest; an undeclared one is not written at all, so a configuration that does not declare it is what it was
+      before the field existed (its hash, its record and its fingerprint).
     """
 
     limits: Limits
@@ -64,6 +71,7 @@ class AgentConfig:
     min_call_s: float = MIN_CALL_S
     ceiling_factor: float | None = None
     cleanup_deadline_s: float = CLEANUP_DEADLINE_S
+    tool_call_bound_s: float | None = None
 
     def __post_init__(self) -> None:
         """Refuse caps that cannot work and an unknown policy, and settle the ceiling and the kind it ends as."""
@@ -77,6 +85,11 @@ class AgentConfig:
             problems.append(f"malformed_policy must be one of {', '.join(MALFORMED_POLICIES)}")
         if not (math.isfinite(self.cleanup_deadline_s) and self.cleanup_deadline_s > 0):
             problems.append("cleanup_deadline_s must be a positive, finite number of seconds")
+        bound = self.tool_call_bound_s
+        if bound is not None and not (
+            isinstance(bound, int | float) and not isinstance(bound, bool) and math.isfinite(bound) and bound > 0
+        ):
+            problems.append("tool_call_bound_s must be a positive, finite number of seconds when it is given")
         problems.extend(self._settle_ceiling())
         if not (math.isfinite(self.min_call_s) and self.min_call_s >= MIN_CALL_S):
             problems.append(
@@ -126,8 +139,15 @@ class AgentConfig:
         return AgentTimer(self.limits.time_cap_s, clock=clock, ceiling_s=self.ceiling_s, cleanup_waiter=cleanup_waiter)
 
     def as_dict(self) -> dict[str, Any]:
-        """Return every value as the record keeps it."""
-        return dataclasses.asdict(self)
+        """Return every value as the record keeps it.
+
+        `tool_call_bound_s` is left out when it is not declared, never written as a null: an optional setting that was
+        never given leaves the record, the hash and the campaign's caps as they were before the setting existed (L17).
+        """
+        values = dataclasses.asdict(self)
+        if values["tool_call_bound_s"] is None:
+            del values["tool_call_bound_s"]
+        return values
 
     def config_sha256(self) -> str:
         """Return the SHA-256 of the canonical form of every value; any cap that differs gives a different hash.
