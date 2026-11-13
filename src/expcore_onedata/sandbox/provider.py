@@ -501,10 +501,13 @@ class SandboxPlatform:
             raise
         try:
             yield sandbox
-        except Exception:
+        except Exception as error:
             refused = await self._gate_refused(sandbox)
             await self._stop(ctx, sandbox, quiet=True)
-            if refused is not None:  # the gate cut the condition's read: that, not the body's failure, ends the run
+            unkillable = isinstance(error, InfraError) and error.kind == kinds.CELL_UNKILLABLE
+            # the gate cut the condition's read: that, not the body's failure, ends the run; unless a cell outlived its
+            # kill (O30), after which the gate's log, gone with a stopped sandbox, is not the run's evidence
+            if refused is not None and not unkillable:
                 raise refused from None
             raise
         except BaseException:

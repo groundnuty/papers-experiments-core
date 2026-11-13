@@ -149,6 +149,9 @@ class FakeHost:
         }
         self.links = {"/proc/self/ns/pid": PID_NS}
         self.alive: set[int] = set()
+        # processes a signal does not end: a read waiting in the kernel on a FUSE mount, which takes its kill only when
+        # it returns (O30); a test releases one by removing it from here and from /proc
+        self.unkillable: set[int] = set()
         self.calls: list[tuple] = []
         self.routes = "default via 192.0.2.1 dev eth0\n"
         self.dmesg = ""
@@ -312,6 +315,8 @@ class FakeHost:
                 return CmdResult(0, text) if text is not None else CmdResult(1, "", "No such file")
             case "kill":
                 for pid in argv[argv.index("-s") + 2 :] if "-s" in argv else argv[1:]:
+                    if int(pid) in self.unkillable:
+                        continue
                     self.alive.discard(int(pid))
                     self.files.pop(f"/proc/{pid}/stat", None)
                 return CmdResult(0)

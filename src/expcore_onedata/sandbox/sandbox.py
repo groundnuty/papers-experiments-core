@@ -54,6 +54,7 @@ from typing import Any
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
 from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool, reap
+from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
@@ -77,6 +78,7 @@ from expcore_onedata.sandbox.containers import (
     certifi_probe_args,
     effective_log_dir,
     gate_run_args,
+    sidecar_abort_args,
     sidecar_command,
     sidecar_run_args,
     trust_targets,
@@ -149,6 +151,7 @@ class DockerSandbox:
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
             "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O23); never the bundle's path
+            "cell_deadline": {"grace_s": settings.kill_grace_s},  # each cell's deadline: `cell_deadlines` (O30)
         }
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
@@ -325,7 +328,10 @@ class DockerSandbox:
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
         if share:
             roles["sidecar"] = self.names.sidecar
-        self._cells = CellRunner(self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started)
+        escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, self._stop_at_deadline, sleep=self._sleep)
+        self._cells = CellRunner(
+            self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation
+        )
         self._verify_read_only()
         self._verify_inputs()
         self._cells.sample_pids()
@@ -789,7 +795,12 @@ class DockerSandbox:
         is recorded under `harness_steps` with its exit status, its refusals and the host killer's kills it met, none
         of which the agent's first cell takes. Its only time limit is the backstop `timeout` in the container
         (`CAP_MARGIN_S` after `timeout_s`): the harness's timer, which would stop the agent's processes, is not started,
-        and no kill cause is read."""
+        and no kill cause is read.
+
+        A cell's limit is a hard deadline (deadline.py, O30): a process of the cell that outlives its kill has the
+        mount aborted from the sidecar (`_abort_mount`), or the sandbox stopped (`_stop_at_deadline`), and the run is
+        over: every later `exec` and the collection of a stopped run raise `InfraError("cell_unkillable")`."""
+        self._refuse_if_ended()
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
         self._enter(record)
@@ -816,6 +827,48 @@ class DockerSandbox:
                     "a harness step runs only before the agent's run: its start is marked or a cell began"
                 )
             self._steps_running += 1
+
+    def _refuse_if_ended(self, *, unless: tuple[str, ...] = ()) -> None:
+        """Raise `InfraError("cell_unkillable")` once a cell's deadline ended the run (O30), unless it ended as one of
+        `unless`: after an abort the mount is dead, and no later cell may read it as if it were an empty directory."""
+        record = self._cells.ended if self._cells is not None else None
+        if record is not None and record["outcome"] not in unless:
+            raise kinds.run_ended_error(record)
+
+    def _abort_mount(self) -> dict[str, Any]:
+        """At a cell's deadline, when a process of the cell outlived its kill (O30): abort the run's FUSE connection from
+        the sidecar, which holds the mount and SYS_ADMIN (`containers.sidecar_abort_args`), nothing in the agent's
+        container. The connection is the device of the run's mount in the host's table, read without touching the
+        mount. `ok` is None when there is no mount to abort; once it is True the mount is dead for the rest of the run."""
+        if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
+            return {"ok": None, "why": "the run has no FUSE mount"}
+        found = TD._fuse_at(self.host, TD.host_path(self.dir / "mount"), self.waits)
+        connections = sorted({n for m in found or [] if (n := TD._conn(m["dev"])) is not None})
+        if not connections:
+            return {"ok": None, "why": "the mount's FUSE connection is not in the host's mount table"}
+        failed = []
+        for n in connections:
+            done = self.host.docker(*sidecar_abort_args(self.names, n), check=False, timeout=self.waits.command_s)
+            if done.returncode != 0:
+                failed.append(done)
+        note: dict[str, Any] = {"ok": not failed, "connections": len(connections)}
+        if failed:
+            note.update(rc=failed[0].returncode, stderr=stderr_digest(failed[0].stderr))
+            log.error("the sidecar could not abort the mount's FUSE connection: %s", describe_stderr(failed[0].stderr))
+        else:
+            self._meta.setdefault("mount", {})["aborted"] = True  # dead for the rest of the run
+        return note
+
+    def _stop_at_deadline(self) -> dict[str, Any]:
+        """At a cell's deadline, when the abort could not end the cell (O30): stop the sandbox, from the timer's thread;
+        the ordered teardown has its own last resorts, and the driver's later stop finds it stopped. A stop that fails is
+        recorded, never raised here."""
+        try:
+            self.stop()
+        except SandboxError as e:
+            log.error("the sandbox could not be stopped at a cell's deadline: %s", describe_error(e))
+            return {"ok": False, "error": "the sandbox's teardown was incomplete"}
+        return {"ok": True}
 
     def _new_refusals(self) -> tuple[str, ...]:
         """The data gate's refusals since the last cell or step; an unreadable log stands for them, unknown never none."""
@@ -951,7 +1004,10 @@ class DockerSandbox:
         for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
         that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash)
         raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
-        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection."""
+        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection. A run a
+        cell's deadline stopped, or left with a process that outlived its kill, raises `InfraError("cell_unkillable")`
+        (O30); after the mount's abort alone the outputs are collected as usual."""
+        self._refuse_if_ended(unless=(DL.MOUNT_ABORTED,))
         try:
             state = self._cells.quiesce("before collection")
             if not CellRunner.quiet(state):

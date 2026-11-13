@@ -8,6 +8,10 @@ because a killed worker may leave a parent that exits 1, or 0, and a cell may ex
 the host's out-of-memory killer likewise. An exit code alone never makes a kill. A cell that printed
 bytes that are not UTF-8 is the agent's own outcome: they are replaced, never an exception. The only time limit is the
 `timeout_s` the caller sets, so no hidden per-cell limit can creep back.
+
+That limit is a hard deadline (deadline.py, O30): at the cap every process of the cell is killed, and one that outlives
+the kill past the grace period has the mount aborted under it, or the sandbox stopped. Its record is the cell's
+`deadline`, and a cell that outlived its kill is `kill_survived`, infrastructure, and ends the run (`ended`).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox import teardown as TD
@@ -81,6 +86,25 @@ class CellTimer:
         return fired
 
 
+class _CellProcesses:
+    """The deadline's tracker (deadline.Tracker): the cell's processes are every process of the agent's container but
+    its init and the init's `sleep`, from its cgroup, so a worker in a session of its own is one; SIGKILLed through the
+    host's privilege, as the quiesce does."""
+
+    def __init__(self, runner: CellRunner) -> None:
+        self._runner = runner
+
+    def processes(self) -> list[dict] | None:
+        try:
+            return self._runner.agent_processes()
+        except Exception as e:  # unknown, never none
+            log.error("the processes of a cell could not be listed at its deadline: %s", describe_error(e))
+            return None
+
+    def kill(self, procs: list[dict]) -> None:
+        TD._sudo(self._runner._host, "kill", "-s", "KILL", *[str(p["pid"]) for p in procs], timeout_s=20.0)
+
+
 class CellRunner:
     """Runs cells in one agent container and keeps what is known about their kills."""
 
@@ -94,9 +118,16 @@ class CellRunner:
         registry: Registry,
         roles: dict[str, str],
         started_epoch: float,
+        escalation: DL.Escalation | None = None,
     ) -> None:
         self._host, self._obs, self._names, self._s = host, observer, names, settings
         self._meta, self._registry, self.roles, self._started = meta, registry, roles, started_epoch
+        # past the kill at a cell's deadline: by default the grace alone, with nothing to abort and no stop
+        self._escalation = escalation or DL.Escalation(
+            settings.kill_grace_s, lambda: {"ok": None, "why": "no abort"}, lambda: {"ok": None, "why": "no stop"}
+        )
+        self._deadline: dict[str, Any] | None = None  # the record of the running cell's deadline, once it fired
+        self.ended: dict[str, Any] | None = None  # the deadline that ended the run: a process outlived its kill
         self.cells: list[dict[str, Any]] = []
         self._events_seen: dict[str, int] | None = None
         self._earlyoom_seen = 0
@@ -193,12 +224,19 @@ class CellRunner:
         return state["killed"] is not None and not [p for p in state["left"] if p["state"] not in ("D", "Z")]
 
     def _kill_at_the_cap(self) -> None:
-        """In the timer's thread, when a cell's time runs out: every process of the agent's except its init and `sleep`,
-        the cell's own and any worker it detached. It never raises."""
+        """In the timer's thread, when a cell's time runs out: its deadline (deadline.py). Every process of the agent's
+        except its init and `sleep`, the cell's own and any worker it detached, is killed, and one that outlives the
+        kill past the grace has the mount aborted or the sandbox stopped. The record is kept for the cell; it never
+        raises."""
         try:
-            self.quiesce("time cap")
+            self._deadline = DL.enforce(_CellProcesses(self), self._escalation)
         except Exception as e:
-            log.error("killing the processes of a cell at its cap failed: %s", describe_error(e))
+            log.error("the deadline of a cell failed: %s", describe_error(e))
+            self.quiesce("time cap")
+            return
+        outcome = self._deadline["outcome"]
+        if outcome in DL.ESCALATED:
+            log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
 
     # ------------------------------------------------------------------------------------------------ the cell
     def run(self, code: str, timeout_s: float, *, record: bool = True) -> ExecResult:
@@ -237,6 +275,7 @@ class CellRunner:
         if remaining < 1:  # too little left to start it: nothing runs, no timer was started, so none fired
             return self._not_started(record)
         t0, wall0 = time.monotonic(), time.time()
+        self._deadline = None  # this cell's, once its timer fires
         timer = CellTimer(remaining, self._kill_at_the_cap)
         gave_up = fired = False
         try:
@@ -310,12 +349,34 @@ class CellRunner:
             self._meta.setdefault("cell_kills", []).append({"cell": entry["cell"], **kill})
         self._events_seen = events
         res.kill = self._with_earlyoom(res, entry, before, up0, used, timeout_s, gave_up, fired, wall0)
+        escalated = self._with_deadline(res, entry, fired)
         if res.kill:  # from what caused it, not from an exit code that a memory kill shares
-            res.timed_out = entry["timed_out"] = gave_up or res.kill["reason"] == "time_limit"
+            res.timed_out = entry["timed_out"] = gave_up or res.kill["reason"] in ("time_limit", KC.KILL_SURVIVED)
         entry["timed_out"] = res.timed_out
-        if res.timed_out:  # now, and not only from the timer: a worker that closed the pipes must not run on
-            self.quiesce("time cap")
+        if res.timed_out and not escalated:  # now, and not only from the timer: a worker that closed the pipes must
+            self.quiesce("time cap")  # not run on (after an escalation the deadline has done all a kill can)
         self.cells.append(entry)
+
+    def _with_deadline(self, res: ExecResult, entry: dict[str, Any], fired: bool) -> bool:
+        """The record of the cell's deadline, when its timer fired; and when a process of the cell outlived its kill,
+        its kill becomes `kill_survived`, whatever else the counters said (after an abort or a stop they describe the
+        harness's doing), and the run is over (`ended`). Whether that happened."""
+        record = self._deadline if fired else None
+        if record is None:
+            return False
+        entry["deadline"] = record
+        self._meta.setdefault("cell_deadlines", []).append({"cell": entry["cell"], **record})
+        if record["outcome"] not in DL.ESCALATED:
+            return False
+        kill = {**(entry.get("kill") or {}), **KC.survived_cause(record)}
+        entry["kill"] = res.kill = kill
+        cell_kills = self._meta.setdefault("cell_kills", [])
+        if cell_kills and cell_kills[-1]["cell"] == entry["cell"]:
+            cell_kills[-1] = {"cell": entry["cell"], **kill}
+        else:
+            cell_kills.append({"cell": entry["cell"], **kill})
+        self.ended = record
+        return True
 
     def _with_earlyoom(self, res, entry, before, up0, used, timeout_s, gave_up, fired, wall0) -> dict[str, Any] | None:
         """Whatever the exit code, the host's killer's victim may be another container of the run, and the cell may
