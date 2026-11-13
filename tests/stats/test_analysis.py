@@ -16,6 +16,7 @@ from expcore.stats.analysis import (
     TreatmentOutcomesRefused,
     analyse,
     conclude,
+    equivalence_feasibility,
     pilot_power,
     power_study,
     run_contrast,
@@ -1148,6 +1149,53 @@ def test_s15_s02_an_untestable_member_keeps_its_place_in_the_equivalence_family(
     decisions = {d.name: d for d in result.equivalence_holm}
     assert decisions["a-vs-b"].level == 0.05 / 2
     assert decisions["x-vs-y"].reject is False
+
+
+FEASIBILITY_POWER = "\n[power]\nseed = 3\nn_simulations = 60\ntarget_clusters = 20\ntarget_difference = 0.1\n"
+
+
+def feasibility_prereg(sd_grid="[0.05, 2.0]"):
+    """The equivalence family above, with power settings whose SD grid has a reachable and an unreachable spread."""
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", "wilcoxon_cluster_bootstrap").replace(
+        "replicates = 400", "replicates = 100"
+    )
+    text = text.replace("[contrasts.a-vs-b]", FEASIBILITY_POWER + f"sd_grid = {sd_grid}\n\n[contrasts.a-vs-b]")
+    return parse(tomllib.loads(text), "inline", "e" * 64, ARMS)
+
+
+def test_s15_the_feasibility_of_each_members_claim_at_the_declared_spreads_and_the_family_level():
+    """S15: per member and declared SD, the chance of concluding equivalent at a true 0 and at half the margin, at
+    alpha over the family size, with the target clusters; reachable when the chance at 0 meets the target power."""
+    result = equivalence_feasibility(feasibility_prereg())
+    rows = [row for row in result.rows if row["contrast"] == "a-vs-b"]
+    assert [(row["sd"], row["delta"]) for row in rows] == [(0.05, 0.0), (0.05, 0.1), (2.0, 0.0), (2.0, 0.1)]
+    assert {(row["n_clusters"], row["margin"], row["alpha"]) for row in rows} == {(20, 0.2, 0.05 / 2)}
+    tight, _, wide, _ = rows
+    assert (tight["probability"], tight["reachable"]) == (1.0, True)
+    assert (wide["probability"], wide["reachable"]) == (0.0, False)
+    assert {row["contrast"] for row in result.rows} == {"a-vs-b", "x-vs-y"}
+    assert result.manifest["preregistration_sha256"] == "e" * 64  # P04
+    assert equivalence_feasibility(feasibility_prereg()) == result  # seeded by the file
+
+
+def test_s15_the_feasibility_from_pilot_rows_uses_each_contrasts_own_spread():
+    """S15: with pilot rows, the SD is each member's between-cluster SD of its paired differences."""
+    result = equivalence_feasibility(feasibility_prereg(), near_zero_rows())
+    sds = {row["contrast"]: row["sd"] for row in result.rows}
+    expected = power.pilot_cluster_sd(
+        pair_rows(near_zero_rows(), feasibility_prereg().contrasts["a-vs-b"]).differences.cluster_differences
+    )
+    assert sds["a-vs-b"] == pytest.approx(expected)
+    assert all(row["reachable"] for row in result.rows if row["delta"] == 0.0)
+
+
+def test_s15_the_feasibility_refuses_what_it_cannot_run():
+    """S15: no power settings, or no contrast with a margin, is an error naming the preregistration."""
+    with pytest.raises(ValueError, match=r"inline: has no \[power\] section"):
+        equivalence_feasibility(equivalence_prereg())
+    text = TEXT + "\n"
+    with pytest.raises(ValueError, match="inline: no contrast declares an equivalence_margin"):
+        equivalence_feasibility(parse(tomllib.loads(text), "inline", "a" * 64, SCHEMA))
 
 
 def test_s15_a_margin_outside_the_equivalence_family_keeps_the_interval_rule():

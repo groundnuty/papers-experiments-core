@@ -38,6 +38,11 @@ contrast's preregistered `max_unscored_treatment` (0 unless set). An exploratory
 refused.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
+
+A preregistration may declare an equivalence family (S15): members of the Holm family with a margin, whose equivalence
+claims are decided together. Each member's TOST p-value comes from its estimator's own resamples, Holm adjusts them
+over the family, and a member is equivalent only when Holm rejects; the interval at 1 - 2 times its Holm level is
+reported with it. `equivalence_feasibility` simulates, before the campaign, how often each claim would be reached.
 """
 
 from __future__ import annotations
@@ -458,3 +463,56 @@ def pilot_power(rows: Iterable[Row], prereg: Preregistration, names: Sequence[st
         raise ValueError(f"{prereg.source}: no contrast named {unknown[0]!r}; declared: {', '.join(prereg.contrasts)}")
     pilot = {name: pair_rows(rows, prereg.contrasts[name]).differences.cluster_differences for name in chosen}
     return PowerResult(tuple(power.pilot_power(pilot, prereg.power, prereg.alpha)), prereg.manifest())
+
+
+def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None = None) -> PowerResult:
+    """Whether each equivalence claim can be reached before the campaign (S15): for each contrast with a margin, the
+    chance of concluding equivalent when the true difference is 0 and when it is half the margin.
+
+    The simulation (`power.equivalence_feasibility`) has the [power] section's target clusters, simulations and seed
+    (with a digest of the contrast's name), and the [bootstrap] replicates. The SD is each of the [power] sd_grid's,
+    declared; or, given pilot rows, the contrast's own between-cluster SD of its paired differences, estimated. The
+    level is alpha divided by the equivalence family's size for a member (Holm's first and hardest step, so the figure
+    is conservative for every member but the one with the smallest p-value) and alpha for a contrast outside it, whose
+    interval rule is the same test at alpha. A claim is `reachable` when its chance at 0 meets the target power; a
+    preregistration should state an equivalence hypothesis only if it is, and say so if it is not.
+    """
+    if prereg.power is None:
+        raise ValueError(f"{prereg.source}: has no [power] section, so there is no feasibility study to run")
+    margined = [spec for spec in prereg.contrasts.values() if spec.equivalence_margin is not None]
+    if not margined:
+        raise ValueError(f"{prereg.source}: no contrast declares an equivalence_margin, so no equivalence is claimed")
+    pilot = list(rows) if rows is not None else None
+    settings, family = prereg.power, prereg.equivalence_family
+    table = []
+    for spec in margined:
+        margin = float(spec.equivalence_margin or 0.0)
+        alpha = prereg.alpha / len(family) if spec.name in family else prereg.alpha
+        if pilot is None:
+            sds = list(settings.sd_grid)
+        else:
+            sds = [power.pilot_cluster_sd(pair_rows(pilot, spec).differences.cluster_differences)]
+        rng = np.random.default_rng([settings.seed, name_digest(spec.name)])
+        for sd in sds:
+            deltas = (0.0, margin / 2)
+            if math.isfinite(sd) and sd > 0:
+                chances = power.equivalence_feasibility(
+                    sd, settings.target_clusters, margin, alpha, settings.n_simulations, prereg.bootstrap.replicates,
+                    rng, deltas,
+                )  # fmt: skip
+            else:  # a pilot with fewer than two clusters, or no spread: nothing to simulate, and a gap shows
+                chances = [math.nan, math.nan]
+            for delta, chance in zip(deltas, chances, strict=True):
+                table.append(
+                    {
+                        "contrast": spec.name,
+                        "sd": sd,
+                        "n_clusters": settings.target_clusters,
+                        "margin": margin,
+                        "alpha": alpha,
+                        "delta": delta,
+                        "probability": chance,
+                        "reachable": bool(chances[0] >= settings.target_power),  # False for NaN
+                    }
+                )
+    return PowerResult(tuple(table), prereg.manifest())

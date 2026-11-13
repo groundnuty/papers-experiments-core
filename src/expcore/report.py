@@ -59,6 +59,7 @@ from expcore.report_notes import (
     NO_KIND,
     UNKNOWN,
     contrast_notes,
+    equivalence_family_notes,
     equivalence_header,
     percent,
 )
@@ -256,6 +257,7 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *MDE_NOTES]
     if family:
         lines += ["", *_pairs(family, "### Pairs of the family's contrasts")]
+    lines += _equivalence_family(result)
     lines += [
         "",
         "## Exploratory contrasts (outside the Holm family)",
@@ -268,6 +270,25 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     else:
         lines += ["None declared."]
     return [*lines, "", *MISSING_PAIRS, ""]
+
+
+def _equivalence_family(result: AnalysisResult) -> list[str]:
+    """The equivalence family's members (S15): each one's TOST p-value, its Holm-adjusted one, and the interval at the
+    level Holm compared it with; nothing when the preregistration declares no equivalence family."""
+    members = [r for r in result.contrasts if r.in_equivalence_family]
+    if not members:
+        return []
+    rows = []
+    for r in members:
+        low, high = r.equivalence_interval_adjusted or (math.nan, math.nan)
+        level = UNKNOWN if r.equivalence_level is None else percent(r.equivalence_level)
+        interval = f"[{_num(low)}, {_num(high)}]"
+        rows.append(
+            [r.name, _margin(r), _p(r.tost_p), _p(r.tost_p_holm), level, interval, "yes" if r.equivalent else "no"]
+        )
+    header = ["Contrast", "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"]
+    heading = "### Equivalence family (Holm over two one-sided tests)"
+    return ["", heading, "", *_table(header, rows), "", *equivalence_family_notes(result.alpha)]
 
 
 def _pairs(results: Sequence[ContrastResult], heading: str) -> list[str]:
@@ -373,7 +394,8 @@ def summary_lines(result: AnalysisResult) -> list[str]:
         member = not _exploratory(r, adjusted)
         holm = _p(adjusted[r.name]) if member else EXPLORATORY
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
-        lines.append(f"{r.name}: estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}, {word}")
+        tost = f", Holm TOST p {_p(r.tost_p_holm)}" if r.in_equivalence_family else ""  # the basis of `equivalent`
+        lines.append(f"{r.name}: estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}, {word}{tost}")
     return lines
 
 
