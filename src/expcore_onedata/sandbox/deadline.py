@@ -21,6 +21,18 @@ counted by the clock, never in polls, and every command is given only the time l
 the margin otherwise. When the margin runs out before the cell is shown ended, the escalation stops waiting, the stop is
 ordered all the same, and the outcome is `survived_kill`.
 
+A listing or a kill that raises (its command failed, not the cell) is recorded as the step `raised`, with what was
+under way and the error's class, and the caller's own kill of what is left (`fallback`, the sandbox's quiesce) is
+tried: every process shown gone is the clean kill it would have been, `killed`, unless the mount was aborted before the
+raise (see below); anything else, a process left in whatever state or none that could be listed, is `survived_kill`,
+and the stop is ordered. Unknown is never gone.
+
+An outcome never gets less severe than a step already taken (`SEVERITY`): `killed` < `mount_aborted` <
+`sandbox_stopped` < `survived_kill`. Once the mount was aborted, or the stop reached, the outcome is at least that
+whatever a later step decides, a fallback that finds nothing among them: the mount is dead, so the cell is not the
+agent's and no later cell may run on it. It is enforced where the outcome is recorded (`_Run.done`), so no path of
+`enforce` can end lower than what it did.
+
 Every step is recorded with its seconds since the cap (`t_s`), and the record with the wall-clock time of the cap.
 Each outcome but `killed` makes the attempt infrastructure (`kinds.CELL_UNKILLABLE`), and the run is over: after an
 abort the mount is dead for the rest of the run, so no later cell may read it as if it were an empty directory.
@@ -43,6 +55,10 @@ MOUNT_ABORTED = "mount_aborted"  # a process outlived its kill and ended once th
 SANDBOX_STOPPED = "sandbox_stopped"  # a process outlived its kill and the abort: the sandbox's stop is ordered
 OUTCOMES = (KILLED, SURVIVED, MOUNT_ABORTED, SANDBOX_STOPPED)
 ESCALATED = (SURVIVED, MOUNT_ABORTED, SANDBOX_STOPPED)  # each makes the attempt infrastructure
+# from the least severe to the most: an outcome never falls below a step already taken. The two stops are in STOPS and
+# order the same stop, so their order never changes what is done; `survived_kill`, where nothing shows the cell gone, is
+# above them all
+SEVERITY = (KILLED, MOUNT_ABORTED, SANDBOX_STOPPED, SURVIVED)
 STOPS = (SURVIVED, SANDBOX_STOPPED)  # each orders the sandbox's stop: the caller runs it once the outcome is recorded
 KILL_ROUNDS = 5  # a forking worker can start a child between a listing and the kill: listed again until none is new
 POLL_S = 0.25
@@ -93,6 +109,8 @@ class _Run:
     def __init__(self, tracker: Tracker, esc: Escalation) -> None:
         self.tracker, self.esc = tracker, esc
         self.seen: set[tuple[Any, Any]] = set()
+        self.doing: str | None = None  # the command under way, named when it raises
+        self.reached = KILLED  # the most severe step taken: no outcome is less (`reach`, `done`)
         self.t0 = esc.clock()
         self.end = self.t0 + esc.margin_s  # the whole escalation's bound
         utc = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
@@ -114,14 +132,21 @@ class _Run:
     def listing(self, until: float) -> list[dict[str, Any]] | None:
         """The cell's processes, the listing given the time left until `until`; None (unknown) when none is left."""
         budget = self.left(until)
-        return self.tracker.processes(budget) if budget > 0 else None
+        return self.command("listing", self.tracker.processes, budget) if budget > 0 else None
+
+    def command(self, what: str, call: Callable[..., Any], *args: Any) -> Any:
+        """One command of the escalation, what is under way kept while it runs, so that one that raises is named."""
+        self.doing = what
+        result = call(*args)
+        self.doing = None
+        return result
 
     def kill_new(self, procs: list[dict[str, Any]], until: float) -> int:
         """SIGKILL what was not signalled yet, within the time left until `until`; how many that was."""
         fresh = [p for p in procs if _key(p) not in self.seen]
         budget = self.left(until)
         if fresh and budget > 0:
-            self.tracker.kill(fresh, budget)
+            self.command("kill", self.tracker.kill, fresh, budget)
             self.seen.update(_key(p) for p in fresh)
             return len(fresh)
         return 0
@@ -163,7 +188,17 @@ class _Run:
         states = None if left is None else [p.get("state") for p in left[:STATES_KEPT]]
         self.step("survived", left=None if left is None else len(left), states=states)
 
+    def reach(self, outcome: str) -> None:
+        """A step is taken that no later outcome may fall below: the mount aborted, or the sandbox's stop reached.
+        Called before whatever can raise next, so that the fallback run for a raise still knows of it."""
+        self.reached = max(self.reached, outcome, key=SEVERITY.index)
+
     def done(self, outcome: str) -> dict[str, Any]:
+        """Record the outcome, the one place that does: never less severe than what was reached. One that orders the
+        sandbox's stop has that step recorded, if it is not yet (the caller runs the stop once this is recorded)."""
+        outcome = max(outcome, self.reached, key=SEVERITY.index)
+        if outcome in STOPS and not any(s["step"] == "stop" for s in self.record["steps"]):
+            self.step("stop")
         self.record["outcome"] = outcome
         return self.record
 
@@ -176,11 +211,40 @@ def _attempt(action: Callable[[], dict[str, Any]], what: str) -> dict[str, Any]:
         return {"ok": False, "error": f"the {what} raised {type(error).__name__}"}
 
 
-def enforce(tracker: Tracker, esc: Escalation) -> dict[str, Any]:
+def enforce(
+    tracker: Tracker, esc: Escalation, fallback: Callable[[], list[dict[str, Any]] | None] | None = None
+) -> dict[str, Any]:
     """Kill the cell at its deadline and escalate while any of its processes outlives that (module docstring), within
     `esc.margin_s`; the record of every step. An outcome in `STOPS` leaves the sandbox's stop to the caller, once the
-    outcome is recorded. Never raises for what the abort does."""
+    outcome is recorded. A step that raises ends in `fallback`, the caller's own kill of the cell's processes, which
+    returns what is left (None when unknown); what it finds is never less severe than the mount's abort or the stop,
+    when one was reached. Never raises for what the escalation's commands or the abort do."""
     run = _Run(tracker, esc)
+    try:
+        return _escalate(run, esc)
+    except Exception as error:
+        what = run.doing or "escalation"
+        run.step("raised", during=what, error=f"the {what} raised {type(error).__name__}")
+        return _fall_back(run, fallback)
+
+
+def _fall_back(run: _Run, fallback: Callable[[], list[dict[str, Any]] | None] | None) -> dict[str, Any]:
+    """After a step that raised: what `fallback` leaves of the cell. Every process shown gone is `killed`, unless the
+    mount was aborted or the stop reached before (`_Run.reached`): then that, and never a clean kill; a process left, in
+    whatever state, or none that could be listed, is `survived_kill`, with the stop ordered (`_Run.done` records it)."""
+    try:
+        left = fallback() if fallback is not None else None
+    except Exception as error:
+        left = None
+        run.step("fallback", error=f"the fallback raised {type(error).__name__}")
+    if left == []:
+        run.step("ended")
+        return run.done(KILLED)
+    run.survivors(left)
+    return run.done(SURVIVED)
+
+
+def _escalate(run: _Run, esc: Escalation) -> dict[str, Any]:
     left = run.wait(run.kill())
     if left == []:
         run.step("ended")
@@ -189,6 +253,9 @@ def enforce(tracker: Tracker, esc: Escalation) -> dict[str, Any]:
     budget = run.left()
     abort = _attempt(lambda: esc.abort(budget), "abort") if budget > 0 else {"ok": False, "why": "no time was left"}
     run.step("abort", **abort)
+    # from here the mount is dead (an abort that worked) or the stop is the only step left (one that did not): a raise
+    # in the wait below, and the fallback it ends in, may not make of this a clean kill
+    run.reach(MOUNT_ABORTED if abort.get("ok") is True else SANDBOX_STOPPED)
     if abort.get("ok") is True and run.left() > 0:
         left = run.wait(left)
         if left == []:
@@ -198,8 +265,7 @@ def enforce(tracker: Tracker, esc: Escalation) -> dict[str, Any]:
     over = run.left() <= 0
     if over:  # waited no longer: whatever runs still is the stop's
         run.step("margin", margin_s=esc.margin_s)
-    run.step("stop")  # ordered: the caller stops the sandbox once this outcome is recorded
-    return run.done(SURVIVED if over else SANDBOX_STOPPED)
+    return run.done(SURVIVED if over else SANDBOX_STOPPED)  # `done` orders the stop: the caller runs it once recorded
 
 
 __all__ = [
@@ -209,6 +275,7 @@ __all__ = [
     "MOUNT_ABORTED",
     "OUTCOMES",
     "SANDBOX_STOPPED",
+    "SEVERITY",
     "STOPS",
     "SURVIVED",
     "Escalation",

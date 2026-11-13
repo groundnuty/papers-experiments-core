@@ -100,7 +100,7 @@ def test_o17_a_timer_that_the_cell_outran_never_fires_and_never_kills():
     kills = []
     timer = CellTimer(60, lambda: kills.append(1))
     timer.start()
-    assert timer.end() is False
+    assert timer.end(1.0) is False
     timer._fire()  # a firing that raced the cell's end: it finds the cell ended and does nothing
     assert kills == []
     fired = CellTimer(0.0, lambda: kills.append(2))
@@ -108,7 +108,7 @@ def test_o17_a_timer_that_the_cell_outran_never_fires_and_never_kills():
     deadline = time.monotonic() + 10
     while not kills and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert fired.end() is True
+    assert fired.end(10.0) is True
     assert kills == [2]
 
 
