@@ -184,8 +184,9 @@ class FakeData(FakeQos, FakeFederation):
       GET    /data/{id}                             attributes, `parent_id` among them; asked for a path, 400 as in 25.0
       GET    /data/{id}/children                    paged by `limit` and `token`, ending as 25.0's do
       POST   /data/{id}/children?name&type          create a file or a directory
-      PUT    /data/{id}/content?offset              write bytes; the writing provider holds them. Without `offset`
-                                                    the file is truncated first, as the API describes
+      PUT    /data/{id}/content?offset              write bytes; the writing provider holds them. An empty body
+                                                    past the end only extends the size. Without `offset` the file
+                                                    is truncated to 0 first, as the API describes
       GET    /data/{id}/content  (Range)            206; a provider lacking the bytes fetches them on the fly
       GET    /data/{id}/distribution                the block map of every provider
       DELETE /data/{id}                             remove a file or a directory with what is under it
@@ -219,6 +220,19 @@ class FakeData(FakeQos, FakeFederation):
     the bytes fetches them there, on the fly, and they show in its map after `fetch_lag` polls of the map. A
     replication places the whole file on its target, and an eviction removes all of the evicting provider's blocks of
     the file (a migration does both); no provider's map changes another's.
+
+    **Sparse files** (#107, O36), as op-worker f118ed9's source has them and the Compose federation measured
+    (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A file at its final size with only a prefix
+    written"): a write past the end leaves the bytes before it unwritten, read as zeros, and an empty body at an offset
+    past the end extends the size to it with no block (read_write_req.erl:58-86; fslogic_blocks.erl:125-126 drops the
+    zero-size block). The size is the namespace's (`size`, `virtualSize`); the block map and `physicalSize` hold only
+    what was written. A range read of an unwritten range, through any provider, answers 206 with zeros and fetches
+    nothing, since no provider holds it (replica_finder.erl:53-89): an on-the-fly read places on its reader only the
+    parts of its window that another provider holds. A write without `offset` truncates the file to 0 first
+    (file_content_rest_handler.erl:224-228): its bytes and every provider's blocks go before the body is written at 0.
+    Not modelled: the mount's reads into a gap (about seven `SynchronizeBlock` round trips each before oneclient
+    returns zeros, by its source), and a creation with `offset` (`POST .../children?...&offset=N`), which no caller
+    sends.
 
     **Listings** end as Onedata 25.0's were measured to (`LISTING_END_FACTS`). A children page has the keys
     `nextPageToken`, `isLast` and `children`, in that order: `isLast` is true only on a page shorter than its limit,
@@ -1281,7 +1295,8 @@ class FakeData(FakeQos, FakeFederation):
                 if self.onthefly_unit is None
                 else min(max(length, self.onthefly_unit), len(node.content) - first)
             )
-            self.pending.setdefault((node.file_id, provider), []).append([first, placed, self.fetch_lag])
+            for offset, size in self._fetchable(node.file_id, provider, first, placed):
+                self.pending.setdefault((node.file_id, provider), []).append([offset, size, self.fetch_lag])
             self._promote(node.file_id, provider)
         return httpx.Response(
             206,
@@ -1300,6 +1315,14 @@ class FakeData(FakeQos, FakeFederation):
         if not marks or None in marks:
             return None
         return "hang" if "hang" in marks else "fail"
+
+    def _fetchable(self, file_id: str, reader: str, offset: int, length: int) -> list[list[int]]:
+        """The parts of `[offset, offset + length)` that a provider other than the reader holds: what an on-the-fly read
+        can fetch. A range no provider holds, the unwritten range of a sparse file, is read as zeros and fetched from
+        nowhere, so it places no block (op-worker f118ed9, replica_finder.erl:53-89)."""
+        held = _merge([list(b) for p in self.providers if p != reader for b in self.blocks.get((file_id, p), [])])
+        end = offset + length
+        return [[max(o, offset), min(o + n, end) - max(o, offset)] for o, n in held if o < end and o + n > offset]
 
     def _holds(self, file_id: str, provider: str, offset: int, length: int) -> bool:
         return any(
