@@ -14,6 +14,10 @@ configured name or lies outside the prefixes. On top of that gate:
 - **A large file is never held whole** (O25). `upload` sends a local file a chunk at a time, skips a target that
   already holds its bytes, resumes one that holds a prefix, and reports success only once the size and SHA-256 read
   back match; `read_file` reads a file back by streamed ranges, hashing as it goes. Every write carries a content type.
+- **No write truncates** (O36): every write of content names its offset, since one without truncates the file to 0
+  first. `preallocate` makes a file at its final size with no block written (an empty write at that offset), and
+  `write_range` writes a range of a local file into the same range of one, so a file can be at its final size with
+  only some of its ranges written; `read_file(stop=)` reads and hashes its prefix.
 - **A listing ends only on its last-page marker** (O26, `next_page_token`): a page without one is refused.
 - **Placement is what the block map says** (O01). A replication job that reports `completed` is a report; `replicate`
   returns only when `GET /data/{id}/distribution` on the receiving provider covers the whole file on consecutive polls,
@@ -621,6 +625,65 @@ class Provisioner:
                 "overwrite or adopt it, and nothing was written"
             )
 
+    def preallocate(self, path: str, size: int, *, content_type: str = OCTET_STREAM) -> str:
+        """Create a file at a path of the space, in a directory that exists, at `size` bytes with no byte written; log
+        it and return its id (O36, #107).
+
+        The file is created, then extended by an empty write at offset `size`, which on 25.0 sets the size and writes
+        no block (measured on 10 Nov, `deploy/compose-federation/day0/2026-11-10-federation-facts.md`; op-worker
+        f118ed9, read_write_req.erl:58-86). Extending first keeps the size `size` from the first moment the file holds
+        anything, since every later write lies inside it. A path that exists, or whose directory does not, is refused
+        before anything is written; a size read back other than `size` is a ProvisionError, the file left logged.
+        """
+        media = media_type(content_type)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ProvisionError(f"{self._where}a preallocated file has a size of one byte or more")
+        self._verified()
+        *directory, name = safe_path(path)
+        try:
+            parent = self.resolve("/".join(directory)) if directory else Entry(self.root(), "", 0, "DIR")
+        except KeyError:
+            raise ProvisionError(
+                f"{self._where}a preallocated file's directory is not there; nothing was written"
+            ) from None
+        if parent.kind != "DIR":
+            raise ProvisionError(
+                f"{self._where}a preallocated file's directory is not a directory; nothing was written"
+            )
+        if name in self.children(parent.file_id):
+            raise ProvisionError(
+                f"{self._where}the file already exists; a preallocation makes a new one, so nothing was written"
+            )
+        file_id = self._create(parent.file_id, name, "REG", path)
+        self._put(file_id, b"", size, media)
+        if self._size_of(file_id) != size:
+            raise ProvisionError(f"{self._where}the size read back after a preallocation is not the size asked for")
+        return file_id
+
+    def write_range(
+        self, file_id: str, source: Path | str, start: int, stop: int, *, content_type: str = OCTET_STREAM
+    ) -> Digest:
+        """Write bytes `start` to `stop` of a local file into the same range of a file this provisioner made, chunk by
+        chunk, each at its offset; return the size and SHA-256 of the bytes sent (O36, #107). Nothing else of the file
+        is touched: no write truncates, and a write inside the file's size leaves the size as it was.
+
+        A file the change log does not hold is refused, since writing into it adopts it (O09), and so is a range that
+        is empty or outside the local file; a local file that ends before `stop` meanwhile is a ProvisionError. The
+        caller verifies what the file holds."""
+        media, source = media_type(content_type), Path(source)
+        whole = source.stat().st_size
+        if any(isinstance(n, bool) or not isinstance(n, int) for n in (start, stop)) or not 0 <= start < stop <= whole:
+            raise ProvisionError(f"{self._where}a written range lies within the local file and holds a byte at least")
+        self._verified()
+        self._require_created(file_id)
+        hasher = hashlib.sha256()
+        sent = self._write_chunks(
+            file_id, _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=stop), hasher), media
+        )
+        if sent != stop - start:
+            raise ProvisionError(f"{self._where}the local file changed size while a range of it was written")
+        return Digest(sent, hasher.hexdigest())
+
     def _write_chunks(self, file_id: str, blocks: Iterable[tuple[int, bytes]], media: str) -> int:
         """Write `(offset, bytes)` blocks to a file's content on the data provider, each a PUT at its offset through the
         gate; return the bytes sent."""
@@ -661,9 +724,11 @@ class Provisioner:
         dest: Path | str | None = None,
         size: int | None = None,
         deadline_s: float | None = None,
+        stop: int | None = None,
     ) -> Digest:
         """Read a file's whole content through a provider (the data provider unless named), hashing it as it comes,
-        and write it to `dest` when one is given; return its size and SHA-256 (O25).
+        and write it to `dest` when one is given; return its size and SHA-256 (O25). With `stop`, only its first `stop`
+        bytes are read and hashed, of a file of `size` bytes (O36): the prefix of a file at its final size.
 
         The read is the client's `read_content`: by ranges of `chunk_bytes`, each gated as a range read and streamed,
         so the file is never held. It is bounded in bytes by `size`, or else by the size the file's attributes give,
@@ -684,11 +749,14 @@ class Provisioner:
             size = answer.get("size") if isinstance(answer, dict) else None
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise PlatformError("a file's attributes hold no size, so its read has no bound")
+        if stop is not None and (isinstance(stop, bool) or not isinstance(stop, int) or not 0 <= stop <= size):
+            raise ProvisionError(f"{self._where}a read's stop is a whole number of bytes within the file")
         read = functools.partial(
             self._client.read_content,
             f"/data/{_segment(file_id)}/content",
             provider=provider,
             size=size,
+            stop=stop,
             chunk_bytes=self._settings.chunk_bytes,
             deadline_s=deadline,
             timeout_s=self._settings.request_timeout_s,

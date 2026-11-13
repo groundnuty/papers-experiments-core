@@ -1252,9 +1252,11 @@ class OnezoneClient:
         clock: Callable[[], float] = time.monotonic,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        stop: int | None = None,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
-        size and the SHA-256 of what was read (O25).
+        size and the SHA-256 of what was read (O25). With `stop`, only the first `stop` bytes are read, each answer
+        still checked against the file's `size`: the prefix of a file at its final size (O36).
 
         Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
         delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of
@@ -1279,6 +1281,9 @@ class OnezoneClient:
             raise OutOfScope("a content read is of /data/{id}/content only")
         if size < 0 or chunk_bytes < 1 or not deadline_s > 0:
             raise OutOfScope("a streamed read needs its bounds: a size of zero or more, a positive chunk and deadline")
+        end = size if stop is None else stop
+        if not 0 <= end <= size:
+            raise OutOfScope("a streamed read's stop lies within the file's size")
         path = _check_path(path)
         base, label = self._base(provider)
         hasher, began = hashlib.sha256(), clock()
@@ -1294,16 +1299,16 @@ class OnezoneClient:
             if clock() - began > deadline_s:
                 raise PlatformError(late)
 
-        if size == 0:
+        if end == 0:
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
-        for first in range(0, size, chunk_bytes):
+        for first in range(0, end, chunk_bytes):
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
             remaining = deadline_s - (clock() - began)
             if remaining <= 0:
                 raise PlatformError(late)
             wait = min(timeout_s if timeout_s is not None else self._timeout_s, remaining)
-            self._stream_range(base + path, label, (first, min(chunk_bytes, size - first), size), wait, consume)
-        return Digest(size, hasher.hexdigest())
+            self._stream_range(base + path, label, (first, min(chunk_bytes, end - first), size), wait, consume)
+        return Digest(end, hasher.hexdigest())
 
     def _stream_range(
         self, url: str, label: str, span: tuple[int, int, int], wait: float, consume: Callable[[bytes], None]
