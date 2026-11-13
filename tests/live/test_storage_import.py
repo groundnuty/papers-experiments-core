@@ -44,7 +44,7 @@ from expcore_onedata.config import load_platform  # noqa: E402
 from expcore_onedata.ingestbase import plain  # noqa: E402
 from expcore_onedata.provision import Provisioner, resolve_provider_ids  # noqa: E402
 from expcore_onedata.rangemap import load_placement  # noqa: E402
-from expcore_onedata.reset import STAGES, SpaceReset  # noqa: E402
+from expcore_onedata.reset import STAGES, ResetFailed, SpaceReset  # noqa: E402
 from expcore_onedata.storageimport import ImportedSpace, ImportFailed, SpaceCheck, manifest_of_tree  # noqa: E402
 
 PLATFORM = Path(os.environ["EXPCORE_LIVE_PLATFORM"])
@@ -113,6 +113,13 @@ def pair(tmp_path_factory):
     finally:
         report = up.teardown()
         FACTS["upload_teardown_left"] = len(report.left)
+        mirrors = [p for p in every if p != imp.settings.holder]
+        try:  # the mirrors hold no replica of the imported copy after the module, whatever ran: recorded, not asserted
+            plan = {mirror: top_paths(manifest) for mirror in mirrors}
+            FACTS["imported_final_reset_ok"] = SpaceReset(imp).run(plan)["ok"]
+        except ResetFailed as failed:
+            FACTS["imported_final_reset_ok"] = False
+            FACTS["imported_final_reset_stage"] = failed.stage
         if OUT:
             Path(OUT).write_text(json.dumps(FACTS, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
         client.close()
@@ -140,10 +147,14 @@ def sample(pair) -> list[str]:
     return [largest(pair), *small[:: max(1, len(small) // SAMPLE)][:SAMPLE]]
 
 
-def tops(pair) -> list[str]:
+def top_paths(manifest) -> list[str]:
     """The entries directly under the space's root, which a reset's eviction plan names to empty a mirror."""
-    paths = [*(f.path for f in pair["manifest"].files), *pair["manifest"].directories]
+    paths = [*(f.path for f in manifest.files), *manifest.directories]
     return sorted({path.split("/")[0] for path in paths})
+
+
+def tops(pair) -> list[str]:
+    return top_paths(pair["manifest"])
 
 
 def settled_blocks(provisioner, file_id: str, provider: str) -> list:
@@ -316,7 +327,7 @@ def test_o37_a_qos_requirement_is_fulfilled_and_viewed_alike_in_both_copies(pair
         )
         summary = provisioner.client.get(f"/data/{file_id}/qos/summary", provider=holder)
         views.append((fulfilled.converged, sorted(fulfilled.value or {}), qid in summary.get("requirements", {})))
-        reset = SpaceReset(provisioner).run()
+        reset = SpaceReset(provisioner).run({mirror: tops(pair) for mirror in pair["mirrors"]})  # whatever ran before
         assert reset["stages"]["qos"]["removed"] >= 1
     FACTS["qos_views"] = views
     assert views[0] == views[1]
