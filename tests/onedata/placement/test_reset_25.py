@@ -157,27 +157,27 @@ def test_o01_files_cancelled_per_file_are_named_in_the_refusal_of_a_bulk_evictio
     assert caught.value.facts["providers"]["providers[1]"]["files_processed"] == 1
 
 
-def test_o01_a_gap_that_a_later_attempt_clears_is_not_a_failure(provisioner, stocked):
+def test_o01_a_gap_that_a_later_attempt_clears_is_not_a_failure(provisioner, stocked, ticker):
     """O01: the first attempt's job processed four files and evicted none, as 25.0's does right after a placement,
     which the counters show as a gap too; the block map judges, the second attempt evicts, the reset passes, and the
     record counts the last attempt's job: four processed, four evicted."""
     stocked.evictions_noop_first = 1
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert counted(record) == (2, 4, 4, 0)
 
 
-def test_o01_files_the_provider_never_held_are_processed_not_evicted_and_the_reset_passes(provisioner, stocked):
+def test_o01_files_the_provider_never_held_are_processed_not_evicted_and_the_reset_passes(provisioner, stocked, ticker):
     """O01: op-worker counts a file the evicting provider holds nothing of as processed, never evicted, so a gap with
     empty block maps is no failure: two of four files held, both evicted, the reset passes at one attempt."""
     for path in FILES[:2]:
         del stocked.blocks[(stocked.id_of(path), BETA_ID)]
-    assert counted(SpaceReset(provisioner).run({"beta": ["study"]})) == (1, 4, 2, 0)
+    assert counted(SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})) == (1, 4, 2, 0)
 
 
-def test_o01_a_full_eviction_passes_with_every_file_counted_evicted(provisioner, stocked):
+def test_o01_a_full_eviction_passes_with_every_file_counted_evicted(provisioner, stocked, ticker):
     """O01: nothing cancelled and nothing missing: the reset passes at one attempt and the record counts four files
     processed and evicted, none failed, next to the keys it always had."""
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert record["ok"] is True
     assert beta_counts(record) | {"seconds": 0} == {
         "trees": 1,
@@ -192,11 +192,11 @@ def test_o01_a_full_eviction_passes_with_every_file_counted_evicted(provisioner,
     }
 
 
-def test_o01_counters_a_record_does_not_carry_are_unknown_never_zero(provisioner, stocked):
+def test_o01_counters_a_record_does_not_carry_are_unknown_never_zero(provisioner, stocked, ticker):
     """O01: a job's record without filesProcessed leaves the counts unknown (None) and the block map decides, so a full
     eviction still passes; a refusal then names no cause, which it could not tell from the counts."""
     stocked.transfer_omit = {"filesProcessed"}
-    assert counted(SpaceReset(provisioner).run({"beta": ["study"]})) == (1, None, None, None)
+    assert counted(SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})) == (1, None, None, None)
     cover(stocked, FILES[0])
     stocked.blocks[(stocked.id_of(FILES[0]), BETA_ID)] = [[0, len(DATA)]]
     with pytest.raises(NotPlaced) as caught:
