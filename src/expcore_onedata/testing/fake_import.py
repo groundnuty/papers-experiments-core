@@ -46,7 +46,15 @@ MOUNT_POINT = "/volumes/import/study"
 
 
 class FakeImportData(FakeData):
-    """`FakeData` whose data provider holds the study space on an imported storage, with its Onepanel."""
+    """`FakeData` whose data provider holds the study space on an imported storage, with its Onepanel.
+
+    Models: the imported storage's content, a scan that makes what the space lacks with whole block maps on the
+    importing provider, the panel's support, storage and scan reads and its force-start, and a read-only storage's
+    refusals and deletes (the module docstring has each).
+
+    Does not model: the scan's speed, LUMA's owners, modes and times, change detection, manual registration, or a
+    write through another provider that takes the importing provider's blocks.
+    """
 
     def __init__(self, *, readonly: bool = True, **kwargs: Any) -> None:
         super().__init__(**kwargs)
