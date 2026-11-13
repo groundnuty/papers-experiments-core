@@ -23,9 +23,10 @@ condition's own token, minted and launched as a run's is (`ToolServerLauncher.la
   replication, an eviction, a rerun and a cancel of a transfer, a QoS requirement added and one removed, a file
   created and a file's content written, and none of them happened. The file writes are the refusals the old token
   got from its `data.readonly` caveat; this one gets them from its user, who holds no `space_write_data`;
-- with `EXPCORE_LIVE_OUTSIDE_SPACE`, a space the condition's user is no member of: its transfer listing and root are
-  not served to the token, through the tool and straight, and a transfer of it, when the admin finds one, is not
-  served through `get_transfer`.
+- with `EXPCORE_LIVE_OUTSIDE_SPACE`, a space the condition's user is no member of and the agent's local provider
+  supports: its root, its transfer listing and an ended transfer of it, each first shown served to the admin
+  credential through that provider (or the test fails, so a space that is not there cannot pass it), are not served
+  to the token, through the tools and straight.
 
 The tools' names are this test's choice, their arguments are filled from each tool's own input schema
 (`live_support.tool_arguments`), and nothing here changes a tool.
@@ -55,7 +56,7 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
 )
 
 from expcore_onedata import consistency  # noqa: E402
-from expcore_onedata.client import AUTH_HEADER, PlatformError, answered_absent  # noqa: E402
+from expcore_onedata.client import AUTH_HEADER, PlatformError  # noqa: E402
 from expcore_onedata.toolserver import ToolServerLauncher  # noqa: E402
 
 CEILING_S = 300.0
@@ -313,33 +314,43 @@ OUTSIDE = pytest.mark.skipif(
 )
 
 
+def served_to_the_admin(plane, path, params=None):
+    """Read a path of the outside space with the admin credential through the agent's local provider, the one the
+    tool server and `as_token` talk to, and fail the test unless it is served: a refusal of the token then shows the
+    token's reach, never a space that is not there or that the provider does not support (a false pass)."""
+    try:
+        return plane["client"].get(path, provider=plane["config"].support.local, params=params)
+    except PlatformError as error:
+        pytest.fail(
+            "EXPCORE_LIVE_OUTSIDE_SPACE must name a space the agent's local provider supports and serves to the admin "
+            f"credential; it answered ({error.status}, {error.code})"
+        )
+
+
 @OUTSIDE
 def test_o37_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plane):
-    """O37: the token's reach is its user's spaces, so another space's transfer listing is refused through the tool
-    and straight at the provider, and so is its root."""
+    """O37: the token's reach is its user's spaces. Another space's root and transfer listing, which the local
+    provider serves to the admin credential, are not served to the token through the tool or straight at that
+    provider."""
+    path, ended = f"/spaces/{OUTSIDE_SPACE}", {"state": "ended"}
+    served_to_the_admin(plane, path)
+    served_to_the_admin(plane, f"{path}/transfers", ended)
     (listing,) = call_tools(plane, [("list_space_transfers", values_of(plane, space=OUTSIDE_SPACE))])
     assert listing.is_error, "the tool listed the transfers of a space the condition does not hold"
-    path = f"/spaces/{OUTSIDE_SPACE}"
-    require_unseen(as_token(plane, "GET", f"{path}/transfers", params={"state": "ended"}), "a listing")
+    require_unseen(as_token(plane, "GET", f"{path}/transfers", params=ended), "a listing")
     require_unseen(as_token(plane, "GET", path), "the space's root")
 
 
 @OUTSIDE
 def test_o37_a_read_only_condition_cannot_view_a_transfer_of_a_space_it_does_not_hold(plane):
-    """O37: a transfer of another space, found with the admin credential through any declared provider that lists it,
-    is refused to the condition through `get_transfer`. Skipped, saying so, when no declared provider lists one."""
-    client, found = plane["client"], None
-    for provider in plane["config"].providers:
-        try:
-            page = client.get(f"/spaces/{OUTSIDE_SPACE}/transfers", provider=provider, params={"state": "ended"})
-        except PlatformError as error:
-            if answered_absent(error) or error.status in (400, 403):
-                continue
-            raise
-        found = next(iter(page.get("transfers") or []), None)
-        if found is not None:
-            break
+    """O37: a transfer of another space, which the local provider lists and serves to the admin credential, is not
+    served to the condition, through `get_transfer` or straight. Skipped, saying so, when the space has no ended
+    transfer to view."""
+    path = f"/spaces/{OUTSIDE_SPACE}/transfers"
+    found = next(iter(served_to_the_admin(plane, path, {"state": "ended"}).get("transfers") or []), None)
     if found is None:
-        pytest.skip("no declared provider lists a transfer of the outside space")
+        pytest.skip("the outside space lists no ended transfer to view")
+    served_to_the_admin(plane, f"/transfers/{found}")
     (viewed,) = call_tools(plane, [("get_transfer", values_of(plane, transfer=found))])
     assert viewed.is_error, "the tool showed a transfer of a space the condition does not hold"
+    require_unseen(as_token(plane, "GET", f"/transfers/{found}"), "a transfer of the space")
