@@ -170,13 +170,14 @@ def aggregate(
     """The input of a ratio contrast's estimator under the default key, and the pairs the rule excluded by cause.
 
     `cells` maps a cluster to its used pairs, each the (numerator, denominator) of the run of arm A and of arm B, every
-    model's together. A cluster the rule excludes is not a row, and its pairs are counted; the one column is `POOLED`.
+    model's together. A cluster the rule excludes is not a row, and its pairs are counted; the one column is `POOLED`,
+    and the input is marked `pooled`.
     """
     values, excluded = _values(cells, form)
     if not values:
-        return PairedDifferences((), (), np.empty((0, 0))), excluded
+        return PairedDifferences((), (), np.empty((0, 0)), pooled=True), excluded
     clusters = tuple(values)
-    return PairedDifferences(clusters, (POOLED,), np.array([[values[c]] for c in clusters])), excluded
+    return PairedDifferences(clusters, (POOLED,), np.array([[values[c]] for c in clusters]), pooled=True), excluded
 
 
 def cell_label(model: str, cluster: str) -> str:
@@ -192,7 +193,8 @@ def aggregate_by_model(
 
     `cells` maps a (model, cluster) cell to that model's used pairs in that cluster. Each cell the rule keeps is a row,
     named by `cell_label`, its log ratio in its model's column and NaN in every other; a cell the rule excludes is no
-    row, and its pairs are counted. The columns are the models with a cell left, sorted.
+    row, and its pairs are counted. The columns are the models with a cell left, sorted, and the input is not
+    `pooled`, whatever the models are called.
     """
     values, excluded = _values(cells, form)
     if not values:

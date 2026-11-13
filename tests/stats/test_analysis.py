@@ -1311,3 +1311,16 @@ def test_s13_a_none_in_one_numerator_column_refuses_only_the_confirmatory_contra
     confirmatory = TWO_BOUNDS.replace('holm_family = ["low-per-win"]', 'holm_family = ["low-per-win", "high-per-win"]')
     with pytest.raises(RatioNumeratorRefused, match=r"'high-per-win' drops 1 pair.*numerator 'spend_high' is None"):
         analyse(rows, parse(tomllib.loads(confirmatory), "inline", "d" * 64, ARMS))
+
+
+def test_s13_the_one_model_a_cell_key_leaves_keeps_its_estimate_whatever_its_name():
+    """S13: model-b's every cell has no win in B and is excluded, so the model called `pooled` is the only one left;
+    its estimate by model is still reported."""
+    rows = []
+    for i, ratio in enumerate(RATIOS[:4]):
+        rows += ratio_arms(f"t{i}", "pooled", 1, (40.0 * ratio, 1.0), (20.0, 1.0), cluster=f"c{i}")
+        rows += ratio_arms(f"t{i}", "model-b", 1, (40.0, 1.0), (20.0, 0.0), cluster=f"c{i}")
+    contrast = analyse(rows, cell_prereg()).contrast("spend-per-win")
+    assert (contrast.n_clusters, contrast.pairs_missing["zero_denominator"]) == (4, 4)
+    assert [m.model for m in contrast.per_model] == ["pooled"]
+    assert contrast.per_model[0].estimate == pytest.approx(contrast.estimate)

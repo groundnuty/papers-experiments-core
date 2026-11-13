@@ -44,6 +44,7 @@ def test_s13_the_input_has_one_column_for_the_models_pooled_in_each_cluster():
     differences, _ = aggregate({"grp-b": [((10.0, 1.0), (10.0, 1.0))], "grp-a": [((30.0, 1.0), (10.0, 1.0))]}, EXCLUDE)
     assert differences.clusters == ("grp-a", "grp-b")
     assert differences.models == (POOLED,)
+    assert differences.pooled
     assert list(differences.cluster_differences) == pytest.approx([math.log(3.0), 0.0])
 
 
@@ -202,3 +203,9 @@ def test_a_cell_label_cannot_be_read_as_another_cell():
     """The label of a (model, cluster) cell names both parts unambiguously, whatever characters they hold."""
     assert cell_label("model-a", "x / y") != cell_label("model-a / x", "y")
     assert cell_label("model-a", "grp-a") == '["model-a", "grp-a"]'
+
+
+def test_s13_a_cell_input_is_not_pooled_even_for_a_model_named_pooled():
+    """S13: the input says it is by cell, so a model that happens to be called `pooled` is read as a model."""
+    differences, _ = aggregate_by_model({(POOLED, "grp-a"): [((300.0, 1.0), (100.0, 2.0))]}, EXCLUDE)
+    assert (differences.models, differences.pooled) == ((POOLED,), False)

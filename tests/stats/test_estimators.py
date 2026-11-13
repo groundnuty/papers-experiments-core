@@ -246,8 +246,9 @@ LOG_RATIOS = [math.log(r) for r in (6.0, 2.0, 3.0, 1.5, 4.0, 5.0)]  # six cluste
 
 
 def pooled(values):
-    """A ratio contrast's input: one log ratio per cluster, in the one column of the pooled models."""
-    return paired(np.array(values, dtype=float).reshape(-1, 1), models=(POOLED,))
+    """A ratio contrast's input: one log ratio per cluster, in the one column of the pooled models, marked pooled."""
+    column = paired(np.array(values, dtype=float).reshape(-1, 1), models=(POOLED,))
+    return dataclasses.replace(column, pooled=True)
 
 
 def test_s13_the_ratio_estimator_is_registered_for_the_ratio_form_and_the_first_for_the_difference_form():
@@ -383,3 +384,18 @@ def test_s13_the_ratio_estimator_refuses_a_row_holding_more_than_one_models_cell
     """S13: a row by cell holds one model's log ratio; a row with two would be averaged as no ratio contrast is."""
     with pytest.raises(ValueError, match="one column of the pooled models"):
         estimators.get(RATIO)(paired([[0.1, math.nan], [0.3, 0.4]]), settings())
+
+
+def test_s13_a_model_named_pooled_keeps_its_estimate_by_cell():
+    """S13: whether the models are pooled is said by the input, not read from a column's name, so the one model left
+    of a key by cell keeps its estimate whatever it is called."""
+    result = estimators.get(RATIO)(by_model({POOLED: CELLS["model-a"]}), settings())
+    assert [(m.model, m.estimate) for m in result.per_model] == [(POOLED, pytest.approx(result.estimate))]
+    assert estimators.get(RATIO)(pooled(CELLS["model-a"]), settings()).per_model == ()
+
+
+def test_a_pooled_input_has_the_one_pooled_column():
+    """An input marked pooled holds one column of the pooled models, or no cluster at all."""
+    with pytest.raises(ValueError, match="pooled input has the one column 'pooled'"):
+        PairedDifferences(("grp-a",), ("model-a",), np.array([[0.1]]), pooled=True)
+    assert PairedDifferences((), (), np.empty((0, 0)), pooled=True).pooled
