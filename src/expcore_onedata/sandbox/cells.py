@@ -235,7 +235,8 @@ class CellRunner:
             self.quiesce("time cap")
             return
         outcome = self._deadline["outcome"]
-        if outcome in DL.ESCALATED:
+        if outcome in DL.ESCALATED:  # the run is over from now, whatever the cell's record makes of it after
+            self.ended = self._deadline
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
 
     # ------------------------------------------------------------------------------------------------ the cell
@@ -360,7 +361,7 @@ class CellRunner:
     def _with_deadline(self, res: ExecResult, entry: dict[str, Any], fired: bool) -> bool:
         """The record of the cell's deadline, when its timer fired; and when a process of the cell outlived its kill,
         its kill becomes `kill_survived`, whatever else the counters said (after an abort or a stop they describe the
-        harness's doing), and the run is over (`ended`). Whether that happened."""
+        harness's doing); the timer's thread has already ended the run (`ended`). Whether that happened."""
         record = self._deadline if fired else None
         if record is None:
             return False
@@ -375,7 +376,6 @@ class CellRunner:
             cell_kills[-1] = {"cell": entry["cell"], **kill}
         else:
             cell_kills.append({"cell": entry["cell"], **kill})
-        self.ended = record
         return True
 
     def _with_earlyoom(self, res, entry, before, up0, used, timeout_s, gave_up, fired, wall0) -> dict[str, Any] | None:
