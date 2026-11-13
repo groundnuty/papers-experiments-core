@@ -114,7 +114,7 @@ class ExecResult:
     timeout and no kill, and what the time running out means is the loop's own rule.
 
     `output_cut` is what the sandbox cut of the cell's output, which it keeps up to a cap per stream: for each stream it
-    cut, the bytes the cell wrote (`produced`) and the bytes kept (`kept`); None when nothing was cut (O40)."""
+    cut, the bytes the cell wrote (`produced`) and the bytes kept (`kept`); None when nothing was cut (O42)."""
 
     stdout: str
     stderr: str
@@ -124,7 +124,7 @@ class ExecResult:
     kill: dict[str, Any] | None = None  # the cause of a kill or timeout, from the kernel's counters (killcause.py)
     status: str = RAN
     gate_refusals: tuple[str, ...] = ()  # the data gate's own refusals during the cell (gatelog.refusals)
-    # the streams of the cell the sandbox cut (O40): `{"stdout": {"produced": n, "kept": m}, ...}`, only those it cut
+    # the streams of the cell the sandbox cut (O42): `{"stdout": {"produced": n, "kept": m}, ...}`, only those it cut
     output_cut: dict[str, dict[str, int]] | None = None
 
 

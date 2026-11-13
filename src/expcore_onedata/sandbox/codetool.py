@@ -21,7 +21,7 @@ gate refused an answer for its own integrity raises `InfraError` of kind `data_g
 treat (O05, C01). A cell a process of which outlived its kill at the cell's deadline raises `InfraError` of kind
 `cell_unkillable`, before anything else, which no condition can treat either (O34).
 
-What is kept of a cell's output is capped per stream by the sandbox (`cells.OUTPUT_CAP_BYTES`, O40). When it cut
+What is kept of a cell's output is capped per stream by the sandbox (`cells.OUTPUT_CAP_BYTES`, O42). When it cut
 one, the text the model sees ends with a notice that says how much of each cut stream was written and how much kept,
 and the call's
 `source_truncated` is True, as for any source's own limit (L07, apart from the loop's own cap), so the agent's view and
@@ -81,7 +81,7 @@ class CodeExecutionProvider:
     @classmethod
     def _output(cls, result: ExecResult) -> ToolOutput:
         """The text the model sees for a finished cell, or for one too little time was left to start; a notice ends it
-        when the sandbox cut the cell's output (O40)."""
+        when the sandbox cut the cell's output (O42)."""
         shown = cls._shown(result)
         if not result.output_cut:
             return shown

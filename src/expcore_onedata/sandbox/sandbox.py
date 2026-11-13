@@ -132,7 +132,7 @@ class DockerSandbox:
         clock: Callable[[], float] = time.monotonic,
         output_cap_bytes: int = CELL_OUTPUT_CAP_BYTES,
     ) -> None:
-        self._output_cap = output_cap_bytes  # what is kept of each of a cell's output streams (O40)
+        self._output_cap = output_cap_bytes  # what is kept of each of a cell's output streams (O42)
         self.host, self.s, self.spec, self.registry = host, settings, spec, registry
         self.waits, self._sample_period, self._sleep = waits or TD.WAITS, sample_period_s, sleep
         self._clock = clock  # what a cell's deadline counts its graces and its margin by (O34), with `sleep`
@@ -150,7 +150,7 @@ class DockerSandbox:
         self._steps_running = 0  # harness steps under way: no mark meanwhile
         self._containers: list[str] = []
         self._net: str | None = None
-        # how far a stop under way has got, for `teardown_left` (O39): the phase it is in, and what it has shown gone
+        # how far a stop under way has got, for `teardown_left` (O41): the phase it is in, and what it has shown gone
         self._teardown_step: str | None = None
         self._removed: set[str] = set()
         self._net_removed = False
@@ -962,7 +962,7 @@ class DockerSandbox:
                 "duration_s": res.duration_s,
                 "timed_out": res.timed_out,
                 "gate_refusals": list(res.gate_refusals),
-                **({"output_cut": res.output_cut} if res.output_cut else {}),  # only a step that was cut (O40)
+                **({"output_cut": res.output_cut} if res.output_cut else {}),  # only a step that was cut (O42)
                 "earlyoom_kills": self._cells.step_earlyoom(),
             }
         )
@@ -1258,11 +1258,12 @@ class DockerSandbox:
             self._stop_locked(force)
 
     def teardown_left(self) -> dict[str, Any]:
-        """What a stop under way has not yet shown removed, for the record of one that was cut at its deadline (O39): the
+        """What a stop under way has not yet shown removed, for the record of one that was cut at its deadline (O41): the
         phase it is in (`step`), how many of the sandbox's containers it has not removed, whether its network is not,
         and how many of its mounts are not unmounted. Counts and a phase name, never a name of the configuration; read
         from what the stop has noted, so it asks the host nothing and cannot wait on it. What a step did not show
-        removed counts as left."""
+        removed counts as left, so `containers` is an upper bound: it counts every container the start registered
+        and the stop has not yet removed, those that went by themselves (a one-shot `--rm`) included."""
         return {
             "step": self._teardown_step,
             "containers": sum(1 for c in self._containers if c not in self._removed),

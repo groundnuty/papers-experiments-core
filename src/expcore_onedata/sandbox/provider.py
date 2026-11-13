@@ -32,15 +32,18 @@ user, shared with day-0, health and the live checks) revokes nothing.
 tool-server launcher records through, so that the slots' minting can record `token_expiry_beyond_request`
 (`users.py`). It has no default, because a silent no-op would lose the event.
 
-**The teardown has a deadline (O39).** The platform waits for `DockerSandbox.stop` at most `teardown_deadline_s`
+**The teardown has a deadline (O41).** The platform waits for `DockerSandbox.stop` at most `teardown_deadline_s`
 (`TEARDOWN_DEADLINE_S`, 600 s, unless the platform is built with another), and records how it ended in the sandbox's
 metadata under `teardown`: `outcome` `completed`, `failed` (it raised, which is the run's `InfraError("sandbox")` as
 before) or `cut`, with `deadline_s` and `elapsed_s`, and for the last two what the stop had left (`left`:
 `sandbox.teardown_left()`). A teardown still running at its deadline, wedged on a FUSE mount whose provider is gone
 say, is not waited for any more: the run is `InfraError("sandbox")`, which is infrastructure and never the agent's
 doing (unless its body had raised, which stands). A thread cannot be made to stop, so the teardown goes on in a daemon
-thread of its own, which never holds the process's exit; the lease's probe keeps the key quarantined until the
-sandbox is shown gone, and the slot's tokens are revoked after the cut as after any stop.
+thread of its own, which never holds a normal exit of the process (a SIGTERM's stopper, `termination.py`, calls
+`stop()` too and waits for it behind the same lock, as it always waited for a teardown); the lease's probe keeps the
+key quarantined until the sandbox is shown gone. The slot's tokens are revoked after the cut as after any stop, though
+the stop is still running: the revocation checks no stop thread, only the mint and start threads, and a revoked token
+can only free what holds it.
 
 Waits. Start and teardown (the token mint, the image checks, the containers, the stop) are each inside
 `ctx.infrastructure_wait("sandbox_lifecycle")`. What the agent's code does in the sandbox and its reads of data are the
@@ -90,7 +93,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 WAIT_KIND = "sandbox_lifecycle"
-TEARDOWN_DEADLINE_S = 600.0  # how long the platform waits for a sandbox's stop, whatever it is doing (O39)
+TEARDOWN_DEADLINE_S = 600.0  # how long the platform waits for a sandbox's stop, whatever it is doing (O41)
 CANCEL_WAIT_S = 120.0  # how long a cancelled launch waits for its start thread to notice and clean up, before it stops
 DATA_PATH_FACTOR = "data_path"  # the study's factor whose levels [sandbox.data_paths] maps
 
@@ -653,7 +656,7 @@ class SandboxPlatform:
     async def _stop(self, ctx: CallContext, sandbox: DockerSandbox, *, quiet: bool) -> None:
         """Stop the sandbox, verified, within the teardown's deadline, and then, in the same wait and whatever the stop
         did, revoke its run's slot's tokens when the launch registered them (`_revoke_now`). How it ended is recorded in
-        the sandbox's metadata (`teardown`, O39): a stop that ends in time is `completed`, one that raised `failed`, and
+        the sandbox's metadata (`teardown`, O41): a stop that ends in time is `completed`, one that raised `failed`, and
         one still running at the deadline `cut` with what it had left: it is not waited for any more, and the run is
         `InfraError("sandbox")` unless `quiet` (the body's own error stands). A cancellation pending at the cut is kept."""
         async with ctx.infrastructure_wait(WAIT_KIND):
@@ -693,7 +696,7 @@ class SandboxPlatform:
     def _record_teardown(
         self, sandbox: DockerSandbox, outcome: str, began: float, left: Mapping[str, Any] | None = None
     ) -> None:
-        """Put how the sandbox's stop ended in its metadata (O39): `outcome`, the deadline, the seconds it took, and for
+        """Put how the sandbox's stop ended in its metadata (O41): `outcome`, the deadline, the seconds it took, and for
         a stop that did not complete what it had left. It touches no host: a wedged one must not hold the record."""
         record: dict[str, Any] = {
             "outcome": outcome,
@@ -774,7 +777,7 @@ async def _wait_through_cancellation(future: asyncio.Future[Any], seconds: float
 
 
 class TeardownCut(Exception):
-    """A teardown still running at its deadline: nobody waits for it any more, and it goes on in its thread (O39).
+    """A teardown still running at its deadline: nobody waits for it any more, and it goes on in its thread (O41).
     `cancelled` is whether a cancellation of the waiting task was pending when it was cut."""
 
     def __init__(self, deadline_s: float, *, cancelled: bool = False) -> None:
@@ -783,7 +786,7 @@ class TeardownCut(Exception):
 
 
 def _in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future[Any]:
-    """Run a blocking `fn` in a daemon thread of its own and return the future of its result (O39). A thread cannot be
+    """Run a blocking `fn` in a daemon thread of its own and return the future of its result (O41). A thread cannot be
     stopped, and a teardown wedged on the host may never end: in a daemon thread it never holds the process's exit, as a
     worker of the default executor, which is joined at exit, would. A result that comes after its loop has gone is
     dropped."""
@@ -811,7 +814,7 @@ async def _complete(work: Any, *, within: float | None = None) -> None:
     """Run `work` (a coroutine or a future) to its end even if this task is cancelled meanwhile, then raise the
     cancellation: a teardown that is cut short leaves what it exists to remove. An error of the work is raised in
     preference. With `within`, the wait ends after that many seconds whatever the work is doing: `TeardownCut` is raised,
-    and the work is left to go on (O39)."""
+    and the work is left to go on (O41)."""
     task = asyncio.ensure_future(work)
     loop = asyncio.get_running_loop()
     stop_at = None if within is None else loop.time() + within

@@ -63,7 +63,7 @@ def docker_failed(rc: int, err: str) -> bool:
 
 
 def _output_cut(done: Any, gave_up: bool) -> dict[str, dict[str, int]] | None:
-    """The streams of a finished `docker exec` that were cut to the output cap (O40), by what each wrote and what was
+    """The streams of a finished `docker exec` that were cut to the output cap (O42), by what each wrote and what was
     kept; None when none was. The stderr of a call that was given up on is the harness's own words, not the cell's."""
     streams = {"stdout": done.stdout_count, "stderr": None if gave_up else done.stderr_count}
     cut = {name: count.record() for name, count in streams.items() if count is not None and count.cut}
@@ -186,7 +186,7 @@ class CellRunner:
         meta_lock: threading.RLock | None = None,
         output_cap_bytes: int = OUTPUT_CAP_BYTES,
     ) -> None:
-        self._output_cap = output_cap_bytes  # the most kept of a cell's stdout, and of its stderr (O40)
+        self._output_cap = output_cap_bytes  # the most kept of a cell's stdout, and of its stderr (O42)
         self._host, self._obs, self._names, self._s = host, observer, names, settings
         self._meta, self._registry, self.roles, self._started = meta, registry, roles, started_epoch
         # past the kill at a cell's deadline: by default the grace alone, with nothing to abort and no stop
@@ -526,7 +526,7 @@ class CellRunner:
         if res.kill:  # from what caused it, not from an exit code that a memory kill shares
             res.timed_out = entry["timed_out"] = gave_up or res.kill["reason"] in ("time_limit", KC.KILL_SURVIVED)
         entry["timed_out"] = res.timed_out
-        if res.output_cut:  # what the agent was told was cut (the code tool's notice) is on the run's record (O40)
+        if res.output_cut:  # what the agent was told was cut (the code tool's notice) is on the run's record (O42)
             entry["output_cut"] = res.output_cut
             with self.meta_lock:
                 self._meta.setdefault("cell_output_cuts", []).append({"cell": entry["cell"], **res.output_cut})

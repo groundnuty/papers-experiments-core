@@ -1,4 +1,4 @@
-"""O40: what is kept of a cell's stdout and stderr is capped, the cut is recorded, and the agent is told of it.
+"""O42: what is kept of a cell's stdout and stderr is capped, the cut is recorded, and the agent is told of it.
 
 A 1 MiB read printed about 1.4 MB, all of it read into the harness's memory and kept. The sandbox now keeps the first
 `OUTPUT_CAP_BYTES` of each stream of a cell (a whole number of characters), reads and drops the rest, and records on the
@@ -101,7 +101,7 @@ def execute(provider):
 
 
 def test_o40_the_model_is_told_what_the_sandbox_cut_and_the_record_flags_the_source_limit():
-    """O40 with L07: the notice after the kept output says how much was written and kept, and the call's
+    """O42 with L07: the notice after the kept output says how much was written and kept, and the call's
     `source_truncated` is True, apart from the harness's own cap."""
     cut = {"stdout": {"produced": 1_400_000, "kept": 1_048_576}}
     got = execute(scripted(stdout="data", output_cut=cut))

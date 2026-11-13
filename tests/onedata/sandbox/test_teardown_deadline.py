@@ -1,4 +1,4 @@
-"""O39: the platform's teardown of a sandbox ends within its deadline, and says how it ended.
+"""O41: the platform's teardown of a sandbox ends within its deadline, and says how it ended.
 
 `SandboxPlatform` waited for `DockerSandbox.stop` without a bound, so a teardown wedged on a FUSE mount whose provider
 is gone (a `docker rm` that never returns) held the run, the worker and the process for ever. Now the wait is bounded by
@@ -135,7 +135,7 @@ def test_o39_a_teardown_that_raised_is_recorded_failed_and_is_the_runs_infrastru
 
 
 def test_o39_a_teardown_past_its_deadline_is_cut_with_what_it_left_and_the_run_is_infrastructure(world):
-    """O39: the run's wait ends at the deadline, whatever the host does, with `InfraError("sandbox")`, and the record
+    """O41: the run's wait ends at the deadline, whatever the host does, with `InfraError("sandbox")`, and the record
     says the teardown was cut and what it had not removed: counts and a step, never a name."""
     entered = wedge_removals(world)
     platform = world.build(teardown_deadline_s=0.5)
@@ -174,7 +174,7 @@ def test_o39_a_cut_never_hides_the_bodys_own_error_but_is_still_recorded(world):
 
 
 def test_o39_a_cancelled_run_is_still_cut_at_the_deadline_and_stays_cancelled(world):
-    """O39: a cancellation does not shorten a teardown (it must finish what it removes), and it does not lengthen
+    """O41: a cancellation does not shorten a teardown (it must finish what it removes), and it does not lengthen
     it past its deadline either."""
     removing = wedge_removals(world)
     platform = world.build(teardown_deadline_s=0.5)
@@ -203,7 +203,7 @@ def test_o39_a_cancelled_run_is_still_cut_at_the_deadline_and_stays_cancelled(wo
 
 
 def test_o39_a_cut_with_a_lease_keeps_the_key_quarantined_until_the_sandbox_is_shown_gone(world):
-    """C19 with O39: the cut says nothing was proven; the probe still finds the sandbox's containers, so the key is not
+    """C19 with O41: the cut says nothing was proven; the probe still finds the sandbox's containers, so the key is not
     freed."""
     wedge_removals(world)
     platform = world.build(teardown_deadline_s=0.5)

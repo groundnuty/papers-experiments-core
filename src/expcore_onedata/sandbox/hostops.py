@@ -10,10 +10,10 @@ that reaches the host takes a `HostOps` as its first argument; none of them impo
 Secrets never travel in an argument list: `docker` takes an `env` mapping for them, and a failure is logged with the
 size and SHA-256 of the tool's own stderr, never its text and never the environment.
 
-Every command runs through `run_bounded`, which bounds it twice. In time (O39): a command past its limit is killed, and
+Every command runs through `run_bounded`, which bounds it twice. In time (O41): a command past its limit is killed, and
 the wait for it to end after the kill is bounded too, since a process in an uninterruptible sleep (a read of a FUSE
 mount whose provider is gone) cannot die and `subprocess.run` waits for it for ever, holding the caller and with it
-a whole teardown. In memory (O40): with an `output_cap` the first bytes of each stream are kept and the rest is read,
+a whole teardown. In memory (O42): with an `output_cap` the first bytes of each stream are kept and the rest is read,
 counted and dropped, so a command that writes without end is never blocked on a full pipe and never held whole;
 `Counted` says how many bytes it wrote and how many were kept.
 """
@@ -43,14 +43,14 @@ DOCKER_TIMEOUT_S = 120.0
 TIMED_OUT = 124  # the exit code GNU timeout uses, and what a bounded command that ran out of time reports
 
 
-KILL_WAIT_S = 10.0  # how long a command's end is waited for after its kill: one that does not die is given up on (O39)
+KILL_WAIT_S = 10.0  # how long a command's end is waited for after its kill: one that does not die is given up on (O41)
 READER_JOIN_S = 5.0  # how long the readers of a command's output are waited for once it has ended or was given up on
 READ_BYTES = 1 << 16  # what one read of a command's output takes: the most held at once beside the kept part
 
 
 @dataclass(frozen=True)
 class Counted:
-    """What one output stream of a command held when a cap was asked for (O40): the bytes it wrote and the bytes kept of
+    """What one output stream of a command held when a cap was asked for (O42): the bytes it wrote and the bytes kept of
     them, always the first ones and a whole number of characters."""
 
     produced: int
@@ -67,7 +67,7 @@ class Counted:
 @dataclass(frozen=True)
 class CmdResult:
     """A finished command. A command that ran out of time has `returncode` 124 and says so on stderr. With an output
-    cap, `stdout_count` and `stderr_count` say how much each stream wrote and how much of it is in the text (O40); they
+    cap, `stdout_count` and `stderr_count` say how much each stream wrote and how much of it is in the text (O42); they
     are None when no cap was asked for."""
 
     returncode: int
@@ -92,7 +92,7 @@ class HostOps(Protocol):
     ) -> CmdResult:
         """Run `docker <args>`. With `check`, a non-zero exit raises; `env` is added to the environment. With
         `output_cap`, each of stdout and stderr keeps at most that many bytes (a whole number of characters) and the
-        result says how many each wrote (`CmdResult.stdout_count`, O40)."""
+        result says how many each wrote (`CmdResult.stdout_count`, O42)."""
         ...
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
@@ -249,9 +249,9 @@ def run_bounded(
 
     A command past its time is killed, and its end is waited for at most `KILL_WAIT_S` more: one that does not die (a
     process in uninterruptible sleep) is left behind, and the result is the timeout all the same (returncode 124, stderr
-    `timed out after Ns`, stdout what it had written; O39). A program that cannot be run is 127. With `output_cap`, each
+    `timed out after Ns`, stdout what it had written; O41). A program that cannot be run is 127. With `output_cap`, each
     of stdout and stderr keeps at most that many bytes and the rest is read and dropped, and `stdout_count` and
-    `stderr_count` say what was written and kept (O40). `env` is added to the environment."""
+    `stderr_count` say what was written and kept (O42). `env` is added to the environment."""
     cap = _check_cap(output_cap)
     merged = None if env is None else {**os.environ, **env}
     try:

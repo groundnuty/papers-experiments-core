@@ -1,4 +1,4 @@
-"""O40, O39: a command the host runs is bounded in what it keeps of its output and in how long it can hold the caller.
+"""O42, O41: a command the host runs is bounded in what it keeps of its output and in how long it can hold the caller.
 
 `hostops.run_bounded` is what `DockerHost` runs every command with. The output of a cell of the agent's code goes
 through it: a cell that printed 1.4 MB of a 1 MiB read had all of it read into memory and kept. With a cap, the first
@@ -52,7 +52,7 @@ def test_o40_output_within_the_cap_is_whole_and_counted_as_not_cut():
 
 
 def test_o40_memory_stays_flat_however_much_a_command_writes():
-    """O40: 24 MB are written and 1 KiB kept; the caller's peak allocation is far below the output."""
+    """O42: 24 MB are written and 1 KiB kept; the caller's peak allocation is far below the output."""
     tracemalloc.start()
     try:
         got = py("import sys; [sys.stdout.write('z' * 65536) for _ in range(384)]", output_cap=1024)
@@ -122,7 +122,7 @@ class Undying:
 
 
 def test_o39_a_command_that_does_not_die_after_its_kill_is_given_up_on_and_never_waited_for_for_ever(monkeypatch):
-    """O39: `subprocess.run` waits for a killed child without a bound, so a process in D state held the caller, and
+    """O41: `subprocess.run` waits for a killed child without a bound, so a process in D state held the caller, and
     through it the whole teardown. The wait after the kill is bounded now; the result is the timeout, with the output
     the command had written."""
     child = Undying()
