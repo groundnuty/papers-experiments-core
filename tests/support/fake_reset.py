@@ -23,21 +23,76 @@ while a reset runs), and `dir_stats_disabled` (a directory's distribution answer
 space without directory statistics does).
 
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
-`distributionPerStorageBackend.{storage}.physicalSize`, with `success` true.
+`distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and not an
+eviction**, as the build's does (op-worker f118ed9, the module docstring of `expcore_onedata.resetqos` traces it): bytes
+that land show in it `blocks_flush_delay_s + dir_stats_flush_s x (L - 1)` seconds later, 10 + 5 x (L - 1) by default,
+L being the parts of the file's path below the directory asked (the levels from the file's parent up to it); bytes
+that leave show at once. A test sets the two attributes (both 0: no lag). Only changes made once the fake has been
+called are dated: what a test puts in place before the first provider call, its setup, is old, and shows at once. A
+change is dated on the fake's `clock` by the write to `blocks` (a replication's landing, a hook's assignment) and an
+eviction by the removal of its entry; a list of blocks edited in place is not seen.
 """
 
 from __future__ import annotations
 
+import math
 import re
 import threading
+from collections.abc import Callable
 
 import httpx
 
 from expcore_onedata.testing.fake_data import ROOT_ID, FakeData, Node, Transfer
 
 
+def _held(blocks: list[list[int]] | None) -> int:
+    return sum(n for _, n in blocks or [])
+
+
+class _Placements(dict):
+    """The fake's table of blocks, `(file id, provider id)` to `[offset, length]` lists, which dates its changes once
+    `armed()` says so: each is kept as `(when, bytes held after it, whether it grew)`, so that `reported` can say how
+    many bytes a directory's physical size shows at a later time. A growth shows `lag` seconds after it, a shrink (an
+    eviction, `pop` and `del` included) at once. Before the first change of a key the entry is old: it shows as held."""
+
+    def __init__(self, clock: Callable[[], float], armed: Callable[[], bool]) -> None:
+        super().__init__()
+        self._clock, self._armed = clock, armed
+        self._changes: dict[tuple[str, str], list[tuple[float, int, bool]]] = {}
+
+    def _note(self, key: tuple[str, str], now_held: int) -> None:
+        if not self._armed():
+            return
+        before = _held(self.get(key))
+        if now_held != before:
+            changes = self._changes.setdefault(key, [(-math.inf, before, False)])
+            changes.append((self._clock(), now_held, now_held > before))
+
+    def __setitem__(self, key: tuple[str, str], value: list[list[int]]) -> None:
+        self._note(key, _held(value))
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: tuple[str, str]) -> None:
+        self._note(key, 0)
+        super().__delitem__(key)
+
+    def pop(self, key, *default):  # type: ignore[override]
+        if key in self:
+            self._note(key, 0)
+        return super().pop(key, *default)
+
+    def reported(self, key: tuple[str, str], lag: float) -> int:
+        """The bytes of `key` a directory shows now, a growth showing `lag` seconds after it was made."""
+        now, held = self._clock(), _held(self.get(key))
+        for when, after, grew in reversed(self._changes.get(key, [])):
+            if when + (lag if grew else 0.0) <= now:
+                return min(held, after)
+        return held
+
+
 class FakeReset(FakeData):
-    """FakeData with several data spaces, QoS requirements, cancels, directory evictions and a lock."""
+    """FakeData with several data spaces, QoS requirements, cancels, directory evictions, a lock, and a directory
+    size that lags a placement."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -45,6 +100,12 @@ class FakeReset(FakeData):
         self.ignore_cancels = False
         self.spawn_on_evict: str | None = None
         self.dir_stats_disabled = False
+        self.blocks_flush_delay_s = 10.0  # the file location's flush after its first change (rel/files/app.config:511)
+        self.dir_stats_flush_s = 5.0  # each directory level's collector flush (dir_stats_collector.erl:168)
+        self._called = False
+        placements = _Placements(lambda: self.clock(), lambda: self._called)
+        placements.update(self.blocks)  # unhooked: what is there is old
+        self.blocks = placements  # type: ignore[assignment]
         self._serve = threading.RLock()
 
     # -- setup helpers ---------------------------------------------------------
@@ -106,9 +167,15 @@ class FakeReset(FakeData):
 
     # -- answers ---------------------------------------------------------------
     def respond(self, request: httpx.Request) -> httpx.Response:
-        """Answer one call at a time, whatever thread sent it."""
+        """Answer one call at a time, whatever thread sent it. The first call ends the setup: what changes after it is
+        dated, for the lag of a directory's size."""
         with self._serve:
+            self._called = True
             return super().respond(request)
+
+    def occupancy_lag_s(self, levels: int) -> float:
+        """Seconds a directory's physical size lags a placement of a file `levels` path parts below it."""
+        return self.blocks_flush_delay_s + self.dir_stats_flush_s * (max(levels, 1) - 1)
 
     def _space_root(self, space: str) -> httpx.Response:
         if space in self.space_roots and space != self.SPACE_ID:
@@ -200,9 +267,11 @@ class FakeReset(FakeData):
         if node.kind != "DIR":
             return super()._distribution(node)
         files = self._files_under(node.file_id)
+        top = len(self._ancestry(node.file_id))
+        lags = {f: self.occupancy_lag_s(len(self._ancestry(f)) - top) for f in files}
         per: dict = {}
         for provider in self.providers:
-            held = sum(n for f in files for _, n in self.blocks.get((f, provider), []))
+            held = sum(self.blocks.reported((f, provider), lags[f]) for f in files)
             backend = (
                 {"success": False, "error": {"id": "dirStatsDisabledForSpace"}}
                 if self.dir_stats_disabled

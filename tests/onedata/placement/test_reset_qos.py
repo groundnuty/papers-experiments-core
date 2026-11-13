@@ -198,6 +198,61 @@ def test_o33_the_fakes_recursive_listing_marks_requirements_on_an_entry_and_its_
     assert (answer["nextPageToken"], answer["inaccessiblePaths"]) == (None, [])
 
 
+def beta_physical(client) -> int:
+    """Beta's physical size of the space, as the space root's distribution answers it on alpha."""
+    answer = client.get(f"/data/{ROOT_ID}/distribution", provider="alpha")
+    return answer["distributionPerProvider"][BETA_ID]["distributionPerStorageBackend"]["storage-1"]["physicalSize"]
+
+
+@pytest.mark.parametrize(("path", "lag"), [("top.bin", 10.0), ("study/one.bin", 15.0), ("a/b/c/deep.bin", 25.0)])
+def test_o33_the_fakes_root_size_shows_a_placement_after_the_sources_lag_and_an_eviction_at_once(
+    client, fake, ticker, path, lag
+):
+    """O33: the fake's directory size follows the source's bound: bytes that land on a file L path parts below the
+    space root show in the root's physical size 10 + 5 x (L - 1) s later, and bytes that leave show at once; what the
+    test put in place before the first call is old and shows at once."""
+    held = len(FILES) * len(DATA)
+    assert beta_physical(client) == held  # the setup's: old (this first call also ends the setup)
+    landed = fake.add_file(path, DATA, holder=BETA_ID)
+    assert beta_physical(client) == held
+    ticker.sleep(lag - 0.5)
+    assert beta_physical(client) == held  # not yet
+    ticker.sleep(0.5)
+    assert beta_physical(client) == held + len(DATA)
+    del fake.blocks[(landed, BETA_ID)]
+    assert beta_physical(client) == held  # an eviction shows at once
+    fake.blocks[(landed, BETA_ID)] = [[0, len(DATA)]]
+    ticker.sleep(lag - 0.5)
+    assert beta_physical(client) == held  # a placement again: the lag counts from this one
+    ticker.sleep(0.5)
+    assert beta_physical(client) == held + len(DATA)
+
+
+def test_o33_the_fakes_root_size_does_not_show_a_placement_that_was_evicted_within_the_lag(client, fake, ticker):
+    """O33: bytes that land and leave inside the lag never show in the directory's size, whatever time passes."""
+    assert beta_physical(client) == len(FILES) * len(DATA)
+    landed = fake.add_file("study/one.bin", DATA, holder=BETA_ID)
+    ticker.sleep(5.0)
+    del fake.blocks[(landed, BETA_ID)]
+    ticker.sleep(60.0)
+    assert beta_physical(client) == len(FILES) * len(DATA)
+
+
+def test_o33_the_fakes_lag_is_two_attributes_and_zero_gives_an_instant_size(client, fake, ticker):
+    """O33: a test that wants the old behaviour sets the flush delays to 0, and one that wants another lag sets them."""
+    fake.blocks_flush_delay_s = fake.dir_stats_flush_s = 0.0
+    assert beta_physical(client) == len(FILES) * len(DATA)
+    fake.add_file("a/b/c/deep.bin", DATA, holder=BETA_ID)
+    assert beta_physical(client) == (len(FILES) + 1) * len(DATA)
+    fake.blocks_flush_delay_s, fake.dir_stats_flush_s = 2.0, 1.0  # at four path parts: 2 + 3 x 1 s
+    ticker.sleep(5.0)
+    fake.add_file("a/b/c/deeper.bin", DATA, holder=BETA_ID)
+    ticker.sleep(4.5)
+    assert beta_physical(client) == (len(FILES) + 1) * len(DATA)
+    ticker.sleep(0.5)
+    assert beta_physical(client) == (len(FILES) + 2) * len(DATA)
+
+
 def test_o33_a_listing_that_could_not_enter_a_path_fails_the_qos_stage(
     client, config, platform_file, ticker, tmp_path, fake
 ):

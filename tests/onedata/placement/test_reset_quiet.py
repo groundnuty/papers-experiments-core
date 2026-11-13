@@ -11,6 +11,12 @@ from expcore_onedata.reset import STAGES, ResetFailed, SpaceReset
 from expcore_onedata.testing import BETA_ID, DATA, write_platform
 from expcore_onedata.testing.fake_data import ROOT_ID
 
+LAGGING_OCCUPANCY = (
+    "defect 2 of the #209 review, shown by the fake's lagging occupancy: the quiet stage reads the occupancy once, as "
+    "its wait ends, and bytes that landed in the last seconds of it are not in it yet (the lag, 15 s at depth 2); "
+    "replaced with the occupancy read at T + lag + margin"
+)
+
 
 @pytest.fixture
 def fake(monkeypatch, ticker):
@@ -119,6 +125,7 @@ def test_o33_a_requirement_added_and_removed_by_the_agent_fails_the_reset_when_i
     assert caught.value.record["stages"]["quiet"]["seconds"] >= WAIT_S
 
 
+@pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=LAGGING_OCCUPANCY)
 def test_o33_a_late_replication_of_a_file_beta_did_not_hold_is_caught_by_the_occupancy(
     client, config, platform_file, ticker, tmp_path, fake
 ):
@@ -235,6 +242,7 @@ def test_o33_a_plan_of_file_paths_bounds_the_quiet_stage_to_those_files(scanned,
     assert (quiet["files"], quiet["held_files"], quiet["held_source"]) == (2, 2, "eviction plan")
 
 
+@pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=LAGGING_OCCUPANCY)
 def test_o33_with_an_empty_plan_the_occupancy_is_still_read_after_the_wait(
     client, config, platform_file, ticker, tmp_path, fake
 ):
