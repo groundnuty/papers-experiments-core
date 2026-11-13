@@ -718,10 +718,10 @@ class Provisioner:
         for file_id in file_ids:
             if (provider, file_id) in self._visible:
                 continue
-            size = self._client.get(
+            size = self._client.get(  # with `name`, which a deleted entry refuses: `size` alone may read a tombstone
                 f"/data/{_segment(file_id)}",
                 provider=self._settings.holder,
-                params={"attribute": "size"},
+                params={"attribute": list(consistency.VISIBLE_ATTRIBUTES)},
                 retry=self._retry,
             ).get("size")
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:

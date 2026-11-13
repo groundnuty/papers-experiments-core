@@ -206,8 +206,9 @@ def test_o29_the_visibility_wait_is_asked_again_on_both_providers(provisioner, s
     """O29: `await_visible` reads the file's size on the data provider, then through the receiver; each read hangs once
     and is asked again, two retries in all."""
     file_id = seeded.id_of(PATH)
-    flaky.hang(reads(r"/data/[^/]+", host="alpha.test", attribute="size"))
-    flaky.hang(reads(r"/data/[^/]+", host="beta.test", attribute="size"))
+    # the wait reads `name`, `size` and `parent_id` together, and a matcher compares the first value, `name`
+    flaky.hang(reads(r"/data/[^/]+", host="alpha.test", attribute="name"))
+    flaky.hang(reads(r"/data/[^/]+", host="beta.test", attribute="name"))
     provisioner.await_visible("beta", [file_id])
     assert (len(flaky.timed_out), provisioner.reads_retried, ticker.slept) == (2, 2, [2.0, 2.0])
 
