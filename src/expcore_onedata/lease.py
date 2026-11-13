@@ -17,8 +17,8 @@ This command runs the same revocation for one slot:
    the slot and it is refused;
 3. refuses a slot whose sandbox is not shown gone (`SandboxProbe`: no container, network or mount of the lease);
 4. revokes both users' temporary tokens, requires each generation to rise, and journals the revoked line with its
-   settle end (`users.SlotTokens.revoke`); any failure journals nothing, and a line of the slot written meanwhile is
-   answered with an indeterminate line for an operator.
+   settle end (`users.SlotTokens.revoke`); any failure journals no revoked line, so the expiry rule stands, and a line
+   of the slot journalled after the revocation's start is never capped by it.
 
 It never rewrites the lock's note. The campaign's pool frees the slot at its first look after the settle end: a
 quarantine is asked again every minute, and a dead holder's key at the next sweep. The output names the slot by its
@@ -124,7 +124,9 @@ def revoke(
             done = minter.revoke(slot.name)
         except (PlatformError, RevocationUnconfirmed, OSError, ValueError) as error:
             shown = str(error) if isinstance(error, PlatformError | RevocationUnconfirmed) else type(error).__name__
-            raise Refused(f"failed: the tokens of {label} were not revoked ({shown}); nothing was journalled") from None
+            raise Refused(
+                f"failed: the tokens of {label} were not revoked ({shown}); no revoked line was written"
+            ) from None
     free = datetime.datetime.fromtimestamp(done.settle_until, tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     planes = ", ".join(f"{plane} {before}->{after}" for plane, (before, after) in done.generations.items())
     return f"revoked {label} (generations {planes}); its tokens count as gone from {free}"

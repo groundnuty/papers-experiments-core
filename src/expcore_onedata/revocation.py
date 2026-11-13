@@ -6,7 +6,8 @@ ceiling plus their margins, about a day for a long run, whatever the run took. O
 user's generation, so the slot's two users each revoke all their temporary tokens with their own credential
 (`TokenIssuer.revoke_own`): the run's tokens, those an earlier run on the slot dropped, and any a provider derived from
 them, and nothing of another slot or of the fixed principals, since `users.load_slots` keeps every user to one slot and
-plane. Every check must pass before anything is journalled:
+plane. The revocation's **start** line is journalled first, durably, and every check must pass before its **revoked**
+line is:
 
 1. for each user, its generation read, its revocation sent and its generation read again, which must have risen;
 2. every token value the run still holds verifies as 400 `tokenRevoked` (`TokenIssuer.require_revoked`), never merely
@@ -17,10 +18,16 @@ plane. Every check must pass before anything is journalled:
    bound, 315 s (`config.REVOCATION_SETTLE_MIN_S`), is refused before anything is sent, whether it comes from
    `[tokens] revocation_settle_s` or is passed directly.
 
-Any failure raises before the line, so the journal keeps the expiry rule. A line of the slot journalled while this ran
-can only be a mint that started meanwhile, which may have finished after a bump at the new generation and so holds a
-valid token: the revocation line must not cap it, so an indeterminate line follows it, which holds the slot until an
-operator clears it, and the revocation is reported unconfirmed.
+Any failure raises before the revoked line, so the journal keeps the expiry rule; a start line alone caps nothing.
+
+**The cap is safe by construction, with no second write.** The revoked line caps only the slot's lines before its
+start line (`users.TokenJournal.held_until`), and the start line is written before the first bump. A line after it may
+be a mint that finished after the bump, at the new generation, so it holds a valid token: it keeps its own end, and
+that needs nothing written after the cap, so a process that dies right after the revoked line leaves no valid token
+capped. A line before it is a mint that ended before it, because the caller keeps any mint off the slot while this
+runs (its run ended and no mint or start thread of it runs, or the command holds the slot's lease lock): each of its
+tokens was minted before the bump, at the old generation, which the bump revoked. Capping lines by their position in
+the file would not do: an operator who removes an indeterminate line moves every later line up.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from expcore_onedata.config import REVOCATION_SETTLE_BOUND, REVOCATION_SETTLE_MIN_S
-from expcore_onedata.tokens import RevocationUnconfirmed, RunTokens, TokenIssuer
+from expcore_onedata.tokens import RunTokens, TokenIssuer
 
 if TYPE_CHECKING:
     from expcore_onedata.users import Slot, TokenJournal
@@ -69,9 +76,9 @@ def revoke_slot(
 ) -> Revoked:
     """Revoke both users' temporary tokens of a slot, confirm it, and journal the settle end; raise on any failure.
 
-    The caller makes sure nothing mints on the slot meanwhile (its run ended, no start thread of it runs, or the
-    lease's lock is held); a line of the slot journalled meanwhile all the same turns the revocation into an
-    indeterminate line and `RevocationUnconfirmed`.
+    The caller makes sure no mint of the slot is under way when it starts (its run ended and no mint or start thread
+    of it runs, or the slot's lease lock is held). A line of the slot journalled after the start line all the same is
+    never capped by this revocation, so it keeps its own end.
     """
     if (
         isinstance(settle_s, bool)
@@ -79,14 +86,15 @@ def revoke_slot(
         or not REVOCATION_SETTLE_MIN_S <= settle_s < float("inf")
     ):
         raise ValueError(f"a revocation's settle time must be a finite number of seconds {REVOCATION_SETTLE_BOUND}")
-    mark = journal.written()  # before the first bump: a mint journalled after it may hold a token of the new generation
+    name = secrets.token_hex(8)
+    # durably before the first bump: the revoked line caps only what precedes this, never a mint journalled after it
+    journal.record_revoking(slot.name, revocation=name, started_at=clock())
     generations = {"data_path": issuer.revoke_own(slot.data_path), "tool_server": issuer.revoke_own(slot.tool_server)}
     held = [t for t in (tokens.data_path, tokens.tool_server) if t is not None] if tokens is not None else []
     for token in held:
         issuer.require_revoked(token.reveal())
     now = clock()
     done = Revoked(now, now + settle_s, generations, len(held))
-    name = secrets.token_hex(8)
     journal.record_revoked(
         slot.name,
         revocation=name,
@@ -95,12 +103,6 @@ def revoke_slot(
         generations=generations,
         verified=done.verified,
     )
-    if journal.slot_lines_since(slot.name, mark, revocation=name):
-        journal.record_indeterminate(slot.name)
-        raise RevocationUnconfirmed(
-            "a token of the slot was journalled during its revocation, so it may outlive it: the slot is held until an "
-            "operator clears it"
-        )
     return done
 
 

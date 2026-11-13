@@ -24,8 +24,8 @@ stopped, since its teardown reads its plane again as its token; and only when no
 runs, since a mint that finished after the bump would hold a token of the new generation, which stays valid. The
 journalled settle end then frees the key about `revocation_settle_s` (330 s) after the run, plus the pool's next look,
 instead of at the tokens' expiry. A revocation that is skipped or fails is logged and recorded under `token_revocation`
-in the sandbox's metadata, never fails the run, and journals nothing, so the expiry rule stands; a sandbox that is not
-shown gone keeps its key quarantined whatever the tokens. A run without a lease (the fixed `[principals.data_path]`
+in the sandbox's metadata, never fails the run, and journals no revoked line, so the expiry rule stands; a sandbox that
+is not shown gone keeps its key quarantined whatever the tokens. A run without a lease (the fixed `[principals.data_path]`
 user, shared with day-0, health and the live checks) revokes nothing.
 
 `SandboxPlatform` takes a required `events` (a change of interface): the platform's event sink, the one its
@@ -668,7 +668,8 @@ class SandboxPlatform:
         """Blocking: revoke the slot's tokens once its run has ended, and record what happened; never raise.
 
         Nothing is revoked while a mint or start thread of the key runs, or while the run's tool server has not
-        stopped; a failure is logged and recorded. Either way nothing is journalled, so the expiry rule stands."""
+        stopped; a failure is logged and recorded. Either way no revoked line is journalled, so the expiry rule
+        stands."""
         lease = revocable.lease
         reason: str | None = None
         if self._threads.active(lease.key):

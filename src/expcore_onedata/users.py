@@ -58,16 +58,20 @@ later than that line.
 `SlotTokens.revoke` (`revocation.py`) sends, for each of the slot's two users, that user's own revocation of all its
 temporary tokens (HTTP Basic, no privilege; `load_slots` keeps every user to one slot and plane, so nothing of another
 slot or of the fixed principals is touched), and requires the user's generation to have risen and every token the run
-still holds to verify as `tokenRevoked`. Only then does it journal a **revoked** line with `settle_until`, the moment
-the revocation has surely reached every provider (`[tokens] revocation_settle_s` after it was confirmed, 330 s by
-default), never a token or a user. A revoked line caps every earlier line of its slot at `settle_until`, the
-indeterminate ones included, since a bump of the generation revokes a token whatever its expiry; a line after it is a
-later mint's and stands. `SlotProbe.resource_gone` compares a settle end with the clock with no margin, because it
-records an observation and not a prediction of another clock, and keeps the margin for every expiry. Anything that
-fails journals nothing, so the expiry rule stands; a line of the slot journalled while the revocation ran (a mint that
-may have finished after the bump, at the new generation) makes it journal an indeterminate line instead, for an
-operator. The sandbox platform revokes when a run's launch ends (`sandbox/provider.py`), and
-`python -m expcore_onedata.lease revoke` does it for a slot held from before (`lease.py`).
+still holds to verify as `tokenRevoked`. Before the first bump it journals, durably, the revocation's **start** line;
+only once every check has passed does it journal a **revoked** line with `settle_until`, the moment the revocation has
+surely reached every provider (`[tokens] revocation_settle_s` after it was confirmed, 330 s by default, never less
+than 315 s), never a token or a user. A revoked line caps, at `settle_until`, every line of its slot before its start
+line, the indeterminate ones included, since a bump of the generation revokes a token whatever its expiry. A line
+after the start line is never capped by it: it may be a mint that finished after the bump, with a token of the new
+generation, so it keeps its own end whether or not anything is written after the cap. The lines before the start are
+those of mints that had ended before it, since the caller keeps any mint off the slot (its run ended and no start
+thread runs, or the command holds the slot's lease lock), so each of their tokens was minted at the old generation and
+the bump revoked it. `SlotProbe.resource_gone` compares a settle end with the clock with no margin, because it records
+an observation and not a prediction of another clock, and keeps the margin for every expiry. Anything that fails
+journals no revoked line, so the expiry rule stands; a start line alone caps nothing. The sandbox platform revokes
+when a run's launch ends (`sandbox/provider.py`), and `python -m expcore_onedata.lease revoke` does it for a slot
+held from before (`lease.py`).
 
 **The provisional bound assumes the platform honours the requested time caveat.** Caveats only restrict a token, so a
 token minted with `validUntil` cannot outlive it unless the server disregards it. Every successful mint checks this, and a
@@ -127,7 +131,8 @@ GROUP = "platform_users"  # every slot: the group of a run with a data path and 
 EVENT_EXPIRY_BEYOND_REQUEST = "token_expiry_beyond_request"
 JOURNAL = "tokens.jsonl"
 SAFETY_MARGIN_S = 60.0  # seconds past a journalled end before a slot counts as free: clock skew and whole-second expiry
-REVOKED = "revoked"  # the plane of a revocation line: the slot's earlier tokens end, at the latest, at its settle_until
+REVOKED = "revoked"  # the plane of a revocation line: the slot's tokens before its start end by its settle_until
+REVOKING = "revoking"  # the plane of a revocation's start line, written before the first bump: what it caps ends here
 
 
 def group_of(rights: Iterable[str]) -> str:
@@ -306,6 +311,21 @@ class TokenJournal:
         removes this line, having made sure the token has ended, or a later revocation caps it."""
         self._append({"slot": slot, "plane": "refused", "indeterminate": True})
 
+    def record_revoking(self, slot: str, *, revocation: str, started_at: float) -> None:
+        """Append, durably and before the first bump of a generation, the start of the revocation named `revocation`:
+        its revoked line caps only the slot's lines before this one. A start line with no revoked line caps nothing.
+        It carries `expires_at` equal to `started_at`, so a reader of the earlier journal takes it as an exact line that
+        has already ended."""
+        self._append(
+            {
+                "slot": slot,
+                "plane": REVOKING,
+                "expires_at": started_at,
+                "revocation": revocation,
+                "started_at": started_at,
+            }
+        )
+
     def record_revoked(
         self,
         slot: str,
@@ -316,10 +336,11 @@ class TokenJournal:
         generations: Mapping[str, tuple[int, int]],
         verified: int,
     ) -> None:
-        """Append, durably, that the slot's tokens were revoked and confirmed: every earlier line of the slot ends at
-        `settle_until` at the latest. `revocation` names this line; `generations` are each plane's user's generation
-        before and after, by plane, never by user. It carries `expires_at` equal to `settle_until` as well, so a reader
-        of the earlier journal, which knows no revocation, takes it as an exact line and holds the slot as before."""
+        """Append, durably, that the slot's tokens were revoked and confirmed: every line of the slot before the
+        revocation's start line (`record_revoking`, with the same `revocation`) ends at `settle_until` at the latest,
+        and no line after it is touched. `generations` are each plane's user's generation before and after, by plane,
+        never by user. It carries `expires_at` equal to `settle_until` as well, so a reader of the earlier journal,
+        which knows no revocation, takes it as an exact line and holds the slot as before."""
         line = {
             "slot": slot,
             "plane": REVOKED,
@@ -331,18 +352,6 @@ class TokenJournal:
             "verified": verified,
         }
         self._append(line)
-
-    def written(self) -> int:
-        """How many lines the journal holds now (0 when it has no file): a mark that `slot_lines_since` reads from."""
-        return len(self._lines())
-
-    def slot_lines_since(self, slot: str, mark: int, *, revocation: str) -> int:
-        """Count the slot's lines written after `mark` and before the revocation line named `revocation`."""
-        lines = self._lines()[mark:]
-        ends = [i for i, line in enumerate(lines) if line.get("revocation") == revocation]
-        if not ends:
-            raise ValueError("the revocation's own line is not in the journal")
-        return sum(1 for line in lines[: ends[0]] if line["slot"] == slot)
 
     def _lines(self) -> list[dict[str, Any]]:
         """Every line, in order; raise if the journal cannot be read or a line is not an object with a slot."""
@@ -376,54 +385,66 @@ class TokenJournal:
         """Return the latest end journalled for a slot, or None when none was; raise if the journal is unreadable.
 
         That is the latest of the slot's exact lines and of its provisional lines that no exact line settled, each
-        line before a revocation capped at that revocation's `settle_until` (`held_until` with no margin).
+        line before a revocation's start capped at that revocation's `settle_until` (`held_until` with no margin).
         """
         return self.held_until(slot, 0.0)
 
     def held_until(self, slot: str, margin_s: float) -> float | None:
         """Return when the slot's tokens surely no longer work, or None when it has no line; raise if unreadable.
 
-        Each expiry counts with `margin_s` added (another clock's prediction); each revocation line caps everything
-        before it at its `settle_until`, with no margin (an observation), and counts itself when nothing came before it.
+        Each expiry counts with `margin_s` added (another clock's prediction), or as infinity when it is indeterminate.
+        A revocation caps, at its `settle_until` and with no margin (an observation), only the lines before its start
+        line, which it wrote before the first bump; a line after the start, a mint that may have ended after the bump
+        with a token of the new generation, is never capped by it, whatever was or was not written after the cap. A
+        revocation with no line of the slot before its start counts its own settle end. A revoked line with no start
+        line before it, or with no finite settle end, makes the journal unreadable, which holds the slot.
         """
+        lines = [line for line in self._lines() if line["slot"] == slot]
+        revocations = _revocations(lines)
+        settled = {
+            line["mint"] for line in lines if _expiry_line(line) and not line.get("provisional") and "mint" in line
+        }
         held: float | None = None
-        segment: list[dict[str, Any]] = []
-        for line in self._lines():
-            if line["slot"] != slot:
+        for index, line in enumerate(lines):
+            if line.get("plane") == REVOKING:
                 continue
-            if line.get("plane") != REVOKED:
-                segment.append(line)
+            if line.get("plane") == REVOKED:
+                start, end = revocations[index]
+                if any(earlier.get("plane") != REVOKING for earlier in lines[:start]):
+                    continue  # it caps the lines before its start, and extends nothing
+            elif line.get("indeterminate") is True:  # a dropped token of unknown expiry: held until cleared or capped
+                end = math.inf
+            elif line.get("provisional") is True and line["mint"] in settled:  # no mint id: unreadable
                 continue
+            else:
+                end = float(line["expires_at"]) + margin_s
+            caps = [settle for start, settle in revocations.values() if start > index]
+            held = _later(held, min([end, *caps]))
+        return held
+
+
+def _expiry_line(line: Mapping[str, Any]) -> bool:
+    """Whether a journal line records an expiry, not the start or the end of a revocation."""
+    return line.get("plane") not in (REVOKING, REVOKED)
+
+
+def _revocations(lines: list[dict[str, Any]]) -> dict[int, tuple[int, float]]:
+    """Map the index of each of a slot's revoked lines to the index of its start line and its settle end; raise
+    ValueError for a revoked line with no start line of the same name before it or with no finite settle end."""
+    starts: dict[str, int] = {}
+    found: dict[int, tuple[int, float]] = {}
+    for index, line in enumerate(lines):
+        if line.get("plane") == REVOKING:
+            starts[str(line["revocation"])] = index
+        elif line.get("plane") == REVOKED:
             settle = float(line["settle_until"])
             if not math.isfinite(settle):
                 raise ValueError("a revocation line's settle end is not a finite time")
-            before = _later(held, _plus(_segment_end(segment), margin_s))
-            held, segment = (settle if before is None else min(before, settle)), []
-        return _later(held, _plus(_segment_end(segment), margin_s))
-
-
-def _segment_end(lines: list[dict[str, Any]]) -> float | None:
-    """The latest end of a run of a slot's lines with no revocation among them: its exact lines and the provisional
-    lines no exact line of the run settled, or infinity when one is indeterminate; None for no line."""
-    exact: list[float] = []
-    open_lines: dict[str, float] = {}
-    settled: set[str] = set()
-    for line in lines:
-        if line.get("indeterminate") is True:
-            return math.inf  # a dropped token of unknown expiry: never free until an operator or a revocation clears it
-        expires_at = float(line["expires_at"])
-        if line.get("provisional") is True:
-            open_lines[line["mint"]] = expires_at  # a provisional line without its mint id is unreadable
-            continue
-        exact.append(expires_at)
-        if "mint" in line:
-            settled.add(line["mint"])
-    times = exact + [t for mint, t in open_lines.items() if mint not in settled]
-    return max(times) if times else None
-
-
-def _plus(end: float | None, margin_s: float) -> float | None:
-    return None if end is None else end + margin_s
+            start = starts.get(str(line.get("revocation")))
+            if start is None:
+                raise ValueError("a revocation line has no start line before it, so what it caps is unknown")
+            found[index] = (start, settle)
+    return found
 
 
 def _later(a: float | None, b: float | None) -> float | None:
@@ -533,8 +554,8 @@ class SlotTokens:
 
         `tokens` are the values the run still holds, each of which must verify as revoked; without them the rise of
         both users' generations alone confirms it. `settle_s` is `[tokens] revocation_settle_s` unless given. Call it
-        only when nothing can mint on the slot meanwhile: its run has ended and no start thread of it runs. Raises, and
-        journals nothing, when any step fails (`revocation.revoke_slot`).
+        only when no mint of the slot is under way: its run has ended and no start thread of it runs. Raises, and
+        journals no revoked line, when any step fails (`revocation.revoke_slot`).
         """
         from expcore_onedata.revocation import revoke_slot  # its own module; it needs this one's journal
 

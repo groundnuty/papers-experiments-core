@@ -631,10 +631,11 @@ def test_c19_one_lease_key_per_run_serves_both_planes(stage, tmp_path):
         (KEY, True),
         (KEY, False),
         (KEY, False),
+        (KEY, False),
     ]
     assert lines[0]["mint"] == lines[1]["mint"]
     assert seen["data"].expires_at == started.token.expires_at == lines[1]["expires_at"]
-    assert lines[2]["plane"] == "revoked"  # the run's end revoked both users' tokens (C19)
+    assert [line["plane"] for line in lines[2:]] == ["revoking", "revoked"]  # the run's end revoked both users' (C19)
     assert stage.journal.latest_expiry("slot-b") is None
     assert seen["metadata"]["tool_server_token"] == {"slot": 0, "expires_at": started.token.expires_at}
 

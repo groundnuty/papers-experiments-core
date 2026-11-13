@@ -6,6 +6,7 @@ or revoked, confirmed and settled: the generation of both slot users rose, every
 observation and not a prediction of a clock).
 """
 
+import itertools
 import json
 from types import SimpleNamespace
 
@@ -15,7 +16,16 @@ from expcore.campaign.lease import LeasePool
 from expcore_onedata.client import PlatformError
 from expcore_onedata.testing import CEILING_S, NOW
 from expcore_onedata.tokens import RevocationUnconfirmed, data_path_spec
-from expcore_onedata.users import GROUP, JOURNAL, REVOKED, SAFETY_MARGIN_S, SlotProbe, SlotTokens, TokenJournal
+from expcore_onedata.users import (
+    GROUP,
+    JOURNAL,
+    REVOKED,
+    REVOKING,
+    SAFETY_MARGIN_S,
+    SlotProbe,
+    SlotTokens,
+    TokenJournal,
+)
 
 KEY = "slot-a"  # the first slot of the platform document
 OTHER = "slot-b"
@@ -26,11 +36,19 @@ def no_events(kind, detail):
     """The event sink of a test that is not about events."""
 
 
-def revocation(journal: TokenJournal, slot: str, settle_until: float) -> None:
-    """Append a revocation line as `SlotTokens.revoke` writes it, without asking the federation."""
+NAMES = (f"r-test-{n}" for n in itertools.count())
+
+
+def revocation(journal: TokenJournal, slot: str, settle_until: float, *, between=()) -> None:
+    """Append a revocation's start and revoked lines as `SlotTokens.revoke` writes them, without asking the federation;
+    `between` are lines journalled after its start and before its revoked line, each a `TokenJournal.record` call."""
+    name = next(NAMES)
+    journal.record_revoking(slot, revocation=name, started_at=settle_until - SETTLE_S)
+    for args, kwargs in between:
+        journal.record(*args, **kwargs)
     journal.record_revoked(
         slot,
-        revocation="r-test",
+        revocation=name,
         revoked_at=settle_until - SETTLE_S,
         settle_until=settle_until,
         generations={"data_path": (1, 2), "tool_server": (1, 2)},
@@ -102,6 +120,59 @@ def test_c19_a_revocation_caps_only_its_own_slot(tmp_path):
     assert journal.latest_expiry(OTHER) == NOW + 5000
 
 
+def test_c19_a_mint_journalled_after_a_revocations_start_keeps_its_own_end(tmp_path):
+    """C19: a line after the start line may be a mint that ended after the bump, with a token of the new generation:
+    the revocation never caps it, its provisional line and its exact line alike."""
+    journal = TokenJournal(tmp_path)
+    journal.record(KEY, "data_path", NOW + 5000)
+    revocation(
+        journal,
+        KEY,
+        NOW + SETTLE_S,
+        between=[
+            ((KEY, "provisional", NOW + 9000), {"mint": "m2", "provisional": True}),
+            ((KEY, "data_path", NOW + 8000), {"mint": "m2"}),
+        ],
+    )
+    assert journal.latest_expiry(KEY) == NOW + 8000  # its exact line settles its provisional one, uncapped
+    journal.record(KEY, "provisional", NOW + 9500, mint="m3", provisional=True)
+    assert journal.latest_expiry(KEY) == NOW + 9500
+
+
+def test_c19_a_start_line_whose_revocation_never_finished_caps_nothing(tmp_path):
+    journal = TokenJournal(tmp_path)
+    journal.record(KEY, "data_path", NOW + 5000)
+    journal.record_revoking(KEY, revocation="r-unfinished", started_at=NOW)
+    assert journal.latest_expiry(KEY) == NOW + 5000
+
+
+def test_c19_a_revocation_line_with_no_start_line_before_it_keeps_the_slot_held(tmp_path):
+    """C19: without its start line what the revocation caps is unknown, so nothing is capped and the slot is held."""
+    journal = TokenJournal(tmp_path)
+    journal.record(KEY, "data_path", NOW + 100)
+    journal.record_revoked(
+        KEY, revocation="r-alone", revoked_at=NOW, settle_until=NOW + SETTLE_S, generations={}, verified=0
+    )
+    assert probe_at(journal, NOW + 10**9).resource_gone(KEY, {}) is False
+    journal.record_revoking(KEY, revocation="r-alone", started_at=NOW)  # a start after it is not before it
+    assert probe_at(journal, NOW + 10**9).resource_gone(KEY, {}) is False
+
+
+def test_c19_removing_an_earlier_line_never_brings_a_later_mint_under_the_cap(tmp_path):
+    """C19: the cap is bounded by the start line, not by a position in the file, so an operator who removes an
+    indeterminate line, of this slot or another, never moves a later mint's line under it."""
+    journal = TokenJournal(tmp_path)
+    journal.record_indeterminate(OTHER)
+    journal.record_indeterminate(KEY)
+    mint = ((KEY, "provisional", NOW + 9000), {"mint": "m2", "provisional": True})
+    revocation(journal, KEY, NOW + SETTLE_S, between=[mint])
+    path = tmp_path / JOURNAL
+    kept = [line for line in path.read_text(encoding="utf-8").splitlines() if '"indeterminate"' not in line]
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    assert journal.latest_expiry(KEY) == NOW + 9000
+    assert journal.latest_expiry(OTHER) is None
+
+
 # ------------------------------------------------------------------------------------------------------- the probe
 def probe_at(journal, moment, sandbox_gone=None):
     return SlotProbe(journal, sandbox_gone=sandbox_gone, clock=lambda: moment)
@@ -146,8 +217,10 @@ def test_c19_tokens_that_expire_before_the_settle_end_keep_their_margin(tmp_path
 def test_c19_a_revocation_line_without_a_finite_settle_end_keeps_the_slot_held(tmp_path, settle_until):
     journal = TokenJournal(tmp_path)
     journal.record(KEY, "data_path", NOW + 100)
+    journal.record_revoking(KEY, revocation="r-raw", started_at=NOW)
     with open(tmp_path / JOURNAL, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"slot": KEY, "plane": REVOKED, "settle_until": settle_until}) + "\n")
+        line = {"slot": KEY, "plane": REVOKED, "revocation": "r-raw", "settle_until": settle_until}
+        handle.write(json.dumps(line) + "\n")
     assert probe_at(journal, NOW + 10**9).resource_gone(KEY, {}) is False
 
 
@@ -225,7 +298,10 @@ def test_c19_revoking_one_slot_leaves_the_other_slots_tokens_valid(minted, slots
 
 
 def assert_nothing_journalled(minted, tmp_path, before):
-    assert lines(tmp_path / "leases") == before
+    """No revoked line: only the revocation's start line, which caps nothing, follows the lines from before."""
+    after = lines(tmp_path / "leases")
+    assert after[: len(before)] == before
+    assert [line["plane"] for line in after[len(before) :]] == [REVOKING]
     assert minted.journal.latest_expiry(KEY) == before[-1]["expires_at"]
     held = SlotProbe(minted.journal, clock=lambda: NOW + SETTLE_S + 1)
     assert held.resource_gone(KEY, {}) is False  # the expiry rule stands
@@ -263,24 +339,46 @@ def test_c19_a_verification_that_answers_anything_but_token_revoked_journals_not
     assert_nothing_journalled(minted, tmp_path, before)
 
 
-def test_c19_a_mint_journalled_while_the_slot_was_revoked_holds_the_slot_for_an_operator(minted, tmp_path, monkeypatch):
-    """C19: a line of the slot written between the revocation's start and its own line is a mint that may have ended
-    after the bump, with a token of the new generation that stays valid: the revocation must not cap it, so the slot
-    is held by an indeterminate line until an operator clears it."""
-    issuer = minted.minter._issuer
-    confirm = issuer.require_revoked
+class Died(BaseException):
+    """The process dying at a given point: nothing after it runs."""
 
-    def concurrent(value):
-        minted.journal.record(KEY, "provisional", NOW + 9000, mint="m-other", provisional=True)
+
+def test_c19_a_mint_after_the_bump_keeps_its_full_expiry_even_if_the_process_dies_right_after_the_cap(
+    minted, tmp_path, monkeypatch
+):
+    """C19: a mint that ends after the bump holds a token of the new generation, which stays valid. Its lines follow
+    the revocation's start line, so the cap never covers them, with nothing written after the cap: a process that dies
+    right after the revoked line leaves the slot held until that token's own expiry, never freed at the settle end."""
+    issuer = minted.minter._issuer
+    confirm, record_revoked = issuer.require_revoked, minted.journal.record_revoked
+    later = []
+
+    def concurrent(value):  # after both bumps: a mint of the slot that runs all the same
+        if not later:
+            minted.now[0] = NOW + 100
+            later.append(minted.minter.mint(minted.lease, ceiling_s=CEILING_S, condition="read"))
         return confirm(value)
 
+    def dying(*args, **kwargs):
+        record_revoked(*args, **kwargs)
+        raise Died
+
     monkeypatch.setattr(issuer, "require_revoked", concurrent)
-    with pytest.raises(RevocationUnconfirmed, match="during its revocation"):
+    monkeypatch.setattr(minted.journal, "record_revoked", dying)
+    with pytest.raises(Died):
         minted.minter.revoke(KEY, minted.tokens)
     written = lines(tmp_path / "leases")
-    assert [line.get("plane") for line in written[-2:]] == [REVOKED, "refused"]
-    assert written[-1]["indeterminate"] is True
-    assert minted.journal.latest_expiry(KEY) == float("inf")
+    assert written[-1]["plane"] == REVOKED  # the cap is the last line: nothing corrected it
+    [fresh] = later
+    expiry = max(t.expires_at for t in (fresh.data_path, fresh.tool_server) if t is not None)
+    assert minted.journal.latest_expiry(KEY) == expiry > written[-1]["settle_until"]
+    with pytest.raises(RevocationUnconfirmed, match="tokenCaveatUnverified"):  # still valid: refused for its caveats
+        issuer.require_revoked(fresh.data_path.reveal())
+    settled, after = written[-1]["settle_until"] + 1, expiry + SAFETY_MARGIN_S + 1
+    assert (
+        SlotProbe(minted.journal, sandbox_gone=lambda k, n: True, clock=lambda: settled).resource_gone(KEY, {}) is False
+    )
+    assert SlotProbe(minted.journal, sandbox_gone=lambda k, n: True, clock=lambda: after).resource_gone(KEY, {}) is True
 
 
 @pytest.mark.parametrize("settle_s", [0, 314, -1, float("inf"), True])
