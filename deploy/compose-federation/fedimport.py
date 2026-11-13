@@ -80,8 +80,12 @@ def pending_copies(layout: Layout, environ: Mapping[str, str]) -> list[tuple[str
     is done: its source may have moved on, or gone, and is no longer read."""
     pending = []
     for space in layout.spec.spaces:
-        if space.imported is None or (not space.imported.readonly and layout.import_dir(space.name).exists()):
+        if space.imported is None:
             continue
+        if not space.imported.readonly:
+            require_no_link(layout, space.name)  # before exists(), which would follow one
+            if layout.import_dir(space.name).exists():
+                continue
         try:
             source = layout.import_source(space.name, environ)
         except ValueError as error:
@@ -90,6 +94,20 @@ def pending_copies(layout: Layout, environ: Mapping[str, str]) -> list[tuple[str
             check_tree(space.name, source)
             pending.append((space.name, source))
     return pending
+
+
+def require_no_link(layout: Layout, space: str) -> None:
+    """Refuse a writable import whose copy, or a directory on the way to it below the root, is a symbolic link: the
+    copy, its modes, the removal of an unfinished one and the read-write mount all lie below the root, which down
+    empties, and a link would lead them outside it. Nothing is created or followed."""
+    target = layout.import_dir(space)
+    steps = [p for p in reversed(target.parents) if layout.root in p.parents]
+    for step in (*steps, target, target.with_name(target.name + UNFINISHED)):
+        if step.is_symlink():
+            raise RuntimeError(
+                f"the copy of the dataset of {space} would pass through a symbolic link below the root; refused, "
+                "nothing was copied"
+            )
 
 
 def require_resettable(layout: Layout) -> None:
@@ -127,6 +145,7 @@ def copy_imports(layout: Layout, copies: list[tuple[str, Path]]) -> None:
     """Make each copy beside its directory and rename it into place. A copy that stops leaves no directory of its
     name, and the next up makes it again from nothing; what was left unfinished is removed first."""
     for space, source in copies:
+        require_no_link(layout, space)  # again: nothing is touched through a link, whenever it appeared
         target = layout.import_dir(space)
         unfinished = target.with_name(target.name + UNFINISHED)
         target.parent.mkdir(parents=True, exist_ok=True)

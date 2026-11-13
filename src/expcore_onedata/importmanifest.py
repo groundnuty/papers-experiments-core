@@ -87,15 +87,19 @@ def manifest_of_tree(root: Path | str) -> Manifest:
     """The manifest of a local tree: every regular file with its size and SHA-256, every directory below `root`.
 
     Nothing is hashed before the whole tree is known to hold regular files and directories alone; anything else, a
-    symbolic link included, raises ValueError with how many entries there are, naming none. A file is read by blocks,
-    never held whole."""
+    symbolic link included, raises ValueError with how many entries there are, naming none, and so does a directory
+    that cannot be listed, whose files would otherwise be left out. A file is read by blocks, never held whole."""
     top = Path(root)
     if top.is_symlink() or not top.is_dir():
         raise ValueError("the dataset's root is not a directory")
     files: list[Path] = []
     directories: list[Path] = []
     odd = 0
-    for directory, subdirectories, names in os.walk(top, followlinks=False):
+
+    def unreadable(error: OSError) -> None:  # a directory left out would leave its files out of the manifest
+        raise ValueError(f"a directory of the tree could not be read ({type(error).__name__})") from None
+
+    for directory, subdirectories, names in os.walk(top, onerror=unreadable, followlinks=False):
         for name in [*subdirectories, *names]:
             mode = os.lstat(Path(directory) / name).st_mode
             if stat.S_ISDIR(mode):

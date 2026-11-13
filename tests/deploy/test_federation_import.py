@@ -446,6 +446,40 @@ def test_a_copy_that_exists_is_never_made_again_and_its_source_is_no_longer_read
     assert not (layout.import_dir("moss-space") / "late.txt").exists()
 
 
+@pytest.mark.parametrize("linked", ["import directory", "copy"])
+def test_o37_a_symbolic_link_where_the_copy_goes_is_refused_and_nothing_outside_the_root_is_touched(
+    fed, tmp_path, linked
+):
+    """O37: the copy and its mount lie below the root, which down empties; a link at the owner's import directory, or
+    at the copy itself, would lead them, the copy's chmod and the removal of an unfinished copy outside it."""
+    layout, _, environ = writable_layout(fed, tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "kept.txt").write_bytes(b"not the federation's")
+    outside.chmod(0o700)
+    target = layout.import_dir("moss-space")
+    link = target.parent if linked == "import directory" else target
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symbolic link"):
+        fed.importing.copy_imports(layout, fed.importing.pending_copies(layout, environ))
+    assert sorted(p.name for p in outside.iterdir()) == ["kept.txt"]
+    assert outside.stat().st_mode & 0o777 == 0o700
+
+
+def test_o37_no_compose_command_mounts_a_writable_copy_that_is_a_symbolic_link(fed, tmp_path, monkeypatch):
+    """O37: every Compose command binds the writable copy read-write from the root; one that is a link is refused
+    before Compose runs, whatever made it after up."""
+    layout, data, environ = writable_layout(fed, tmp_path)
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+    target = layout.import_dir("moss-space")
+    target.parent.mkdir(parents=True)
+    target.symlink_to(data, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symbolic link"):
+        fed.docker.import_sources(layout)
+
+
 def test_a_read_only_import_is_never_copied_but_its_source_is_checked(fed, tmp_path):
     layout, data, environ = writable_layout(fed, tmp_path)
     assert [space for space, _ in fed.importing.pending_copies(layout, environ)] == ["moss-space"]

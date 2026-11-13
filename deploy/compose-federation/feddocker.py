@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fedcompose import ROOT_LABEL, render
+from fedimport import require_no_link
 from fedlayout import HERE, IMAGES, Layout
 from fedspec import LOOPBACK, Spec
 
@@ -34,9 +35,12 @@ def gib(value: int | None) -> str:
 
 def import_sources(layout: Layout) -> dict[str, str]:
     """Each read-only import's variable with its checked source, read from this process's environment; a source the
-    layout would not take is a RuntimeError, so no command meets it as a traceback."""
+    layout would not take is a RuntimeError, so no command meets it as a traceback. A writable import's copy, which
+    the file binds read-write from the root, is refused when a symbolic link lies on its way (fedimport)."""
     found = {}
     for space in layout.spec.spaces:
+        if space.imported is not None and not space.imported.readonly:
+            require_no_link(layout, space.name)  # its copy is mounted read-write: never through a link
         if space.imported is not None and space.imported.readonly:
             try:
                 found[space.imported.source_env] = str(layout.import_source(space.name, os.environ))

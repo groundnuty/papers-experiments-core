@@ -157,6 +157,12 @@ def tops(pair) -> list[str]:
     return top_paths(pair["manifest"])
 
 
+def emptied(provisioner, path: str, file_id: str, mirror: str) -> None:
+    """Evict a file from a mirror and require its block map there empty, so what a test places next is its own."""
+    assert provisioner.evict(path, mirror)["empty"] is True
+    assert provisioner.holds(mirror, [file_id], retry=provisioner.retry) == 0
+
+
 def settled_blocks(provisioner, file_id: str, provider: str) -> list:
     """A provider's blocks of a file once its block map shows bytes on reads in a row (O07)."""
     settings = provisioner.settings
@@ -258,12 +264,14 @@ def test_o01_the_owner_holds_every_file_as_one_whole_block_in_both_copies(pair):
 
 def test_o37_an_on_demand_read_through_a_mirror_places_the_same_window_in_both_copies(pair):
     """O02, O37: one byte read through a mirror from the middle of the largest file places the same window there in
-    both spaces; the mirror is emptied again by an eviction, verified on its block map."""
+    both spaces. The mirror is emptied first, verified on its block map, so the window is the read's alone, and again
+    after."""
     path, mirror = largest(pair), pair["mirrors"][0]
     size = next(f.size for f in pair["manifest"].files if f.path == path)
     windows = []
     for provisioner, check in both(pair):
         file_id = check.listing(provisioner.settings.holder)[path].file_id
+        emptied(provisioner, path, file_id, mirror)
         provisioner.fetch(mirror, file_id, size // 2, 1)
         windows.append(settled_blocks(provisioner, file_id, mirror))
         assert provisioner.evict(path, mirror)["empty"] is True
@@ -272,11 +280,13 @@ def test_o37_an_on_demand_read_through_a_mirror_places_the_same_window_in_both_c
 
 
 def test_o37_a_replication_onto_a_mirror_places_the_file_whole_with_the_same_transfer_record(pair):
-    """O01, O37: a replication of the largest file onto a mirror places it whole in both spaces, and the transfer
-    records have the same fields and end in the same state."""
+    """O01, O37: a replication of the largest file onto a mirror emptied first, verified on its block map, places it
+    whole in both spaces, so each moved the whole file, and the transfer records have the same fields and end in the
+    same state."""
     path, mirror = largest(pair), pair["mirrors"][-1]
     shapes = []
-    for provisioner, _ in both(pair):
+    for provisioner, check in both(pair):
+        emptied(provisioner, path, check.listing(provisioner.settings.holder)[path].file_id, mirror)
         done = provisioner.replicate(path, mirror)
         assert done["placement"]["fully_placed"] is True
         tid = provisioner.transfers()[-1][1]
@@ -299,6 +309,7 @@ def test_o37_the_reset_evicts_and_verifies_both_copies_alike(pair):
         for mirror in pair["mirrors"]:
             provisioner.replicate(small, mirror)
             provisioner.fetch(mirror, listed[path].file_id, 0, 1)
+            settled_blocks(provisioner, listed[path].file_id, mirror)  # the eviction has bytes to remove
         record = SpaceReset(provisioner).run({mirror: tops(pair) for mirror in pair["mirrors"]})
         assert record["ok"] is True
         stages.append([stage for stage in STAGES if record["stages"][stage]["ok"]])

@@ -112,6 +112,21 @@ def test_o37_a_tree_holding_a_link_is_refused_before_anything_is_hashed(tree):
     assert str(tree) not in str(caught.value)
 
 
+def test_o37_a_tree_with_a_directory_that_cannot_be_read_is_refused_never_left_out(tree, monkeypatch):
+    """O37: a directory the walk cannot list would drop its files from the manifest, and a space short of them would
+    then pass; the manifest is refused instead."""
+    real = os.scandir
+
+    def refusing(path):
+        if os.fspath(path).endswith("records"):
+            raise PermissionError(13, "Permission denied")
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", refusing)
+    with pytest.raises(ValueError, match="could not be read"):
+        manifest_of_tree(tree)
+
+
 def test_o37_a_written_manifest_loads_as_it_was(manifest, tmp_path):
     """O37: the manifest a study writes beside its dataset is the one it loads at every federation."""
     path = tmp_path / "manifest.json"
@@ -278,6 +293,18 @@ def test_o37_a_space_that_differs_from_the_manifest_fails_the_import_naming_no_p
     assert caught.value.record["listing"]["providers[0]"][key] == expected
     for path in (*TREE, "stray.txt"):
         assert path not in str(caught.value)
+
+
+def test_o37_a_later_check_that_fails_records_ok_false_after_one_that_passed(imported, fake):
+    """O37: the record is the last check's: once a file is gone after a passing provision, the failure's record says
+    `ok` false and holds no block or hash result of the earlier pass."""
+    assert imported.provision(timeout_s=60, hashes=True)["ok"] is True
+    fake.remove_from_space("notes/readme.txt")
+    with pytest.raises(ImportFailed) as caught:
+        imported.verify(timeout_s=30)
+    assert caught.value.record["ok"] is False
+    assert (caught.value.record["blocks"], caught.value.record["hashes"]) == (None, None)
+    assert caught.value.record["listing"]["providers[0]"]["missing"] == ["manifest.files[2]"]
 
 
 def test_o37_a_file_not_whole_on_the_data_provider_fails_the_import(imported, fake):

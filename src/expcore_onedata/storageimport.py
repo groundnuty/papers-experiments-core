@@ -117,6 +117,7 @@ class SpaceCheck:
         return {**self._record, "listing": dict(self._record["listing"]), "seconds": dict(self._record["seconds"])}
 
     def _fail(self, what: str) -> ImportFailed:
+        self._record["ok"] = False  # whatever passed before: the record is the failing check's
         return ImportFailed(f"{self._p.where}{what}", self.record)
 
     def _list(self, provider: str) -> dict[str, Entry]:
@@ -186,6 +187,8 @@ class SpaceCheck:
             raise ValueError("a space is verified on providers that support it, at least one")
         if holder not in named:
             named.insert(0, holder)  # the block maps are the data provider's, so its listing is read first
+        # A verification stands on its own: nothing an earlier one found is kept as this one's.
+        self._record.update(ok=False, listing={}, blocks=None, hashes=None)
         began = self._p.clock()
         for provider in named:  # one bound for all: each provider waits only for what the ones before it left
             label = self._p.client.provider_label(provider)
@@ -361,6 +364,8 @@ class ImportedSpace(SpaceCheck):
     def rescan(self, *, timeout_s: float, providers: Sequence[str] | None = None) -> dict[str, Any]:
         """Force a new scan, wait for it, verify the space again and record whether every file kept its id: `new_ids`
         names, by position, each manifest file whose id differs from the one it had before (or that had none)."""
+        for key in ("ids_stable", "new_ids"):  # an earlier re-scan's, never this one's
+            self._record.pop(key, None)
         before = self.scan_info()
         holder = self._p.settings.holder
         ids_before = {path: entry.file_id for path, entry in self._list(holder).items()}
