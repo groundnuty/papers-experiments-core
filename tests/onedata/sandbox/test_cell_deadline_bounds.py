@@ -166,9 +166,9 @@ class Timer:
 
 def test_o34_a_deadline_that_is_not_decided_within_its_bound_ends_the_run_as_survived_kill(world, mounted, monkeypatch):
     """O34: the run's body is over while a cell's escalation never decides (a docker daemon that answers none of the
-    commands the margin bounds): `settle` waits for it its margin and `SETTLE_SLACK_S`, no more and, never knowing its
-    outcome, no clean kill is assumed: the run is ended as `survived_kill`, which is `cell_unkillable`. Without that,
-    the attempt would be scored the agent's own `time_cap`."""
+    commands the margin bounds): `settle` waits for its outcome at most the cell's margin and `SETTLE_SLACK_S`, never
+    for ever. An outcome it never learns is no clean kill, so the run is ended as `survived_kill`, which is
+    `cell_unkillable`. Without that, the attempt would be scored the agent's own `time_cap`."""
     cells, timer = mounted._cells, Timer(None)
     monkeypatch.setattr(cells, "_running", timer)
     ended = cells.settle()
@@ -331,3 +331,32 @@ def test_o34_the_sandboxs_teardown_spares_the_inits_sleep_identified_at_the_star
     }
     assert 7010 in terminated
     assert agent.init_child not in terminated
+
+
+# --------------------------------------------------------------------------------- the metadata and the deadline's lock
+def test_o34_the_metadata_is_read_whole_under_the_lock_a_deadline_writes_it_under(world, mounted):
+    """O34: a cell's deadline writes the run's metadata from its timer's thread under the sandbox's metadata lock, so
+    `metadata()` reads it under that lock: while another thread holds it, the read waits, and it ends once it is
+    released. Read unlocked, it could meet a record half written."""
+    holding, release, reads = threading.Event(), threading.Event(), []
+
+    def hold() -> None:
+        with mounted._meta_lock:
+            holding.set()
+            release.wait(30)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    reader = threading.Thread(target=lambda: reads.append(mounted.metadata()), daemon=True)
+    try:
+        holder.start()
+        assert holding.wait(10), "the lock was not taken"
+        reader.start()
+        reader.join(0.3)
+        waited = reader.is_alive()
+    finally:
+        release.set()
+        holder.join(10)
+        reader.join(10)
+    assert waited, "metadata() did not wait for the lock a deadline writes the metadata under"
+    assert not reader.is_alive()
+    assert reads
