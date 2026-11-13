@@ -103,6 +103,43 @@ def test_l16_a_call_whose_own_expiry_was_judged_as_the_loops_cut_replays_as_that
     assert replayed.clock == record.clock
 
 
+def test_l17_a_call_that_outlasts_the_declared_bound_replays_as_the_knowledge_failure_it_was():
+    """L17: the call's expiry at the declared bound came while the agent had time left, so the loop took no reading for
+    it; the replay raises the recorded failure the same way and reads the clock as the run did. The second call of the
+    reply is answered as skipped, with no elapsed time."""
+    record = SCENARIOS["tool_bound_expiry"][0]()
+    assert record.agent_config["tool_call_bound_s"] == 60
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "knowledge")
+    assert "within 60 s" in record.outcome["detail"]
+    started, skipped = record.tool_calls
+    assert (started["status"], started["elapsed_s"]) == ("failed", 60)
+    assert (skipped["status"], "elapsed_s" in skipped) == ("skipped", False)
+    assert "watch" not in [label for label, _ in record.clock]
+    replayed = replay_record(record)
+    assert replayed.dumps() == record.dumps()
+
+
+def test_l17_a_call_whose_time_left_is_shorter_than_the_declared_bound_replays_as_the_loops_cut():
+    """L17: with the bound past the agent's time left the call was handed the time left, its expiry at it was the
+    loop's cut, a time cap with the call recorded as cut and the watch reading that cut it, and the replay ends the same
+    way."""
+    record = SCENARIOS["tool_bound_past_the_time_left"][0]()
+    assert record.agent_config["tool_call_bound_s"] == 500
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("time_cap", None)
+    assert record.tool_calls[0]["status"] == "cut"
+    assert record.tool_calls[0]["elapsed_s"] == 300
+    assert "watch" in [label for label, _ in record.clock]
+    assert replay_record(record).dumps() == record.dumps()
+
+
+def test_l17_a_changed_declared_bound_is_a_divergence_of_the_configuration():
+    """L17: the bound is part of the configuration the record pins, so replaying a record whose bound was edited fails
+    before the loop runs, at the hash of the configuration."""
+    data = record_of("tool_bound_expiry")
+    data["agent_config"]["tool_call_bound_s"] = 30
+    diverges(data, "agent_config_sha256")
+
+
 def test_r03_a_cleanup_that_timed_out_is_served_from_the_label_of_the_reading_that_ended_it():
     """R03: the replay's cleanup waiter answers as the record says, so a call given up on replays as given up on."""
     record = SCENARIOS["cleanup_timeout"][0]()

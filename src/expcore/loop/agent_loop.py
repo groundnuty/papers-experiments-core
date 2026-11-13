@@ -299,10 +299,12 @@ class _Run:
             return self._skip(index, call, "time"), stop
         waited0 = (self.timer.infra_wait_s, self.timer.infra_wait_by_kind)
         try:
-            # The provider is told the agent's time left and marks its waits on infrastructure through the context; the
-            # loop cuts the call if the agent's time, which leaves those waits out, or the ceiling is used up (L04, L05).
+            # The provider is told the shorter of the declared per-call bound and the agent's time left, and marks its
+            # waits on infrastructure through the context; the loop cuts the call if the agent's time, which leaves
+            # those waits out, or the ceiling is used up (L04, L05). A provider that runs out of a bound shorter than
+            # the time left fails the call as infrastructure (L17); the watch judges an expiry at the time left (L16).
             ctx = WaitContext(self.timer)
-            run = await self.watcher.run(self.toolbox.run(call, timeout_s=tick.remaining_s, ctx=ctx), tick)
+            run = await self.watcher.run(self.toolbox.run(call, timeout_s=self._call_bound(tick), ctx=ctx), tick)
         except Cut as cut:
             cut_run = self.toolbox.skipped(call, "cut")
             self._log(index, call, cut_run, self.rounds, tick, cut.tick, status="cut", waited=self._waited(waited0))
@@ -325,6 +327,12 @@ class _Run:
                 return run, Outcome(over.name, detail, infra_kind=over.infra_kind)
             return run, Outcome("finished", f"a call to the terminal tool {call.name!r} succeeded")
         return run, None
+
+    def _call_bound(self, tick: Tick) -> float:
+        """The `timeout_s` a call is handed: the agent's time left, or the declared per-call bound when that is shorter
+        (L05, L17). The call is cut at the time left whatever the provider does; the bound is the provider's to keep."""
+        declared = self.config.tool_call_bound_s
+        return tick.remaining_s if declared is None else min(declared, tick.remaining_s)
 
     def _waited(self, before: tuple[float, dict[str, float]]) -> tuple[float, dict[str, float]]:
         """The time the call just made spent waiting on infrastructure, in all and by kind: the timer's totals now, less
@@ -385,6 +393,7 @@ class _Run:
                 round_no=round_no,
                 started_s=self.timer.since_start(started.now) if started else None,
                 ended_s=self.timer.since_start(ended.now) if ended else None,
+                elapsed_s=ended.now - started.now if started and ended else None,
                 status=status,
                 detail=detail,
                 waited_s=waited[0],
