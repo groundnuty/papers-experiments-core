@@ -11,19 +11,23 @@ This command runs the same revocation for one slot:
 `expcore`; each shard has its own). The command reads the slot by its name in `[slots]`, and then:
 
 1. refuses a slot whose lock file is not in that directory (the wrong directory, or a slot never leased there);
-2. takes the slot's lock when it is free, and holds it until the end, so no run can lease the slot meanwhile; a lock
-   that is busy is accepted only when the pool's quarantine log shows the slot's lease quarantined, by the holder its
-   lock note names, and not freed since (a campaign that runs keeps a quarantined lease's lock); otherwise a run holds
-   the slot and it is refused;
+2. takes the slot's lock, the one the campaign's lease pool holds a lease by, and holds it from before the first check
+   until after the revoked line: while it does, no pool can lease the slot, reap a dead holder's key or free a
+   quarantine, since each of those needs that lock, and no mint of the slot can run, since a mint runs only under a
+   held lease. A lock that is busy is refused, whoever holds it: a run under way, or a campaign that runs and keeps a
+   quarantined lease's lock (a pool frees a quarantine only by letting the lock go, at a moment the command cannot
+   know, and the next run could then mint tokens this revocation would revoke). Stop that campaign first: its lock
+   goes with its process, and the next campaign only looks at the key a moment at a time, so try again if it was
+   looking;
 3. refuses a slot whose sandbox is not shown gone (`SandboxProbe`: no container, network or mount of the lease);
 4. revokes both users' temporary tokens, requires each generation to rise, and journals the revoked line with its
    settle end (`users.SlotTokens.revoke`); any failure journals no revoked line, so the expiry rule stands, and a line
    of the slot journalled after the revocation's start is never capped by it.
 
-It never rewrites the lock's note. The campaign's pool frees the slot at its first look after the settle end: a
-quarantine is asked again every minute, and a dead holder's key at the next sweep. The output names the slot by its
-position (`slots[i]`), never by its name or its users (O12). Exit codes: 0 revoked, 1 refused or failed, 2 a usage
-error.
+It never rewrites the lock's note, which still names the holder that died, so the next campaign's pool asks the probe
+and frees the slot at its first look after the settle end: a dead holder's key is asked again every 30 s, and at each
+sweep. The output names the slot by its position (`slots[i]`), never by its name or its users (O12). Exit codes: 0
+revoked, 1 refused or failed, 2 a usage error.
 """
 
 from __future__ import annotations
@@ -32,14 +36,12 @@ import argparse
 import contextlib
 import datetime
 import fcntl
-import json
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import IO, Any
+from typing import IO
 
-from expcore.campaign.lease import QUARANTINE_LOG
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
@@ -53,41 +55,20 @@ class Refused(Exception):
     """The command will not revoke the slot: its message says why, naming the slot by its position."""
 
 
-def _note(lock: Path) -> dict[str, Any]:
-    """The lock file's note, or an empty one when it cannot be read."""
-    try:
-        note = json.loads(lock.read_text(encoding="utf-8") or "{}")
-    except (OSError, ValueError):
-        return {}
-    return note if isinstance(note, dict) else {}
-
-
-def quarantined(directory: Path, key: str, note: dict[str, Any]) -> bool:
-    """Whether the pool's log shows the key's lease quarantined and not freed since, held by the holder the lock's
-    note names: its last event is a quarantine, by that holder's process, which began no later than the quarantine."""
-    try:
-        text = (directory / QUARANTINE_LOG).read_text(encoding="utf-8")
-        events = [json.loads(line) for line in text.splitlines() if line.strip()]
-    except (OSError, ValueError):
-        return False
-    mine = [e for e in events if isinstance(e, dict) and e.get("key") == key]
-    if not mine or mine[-1].get("ev") != "q":
-        return False
-    last, since = mine[-1], note.get("since")
-    numbers = isinstance(since, int | float) and isinstance(last.get("start"), int | float)
-    return note.get("pid") == last.get("pid") and numbers and since <= last["start"]
-
-
 @contextlib.contextmanager
-def _held(lock: Path, key: str, label: str) -> Iterator[None]:
-    """Hold the key's lock for the body when it is free; let a busy one through only for a quarantine; else refuse."""
+def _held(lock: Path, label: str) -> Iterator[None]:
+    """Hold the slot's lease lock, exclusively, for the body; refuse when any other holder has it, whoever it is."""
     handle: IO[str] = open(lock, "r+", encoding="utf-8")  # noqa: SIM115 -- held for the body, closed below
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            if not quarantined(lock.parent, key, _note(lock)):
-                raise Refused(f"refused: a run holds {label}; revoke it only once its run has ended") from None
+        except BlockingIOError:
+            raise Refused(
+                f"refused: a live process holds the lock of {label}, a run under way or a running campaign that keeps "
+                "it quarantined; the command needs the slot to itself, so let the run end or stop that campaign first"
+            ) from None
+        except OSError as error:
+            raise Refused(f"refused: the lock of {label} could not be taken ({type(error).__name__})") from None
         yield
     finally:
         handle.close()
@@ -115,7 +96,7 @@ def revoke(
     lock = leases / f"{slot.name}.lock"
     if not lock.is_file() or not (leases / JOURNAL).is_file():
         raise Refused(f"refused: {label} has no lock file or no token journal in that directory")
-    with _held(lock, slot.name, label):
+    with _held(lock, label):
         if SandboxProbe(host, config.sandbox).resource_gone(slot.name, {}) is not True:
             raise Refused(f"refused: the sandbox of {label} is not shown gone")
         issuer = TokenIssuer(client if client is not None else OnezoneClient(config), config, clock=clock)
