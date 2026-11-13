@@ -38,12 +38,19 @@ PLUMBING = {
     ("provision.py", "Provisioner.fetch", "client.read_range"): ["self._retry"],
     ("ingestbase.py", "Baseline._times", "client.get"): ["self._p.retry"],
     ("ingestbase.py", "Baseline.confirm", "consistency.wait_visible"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._summary", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._page", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._requirements", "consistency.space_root"): ["self._p.retry"],
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
     ("reset.py", "SpaceReset._occupancy", "physical_sizes"): ["self._p.retry"],
+    ("reset.py", "SpaceReset._quiet", "physical_sizes"): ["self._p.retry"],
+    # the reset's QoS stages (O33): the scans, each requirement's record, and the settle's and the quiet re-check's
+    # block maps, whose failure fails the stage (a read that fails is no poll that did not match)
+    ("resetqos.py", "_summary", "client.get"): ["p.retry"],
+    ("resetqos.py", "by_summaries", "consistency.space_root"): ["p.retry"],
+    ("resetqos.py", "by_listing", "consistency.space_root"): ["p.retry"],
+    ("resetqos.py", "_listing_page", "client.get"): ["p.retry"],
+    ("resetqos.py", "_requirement_entry", "client.get"): ["p.retry"],
+    ("resetqos.py", "read_maps", "provisioner.blocks"): ["p.retry"],
     ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["provisioner.retry"],
     # the placement's block-map reads outside a poll: a stall there ends the placement
     ("ranges.py", "_held", "provisioner.blocks"): ["provisioner.retry"],
@@ -105,7 +112,7 @@ ONE_ATTEMPT_SITES = {
     ("provision.py", "Provisioner.require_empty", "provisioner.holds"): ["<default>"],
     ("eviction.py", "_converge_empty", "provisioner.blocks"): ["<default>"],
     ("ingestbase.py", "Baseline._absent_everywhere", "client.get"): ["ONE_ATTEMPT"],
-    ("reset.py", "SpaceReset._qos_gone", "client.get"): ["ONE_ATTEMPT"],
+    ("resetqos.py", "_gone", "client.get"): ["ONE_ATTEMPT"],
 }
 
 # The client's own calls: a request it sends, the gate's reads and what each call into the gate says about them. The
@@ -199,12 +206,12 @@ HELPER_USERS = {
     },
     "reset.py": {
         "provisioner.verify_space",
-        "provisioner.walk",
         "provisioner.mutate",
         "provisioner.resolve_many",
         "layer.evict_ids",
         "layer.evict_tree",
     },
+    "resetqos.py": {"provisioner.walk", "provisioner.mutate"},
 }
 
 # Calls that have a provisioner helper's name and are the method of another object (module, function, receiver).

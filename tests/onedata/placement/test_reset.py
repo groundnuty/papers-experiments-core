@@ -216,7 +216,7 @@ def test_o11_a_cancel_the_provider_ignores_fails_the_reset_at_its_transfer_stage
     stocked.ignore_cancels, stocked.transfer_flip_after = True, 10**6
     with pytest.raises(ResetFailed, match="transfers stage") as caught:
         SpaceReset(provisioner).run({"beta": ["study"]})
-    assert list(caught.value.record["stages"]) == ["qos", "transfers"]
+    assert list(caught.value.record["stages"]) == ["qos", "qos_settle", "transfers"]
     assert all(stocked.held(path, BETA_ID) for path in FILES)
 
 

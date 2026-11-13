@@ -7,14 +7,15 @@ listing of ended transfers shows the next agent what earlier runs replicated. `S
 on the space its provisioner is bound to, and records the time of each stage, a resource-projection figure. Every
 read and every check is made on each provider that supports the space, since each lists what it has seen:
 
-1. **qos**: every QoS requirement in the space is found and removed. There is no listing of a space's requirements
-   (Oneprovider 25.0's REST description has `/qos_requirements` and `/qos_requirements/{qid}` and, per entry,
-   `/data/{id}/qos/summary`, nothing under `/spaces/{sid}`), so on each provider the stage walks the space, listing
-   each directory once, and reads the summary of the root and of every leaf, a file or an empty directory: a leaf's
-   summary holds the requirements on it and on every ancestor, so together they hold every requirement. Each is
-   removed through the mutation gate (bound to this space, its record's `fileId` resolved by its parent links), must
-   then answer that it is not there (`client.answered_absent`: a 404, or 25.0's 400 posix enoent; any other 400 fails
-   closed) on consecutive reads on every provider, and a second walk on every provider must find none.
+1. **qos**: every QoS requirement in the space is found (there is no listing of a space's requirements; how they are
+   found, a summary per leaf or one recursive listing, is `[placement] qos_scan`, `resetqos.py`), and each one not in
+   the caller's baseline (`qos_baseline`, the run's start's, from `qos_requirements()`) is removed through the
+   mutation gate (bound to this space, its record's `fileId` resolved by its parent links), must then answer that it is
+   not there (`client.answered_absent`: a 404, or 25.0's 400 posix enoent; any other 400 fails closed) on consecutive
+   reads on every provider, and a second scan must find none but the baseline's (O33).
+   **qos_settle**: a QoS replication creates no transfer to wait for, so the block maps of the files a removed
+   requirement applied to must stay the same on every provider for `resetqos.SETTLE_STABLE_S`, within
+   `resetqos.SETTLE_BOUND_S`.
 2. **transfers**: every waiting and ongoing transfer, on every provider that lists it, is cancelled there through the
    gate (bound to this space, its record's `spaceId` resolved); a cancel answered 400 is a job that has ended, never
    one the gate refused unsent. Each must then report an ended state on that provider, and the listings must show
@@ -30,6 +31,10 @@ read and every check is made on each provider that supports the space, since eac
    distribution gives each provider's physical size, the bytes its storage holds of the space; never the logical
    figures, which lag. A provider other than the data provider that holds more than the caller allows (nothing by
    default) fails the reset, so a reset without an eviction plan still shows that only the owner holds data.
+   **quiet**: when a requirement was removed, its files' block maps are read, again after `resetqos.QUIET_WAIT_S`, and
+   the occupancy with them: a provider holding more of one of those files, or a provider other than the data provider
+   holding more of the space than at the occupancy stage, fails the reset (a replication that landed after the
+   eviction). The block maps decide; the occupancy, which grows late, is a second sign and never alone the proof.
 5. **history**: ended transfers cannot be removed. The 25.0 REST description offers, for a transfer, only `GET` and
    `DELETE /transfers/{tid}`, a cancel that answers 400 for a job that has ended, and `POST .../rerun`; the space's
    listing (`GET /spaces/{sid}/transfers`) only reads. So the next agent sees every ended transfer, the reset's own
@@ -60,29 +65,27 @@ and each provider by its position, never a label, a name or a path.
 The waits happen between runs, never in an agent's time (`consistency.guard`).
 """
 
-import re
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from functools import partial
 from math import isfinite
 from typing import Any
 
-from expcore_onedata import consistency
-from expcore_onedata.client import NotSent, PlatformError, answered_absent
+from expcore_onedata import consistency, resetqos
+from expcore_onedata.client import NotSent, PlatformError
 from expcore_onedata.eviction import evict_ids, evict_tree
 from expcore_onedata.occupancy import physical_sizes
 from expcore_onedata.provision import Provisioner, ProvisionError
-from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferlog import PAGE_LIMIT
 from expcore_onedata.transferorder import STOP_MARGIN_S, newest_first
 from expcore_onedata.transferrecord import Unreadable, page_of
 
-STAGES = ("qos", "transfers", "eviction", "occupancy", "history")
+STAGES = ("qos", "qos_settle", "transfers", "eviction", "occupancy", "quiet", "history")
 ACTIVE = ("waiting", "ongoing")  # the listing's states of a job that has not ended
 # Transfer ids one provider's waiting or ongoing listing, or its ended one within the history's window, may hold before
 # it counts as unreadable, not cut. Older ended transfers are never read, so they never count (O32).
 LISTED_MAX = 100_000
 _FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, Unreadable, KeyError)
-_PLAIN_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a requirement id the client accepts as one path segment
 NOT_IN_SPACE = "a path the plan names is not in the space"  # a KeyError's own text holds a path's part (O12)
 
 
@@ -129,19 +132,24 @@ class SpaceReset:
         allowed: Mapping[str, int] | None = None,
         *,
         since: float | None = None,
+        qos_baseline: Collection[str] = (),
     ) -> dict[str, Any]:
-        """Check the plan, verify the space, run the five stages in order and return the record; raise ResetFailed at
-        the first stage that fails.
+        """Check the plan, verify the space, run the stages in order and return the record; raise ResetFailed at the
+        first stage that fails.
 
         `evict` maps a provider to the space-relative paths of what must leave it: a directory leaves in one
         transfer, files together. `allowed` maps a provider to the physical bytes of the space it may still hold at the
         end (none by default). Every provider in either must support the space and must not be the data provider; a
         plan that breaks this is refused, and so is a space whose live name is not the configured one, before any
         stage runs. `since` is where the history's window starts, epoch seconds on `now`: the run's start, to count
-        what the run and the reset added; by default the reset's own start."""
+        what the run and the reset added; by default the reset's own start. `qos_baseline` holds the ids of the QoS
+        requirements the run started with (`qos_requirements()` at its start), which are kept; by default none is."""
         if since is not None and (isinstance(since, bool) or not isinstance(since, int | float) or not isfinite(since)):
             raise ValueError("the history's since is a finite number of epoch seconds")
+        if isinstance(qos_baseline, str) or not all(isinstance(q, str) for q in qos_baseline):
+            raise ValueError("the QoS baseline is a collection of requirement ids")
         history_since = float(self._now() if since is None else since)
+        run: dict[str, Any] = {"affected": frozenset(), "occupancy": {}}  # what one stage hands a later one
         plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (evict or {}).items()}
         bounds = dict(allowed or {})
         for provider in [*plan, *bounds]:
@@ -150,10 +158,12 @@ class SpaceReset:
             raise ProvisionError(f"{self._p.where}an allowed holding is a whole number of bytes, zero or more")
         self._p.verify_space()
         steps: dict[str, Callable[[], dict[str, Any]]] = {
-            "qos": self._qos,
+            "qos": lambda: self._qos(qos_baseline, run),
+            "qos_settle": lambda: self._qos_settle(run),
             "transfers": self._transfers,
             "eviction": lambda: self._evict(plan),
-            "occupancy": lambda: self._occupancy(bounds),
+            "occupancy": lambda: self._occupancy(bounds, run),
+            "quiet": lambda: self._quiet(run),
             "history": lambda: self._history(history_since),
         }
         record: dict[str, Any] = {
@@ -184,73 +194,26 @@ class SpaceReset:
         record.update(ok=True, seconds=round(self._p.clock() - began, 3), reads_retried=self._p.reads_retried - retried)
         return record
 
-    # -- 1. QoS requirements --------------------------------------------------------
-    def _summary(self, file_id: str, provider: str) -> set[str]:
-        """The ids of the QoS requirements on an entry and its ancestors, from its summary on one provider."""
-        answer = self._p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=self._p.retry)
-        requirements = answer.get("requirements") if isinstance(answer, dict) else None
-        if not isinstance(requirements, Mapping) or not all(isinstance(q, str) for q in requirements):
-            raise Unreadable("a QoS summary holds no table of requirements keyed by id")
-        if not all(_PLAIN_ID.fullmatch(q) for q in requirements):  # an id becomes a path segment of the next calls
-            raise Unreadable("a QoS summary holds a requirement id that is not one plain path segment")
-        return set(requirements)
+    # -- 1. QoS requirements, and 1a. their files settled (`resetqos.py`) -------------------
+    def qos_requirements(self) -> frozenset[str]:
+        """The ids of the QoS requirements on the space now, found as the reset finds them: the baseline a caller reads
+        at the run's start and hands to `run`, so that the reset removes only the run's own."""
+        return frozenset(resetqos.scan(self._p, self._providers).where)
 
-    def _requirements(self) -> tuple[dict[str, str], int]:
-        """Every QoS requirement any provider shows, with the first provider that shows it, and how many summaries
-        were read: on each provider, the root's and every leaf's."""
-        found: dict[str, str] = {}
-        read = 0
-        for provider in self._providers:
-            root = consistency.space_root(
-                self._p.client, provider, self._p.space_id, sleep=self._p.sleep, retry=self._p.retry
-            )
-            entries = [root, *(entry.file_id for entry, leaf in self._p.walk(root, provider) if leaf)]
-            summaries = consistency.bounded_map(
-                lambda f, p=provider: self._summary(f, p), entries, self._p.settings.concurrency
-            )
-            for qid in sorted(set().union(*summaries)):
-                found.setdefault(qid, provider)
-            read += len(entries)
-        return found, read
+    def _qos(self, baseline: Collection[str], run: dict[str, Any]) -> dict[str, Any]:
+        """Remove every requirement not in the baseline and show them gone; keep the files they applied to."""
+        facts, run["affected"] = resetqos.remove(self._p, self._providers, baseline)
+        return facts
 
-    def _qos_gone(self, key: tuple[str, str]) -> bool:
-        """Whether a removed requirement answers on one provider that it is not there (`answered_absent`: a 404, or
-        25.0's 400 posix enoent); any other failure, another 400 included, propagates and does not count."""
-        provider, qid = key
-        try:
-            self._p.client.get(f"/qos_requirements/{qid}", provider=provider, retry=ONE_ATTEMPT)
-        except PlatformError as error:
-            if answered_absent(error):
-                return True
-            raise
-        return False
+    def _qos_settle(self, run: dict[str, Any]) -> dict[str, Any]:
+        """Wait for the affected files' block maps to stay the same, within the bound."""
+        return resetqos.settle(self._p, run["affected"], self._providers)
 
-    def _qos(self) -> dict[str, Any]:
-        """Find every requirement on every provider, remove each, and show them gone everywhere: each answers that it
-        is not there on every provider, and a second walk on every provider finds none."""
-        found, read = self._requirements()
-        if not found:
-            return {"found": 0, "removed": 0, "summaries_read": read}
-        for qid, provider in found.items():
-            self._p.mutate("DELETE", f"/qos_requirements/{qid}", provider=provider)
-        settings = self._p.settings
-        gone = consistency.converge_each(
-            [(provider, qid) for provider in self._providers for qid in found],
-            self._qos_gone,
-            bool,
-            timeout_s=settings.settle_timeout_s,
-            poll_s=settings.poll_s,
-            consecutive=settings.consecutive_polls,
-            workers=settings.concurrency,
-            clock=self._p.clock,
-            sleep=self._p.sleep,
-        )
-        if not gone.converged:
-            raise ProvisionError(f"{len(gone.pending)} QoS requirement reading(s) still answer after the removals")
-        again, read_again = self._requirements()
-        if again:
-            raise ProvisionError(f"the walks after the removals still find {len(again)} QoS requirement(s)")
-        return {"found": len(found), "removed": len(found), "summaries_read": read + read_again}
+    def _quiet(self, run: dict[str, Any]) -> dict[str, Any]:
+        """Show that nothing reappeared on the affected files after the eviction, by their block maps after a wait, and
+        that the occupancy did not grow."""
+        sizes = partial(physical_sizes, self._p, self._providers, retry=self._p.retry)  # read after the wait
+        return resetqos.quiet(self._p, run["affected"], self._providers, sizes, run["occupancy"])
 
     # -- 2. running transfers ---------------------------------------------------------
     def _page(self, provider: str, state: str, token: str | None) -> tuple[list[str], str | None]:
@@ -378,11 +341,11 @@ class SpaceReset:
         return {"providers": out}
 
     # -- 4. occupancy -----------------------------------------------------------------
-    def _occupancy(self, allowed: Mapping[str, int]) -> dict[str, Any]:
+    def _occupancy(self, allowed: Mapping[str, int], run: dict[str, Any]) -> dict[str, Any]:
         """With no transfer running, read each provider's physical size of the space and refuse a provider other
-        than the data provider that holds more than it is allowed."""
+        than the data provider that holds more than it is allowed; keep the sizes for the quiet re-check."""
         self._require_quiet()
-        sizes = physical_sizes(self._p, self._providers, retry=self._p.retry)
+        sizes = run["occupancy"] = physical_sizes(self._p, self._providers, retry=self._p.retry)
         over = [p for p, held in sizes.items() if p != self._p.settings.holder and held > allowed.get(p, 0)]
         if over:
             where = ", ".join(self._label(p) for p in over)

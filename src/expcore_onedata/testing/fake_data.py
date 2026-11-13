@@ -485,6 +485,13 @@ class FakeData(FakeFederation):
         self.provider_skew: dict[str, float] = {}  # provider id -> seconds its clock runs ahead (negative: behind)
         self.date_override: dict[str, str | None] = {}  # provider id -> the Date header it sends (None: none)
         self.listings = 0  # the listing answers given
+        self.qos: dict[str, dict] = {}  # requirement id -> its record (`add_qos`, `POST /qos_requirements`)
+        self.ignore_qos_deletes = False  # a requirement's removal answers 204 and the requirement stays
+        self.qos_hidden_on: dict[str, set[str]] = {}  # requirement id -> provider ids that have not seen it yet
+        self.qos_replicates_to: str | None = None  # a new requirement replicates its files into this provider id
+        self.qos_land_after_s = 0.0  # seconds of `clock` before that replication's bytes land, with no transfer
+        self._qos_landings: list[tuple[float, str, str]] = []  # (when, file id, provider id) still to land
+        self._qos_ids = itertools.count(1)
         self._ids = itertools.count(1)
         self._root_polls = 0
 
@@ -866,9 +873,13 @@ class FakeData(FakeFederation):
         ):
             return self._answer(self.readonly_answer)
         self._settle_deletes()
+        self._land_qos()
         found = re.fullmatch(r"/spaces/([^/]+)", route)
         if found and method == "GET":
             return self._space_root(found.group(1))
+        qos = self._qos_route(request, provider, route)
+        if qos is not None:
+            return qos
         found = re.fullmatch(r"/data/([^/]+)(/children|/content|/distribution)?", route)
         if found:
             if method == "GET" and not found.group(2) and UNKNOWN_ATTRIBUTES & set(query.get_list("attribute")):
@@ -908,6 +919,126 @@ class FakeData(FakeFederation):
         if found and method == "GET":
             return self._transfer(found.group(1), provider)
         return self._error(404, "notFound")
+
+    # -- QoS requirements and the recursive listing -------------------------------
+    def add_qos(self, path: str, *, expression: str = "anyStorage") -> str:
+        """Put a requirement on an entry, as an agent's QoS tool would, and return its id."""
+        return self._new_qos(self.id_of(path), expression)
+
+    def _new_qos(self, file_id: str, expression: str) -> str:
+        """Record a requirement; with `qos_replicates_to`, its files land there after `qos_land_after_s`, as a QoS
+        replication's do: with no transfer document, and even if the requirement is removed before they land."""
+        qid = f"qos-{next(self._qos_ids):04d}"
+        self.qos[qid] = {"qosRequirementId": qid, "fileId": file_id, "expression": expression, "replicasNum": 1}
+        if self.qos_replicates_to is not None:
+            lands = self.clock() + self.qos_land_after_s
+            self._qos_landings += [(lands, f, self.qos_replicates_to) for f in self._regular_under(file_id)]
+        return qid
+
+    def _regular_under(self, file_id: str) -> list[str]:
+        """The regular files at or under an entry."""
+        node = self.nodes.get(file_id)
+        if node is None or node.kind != "DIR":
+            return [file_id] if node is not None else []
+        return [
+            f for child in self.nodes.values() if child.parent == file_id for f in self._regular_under(child.file_id)
+        ]
+
+    def _land_qos(self) -> None:
+        """Place every QoS replication whose time has come: the whole file, on its provider."""
+        now, due = self.clock(), []
+        for landing in self._qos_landings:
+            if landing[0] <= now:
+                due.append(landing)
+        for landing in due:
+            self._qos_landings.remove(landing)
+            _, file_id, provider_id = landing
+            node = self.nodes.get(file_id)
+            if node is not None and node.content:
+                held = self.blocks.get((file_id, provider_id), [])
+                self.blocks[(file_id, provider_id)] = _merge([*held, [0, len(node.content)]])
+
+    def _visible_qos(self, provider: str) -> dict[str, dict]:
+        return {q: r for q, r in self.qos.items() if provider not in self.qos_hidden_on.get(q, set())}
+
+    def _qos_route(self, request: httpx.Request, provider: str, route: str) -> httpx.Response | None:
+        """The QoS calls and the recursive listing, or None for another call."""
+        method = request.method
+        if route == "/qos_requirements" and method == "POST":
+            sent = json.loads(request.content or b"{}")
+            if sent.get("fileId") not in self.nodes or not sent.get("expression"):
+                return self._error(400, "badValueNotAllowed")
+            return httpx.Response(201, json={"qosRequirementId": self._new_qos(sent["fileId"], sent["expression"])})
+        found = re.fullmatch(r"/qos_requirements/([^/]+)", route)
+        if found and method in ("GET", "DELETE"):
+            record = self._visible_qos(provider).get(found.group(1))
+            if record is None:
+                return self._answer(self.missing_answer)  # a 404, or 25.0's 400 posix enoent
+            if method == "DELETE" and not self.ignore_qos_deletes:
+                del self.qos[found.group(1)]
+            return (
+                httpx.Response(204)
+                if method == "DELETE"
+                else httpx.Response(200, json={**record, "status": "fulfilled"})
+            )
+        found = re.fullmatch(r"/data/([^/]+)/(qos/summary|files)", route)
+        if not found or method != "GET":
+            return None
+        node = self.nodes.get(found.group(1))
+        if node is None or self._hidden(node, provider):
+            return self._answer(self.missing_answer)
+        if found.group(2) == "files":
+            return self._list_recursive(node, request.url.params, provider)
+        chain = set(self._ancestry(node.file_id))
+        requirements = {q: "fulfilled" for q, r in self._visible_qos(provider).items() if r["fileId"] in chain}
+        return httpx.Response(200, json={"requirements": requirements, "status": "fulfilled"})
+
+    def _ancestry(self, file_id: str) -> list[str]:
+        """An entry's id and its ancestors' ids, up to its root."""
+        chain, node = [], self.nodes.get(file_id)
+        while node is not None:
+            chain.append(node.file_id)
+            node = self.nodes.get(node.parent) if node.parent else None
+        return chain
+
+    def _inheritance(self, file_id: str, provider: str) -> str:
+        """An entry's `effQosInheritancePath`: whether a requirement is on it, on an ancestor, on both, or none."""
+        on = {r["fileId"] for r in self._visible_qos(provider).values()}
+        direct, above = file_id in on, bool(on & set(self._ancestry(file_id)[1:]))
+        return {(True, True): "directAndAncestor", (True, False): "direct", (False, True): "ancestor"}.get(
+            (direct, above), "none"
+        )
+
+    def _list_recursive(self, top: Node, query: httpx.QueryParams, provider: str) -> httpx.Response:
+        """A page of the recursive listing under an entry, in path order: its regular files, and with
+        `include_directories` its directories and the entry itself as "."; each with the attributes asked for."""
+        directories = query.get("include_directories") == "true"
+        entries: list[tuple[str, Node]] = [(".", top)] if directories else []
+        pending = [(top, "")]
+        while pending:
+            parent, prefix = pending.pop()
+            for child in sorted((n for n in self.nodes.values() if n.parent == parent.file_id), key=lambda n: n.name):
+                if self._hidden(child, provider) or not self._shown(child, provider):
+                    continue
+                path = f"{prefix}{child.name}"
+                if child.kind == "DIR":
+                    pending.append((child, f"{path}/"))
+                if child.kind != "DIR" or directories:
+                    entries.append((path, child))
+        entries.sort(key=lambda item: item[0])
+        start, limit = int(query.get("token") or "0"), int(query.get("limit", "1000"))
+        page = entries[start : start + limit]
+        asked = query.get_list("attribute") or ["fileId", "path"]
+        files = []
+        for path, node in page:
+            known = {"fileId": node.file_id, "path": path, "type": node.kind, "name": node.name}
+            known["effQosInheritancePath"] = self._inheritance(node.file_id, provider)
+            files.append({k: known[k] for k in asked if k in known})
+        truncated = start + limit < len(entries)
+        return httpx.Response(
+            200,
+            json={"files": files, "isTruncated": truncated, "nextPageToken": str(start + limit) if truncated else None},
+        )
 
     def _space_root(self, space: str) -> httpx.Response:
         if space != self.SPACE_ID:

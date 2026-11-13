@@ -1,31 +1,25 @@
-"""The fake federation's data API with what a complete reset meets: several data spaces, QoS requirements, transfers
-that can be cancelled, directory evictions, and concurrent callers.
+"""The fake federation's data API with what a complete reset meets: several data spaces, transfers that can be
+cancelled, directory evictions, and concurrent callers. QoS requirements are `FakeData`'s (`add_qos`, `qos`,
+`ignore_qos_deletes`, `qos_hidden_on`, `qos_replicates_to`).
 
-`FakeReset` extends `fake_data.FakeData` with these provider calls (25.0's REST description is the reference):
+`FakeReset` extends `fake_data.FakeData` with this provider call (25.0's REST description is the reference):
 
-  POST   /qos_requirements                     a requirement on a file or a directory (body fileId, expression)
-  GET    /qos_requirements/{qid}               the requirement: qosRequirementId, fileId, expression, status
-  DELETE /qos_requirements/{qid}               remove it (204; once gone, answered as `missing_answer`)
-  GET    /data/{id}/qos/summary                the requirements on the entry and its ancestors, keyed by id
   DELETE /transfers/{tid}                      cancel a job that has not ended (204), or 400 for one that has
 
 and with these changes to the calls it inherits:
 
 - `add_data_space` adds a space with a root of its own, which `GET /spaces/{space}` answers on a provider and at which
   a file's parent links end, and the transfer listing of the space holds only the jobs on its files; `add_file`,
-  `id_of`, `held` and `exists` take `space=` (the study space by default);
+  `id_of`, `held`, `exists` and `add_qos` take `space=` (the study space by default);
 - a job's record has the `spaceId` of its file's space, and a cancelled job reports `cancelled`;
 - an eviction scheduled on a directory evicts every file under it when it ends, unless `evictions_noop_first` makes
   it one that evicted nothing, as FakeData's file evictions are;
 - every provider call is answered under one lock, so a bulk operation's threads never interleave inside the fake.
 
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
-`ignore_qos_deletes` (a removal answers 204 and the requirement stays), `qos_spawns` (adding a requirement starts a
-replication of its file into this provider id, as a requirement that selects that provider's storage would),
-`qos_hidden_on` (requirement id to the provider ids that have not seen it yet: its summary there leaves it out and
-reading it answers as a requirement that is not there, `missing_answer`), `spawn_on_evict` (a provider id: an eviction
-that ends starts a replication of the same data into it, a job begun while a reset runs), and `dir_stats_disabled` (a
-directory's distribution answers its physical sizes as failed, as a space without directory statistics does).
+`spawn_on_evict` (a provider id: an eviction that ends starts a replication of the same data into it, a job begun
+while a reset runs), and `dir_stats_disabled` (a directory's distribution answers its physical sizes as failed, as a
+space without directory statistics does).
 
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
 `distributionPerStorageBackend.{storage}.physicalSize`, with `success` true.
@@ -33,7 +27,6 @@ A directory's distribution answers, per provider, the physical size of what that
 
 from __future__ import annotations
 
-import json
 import re
 import threading
 
@@ -48,15 +41,10 @@ class FakeReset(FakeData):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.space_roots: dict[str, str] = {self.SPACE_ID: ROOT_ID}
-        self.qos: dict[str, dict] = {}  # requirement id -> its record
         self.ignore_cancels = False
-        self.ignore_qos_deletes = False
-        self.qos_spawns: str | None = None
-        self.qos_hidden_on: dict[str, set[str]] = {}
         self.spawn_on_evict: str | None = None
         self.dir_stats_disabled = False
         self._serve = threading.RLock()
-        self._qos_ids = 0
 
     # -- setup helpers ---------------------------------------------------------
     def add_data_space(self, space_id: str, name: str, supports: list[str]) -> None:
@@ -111,19 +99,9 @@ class FakeReset(FakeData):
             return False
         return True
 
-    def add_qos(self, path: str, *, space: str | None = None, expression: str = "anyStorage") -> str:
-        """Put a requirement on an entry, as an agent's QoS tool would, and return its id."""
+    def add_qos(self, path: str, *, space: str | None = None, expression: str = "anyStorage") -> str:  # type: ignore[override]
+        """Put a requirement on an entry of a space, as an agent's QoS tool would, and return its id."""
         return self._new_qos(self.id_of(path, space), expression)
-
-    def _new_qos(self, file_id: str, expression: str) -> str:
-        self._qos_ids += 1
-        qid = f"qos-{self._qos_ids:04d}"
-        self.qos[qid] = {"qosRequirementId": qid, "fileId": file_id, "expression": expression, "replicasNum": 1}
-        if self.qos_spawns is not None and self.nodes[file_id].kind == "REG":
-            tid = f"tid-{next(self._ids):04d}"
-            now = int(self.clock())
-            self.transfers[tid] = Transfer("replication", file_id, self.qos_spawns, scheduled=now, started=now)
-        return qid
 
     # -- answers ---------------------------------------------------------------
     def respond(self, request: httpx.Request) -> httpx.Response:
@@ -143,47 +121,10 @@ class FakeReset(FakeData):
         readonly = issued is not None and any(c.get("type") == "data.readonly" for c in issued["caveats"])
         if self.enforce_readonly and readonly and method in ("POST", "DELETE"):
             return self._error(403, "forbidden")
-        if route == "/qos_requirements" and method == "POST":
-            sent = json.loads(request.content or b"{}")
-            if sent.get("fileId") not in self.nodes or not sent.get("expression"):
-                return self._error(400, "badValueNotAllowed")
-            return httpx.Response(201, json={"qosRequirementId": self._new_qos(sent["fileId"], sent["expression"])})
-        found = re.fullmatch(r"/qos_requirements/([^/]+)", route)
-        if found:
-            return self._qos_requirement(method, found.group(1), provider)
-        found = re.fullmatch(r"/data/([^/]+)/qos/summary", route)
-        if found and method == "GET":
-            return self._qos_summary(found.group(1), provider)
         found = re.fullmatch(r"/transfers/([^/]+)", route)
         if found and method == "DELETE":
             return self._cancel(found.group(1))
         return super()._provider_route(request, provider, route)
-
-    def _qos_requirement(self, method: str, qid: str, provider: str) -> httpx.Response:
-        record = self.qos.get(qid)
-        if record is None or provider in self.qos_hidden_on.get(qid, set()):
-            return self._answer(self.missing_answer)  # a 404, or 25.0's 400 posix enoent (`answer_missing_as_25`)
-        if method == "GET":
-            return httpx.Response(200, json={**record, "status": "fulfilled"})
-        if method == "DELETE":
-            if not self.ignore_qos_deletes:
-                del self.qos[qid]
-            return httpx.Response(204)
-        return self._error(404, "notFound")
-
-    def _qos_summary(self, file_id: str, provider: str) -> httpx.Response:
-        if file_id not in self.nodes:
-            return self._error(404, "notFound")
-        chain, node = set(), self.nodes.get(file_id)
-        while node is not None:
-            chain.add(node.file_id)
-            node = self.nodes.get(node.parent) if node.parent else None
-        requirements = {
-            qid: "fulfilled"
-            for qid, r in self.qos.items()
-            if r["fileId"] in chain and provider not in self.qos_hidden_on.get(qid, set())
-        }
-        return httpx.Response(200, json={"requirements": requirements, "status": "fulfilled"})
 
     def _cancel(self, tid: str) -> httpx.Response:
         transfer = self.transfers.get(tid)

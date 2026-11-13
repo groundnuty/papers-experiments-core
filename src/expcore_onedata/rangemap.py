@@ -27,6 +27,7 @@ transfer_settle_s = 30.0        # the wait between two observations of the trans
 transfer_settle_polls = 4       # the most observations of the listing before it counts as not settled (2 or more)
 clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that widen the run's window (O08)
 concurrency = 16                # the most requests a bulk operation has in flight at once (eviction, block maps, reset)
+qos_scan = "summaries"          # how the reset finds QoS requirements: "summaries" (a read per leaf) or "listing" (O33)
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -60,6 +61,10 @@ PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")
 # threshold, which with these defaults is every full chunk, is sent on a new connection (`OnezoneClient.mutate`).
 DEFAULT_CHUNK_BYTES = 16 << 20
 DEFAULT_FRESH_CONNECTION_BYTES = 16 << 20
+# How the reset finds a space's QoS requirements (O33): `summaries`, a summary per leaf on every provider (the default
+# until the listing's two live facts are verified, `tests/live/test_qos_listing.py`), or `listing`, one recursive
+# listing with `effQosInheritancePath` and a summary per entry a requirement is on.
+QOS_SCANS = ("summaries", "listing")
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,7 @@ class PlacementSettings:
     transfer_settle_polls: int = 4
     clock_skew_allowance_s: float = 5.0  # beyond the providers' estimated clock offsets
     concurrency: int = 16  # the named bound on a bulk operation's requests in flight (eviction, block maps, reset)
+    qos_scan: str = QOS_SCANS[0]  # how the reset finds QoS requirements (`resetqos.py`); see QOS_SCANS
 
 
 @dataclass(frozen=True)
@@ -241,11 +247,15 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "transfer_settle_polls",
             "clock_skew_allowance_s",
             "concurrency",
+            "qos_scan",
         )
     )
     holder = table.string("holder")
     if holder not in config.providers:
         raise table.fail("holder", "must be a provider declared in [providers]")
+    qos_scan = table.optional_string("qos_scan") or QOS_SCANS[0]
+    if qos_scan not in QOS_SCANS:
+        raise table.fail("qos_scan", f"must be one of {', '.join(QOS_SCANS)}")
     settings = PlacementSettings(
         holder=holder,
         poll_s=_number(table, "poll_s", 2.0, minimum=0.001),
@@ -263,6 +273,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         transfer_settle_polls=_number(table, "transfer_settle_polls", 4, minimum=2, integer=True),
         clock_skew_allowance_s=_number(table, "clock_skew_allowance_s", 5.0, minimum=0),
         concurrency=_number(table, "concurrency", 16, minimum=1, integer=True),
+        qos_scan=qos_scan,
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))
