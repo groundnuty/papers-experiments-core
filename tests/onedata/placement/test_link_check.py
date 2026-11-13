@@ -6,23 +6,28 @@ import json
 import pytest
 
 from expcore.config.loading import ConfigError
-from expcore_onedata.client import OutOfScope
+from expcore_onedata.client import OnezoneClient, OutOfScope
 from expcore_onedata.config import load_platform
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.linkcheck import PROBE_PREFIX, check_links, probe_content, probe_name
+from expcore_onedata.linkprobe import generation_of
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, SPACE_NAME, with_placement, write_platform
 from expcore_onedata.testing.world import PROBE_SPACE_ID, PROBE_SPACE_NAME, with_link_check
 from expcore_onedata.tokens import TokenIssuer
 
 GAMMA_ID = "pr-gamma"
+DELTA_ID = "pr-delta"  # declared, supports the probe space and no study space, and is not in [link_check].providers
+OMEGA_ID = "pr-omega"  # supports the probe space and is not in platform.toml at all
 BOUND_S = 5.0
-CONFIGURED = (PROBE_SPACE_NAME, PROBE_SPACE_ID, "alpha", "beta", "gamma", SPACE_NAME, ".test")  # never in a message
+CONFIGURED = (PROBE_SPACE_NAME, PROBE_SPACE_ID, "alpha", "beta", "gamma", "delta", "omega", SPACE_NAME, ".test")
 
 
 def three_providers(data, *, link_check=True, **override):
-    """The study space supported by alpha (local), beta and gamma; the probe space by all three."""
+    """The study space supported by alpha (local), beta and gamma; the probe space by all three, and by delta, which is
+    declared and left out of `[link_check].providers`, and by omega, which platform.toml does not declare."""
     with_placement(data)
     data["providers"]["gamma"] = {"url": "https://gamma.test", "id": GAMMA_ID}
+    data["providers"]["delta"] = {"url": "https://delta.test", "id": DELTA_ID}
     data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "alpha"}
     if link_check:
         with_link_check(data, ["alpha", "beta", "gamma"], timeout_s=BOUND_S, **override)
@@ -37,7 +42,9 @@ def platform_file(tmp_path):
 def fake(fake):
     fake.supports[BETA_ID] = {"readonly": False}
     fake.add_provider(GAMMA_ID, "gamma.test")
-    fake.add_data_space(PROBE_SPACE_ID, PROBE_SPACE_NAME, [ALPHA_ID, BETA_ID, GAMMA_ID])
+    fake.add_provider(DELTA_ID, "delta.test", supports=False)
+    fake.add_provider(OMEGA_ID, "omega.test", supports=False)
+    fake.add_data_space(PROBE_SPACE_ID, PROBE_SPACE_NAME, [ALPHA_ID, BETA_ID, GAMMA_ID, DELTA_ID, OMEGA_ID])
     return fake
 
 
@@ -46,12 +53,25 @@ def run(config, client, ticker):
     return check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, now=ticker.clock, workers=1)
 
 
-def probe_of(fake, provider_id):
-    """The probe file of a source, found by its name in the probe space's tree."""
+def probes_of(fake, provider_id):
+    """The probe files of a source in the probe space's tree, by generation."""
     root = fake.space_roots[PROBE_SPACE_ID]
-    found = [n for n in fake.nodes.values() if n.parent == root and n.name == probe_name(provider_id)]
-    assert len(found) == 1, "each source has exactly one probe"
-    return found[0].file_id
+    found = {generation_of(n.name, provider_id): n.file_id for n in fake.nodes.values() if n.parent == root}
+    found.pop(None, None)
+    return found
+
+
+def probe_of(fake, provider_id):
+    """The probe file of a source: the one probe it has, found by its name in the probe space's tree."""
+    found = probes_of(fake, provider_id)
+    assert len(found) == 1, "each source has exactly one probe once a check has passed"
+    return next(iter(found.values()))
+
+
+def alpha_reads(fake, start=0):
+    """The ids of the files whose content the local provider was asked for, in order, from the `start`th call on."""
+    calls = fake.provider_calls[start:]
+    return [c[2].split("/")[2] for c in calls if c[0] == ALPHA_ID and c[1] == "GET" and c[2].endswith("/content")]
 
 
 def held(fake, file_id, provider_id):
@@ -309,3 +329,196 @@ def test_o35_the_health_gate_checks_the_links_again_every_every_s_and_a_stuck_li
     assert "remedy" in stuck.detail
     del fake.links[(ALPHA_ID, GAMMA_ID)]
     assert health().ok  # a failed check is run again at the next call, however soon
+
+
+def hold(fake, file_id, provider_id):
+    """Another provider of the probe space fetched the whole probe at some point and still holds it."""
+    fake.blocks[(file_id, provider_id)] = [[0, len(fake.nodes[file_id].content)]]
+
+
+def stuck_beta(fake, ticker):
+    """The link local <- beta hangs, as a provider's rtransfer link did on the first real federation."""
+    fake.links[(ALPHA_ID, BETA_ID)] = "hang"
+    fake.hang_hook = ticker.sleep
+
+
+@pytest.mark.parametrize(
+    ("holder", "label", "words"),
+    [
+        (DELTA_ID, "providers[3]", "not a provider of [link_check]"),
+        (OMEGA_ID, "a provider platform.toml does not declare", "list it in [link_check] providers"),
+    ],
+    ids=["declared, not listed", "not declared"],
+)
+def test_o35_another_holder_the_check_cannot_evict_fails_the_pair_instead_of_serving_the_fetch(
+    fake, config, client, ticker, holder, label, words
+):
+    """O35: another supporter of the probe space that also holds the probe, one `[link_check].providers` leaves out,
+    would serve the local provider's read while the tested link is stuck, and the cold check once passed with no
+    eviction of it. The whole block map is read now: such a holder fails the pair, named, and nothing is fetched."""
+    assert run(config, client, ticker).ok
+    probe = probe_of(fake, BETA_ID)
+    hold(fake, probe, holder)
+    stuck_beta(fake, ticker)
+    calls = len(fake.provider_calls)
+    report = run(config, client, ticker)
+    assert not report.ok
+    failed, other = report.pairs
+    assert not failed.ok
+    assert failed.seconds is None  # not tested: nothing was fetched, so the delta's copy never served the read
+    assert label in failed.reason
+    assert words in failed.reason
+    assert other.ok
+    assert probe not in alpha_reads(fake, calls)
+    assert not any(value in report.detail for value in (*CONFIGURED, holder))
+
+
+def test_o35_a_second_holder_the_check_can_evict_is_evicted_and_the_stuck_link_is_still_found(tmp_path, fake, ticker):
+    """O35: a holder that `[link_check].providers` names is evicted before the fetch, so the stuck link is not
+    bypassed through it."""
+    listed = write_platform(
+        tmp_path,
+        lambda d: (three_providers(d), d["link_check"].update(providers=[*d["link_check"]["providers"], "delta"])),
+    )
+    config = load_platform(listed)
+    client = OnezoneClient(config, http=fake.client_http())
+    assert run(config, client, ticker).ok
+    probe = probe_of(fake, BETA_ID)
+    hold(fake, probe, DELTA_ID)
+    stuck_beta(fake, ticker)
+    report = run(config, client, ticker)
+    stuck = report.pairs[0]
+    assert held(fake, probe, DELTA_ID) == 0
+    assert {fake.transfers[t].provider_id for t in stuck.cooled} == {DELTA_ID}
+    assert not stuck.ok
+    assert stuck.reason.startswith(f"no transfer from providers[1] to providers[0] within {BOUND_S:g} s")
+
+
+@pytest.mark.parametrize(
+    ("holder", "label"), [(DELTA_ID, "providers[3]"), (GAMMA_ID, "providers[2]"), (OMEGA_ID, "does not declare")]
+)
+def test_o35_a_holding_that_cannot_be_read_fails_the_pair_and_is_never_dropped(
+    fake, config, client, ticker, holder, label
+):
+    """O35: a provider the block map lists with a holding that cannot be parsed is unknown, never empty: the pair is
+    not tested, naming it, whichever provider it is."""
+    assert run(config, client, ticker).ok
+    probe = probe_of(fake, BETA_ID)
+    fake.distribution_entries[(probe, holder)] = {"virtualSize": 7}  # no table of storage backends
+    calls = len(fake.provider_calls)
+    report = run(config, client, ticker)
+    assert not report.ok
+    failed, other = report.pairs
+    assert failed.seconds is None
+    assert label in failed.reason
+    assert "readable" in failed.reason
+    assert other.ok
+    assert probe not in alpha_reads(fake, calls)
+    assert not any(value in report.detail for value in (*CONFIGURED, holder))
+
+
+def test_o35_a_provider_that_lists_no_blocks_is_not_a_holder(fake, config, client, ticker):
+    """O35: a supporter of the probe space the block map shows with an explicit empty holding does not hold it, even
+    when `[link_check].providers` leaves it out: it fails nothing."""
+    assert run(config, client, ticker).ok
+    assert fake.blocks.get((probe_of(fake, BETA_ID), DELTA_ID)) is None
+    assert run(config, client, ticker).ok
+
+
+def test_o35_after_a_timeout_the_probe_is_retired_and_the_next_check_reads_a_fresh_file(fake, config, client, ticker):
+    """O35: a read that timed out leaves a fetch job on the local provider, and a later read of the same file joins it
+    until its restart. The next check reads another file, a new name and id, so a recovered link passes at once."""
+    fake.joins_stuck_jobs = True
+    stuck_beta(fake, ticker)
+    first = run(config, client, ticker)
+    failed = first.pairs[0]
+    assert not failed.ok
+    assert failed.retired is True
+    ((_, old),) = fake.stuck_jobs  # the file whose fetch the local provider is still waiting on
+    assert old not in fake.nodes  # retired: deleted
+    fresh = probe_of(fake, BETA_ID)
+    assert fresh != old
+    assert fake.nodes[fresh].name == probe_name(BETA_ID, 1)
+    assert bytes(fake.nodes[fresh].content) == probe_content(BETA_ID, config.link_check.probe_bytes)
+    del fake.links[(ALPHA_ID, BETA_ID)]  # the remedy: the link restarted, the outstanding job not yet
+    calls = len(fake.provider_calls)
+    second = run(config, client, ticker)
+    assert second.ok, second.detail
+    assert second.pairs[0].seconds is not None
+    assert old not in alpha_reads(fake, calls)
+    assert fresh in alpha_reads(fake, calls)
+    assert second.pairs[0].purged == 0
+
+
+def test_o35_a_probe_that_failed_is_replaced_whatever_the_failure_was(fake, config, client, ticker):
+    """O35: an answered error is retired the same as a timeout, and the passing check keeps the fresh probe."""
+    fake.links[(ALPHA_ID, GAMMA_ID)] = "fail"
+    first = run(config, client, ticker)
+    assert [p.retired for p in first.pairs] == [None, True]
+    old = probes_of(fake, GAMMA_ID)
+    assert set(old) == {1}
+    del fake.links[(ALPHA_ID, GAMMA_ID)]
+    second = run(config, client, ticker)
+    assert second.ok
+    assert set(probes_of(fake, GAMMA_ID)) == {1}  # kept, not written again
+    assert [p.provisioned for p in second.pairs] == [False, False]
+    assert second.pairs[0].retired is None
+
+
+def test_o35_a_retired_file_that_could_not_be_deleted_is_deleted_by_a_later_passing_check(fake, config, client, ticker):
+    """O35: the cleanup of retired files is bounded: a deletion that failed is counted, the fresh probe is used, and
+    the next check that passes deletes the retired file."""
+    fake.joins_stuck_jobs = True
+    stuck_beta(fake, ticker)
+    fake.fail_deletes = True
+    first = run(config, client, ticker)
+    failed = first.pairs[0]
+    assert failed.retired is True  # the successor was written, so the next check reads it
+    assert failed.unpurged == 1
+    assert set(probes_of(fake, BETA_ID)) == {0, 1}
+    fake.fail_deletes = False
+    del fake.links[(ALPHA_ID, BETA_ID)]
+    second = run(config, client, ticker)
+    assert second.ok, second.detail
+    assert second.pairs[0].purged == 1
+    assert set(probes_of(fake, BETA_ID)) == {1}
+    assert json.loads(json.dumps(second.to_json()))["pairs"][0]["purged"] == 1
+
+
+def test_o35_a_probe_that_could_not_be_retired_is_said_so_and_retired_by_the_next_failure(fake, config, client, ticker):
+    """O35: when neither the successor can be written nor the failed file deleted, the failure says the next check may
+    read it again, and the check after that retires it."""
+    fake.joins_stuck_jobs = True
+    fake.links[(ALPHA_ID, BETA_ID)] = "hang"
+
+    def hang(seconds):
+        ticker.sleep(seconds)
+        fake.resets.append(["/children", 1, BETA_ID])  # the successor's creation, after the fetch, is reset
+        fake.fail_deletes = True
+
+    fake.hang_hook = hang
+    first = run(config, client, ticker)
+    failed = first.pairs[0]
+    assert failed.retired is False
+    assert "could not be retired" in failed.reason
+    assert "may read it again" in failed.reason
+    assert set(probes_of(fake, BETA_ID)) == {0}
+    fake.fail_deletes = False
+    fake.hang_hook = ticker.sleep
+    second = run(config, client, ticker)
+    assert second.pairs[0].retired is True  # the same file failed again, and now it is retired
+    del fake.links[(ALPHA_ID, BETA_ID)]
+    assert run(config, client, ticker).ok
+
+
+def test_o35_the_health_gate_reopens_at_the_first_recheck_after_a_hung_link_recovers(fake, config, client, ticker):
+    """O35: the closed gate's re-check, after a link hung and then recovered while its fetch job was still outstanding,
+    passes at once and reads no file whose fetch may still be stuck."""
+    fake.joins_stuck_jobs = True
+    issuer = TokenIssuer(client, config, clock=lambda: 1_800_000_000.0)
+    health = PlatformHealth(config, client, issuer, monotonic=ticker.clock, sleep=ticker.sleep)
+    stuck_beta(fake, ticker)
+    assert not health().ok
+    del fake.links[(ALPHA_ID, BETA_ID)]
+    passed = health()
+    assert passed.ok, passed.detail

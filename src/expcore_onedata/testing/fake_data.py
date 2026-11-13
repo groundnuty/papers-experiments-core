@@ -393,6 +393,12 @@ class FakeData(FakeQos, FakeFederation):
       default; how a provider answers a failed fetch was not measured). One working link to a holder serves the read.
       Seen live: a stuck link left a read through the reader hanging past its bound with nothing logged, while every
       other pair transferred; the hang is that, the failure an assumption;
+    - `joins_stuck_jobs`: True makes a read that hung a stuck fetch job of its reader (`stuck_jobs`, which a test
+      empties to model the synchronizer's restart): every later read of that file through that reader hangs too, even
+      once its link works, as op-worker's does (a later read of the same range joins the job, until its 1,800 s
+      restart); a read of another file is unaffected;
+    - `distribution_entries`: `(file id, provider id)` to what the block map holds for that provider instead of its
+      own entry, such as a malformed one;
     - `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at
       all, each answered `transfer_unseen_answer`; a fresh space root answers `root_enoent_answer` for
       `root_enoent_polls` reads;
@@ -549,6 +555,12 @@ class FakeData(FakeQos, FakeFederation):
         # (reading provider id, holding provider id) -> "hang" or "fail": a link between two providers that is stuck
         self.links: dict[tuple[str, str], str] = {}
         self.hang_hook: Callable[[float], None] | None = None  # given the read's timeout before a stuck read times out
+        # With `joins_stuck_jobs`, a read that hung is a stuck fetch job of its reader: (reader id, file id) is kept
+        # here, and any later read of that file through that reader hangs too, whatever `links` says, until `clear`.
+        self.joins_stuck_jobs = False
+        self.stuck_jobs: set[tuple[str, str]] = set()
+        # (file id, provider id) -> what the block map holds for that provider instead of its entry (a malformed one)
+        self.distribution_entries: dict[tuple[str, str], object] = {}
         self.link_fail_answer: Answer = (500, "internalServerError", None)  # a read whose only link failed
         self._init_qos_model()  # dbsync, status and replication of a requirement (`fake_qos.py`)
         self._qos_ids = itertools.count(1)
@@ -1251,6 +1263,8 @@ class FakeData(FakeQos, FakeFederation):
         if not self._holds(node.file_id, provider, first, length):
             stuck = self._stuck_link(node.file_id, provider, first, length)
             if stuck == "hang":
+                if self.joins_stuck_jobs:
+                    self.stuck_jobs.add((provider, node.file_id))
                 wait = (request.extensions.get("timeout") or {}).get("read")
                 if self.hang_hook is not None:
                     self.hang_hook(float(wait) if wait is not None else 0.0)  # the wait runs out, then the read
@@ -1275,6 +1289,8 @@ class FakeData(FakeQos, FakeFederation):
         """How a read through `reader` that lacks these bytes fares by `links`: "hang" or "fail" when every other
         provider holding them has its link to the reader so marked ("hang" if any does), None when one link works or
         no other provider holds them."""
+        if (reader, file_id) in self.stuck_jobs:  # the fetch of this file through this reader is still outstanding
+            return "hang"
         holders = [p for p in self.providers if p != reader and self._holds(file_id, p, offset, length)]
         marks = [self.links.get((reader, holder)) for holder in holders]
         if not marks or None in marks:
@@ -1307,10 +1323,10 @@ class FakeData(FakeQos, FakeFederation):
             if not self.omit_blocks:
                 backend["blocks"] = [list(b) for b in held]
             if provider not in self.omit_providers:
-                per[provider] = {
-                    "virtualSize": len(node.content),
-                    "distributionPerStorageBackend": {"storage-1": backend},
-                }
+                per[provider] = self.distribution_entries.get(
+                    (node.file_id, provider),
+                    {"virtualSize": len(node.content), "distributionPerStorageBackend": {"storage-1": backend}},
+                )
         return {"type": node.kind, "distributionPerProvider": per}
 
     def _schedule(self, request: httpx.Request, via: str) -> httpx.Response:
