@@ -1,5 +1,6 @@
 """Leased platform users for the two planes: slots through the core's lease pool, and tokens no free slot outlives."""
 
+import json
 import os
 import stat
 
@@ -14,6 +15,7 @@ from expcore_onedata.tokens import DroppedToken, ExpiryMismatch, TokenIssuer, to
 from expcore_onedata.users import (
     EVENT_EXPIRY_BEYOND_REQUEST,
     GROUP,
+    JOURNAL,
     SAFETY_MARGIN_S,
     SlotProbe,
     SlotTokens,
@@ -172,12 +174,12 @@ class SpyJournal(TokenJournal):
         self.fake, self.crash_on_exact = fake, crash_on_exact
         self.minted_at_write, self.kinds = [], []
 
-    def record(self, slot, plane, expires_at, *, mint=None, provisional=False):
+    def record(self, slot, plane, expires_at, *, mint=None, provisional=False, **lifetime):
         if self.crash_on_exact and not provisional:
             raise SystemExit("the process died after minting")
         self.minted_at_write.append(len([r for r in self.fake.requests if r.path.endswith("/tokens/temporary")]))
         self.kinds.append("provisional" if provisional else "exact")
-        super().record(slot, plane, expires_at, mint=mint, provisional=provisional)
+        super().record(slot, plane, expires_at, mint=mint, provisional=provisional, **lifetime)
 
 
 def test_tokens_of_a_leased_slot_are_minted_on_its_two_users_and_their_end_is_journalled(slots, client, tmp_path, fake):
@@ -273,6 +275,57 @@ def test_c19_a_pause_before_the_mint_cannot_push_a_tokens_expiry_past_its_journa
         now[0] = moment
         freed.append(SlotProbe(journal, clock=lambda: now[0]).resource_gone(lease.key, {}))
     assert freed == [False, False, True]
+
+
+def mint_for(slots, client, directory, ceiling_s):
+    """Lease the first slot from a pool of its own and mint a reading run's tokens for a whole-time ceiling."""
+    config, loaded = slots
+    lease = LeasePool(directory, loaded.keys_of, SlotProbe(TokenJournal(directory))).acquire(GROUP, timeout_s=0)
+    issuer = TokenIssuer(client, config, clock=lambda: NOW)
+    minter = SlotTokens(issuer, config, loaded, TokenJournal(directory), events=no_events, clock=lambda: NOW)
+    return lease, minter.mint(lease, ceiling_s=ceiling_s, condition="read")
+
+
+def test_o06_a_runs_tokens_and_its_slot_end_with_its_own_ceiling_not_a_longer_one(slots, client, tmp_path):
+    """O06 with C19: a run whose whole time is bounded at 600 s gets tokens that live 600 s plus the margins (900 s
+    after the ceiling, 300 s of headroom before the run starts), 1800 s in all, and its slot is free 60 s past that.
+    The same run under the default ceiling, three times its cap, holds its slot 1200 s longer."""
+    ends = {}
+    for ceiling in (600.0, 1800.0):
+        directory = tmp_path / f"leases-{ceiling:g}"
+        lease, tokens = mint_for(slots, client, directory, ceiling)
+        end = TokenJournal(directory).latest_expiry(lease.key)
+        assert tokens.data_path.expires_at == tokens.tool_server.expires_at == end
+        freed = [
+            SlotProbe(TokenJournal(directory), clock=lambda moment=moment: moment).resource_gone(lease.key, {})
+            for moment in (end + SAFETY_MARGIN_S, end + SAFETY_MARGIN_S + 1)
+        ]
+        assert freed == [False, True]
+        ends[ceiling] = end
+    assert ends == {600.0: int(NOW) + 1800, 1800.0: int(NOW) + 3000}
+
+
+def test_o06_every_line_of_a_mint_records_the_lifetime_and_the_ceiling_it_was_minted_for(slots, client, tmp_path):
+    """O06: the provisional line and the exact line that settles it both say how long the slot's tokens were minted
+    for and the whole-time ceiling that lifetime follows, so the journal alone explains when the slot is free."""
+    directory = tmp_path / "leases"
+    mint_for(slots, client, directory, 600.0)
+    lines = [json.loads(line) for line in (directory / JOURNAL).read_text().splitlines()]
+    assert [line.get("provisional", False) for line in lines] == [True, False]
+    for line in lines:
+        assert (line["ttl_s"], line["ceiling_s"], line["expires_at"]) == (1800, 600.0, int(NOW) + 1800)
+
+
+def test_o06_a_journal_without_the_lifetime_still_reads_and_a_line_with_it_adds_nothing_to_the_end(tmp_path):
+    """O06: the lifetime and the ceiling are for a reader of the journal. A line written before they existed, or by a
+    caller that gives none, has neither key, and the slot's end is the same either way."""
+    journal = TokenJournal(tmp_path)
+    journal.record("one", "data_path", NOW + 700)
+    journal.record("two", "data_path", NOW + 700, ttl_s=1800, ceiling_s=600.0)
+    lines = [json.loads(line) for line in (tmp_path / JOURNAL).read_text().splitlines()]
+    assert lines[0] == {"slot": "one", "plane": "data_path", "expires_at": NOW + 700}
+    assert (lines[1]["ttl_s"], lines[1]["ceiling_s"]) == (1800, 600.0)
+    assert journal.latest_expiry("one") == journal.latest_expiry("two") == NOW + 700
 
 
 def test_c19_a_pause_so_long_that_a_token_would_be_too_short_refuses_it_and_the_journal_still_covers_it(

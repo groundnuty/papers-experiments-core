@@ -43,7 +43,10 @@ written to a journal beside the leases as a **provisional** line (durably: fsync
 the file), and then both tokens are minted with exactly that absolute expiry as their time caveat, so no delay between
 the journal line and the mint (the privilege reads take time) can push a token past it. After each token is examined
 its expiry must still equal the journalled one; a token that differs is refused, dropped and recorded with the expiry it
-does have. When both are minted, an **exact** line with the same mint id settles the provisional one.
+does have. When both are minted, an **exact** line with the same mint id settles the provisional one. Every line of a
+mint also says, for a reader, `ttl_s`, how long the tokens were minted to live, and `ceiling_s`, the run's whole-time
+ceiling (`AgentConfig.ceiling_s`, which a study may set in `[agent]`) that lifetime follows; the slot's end is still
+the lines' `expires_at` alone.
 
 `SlotProbe.resource_gone` answers True for a slot only once the clock is past the slot's journalled end plus a safety
 margin (the clocks of this host and of Onezone are not the same) and, when the platform supplies one, its sandbox probe
@@ -271,16 +274,32 @@ class TokenJournal:
         self._path = Path(directory) / JOURNAL
 
     def record(
-        self, slot: str, plane: str, expires_at: float, *, mint: str | None = None, provisional: bool = False
+        self,
+        slot: str,
+        plane: str,
+        expires_at: float,
+        *,
+        mint: str | None = None,
+        provisional: bool = False,
+        ttl_s: int | None = None,
+        ceiling_s: float | None = None,
     ) -> None:
         """Append one line and make it durable before returning: write, flush and fsync the file, and fsync the
         directory when the line created the file (and that directory's parent when it created the directory), so
-        neither a crash nor a power cut after this call can lose the expiry."""
+        neither a crash nor a power cut after this call can lose the expiry.
+
+        `ttl_s` and `ceiling_s` are for whoever reads the journal: how long the mint's tokens were minted to live and
+        the run's whole-time ceiling that lifetime follows (O06), so the line explains its own `expires_at`. They are
+        written only when given, and nothing reads them back: the slot's end is `expires_at` alone."""
         line: dict[str, Any] = {"slot": slot, "plane": plane, "expires_at": expires_at}
         if mint is not None:
             line["mint"] = mint
         if provisional:
             line["provisional"] = True
+        if ttl_s is not None:
+            line["ttl_s"] = ttl_s
+        if ceiling_s is not None:
+            line["ceiling_s"] = ceiling_s
         self._append(line)
 
     def record_indeterminate(self, slot: str) -> None:
@@ -410,9 +429,10 @@ class SlotTokens:
                 f"[toolserver] {self._config.condition_label(condition)}; lease a slot of the condition's group"
             )
         window = token_window(ceiling_s, self._config.tokens)
+        lifetime = {"ttl_s": window.mint_ttl_s, "ceiling_s": ceiling_s}  # on every line of this mint (O06)
         mint = secrets.token_hex(8)
         valid_until = int(self._clock()) + window.mint_ttl_s
-        self._journal.record(slot.name, "provisional", valid_until, mint=mint, provisional=True)
+        self._journal.record(slot.name, "provisional", valid_until, mint=mint, provisional=True, **lifetime)
         try:
             tokens = self._issuer.mint_run_tokens(
                 data=slot.data_path if interface is not None else None,
@@ -425,12 +445,12 @@ class SlotTokens:
             if refused.expires_at is None:
                 self._journal.record_indeterminate(slot.name)
             else:
-                self._journal.record(slot.name, "refused", refused.expires_at)
+                self._journal.record(slot.name, "refused", refused.expires_at, **lifetime)
                 if refused.expires_at > valid_until:
                     self._beyond_request(self._slots.label(slot.name), valid_until, refused)
             raise
         latest = max((t for t in (tokens.data_path, tokens.tool_server) if t is not None), key=lambda t: t.expires_at)
-        self._journal.record(slot.name, latest.plane.value, latest.expires_at, mint=mint)
+        self._journal.record(slot.name, latest.plane.value, latest.expires_at, mint=mint, **lifetime)
         return tokens
 
     def _beyond_request(self, label: str, requested: int, refused: DroppedToken) -> None:

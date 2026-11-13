@@ -254,7 +254,8 @@ class ToolServerLauncher:
         examination, a principal whose privileges differ from the condition's rights, and a read of either that fails
         (an outage included) raise `InfraError` of kind `tool_plane_integrity` before the server is started; a server
         that fails to start is the server's own. `ceiling_s` is the same value the token was minted for, so a token that
-        cannot last the run fails here.
+        cannot last the run fails here; the platform's `tool_server` passes the ceiling its launch minted for and
+        refuses another.
 
         On leaving, after the server has stopped, the principal's privileges and the token are checked again: a
         change from the condition's declared rights records `tool_plane_rights_changed` and raises `InfraError` of kind

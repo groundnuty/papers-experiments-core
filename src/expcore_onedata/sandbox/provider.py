@@ -57,7 +57,7 @@ from expcore_onedata.sandbox.inputs import InputsRecord
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
-from expcore_onedata.tokens import MintedToken, Plane, RunTokens, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, Plane, RunTokens, TokenIssuer, data_path_spec, token_window
 from expcore_onedata.users import GROUP, SlotProbe, Slots, SlotTokens, TokenJournal
 
 if TYPE_CHECKING:
@@ -244,6 +244,7 @@ class _ToolPlane:
     condition: str
     token: MintedToken
     principal: Principal
+    ceiling_s: float  # the whole-time ceiling the token was minted for: the server's checks of it use no other (O06)
 
 
 class SandboxPlatform:
@@ -409,10 +410,12 @@ class SandboxPlatform:
         lease: Lease | None,
         tokens: RunTokens | None,
         condition: str | None,
+        ceiling_s: float,
         inputs: Sequence[ReadOnlyInput] = (),
     ) -> DockerSandbox:
         """The sandbox of a run, built and not started: it has no effect on the host, so a launch holds it, and can stop
-        it, from before the first resource exists."""
+        it, from before the first resource exists. Its metadata records each token's expiry beside the lifetime it was
+        minted for and the whole-time ceiling that lifetime follows (O06)."""
         data = tokens.data_path if tokens is not None else None
         sandbox = DockerSandbox(
             self._host,
@@ -424,12 +427,15 @@ class SandboxPlatform:
         )
         # never a value, and the slot by its place in the file, never by its name (O12)
         slot = self._slots.keys_of(GROUP).index(lease.key) if lease is not None else "principals.data_path"
+        lifetime = {}  # a run that minted nothing records no lifetime; one that minted had its ceiling accepted
+        if tokens is not None:
+            lifetime = {"ttl_s": token_window(ceiling_s, self._config.tokens).mint_ttl_s, "ceiling_s": ceiling_s}
         if data is not None:
-            sandbox.record(data_path_token={"slot": slot, "expires_at": data.expires_at})
+            sandbox.record(data_path_token={"slot": slot, "expires_at": data.expires_at, **lifetime})
         if tokens is not None and tokens.tool_server is not None and lease is not None:
-            sandbox.record(tool_server_token={"slot": slot, "expires_at": tokens.tool_server.expires_at})
+            sandbox.record(tool_server_token={"slot": slot, "expires_at": tokens.tool_server.expires_at, **lifetime})
             principal = self._slots.users_of(lease).tool_server
-            self._planes[sandbox] = _ToolPlane(str(condition), tokens.tool_server, principal)
+            self._planes[sandbox] = _ToolPlane(str(condition), tokens.tool_server, principal, ceiling_s)
         return sandbox
 
     @contextlib.asynccontextmanager
@@ -462,7 +468,9 @@ class SandboxPlatform:
 
         The start and the stop are each inside `ctx.infrastructure_wait("sandbox_lifecycle")`; the body is the agent's
         own time. A teardown that leaves something behind raises `InfraError("sandbox")` when nothing else is in
-        flight, and the lease's probe then keeps the key quarantined. `ceiling_s` is the run's whole-time ceiling (O06).
+        flight, and the lease's probe then keeps the key quarantined. `ceiling_s` is the run's whole-time ceiling (O06): the
+        executor passes the loop's own, `AgentConfig.ceiling_s`, which a study may set in `[agent]` of campaign.toml,
+        so the tokens live as long as the run can: that ceiling plus the margins of `[tokens]`.
         When the data gate refused an answer for its own integrity during the run, the run ends in `InfraError` of
         kind `data_gate_integrity` (`kinds.gate_error`), whatever its body raised or returned (O05, C01).
 
@@ -505,7 +513,7 @@ class SandboxPlatform:
                 )
                 minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
                 tokens = await asyncio.shield(minting)
-                sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
+                sandbox = self._prepare(run_key, level, lease, tokens, condition, ceiling_s, inputs)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
@@ -534,12 +542,22 @@ class SandboxPlatform:
 
     @contextlib.asynccontextmanager
     async def tool_server(
-        self, ctx: CallContext, sandbox: DockerSandbox, *, ceiling_s: float, extra_env: Mapping[str, str] | None = None
+        self,
+        ctx: CallContext,
+        sandbox: DockerSandbox,
+        *,
+        ceiling_s: float | None = None,
+        extra_env: Mapping[str, str] | None = None,
     ) -> AsyncIterator[McpToolProvider]:
         """Start the tool server of a run whose sandbox `launch` yielded, and yield its tool provider; stop it on leaving.
 
         The server takes the tool-server token minted with the run's data-path token on the same leased slot, and the
         launcher requires that token's subject to be the slot's tool-server user; nothing else can give it a token.
+
+        The server re-examines its token against a whole-time ceiling, at its start and again after it stops, and that
+        has to be the ceiling the token was minted for (O06): a longer one would refuse a correct token, and a shorter
+        one would pass a token the run could outlive. So `ceiling_s` is best left out: it then defaults to the one
+        `launch` was given, and any other value raises `ValueError` before anything starts.
         """
         plane = self._planes.get(sandbox)
         if plane is None:
@@ -548,8 +566,13 @@ class SandboxPlatform:
             )
         if self._launcher is None:
             raise ValueError("the platform was built without a tool-server launcher")
+        if ceiling_s is not None and ceiling_s != plane.ceiling_s:
+            raise ValueError(
+                f"the tool-server token was minted for a whole-time ceiling of {plane.ceiling_s:g} s, "
+                f"not {ceiling_s:g} s: the server's checks of it use the ceiling it was minted for"
+            )
         async with self._launcher.launch(
-            ctx, plane.condition, plane.token, ceiling_s=ceiling_s, extra_env=extra_env, principal=plane.principal
+            ctx, plane.condition, plane.token, ceiling_s=plane.ceiling_s, extra_env=extra_env, principal=plane.principal
         ) as provider:
             yield provider
 
