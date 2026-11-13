@@ -279,7 +279,10 @@ class SparseBaseline(Baseline):
 
     def _remove_lost(self, planned: PlannedFile, before: Entry, phase: str) -> None:
         """Delete an empty file a lost creation left, journalled first so that a failed delete is tried again by the
-        next restore, and wait until every provider answers it absent before the name is written again."""
+        next restore, and wait until every provider answers it absent before the name is written again. The staged
+        source is checked first, as in every removal: with a damaged copy the file stays and this file's restore fails,
+        rather than leave the path empty with nothing to write back."""
+        self.check_source(planned)
         label = planned.label
         self.journal(entry="intent", label=label, action=REMOVE_LOST, file_id=before.file_id, phase=phase)
         try:

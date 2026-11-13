@@ -277,7 +277,7 @@ def test_o44_a_creation_whose_answer_was_lost_is_taken_back_and_the_file_written
     again.stop()
 
 
-def test_o44_a_lost_creation_whose_removal_failed_is_removed_by_the_next_start(make, fake, provisioner):
+def test_o44_a_lost_creation_whose_removal_failed_is_removed_by_the_next_start(make, fake, provisioner, tmp_path):
     """O44: the answer of the new file's creation was lost and the recovery's delete of the empty file failed too, so
     the attempt is set aside with the empty file in place; its removal's intent is journalled, so the next start
     removes it, writes the day back whole and sets the start state."""
@@ -298,7 +298,14 @@ def test_o44_a_lost_creation_whose_removal_failed_is_removed_by_the_next_start(m
     assert (fake.id_of(DAY_PATH), len(node(fake).content)) == (lost[0], 0)
     del provisioner.mutate
     fake.fail_deletes = False
-    again = make(ROW)
+    damaged = make(ROW)
+    (tmp_path / "staged" / "day-13.csv").write_bytes(DAY[:-1] + b"?")  # the empty file stays, nothing is deleted
+    deletes = sum(1 for c in fake.provider_calls if c[1] == "DELETE")
+    with pytest.raises(InfraError):
+        damaged.start({})
+    assert fake.id_of(DAY_PATH) == lost[0]
+    assert sum(1 for c in fake.provider_calls if c[1] == "DELETE") == deletes
+    again = make(ROW)  # the staged copy written whole again
     again.start({})
     assert again.finish()["start"]["restore"]["day-13"]["action"] == "created"
     assert lost[0] not in {fake.id_of(DAY_PATH)}
