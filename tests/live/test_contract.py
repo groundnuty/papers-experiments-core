@@ -3,13 +3,15 @@
     EXPCORE_LIVE_PLATFORM=/path/to/platform.toml uv run pytest tests/live
     EXPCORE_LIVE_SLOW=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live   # also the test that waits out a lifetime
     EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live  # also the test that takes a provider down
+    EXPCORE_LIVE_REVOKE=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live  # also the test that revokes tokens
 
 They check what the fake can only assume: that the endpoints the layer calls answer in the shape it parses. They read
 (health, discovery, the examination of a token, and, with EXPCORE_LIVE_CONTENT_PATH naming a provisioned file by its
 path in the space, that file's content) and mint a short-lived token per plane for the configured fixed users.
-Tokens are never revoked, so each one ends with its lifetime. Nothing here changes a space, a file or a privilege, and
-without the variable nothing is constructed or contacted. Only with EXPCORE_LIVE_FAULTS=1 as well does the fault test
-take a provider declared in `[faults]` down and bring it back.
+Each one ends with its lifetime; only with EXPCORE_LIVE_REVOKE=1 does one test revoke every temporary token of the
+`[principals.service]` user, as a run's teardown revokes its slot users'. Nothing here changes a space, a file or a
+privilege, and without the variable nothing is constructed or contacted. Only with EXPCORE_LIVE_FAULTS=1 as well does
+the fault test take a provider declared in `[faults]` down and bring it back.
 """
 
 import os
@@ -47,7 +49,7 @@ from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E
 from expcore_onedata.health import PlatformHealth  # noqa: E402
 from expcore_onedata.sandbox import gateboundary  # noqa: E402
 from expcore_onedata.tokencheck import CaveatSpec  # noqa: E402
-from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
+from expcore_onedata.tokens import RevocationUnconfirmed, TokenIssuer, data_path_spec  # noqa: E402
 from expcore_onedata.tokenscope import admin_privileges, effective_clusters  # noqa: E402
 
 CEILING_S = 300.0
@@ -261,7 +263,7 @@ def test_a_writing_tool_server_token_acts_in_no_cluster(config, client, issuer):
 
 @SLOW
 def test_a_token_stops_working_when_its_lifetime_ends(config, client):
-    """Tokens are not revoked; they expire. Mint with a minimal lifetime, wait it out, expect a refusal: 401 or 403, or
+    """A token not revoked expires. Mint with a minimal lifetime, wait it out, expect a refusal: 401 or 403, or
     the 400 `tokenCaveatUnverified` with which Onedata 25.0 answers the scope inference of a token past its time
     caveat (seen on the Compose federation of deploy/compose-federation, 10 Nov 2026)."""
     user = service_user(config)
@@ -273,6 +275,30 @@ def test_a_token_stops_working_when_its_lifetime_ends(config, client):
         read_space(client, value, config.space.id)
     answer = (refused.value.status, refused.value.code)
     assert answer[0] in (401, 403) or answer == (400, "tokenCaveatUnverified")
+
+
+REVOKE = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_REVOKE") != "1",
+    reason="EXPCORE_LIVE_REVOKE=1 is not set; this test revokes every temporary token of [principals.service]",
+)
+
+
+@REVOKE
+def test_a_users_own_revocation_raises_its_generation_and_its_token_then_verifies_as_revoked(config, client, issuer):
+    """C19: the revocation a run's teardown sends for each slot user, sent here for the health check's own user, whose
+    tokens are minted per check: run it only when nothing else holds a token of that user. Before it the token is not
+    revoked (it verifies, or is refused for its data-access caveats); after it the user's generation has risen and the
+    token verifies as 400 `tokenRevoked`. Named by oz-worker's source alone (14b5bda, `token_routes.erl:163-176`)."""
+    # covers: GET /user/tokens/temporary
+    # covers: DELETE /user/tokens/temporary
+    # covers: POST /tokens/verify_access_token
+    user = service_user(config)
+    token = issuer.mint(data_path_spec(config.space.id), user, ceiling_s=CEILING_S)
+    with pytest.raises(RevocationUnconfirmed):  # it verifies, or is refused for its caveats: either way not revoked
+        issuer.require_revoked(token.reveal())
+    before, after = issuer.revoke_own(user)
+    assert after > before
+    issuer.require_revoked(token.reveal())  # answered 400 tokenRevoked, and nothing else
 
 
 # -- step 4b2: placement, probes and day-0 checks ----------------------------------------------------------------------

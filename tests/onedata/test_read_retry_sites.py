@@ -150,6 +150,8 @@ CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient.mutate", "self._target"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient.read_range", "self._target"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient.read_range", "self._request(GET)"): ["ONE_ATTEMPT"],  # it may have fetched bytes
+    # a revocation's confirmation: a failed read writes no revoked line, so the slot stays held (fail closed)
+    ("client.py", "OnezoneClient.own_temporary_generation", "self._send(GET)"): ["ONE_ATTEMPT"],
     ("client.py", "OnezoneClient.read_content", "self._target"): ["gate", "gate"],  # bounded by the deadline left
     ("client.py", "OnezoneClient._stream_range", "http.stream"): ["<streamed>"],
     ("client.py", "OnezoneClient.content_answer", "self._target"): ["_ONE_ATTEMPT"],  # the pre-campaign measurement

@@ -39,6 +39,8 @@ margin_s = 900                  # a token outlives the run's whole-time ceiling 
 max_excess_s = 600              # and by at most this much more
 mint_headroom_s = 300           # the lifetime asked for beyond the minimum, for the seconds before examination
 max_ttl_s = 86400               # optional: the longest lifetime the platform grants
+revocation_settle_s = 330       # a slot's revoked tokens count as gone this long after the revocation is confirmed;
+                                #   at least 315, the propagation bound (300 s cache purge + 15 s session recheck)
 
 [principals.data_path]          # optional fixed users for runs that lease none (day-0, health, live checks)
 username = "..."                # the login name whose credential file is read
@@ -103,6 +105,13 @@ from expcore_onedata.tls import TlsSettings, load_tls, moved
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 HOSTNAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
+# The shortest settle a revocation may have: the bound of its propagation to a provider, the cache purge 300 s after
+# the provider lost its connection to Onezone plus the 15 s an open session waits before it checks its token again.
+REVOCATION_SETTLE_MIN_S = 315
+REVOCATION_SETTLE_BOUND = (
+    f"at least {REVOCATION_SETTLE_MIN_S} s, the bound of a revocation's propagation: a provider purges its cache 300 s "
+    "after it lost its connection to Onezone, and an open session checks its token again every 15 s"
+)
 
 
 @dataclass(frozen=True)
@@ -133,12 +142,18 @@ class Provider:
 
 @dataclass(frozen=True)
 class TokenSettings:
-    """The lifetime rule's numbers (O06)."""
+    """The lifetime rule's numbers (O06), and how long a confirmed revocation takes to settle (C19).
+
+    `revocation_settle_s` covers its propagation to the providers: pushed at once over Graph Sync, and at worst the
+    300 s after which a provider whose connection to Onezone broke purges its cache, plus the 15 s an open session
+    waits before it checks its token again (`users.py`). A shorter one than that bound, `REVOCATION_SETTLE_MIN_S`
+    (315 s), is refused, here and by `revocation.revoke_slot`."""
 
     margin_s: int = 900
     max_excess_s: int = 600
     mint_headroom_s: int = 300
     max_ttl_s: int | None = None
+    revocation_settle_s: int = 330
 
 
 @dataclass(frozen=True)
@@ -382,7 +397,7 @@ def _providers(root: Section) -> dict[str, Provider]:
 
 def _tokens(section: Section) -> TokenSettings:
     """Read the optional [tokens] table."""
-    section.reject_unknown(("margin_s", "max_excess_s", "mint_headroom_s", "max_ttl_s"))
+    section.reject_unknown(("margin_s", "max_excess_s", "mint_headroom_s", "max_ttl_s", "revocation_settle_s"))
     base = TokenSettings()
     max_ttl = _number(section, "max_ttl_s", 0, minimum=1, integer=True) if "max_ttl_s" in section.data else None
     settings = TokenSettings(
@@ -390,10 +405,22 @@ def _tokens(section: Section) -> TokenSettings:
         int(_number(section, "max_excess_s", base.max_excess_s, minimum=0, integer=True)),
         int(_number(section, "mint_headroom_s", base.mint_headroom_s, minimum=0, integer=True)),
         None if max_ttl is None else int(max_ttl),
+        _settle(section, base.revocation_settle_s),
     )
     if settings.mint_headroom_s > settings.max_excess_s:
         raise section.fail("mint_headroom_s", "must not exceed max_excess_s, or a fresh token fails its examination")
     return settings
+
+
+def _settle(section: Section, default: int) -> int:
+    """Read the optional `revocation_settle_s`: an integer no shorter than the propagation bound, so a slot is never
+    freed while a provider may still accept a revoked token from its cache."""
+    if "revocation_settle_s" not in section.data:
+        return default
+    value = section.data["revocation_settle_s"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < REVOCATION_SETTLE_MIN_S:
+        raise section.fail("revocation_settle_s", f"must be an integer of {REVOCATION_SETTLE_BOUND}")
+    return value
 
 
 def _principal(section: Section, key: str) -> Principal | None:
