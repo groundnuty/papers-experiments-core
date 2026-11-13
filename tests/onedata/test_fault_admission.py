@@ -97,6 +97,16 @@ class WatchedLock(FederationLock):
         return held
 
 
+WAIT_S = 10.0  # the bound of every wait of a test that holds the lock between threads
+GRACE_S = 0.3  # how long a party that must be held back is given to get in anyway
+
+
+def held_back(entered, names, grace_s=GRACE_S):
+    """The names, after a grace, that are in despite the test not having let them: empty when each is held back."""
+    time.sleep(grace_s)
+    return [name for name in names if entered[name].is_set()]
+
+
 def overlapping(one, other):
     """Whether two holds, each its `in` and `out` times, share any instant."""
     return one["in"] < other["out"] and other["in"] < one["out"]
@@ -299,39 +309,61 @@ def test_o11_a_writer_is_admitted_once_the_readers_at_its_arrival_finish_and_lat
     outage run gets in, and readers arriving after it wait for it, so a steady stream of readers cannot starve it. No
     hold overlaps the outage run's.
 
-    Each arrival waits on the lock's state, not on a sleep: the writer starts once both present readers are in, and the
-    later readers once the writer holds the turnstile, so a slow thread start cannot turn a present reader into a later
-    one and falsify the premise."""
+    Every party holds until the test lets it go, so the contention is the test's to keep and not a matter of sleeps a
+    slow thread could outlast: the present readers hold until `release_present`, the outage run until `release_writer`.
+    The test shows the outage run waiting while the present readers hold (it holds the turnstile and is not in), shows
+    the later readers held at the turnstile while it waits and again while it holds, and checks each hold against the
+    others from the times it recorded."""
     platform = write_faults(tmp_path)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     present, later = ["first", "second"], [f"later{i}" for i in range(3)]
     lock = WatchedLock(settings, [*present, "writer", *later])
     holds: dict[str, dict[str, float]] = {}
     entered = {name: threading.Event() for name in lock.at_turnstile}
+    trying = {name: threading.Event() for name in later}
+    release_present, release_writer = threading.Event(), threading.Event()
 
-    def holder(name, exclusive, hold_s):
+    def holder(name, exclusive, release=None):
         def run():
-            with lock.held(exclusive=exclusive, timeout_s=10):
+            if name in trying:
+                trying[name].set()  # about to ask for the lock
+            with lock.held(exclusive=exclusive, timeout_s=3 * WAIT_S):
                 holds[name] = {"in": time.monotonic()}
                 entered[name].set()
-                time.sleep(hold_s)
+                if release is not None:
+                    assert release.wait(WAIT_S), f"{name} was never let go"
                 holds[name]["out"] = time.monotonic()
 
         return in_thread(run, name=name)
 
-    threads = [holder("first", False, 0.4), holder("second", False, 0.6)]
-    assert all(entered[name].wait(10) for name in present)  # both readers are on the federation
-    threads.append(holder("writer", True, 0.2))
-    assert lock.at_turnstile["writer"].wait(10)  # the outage run has arrived: it holds the turnstile
-    threads += [holder(name, False, 0.4) for name in later]
-    for thread, landed in threads:
-        thread.join(15)
-        assert landed == [None]
+    threads: list = []
+    try:
+        threads += [holder(name, False, release_present) for name in present]
+        assert all(entered[name].wait(WAIT_S) for name in present)  # both readers are on the federation
+        threads.append(holder("writer", True, release_writer))
+        assert lock.at_turnstile["writer"].wait(WAIT_S)  # the outage run has arrived: it holds the turnstile
+        assert held_back(entered, ["writer"]) == [], "the outage run was admitted with readers on the federation"
+        threads += [holder(name, False) for name in later]
+        assert all(trying[name].wait(WAIT_S) for name in later)
+        assert held_back(entered, later) == [], "a reader that arrived after the outage run passed it"
+        release_present.set()
+        assert entered["writer"].wait(WAIT_S)  # the readers it waited for are gone: it is in
+        assert held_back(entered, later) == [], "a reader that arrived after the outage run got in while it holds"
+        release_writer.set()
+        for thread, landed in threads:
+            thread.join(WAIT_S)
+            assert not thread.is_alive()
+            assert landed == [None]
+    finally:  # a failed check must not leave a thread parked on the lock or on an Event
+        release_present.set()
+        release_writer.set()
+        for thread, _ in threads:
+            thread.join(WAIT_S)
     writer = holds["writer"]
     assert [name for name in present + later if overlapping(holds[name], writer)] == [], holds
     assert writer["in"] >= max(holds[name]["out"] for name in present), holds
     assert all(holds[name]["in"] >= writer["out"] for name in later), holds
-    # the turnstile held the later readers back until the writer had the main lock
+    # the turnstile let a later reader through only once the writer had the main lock
     assert all(lock.taken[name, FEDERATION_INTENT] >= lock.taken["writer", FEDERATION_LOCK] for name in later)
 
 
