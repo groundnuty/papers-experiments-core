@@ -11,7 +11,7 @@ never from an exit code. Their categories map to the core's vocabulary of infras
   `unattributed_kill`, retried within the attempt limit.
 
 Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). The platform's own kinds are registered here,
-when this module is first imported. Three are the sandbox's and the ingest's, and none is treatable:
+when this module is first imported. Four are the sandbox's and the ingest's, and none is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
   its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
@@ -30,6 +30,11 @@ when this module is first imported. Three are the sandbox's and the ingest's, an
   state, write or confirm an arrival, or restore the dataset's baseline after the run (O27). Data missing or partial
   because the plan has not finished is the condition's manipulation and the agent's outcome, never this kind; an
   ingest that fails on its own says nothing about the agent, so the run is set aside and no condition may declare it.
+- `cell_unkillable`: a process of a cell outlived its kill at the cell's deadline (a read waiting in the kernel on the
+  FUSE mount, as one of a file only a stopped provider holds does), so the sandbox aborted the mount or stopped
+  (`deadline.py`, O34). The harness could not bound the cell, and the run's mount or sandbox is gone: the run says
+  nothing about the agent or the manipulation, so it is set aside, and no condition may declare it, an outage's
+  included. A cell killed cleanly at its deadline is the agent's own time limit, never this kind.
 
 This is the one module of the platform layer that registers kinds, so a study names it alone in `[study] platforms` to
 make every kind the layer raises known before its conditions are validated, and `check` imports it alone for a record
@@ -43,7 +48,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from expcore.errors import InfraError, register_infra_kind
-from expcore_onedata.sandbox import infradeath
+from expcore_onedata.sandbox import infradeath, killcause
 
 DATA_GATE_INTEGRITY = "data_gate_integrity"
 register_infra_kind(
@@ -76,6 +81,15 @@ register_infra_kind(
     treatable=False,
 )
 
+CELL_UNKILLABLE = "cell_unkillable"
+register_infra_kind(
+    CELL_UNKILLABLE,
+    "a process of the agent's code outlived its kill at the cell's deadline (a read waiting in the kernel on the FUSE "
+    "mount), so the sandbox aborted the mount or stopped: the harness could not bound the cell, and the run says "
+    "nothing about the agent or the manipulation",
+    treatable=False,
+)
+
 KIND_OF_CATEGORY: Mapping[str, str | None] = {
     "agent": None,
     "infrastructure": "sandbox",
@@ -88,10 +102,30 @@ def kind_of(category: str | None) -> str | None:
     return KIND_OF_CATEGORY.get(category or "", "unattributed_kill")
 
 
+def deadline_error(kill: Mapping[str, Any] | None) -> InfraError | None:
+    """The error of a cell that outlived its kill at its deadline (`killcause.KILL_SURVIVED`), or None for any other
+    cell: kind `cell_unkillable`, with how the deadline ended. It comes before every other error of the cell, the
+    gate's refusals included: after an abort or a stop, nothing read from the run is the cell's own evidence."""
+    if not kill or kill.get("reason") != killcause.KILL_SURVIVED:
+        return None
+    outcome = (kill.get("deadline") or {}).get("outcome", "unknown")
+    return InfraError(CELL_UNKILLABLE, f"a process of the agent's code outlived its kill at its deadline ({outcome})")
+
+
+def run_ended_error(record: Mapping[str, Any]) -> InfraError:
+    """The error of every later cell of a run a cell's deadline ended (O34), and of its collection once the sandbox was
+    stopped: kind `cell_unkillable`, with how that deadline ended."""
+    outcome = record.get("outcome", "unknown")
+    return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}): nothing more runs")
+
+
 def kill_error(kill: Mapping[str, Any] | None) -> InfraError | None:
     """The error a killed cell makes of its attempt; None when the kill was the agent's own outcome, or absent."""
     if not kill:
         return None
+    survived = deadline_error(kill)
+    if survived is not None:
+        return survived
     kind = kind_of(kill.get("category"))
     if kind is None:
         return None
@@ -140,6 +174,7 @@ def collection_error(what: str, reason: str) -> InfraError:
 
 
 __all__ = [
+    "CELL_UNKILLABLE",
     "DATA_GATE_INTEGRITY",
     "INGEST_FAILURE",
     "INJECTOR_FAILURE",
@@ -147,8 +182,10 @@ __all__ = [
     "OUTPUT_COLLECTION",
     "PROVIDER_OUTAGE",
     "collection_error",
+    "deadline_error",
     "death_error",
     "gate_error",
     "kill_error",
     "kind_of",
+    "run_ended_error",
 ]

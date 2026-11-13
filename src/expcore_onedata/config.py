@@ -91,7 +91,7 @@ from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
-from expcore_onedata.rights import BASELINE_RIGHTS, KNOWN_RIGHTS, declares_qos, declares_write
+from expcore_onedata.rights import declares_qos, declares_write, rights_problem
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
@@ -448,10 +448,9 @@ def _condition(name: str, section: Section, base: Path) -> Condition:
     allow, rights = section.strings("allow"), section.strings("rights")
     if not allow or len(set(allow)) != len(allow):
         raise section.fail("allow", "must list at least one tool, each once")
-    if len(set(rights)) != len(rights) or any(right not in KNOWN_RIGHTS for right in rights):
-        raise section.fail("rights", f"must list known rights, each once; known: {', '.join(KNOWN_RIGHTS)}")
-    if not all(right in rights for right in BASELINE_RIGHTS):
-        raise section.fail("rights", f"must include {' and '.join(BASELINE_RIGHTS)}")
+    problem = rights_problem(rights)
+    if problem is not None:
+        raise section.fail("rights", problem)
     manifest = (base / section.string("manifest")).resolve()
     if not manifest.is_file():
         raise section.fail("manifest", "is not a file; freeze the server's manifest first")

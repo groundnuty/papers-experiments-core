@@ -6,8 +6,12 @@
 """Policy gate: the only network peer the sandbox has (the sandbox network is internal).
 
 Runs in its own container, as root with all capabilities but NET_BIND_SERVICE
-dropped, attached to the sandbox's internal network and to a bridge to reach
-the upstream. Configuration: JSON at the path in argv[1]:
+dropped (so it reads only files root owns or anyone may read: the sandbox gives it
+its keys and its token file as root's), attached to the sandbox's internal network
+and to the network it reaches the upstream on: docker's default bridge, or the
+federation's own network that `[sandbox.federation]` names, where the `hosts` are
+the zone's and the local provider's names there. Configuration: JSON at the path
+in argv[1]:
 
   {"run_key": "...", "verify_ssl": true, "log": "/var/gate/requests.jsonl",
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
@@ -903,7 +907,8 @@ class Handler(BaseHTTPRequestHandler):
             if dec.merge_pages:
                 self._complete_listing(hcfg, url, headers, body, rec)
             else:
-                self._forward(hcfg, url, headers, body, rec)
+                # the token-scope inference carries the gate's token in its body, never in a header (O30)
+                self._forward(hcfg, url, headers, body, rec, auth=dec.tag != "scope")
         except (ConnectionError, ssl.SSLError) as e:
             # unwrapped connection and TLS errors come only from the client's socket (upstream ones arrive as
             # _Upstream): the client went away, for instance while the headers were written; its own doing, not an error
@@ -928,8 +933,11 @@ class Handler(BaseHTTPRequestHandler):
             with contextlib.suppress(OSError):
                 self._answer(rec, 502, {"error": {"id": "badGateway", "details": details}})
 
-    def _fwd_headers(self, headers: dict) -> dict:
-        # the run attribution is the gate's: whatever the agent sent under that name is dropped, then ours is added
+    def _fwd_headers(self, headers: dict, *, auth: bool = True) -> dict:
+        # the run attribution is the gate's: whatever the agent sent under that name is dropped, then ours is added.
+        # `auth` False sends no credential header at all: the token-scope inference is public on Onezone (oz-worker
+        # token_routes.erl, `scope = public`) and names its token in the body, but a request carrying a token in a header
+        # is first authenticated with it, which a data-path token's data-access caveats fail with 401 (live, 13 Nov)
         out = {
             k: v
             for k, v in headers.items()
@@ -939,7 +947,9 @@ class Handler(BaseHTTPRequestHandler):
         out["Accept-Encoding"] = "identity"  # a body the boundary can read: never compressed, whatever the agent asked
         if CFG.get("run_key"):
             out[RUN_HEADER] = CFG["run_key"]
-        if CFG.get("token"):  # the credential is the gate's: the agent holds none, and any it sent is gone (O05)
+        if auth and CFG.get(
+            "token"
+        ):  # the credential is the gate's: the agent holds none, and any it sent is gone (O05)
             out[AUTH_HEADER] = CFG["token"]
         return out
 
@@ -966,9 +976,10 @@ class Handler(BaseHTTPRequestHandler):
         with contextlib.suppress(OSError):  # a client gone meanwhile: the line is logged all the same
             self._answer(rec, 502, {"error": {"id": "badGateway", "details": details}})
 
-    def _forward(self, hcfg, url, headers, body, rec) -> None:
+    def _forward(self, hcfg, url, headers, body, rec, *, auth: bool = True) -> None:
         target = url.path + ("?" + url.query if url.query else "")
-        self._pass_on(hcfg, self._upstream(hcfg, self.command, target, body, self._fwd_headers(headers), rec), rec)
+        fwd = self._fwd_headers(headers, auth=auth)
+        self._pass_on(hcfg, self._upstream(hcfg, self.command, target, body, fwd, rec), rec)
 
     def _screen(self, hcfg, resp, rec) -> list[tuple[str, str]] | None:
         """The boundary's checks of an answer's status and headers (O05): the headers that may go to the agent, or None

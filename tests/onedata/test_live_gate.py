@@ -24,7 +24,13 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
     assert "EXPCORE_LIVE_PLATFORM is not set" in done.stdout
     assert "EXPCORE_LIVE_DOCKER is not set" in done.stdout
     assert "EXPCORE_LIVE_DOCKER=1, EXPCORE_LIVE_MUTATE=1 and EXPCORE_LIVE_PLATFORM are needed" in done.stdout
-    assert "3 skipped" in done.stdout
+    # every live module is skipped whole, and none runs a test: counted from the files, so a new live module is
+    # covered without editing this test
+    modules = sorted((ROOT / "tests" / "live").glob("test_*.py"))
+    assert modules
+    assert f"{len(modules)} skipped" in done.stdout, done.stdout[-800:]
+    for outcome in (" passed", " failed", " error"):
+        assert outcome not in done.stdout, done.stdout[-800:]
 
 
 def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_reads_and_the_clock_are_unconfirmed():
