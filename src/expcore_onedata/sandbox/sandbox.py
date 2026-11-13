@@ -842,7 +842,8 @@ class DockerSandbox:
         is recorded under `harness_steps` with its exit status, its refusals and the host killer's kills it met, none
         of which the agent's first cell takes. Its only time limit is the backstop `timeout` in the container
         (`CAP_MARGIN_S` after `timeout_s`): the harness's timer, which would stop the agent's processes, is not started,
-        and no kill cause is read.
+        and no kill cause is read. A step that backstop killed is `timed_out`, with `bound` naming it, as a cell of the
+        agent's is when its timer kills it; a step that exits 137 sooner, by itself, is not (O39, `bounds`).
 
         A cell's limit is a hard deadline (deadline.py, O34): a process of the cell that outlives its kill has the
         mount aborted from the sidecar (`_abort_mount`), or the sandbox stopped (`_stop_at_deadline`), and the run is
@@ -953,6 +954,7 @@ class DockerSandbox:
                 "exit_code": res.exit_code if res.status == RAN else None,
                 "duration_s": res.duration_s,
                 "timed_out": res.timed_out,
+                "bound": res.bound,
                 "gate_refusals": list(res.gate_refusals),
                 "earlyoom_kills": self._cells.step_earlyoom(),
             }

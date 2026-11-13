@@ -449,3 +449,26 @@ def test_o20_a_read_only_input_is_read_and_run_but_never_changed_and_work_stays_
         sandbox.stop()
     refused = dict.fromkeys(("write", "beside", "rename", "chmod", "delete"), "EROFS")
     assert said == {"ran": "analysed", "read": "done", **refused, "work": "done"}
+
+
+@needs_platform
+def test_o39_a_harness_step_the_containers_timeout_killed_is_timed_out_and_a_step_that_kills_itself_is_not(
+    config, host
+):
+    """O39: in a real container a harness step (`record=False`) that sleeps past its limit is ended by the container's
+    own `timeout -s KILL` and reads as `timed_out` with the `container_timeout` bound, and one that kills itself at once
+    exits 137 too but is no timeout. The fake host cannot show which exit code the real `timeout` gives or how long
+    `docker exec` takes to start; this does."""
+    sandbox = DockerSandbox.start(
+        host, config.sandbox, spec_for(config, levels(config)[0], f"live-bound-{int(time.time())}")
+    )
+    try:
+        itself = sandbox.exec("import os\nos.kill(os.getpid(), 9)", 30, record=False)
+        hung = sandbox.exec("import time\ntime.sleep(3600)", 2.0, record=False)
+        steps = sandbox.metadata()["harness_steps"]
+    finally:
+        sandbox.stop()
+    assert (itself.exit_code, itself.timed_out, itself.bound) == (137, False, None)
+    assert hung.exit_code in (137, 124)
+    assert (hung.timed_out, hung.bound) == (True, "container_timeout")
+    assert [(step["timed_out"], step["bound"]) for step in steps] == [(False, None), (True, "container_timeout")]
