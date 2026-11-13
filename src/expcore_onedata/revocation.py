@@ -13,7 +13,9 @@ plane. Every check must pass before anything is journalled:
    as an error: the verification refuses a caveated token for its caveats anyway;
 3. then one **revoked** line, durably: `settle_until` is the clock then plus the settle time, by which the change has
    reached every provider (pushed over Graph Sync at once; at worst the 300 s purge after a provider's lost connection
-   to Onezone, plus the 15 s an open session waits before checking its token again).
+   to Onezone, plus the 15 s an open session waits before checking its token again). A settle time shorter than that
+   bound, 315 s (`config.REVOCATION_SETTLE_MIN_S`), is refused before anything is sent, whether it comes from
+   `[tokens] revocation_settle_s` or is passed directly.
 
 Any failure raises before the line, so the journal keeps the expiry rule. A line of the slot journalled while this ran
 can only be a mint that started meanwhile, which may have finished after a bump at the new generation and so holds a
@@ -28,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from expcore_onedata.config import REVOCATION_SETTLE_BOUND, REVOCATION_SETTLE_MIN_S
 from expcore_onedata.tokens import RevocationUnconfirmed, RunTokens, TokenIssuer
 
 if TYPE_CHECKING:
@@ -70,8 +73,12 @@ def revoke_slot(
     lease's lock is held); a line of the slot journalled meanwhile all the same turns the revocation into an
     indeterminate line and `RevocationUnconfirmed`.
     """
-    if isinstance(settle_s, bool) or not isinstance(settle_s, int | float) or not 0 <= settle_s < float("inf"):
-        raise ValueError("the settle time of a revocation must be a finite number of seconds, zero or more")
+    if (
+        isinstance(settle_s, bool)
+        or not isinstance(settle_s, int | float)
+        or not REVOCATION_SETTLE_MIN_S <= settle_s < float("inf")
+    ):
+        raise ValueError(f"a revocation's settle time must be a finite number of seconds {REVOCATION_SETTLE_BOUND}")
     mark = journal.written()  # before the first bump: a mint journalled after it may hold a token of the new generation
     generations = {"data_path": issuer.revoke_own(slot.data_path), "tool_server": issuer.revoke_own(slot.tool_server)}
     held = [t for t in (tokens.data_path, tokens.tool_server) if t is not None] if tokens is not None else []

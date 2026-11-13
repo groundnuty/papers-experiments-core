@@ -283,6 +283,23 @@ def test_c19_a_mint_journalled_while_the_slot_was_revoked_holds_the_slot_for_an_
     assert minted.journal.latest_expiry(KEY) == float("inf")
 
 
+@pytest.mark.parametrize("settle_s", [0, 314, -1, float("inf"), True])
+def test_c19_a_direct_settle_below_the_propagation_bound_is_refused_before_anything_is_sent(minted, tmp_path, settle_s):
+    """C19: the settle passed directly is held to the same bound as the configured one (315 s: a provider's 300 s
+    cache purge after a lost connection to Onezone, and a session's 15 s recheck), and refused before any request."""
+    before, sent = lines(tmp_path / "leases"), len(minted.fake.requests)
+    with pytest.raises(ValueError, match="at least 315 s"):
+        minted.minter.revoke(KEY, minted.tokens, settle_s=settle_s)
+    assert len(minted.fake.requests) == sent
+    assert lines(tmp_path / "leases") == before
+
+
+@pytest.mark.parametrize("settle_s", [315, 330])
+def test_c19_a_direct_settle_at_or_above_the_propagation_bound_is_accepted(minted, settle_s):
+    done = minted.minter.revoke(KEY, minted.tokens, settle_s=settle_s)
+    assert done.settle_until == done.revoked_at + settle_s
+
+
 def test_c19_a_slot_whose_run_holds_no_token_is_revoked_on_the_generations_alone(minted, tmp_path):
     """C19: a holder that crashed has no token values; the generation check alone confirms the revocation."""
     done = minted.minter.revoke(KEY)

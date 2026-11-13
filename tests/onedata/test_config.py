@@ -134,6 +134,25 @@ def test_c19_the_revocation_settle_is_330_seconds_unless_the_file_says_otherwise
     assert load(tmp_path, lambda d: d.update(tokens={"revocation_settle_s": 600})).tokens.revocation_settle_s == 600
 
 
+@pytest.mark.parametrize("settle", [315, 330])
+def test_c19_a_revocation_settle_at_or_above_the_propagation_bound_is_accepted(tmp_path, monkeypatch, settle):
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    loaded = load(tmp_path, lambda d: d.update(tokens={"revocation_settle_s": settle}))
+    assert loaded.tokens.revocation_settle_s == settle
+
+
+@pytest.mark.parametrize("settle", [0, 314, 314.5, True])
+def test_c19_a_revocation_settle_below_the_propagation_bound_is_refused_naming_it(tmp_path, monkeypatch, settle):
+    """C19: a shorter settle could free a slot while a provider that lost its connection to Onezone still accepts a
+    revoked token from its cache (purged after 300 s) and an open session has not checked it again (every 15 s)."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    with pytest.raises(ConfigError, match="revocation_settle_s") as caught:
+        load(tmp_path, lambda d: d.update(tokens={"revocation_settle_s": settle}))
+    assert "at least 315 s" in str(caught.value)
+    assert "300 s" in str(caught.value)
+    assert "15 s" in str(caught.value)
+
+
 @pytest.mark.parametrize("name", sorted(BAD_EDITS))
 def test_o12_a_bad_file_names_the_file_and_the_key_and_echoes_no_value(name, tmp_path, monkeypatch):
     """O12: every validation failure names platform.toml and the key, and never prints a value from the file."""
