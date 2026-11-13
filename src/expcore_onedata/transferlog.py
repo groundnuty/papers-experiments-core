@@ -23,17 +23,21 @@ one that finished before the cutoff but whose record does not say it ended is re
 record says it ended by the next observation, the walk stops at it and it leaves the listing, which flags every bound
 (`transfer_left_listing`), so a record that catches up errs closed. The order is checked as the listing is read, and
 a listing out of that order is unknown (`transferorder.py`). A job's times are stamped on the platform's global clock,
-Onezone's, not the system clock a provider's Date header gives (`transferorder.py` has the source), so the window is
-placed on Onezone's clock: each observation reads the space on Onezone (`GET /spaces/{space}`, the read `space_name`
-makes) and its answer's Date header gives Onezone's offset from this host. The window on that clock must not open
-before the cutoff: Onezone's clock more than the margin behind this host's leaves the listing unknown, naming the
-clock. The band at each edge of the window, from Onezone's least offset less the allowance to its greatest plus it,
-is where a time may lie on either side: a job with a time in one is recorded with `near_window_edge` and leaves its
-target's bound unknown (`transfer_near_window_edge`), never part of a known figure. The providers' Date offsets are
-recorded beside Onezone's, a diagnostic that places nothing. A job cancelled before it started is given no finish
-time, so the ended listing puts it last, past where the walk stops: `records` and `listed` hold it only when the
-listing is read to its end, so neither counts every transfer that ended in the window. It moved no bytes, so no
-figure of bytes misses it.
+not on the system clock a provider's or Onezone's Date header gives (`transferorder.py` has the source), so the window
+is placed on that clock, which each observation reads from Onezone's public current-time endpoint (`GET
+/provider/public/get_current_time`, no credential, answered `timeMillis`): the answer less the midpoint of this host's
+clock around the read is the clock's offset from this host, and half the round trip is how far that may be off. The
+window on that clock must not open before the cutoff: a global clock more than the margin behind this host's leaves
+the listing unknown, naming the clock. The band at each edge of the window, from the least offset the readings allow
+less the allowance to the greatest plus it, is where a time may lie on either side: a job with a time in one is
+recorded with `near_window_edge` and leaves its target's bound unknown (`transfer_near_window_edge`), never part of a
+known figure. A reading that fails or cannot be read leaves the clock unknown, and every bound with it
+(`clock_offset_unknown`). The `Date` headers, of Onezone's answer and of the providers', are recorded beside the
+offset, a diagnostic that places nothing. A job cancelled before it started is given no finish time, so the ended
+listing puts it after every job that has one and the walk stops at it: it and what follows are never read as part of
+the window, so `records` and `listed` never hold it and no long tail of such cancellations can exhaust the bound, and
+neither counts every transfer that ended in the window, only those with a finish time. It moved no bytes, so no figure
+of bytes misses it.
 
 **One provider's observation at a time.** A job's state and counters are always taken from one provider's listing and
 record together, never one provider's state with another's counters. A provider lists a job only after a lag (a
@@ -56,8 +60,8 @@ setting is what bounds that.
 the whole listing `probe_ok` false with the reason and no records, never fewer or no transfers. A listing longer than
 its bound (`MAX_LISTED` distinct ids read: the waiting, the ongoing and the ended ones down to the cutoff, never the
 older history; or a token that keeps coming back) is unknown in the same way, not truncated.
-`transferwindow.py` places the jobs in the run's window, moved onto Onezone's clock by the offsets its answers' Date
-headers give (recorded under `clock`), and splits a provider's gained bytes.
+`transferwindow.py` places the jobs in the run's window, moved onto the global clock by the readings of it (recorded
+under `clock`), and splits a provider's gained bytes.
 """
 
 import math
@@ -65,7 +69,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from expcore_onedata.client import OnezoneClient
+from expcore_onedata.client import ZONE_TIME_PATH, OnezoneClient
 from expcore_onedata.provision import Provisioner
 from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferorder import STOP_MARGIN_S, ZONE_BEHIND, newest_first
@@ -81,7 +85,10 @@ from expcore_onedata.transferwindow import (
     NOT_SETTLED,
     Edges,
     Window,
+    ZoneClock,
     offset_of,
+    span,
+    zone_clock_of,
 )
 
 PAGE_LIMIT = 1000  # ids asked for per page; the listing takes 1 to 1000
@@ -148,27 +155,29 @@ class TransferLog:
         self._page_limit, self._max_listed, self._sleep, self._now = page_limit, max_listed, sleep, now
         self._pages = 0
         self._offsets: dict[str, list[float | None]] = {}  # provider -> each listing answer's clock offset, or None
-        self._zone: list[float | None] = []  # Onezone's clock offset each observation read, or None
+        self._zone: list[ZoneClock | None] = []  # the global clock each observation read from Onezone, or None
         self._seen: set[str] = set()  # every job id any observation of the current reading showed
         self._cutoff = 0.0  # the earliest finish time the ended listing is read down to, this host's clock
 
     def _dated_page(self, path: str, provider: str, params: Mapping[str, Any]) -> Any:
         """Read one page of a provider's listing and keep the provider's system-clock offset its Date header gives, a
-        diagnostic, since a job's times are on Onezone's clock."""
+        diagnostic, since a job's times are on the global clock."""
         answer, date = self._client.get_dated(path, provider=provider, params=params, retry=ONE_ATTEMPT)
         self._offsets.setdefault(provider, []).append(offset_of(date, self._now()))
         return answer
 
     def _zone_dated(self) -> Any:
-        """Read the space on Onezone and keep Onezone's clock offset its Date header gives, the clock a job's times are
-        stamped on."""
-        answer, date = self._client.get_dated(f"/spaces/{self._provisioner.space_id}", retry=ONE_ATTEMPT)
-        self._zone.append(offset_of(date, self._now()))
+        """Read Onezone's public current-time endpoint and keep the global clock's offset from this host, the clock a
+        job's times are stamped on, with half the round trip as its uncertainty, or None when the answer cannot be read
+        (the clock is then unknown)."""
+        sent = self._now()
+        answer, date = self._client.get_dated(ZONE_TIME_PATH, retry=ONE_ATTEMPT, anonymous=True)
+        self._zone.append(zone_clock_of(answer, date, sent, self._now()))
         return answer
 
     def _read_zone(self) -> None:
-        """Read Onezone's clock through the probe; a read that fails leaves its offset unknown (None), as an answer
-        without a readable Date does, and so the clock."""
+        """Read the global clock through the probe; a read that fails leaves the clock unknown (None), as an answer
+        that cannot be read does."""
         if not self._probe(self._zone_dated).ok:
             self._zone.append(None)
 
@@ -225,7 +234,7 @@ class TransferLog:
         return listed, walk.kept
 
     def _observe(self) -> Observation:
-        """Read Onezone's clock, then list every tracked provider and read each id it listed on that same provider (an
+        """Read the global clock, then list every tracked provider and read each id it listed on that same provider (an
         ended one's record is the one its walk read); raise Unreadable when a listing or a record fails."""
         self._read_zone()
         observation: Observation = {}
@@ -306,7 +315,7 @@ class TransferLog:
         flagged = [(t, NOT_SETTLED) for t in dict.fromkeys(j.target_id for j in changed) if t]
         edges, clock = self._edges(window)
         if edges.first < self._cutoff:
-            # The window opens before the cutoff on Onezone's clock: a job of the run could lie past the stop.
+            # The window opens before the cutoff on the global clock: a job of the run could lie past the stop.
             return Reading({**section, "pages": self._pages, "clock": clock, "error": ZONE_BEHIND}, None)
         section.update(settled=not changed, polls=polls, clock=clock)
         reading = self._classified(edges, observation, file_ids, harness, section, flagged)
@@ -329,19 +338,23 @@ class TransferLog:
         return Reading(reading.section, reading.inside, reading.flagged, frozenset(everywhere))
 
     def _edges(self, window: Window) -> tuple[Edges, dict[str, Any]]:
-        """Move the window onto Onezone's clock, the one a job's times are stamped on, by the offsets its answers gave,
-        and describe that for the snapshot with the providers' Date offsets beside it, a diagnostic. An answer of
-        Onezone's whose Date could not be read, or a read of it that failed, leaves the clock unknown, and the window is
-        then taken as it is on this host's clock."""
+        """Move the window onto the global clock, the one a job's times are stamped on, by the readings of it, and
+        describe that for the snapshot with the providers' Date offsets beside it, a diagnostic. A reading that could
+        not be read, or a read that failed, leaves the clock unknown, and the window is then taken as it is on this
+        host's clock."""
         allowance = self._provisioner.settings.clock_skew_allowance_s
-        zone = [o for o in self._zone if o is not None]
+        zone = [reading for reading in self._zone if reading is not None]
         known = bool(zone) and len(zone) == len(self._zone)
-        edges = Edges(window, min(zone), max(zone), allowance) if known else Edges(window, 0.0, 0.0, allowance)
+        edges = (
+            Edges(window, min(r.low for r in zone), max(r.high for r in zone), allowance)
+            if known
+            else Edges(window, 0.0, 0.0, allowance)
+        )
         described = {
             self._client.provider_label(provider): _described(self._offsets.get(provider, []))
             for provider in self._providers
         }
-        return edges, {"known": known, "zone": _described(self._zone), "offsets": described, **edges.to_json()}
+        return edges, {"known": known, "zone": _described_zone(self._zone), "offsets": described, **edges.to_json()}
 
     def _classified(
         self,
@@ -399,10 +412,11 @@ def _placement(edges: Edges, job: Job) -> str:
 
 
 def _finished(body: Any) -> float | None:
-    """An ended job's finish time from its record, or None when it gives none: such a job neither stops the walk nor
-    takes part in its order check, and is placed against the window as any other is."""
+    """An ended job's finish time from its record: 0 for a job given none (cancelled before it was enqueued), which
+    stops the walk when its record says it ended, and None when the record gives no readable one, which neither stops
+    the walk nor takes part in its order check, and is placed against the window as any other is."""
     value = body.get("finishTime") if isinstance(body, dict) else None
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
         return None
     return float(value)
 
@@ -415,6 +429,21 @@ def _described(samples: Sequence[float | None]) -> dict[str, Any]:
         "unreadable": len(samples) - len(readable),
         "min_s": round(min(readable), 3) if readable else None,
         "max_s": round(max(readable), 3) if readable else None,
+    }
+
+
+def _described_zone(readings: Sequence[ZoneClock | None]) -> dict[str, Any]:
+    """The global clock's readings for the snapshot: how many were made, how many could not be read, the least offset
+    they allow (`min_s`) and the greatest (`max_s`), each reading's offset less and plus its half round trip, the
+    greatest half round trip, and the least and greatest `Date` offset of the same answers, a cross-check."""
+    read = [reading for reading in readings if reading is not None]
+    return {
+        "samples": len(readings),
+        "unreadable": len(readings) - len(read),
+        "min_s": round(min(r.low for r in read), 3) if read else None,
+        "max_s": round(max(r.high for r in read), 3) if read else None,
+        "half_trip_s": round(max(r.half_trip for r in read), 3) if read else None,
+        "date_offsets_s": span([r.date_offset for r in read]),
     }
 
 

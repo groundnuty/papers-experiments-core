@@ -2,20 +2,22 @@
 """The run's window on the transfer log, and the split of a provider's gained bytes into transfer bytes and the rest.
 
 **The window.** The run's window runs from its start to just after the block maps were read at its end, on this
-host's clock. A job's times are stamped on the platform's global clock, Onezone's (`transferorder.py` has the source),
-so the window is moved onto Onezone's clock (`Edges`): the `Date` header of each answer of Onezone's that the transfer
-log reads gives its offset from this host (`offset_of`, the header's whole second less this host's time when the
-answer came), and the window is widened by the least and the greatest offset seen and by `[placement]
-clock_skew_allowance_s` (5 s by default) on each side, which covers a provider's synchronisation error to Onezone and
-the header's whole second. A job is in the window when its `scheduleTime`
+host's clock. A job's times are stamped on the platform's global clock (`transferorder.py` has the source), so the
+window is moved onto it (`Edges`): Onezone's own reading of that clock, from its public current-time endpoint, gives
+its offset from this host (`ZoneClock`: the global time less the midpoint of this host's clock around the read, with
+half the round trip as its uncertainty), and the window is widened by the least and the greatest offset the reads allow
+(each read's offset less and plus its half round trip) and by `[placement] clock_skew_allowance_s` (5 s by default) on
+each side, which covers a provider's synchronisation error to that clock. A job is in the window when its `scheduleTime`
 lies in the widened one; the schedule time is the one every job has, a waiting one included, and it says when someone
 (the harness, the agent through the tool plane, a QoS requirement) started it. A job scheduled before the widened
 window that had not ended by its start (listed as waiting or ongoing, ended at or after it, or with no finish time) is
 not in the record, but it may have placed bytes during the run, so it is counted as carried over.
 
 Each edge of the window has a band of the same width on either side of it. A job whose schedule, start or finish time
-falls in a band may lie on either side of the edge, so it is ambiguous. A `Date` header of Onezone's that is missing
-or that cannot be read leaves its offset unknown, and with it the window on its clock.
+falls in a band may lie on either side of the edge, so it is ambiguous. A read of the global clock that fails or whose
+answer cannot be read leaves its offset unknown, and with it the window on its clock. The `Date` header of the same
+answer is Onezone's answering node's system clock, which a multi-node Onezone's global clock may differ from by a bias:
+it places nothing and is recorded beside the offset as a cross-check (`ZoneClock.date_offset`).
 
 **The split.** `split_gained` gives, per tracked receiving provider, `transfer_bytes_in`: the `bytesReplicated` of every
 job in the window that replicates into it (a replication's or a migration's `replicatingProviderId`; an eviction moves
@@ -31,11 +33,11 @@ or not, so the bound only errs low; `difference` keeps the unfloored value so th
 `listings_disagree` (the tracked providers do not list and answer a job into it alike, `transferlog.py`),
 `listing_not_settled` (a job into it still changed between the last two observations of the listing),
 `transfer_near_window_edge` (a job into it has a time in a band at an edge of the window), and
-`clock_offset_unknown` (Onezone's clock could not be read, which leaves every bound unknown).
+`clock_offset_unknown` (the global clock could not be read, which leaves every bound unknown).
 """
 
 import math
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -55,8 +57,9 @@ LISTING_DROPPED = "transfer_left_listing"
 
 
 def offset_of(date: str | None, host_now: float) -> float | None:
-    """Return a server's clock offset from this host, in seconds, from the `Date` header of an answer that arrived at
-    `host_now`: positive when the server's clock is ahead. None when the header is missing or cannot be read."""
+    """Return a server's system-clock offset from this host, in seconds, from the `Date` header of an answer that
+    arrived at `host_now`: positive when the server's clock is ahead. None when the header is missing or cannot be
+    read. It gives a provider's or Onezone's system clock, never the global clock a job's times are stamped on."""
     if not isinstance(date, str):
         return None
     try:
@@ -66,6 +69,50 @@ def offset_of(date: str | None, host_now: float) -> float | None:
     if moment is None or moment.tzinfo is None:
         return None  # a date without a zone is not a moment
     return moment.timestamp() - host_now
+
+
+@dataclass(frozen=True)
+class ZoneClock:
+    """One reading of Onezone's global clock, the one a job's times are stamped on.
+
+    `offset` is the global time less the midpoint of this host's clock around the read, in seconds, positive when the
+    global clock is ahead; the stamp was made somewhere between the two host readings, so the true offset lies within
+    `half_trip`, half the round trip, of it (`low` to `high`). `date_offset` is what the answer's `Date` header gives,
+    Onezone's answering node's system clock against the midpoint (None when unreadable): a cross-check, never a
+    place."""
+
+    offset: float
+    half_trip: float
+    date_offset: float | None = None
+
+    @property
+    def low(self) -> float:
+        return self.offset - self.half_trip
+
+    @property
+    def high(self) -> float:
+        return self.offset + self.half_trip
+
+
+def zone_clock_of(answer: Any, date: str | None, sent: float, received: float) -> ZoneClock | None:
+    """Read Onezone's public current-time answer (`{"timeMillis": N}`, the global clock in epoch milliseconds) that
+    was asked at `sent` and received at `received` on this host's clock, with its `Date` header. None when the answer
+    holds no `timeMillis` that is a non-negative number, or this host's clock moved backwards during the read: the
+    clock is then unknown, never guessed. When the read was retried, `sent` to `received` spans the retries and their
+    pauses, so `half_trip` grows and the bands widen, the safe way."""
+    millis = answer.get("timeMillis") if isinstance(answer, dict) else None
+    if isinstance(millis, bool) or not isinstance(millis, int | float) or not math.isfinite(millis) or millis < 0:
+        return None
+    if not (math.isfinite(sent) and math.isfinite(received)) or received < sent:
+        return None
+    midpoint = (sent + received) / 2
+    return ZoneClock(millis / 1000 - midpoint, (received - sent) / 2, offset_of(date, midpoint))
+
+
+def span(samples: Sequence[float | None]) -> list[float] | None:
+    """The least and greatest of the readable samples, rounded to the millisecond; None when none can be read."""
+    seen = [round(sample, 3) for sample in samples if sample is not None]
+    return [min(seen), max(seen)] if seen else None
 
 
 @dataclass(frozen=True)
@@ -81,8 +128,9 @@ class Window:
 
 @dataclass(frozen=True)
 class Edges:
-    """The run's window on the clock a job's times are stamped on, Onezone's: widened by the least (`low`) and
-    greatest (`high`) of its offsets seen and the allowance, with a band of that width on either side of each edge."""
+    """The run's window on the clock a job's times are stamped on, the global one: widened by the least (`low`) and
+    greatest (`high`) of its offsets the reads allow (`ZoneClock.low`, `.high`) and the allowance, with a band of that
+    width on either side of each edge."""
 
     window: Window
     low: float

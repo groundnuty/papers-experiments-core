@@ -131,11 +131,17 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until null), confirmed by
   [S10] for the states `ongoing` and `ended`, and each id's `GET /transfers/{id}`, whose `fileId` [S10] and state and
   counters [S11] are confirmed. The state `waiting`, the listing answer's `Date` header (`get_dated`, the provider's
-  clock), and a record's `type`, provider ids and times (epoch seconds), for a replication and an eviction, are
-  confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state `transferStatus`, as
-  [S11] reads them. The transfer log and the reset's history also read `GET /spaces/{space}` on Onezone with
-  `get_dated`, the read `space_name` makes ([L1]), for its `Date` header, Onezone's clock, on which a job's times are
-  stamped (`transferorder.py`); that header is cowboy's, as a provider's is, and no live run has recorded it yet.
+  system clock, which places nothing), and a record's `type`, provider ids and times (epoch seconds), for a replication
+  and an eviction, are confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state
+  `transferStatus`, as [S11] reads them. A job's times are stamped on the platform's global clock, so the transfer log
+  and the reset's history also read Onezone's own reading of it, `GET /provider/public/get_current_time`
+  (`get_dated` with `anonymous=True`, so no credential header; answer `{"timeMillis": N}`, epoch milliseconds), the
+  public call the providers synchronise their clocks to: onedata/oz-worker at 14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55,
+  src/http/rest/routes/provider_routes.erl:192-198 (the route, "does not require any specific privileges"),
+  src/logic/provider_logic_plugin.erl:304-305 (answers `global_clock:timestamp_millis()`) and :491-492 (authorised for
+  any client), src/http/rest/translators/provider_rest_translator.erl:128-129 (the `timeMillis` body) and
+  src/logic/provider_logic.erl:548-554 ("used by providers to synchronize clocks with onezone"). No live run has made
+  it, so it is in `UNVERIFIED_ENDPOINTS`; the `Date` header of the same answer is recorded beside it as a cross-check.
 - The reset (`reset.py`, `eviction.py`, `occupancy.py`) sends a `POST /transfers` eviction of a directory, which covers
   every file under it, confirmed by [L1] (`day0/2026-11-11-federation-facts.md`: the mirror's block map of a file in
   the directory was empty once the directory's eviction ended), and reads a directory's `GET /data/{id}/distribution`
@@ -159,9 +165,9 @@ or the range read is refused as not sent (`ScopeUnread`).
 
 No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
 which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, and
-the reads of a user's Onezone admin privileges and of the clusters a token's user is a member of, since [L1] confirmed
-every other call and detail the layer relies on.
+[L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, the
+reads of a user's Onezone admin privileges and of the clusters a token's user is a member of, and Onezone's reading of
+the global clock, since [L1] confirmed every other call and detail the layer relies on.
 Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
 """
@@ -195,13 +201,18 @@ UPLOAD_CONTENT_TYPE = "application/octet-stream"  # of every raw body a mutation
 # POSTs that only read, and whether they are sent with the admin credential: the examination is [S4], [S5], called as
 # an admin; the scope inference is [S6], called without a header.
 READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_access_token_scope": False}
+# Onezone's reading of the global clock, which a job's times are stamped on: a GET it answers to anyone, so `get_dated`
+# sends it with no credential header when asked to (`anonymous`), and for this path alone.
+ZONE_TIME_PATH = "/provider/public/get_current_time"
+PUBLIC_READS: tuple[str, ...] = (ZONE_TIME_PATH,)
 
 # What no source and no live run confirms, or a live run refuted: (method, path, what). Each has a test in
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
 # live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a writing
-# tool-server user's Onezone admin privileges and of the clusters its token's user is a member of.
+# tool-server user's Onezone admin privileges and of the clusters its token's user is a member of, and Onezone's
+# reading of the global clock, which the transfer log and the reset's history place their window by.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "PUT",
@@ -247,6 +258,13 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "a Onezone call sent as the token being checked: the clusters its user is an effective member of under "
         "clusters, which a writing tool-server user must have none of; named only by Onezone's REST description "
         "(25.0), which says it is for the current user, and by oz-worker's route of that path",
+    ),
+    (
+        "GET",
+        ZONE_TIME_PATH,
+        "a Onezone call sent with no credential: the global clock, which a job's times are stamped on, in epoch "
+        "milliseconds under timeMillis, which the transfer log and the reset's history place their window by; named "
+        "only by oz-worker's source (14b5bda, provider_routes.erl:192-198), which says it needs no privilege",
     ),
 )
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
@@ -690,12 +708,20 @@ class OnezoneClient:
         provider: str | None = None,
         params: Mapping[str, Any] | None = None,
         retry: ReadRetry = ONE_ATTEMPT,
+        anonymous: bool = False,
     ) -> tuple[Any, str | None]:
         """GET as `get` does with the admin credential, and return with the decoded answer its `Date` header as sent,
-        or None when it has none. The transfer log and the reset's history estimate a provider's clock offset from it
-        (`transferlog.py`, `reset.py`). `retry` is the call site's choice, as for `get`: the header is the answered
-        attempt's."""
-        response = self._request("GET", path, provider=provider, headers=self._admin, params=params, retry=retry)
+        or None when it has none. The transfer log and the reset's history estimate a provider's system-clock offset
+        from it, and read Onezone's global clock through it (`transferlog.py`, `reset.py`). `retry` is the call site's
+        choice, as for `get`: the header is the answered attempt's.
+
+        With `anonymous` the request carries no credential header: it is for the calls Onezone answers to anyone
+        (`PUBLIC_READS`, a path of Onezone's, not a provider's), so a token's caveats can never refuse it; any other
+        path is refused, unsent."""
+        if anonymous and (provider is not None or path not in PUBLIC_READS):
+            raise OutOfScope("only a public read of Onezone's is sent with no credential; nothing was sent")
+        headers = {} if anonymous else self._admin
+        response = self._request("GET", path, provider=provider, headers=headers, params=params, retry=retry)
         return self._decoded(response, "GET", provider), response.headers.get("date")
 
     def get(

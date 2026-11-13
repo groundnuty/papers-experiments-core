@@ -147,20 +147,21 @@ def test_o32_the_ended_listing_is_read_back_to_the_allowance_and_the_margin_befo
     assert section["ended_since"] == cutoff
 
 
-@pytest.mark.parametrize(("clock", "fails"), [("zone", True), ("provider", False)])
-def test_o32_onezones_clock_behind_by_more_than_the_margin_fails_closed(
+@pytest.mark.parametrize(("clock", "fails"), [("global", True), ("provider", False)])
+def test_o32_the_global_clock_behind_by_more_than_the_margin_fails_closed(
     client, provisioner, seeded, ticker, clock, fails
 ):
-    """O32: the cutoff is on this host's clock; Onezone's clock, the one a job's times are stamped on, running more
-    than `STOP_MARGIN_S` behind would put the window's start before the cutoff, so a job of the window could lie past
-    the stop: the reading is unknown, naming the clock, never read short. A provider's Date header that far behind is
-    its system clock, which places nothing."""
+    """O32: the cutoff is on this host's clock; the global clock, the one a job's times are stamped on, running more
+    than `STOP_MARGIN_S` behind it (this host's clock ahead) would put the window's start before the cutoff, so a job
+    of the window could lie past the stop: the reading is unknown, naming the clock, never read short. A provider's
+    Date header that far behind is its system clock, which places nothing."""
     seeded.clock = ticker.clock
-    if clock == "zone":
-        seeded.zone_skew = -(STOP_MARGIN_S + 2)
-    else:
+    ahead = STOP_MARGIN_S + 2 if clock == "global" else 0.0
+    if clock == "provider":
         seeded.provider_skew[BETA_ID] = -(STOP_MARGIN_S + 2)
-    probes = made_with(client, provisioner, ticker)
+    probes = PlatformProbes(
+        client, provisioner, {"data": PATH}, ["alpha", "beta"], sleep=ticker.sleep, now=lambda: ticker.now + ahead
+    )
     probes.start({})
     ticker.sleep(10)
     section = probes.finish()["space_transfers"]
@@ -168,3 +169,61 @@ def test_o32_onezones_clock_behind_by_more_than_the_margin_fails_closed(
     if fails:
         assert "Onezone's clock" in section["error"]
         assert section["records"] is None
+
+
+def test_o32_jobs_given_no_finish_time_do_not_count_against_the_bound_of_the_window(
+    client, provisioner, seeded, ticker
+):
+    """O32: the third delta review's case, on the probes, with a bound of two jobs: the run's one finished job, then two
+    that were cancelled while still scheduled and keep finishTime 0, which sort last in the ended listing. The walk
+    stops at the first of them and counts neither, so the reading is known and holds the finished job alone, where it
+    kept all three and was unknown. A cancelled job moved no bytes, so no figure misses it."""
+    seeded.clock = ticker.clock
+    seeded.add_file(OTHER, DATA)
+    probes = made_with(client, provisioner, ticker, max_listed=2)
+    probes.start({})
+    ticker.sleep(10)
+    tid = seeded.add_transfer("replication", PATH, BETA_ID, scheduled=ticker.now)
+    for _ in range(2):
+        seeded.add_transfer("eviction", OTHER, BETA_ID, scheduled=ticker.now, finished=0)
+    ticker.sleep(10)
+    section = probes.finish()["space_transfers"]
+    assert section["probe_ok"] is True, section["error"]
+    assert [r["transfer_id"] for r in section["records"]] == [tid]
+    assert section["listed"] == 1
+
+
+def test_o32_a_job_with_a_finish_time_listed_after_one_with_none_fails_closed(client, provisioner, seeded, ticker):
+    """O32: the listing puts a job given no finish time after every job that has one, so one whose record has a finish
+    time but whose key is the largest (`listing_time`) is an order the stop rests on not holding: the reading is
+    unknown, naming the order, never one that stops at the cancelled job and omits what follows it."""
+    seeded.clock = ticker.clock
+    seeded.add_file(OTHER, DATA)
+    probes = made_with(client, provisioner, ticker)
+    probes.start({})
+    ticker.sleep(10)
+    seeded.add_transfer("eviction", OTHER, BETA_ID, scheduled=ticker.now, finished=0)
+    late = seeded.add_transfer("replication", PATH, BETA_ID, scheduled=ticker.now)
+    seeded.listing_time[late] = 0
+    ticker.sleep(10)
+    section = probes.finish()["space_transfers"]
+    assert section["probe_ok"] is False
+    assert "listed after one with none" in section["error"]
+    assert section["records"] is None
+
+
+def test_o32_a_record_with_no_readable_finish_time_is_kept_and_is_no_job_given_none(
+    client, provisioner, seeded, ticker
+):
+    """O32: a job given no finish time has finishTime 0 and stops the walk; a record whose finishTime is missing is no
+    such job, and is unread rather than absent: the walk keeps it and goes on, and the job is recorded."""
+    seeded.clock = ticker.clock
+    probes = made_with(client, provisioner, ticker)
+    probes.start({})
+    ticker.sleep(10)
+    tid = seeded.add_transfer("replication", PATH, BETA_ID, scheduled=ticker.now)
+    seeded.transfer_omit = {"finishTime"}
+    ticker.sleep(10)
+    section = probes.finish()["space_transfers"]
+    assert section["probe_ok"] is True, section["error"]
+    assert [r["transfer_id"] for r in section["records"]] == [tid]
