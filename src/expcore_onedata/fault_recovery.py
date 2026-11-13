@@ -43,6 +43,7 @@ reports a lock held while its journalled holder is gone as stuck, and returns th
 
 import contextlib
 import hashlib
+import logging
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -77,8 +78,14 @@ class FaultDriver(Protocol):
         ...
 
 
+log = logging.getLogger(__name__)
+
 _WHY = {  # how a settling failed, in words, where the bare word would not say it
     "serves_unconfigured": "its service has no provider declared in [faults.services], so no read can show it serving",
+    "links_stuck": (
+        "it serves, but a link of it transferred no probe within the link check's bound (O35): restart the rtransfer "
+        "link on the local provider (rtransfer_config:restart_link()) or that provider's container alone"
+    ),
 }
 
 
@@ -117,6 +124,7 @@ class Recovery:
         self.journal = InjectionJournal(settings.journal)
         self.last: Observation | None = None  # the latest reading `wait` took
         self.unreadable = 0  # the readings of the latest `wait` that failed and counted as no answer
+        self.links_detail: str | None = None  # why the latest restore's link check failed (O35), names labels only
 
     def entries(self, target: str | None = None) -> list[dict[str, Any]]:
         """The journal's open injections; raise InfraError of kind `injector_failure` when it cannot be read."""
@@ -214,8 +222,23 @@ class Recovery:
                 return Settled(False, "serves_unconfigured", after)
             if ready_after_s is None:
                 return Settled(False, "not_serving", after)  # fail closed: the injection stays open, the identity known
+            self.links_detail = self._stuck_links(entry["service"])
+            if self.links_detail is not None:  # it serves, and a link of it does not transfer: not restored yet (O35)
+                log.warning("a restored provider's link check failed: %s", self.links_detail)
+                return Settled(False, "links_stuck", after, ready_after_s)
         self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
         return Settled(True, how, after, ready_after_s)
+
+    def _stuck_links(self, service: str) -> str | None:
+        """The link check of the pairs a restored service's provider is in, when the driver has one
+        (`ComposeDriver.restored_links`): None when each passed, else why not. A check that raises fails closed."""
+        check = getattr(self._driver, "restored_links", None)
+        if check is None:
+            return None
+        try:
+            return check(service)
+        except Exception as error:  # a check that cannot answer is a failed one, never a pass
+            return f"the link check raised {type(error).__name__}"
 
     def _await_serving(self, service: str) -> float | None:
         """Ask the driver whether the service serves, now and then every `poll_s`, until it does or `ready_timeout_s`

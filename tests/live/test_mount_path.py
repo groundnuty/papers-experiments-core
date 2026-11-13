@@ -83,7 +83,7 @@ from expcore_onedata.provision import Provisioner, resolve_provider_ids  # noqa:
 from expcore_onedata.rangemap import load_placement  # noqa: E402
 from expcore_onedata.sandbox import hostops, teardown  # noqa: E402
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec  # noqa: E402
-from expcore_onedata.sandbox.containers import ONECLIENT_BIN, effective_log_dir, sidecar_command  # noqa: E402
+from expcore_onedata.sandbox.containers import ONECLIENT_BIN, SIDECAR_LOG_DIR  # noqa: E402
 from expcore_onedata.sandbox.hostops import DockerHost  # noqa: E402
 from expcore_onedata.sandbox.provider import SandboxProbe  # noqa: E402
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, TOKEN_FILE, DockerSandbox  # noqa: E402
@@ -312,7 +312,7 @@ def sidecar_accounting(host: DockerHost, sandbox: DockerSandbox, spec: SandboxSp
         "candidate_options": candidate_options(help_text),
         "oneclient_args": list(sandbox.s.mount.extra_args),
     }
-    log_dir = effective_log_dir(sidecar_command(spec.provider.host, sandbox.s))
+    log_dir = SIDECAR_LOG_DIR
     listed = host.docker("exec", sidecar, "find", log_dir, "-type", "f", "-printf", "%s %p\\n", check=False, timeout=60)
     found = [(int(size), path) for size, _, path in (line.partition(" ") for line in listed.stdout.splitlines())]
     out["log_files"] = [{"name": os.path.relpath(path, log_dir), "bytes": size} for size, path in found]

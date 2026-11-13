@@ -180,9 +180,9 @@ def test_o04_health_checks_each_space_against_its_own_support_set(tmp_path, fake
     fake.supports.pop(BETA_ID)  # the study space: alpha alone, as its entry declares
     health = PlatformHealth(config, client, issuer, clock=lambda: NOW)
     passed = {"ok": True, "detail": "ok: each of the 2 spaces is supported by its declared set", "deferred": False}
-    assert health()._asdict() == passed
+    assert health.space()._asdict() == passed  # the space check: the composed one probes links first (O35)
     fake.space_supports[SPACE_IDS[1]].pop(BETA_ID)
-    verdict = health()
+    verdict = health.space()
     assert verdict.ok is False
     assert verdict.detail.startswith("spaces[1]: the providers supporting the space differ from the declared set")
 
