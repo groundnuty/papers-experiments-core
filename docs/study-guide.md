@@ -233,6 +233,29 @@ alpha = study.models.resolve("alpha-stub")
 assert round(bound_usd(alpha, study.campaign.agent.limits), 6) == 0.056384  # (20,000 + 8,192) x 2, per million
 ```
 
+### An abandoned request
+
+When a run gives up a request in flight, the record cannot say what it cost. Its `route.abandoned_request` holds the bound the adapter took when it built that request: `prompt_bound_tokens`, `prompt_bound_by` (`bytes`, or `window` where the byte assumption cannot be used: the first request, a reply that left a count out, a conversation in which a reply reported more than its bound), and the `reply_max_tokens` it carried. A cost scorer that charges an abandoned run for that request prices it with `abandoned_request_bound`, in place of the window and the reply maximum, and reports which basis it used. The budget gate does not read it, and the reservation above is unchanged. Pass `reply_capped` from the record's own totals, which say whether the attempt was held to its reply maximum; a record with neither field was not.
+
+For the tiered model above, a run that had sent 100,000 tokens when its next request was given up has a bound of 100,500 tokens, and the prompt cannot reach the upper tier. The request is at most that prompt and a reply of 8,000 tokens at the lower tier's dearest rates, $0.0414, where the window's bound, which reaches the upper tier, is $0.145:
+
+```python
+from expcore.campaign.abandoned_bound import abandoned_request_bound, held_to_reply_maximum
+
+entry = {
+    "reason": "read_timeout", "usage": "unknown", "prompt_bound_tokens": 100_500, "prompt_bound_by": "bytes",
+    "reply_max_tokens": 8000, "window_tokens": 200_000, "bound_checked": 3, "bound_exceeded": 0, "bound_unreported": 0,
+}
+totals = {"reserved_capped": True, "reply_cap_unheld": False}  # as the record's totals say
+tight = abandoned_request_bound(model, limits, entry, reply_capped=held_to_reply_maximum(totals))
+assert (tight.request_bound_tokens, tight.prompt_by, tight.reply_by) == (108_500, "bytes", "reply_maximum")
+assert round(tight.request_bound_usd, 8) == 0.04140625  # 100,500 x 0.3125 + 8,000 x 1.25, per million
+loose = abandoned_request_bound(model, limits, {"reason": "read_timeout", "usage": "unknown"}, reply_capped=True)
+assert (loose.prompt_by, round(loose.request_bound_usd, 6)) == ("window", 0.145)  # an older record: `overshoot_usd`
+```
+
+The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows. Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `bound_exceeded` before trusting an entry. A backend of your own that does not record the bound keeps the window's.
+
 ### The federation's certificate
 
 On the Onedata platform four clients talk to the federation: the platform layer's REST client, the data gate that carries the agent's REST data path, oneclient in the mount sidecar, and the MCP tool server. All four take their certificate check from one `[tls]` table of `platform.toml`, so no two can check differently. Without the table, every client verifies the federation's certificate against its own default CAs, which is right for a federation with a publicly trusted certificate. A federation whose certificate no default trusts, such as a self-signed one, takes one of two modes:
