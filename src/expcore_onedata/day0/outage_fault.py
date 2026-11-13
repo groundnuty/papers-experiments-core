@@ -7,9 +7,11 @@ reads what the injector did from its snapshot, so the check has the injector's g
 - **Sanction (O10).** The injector needs `sanctioned = true` in `[faults]` and `sanctioned=True` from its caller; the
   check gives the caller's half only once `EXPCORE_LIVE_MUTATE=1` and `EXPCORE_LIVE_FAULTS=1` are both set.
 - **Journal and recovery (O11).** The injection is journalled before the stop; an injection an earlier process left open
-  is cleared and verified before this one starts, and one that cannot be fails the start. Such a start took nothing down
-  and still leaves a provider that may be down, so `restored` tells it from a start that failed cleanly
-  (`earlier_injection_open`, not cleared, naming each provider left open by its label).
+  is cleared and verified before this one starts, and one that cannot be fails the start. The check runs that recovery
+  (`recover`) before it prepares anything (#178), since a provider an earlier process left stopped fails every read and
+  write of the preparation; what it settled is `recovered`, and one it cannot settle stops the run there. Such a run
+  took nothing down and still leaves a provider that may be down, so `restored` tells it from a start that failed
+  cleanly (`earlier_injection_open`, not cleared, naming each provider left open by its label).
 - **Verified restore (O11).** A restore counts only when the service runs with an identity other than the one read
   before the stop and the provider then serves (its driver's `serves`, within `ready_timeout_s` of `[faults]`; the
   wait is `ready_after_s`); readiness alone is not one, and a provider that does not serve in time is `not_serving`,
@@ -34,6 +36,7 @@ failed before anything was journalled, with nothing open. The provider is named 
 digest, as the injector names them (O12).
 """
 
+import asyncio
 import contextlib
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -66,6 +69,50 @@ class Outage:
         """`journal` is the injector's own (`[faults] journal`), read only after a start that failed with nothing
         taken down, to see whether it left an injection open (`left_open`)."""
         self._injector, self._identity, self._journal = injector, {"run_key": run_key, "attempt": 1}, journal
+
+    async def recover(self) -> list[dict[str, Any]]:
+        """Settle every injection an earlier run left open, before the check prepares anything (#178): preparing reads
+        and writes through the data provider, which a process that died with it stopped leaves unanswering, so the
+        recovery cannot wait for the start. Return the injections still open, each as `{"target": label, "how":
+        word}`: none when nothing is, and `recovered` then tells what was settled. A recovery the injector cannot
+        finish, a lock that is stuck, a journal that cannot be read and an injection a live injector holds down are
+        each left open, since the provider may be down.
+
+        The recovery runs in a worker thread whose future is kept, so a cancellation waits for it (shielded, at most
+        the injector's `cancel_wait_s`) instead of leaving it restarting a provider while the check cleans up."""
+        recovering = asyncio.ensure_future(asyncio.to_thread(self._injector.recover))
+        try:
+            try:
+                held = await asyncio.shield(recovering)
+            except asyncio.CancelledError:
+                await asyncio.wait({recovering}, timeout=self._injector.cancel_wait_s)
+                if recovering.done() and not recovering.cancelled():
+                    recovering.exception()  # read here: what the thread raised is never an unread error
+                raise
+        except Exception as error:  # fail closed, as a start's failure does: the provider may be down (O11)
+            how = "left_open" if isinstance(error, InfraError) else _word(type(error).__name__, "left_open")
+            # the injector's failed `recovered` step, else the journal, tells which injection is open
+            return self.left_open(self._injector.snapshot()["steps"]) or [{"target": None, "how": how}]
+        return [{"target": target, "how": "left_open"} for target in held]
+
+    def recovered(self) -> list[dict[str, Any]]:
+        """The injections of an earlier run that `recover` settled, each as `{"target", "how", "ready_after_s"}` in the
+        injector's words (`restored`, `found_restored`): the provider was found back, or restarted under a new identity
+        and serving."""
+        steps = [step for step in self._injector.snapshot()["steps"] if step.get("step") == "recovered" and step["ok"]]
+        return [
+            {
+                "target": step["target"],
+                "how": _word(step.get("how"), "restored"),
+                "ready_after_s": step.get("ready_after_s"),
+            }
+            for step in steps
+        ]
+
+    def left_open_facts(self, left: list[dict[str, Any]]) -> dict[str, Any]:
+        """The check's `restore` facts for an injection found open and not settled (`LEFT_OPEN`): not cleared."""
+        steps = [step["step"] for step in self._injector.snapshot()["steps"]]
+        return {"cleared": False, "verified": False, "how": LEFT_OPEN, "left_open": left, "journal_steps": steps}
 
     @contextlib.asynccontextmanager
     async def down(self) -> AsyncIterator[dict[str, Any]]:
@@ -107,13 +154,7 @@ class Outage:
         if cleared is None:
             left = self.left_open(snapshot["steps"])
             if left:
-                return {
-                    "cleared": False,
-                    "verified": False,
-                    "how": LEFT_OPEN,
-                    "left_open": left,
-                    "journal_steps": [step["step"] for step in snapshot["steps"]],
-                }
+                return self.left_open_facts(left)
             return {"cleared": True, "verified": False, "how": "not_injected"}
         facts: dict[str, Any] = {
             "cleared": bool(cleared.get("ok")),
