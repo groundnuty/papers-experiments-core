@@ -4,7 +4,7 @@ was, and the facts and the day-0 table record the import without its path. The p
 call."""
 
 import pytest
-from federation_support import MINIMAL, STUDY_BASELINE_OFF, WITH_IMPORT, import_layout
+from federation_support import MINIMAL, STUDY_BASELINE_OFF, WITH_IMPORT, WITH_WRITABLE_IMPORT, import_layout
 
 # alpha-space (the study space, no baseline) and fern-space, imported read-only from a variable: nothing writes either
 NO_BASELINE = STUDY_BASELINE_OFF + WITH_IMPORT.removeprefix(MINIMAL)
@@ -142,3 +142,73 @@ def test_reset_replicas_is_unchanged_for_a_layout_with_an_imported_space(fed, tm
     monkeypatch.setattr(fed.cli, "evict_replicas", lambda boot, timeout: ran.append("evict") or {})
     assert fed.cli.reset_replicas(layout).startswith("reset --replicas")
     assert ran == ["require_up", "bring_up", "evict", "close"]
+
+
+# -- the facts and the day-0 table ------------------------------------------------------------------------------------
+
+SOURCE = "/srv/invented-datasets/fern"  # what a variable holds: never recorded
+
+
+def facts_boot(fed, tmp_path, text: str = WITH_IMPORT):
+    """A bootstrap with made-up ids over a layout, as up holds them once the federation answered."""
+    layout, _ = import_layout(fed, tmp_path, text)
+    boot = fed.boot.Bootstrap.__new__(fed.boot.Bootstrap)
+    boot.layout = layout
+    spec = layout.spec
+    boot.ids = fed.boot.Ids(
+        users={p.name: f"u{i}" for i, p in enumerate(spec.principals)},
+        providers={p.name: f"p{i}" for i, p in enumerate(spec.providers)},
+        spaces={s.name: f"s{i}" for i, s in enumerate(spec.spaces)},
+    )
+    return boot
+
+
+def test_a_space_that_is_not_imported_records_a_null_import(fed, tmp_path):
+    facts = fed.facts.facts_of(facts_boot(fed, tmp_path))
+    assert facts["spaces"]["alpha-space"]["import"] is None
+
+
+def test_an_imported_space_records_its_mode_its_variable_its_storage_and_no_scan_before_one_is_read(
+    fed, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_FERN", SOURCE)
+    facts = fed.facts.facts_of(facts_boot(fed, tmp_path))
+    assert facts["spaces"]["fern-space"]["import"] == {
+        "readonly": True,
+        "source_env": "EXPCORE_FED_IMPORT_FERN",
+        "storage": "import-fern-space",
+        "scan": None,
+    }
+
+
+def test_an_imported_space_records_the_scan_the_wait_read(fed, tmp_path):
+    boot = facts_boot(fed, tmp_path)
+    scan = {"status": "completed", "createdFiles": 12, "failedFiles": 0}
+    boot.ids.scans["fern-space"] = scan
+    assert fed.facts.facts_of(boot)["spaces"]["fern-space"]["import"]["scan"] == scan
+
+
+def test_the_facts_never_hold_the_path_a_variable_names(fed, tmp_path, monkeypatch):
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_FERN", SOURCE)
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_MOSS", SOURCE + "-copy")
+    boot = facts_boot(fed, tmp_path, WITH_WRITABLE_IMPORT)
+    boot.layout.root.mkdir()
+    fed.facts.write_facts(boot.layout, boot)
+    text = boot.layout.facts.read_text(encoding="utf-8")
+    assert "EXPCORE_FED_IMPORT_FERN" in text
+    assert "invented-datasets" not in text
+
+
+def test_the_day0_table_says_how_an_imported_space_is_held_and_by_which_variable(fed, tmp_path, monkeypatch):
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_FERN", SOURCE)
+    monkeypatch.setenv("EXPCORE_FED_IMPORT_MOSS", SOURCE + "-copy")
+    layout, _ = import_layout(fed, tmp_path, WITH_WRITABLE_IMPORT)
+    rows = {row.split(" | ")[0].removeprefix("| "): row for row in fed.facts.describe(layout).splitlines()}
+    assert rows["Space `fern-space`"].endswith(
+        "; no baseline files; imported (read-only) from $EXPCORE_FED_IMPORT_FERN |"
+    )
+    assert rows["Space `moss-space`"].endswith(
+        "; no baseline files; imported (writable) from $EXPCORE_FED_IMPORT_MOSS |"
+    )
+    assert "imported" not in rows["Space `alpha-space` (study space)"]
+    assert "invented-datasets" not in "\n".join(rows.values())
