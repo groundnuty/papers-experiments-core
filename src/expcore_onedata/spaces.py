@@ -24,7 +24,7 @@ entries (the agent is pinned to one, O03), an entry without its data provider or
 space, and a token plane scoped to no space. Whenever the `[[spaces]]` form is used, with one entry or several, its
 entries are in the campaign fingerprint (`PlatformConfig.fingerprint`); the one-space form's fingerprint is unchanged.
 
-**An imported storage** (`import`, in `[space]` or an entry of `[[spaces]]`; O37, `storageimport.py`). The space's data
+**An imported storage** (`import`, in `[space]` or an entry of `[[spaces]]`; O41, `storageimport.py`). The space's data
 provider holds its files on a storage Onedata imported them from (25.0's storage import), not on one they were written
 to; `readonly` (required) says whether that storage is read-only, so that Onedata never writes to, changes or deletes
 from it. A space without the key is a regular one, as every space was. The declaration is in the fingerprint: in an
@@ -85,7 +85,7 @@ class StudySpace:
     support: Support
     holder: str | None = None
     tokens: tuple[str, ...] = PLANES
-    imported: ImportedStorage | None = None  # None: a regular storage, the data written to it (O37)
+    imported: ImportedStorage | None = None  # None: a regular storage, the data written to it (O41)
 
     def digest(self) -> str:
         """The SHA-256 of everything that makes this the space it is, for the fingerprint: never a value itself. An

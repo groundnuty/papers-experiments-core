@@ -13,7 +13,7 @@ what it does not; the study guide shows them in use ("Testing a study's instrume
   data API: files, per-provider block maps, per-reader visibility delays, pending deletes, transfers, and Onedata
   25.0's error shapes (or the older 404 shape).
 - `fake_import.FakeImportData` and `fake_import.make_import_federation` (imported from their module): a `FakeData`
-  whose data provider holds the study space on an imported storage, with its Onepanel's import calls (O37).
+  whose data provider holds the study space on an imported storage, with its Onepanel's import calls (O41).
 - `Ticker` and the test world (`make_federation`, `write_platform`, `write_with_placement`, `tool_plane_replicates`
   and the names the default `platform.toml` holds).
 - Two stand-in MCP servers, run as `python -m expcore_onedata.testing.fake_mcp_server` and `... .fake_onedata_mcp`.

@@ -24,7 +24,7 @@ configured name or lies outside the prefixes. On top of that gate:
 - **Teardown removes only what the change log says this provisioner created** (O09). A file is deleted by its logged id;
   a directory only when nothing but logged, already deleted entries was in it; anything else is reported as left, and
   the report's `ok` is False. Nothing outside the log is touched, and no token or user is revoked.
-- **A space held on a read-only imported storage is never written** (O37, `[space] import`): every request that would
+- **A space held on a read-only imported storage is never written** (O41, `[space] import`): every request that would
   create, write or delete a file or a directory there, through any provider, and a replication onto the data
   provider, is refused before it is sent (`read_only`). Reads, replications onto other providers and evictions from
   them go on as in any space; `storageimport.py` verifies such a space against its dataset's manifest.
@@ -281,11 +281,11 @@ class Provisioner:
 
     @property
     def read_only(self) -> bool:
-        """Whether the space's data provider holds it on a read-only imported storage (`[space] import`, O37)."""
+        """Whether the space's data provider holds it on a read-only imported storage (`[space] import`, O41)."""
         return self._entry.imported is not None and self._entry.imported.readonly
 
     def _refuse_read_only(self, what: str) -> None:
-        """Refuse, before anything is sent, a request a read-only imported storage cannot take (O37)."""
+        """Refuse, before anything is sent, a request a read-only imported storage cannot take (O41)."""
         if self.read_only:
             raise Refused(
                 f"{self._where}the space is held on a read-only imported storage, so {what} is refused; nothing was sent"
@@ -298,7 +298,7 @@ class Provisioner:
         is sent once.
 
         In a space held on a read-only imported storage every change of a file's content or of the tree
-        (`/data/...`), through any provider, is refused unsent (O37): op-worker answers a creation or a write there
+        (`/data/...`), through any provider, is refused unsent (O41): op-worker answers a creation or a write there
         EROFS, a delete there removes the file from the space and leaves it on the storage, and a write through another
         provider takes the data provider's blocks from it for good, since nothing can be replicated back onto a
         read-only storage (op-worker f118ed9, `test_distributed/readonly_storage_test_SUITE.erl`)."""

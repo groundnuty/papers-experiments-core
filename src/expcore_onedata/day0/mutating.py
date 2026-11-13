@@ -193,7 +193,7 @@ def round_trip(ctx: Context) -> Result:
     its own scratch file, placed from that space's data provider onto the first other provider of its support set, by
     a provisioner bound to that space with a change log of its own. The verdict is the worst over them (`per_space`).
     A space held on a read-only imported storage takes no scratch file, so the trip is unknown there, with nothing
-    sent (O37)."""
+    sent (O41)."""
     if not ctx.allow_mutation:
         return unknown(f"the round trip {NEEDS_CONSENT}")
     if ctx.placement is None:
@@ -203,7 +203,7 @@ def round_trip(ctx: Context) -> Result:
 
 def _round_trip_in(ctx: Context, entry: StudySpace) -> Result:
     """The round trip in one declared space."""
-    if entry.imported is not None and entry.imported.readonly:  # its data provider refuses the scratch file (O37)
+    if entry.imported is not None and entry.imported.readonly:  # its data provider refuses the scratch file (O41)
         return unknown(
             "the space is held on a read-only imported storage, which takes no scratch file, so the round trip cannot "
             "run there; it runs in a writable space"

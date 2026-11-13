@@ -1,4 +1,4 @@
-"""An imported dataset against an uploaded copy of the same bytes, on a live federation (O37, #184). Skipped unless:
+"""An imported dataset against an uploaded copy of the same bytes, on a live federation (O41, #184). Skipped unless:
 
     EXPCORE_LIVE_IMPORT=1 EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_PLATFORM=<root>/platform.toml \\
     EXPCORE_LIVE_IMPORT_TREE=<the dataset's local tree> [EXPCORE_LIVE_IMPORT_OUT=<facts.json>] \\
@@ -180,8 +180,8 @@ def settled_blocks(provisioner, file_id: str, provider: str) -> list:
 # -- the declared storage, the tree and the bytes -------------------------------------------------------------------
 
 
-def test_o37_the_owner_supports_the_imported_space_on_a_read_only_auto_import_that_does_not_rescan(pair):
-    """O37: the owner's panel shows the declared storage: imported, read-only, the auto mode, no continuous scan."""
+def test_o41_the_owner_supports_the_imported_space_on_a_read_only_auto_import_that_does_not_rescan(pair):
+    """O41: the owner's panel shows the declared storage: imported, read-only, the auto mode, no continuous scan."""
     # covers: GET /provider/spaces/{space}
     # covers: GET /provider/storages/{id}
     # covers: GET /provider/spaces/{space}/storage-import/auto/info
@@ -195,8 +195,8 @@ def test_o37_the_owner_supports_the_imported_space_on_a_read_only_auto_import_th
     assert FACTS["import"]["scan"]["status"] == "completed"
 
 
-def test_o37_both_copies_hold_the_manifests_tree_on_every_provider(pair):
-    """O37: every provider lists, in both spaces, exactly the manifest's paths, kinds and sizes."""
+def test_o41_both_copies_hold_the_manifests_tree_on_every_provider(pair):
+    """O41: every provider lists, in both spaces, exactly the manifest's paths, kinds and sizes."""
     for record in (FACTS["import"], FACTS["upload"]):
         assert record["ok"] is True
         assert all(listing["converged"] for listing in record["listing"].values())
@@ -209,13 +209,13 @@ def test_o37_both_copies_hold_the_manifests_tree_on_every_provider(pair):
         )
 
 
-def test_o37_every_file_of_both_copies_reads_back_through_the_owner_with_the_manifests_hash(pair):
-    """O25, O37: the bytes are the manifest's in both spaces, every file read whole through the owner."""
+def test_o41_every_file_of_both_copies_reads_back_through_the_owner_with_the_manifests_hash(pair):
+    """O25, O41: the bytes are the manifest's in both spaces, every file read whole through the owner."""
     assert FACTS["import"]["hashes"]["differ"] == FACTS["upload"]["hashes"]["differ"] == []
 
 
-def test_o37_a_sample_reads_back_through_each_mirror_with_the_manifests_hash_in_both_copies(pair):
-    """O37: through each mirror, which fetches from the owner, the largest file and a sample of small ones read back
+def test_o41_a_sample_reads_back_through_each_mirror_with_the_manifests_hash_in_both_copies(pair):
+    """O41: through each mirror, which fetches from the owner, the largest file and a sample of small ones read back
     with the manifest's SHA-256 in both spaces; the reset test evicts what the reads placed."""
     planned = {f.path: f.sha256 for f in pair["manifest"].files}
     for provisioner, check in both(pair):
@@ -225,8 +225,8 @@ def test_o37_a_sample_reads_back_through_each_mirror_with_the_manifests_hash_in_
                 assert provisioner.read_file(listed[path].file_id, provider=mirror).sha256 == planned[path]
 
 
-def test_o37_file_ids_have_one_form_in_both_copies(pair):
-    """O37: an imported file's id is made as a created one's (op-worker's import, `datastore_key:new()` packed with the
+def test_o41_file_ids_have_one_form_in_both_copies(pair):
+    """O41: an imported file's id is made as a created one's (op-worker's import, `datastore_key:new()` packed with the
     space's id): the client's plain segment, of the same lengths in both spaces."""
     lengths = []
     for provisioner, check in both(pair):
@@ -237,8 +237,8 @@ def test_o37_file_ids_have_one_form_in_both_copies(pair):
     assert lengths[0] == lengths[1]
 
 
-def test_o37_a_forced_rescan_keeps_every_imported_file_id_and_finds_nothing_new(pair):
-    """O37: with continuous scans and change detection off, a forced scan only adds what is new on the storage: every
+def test_o41_a_forced_rescan_keeps_every_imported_file_id_and_finds_nothing_new(pair):
+    """O41: with continuous scans and change detection off, a forced scan only adds what is new on the storage: every
     id stays, and the scan counts nothing created, modified or deleted."""
     # covers: POST /provider/spaces/{space}/storage-import/auto/force-start
     record = pair["imported"].rescan(timeout_s=TIMEOUT_S)
@@ -249,7 +249,7 @@ def test_o37_a_forced_rescan_keeps_every_imported_file_id_and_finds_nothing_new(
 
 
 def test_o01_the_owner_holds_every_file_as_one_whole_block_in_both_copies(pair):
-    """O01, O37: an imported file's location is made with one block [0, size), as an uploaded file's ends; the owner's
+    """O01, O41: an imported file's location is made with one block [0, size), as an uploaded file's ends; the owner's
     block map of every file is exactly that in both spaces."""
     for provisioner, check in both(pair):
         holder = provisioner.settings.holder
@@ -262,8 +262,8 @@ def test_o01_the_owner_holds_every_file_as_one_whole_block_in_both_copies(pair):
 # -- what happens through the mirrors --------------------------------------------------------------------------------
 
 
-def test_o37_an_on_demand_read_through_a_mirror_places_the_same_window_in_both_copies(pair):
-    """O02, O37: one byte read through a mirror from the middle of the largest file places the same window there in
+def test_o41_an_on_demand_read_through_a_mirror_places_the_same_window_in_both_copies(pair):
+    """O02, O41: one byte read through a mirror from the middle of the largest file places the same window there in
     both spaces. The mirror is emptied first, verified on its block map, so the window is the read's alone, and again
     after."""
     path, mirror = largest(pair), pair["mirrors"][0]
@@ -279,8 +279,8 @@ def test_o37_an_on_demand_read_through_a_mirror_places_the_same_window_in_both_c
     assert windows[0] == windows[1]
 
 
-def test_o37_a_replication_onto_a_mirror_places_the_file_whole_with_the_same_transfer_record(pair):
-    """O01, O37: a replication of the largest file onto a mirror emptied first, verified on its block map, places it
+def test_o41_a_replication_onto_a_mirror_places_the_file_whole_with_the_same_transfer_record(pair):
+    """O01, O41: a replication of the largest file onto a mirror emptied first, verified on its block map, places it
     whole in both spaces, so each moved the whole file, and the transfer records have the same fields and end in the
     same state."""
     path, mirror = largest(pair), pair["mirrors"][-1]
@@ -297,8 +297,8 @@ def test_o37_a_replication_onto_a_mirror_places_the_file_whole_with_the_same_tra
     assert shapes[0] == shapes[1]
 
 
-def test_o37_the_reset_evicts_and_verifies_both_copies_alike(pair):
-    """O01, O33, O37: with a file replicated onto each mirror and a range read through it, the reset evicts the
+def test_o41_the_reset_evicts_and_verifies_both_copies_alike(pair):
+    """O01, O33, O41: with a file replicated onto each mirror and a range read through it, the reset evicts the
     mirrors' holdings in both spaces and passes every stage; the mirrors then hold nothing and the owner every block."""
     path = largest(pair)
     stages = []
@@ -320,8 +320,8 @@ def test_o37_the_reset_evicts_and_verifies_both_copies_alike(pair):
     assert stages[0] == stages[1] == list(STAGES)
 
 
-def test_o37_a_qos_requirement_is_fulfilled_and_viewed_alike_in_both_copies(pair):
-    """O33, O37: an `anyStorage` requirement on a file through the owner reads the same in both spaces: its record's
+def test_o41_a_qos_requirement_is_fulfilled_and_viewed_alike_in_both_copies(pair):
+    """O33, O41: an `anyStorage` requirement on a file through the owner reads the same in both spaces: its record's
     fields and its status once fulfilled, and the file's summary; the reset then removes both."""
     path = largest(pair)
     views = []
@@ -345,8 +345,8 @@ def test_o37_a_qos_requirement_is_fulfilled_and_viewed_alike_in_both_copies(pair
     assert views[0][0] is True
 
 
-def test_o37_the_attributes_differ_only_where_the_import_is_documented_to(pair):
-    """O37: every file's attributes, as the owner answers them, have the same names in both spaces and the same values
+def test_o41_the_attributes_differ_only_where_the_import_is_documented_to(pair):
+    """O41: every file's attributes, as the owner answers them, have the same names in both spaces and the same values
     but for the documented differences (`MAY_DIFFER`); what differs, and how often, is written to the facts."""
     differing: dict[str, int] = {}
     names = []

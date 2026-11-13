@@ -1,4 +1,4 @@
-"""A space whose data provider holds it on an imported storage: the `import` key of `[space]` and `[[spaces]]` (O37)."""
+"""A space whose data provider holds it on an imported storage: the `import` key of `[space]` and `[[spaces]]` (O41)."""
 
 import json
 
@@ -34,19 +34,19 @@ def second_entry(value):
     return edit
 
 
-def test_o37_a_space_without_the_key_is_held_on_a_regular_storage(tmp_path):
-    """O37: without `import` nothing changes: the space is ingested, as every space was."""
+def test_o41_a_space_without_the_key_is_held_on_a_regular_storage(tmp_path):
+    """O41: without `import` nothing changes: the space is ingested, as every space was."""
     assert load(tmp_path).spaces[0].imported is None
 
 
-def test_o37_the_one_space_form_declares_a_read_only_imported_storage(tmp_path):
-    """O37: `[space] import = { readonly = true }` says the data provider holds the space on an imported storage that
+def test_o41_the_one_space_form_declares_a_read_only_imported_storage(tmp_path):
+    """O41: `[space] import = { readonly = true }` says the data provider holds the space on an imported storage that
     it never writes."""
     assert load(tmp_path, one_space({"readonly": True})).spaces[0].imported == ImportedStorage(readonly=True)
 
 
-def test_o37_an_entry_of_several_spaces_declares_a_writable_imported_storage_and_the_others_stay_regular(tmp_path):
-    """O37: the key is per entry; an entry without it is a regular space."""
+def test_o41_an_entry_of_several_spaces_declares_a_writable_imported_storage_and_the_others_stay_regular(tmp_path):
+    """O41: the key is per entry; an entry without it is a regular space."""
     config = load(tmp_path, second_entry({"readonly": False}))
     assert [entry.imported for entry in config.spaces] == [None, ImportedStorage(readonly=False)]
 
@@ -61,8 +61,8 @@ BAD = {
 
 @pytest.mark.parametrize("case", list(BAD))
 @pytest.mark.parametrize("form", ["one space", "several"])
-def test_o37_a_bad_import_table_is_refused_at_load_naming_the_key_and_echoing_no_value(case, form, tmp_path):
-    """O37, O12: each mistake fails at load, naming the file, the table and the key, never a name or an id."""
+def test_o41_a_bad_import_table_is_refused_at_load_naming_the_key_and_echoing_no_value(case, form, tmp_path):
+    """O41, O12: each mistake fails at load, naming the file, the table and the key, never a name or an id."""
     value, words = BAD[case]
     edit = one_space(value) if form == "one space" else second_entry(value)
     with pytest.raises(ConfigError, match=words) as caught:
@@ -72,7 +72,7 @@ def test_o37_a_bad_import_table_is_refused_at_load_naming_the_key_and_echoing_no
 
 
 def test_c06_an_imported_storage_enters_the_fingerprint_and_its_absence_leaves_the_old_one(tmp_path):
-    """C06, O37: a resume after the data provider's storage changed kind is refused, so the declaration enters the
+    """C06, O41: a resume after the data provider's storage changed kind is refused, so the declaration enters the
     fingerprint: an entry's digest with several spaces, and a `storage_import` key in the one-space form, which keeps
     its fingerprint unchanged without the key."""
     plain = load(tmp_path / "a").fingerprint()

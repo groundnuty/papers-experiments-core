@@ -1,5 +1,5 @@
 # Provenance: new
-"""Provision a space by storage import instead of an upload, and show it holds exactly its dataset (O37, #184).
+"""Provision a space by storage import instead of an upload, and show it holds exactly its dataset (O41, #184).
 
 A federation's owner can give Onedata 25.0 a directory that already holds a dataset, as an imported storage, instead of
 uploading the files one by one through REST: the provider scans the directory and makes each entry in the space. The

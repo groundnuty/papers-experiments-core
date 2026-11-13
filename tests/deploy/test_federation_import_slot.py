@@ -122,8 +122,8 @@ def test_the_templates_ids_and_users_are_those_the_layout_declares(fed, tmp_path
     assert {"space", "support"}.isdisjoint(data)  # the one-space form is never beside [[spaces]]
 
 
-def test_o37_the_template_is_a_platform_file_the_core_loads_with_its_placement_as_the_live_tests_read_it(fed, tmp_path):
-    """O37: the rendered template loads in the platform layer as tests/live/test_storage_import.py loads it: the two
+def test_o41_the_template_is_a_platform_file_the_core_loads_with_its_placement_as_the_live_tests_read_it(fed, tmp_path):
+    """O41: the rendered template loads in the platform layer as tests/live/test_storage_import.py loads it: the two
     spaces by their labels, the imported one read-only, the other regular, and a `[placement]` table whose data
     provider is the owner, which a provisioner needs."""
     from expcore_onedata.config import load_platform

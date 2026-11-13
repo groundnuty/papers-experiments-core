@@ -1,6 +1,6 @@
 # Provenance: new
 """A fake federation whose data provider holds the study space on an imported storage, with that provider's Onepanel
-(O37, #184): what `storageimport.py` reads and sends, as Onedata 25.0's sources describe it.
+(O41, #184): what `storageimport.py` reads and sends, as Onedata 25.0's sources describe it.
 
 `FakeImportData` is a `FakeData` whose data provider (`importing`, alpha by default) supports the study space on an
 imported POSIX storage. The storage's content is a dictionary (`storage`, path to bytes, and `storage_dirs`), which a

@@ -447,10 +447,10 @@ def test_a_copy_that_exists_is_never_made_again_and_its_source_is_no_longer_read
 
 
 @pytest.mark.parametrize("linked", ["import directory", "copy"])
-def test_o37_a_symbolic_link_where_the_copy_goes_is_refused_and_nothing_outside_the_root_is_touched(
+def test_o41_a_symbolic_link_where_the_copy_goes_is_refused_and_nothing_outside_the_root_is_touched(
     fed, tmp_path, linked
 ):
-    """O37: the copy and its mount lie below the root, which down empties; a link at the owner's import directory, or
+    """O41: the copy and its mount lie below the root, which down empties; a link at the owner's import directory, or
     at the copy itself, would lead them, the copy's chmod and the removal of an unfinished copy outside it."""
     layout, _, environ = writable_layout(fed, tmp_path)
     outside = tmp_path / "outside"
@@ -467,8 +467,8 @@ def test_o37_a_symbolic_link_where_the_copy_goes_is_refused_and_nothing_outside_
     assert outside.stat().st_mode & 0o777 == 0o700
 
 
-def test_o37_no_compose_command_mounts_a_writable_copy_that_is_a_symbolic_link(fed, tmp_path, monkeypatch):
-    """O37: every Compose command binds the writable copy read-write from the root; one that is a link is refused
+def test_o41_no_compose_command_mounts_a_writable_copy_that_is_a_symbolic_link(fed, tmp_path, monkeypatch):
+    """O41: every Compose command binds the writable copy read-write from the root; one that is a link is refused
     before Compose runs, whatever made it after up."""
     layout, data, environ = writable_layout(fed, tmp_path)
     for name, value in environ.items():

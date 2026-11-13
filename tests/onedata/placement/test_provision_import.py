@@ -1,5 +1,5 @@
 """A provisioner in a space its data provider holds on a read-only imported storage sends nothing that would write to,
-change or delete from that storage (O37), and still reads, places and evicts on the other providers."""
+change or delete from that storage (O41), and still reads, places and evicts on the other providers."""
 
 import pytest
 
@@ -51,8 +51,8 @@ WRITES = {
 
 
 @pytest.mark.parametrize("case", list(WRITES))
-def test_o37_a_read_only_imported_space_is_never_written_and_a_refusal_sends_nothing(case, provisioner, fake, tmp_path):
-    """O37: op-worker refuses a write, a creation and a replication onto a read-only storage (EROFS), and a delete there
+def test_o41_a_read_only_imported_space_is_never_written_and_a_refusal_sends_nothing(case, provisioner, fake, tmp_path):
+    """O41: op-worker refuses a write, a creation and a replication onto a read-only storage (EROFS), and a delete there
     leaves the file on the storage while removing it from the space; a write through another provider takes the data
     provider's blocks from it for good. So the provisioner refuses every such request before anything is sent."""
     source = tmp_path / "new.bin"
@@ -63,8 +63,8 @@ def test_o37_a_read_only_imported_space_is_never_written_and_a_refusal_sends_not
     assert fake.held(PATH, ALPHA_ID) == [[0, len(DATA)]]
 
 
-def test_o37_a_read_only_imported_space_is_still_read_replicated_to_a_mirror_and_evicted_from_it(provisioner, fake):
-    """O37: the data provider's storage is only read: a read, a replication onto a mirror's regular storage and an
+def test_o41_a_read_only_imported_space_is_still_read_replicated_to_a_mirror_and_evicted_from_it(provisioner, fake):
+    """O41: the data provider's storage is only read: a read, a replication onto a mirror's regular storage and an
     eviction from it, confirmed by the block maps, all work, and the data provider keeps every block."""
     assert provisioner.read_file(provisioner.resolve(PATH).file_id).size == len(DATA)
     provisioner.replicate(PATH, "beta")
@@ -73,8 +73,8 @@ def test_o37_a_read_only_imported_space_is_still_read_replicated_to_a_mirror_and
     assert fake.held(PATH, ALPHA_ID) == [[0, len(DATA)]]
 
 
-def test_o37_a_writable_imported_space_takes_the_provisioners_writes(tmp_path, fake, client, ticker):
-    """O37: a writable imported storage is written like a regular one; only `readonly` refuses."""
+def test_o41_a_writable_imported_space_takes_the_provisioners_writes(tmp_path, fake, client, ticker):
+    """O41: a writable imported storage is written like a regular one; only `readonly` refuses."""
     from expcore_onedata.config import load_platform
     from expcore_onedata.provision import Provisioner, resolve_provider_ids
     from expcore_onedata.rangemap import load_placement
@@ -95,10 +95,10 @@ def test_o37_a_writable_imported_space_takes_the_provisioners_writes(tmp_path, f
     assert fake.exists("study/new.bin")
 
 
-def test_o37_a_progressive_ingest_is_refused_on_a_read_only_imported_space_before_it_claims_anything(
+def test_o41_a_progressive_ingest_is_refused_on_a_read_only_imported_space_before_it_claims_anything(
     provisioner, config, tmp_path
 ):
-    """O37, O27: the ingest removes files and writes them back through the data provider, which a read-only storage
+    """O41, O27: the ingest removes files and writes them back through the data provider, which a read-only storage
     refuses; it is refused when built, with nothing claimed or sent."""
     staging = tmp_path / "staged"
     staging.mkdir()

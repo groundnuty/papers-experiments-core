@@ -47,11 +47,11 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
     source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it. And the three calls of a
     run's revocation at its end (C19): a user's read of its generation of temporary tokens, its own revocation of them,
     and the verification that answers a revoked token `tokenRevoked`, all named by oz-worker's source alone. And the
-    four Onepanel calls that check a space held on an imported storage (O37), named by onepanel's source alone."""
+    four Onepanel calls that check a space held on an imported storage (O41), named by onepanel's source alone."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
-        ("GET", "/provider/spaces/{space}"),  # an imported space's support and its storage, and its scan (O37)
+        ("GET", "/provider/spaces/{space}"),  # an imported space's support and its storage, and its scan (O41)
         ("GET", "/provider/storages/{id}"),
         ("GET", "/provider/spaces/{space}/storage-import/auto/info"),
         ("POST", "/provider/spaces/{space}/storage-import/auto/force-start"),
@@ -94,7 +94,7 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
 
 def test_every_unverified_endpoint_has_a_live_contract_test():
     """Each (method, path) neither a source nor a live run confirms is named by a `covers:` line of a live test, so
-    none goes unchecked: the contract tests', or, for the panel calls of an imported space, the import's (O37)."""
+    none goes unchecked: the contract tests', or, for the panel calls of an imported space, the import's (O41)."""
     from expcore_onedata.client import UNVERIFIED_ENDPOINTS
 
     live = "".join(path.read_text(encoding="utf-8") for path in sorted((ROOT / "tests" / "live").glob("test_*.py")))

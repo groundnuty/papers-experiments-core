@@ -1,5 +1,5 @@
 # Provenance: new
-"""A dataset's manifest: every file a space must hold, with its size and SHA-256, and every directory (O37, #184).
+"""A dataset's manifest: every file a space must hold, with its size and SHA-256, and every directory (O41, #184).
 
 A study makes the manifest once from the copy of the dataset it keeps (`manifest_of_tree`), writes it beside the
 dataset (`write_manifest`) and loads it at each federation (`load_manifest`), where `storageimport.ImportedSpace` shows

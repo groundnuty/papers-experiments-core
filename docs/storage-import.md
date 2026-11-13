@@ -1,6 +1,6 @@
 # Storage import
 
-How a space can be provisioned by Onedata 25.0's storage import instead of a REST upload, what the core checks, what an imported space cannot take, and the live checks that must pass before a study relies on it. Issue #184, regression O37. Everything here was read from the sources of the build the federation runs; nothing was run against a federation yet.
+How a space can be provisioned by Onedata 25.0's storage import instead of a REST upload, what the core checks, what an imported space cannot take, and the live checks that must pass before a study relies on it. Issue #184, regression O41. Everything here was read from the sources of the build the federation runs; nothing was run against a federation yet.
 
 **The answer to the issue's question 5, from the source:** each federation's owner can import one shared, read-only copy of a dataset. A read-only imported storage is never written by Onedata, the import keeps its state in the provider's own database, and everything the core needs from the owner's copy is a read: reads and on-demand reads through the mirrors, replications onto them, their eviction by the reset, the block maps, the transfer views and QoS requirements. What it cannot take is any write through the owner, so the progressive ingest (O27), `reset --clean` and the day-0 round trip cannot run in such a space, and a write or an eviction that takes the owner's blocks cannot be undone. The live checks below decide whether the import is equivalent to an upload in practice.
 
@@ -53,16 +53,16 @@ A read-only imported storage is only read: the panel skips its write test, op-wo
 
 | Property | Test |
 |---|---|
-| The declared storage on the owner's panel | `test_o37_the_owner_supports_the_imported_space_on_a_read_only_auto_import_that_does_not_rescan` |
-| The tree on every provider | `test_o37_both_copies_hold_the_manifests_tree_on_every_provider` |
-| The bytes through the owner, and a sample through each mirror | `test_o37_every_file_of_both_copies_reads_back_...`, `test_o37_a_sample_reads_back_through_each_mirror_...` |
-| The file ids' form | `test_o37_file_ids_have_one_form_in_both_copies` |
-| The ids across a forced re-scan | `test_o37_a_forced_rescan_keeps_every_imported_file_id_and_finds_nothing_new` |
+| The declared storage on the owner's panel | `test_o41_the_owner_supports_the_imported_space_on_a_read_only_auto_import_that_does_not_rescan` |
+| The tree on every provider | `test_o41_both_copies_hold_the_manifests_tree_on_every_provider` |
+| The bytes through the owner, and a sample through each mirror | `test_o41_every_file_of_both_copies_reads_back_...`, `test_o41_a_sample_reads_back_through_each_mirror_...` |
+| The file ids' form | `test_o41_file_ids_have_one_form_in_both_copies` |
+| The ids across a forced re-scan | `test_o41_a_forced_rescan_keeps_every_imported_file_id_and_finds_nothing_new` |
 | The owner's block maps | `test_o01_the_owner_holds_every_file_as_one_whole_block_in_both_copies` |
-| An on-demand read through a mirror | `test_o37_an_on_demand_read_through_a_mirror_places_the_same_window_in_both_copies` |
-| A replication and its transfer record | `test_o37_a_replication_onto_a_mirror_places_the_file_whole_with_the_same_transfer_record` |
-| The reset's eviction and verification | `test_o37_the_reset_evicts_and_verifies_both_copies_alike` |
-| A QoS requirement's record and summary | `test_o37_a_qos_requirement_is_fulfilled_and_viewed_alike_in_both_copies` |
-| Every attribute but the documented ones | `test_o37_the_attributes_differ_only_where_the_import_is_documented_to` |
+| An on-demand read through a mirror | `test_o41_an_on_demand_read_through_a_mirror_places_the_same_window_in_both_copies` |
+| A replication and its transfer record | `test_o41_a_replication_onto_a_mirror_places_the_file_whole_with_the_same_transfer_record` |
+| The reset's eviction and verification | `test_o41_the_reset_evicts_and_verifies_both_copies_alike` |
+| A QoS requirement's record and summary | `test_o41_a_qos_requirement_is_fulfilled_and_viewed_alike_in_both_copies` |
+| Every attribute but the documented ones | `test_o41_the_attributes_differ_only_where_the_import_is_documented_to` |
 
 With `EXPCORE_LIVE_IMPORT_OUT` the tests write what they read, the timings of the import's check and of the upload among it, as JSON for the dated facts file. Still open after them, and for a slot of its own: the timing at full size against the upload, a provider restart during the scan, and two federations importing one directory.

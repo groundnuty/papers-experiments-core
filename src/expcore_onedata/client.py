@@ -174,7 +174,7 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
   requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
   provisioner's own) has every target checked against that space alone, its id, its name and its own prefixes.
-- A space held on an imported storage (O37, `storageimport.py`) is checked through the data provider's Onepanel, under
+- A space held on an imported storage (O41, `storageimport.py`) is checked through the data provider's Onepanel, under
   `/api/v3/onepanel` on the provider's own address, as the Compose federation's bootstrap calls it, with the admin
   token, which must be a member of that provider's cluster: `panel_get` reads `GET /provider/spaces/{space}` (answer
   `storageId`, `storageImport`), `GET /provider/storages/{id}` (answer `importedStorage`, `readonly`, `mountPoint`) and
@@ -225,7 +225,7 @@ from expcore_onedata.streamed import Digest, media_type
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
 # A provider's Onepanel, served on the provider's own address, as the Compose federation's bootstrap calls it
-# (deploy/compose-federation/fedrest.py, PANEL_API): the storage import's state lives there alone (O37).
+# (deploy/compose-federation/fedrest.py, PANEL_API): the storage import's state lives there alone (O41).
 API_PANEL = "/api/v3/onepanel"
 # The Onepanel reads the layer sends, for a space held on an imported storage (`storageimport.py`): the support's
 # storage and import mode, the storage's flags, and the state of the space's auto import scan. No other panel read is.
@@ -807,7 +807,7 @@ class OnezoneClient:
     def panel_get(self, provider: str, path: str, *, retry: ReadRetry = ONE_ATTEMPT) -> Any:
         """GET one of the Onepanel reads the layer knows (`PANEL_READS`) from a declared provider's panel, with the
         admin credential: a space's support (its `storageId` and `storageImport`), a storage's flags
-        (`importedStorage`, `readonly`, `mountPoint`) and the state of a space's auto import scan (O37). Any other
+        (`importedStorage`, `readonly`, `mountPoint`) and the state of a space's auto import scan (O41). Any other
         panel path, and an undeclared provider, is refused unsent (`OutOfScope`). The admin credential must be a
         member of the provider's cluster for the panel to answer; a refusal is the panel's 401 or 403, raised as it
         came. `retry` is as for `get`."""

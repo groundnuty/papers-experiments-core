@@ -38,7 +38,7 @@ and must never be given to a teardown, which would delete the dataset's restored
 claim, is refused with ProvisionError, and a teardown over a claimed log is refused with nothing sent. Several
 instruments over one provisioner, one run after another, share the claim.
 
-A space held on a read-only imported storage (`[space] import`, O37) cannot take an ingest: it is refused when built
+A space held on a read-only imported storage (`[space] import`, O41) cannot take an ingest: it is refused when built
 (`Refused`), since op-worker refuses the write-back there and a delete leaves the file on the storage. On a writable
 imported storage the ingest runs as on a regular one; its removals then unlink the files from the import directory
 and its write-backs are files made through REST, with new ids (`docs/storage-import.md`).
@@ -83,7 +83,7 @@ class ProgressiveIngest:
         unless given) for a part being written. `now` is the epoch clock of the readings' `utc`."""
         if plan.space != provisioner.space.label:
             raise ValueError("the plan's space is not the space the provisioner is bound to")
-        if provisioner.read_only:  # it removes files and writes them back through the data provider (O37)
+        if provisioner.read_only:  # it removes files and writes them back through the data provider (O41)
             raise Refused(
                 f"{provisioner.where}the space is held on a read-only imported storage, so a progressive ingest, which "
                 "removes files and writes them back through the data provider, is refused; nothing was claimed or sent"
