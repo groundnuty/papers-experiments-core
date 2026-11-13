@@ -219,6 +219,48 @@ def test_o34_a_cell_whose_escalation_never_decides_returns_within_its_bound_as_c
     assert refused.value.kind == kinds.CELL_UNKILLABLE
 
 
+def test_o34_an_outcome_decided_after_the_cells_bounded_wait_never_replaces_the_runs_end(world, mounted, monkeypatch):
+    """O34: the cell's escalation decides only after the cell's own bounded wait gave up on it (its commands answered
+    late), and the cell ended the run as `survived_kill`. The late outcome, here an abort that freed the wedged read, is
+    kept among the cell's deadlines, and the run's end stays the one the cell and its attempt were classified by, so
+    the collection is still refused. Before, the late record replaced it: the end fell to `mount_aborted` after the
+    attempt was classified, out of step with the cell's own record, and the collection went ahead (#226)."""
+    clock = Clock()
+    decided = by_the_clock(monkeypatch, clock)
+    pids = cell_processes(world, mounted, wedged=True)
+    cells, firing, release = mounted._cells, threading.Event(), threading.Event()
+    kill = cells._kill_at_the_cap
+
+    def answers_late(*cell):
+        firing.set()
+        release.wait(30)
+        return kill(*cell)
+
+    def runs_until_its_cap(container, argv, stdin):
+        if stdin == CODE:
+            assert firing.wait(30), "the cell's deadline never fired"
+            return CmdResult(137, "", "")
+        if container.name == mounted.names.sidecar:  # the abort: the read fails with an errno, the pending kill takes
+            world.host.unkillable.discard(pids["python"])
+            world.host.files.pop(f"/proc/{pids['python']}/stat", None)
+        return CmdResult(0)
+
+    cells._kill_at_the_cap, world.host.exec_handler = answers_late, runs_until_its_cap
+    try:
+        result = mounted.exec(CODE, CELL_S)
+    finally:
+        release.set()
+    assert decided[-1].event.wait(30), "the late escalation never decided"
+    assert result.kill["deadline"]["outcome"] == deadline.SURVIVED
+    assert cells.ended["outcome"] == deadline.SURVIVED
+    assert cells.ended["why"] == "not decided within its margin"
+    late = mounted.metadata()["cell_deadlines"]
+    assert [(d["cell"], d["outcome"]) for d in late] == [(1, deadline.SURVIVED), (1, deadline.MOUNT_ABORTED)]
+    with pytest.raises(InfraError) as refused:
+        mounted.collect(world.tmp_path / "out")
+    assert refused.value.kind == kinds.CELL_UNKILLABLE
+
+
 # ------------------------------------------------------------------ an escalation that raises, through the sandbox
 def raising_kill(*args, **kwargs):
     raise OSError("the host's kill could not run")

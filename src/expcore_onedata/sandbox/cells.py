@@ -15,6 +15,7 @@ the kill past the grace period has the mount aborted under it, or the sandbox st
 is published from the timer's thread under `meta_lock`, before the sandbox's stop, which runs after it. Every wait for
 that outcome, the cell's own included, lasts at most the margin and `SETTLE_SLACK_S`: an outcome not decided by then,
 like an escalation that raised and whose quiesce did not show the cell gone, is `survived_kill`, never a clean kill.
+The first end published stands: an outcome decided later is kept among the cell's deadlines, never made the run's end.
 """
 
 from __future__ import annotations
@@ -306,12 +307,16 @@ class CellRunner:
 
     def _publish(self, cell: int, record: dict[str, Any]) -> Callable[[], None] | None:
         """Publish a deadline's record under the metadata's lock, under `cell_deadlines` and, for an escalated outcome,
-        as `ended`; the sandbox's stop it orders, for the timer to run once the outcome is decided."""
+        as `ended` unless the run's end is published already; the sandbox's stop it orders, for the timer to run once
+        the outcome is decided."""
         outcome = record["outcome"]
         with self.meta_lock:
             self._deadline = record
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})  # shares the record's steps
-            if outcome in DL.ESCALATED:  # the run is over from now, whatever the cell's record makes of it after
+            # the run is over from now, whatever the cell's record makes of it after. An end already published stands:
+            # a bounded wait that gave up on this outcome ended the run as `survived_kill` (`_end`, `settle`), and the
+            # cell and its attempt were classified by it, so a late outcome is kept above and never replaces it (#226)
+            if outcome in DL.ESCALATED and self.ended is None:
                 self.ended = record
         if outcome in DL.ESCALATED:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
