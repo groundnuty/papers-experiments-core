@@ -6,6 +6,7 @@ here changes every report, and a replication package's regeneration with it.
 """
 
 NO_KIND = "none"  # the kind column of a condition's row of zeros
+UNKNOWN = "n/a"  # a value that is missing or cannot be computed, never shown as zero
 
 
 def percent(level: float) -> str:
@@ -114,6 +115,38 @@ COUNT_DEFINITIONS = [
     "- *Left out*: the set-aside and treatment attempts of runs a partial analysis leaves out, and only those.",
     "- *Kind* `budget_hold`: no failure of the infrastructure, but the campaign's budget: a request was not sent "
     "because the top-up it needed would have passed the ceiling. Set aside like a failure, and never a treatment.",
+]
+
+SHARD_NOTES = [
+    "This batch was merged from shards: one campaign run as several parts, each by one driver on its own host. Each",
+    "run belongs to one shard, and a pair of runs is never split between two. Planned counts the condition's runs in",
+    "that shard; the three rates are the shares of those planned runs that were analysed, exhausted or unfinished (a",
+    "run a partial analysis leaves out is in none of the three), and `n/a` where the shard ran none of the",
+    "condition's runs.",
+    "",
+    "The shards are a check that the hosts are interchangeable, not a factor of the design: no test across shards is",
+    "made, the contrasts above pool the runs of every shard, every figure in this section is descriptive, and no",
+    "score is shown by shard. A pair never crosses shards, so a host effect meets both arms alike, and a score by",
+    "shard would mostly show which instances landed on which host. A difference between shards is for the reader to",
+    "weigh: a condition whose figures differ by shard is worth a look at the shards before it is read as an effect.",
+]
+
+SHARD_KIND_NOTES = [
+    "Set aside (all runs): attempts that ended as an infrastructure failure, or were discarded for an outage, in",
+    "every run of the shard, by the kind of their outcome as the batch's retries are counted; `not recorded` for an",
+    "export that does not carry them per shard. Charged in exhausted runs: the charged attempts of the",
+    "shard's exhausted runs, by kind; where the first column is recorded they are among it. Scored as treatment: the",
+    "shard's analysed attempts that ended as an infrastructure failure their condition declares as its treatment.",
+    f"Kind `{NO_KIND}`: the shard met no infrastructure failure. Kind `unknown`: an attempt that recorded none.",
+]
+
+SHARD_TIME_NOTES = [
+    "Each figure is the median and the 90th percentile (interpolated between the sorted values) of the N values the",
+    "export carries, in seconds. Run wall time: the wall time of each analysed run's scored attempt. Turn latency:",
+    "the latency of each model reply in those attempts. Reset time: the time each run's environment reset took; the",
+    "core does not record it, so it is `not recorded` unless the export carries it. N can be below the shard's",
+    "analysed runs when only some of them carry the figure; `not recorded` where none does, and `n/a` for a shard",
+    "with no analysed run.",
 ]
 
 BUDGET_HOLD_NOTES = [

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 from shard_support import (
+    MERGE_TIMES,
+    MERGED_ONLY,
     json_meta,
     keys_of_shard,
     make_study,
@@ -19,6 +21,7 @@ from shard_support import (
     plant_run,
     run_shard,
     without_run,
+    without_shard_section,
 )
 from study_support import Campaign, clean_environment, cli, finish
 
@@ -87,18 +90,20 @@ def test_c32_each_shard_by_model_ran_its_models_runs_only_one_at_a_time(shards):
 
 def test_c32_a_campaign_split_by_model_and_merged_gives_the_scores_and_analysis_of_one_driver(whole, merged):
     """C32: scores and analysis of the merged batch are byte for byte one driver's; the export differs only in the
-    fields of a shard's own dispatch sequence and the shard tags, the report only in the median dispatch position."""
+    fields of a shard's own dispatch sequence, the shard tags and what only a merge has (C29: `shard_retries_by_kind`,
+    and each analysed entry's `wall_s` and `turn_latency_s`), the report only in the median dispatch position and the
+    `## Shards` section only a merged batch has."""
     assert (merged.root / "out" / "scores.json").read_bytes() == (whole.root / "out" / "scores.json").read_bytes()
     assert (merged.root / "out" / "analysis.json").read_bytes() == (whole.root / "out" / "analysis.json").read_bytes()
     one, many = read(whole, "export.json"), read(merged, "export.json")
-    own = {"shard", "dispatch_seq", "started_at", "lease_wait_s"}
+    own = {"shard", "dispatch_seq", "started_at", "lease_wait_s", *MERGE_TIMES}
     for key in one:
         if key != "analysed_attempts":
             assert many[key] == one[key], key
     plain = lambda entries: [{k: v for k, v in e.items() if k not in own} for e in entries]  # noqa: E731
     assert plain(many["analysed_attempts"]) == plain(one["analysed_attempts"])
-    assert set(many) - set(one) == {"shards"}
-    lines_one, lines_many = whole.report.splitlines(), merged.report.splitlines()
+    assert set(many) - set(one) == set(MERGED_ONLY)
+    lines_one, lines_many = whole.report.splitlines(), without_shard_section(merged.report).splitlines()
     assert len(lines_one) == len(lines_many)
     for a, b in zip(lines_many, lines_one, strict=True):
         assert a == b or (a.startswith("| ") and a.rsplit(" | ", 1)[0] == b.rsplit(" | ", 1)[0])
@@ -171,7 +176,7 @@ def test_c32_shards_by_model_where_only_some_models_declare_accepted_fingerprint
     assert [share["model"] for share in one["deployment_shares"]] == ["alpha-stub"]
     assert many["deployment_shares"] == one["deployment_shares"]
     assert json.dumps(many["deployment_shares"]) == json.dumps(one["deployment_shares"])
-    assert list(many) == [*one, "shards"]  # the export's bytes: the place of the key too
+    assert list(many) == [*one, *MERGED_ONLY]  # the export's bytes: the place of the keys too
     assert (merged_campaign.root / "out" / "analysis.json").read_bytes() == (
         declared_whole.root / "out" / "analysis.json"
     ).read_bytes()

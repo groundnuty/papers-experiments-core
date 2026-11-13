@@ -26,7 +26,7 @@ LABELS = {1: "shard-1", 2: "shard-2"}
 IDENTITY_VARIABLE = "REHEARSAL_ENVIRONMENT_IDENTITY"
 PLUGIN = "rehearsal_plugin.py"
 RECORD = re.compile(r"[0-9a-f]{64}\.\d+\.json")
-SHARD_FIELDS = ("shard", "shards")  # what a merged batch adds to an export
+SHARD_FIELDS = ("shard", *shard_support.MERGED_ONLY)  # what a merged batch adds to an export, at any depth
 ORDER_FIELDS = ("dispatch_seq", "started_at", "lease_wait_s")  # where and when a run was dispatched: per driver
 CONDITIONS = "## Conditions"  # the report's table whose last cell is a median dispatch position, which a driver counts
 
@@ -118,14 +118,22 @@ def sha256_of(path: Path) -> str:
 # --- what a merged batch must equal ----------------------------------------------------------------------------------
 
 
-def apart_from_where_and_when(value: Any) -> Any:
-    """A JSON value without what is per driver: the shard tags a merged export adds, and where and when a driver
-    dispatched a run, at any depth."""
+def apart_from_where_and_when(export: Mapping[str, Any]) -> Any:
+    """An export without what is per driver: what a merged export adds (the shard tags, each shard's own set-asides,
+    and the run times of each analysed entry, `shard_support.MERGE_TIMES`), and where and when a driver dispatched a
+    run, at any depth. The run times go from the analysed entries only, since `discarded_usage` sums a `wall_s` that
+    every export has and that must still agree."""
+    times = shard_support.MERGE_TIMES
+    analysed = [{k: v for k, v in entry.items() if k not in times} for entry in export["analysed_attempts"]]
+    return _without_per_driver({**export, "analysed_attempts": analysed})
+
+
+def _without_per_driver(value: Any) -> Any:
     dropped = SHARD_FIELDS + ORDER_FIELDS
     if isinstance(value, dict):
-        return {k: apart_from_where_and_when(v) for k, v in value.items() if k not in dropped}
+        return {k: _without_per_driver(v) for k, v in value.items() if k not in dropped}
     if isinstance(value, list):
-        return [apart_from_where_and_when(v) for v in value]
+        return [_without_per_driver(v) for v in value]
     return value
 
 

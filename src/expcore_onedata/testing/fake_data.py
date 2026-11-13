@@ -38,13 +38,26 @@ _LAST_PAGE_TOKEN = "end-"  # how this fake marks the token a last children page 
 
 # Where what `FakeData` answers while a delete is under way (`delete_delay_s`) was recorded on Onedata 25.0: a deleted
 # entry reading as 400 posix/enoent with its parent link kept (the first), another provider's directory sizes following
-# a delete about 5 s later (the second), and a directory delete finishing after the call returns, taking the files of a
-# directory made again under its name (the third, a module docstring and not a dated fact; #29).
+# a delete about 5 s later (the second), a directory delete finishing after the call returns and, it said, taking the
+# files of a directory made again under its name (the third, a module docstring and not a dated fact; #29), and the
+# 12 Nov check of the whole model (the fourth), which held, failed or left untested each claim: it reproduced no
+# loss, so the third now backs only the opt-in `lose_recreated`.
 DELETE_FACTS = (
     "deploy/compose-federation/day0/2026-11-10-federation-facts-parent-walk.md",
     "deploy/compose-federation/day0/2026-11-11-federation-facts-posix-and-fuse.md",
     "deploy/compose-federation/fedcontent.py",
+    "deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md",
 )
+
+# What a deleted entry answers when it is read by id (`FakeData`, "Tombstones"): the facts file that records it with its
+# source references, and the live check of 12 Nov (merged separately), cited by path. The tombstone lives 14 days by
+# default on every provider (cluster-worker's `document_expiry`, 1 209 600 s, from the source and not measured), so no
+# test of this fake waits it out.
+TOMBSTONE_FACTS = (
+    "deploy/compose-federation/day0/2026-11-13-federation-facts-deleted-entries-by-id.md",
+    "deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md",
+)
+TOMBSTONE_S = 14 * 24 * 3600.0
 
 # What each shape sets: how an entry that is not there, one a reader does not show yet, a space root not there yet and
 # a read-only write are answered, whether a deleted entry's parent link still reads, and whether an upload must say it
@@ -100,6 +113,7 @@ class Transfer:
     waiting: bool = False
     bytes_replicated: int | None = None  # the counter the record reports, when a test scripts it
     noop: bool = False  # an eviction that completed and evicted nothing (`evictions_noop_first`)
+    deleted: bool = False  # the file was deleted when the job was scheduled: it ended at once, with no file processed
 
     @property
     def replicates(self) -> bool:
@@ -121,6 +135,25 @@ class _Deleting:
     kind: str
     via: str
     lands: float
+
+
+@dataclass
+class _Tombstone:
+    """What a deleted entry still answers to a lenient read: its attributes as they were when its delete landed, and
+    when that was (on `clock`)."""
+
+    attributes: dict
+    deleted: float
+
+
+# The attributes that, asked for alone, a deleted entry keeps answering (`FakeData`, "Tombstones"): the ones the
+# platform resolves without reading the entry's document strictly. Any other, `name` and `type` included, is enoent.
+# The id attribute is `file_id` on 25.0. `size` is traced for a directory only; for a file it is assumed to answer so.
+LENIENT_ATTRIBUTES = frozenset({"size", "parent_id", "file_id"})
+
+# Names the `attribute` parameter does not take on 25.0, refused before any lookup: `guid` is the internal name of the
+# id, which the REST API calls `file_id` (ctool `onedata_file.erl`, no clause for it).
+UNKNOWN_ATTRIBUTES = frozenset({"guid"})
 
 
 def _merge(blocks: list[list[int]]) -> list[list[int]]:
@@ -177,28 +210,90 @@ class FakeData(FakeFederation):
     each read of the file through that provider answers `unseen_answer` until they are used up; the listing is not
     counted and shows the file.
 
-    **Pending deletes** (`delete_delay_s`; the default 0 finishes every delete at once, everywhere, so nothing changes
-    for a test that does not set it). With a delay, a DELETE of a file or a directory is answered 204 and takes that
-    many seconds of `clock` to land (`land_deletes()` lands them without waiting), so a study can test that its code
-    waits before it uses the name again. In between, by what is recorded (`DELETE_FACTS`):
+    **Pending deletes** (`delete_delay_s`; the default 0 finishes every delete at once, everywhere, so a test that does
+    not set it sees one change: a transfer of a deleted file's id is accepted, where it was refused 400). With a
+    delay, a DELETE of a file or a directory is answered 204 and takes that many seconds of `clock` to land
+    (`land_deletes()` lands them without waiting), so a study can test that its code waits before it uses the name
+    again. In between, by what was recorded (`DELETE_FACTS`; the 12 Nov check, on a 25.0 development build, is
+    `deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md`):
 
-    - Recorded. The provider the DELETE went to answers the entry as a deleted one at once (`missing_answer`), with a
-      deleted file's `parent_id` still reading (`keep_deleted_parents`). A provider finishes deleting a directory after
-      the call returns, and a directory made again under the same name before then loses its files when it does (the
-      reason a federation reset never deletes a directory and makes it again). So the create of the name is accepted
-      there, and when the delete lands the files under the directory made again go with it. Other providers' directory
-      sizes were seen to follow a delete about 5 s late.
-    - Assumed, not recorded; a live check can confirm or correct each. (a) The providers the DELETE did not go to keep
-      showing the entry, in reads and listings, until it lands, and refuse its name (409, as for any taken name);
-      a second DELETE through them changes nothing. (b) Every provider lands it at once, after the one delay. (c) A
-      file's delete is late in the same way (a directory's is what was recorded), and a file's name made again loses
-      nothing. (d) The late removal of a directory takes files at any depth of the directory made again and no
-      directory. (e) A listing through the DELETE's provider already leaves out a directory still going (a deleted
-      file was seen gone from one). (f) A provider that still shows the old entry shows one made again beside it,
-      once the visibility delay lets it. (g) What is under a directory deleted through a provider answers as deleted
-      there at once too: the facts cited have rows for the deleted file and the deleted directory themselves, none
-      for what is under it. (h) A transfer scheduled through that provider for an entry it answers as deleted is
-      refused as one of an entry that is not there (400, as with no delay).
+    - Recorded. The provider the DELETE went to answers a deleted file, and what is under a deleted directory, as a
+      deleted entry at once (`missing_answer`), except a read of its `parent_id` alone, which kept answering live
+      (12 Nov facts); by the source, not live, the same holds for `file_id` alone, and for `size` alone of a
+      directory ("Tombstones"). The providers the DELETE did not go to keep showing the entry, its files and its
+      listing entry until it lands, and all of them stop in the same second. A listing through the DELETE's provider
+      already leaves out a directory still going. A delete finishes after the call returns, a file's like a
+      directory's. The create of a name made again meanwhile is accepted there, and it **loses nothing**: no file of
+      a directory made again was lost or changed when the old delete landed (0 of 21, in four trials watched for
+      120 s on every provider, by hash, and on the owner's storage in one), nor was a file made again. A transfer
+      scheduled through the DELETE's provider for a file it answers as deleted is accepted, a transfer id and no
+      error, and completes at once with 0 files processed, replicated or failed (a replication was tried; the fake
+      does the same for an eviction and a migration, an assumption, and places or removes no block). The earlier
+      assumptions (a) in reads and listings, (b) at once, (c), (e) and (g) held.
+    - Corrected by that check; the fake had them wrong, from an earlier record and an assumption. A directory made
+      again under the same name did not lose its files when the old delete landed: `lose_recreated=True` keeps that
+      loss, for testing code that waits defensively, and it was not reproduced live. The check did not cover a file
+      over 64 KiB, or a delete still working through many files when the name is made again, so a loss there is not
+      ruled out. (h) A transfer for a deleted file was accepted, where the fake answered 400. (f) Corrected: a
+      lagging provider shows only the old entry until the delete lands (12 Nov facts). No tick listed the old and the
+      new entry side by side, and the mirrors switched from the old entry to the new one within one tick; the fake
+      listed both, so a study that resolved a path through a mirror without waiting got the new entry, which live it
+      did not. A mirror now lists, and resolves, only the old entry; the new one, and what is under it, shows in the
+      step the old one goes. The provider the DELETE went to shows the new one at once.
+    - Assumed, not seen live; a live check can confirm or correct each. (a) The providers the DELETE did not go to
+      refuse the entry's name (409, as for any taken name), and a second DELETE through them changes nothing: no
+      mutation was sent through them. (d) With `lose_recreated`, the loss takes files at any depth and no directory:
+      nothing was lost live. (i) A provider that holds the new entry back (f) answers its id, and what is under it,
+      as an entry it does not show yet (`unseen_answer`), as it does not list it: no read of a new entry's id through
+      a mirror was made before the old one went.
+    - Simplified. One `delete_delay_s` serves every provider; live, the mirrors stopped showing an entry after 3 s in
+      four trials and 8 s in two. The owner answered a deleted directory's files as gone at once and the
+      directory's own attributes for up to a second, under another parent and partly emptied, where the fake
+      answers the directory gone at once. A new file showed on a mirror late, at size 0 or with only
+      some of its directory's files, before about 8 s (lag, not loss): not modelled, since `visibility_delay_s` hides
+      a new entry whole. In two trials a mirror showed neither entry of the name for some seconds between the old one
+      and the new one; the fake switches in one step. Directory sizes followed a delete, and an addition, 5 s to 13 s
+      late: not modelled.
+
+    **Tombstones** (`tombstone_s`, `keep_deleted_parents`; `TOMBSTONE_FACTS`). On Onedata 25.0, `GET /data/{id}`
+    resolves only the attributes it is asked for, and a deleted entry's document is read strictly for some and
+    leniently for others. A read with no `attribute` parameter, or with `name` or `type` among the attributes, answers
+    the entry as gone (`missing_answer`, 400 `posix` `enoent`); a read that asks for `size`, `parent_id` or `file_id`
+    and nothing else (`LENIENT_ATTRIBUTES`) keeps answering 200 from the entry's last state, only the attributes asked
+    for, on every provider, for `tombstone_s` seconds of `clock` counted from when the delete landed. Entries under a
+    deleted directory have one each; a read of its children, content or block map is the entry as gone.
+
+    Source, at op-worker f118ed9 (ctool 8ae7baf, cluster-worker 0e9cb40): strict `name` and the `file_meta`
+    attributes, `src/modules/fslogic/operations/utils/file_attr.erl:170-189,203-213,577-578,620-628` through
+    `src/modules/fslogic/context/file_ctx.erl:355-358` and
+    `src/modules/datastore/models/file/metadata/file_meta.erl:219-227`; lenient `parent_id`, a directory's `size` and
+    the permission check, `file_attr.erl:193-199,234-242,505-514`,
+    `src/modules/fslogic/file_tree/file_tree.erl:236-240`, `file_ctx.erl:425-431`; the tombstone keeps its value and
+    expires after `document_expiry`, `cluster-worker/src/cluster_worker.app.src:277-278`, 14 days by default and not
+    measured, and replicates to every provider, `src/modules/datastore/datastore_doc.erl:211-235`,
+    `src/modules/dbsync/dbsync_changes.erl:83-110` (all in
+    `deploy/compose-federation/day0/2026-11-13-federation-facts-deleted-entries-by-id.md`). Live, on 12 Nov: a deleted
+    directory read with `name`, `size` and `parent_id` together answered `enoent` from about 1 s, while `parent_id`
+    alone still answered at 2.0 s (`deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md`,
+    merged with #192); another study's Day-0 reported a directory's `size` alone answering on every provider for 120 s
+    (its report, not recorded in this repository).
+
+    The default `tombstone_s` is `TOMBSTONE_S`, the platform's 14 days, so no test that advances the fake's clock
+    reaches the expiry: a check of presence by `size`, `parent_id` or `file_id` alone never sees the entry go, and
+    fails in a test, as it does live for `parent_id`, `file_id` and a directory's `size`. A test of the expiry itself
+    sets a short `tombstone_s`. `ERRORS_LEGACY` keeps no tombstone.
+
+    The id attribute is `file_id` on 25.0 and `file_id` alone answers the one key (a live read of `parent_id` and
+    `file_id` answered those two keys and nothing else); `guid` is no name the parameter takes, so `?attribute=guid`
+    answers 400 `badValueNotAllowed`, with no `errno`, for every entry, deleted or not, before any lookup
+    (`UNKNOWN_ATTRIBUTES`; ctool `src/onedata_file.erl:253-270` has no clause for it, and `sanitize_attr_names`,
+    `:134-153`, refuses it).
+
+    Assumed, not recorded: that a deleted **file's** `size` alone answers from its tombstone as a directory's does, for
+    `tombstone_s`. The source trace covered a directory's `size` (`resolve_location_attrs_for_dir`); the regular-file
+    branch (`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file location) was not read, and
+    [inference] it may answer from the file location while that exists. The fake models a file as it does a directory,
+    and a live check can correct that. Also assumed: that `size` is the entry's size when it was deleted.
 
     A delay needs a `clock` that moves. The default never does, so a delete would never land and a test of a name used
     again would pass for no reason: the first DELETE that would pend with it raises `ValueError` naming
@@ -216,13 +311,14 @@ class FakeData(FakeFederation):
 
     - `ERRORS_25_0` (the default), as measured live on Onedata 25.0 (the dated facts in
       `deploy/compose-federation/day0/`): an entry that is deleted or not visible yet, and a space root that is not
-      there yet, answer 400 with error id `posix` and `errno` `enoent`, while a deleted entry's `parent_id` still
-      reads its old parent; a write made with a token that has the read-only caveat answers 400 `posix`/`eacces`; an
+      there yet, answer 400 with error id `posix` and `errno` `enoent`, while a deleted entry's tombstone still
+      answers a read of its `size`, `parent_id` or `file_id` alone ("Tombstones"); a write made with a token that has
+      the read-only caveat answers 400 `posix`/`eacces`; an
       upload (`PUT` of content) without `Content-Type: application/octet-stream` answers 415. The statuses and the
       `posix` errors are what was seen. A 415 was seen for an upload with no Content-Type at all; that this fake
       refuses any other type too, and the error id of its 415, `unsupportedMediaType`, are its own.
     - `ERRORS_LEGACY`: the shape this fake had before those observations: 404 `notFound` for an entry that is gone
-      or not shown yet (404 `posix`/`enoent` for the space root), no parent link for a deleted entry, 403 `forbidden`
+      or not shown yet (404 `posix`/`enoent` for the space root), no tombstone for a deleted entry, 403 `forbidden`
       for a read-only write, and no Content-Type check. No live version is known to answer so; it is kept for a study
       that targets an older platform.
 
@@ -242,9 +338,10 @@ class FakeData(FakeFederation):
     metadata other than the id, name, type, size and parent, storage backends beyond one per provider, concurrent
     writers, quotas, symbolic links, a token's space or interface caveats (only the read-only caveat is enforced, and
     `enforce_readonly=False` turns that off), a delete that other providers show late (unless `delete_delay_s` is set),
-    the visibility delay for scheduling a transfer of a file the provider does not show yet (the job is accepted),
-    eviction of part of a file (it removes all of a provider's blocks), other errors than those above, and any
-    provider call that is not listed above.
+    a new file's lag on a mirror at size 0 or with only some of its siblings, directory sizes, the visibility delay for
+    scheduling a transfer of a file the provider does not show yet (the job is accepted), eviction of part of a file
+    (it removes all of a provider's blocks), other errors than those above, and any provider call that is not listed
+    above.
 
     A test bends the fake through plain attributes:
 
@@ -266,12 +363,18 @@ class FakeData(FakeFederation):
     - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
     - `delete_delay_s` (also a constructor argument): seconds of `clock` a delete stays under way after it is answered
       (0: none); `land_deletes()` ends every one now (see "Pending deletes");
+    - `lose_recreated` (also a constructor argument): True makes the landing of a directory's delete take the files of a
+      directory made again under its name meanwhile; off by default, since it was not reproduced live (12 Nov facts)
+      and is kept for testing defensive waits (see "Pending deletes");
     - `enforce_readonly`: False lets a token with the read-only caveat write (a broken enforcement);
       `readonly_answer` is how such a write is refused;
     - `unseen` (`(provider id, file id)` to reads) and `unseen_after_create` (provider id to reads, for every file made
       from then on): a provider that sees a new file only after so many reads of it, each answered `unseen_answer`;
     - `missing_answer`: how a file or directory that is not there is answered; `keep_deleted_parents`: a deleted
-      entry's `parent_id` still answers its old parent; `answer_missing_as_25(answer)` sets both, as 25.0 has them;
+      entry still answers a read of its `size`, `parent_id` or `file_id` alone from its tombstone (the name is kept from
+      when only the parent link did); `tombstone_s` (also a constructor argument): how long, in seconds of `clock`
+      from the delete landing (default `TOMBSTONE_S`, 14 days); `answer_missing_as_25(answer)` sets the first two, as
+      25.0 has them;
     - `require_octet_stream`: a content write (`PUT /data/{id}/content`) without `Content-Type:
       application/octet-stream` is a 415; `content_types` lists the Content-Type of every content write, in order;
     - `corrupt_writes`: True stores every write with its first byte inverted, so the content differs from what was sent;
@@ -303,7 +406,14 @@ class FakeData(FakeFederation):
     require_octet_stream: bool
 
     def __init__(
-        self, *, error_shape: str = ERRORS_25_0, visibility_delay_s: float = 0.0, delete_delay_s: float = 0.0, **kwargs
+        self,
+        *,
+        error_shape: str = ERRORS_25_0,
+        visibility_delay_s: float = 0.0,
+        delete_delay_s: float = 0.0,
+        tombstone_s: float = TOMBSTONE_S,
+        lose_recreated: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         # Re-entrant: `respond` holds it for a whole provider route, and the helpers the route calls take it again.
@@ -314,6 +424,10 @@ class FakeData(FakeFederation):
         self.delete_delay_s = (
             delete_delay_s  # seconds of `clock` a DELETE stays under way after it is answered (0: none)
         )
+        self.tombstone_s = tombstone_s  # seconds of `clock` a tombstone answers, from its delete landing
+        # A directory made again under the name of one whose delete is under way loses its files when that delete lands.
+        # Not reproduced live (12 Nov facts), so off: an opt-in for testing defensive waits.
+        self.lose_recreated = lose_recreated
         self._deleting: dict[str, _Deleting] = {}  # entry id -> the delete of it that has not landed
         self.nodes: dict[str, Node] = {ROOT_ID: Node(ROOT_ID, "", "DIR", None)}
         self.blocks: dict[tuple[str, str], list[list[int]]] = {}
@@ -345,7 +459,7 @@ class FakeData(FakeFederation):
         self.omit_providers: set[str] = set()  # provider ids the block map leaves out (a partial answer)
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
         self.enforce_readonly = True  # a mutation made with a token that has the read-only caveat is refused
-        self.deleted_parents: dict[str, str | None] = {}  # a deleted entry's parent, read if `keep_deleted_parents`
+        self.tombstones: dict[str, _Tombstone] = {}  # a deleted entry's last state, read if `keep_deleted_parents`
         self.resets: list[list] = []
         self.statuses: list[list] = []
         self.content_type: str | None = "application/octet-stream"  # of a file's content, whole or by range
@@ -469,11 +583,15 @@ class FakeData(FakeFederation):
     def _child(self, parent: str, name: str, provider: str | None = None) -> str | None:
         """The id of the entry of that name under a parent, after the deletes that are due have landed. An entry whose
         delete is under way is not found by the provider it was deleted through (nor by `None`, which is how a test's
-        helpers ask), and is found by the others, which still show it."""
+        helpers ask), and is found by the others, which still show it, and which do not show a name made again beside
+        it (`_held_back`)."""
         with self._lock:
             self._settle_deletes()
+            held = self._held_back(provider)
             found = (
-                n for n in self.nodes.values() if n.parent == parent and n.name == name and not self._left(n, provider)
+                n
+                for n in self.nodes.values()
+                if n.parent == parent and n.name == name and not self._left(n, provider) and n.file_id not in held
             )
             return next((n.file_id for n in found), None)
 
@@ -489,6 +607,41 @@ class FakeData(FakeFederation):
         current: Node | None = node
         while current is not None:
             if self._left(current, provider):
+                return True
+            current = self.nodes.get(current.parent) if current.parent is not None else None
+        return False
+
+    def _lingers(self, node: Node, provider: str) -> bool:
+        """Tell whether `provider` still shows an entry whose delete was sent through another provider and has not
+        landed: it answers the entry as it was, and lists it."""
+        pending = self._deleting.get(node.file_id)
+        return pending is not None and pending.via != provider and self._visible(node, provider)
+
+    def _held_back(self, provider: str | None) -> set[str]:
+        """The ids of the entries `provider` does not show yet, because it still shows an entry of the same name,
+        made before them, whose delete has not landed there: a name deleted through one provider and made again at
+        once is listed by another as the old entry alone until the delete lands, and then as the new entry alone, in
+        one step (seen live, `DELETE_FACTS`: old and new were never listed side by side). The provider the DELETE went
+        to answers the old entry as deleted, so it holds nothing back, and a test's helpers (`None`) hold nothing back.
+        Entries are visited in the order they were made, which is the order of `nodes`."""
+        if provider is None or not self._deleting:
+            return set()
+        shown_old: set[tuple[str | None, str]] = set()
+        held: set[str] = set()
+        for node in self.nodes.values():
+            key = (node.parent, node.name)
+            if key in shown_old:
+                held.add(node.file_id)
+            elif self._lingers(node, provider):
+                shown_old.add(key)
+        return held
+
+    def _held_above(self, node: Node, provider: str) -> bool:
+        """Tell whether an entry, or a directory above it, is held back from `provider` (`_held_back`)."""
+        held = self._held_back(provider)
+        current: Node | None = node
+        while held and current is not None:
+            if current.file_id in held:
                 return True
             current = self.nodes.get(current.parent) if current.parent is not None else None
         return False
@@ -519,8 +672,6 @@ class FakeData(FakeFederation):
             if current.file_id in self._deleting:
                 return
             current = self.nodes.get(current.parent) if current.parent is not None else None
-        for member in self._under(node.file_id):  # a gone entry's parent link reads, as it does once the delete lands
-            self.deleted_parents[member] = self.nodes[member].parent
         lands = self.clock() + self.delete_delay_s
         self._deleting[node.file_id] = _Deleting(node.file_id, node.parent, node.name, node.kind, provider, lands)
 
@@ -540,12 +691,14 @@ class FakeData(FakeFederation):
                     self._land(pending)
 
     def _land(self, pending: _Deleting) -> None:
-        """Finish a delete. A directory's late removal takes the files of a directory made again under its name since
-        (`FakeData`, "Pending deletes"); a file's, and a name made again that is a file, lose nothing."""
+        """Finish a delete. It removes the entry and what is under it, and nothing made again under its name since:
+        that was seen live (`FakeData`, "Pending deletes"). With `lose_recreated`, a directory's late removal also takes
+        the files of a directory made again under its name; a file's, and a name made again that is a file, lose
+        nothing either way."""
         if pending.file_id not in self._deleting:  # taken with a directory above it that landed first
             return
         del self._deleting[pending.file_id]
-        if pending.kind == "DIR":
+        if pending.kind == "DIR" and self.lose_recreated:
             again = next(
                 (
                     n.file_id
@@ -585,7 +738,7 @@ class FakeData(FakeFederation):
     def _delete(self, file_id: str) -> None:
         for child in [n.file_id for n in self.nodes.values() if n.parent == file_id]:
             self._delete(child)
-        self.deleted_parents[file_id] = self.nodes[file_id].parent
+        self.tombstones[file_id] = _Tombstone(self._attributes(self.nodes[file_id]), self.clock())
         self._deleting.pop(file_id, None)
         del self.nodes[file_id]
         for table in (self.blocks, self.pending):
@@ -599,17 +752,35 @@ class FakeData(FakeFederation):
         return httpx.Response(status, json={"error": {"id": error_id, "details": details}})
 
     def answer_missing_as_25(self, answer: Answer = (400, "posix", "enoent")) -> None:
-        """Answer what is not there as Onedata 25.0 does: 400 posix enoent instead of a 404, while a deleted entry's
-        `parent_id` still answers its old parent (both read on the Compose federation). `answer` replaces the 400."""
+        """Answer what is not there as Onedata 25.0 does: 400 posix enoent instead of a 404, while a deleted entry still
+        answers a read of its size, parent link or `file_id` alone from its tombstone (the parent link was read on the
+        Compose federation).
+        `answer` replaces the 400."""
         self.missing_answer = answer
         self.keep_deleted_parents = True
 
-    def _missing(self, file_id: str, query: httpx.QueryParams, method: str) -> httpx.Response:
-        """A file or directory that is not there: `missing_answer`, except a deleted entry's kept parent link."""
-        kept = self.deleted_parents if self.keep_deleted_parents else {}
-        if method == "GET" and file_id in kept and query.get("attribute") == "parent_id":
-            return httpx.Response(200, json={"parent_id": kept[file_id]})
-        return self._answer(self.missing_answer)
+    def _missing(self, file_id: str, query: httpx.QueryParams, method: str, part: str) -> httpx.Response:
+        """A file or directory that is not there: `missing_answer`, except a read of the bare entry that asks for
+        `LENIENT_ATTRIBUTES` only, which its tombstone answers (`FakeData`, "Tombstones")."""
+        kept = self._tombstone_read(file_id, query) if method == "GET" and part == "" else None
+        return self._answer(self.missing_answer) if kept is None else httpx.Response(200, json=kept)
+
+    def _tombstone_read(self, file_id: str, query: httpx.QueryParams) -> dict | None:
+        """What a deleted entry's tombstone answers to this read, or None when it answers the entry as gone: the read
+        names no attribute or one that is not lenient, the shape keeps no tombstone, or `tombstone_s` is up. Only the
+        attributes asked for are answered, as the platform resolves only those."""
+        asked = query.get_list("attribute")
+        if not self.keep_deleted_parents or not asked or not set(asked) <= LENIENT_ATTRIBUTES:
+            return None
+        live = self.nodes.get(file_id)  # a delete under way: the entry has not been tombstoned yet and reads as it is
+        if live is not None:
+            attributes = self._attributes(live)
+        else:
+            tombstone = self.tombstones.get(file_id)
+            if tombstone is None or self.clock() >= tombstone.deleted + self.tombstone_s:
+                return None
+            attributes = tombstone.attributes
+        return {name: attributes[name] for name in ("size", "parent_id", "file_id") if name in asked}
 
     def _answer(self, answer: Answer) -> httpx.Response:
         """An error answer from (status, error id, errno); an error id of None is a body that is no error object."""
@@ -691,10 +862,12 @@ class FakeData(FakeFederation):
             return self._space_root(found.group(1))
         found = re.fullmatch(r"/data/([^/]+)(/children|/content|/distribution)?", route)
         if found:
+            if method == "GET" and not found.group(2) and UNKNOWN_ATTRIBUTES & set(query.get_list("attribute")):
+                return self._error(400, "badValueNotAllowed")  # the names are checked before the entry is looked up
             node = self.nodes.get(found.group(1))
             if node is None or self._hidden(node, provider):  # a delete through this provider that is under way: gone
-                return self._missing(found.group(1), query, method)
-            if not self._shown(node, provider):  # this provider does not see the new entry yet
+                return self._missing(found.group(1), query, method, found.group(2) or "")
+            if self._held_above(node, provider) or not self._shown(node, provider):  # it does not see the new entry yet
                 return self._answer(self.unseen_answer)
             part = found.group(2) or ""
             if part == "" and method == "GET":
@@ -768,10 +941,14 @@ class FakeData(FakeFederation):
         limit = min(int(query.get("limit", self.page_size)), self.page_size)
         if limit < 1:
             return self._error(400, "badValueNotInRange")
+        held = self._held_back(provider)
         shown = (
             n
             for n in self.nodes.values()
-            if n.parent == node.file_id and self._visible(n, provider) and not self._left(n, provider)
+            if n.parent == node.file_id
+            and self._visible(n, provider)
+            and not self._left(n, provider)
+            and n.file_id not in held
         )
         children = sorted(shown, key=lambda n: n.name)
         start = int(token or "0")
@@ -882,24 +1059,34 @@ class FakeData(FakeFederation):
         return {"type": node.kind, "distributionPerProvider": per}
 
     def _schedule(self, request: httpx.Request, via: str) -> httpx.Response:
-        """Schedule a job through the provider `via`: an entry that provider answers as deleted, one whose delete is
-        under way included, is refused as an entry that is not there is, as it is with no delay."""
+        """Schedule a job through the provider `via`. A file that provider answers as deleted is accepted, and the job
+        ends at once with no file processed and places or removes nothing. Seen live (`DELETE_FACTS`): a replication
+        scheduled through the deleting provider for a file whose delete was under way. Extrapolated from that, not
+        seen: a file whose delete has landed, a directory's id, an eviction or a migration, and a job scheduled through
+        another provider after the delete landed there. A file id the fake never made is refused as an entry that is
+        not there."""
         sent = json.loads(request.content or b"{}")
         kind = sent.get("type")
         provider = sent.get("evictingProviderId" if kind == "eviction" else "replicatingProviderId")
         source = sent.get("evictingProviderId") if kind == "migration" else None
         node = self.nodes.get(sent.get("fileId"))
+        gone = (node is None and sent.get("fileId") in self.tombstones) or (
+            node is not None and self._hidden(node, via)
+        )
         if (
             kind not in ("replication", "eviction", "migration")
-            or node is None
-            or self._hidden(node, via)
+            or (node is None and not gone)
             or provider is None
             or (kind == "migration" and source is None)
         ):
             return self._error(400, "badValueNotAllowed")
         tid = f"tid-{next(self._ids):04d}"
         now = int(self.clock())
-        self.transfers[tid] = Transfer(kind, sent["fileId"], provider, source_id=source, scheduled=now, started=now)
+        self.transfers[tid] = Transfer(
+            kind, sent["fileId"], provider, source_id=source, scheduled=now, started=now, deleted=gone
+        )
+        if gone:
+            self.end_transfer(tid)
         return httpx.Response(201, json={"transferId": tid})
 
     def _list_transfers(self, space: str, query: httpx.QueryParams, provider: str) -> httpx.Response:
@@ -933,6 +1120,7 @@ class FakeData(FakeFederation):
         state = "completed" if transfer.ended else "scheduled" if transfer.waiting else "active"
         size = len(self.nodes[transfer.file_id].content) if transfer.file_id in self.nodes else 0
         moved = transfer.bytes_replicated if transfer.bytes_replicated is not None else size
+        files = 0 if transfer.deleted else 1  # a job for a file that was deleted processed none
         answer = {
             "evictionStatus" if transfer.kind == "eviction" else "replicationStatus": state,
             "type": transfer.kind,
@@ -942,9 +1130,9 @@ class FakeData(FakeFederation):
             "scheduleTime": transfer.scheduled,
             "startTime": transfer.started,
             "finishTime": transfer.finished,
-            "bytesReplicated": moved if transfer.ended and transfer.replicates else 0,
-            "filesReplicated": 1 if transfer.ended and transfer.replicates else 0,
-            "filesEvicted": 1 if transfer.ended and transfer.kind != "replication" and not transfer.noop else 0,
+            "bytesReplicated": moved if transfer.ended and transfer.replicates and files else 0,
+            "filesReplicated": files if transfer.ended and transfer.replicates else 0,
+            "filesEvicted": files if transfer.ended and transfer.kind != "replication" and not transfer.noop else 0,
             "filesFailed": 0,
         }
         view = self._view(tid, provider)
@@ -959,6 +1147,8 @@ class FakeData(FakeFederation):
         return self.provider_view.get((tid, provider), {})
 
     def _finish(self, transfer: Transfer) -> None:
+        if transfer.deleted:  # nothing to place or remove, and no eviction counted as a no-op
+            return
         key = (transfer.file_id, transfer.provider_id)
         if transfer.replicates and self.transfers_place_blocks and transfer.file_id in self.nodes:
             size = len(self.nodes[transfer.file_id].content)

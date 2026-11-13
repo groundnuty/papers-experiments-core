@@ -92,6 +92,12 @@ class RunRequest:
       also keeps what an executor's own sink raised, which the attempt reports once the result is stored.
       `record_run` passes it on, so a crash the loop catches is logged too, redacted with every secret the executor
       hands `record_run`.
+    - `reserved_capped`: the bound the budget gate reserved the run by when it admitted it, the value the store's
+      attempt row keeps (True: the reply maximum, False: the window, None: no gate decided it). `record_run` writes it
+      into the record's `totals.reserved_capped`, left out for None (C27).
+    - `reply_cap_unheld`: with a budget, a function that tells whether the campaign has taken the run's model off the
+      reply maximum, read when the loop has ended; None without one. `record_run` writes it into the record's
+      `totals.reply_cap_unheld`, left out when there is no function or it answers None (C27).
     """
 
     identity: RunIdentity
@@ -105,6 +111,8 @@ class RunRequest:
     treatment_targets: Mapping[str, str] = field(default_factory=dict)
     models: ModelTable | None = None
     defect_log: DefectSink | None = None
+    reserved_capped: bool | None = None
+    reply_cap_unheld: Callable[[], bool | None] | None = None
 
     @property
     def run_key(self) -> str:
@@ -138,7 +146,8 @@ async def record_run(
 
     The way an executor calls `record_attempt`: it cannot forget the treatment kinds and targets, which the store
     checks, or the model table the keys are redacted from, or the attempt's harness-defect log, or build a backend of
-    its own.
+    its own. It also hands on what the campaign decided about the run's reservation (`RunRequest.reserved_capped` and
+    `reply_cap_unheld`), so the record says what the store says (C27).
     """
     return await record_attempt(
         request.backend,
@@ -152,7 +161,14 @@ async def record_run(
         treatment_targets=request.treatment_targets,
         timer=request.timer,
         clock=request.clock,
-        **{"models": request.models, "defect_log": request.defect_log, **_sink_failure_to(request), **options},
+        **{
+            "models": request.models,
+            "defect_log": request.defect_log,
+            "reserved_capped": request.reserved_capped,
+            "reply_cap_unheld": request.reply_cap_unheld,
+            **_sink_failure_to(request),
+            **options,
+        },
     )
 
 

@@ -33,6 +33,10 @@ failure that names no target, a condition that declares none. Where a declaratio
 holds a version-3 record to its target clause (`target_rule`): the failure must name that target and the run's fault
 injector must have held it down in this attempt (`expcore.records.injections`). A record that declares no target is
 decided as before, so the clause changes nothing for a version-3 record written before it.
+Version 3 also says, in two optional fields of the totals, whether the attempt was held to the reservation R (C27):
+`reserved_capped`, the bound the budget gate reserved the run by, the value the campaign store keeps for the attempt
+(True: by the reply maximum, False: by the window), and `reply_cap_unheld`, whether the campaign had taken the
+attempt's model off the reply maximum when the loop ended. A run that no gate decided has neither.
 Until v0.1.0 is tagged every extension of version 3 is strictly additive: optional fields only, no existing field
 changes meaning or validation, the fields version 3 had at its first merge point keep the shape frozen in
 `tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one per merge point, keep validating
@@ -185,6 +189,8 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "cleanup_timed_out": (bool,),
         "abandoned_threads": (int,),
         "final_text": (str, NONE),
+        "reserved_capped": (bool,),
+        "reply_cap_unheld": (bool,),
     },
 }
 FAILURE_KINDS = ("infra", "context_overflow", "abandoned", "error", "cut")
@@ -251,11 +257,13 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
             "usage": ("extra", "extra_cut"),
             "record": ("treatment_targets", "instrument_refusal"),
             "outcome": ("infra_target",),
+            "totals": ("reserved_capped", "reply_cap_unheld"),
         },
         optional={
             "usage": ("extra", "extra_cut"),
             "record": ("treatment_targets", "instrument_refusal"),
             "outcome": ("infra_target",),
+            "totals": ("reserved_capped", "reply_cap_unheld"),
         },
         first_turn_rule=True,
         target_rule=True,

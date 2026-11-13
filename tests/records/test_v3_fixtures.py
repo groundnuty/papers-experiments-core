@@ -307,3 +307,22 @@ def test_R02_a_retry_entry_of_version_three_needs_no_key_and_takes_any_value(ent
     record = decode(FIXTURES[0].read_bytes())
     record["transcript"][0]["retries"] = [entry]
     assert validate(record) == V3
+
+
+def test_c27_the_fifth_fixture_pins_whether_the_attempt_was_held_to_the_reservation_and_the_first_four_hold_neither():
+    """C27 and R03: the fifth merge point added `totals.reserved_capped` and `totals.reply_cap_unheld`, both optional
+    booleans after the last of the totals. Its fixture, written by the code of that merge on the record tests' fake
+    clock, is a run the budget gate reserved by the reply maximum and whose model the campaign had since taken off it.
+    It validates and replays to its own bytes (the parametrized tests above); the four fixtures before it hold neither
+    field, and a record without them gains nothing."""
+    fifth = [p for p in FIXTURES if p.name.startswith("05-")]
+    assert [p.name for p in fifth] == ["05-reserved-capped.json"]
+    record = load_record(fifth[0])
+    assert (record.totals["reserved_capped"], record.totals["reply_cap_unheld"]) == (True, True)
+    assert list(record.totals)[-2:] == ["reserved_capped", "reply_cap_unheld"]
+    assert replay_record(record).totals == record.totals
+    for earlier in FIXTURES[:4]:
+        held = load_record(earlier)
+        assert "reserved_capped" not in held.totals
+        assert "reply_cap_unheld" not in held.totals
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()

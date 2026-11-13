@@ -166,6 +166,25 @@ def test_c29_accounting_figures_that_are_sums_are_summed_row_by_row():
     assert [(r["condition"], r["attempts"]) for r in joined["budget_holds"]] == [("base", 3), ("zed", 0)]
 
 
+def test_c29_each_shards_retries_by_kind_stay_readable_per_shard_in_shard_order_with_the_sum_unchanged():
+    """C29: `retries_by_kind` is summed over the shards, so the join also keeps `shard_retries_by_kind`: every row of
+    every shard's own table, tagged with its shard, in shard order, including a shard whose table is empty."""
+    one = export(analysed=[entry("a")], retries_by_kind=[retry(2), {**retry(1), "kind": "endpoint"}])
+    two = export(analysed=[entry("b")], retries_by_kind=[retry(5)])
+    three = export(analysed=[entry("c")])
+    shards = [*SHARDS, {**SHARDS[1], "index": 3, "label": "shard-3"}]
+    joined = join_exports({3: three, 2: two, 1: one}, plan("a", "b", "c"), shards)
+    assert joined["shard_retries_by_kind"] == [
+        {**retry(2), "shard": 1},
+        {**retry(1), "kind": "endpoint", "shard": 1},
+        {**retry(5), "shard": 2},
+    ]
+    assert [(r["kind"], r["attempts"]) for r in joined["retries_by_kind"]] == [("endpoint", 1), ("sandbox", 7)]
+    assert "shard_retries_by_kind" not in one, "the join must not change the export it is given"
+    none = join_exports({1: export(analysed=[entry("a")]), 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS)
+    assert none["shard_retries_by_kind"] == []  # a table that is there and empty: recorded, none set aside
+
+
 def test_c29_the_kinds_are_the_cores_then_every_other_kind_sorted():
     """C29: the vocabulary of kinds is what the unsharded export gives: the core's, then the others, sorted."""
     one = export(analysed=[entry("a")], kinds=[*CORE_KINDS, "zeta"])

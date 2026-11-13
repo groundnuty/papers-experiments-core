@@ -631,7 +631,7 @@ class Provisioner:
 
     def _put(self, file_id: str, block: bytes, offset: int | None, media: str) -> None:
         """One write of content, bound to this provisioner's space: at `offset`, or without one, which truncates the file
-        first."""
+        first. A body of `fresh_connection_bytes` or more goes on a connection of its own (#186)."""
         self.mutate(
             "PUT",
             f"/data/{_segment(file_id)}/content",
@@ -640,6 +640,7 @@ class Provisioner:
             content=block,
             timeout_s=self._settings.request_timeout_s,
             content_type=media,
+            fresh=len(block) >= self._settings.fresh_connection_bytes,  # a large body never rides a reused connection
         )
 
     def _size_of(self, file_id: str) -> Any:
@@ -717,10 +718,10 @@ class Provisioner:
         for file_id in file_ids:
             if (provider, file_id) in self._visible:
                 continue
-            size = self._client.get(
+            size = self._client.get(  # with `name`, which a deleted entry refuses: `size` alone may read a tombstone
                 f"/data/{_segment(file_id)}",
                 provider=self._settings.holder,
-                params={"attribute": "size"},
+                params={"attribute": list(consistency.VISIBLE_ATTRIBUTES)},
                 retry=self._retry,
             ).get("size")
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:

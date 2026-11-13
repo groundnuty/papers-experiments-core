@@ -93,6 +93,11 @@ def project_networks(project: str) -> list[Network]:
     return [Network(*[*line.split("\t"), ""][:2]) for line in lines]
 
 
+def project_volumes(project: str) -> list[str]:
+    """The names of every Docker volume labelled with the project, named or anonymous."""
+    return docker_lines("volume", "ls", "--filter", f"label={PROJECT_LABEL}={project}", "--format", "{{.Name}}")
+
+
 def require_own(layout: Layout, containers: list[Container], networks: list[Network] = ()) -> None:
     """Refuse a project whose containers or networks bind another root, or name none: that is another federation."""
     strangers = [item for item in (*containers, *networks) if item.root != str(layout.root)]
