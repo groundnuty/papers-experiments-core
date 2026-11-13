@@ -748,7 +748,10 @@ class Provisioner:
     def put_file(self, path: str, data: bytes, *, content_type: str = "application/octet-stream") -> str
     def upload(self, path: str, source: Path | str, *, content_type: str = "application/octet-stream") -> Upload
     def read_file(self, file_id: str, *, provider: str | None = None, dest: Path | str | None = None,
-                  size: int | None = None, deadline_s: float | None = None) -> Digest
+                  size: int | None = None, deadline_s: float | None = None,
+                  answers: Callable[[ReadOutcome], None] | None = None) -> Digest
+    def fetch(self, provider: str, file_id: str, offset: int, length: int, *,
+              answers: Callable[[ReadOutcome], None] | None = None) -> bytes   # a range read, gated (O02)
     def children(self, directory_id: str, provider: str | None = None, *, listings: Listings | None = None,
                  retry: bool = True) -> dict[str, Entry]
     retry: ReadRetry            # property: the policy of this provisioner's plumbing reads
