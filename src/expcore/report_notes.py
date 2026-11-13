@@ -83,6 +83,29 @@ MISSING_PAIRS = [
     "- *Outcome None (other)*: both runs analysed, and the outcome is None on an ordinary run only.",
 ]
 
+ARM_LOST_HEADINGS = ["Treatment outcome None", "Outcome None", "Exhausted", "Unfinished", "Left out"]  # LOST_CAUSES
+
+ARM_RUNS_NOTES = [
+    "Each arm's own planned runs on the contrast's tasks (S14), whatever became of their partners: a pair lost to one",
+    "run's None is one run lost here, in the arm that lost it. Finished: the runs with an analysed attempt, the",
+    "population the contrast's outcome is defined over, and Finish rate their share of the planned runs (n/a for an",
+    "arm with none planned). Measured: the finished runs whose outcome is known. The other columns give the runs",
+    "lost by cause: the outcome None on a treatment attempt or on another run, or no analysed attempt (exhausted,",
+    "unfinished, or left out of a partial analysis). An arm that finished fewer of its runs is compared on fewer, and",
+    "perhaps other, runs than its partner.",
+]
+
+DESCRIPTIVE_NOTES = [
+    "Each one-arm estimate is descriptive: no test is made, it has no conclusion word, and it is in no Holm family.",
+    "A rate is the mean of its outcome over the arm's runs that have it, averaged per task and model, then per",
+    "cluster and model, then over each cluster's models and over the clusters, each with equal weight (a share for an",
+    "outcome of 0 or 1). A ratio of totals is the sum of the numerator over the sum of the denominator across every",
+    "run of the arm that has both. The interval resamples whole clusters at the preregistration's bootstrap; a",
+    "replicate whose drawn denominators sum to 0 has no ratio and is counted under Undefined replicates, and the",
+    "interval is n/a when fewer than half are defined. Finish rate is the share of the arm's planned runs that",
+    "finished.",
+]
+
 CONDITION_NOTES = [
     "Planned runs are analysed, exhausted (charged infrastructure attempts reached the limit; no scored attempt),",
     "unfinished, or left out of a partial analysis. Attempts set aside are the condition's set-aside",

@@ -293,15 +293,17 @@ def _arm_runs(
     reasons: tuple[dict[tuple, str], dict[tuple, str]],
     spec: ContrastSpec,
 ) -> tuple[ArmRuns, ...]:
-    """Each arm's planned runs on the contrast's tasks, those both arms plan (analysed or absent), by what became of
-    them (S14). A run on a task the other arm never plans is outside the contrast, and is neither counted nor read."""
-    planned = [{key[0] for key in (*arms[side], *reasons[side])} for side in (0, 1)]
+    """Each arm's planned runs whose pairing key the other arm plans too (analysed or absent), by what became of them
+    (S14): the runs of the contrast's planned pairs. A run with no planned partner (a task the other arm never runs,
+    or a factor contrast's run whose other factors no run of the other level shares) is outside every pair, and is
+    neither counted nor read."""
+    planned = [set(arms[side]) | set(reasons[side]) for side in (0, 1)]
     shared = planned[0] & planned[1]
     return tuple(
         count_arm(
             spec.arms[side],
-            ((row.treatment, _value(row, spec) is not None) for row in arms[side].values() if row.task in shared),
-            (reason for key, reason in reasons[side].items() if key[0] in shared),
+            ((row.treatment, _value(row, spec) is not None) for key, row in arms[side].items() if key in shared),
+            (reason for key, reason in reasons[side].items() if key in shared),
         )
         for side in (0, 1)
     )

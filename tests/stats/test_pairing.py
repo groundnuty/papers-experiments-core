@@ -449,6 +449,17 @@ def test_s14_a_run_on_a_task_the_other_arm_never_plans_is_outside_both_arms_coun
     assert (first.planned, first.measured, second.planned, second.measured) == (1, 1, 1, 1)
 
 
+def test_s14_a_factor_contrasts_run_whose_other_factors_no_run_of_the_other_level_shares_is_outside_both_arms():
+    """S14: mode y's open run has no shut run to pair with, so it is no run of the contrast's pairs."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.9, condition="open-x", gate="open", mode="x"),
+        make_row("task-a", "model-a", 1, 0.5, condition="shut-x", gate="shut", mode="x"),
+        make_row("task-a", "model-a", 1, 0.8, condition="open-y", gate="open", mode="y"),
+    ]
+    first, second = pair_rows(rows, by_factor()).arm_runs
+    assert (first.planned, second.planned) == (1, 1)
+
+
 def test_s14_a_factor_contrasts_arms_are_its_levels():
     """S14: the arms are named by the levels of the varying factor, each counting every run of its level."""
     rows = [

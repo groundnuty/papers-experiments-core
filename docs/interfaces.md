@@ -838,6 +838,54 @@ Implementer must guarantee:
 
 **Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
 
+### One-arm estimates and each arm's runs
+
+`expcore.stats.onearm` and `expcore.stats.armruns` (S14, #139).
+
+```toml
+[descriptives.waited-in-a]       # a rate or share of an outcome within one arm
+conditions = ["cond-a"]          # one condition, or several pooled into one arm
+outcome = "waited"
+cluster = "group"
+
+[descriptives.queries-per-placement]   # a ratio of two outcomes' totals within one arm
+conditions = ["cond-a", "cond-b"]
+numerator = "queries"
+denominator = "placements"
+cluster = "group"
+```
+
+```python
+@dataclass(frozen=True)
+class ArmRuns:                   # ContrastResult.arm_runs (arm A, arm B) and DescriptiveResult.runs
+    arm: str                     # a condition, a factor's level, or a one-arm estimate's conditions joined by " + "
+    planned: int                 # = finished + exhausted + unfinished + excluded
+    finished: int                # analysed: = measured + treatment_outcome_none + outcome_none
+    measured: int                # finished, with the outcome known
+    lost: Mapping[str, int]      # LOST_CAUSES in order, zeros included
+    finish_rate: float           # a property: finished / planned, NaN for none planned
+
+@dataclass(frozen=True)
+class DescriptiveResult:         # AnalysisResult.descriptives, in declared order
+    name: str; kind: str         # "rate" or "ratio_of_totals"
+    outcome: str; conditions: tuple[str, ...]; cluster: str
+    estimate: float; ci_low: float; ci_high: float    # NaN where nothing can be computed, never 0
+    n_clusters: int; n_runs: int                      # the clusters and runs that entered the estimate
+    n_undefined_replicates: int  # a ratio's replicates whose drawn denominators sum to 0
+    runs: ArmRuns
+    per_model: tuple[ModelEstimate, ...]              # each model's estimate and interval, from the same draws
+```
+
+**A rate.** The mean of the outcome over the arm's runs that have it, in the stages a contrast's differences take: the runs of a (task, model), every seed and condition of the arm together; the tasks of a (cluster, model); the models of a cluster; and the clusters, each step with equal weight. For an outcome of 0 or 1 it is a share. The interval is the percentile interval of the kernel's cluster bootstrap (clusters drawn with replacement, one draw for every model, S04) at the preregistration's replicates and level and a seed from the estimate's name, so it draws the same resamples whichever others run; each model's comes from the same draws (S05). A percentile interval is never wider than the data: clusters all at one value give that point, so a share of 0 or 1 over few clusters has a zero-width interval.
+
+**A ratio of totals.** theta = (sum of the numerator) / (sum of the denominator) over every run of the arm that has both, all clusters, tasks, models and seeds together, so a cluster weighs by its runs and a run whose denominator is 0 still adds its numerator. Each replicate is the ratio of the drawn clusters' totals; one whose drawn denominators sum to 0 has no ratio, is NaN, never 0 or an infinity, and is counted (`n_undefined_replicates`); the interval is NaN when fewer than half are defined. With every denominator 0 the estimate is NaN. The totals are exact, so no sum overflows. A negative numerator or denominator is refused, naming the run and the outcome.
+
+**Descriptive.** A one-arm estimate has no p-value, no conclusion word and no place in a Holm family; its name may be no contrast's, and `holm_family` cannot name it. A run whose outcome is None is left out of it and counted in its `runs`.
+
+**Each arm's runs.** For a contrast, `arm_runs` counts each arm's planned runs of the contrast's planned pairs, those whose pairing key the other arm plans too, analysed or absent; a run with no planned partner is outside every pair and is not counted. A pair lost to one run's None is one run lost, in the arm that lost it, whatever became of its partner: the pairs table counts pairs, this counts each arm's runs.
+
+**In the outputs.** `analysis.json` gives every contrast `arm_runs` and the analysis `descriptives`. `report.md` has a table "Runs of each arm" after the missing pairs, one row per contrast and arm, with the finish rate (`n/a` for an arm with none planned), and, only when one is declared, a section "One-arm estimates (descriptive)"; the terminal summary prints each one-arm estimate as descriptive, with its interval.
+
 ## The platform layer's spaces and reset
 
 `expcore_onedata.spaces`, `provision`, `eviction` and `reset`. A federation study has one space per data owner, each supported by its owner's provider, by the agent's local provider and sometimes by a mirror. `platform.toml` declares them as an array of tables, in place of `[space]` and `[support]` (one form or the other, never both):
