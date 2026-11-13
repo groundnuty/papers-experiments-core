@@ -14,6 +14,8 @@ The file is validated when it is loaded, with messages that name the file and th
     output_cap_chars = 4000
     max_output_tokens = 1024
     malformed_policy = "report"   # optional: "report" (the default) or "end"
+    ceiling_s = 270               # optional: the whole-time ceiling in seconds, waits included, not below time_cap_s;
+                                  # or `ceiling_factor = 2.25`, a multiple of time_cap_s of at least 1; never both
 
     [scheduler]                   # optional: every key of `SchedulerConfig` that is a number, a flag or a kind
     max_attempts = 3
@@ -38,6 +40,10 @@ The file is validated when it is loaded, with messages that name the file and th
 sum, at least 2, and `run --shard i/N` must give that N. Each such shard runs one run at a time, so the counts of the
 models on one unit are that unit's concurrent runs: a sum above the unit's `[scheduler.unit_caps]` cap is refused. The
 layout is in the campaign's caps, so in the fingerprint every shard shares; without the table nothing changes.
+
+An `[agent]` that gives no ceiling has one of 3 times `time_cap_s`. The ceiling bounds a run's whole time, waits on
+infrastructure included, and a platform that mints tokens for a run lives them as long as it (study guide, "Caps on a
+run's time"). It is in the campaign's caps, so in the fingerprint: another ceiling is another experiment.
 """
 
 import dataclasses
@@ -56,6 +62,7 @@ from expcore.loop.config import MALFORMED_POLICIES, AgentConfig
 
 _TOP_KEYS = ("order_seed", "seeds", "models", "agent", "scheduler", "budget", "endpoints", "shards")
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
+_CEILING_KEYS = ("ceiling_s", "ceiling_factor")  # optional, and at most one of them
 _SCHEDULER_KINDS: dict[str, type] = {
     "max_attempts": int,
     "workers": int,
@@ -126,10 +133,13 @@ def _number(section: Section, key: str) -> float:
 
 def _agent(root: Section) -> AgentConfig:
     section = _table(root, "agent")
-    section.reject_unknown([*_AGENT_KEYS, "malformed_policy"])
+    section.reject_unknown([*_AGENT_KEYS, *_CEILING_KEYS, "malformed_policy"])
     for key in _AGENT_KEYS:
         if key not in section.data:
             raise section.fail(key, "is required")
+    given = [key for key in _CEILING_KEYS if key in section.data]
+    if len(given) > 1:
+        raise section.fail(given[1], f"is given with {given[0]}: they are two ways to say one ceiling, so give one")
     limits = Limits(
         max_tool_rounds=_typed(section, "max_tool_rounds", int),
         time_cap_s=_number(section, "time_cap_s"),
@@ -138,8 +148,9 @@ def _agent(root: Section) -> AgentConfig:
         max_output_tokens=_typed(section, "max_output_tokens", int),
     )
     policy = section.optional_string("malformed_policy") or MALFORMED_POLICIES[0]
+    ceiling = {key: _typed(section, key, float) for key in given}  # at most one; none gives the default factor
     try:
-        return AgentConfig(limits, malformed_policy=policy)
+        return AgentConfig(limits, malformed_policy=policy, **ceiling)
     except ValueError as error:
         raise ConfigError(f"{root.file}: {section.where}: {error}") from None
 

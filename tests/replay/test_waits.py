@@ -4,6 +4,8 @@ import asyncio
 import copy
 
 import pytest
+from loop_support import ClockSleep, FakeClock
+from record_support import record_run
 from replay_scenarios import SCENARIOS
 
 from expcore.records.record import RunRecord, decode
@@ -89,6 +91,27 @@ def test_r03_a_cut_at_the_ceiling_replays_as_infrastructure_of_the_ceiling_kind(
     replayed = replay_record(record)
     assert replayed.outcome == record.outcome
     assert replayed.totals["infra_wait_by_kind"] == record.totals["infra_wait_by_kind"] != {}
+
+
+def test_r03_a_ceiling_a_study_set_is_recorded_as_set_and_replays_as_the_cut_it_made():
+    """R03: a `[agent] ceiling_s` below the default of three times the cap bounds the run; the record keeps the
+    ceiling in force and no factor, since none was given, and the replay rebuilds that configuration and ends the run
+    at the same cut."""
+    clock = FakeClock()
+
+    async def queued(_args, ctx):
+        async with ctx.infrastructure_wait("lease_queue"):
+            while True:
+                clock.advance(100)
+                await asyncio.sleep(0)
+
+    record = record_run(
+        [[("echo", {})], "never"], {"echo": queued}, clock=clock, sleep=ClockSleep(clock), ceiling_s=450.0
+    )
+    assert (record.agent_config["ceiling_s"], record.agent_config["ceiling_factor"]) == (450.0, None)
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "ceiling")
+    assert "450 s" in record.outcome["detail"]
+    assert replay_record(record).outcome == record.outcome
 
 
 def test_r03_a_cleanup_that_timed_out_is_served_from_the_label_of_the_reading_that_ended_it():

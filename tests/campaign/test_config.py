@@ -72,6 +72,74 @@ def test_the_caps_are_plain_data_for_the_fingerprint(tmp_path):
     assert caps["agent"]["limits"]["max_tool_rounds"] == 4
 
 
+def with_agent_lines(lines):
+    """VALID with extra lines in `[agent]`, after the time cap."""
+    return VALID.replace("time_cap_s = 30\n", f"time_cap_s = 30\n{lines}\n")
+
+
+def test_o06_without_a_ceiling_a_runs_whole_time_is_three_times_its_cap_as_before(tmp_path):
+    """O06: `[agent]` that names no ceiling falls back to the default factor, so the caps and the fingerprint are
+    what they were, and a run's tokens are minted for that ceiling."""
+    agent = load(tmp_path).agent
+    assert (agent.ceiling_s, agent.ceiling_factor) == (90.0, 3.0)
+
+
+@pytest.mark.parametrize(
+    ("line", "ceiling", "factor"), [("ceiling_s = 45", 45.0, None), ("ceiling_factor = 1.5", 45.0, 1.5)]
+)
+def test_o06_agent_may_bound_a_runs_whole_time_near_its_cap(tmp_path, line, ceiling, factor):
+    """O06: `[agent] ceiling_s` or `ceiling_factor` sets the ceiling on a run's whole time, waits included, which a
+    platform mints the run's tokens for; a ceiling near the cap is what lets a slot go soon after its run."""
+    campaign = load(tmp_path, with_agent_lines(line))
+    assert (campaign.agent.ceiling_s, campaign.agent.ceiling_factor) == (ceiling, factor)
+    assert campaign.caps()["agent"]["ceiling_s"] == ceiling  # in the fingerprint: a resume cannot change it
+
+
+def test_o06_a_ceiling_is_part_of_the_caps_so_another_one_is_another_experiment(tmp_path):
+    """O06 with C06: the caps the fingerprint is made of hold the ceiling, so two files that differ only in it have
+    different caps, and the same ceiling written as a factor and as seconds differs too, for each records what it
+    was given."""
+    caps = {
+        name: load(tmp_path, text).caps()
+        for name, text in {
+            "default": VALID,
+            "seconds": with_agent_lines("ceiling_s = 45"),
+            "more_seconds": with_agent_lines("ceiling_s = 60"),
+            "factor": with_agent_lines("ceiling_factor = 1.5"),
+            "default_factor": with_agent_lines("ceiling_factor = 3"),
+        }.items()
+    }
+    assert caps["default"] == caps["default_factor"]  # three times the cap, spelt out: the fingerprint it had
+    assert len({repr(c) for c in caps.values()}) == 4
+    assert caps["seconds"]["agent"]["ceiling_s"] == caps["factor"]["agent"]["ceiling_s"] == 45.0
+
+
+@pytest.mark.parametrize(
+    ("lines", "fragments"),
+    [
+        ("ceiling_s = 29", ("[agent]", "ceiling_s must be finite and not below time_cap_s")),
+        ("ceiling_s = inf", ("[agent]", "ceiling_s must be finite and not below time_cap_s")),
+        ("ceiling_factor = 0.5", ("[agent]", "ceiling_factor must be a finite number, at least 1")),
+        ("ceiling_factor = nan", ("[agent]", "ceiling_factor must be a finite number, at least 1")),
+        ('ceiling_s = "long"', ("[agent]", "ceiling_s", "must be a float")),
+        ("ceiling_factor = true", ("[agent]", "ceiling_factor", "must be a float")),
+    ],
+)
+def test_o06_a_ceiling_that_cannot_bound_the_run_is_refused_at_load(tmp_path, lines, fragments):
+    """O06: a ceiling below the cap, a factor below 1, one that is not finite or one that is not a number is refused
+    when the file is loaded, naming the table, so no run is minted tokens for a ceiling its loop cannot keep."""
+    refused(tmp_path, with_agent_lines(lines), *fragments)
+
+
+@pytest.mark.parametrize("lines", ["ceiling_s = 60\nceiling_factor = 3", "ceiling_s = 90\nceiling_factor = 3"])
+def test_o06_a_ceiling_in_seconds_and_a_factor_together_are_refused_even_when_they_agree(tmp_path, lines):
+    """O06: `ceiling_s` and `ceiling_factor` are two ways to say one thing, and a file gives at most one. A pair that
+    agrees (3 times 30 s is 90 s) is refused as a pair that disagrees is, so no reader has to work out which is
+    meant, and the record's `ceiling_factor` is never one the study did not write."""
+    message = refused(tmp_path, with_agent_lines(lines), "[agent]", "ceiling_s", "ceiling_factor", "give one")
+    assert "campaign.toml" in message
+
+
 def test_a_misspelt_key_is_refused_naming_it(tmp_path):
     refused(tmp_path, VALID.replace("seeds =", "seed ="), "'seed'", "not a known key")
     refused(tmp_path, VALID.replace("workers", "worker"), "[scheduler]", "'worker'")
