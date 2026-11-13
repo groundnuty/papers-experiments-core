@@ -192,6 +192,30 @@ def test_o35_a_probe_is_written_once_and_written_again_when_it_is_gone(fake, con
     assert [p.provisioned for p in third.pairs] == [False, True]
 
 
+def test_o36_a_probe_with_other_bytes_is_written_again_at_offset_0_and_a_longer_one_gives_way(
+    fake, config, client, ticker
+):
+    """O35, O36: a probe of the right size whose bytes differ is written again over them at offset 0; a longer probe
+    could only be cut by a write without an offset, which is never sent, so a fresh file under the next generation
+    replaces it and the passing check deletes the old one. Every write of content carries an offset."""
+    assert run(config, client, ticker).ok
+    size = config.link_check.probe_bytes
+    first = probe_of(fake, GAMMA_ID)
+    fake.nodes[first].content[0] ^= 0xFF
+    rewritten = run(config, client, ticker)
+    assert rewritten.ok
+    assert [p.provisioned for p in rewritten.pairs] == [False, True]
+    assert probe_of(fake, GAMMA_ID) == first
+    assert bytes(fake.nodes[first].content) == probe_content(GAMMA_ID, size)
+    fake.nodes[first].content.extend(b"tail")
+    replaced = run(config, client, ticker)
+    assert replaced.ok
+    assert [p.provisioned for p in replaced.pairs] == [False, True]
+    assert list(probes_of(fake, GAMMA_ID)) == [1]
+    assert bytes(fake.nodes[probes_of(fake, GAMMA_ID)[1]].content) == probe_content(GAMMA_ID, size)
+    assert all("offset" in r.query for r in fake.requests if r.method == "PUT" and r.path.endswith("/content"))
+
+
 def test_o35_pairs_and_no_probe_space_refuse_and_no_pairs_pass_without_one(tmp_path, fake, client, ticker):
     """O35: Pairs and no probe space refuse and no pairs pass without one."""
     unprobed = load_platform(write_platform(tmp_path, lambda d: three_providers(d, link_check=False)))

@@ -223,7 +223,7 @@ def test_o25_an_upload_without_a_stop_of_a_local_file_that_grows_meanwhile_fails
     source = local_file(tmp_path, BULKY)
     real = type(provisioner)._write_chunks
 
-    def appending_after_the_first_block(self, file_id, blocks, media, *, truncate=False):
+    def appending_after_the_first_block(self, file_id, blocks, media):
         def blocks_then_append():
             for number, block in enumerate(blocks):
                 yield block
@@ -231,7 +231,7 @@ def test_o25_an_upload_without_a_stop_of_a_local_file_that_grows_meanwhile_fails
                     with open(source, "ab") as handle:
                         handle.write(b"appended" * CHUNK)
 
-        return real(self, file_id, blocks_then_append(), media, truncate=truncate)
+        return real(self, file_id, blocks_then_append(), media)
 
     monkeypatch.setattr(type(provisioner), "_write_chunks", appending_after_the_first_block)
     with pytest.raises(ProvisionError, match="changed size"):
@@ -246,33 +246,37 @@ def test_o25_a_stop_outside_the_local_file_is_refused_before_anything_is_sent(pr
     assert changes(fake) == []
 
 
-def test_o25_a_target_this_provisioner_made_that_differs_is_written_again_from_a_truncating_first_write(
+def test_o36_a_target_this_provisioner_made_that_differs_and_is_no_longer_is_written_again_at_explicit_offsets(
     provisioner, fake, tmp_path
 ):
-    """O25: a target that holds more bytes than the local file, or as many but other ones, is no prefix. The first
-    write goes without an offset, which truncates the file (the API's rule), and the rest follow at their offsets."""
-    made = provisioner.upload(TARGET, local_file(tmp_path, BULKY + b"tail"))
+    """O25, O36: a target as long as the local file but with other bytes, or shorter with bytes that are no prefix, is
+    written again from its first byte, every write at its offset: no write goes without one, which would truncate."""
+    made = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
 
-    def restarted():
+    def restarted(content):
         done = len(writes(fake))
-        result = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
+        result = provisioner.upload(TARGET, local_file(tmp_path, content))
         assert (result.action, result.file_id) == ("restarted", made.file_id)
-        first, *rest = writes(fake)[done:]
-        assert "offset" not in first.query
-        assert [int(r.query["offset"]) for r in rest] == list(range(CHUNK, len(BULKY), CHUNK))
-        assert stored(fake, made.file_id) == BULKY
+        assert [int(r.query["offset"]) for r in writes(fake)[done:]] == list(range(0, len(content), CHUNK))
+        assert stored(fake, made.file_id) == content
 
-    restarted()  # the target was longer
     fake.nodes[made.file_id].content[100] ^= 0xFF  # one byte of the target changed behind the upload
-    restarted()
+    restarted(BULKY)
+    restarted(b"other" + BULKY + b"tail")  # the target is shorter and no prefix of it
+    assert all("offset" in r.query for r in writes(fake))
 
 
-def test_o25_an_empty_file_over_a_longer_target_truncates_it(provisioner, fake, tmp_path):
-    """O25: an empty local file has no chunk to send, so the truncating write goes with an empty body."""
-    made = provisioner.upload(TARGET, local_file(tmp_path, DATA))
-    result = provisioner.upload(TARGET, local_file(tmp_path, b"", name="empty.bin"))
-    assert (result.action, result.digest) == ("restarted", digest(b""))
-    assert stored(fake, made.file_id) == b""
+@pytest.mark.parametrize("local", [BULKY[:-1], b""])
+def test_o36_a_target_longer_than_the_local_file_is_refused_and_nothing_is_written(provisioner, fake, tmp_path, local):
+    """O36: only a write without an offset could shorten a file (to 0, then the bytes it sends), and none is sent, so
+    an upload over a longer target the provisioner made is refused before anything is written, an empty local file
+    included; the target keeps its bytes. The caller removes the file first."""
+    made = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
+    done = len(writes(fake))
+    with pytest.raises(ProvisionError, match="longer"):
+        provisioner.upload(TARGET, local_file(tmp_path, local, name="shorter.bin"))
+    assert writes(fake)[done:] == []
+    assert stored(fake, made.file_id) == BULKY
 
 
 def test_o25_a_differing_file_this_provisioner_did_not_create_is_refused_and_nothing_is_sent(

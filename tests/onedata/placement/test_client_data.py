@@ -12,6 +12,7 @@ from expcore_onedata.client import (
     OutOfScope,
     PlatformError,
     ScopeUnread,
+    TruncatingWrite,
 )
 from expcore_onedata.testing import DATA, PROVIDER, ROOT_ID, SPACE_NAME
 from expcore_onedata.testing.fake_federation import ZONE
@@ -515,6 +516,42 @@ def test_mutate_sends_query_parameters_and_a_raw_body(config, seeded, client):
     sent = [r for r in seeded.requests if r.method == "PUT"]
     assert sent[0].query == {"offset": "7"}
     assert sent[0].body == b"\x00\x01"
+
+
+@pytest.mark.parametrize(
+    ("params", "path"),
+    [
+        (None, "/data/{id}/content"),
+        ({}, "/data/{id}/content"),
+        ({"limit": 1}, "/data/{id}/content"),
+        ({"offset": None}, "/data/{id}/content"),
+        ({"offset": -1}, "/data/{id}/content"),
+        ({"offset": True}, "/data/{id}/content"),
+        ({"offset": 1.0}, "/data/{id}/content"),
+        ({"offset": "0"}, "/data/{id}/content"),
+        (None, "/data/{id}/content/"),
+    ],
+)
+def test_o36_a_content_write_without_an_offset_is_refused_before_anything_is_read_or_sent(
+    config, seeded, client, params, path
+):
+    """O36: a write of content without the `offset` query truncates the file to 0 first (op-worker f118ed9,
+    file_content_rest_handler.erl:224-228), so the client refuses it, a whole offset of 0 or more being the only kind
+    it sends: nothing is read for its gate and nothing is sent, and the file keeps its bytes."""
+    file_id = seeded.id_of(PATH)
+    with pytest.raises(TruncatingWrite, match="offset"):
+        client.mutate("PUT", path.format(id=file_id), provider="alpha", params=params, content=b"x")
+    assert seeded.provider_calls == []
+    assert bytes(seeded.nodes[file_id].content) == DATA
+
+
+def test_o36_a_content_write_at_an_offset_and_an_empty_one_are_sent(config, seeded, client):
+    """O36: an offset of 0 or more passes, an empty body too (the write that extends a file's size, #107)."""
+    file_id = seeded.id_of(PATH)
+    client.mutate("PUT", f"/data/{file_id}/content", provider="alpha", params={"offset": 0}, content=b"y")
+    client.mutate("PUT", f"/data/{file_id}/content", provider="alpha", params={"offset": 8192}, content=b"")
+    assert [r.query for r in seeded.requests if r.method == "PUT"] == [{"offset": "0"}, {"offset": "8192"}]
+    assert len(seeded.nodes[file_id].content) == 8192
 
 
 def test_o09_a_raw_body_is_sent_as_an_octet_stream_and_nothing_else_is_marked_so(config):

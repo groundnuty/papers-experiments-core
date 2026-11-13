@@ -546,8 +546,12 @@ class Provisioner:
           made is skipped too, and stays out of the log;
         - a strict prefix of the local file, in a file the log says this provisioner created: the rest is sent from
           where the target ends, by offset writes (`resumed`);
-        - anything else in a file it created: the file is written again from its first byte, the first write without
-          an offset, which truncates it (`restarted`);
+        - other bytes, in a file it created that is no longer than the local file: the file is written again from its
+          first byte, every write at its offset, so the writes cover the whole target and leave it the local file's
+          size (`restarted`);
+        - a file it created that is longer than the local file: refused before anything is written. Only a write
+          without an offset could shorten it, by truncating it to 0 first, and none is ever sent (O36): remove the file
+          first;
         - anything else in a file it did not create: refused before anything is written, as `put_file` refuses (O09).
 
         Success is reported only once the size and the SHA-256 read back equal those of the bytes read from the local
@@ -574,7 +578,7 @@ class Provisioner:
         # The caller's stop, never the size taken above: without one, a local file appended to meanwhile is read to its
         # new end and fails the size check below instead of being cut to its first bytes and reported done.
         blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=stop), hasher)
-        sent = self._write_chunks(file_id, blocks, media, truncate=action == "restarted")
+        sent = self._write_chunks(file_id, blocks, media)
         expected = Digest(start + sent, hasher.hexdigest())
         if expected.size != size:
             raise ProvisionError(f"{self._where}the local file changed size while it was uploaded")
@@ -603,6 +607,11 @@ class Provisioner:
                 self._require_created(existing.file_id)
                 return "resumed", existing.size, hasher
         self._require_created(existing.file_id)
+        if existing.size > size:
+            raise ProvisionError(
+                f"{self._where}the target is longer than the local file, and only a write without an offset, which "
+                "truncates and is never sent, could shorten it; nothing was written"
+            )
         return "restarted", 0, hashlib.sha256()
 
     def _require_created(self, file_id: str) -> None:
@@ -612,31 +621,27 @@ class Provisioner:
                 "overwrite or adopt it, and nothing was written"
             )
 
-    def _write_chunks(
-        self, file_id: str, blocks: Iterable[tuple[int, bytes]], media: str, *, truncate: bool = False
-    ) -> int:
-        """Write `(offset, bytes)` blocks to a file's content on the data provider, each a PUT through the gate; return
-        the bytes sent. With `truncate`, the first write goes without an offset, which truncates the file (with an
-        empty body when there is no block)."""
+    def _write_chunks(self, file_id: str, blocks: Iterable[tuple[int, bytes]], media: str) -> int:
+        """Write `(offset, bytes)` blocks to a file's content on the data provider, each a PUT at its offset through the
+        gate; return the bytes sent."""
         self._verified()
         sent = 0
         for offset, block in blocks:
-            if truncate and sent == 0 and offset != 0:
-                raise ProvisionError(f"{self._where}a truncating write starts at the file's first byte")
-            self._put(file_id, block, None if truncate and sent == 0 else offset, media)
+            self._put(file_id, block, offset, media)
             sent += len(block)
-        if truncate and sent == 0:
-            self._put(file_id, b"", None, media)
         return sent
 
-    def _put(self, file_id: str, block: bytes, offset: int | None, media: str) -> None:
-        """One write of content, bound to this provisioner's space: at `offset`, or without one, which truncates the file
-        first. A body of `fresh_connection_bytes` or more goes on a connection of its own (#186)."""
+    def _put(self, file_id: str, block: bytes, offset: int, media: str) -> None:
+        """One write of content at `offset`, bound to this provisioner's space. There is no write without an offset,
+        which would truncate the file to 0 first: one is refused here and by the client's gate, before it is sent
+        (O36). A body of `fresh_connection_bytes` or more goes on a connection of its own (#186)."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ProvisionError(f"{self._where}a write of content needs a whole offset of 0 or more; nothing was sent")
         self.mutate(
             "PUT",
             f"/data/{_segment(file_id)}/content",
             provider=self._settings.holder,
-            params=None if offset is None else {"offset": offset},
+            params={"offset": offset},
             content=block,
             timeout_s=self._settings.request_timeout_s,
             content_type=media,
