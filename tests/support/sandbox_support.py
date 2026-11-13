@@ -26,6 +26,7 @@ COMPLETE_LEVEL = "via-gate-whole"  # an invented REST level whose gate answers e
 CHECK_FILE = "checks/content.bin"  # an invented file under the space root, read by the pre-campaign check
 FED_NETWORK = "fed-net-test"  # an invented docker network of a federation's own deployment
 FED_LOCAL = "alpha.fed-net.test"  # the local provider's invented name on that network
+FED_ZONE = "zone.fed-net.test"  # and the zone's
 FED_SUBNET = "10.88.0.0/24"  # the invented subnet the fake host gives that network, outside the pool
 SLOT_USERS = {  # login name -> (password, user id) of the users of the two slots below; all invented
     "slot-a-data": ("pw-slot-a-data", "u-slot-a-data"),
@@ -100,9 +101,10 @@ def add_sandbox(data: dict[str, Any]) -> None:
 
 def add_federation(data: dict[str, Any]) -> None:
     """An `edit` for `write_platform`: the default tables, and a `[sandbox.federation]` table that puts the oneclient
-    sidecar on a federation's own network and has it dial the local provider ("alpha") by its name there."""
+    sidecar and the REST data path's gate on a federation's own network, where they dial the local provider ("alpha")
+    and, the gate, the zone by their names there."""
     add_sandbox(data)
-    data["sandbox"]["federation"] = {"network": FED_NETWORK, "providers": {"alpha": FED_LOCAL}}
+    data["sandbox"]["federation"] = {"network": FED_NETWORK, "zone": FED_ZONE, "providers": {"alpha": FED_LOCAL}}
 
 
 def configured_sandbox_values(tmp_path: Path) -> list[str]:
@@ -110,10 +112,10 @@ def configured_sandbox_values(tmp_path: Path) -> list[str]:
 
     Image names and ids, the pool, the work directory, the mount path, the name prefix and label namespace, the
     slots' names, logins and user ids, the study's levels (looked for quoted, as `{level!r}` would write them), and
-    the federation network and the local provider's name on it that `add_federation` adds.
+    the federation network and the zone's and the local provider's names on it that `add_federation` adds.
     """
     document = sandbox_data()
-    values = [FED_NETWORK, FED_LOCAL, FED_SUBNET]
+    values = [FED_NETWORK, FED_LOCAL, FED_ZONE, FED_SUBNET]
     values += [ref[key] for ref in document["images"].values() for key in ("name", "id")]
     values += document["network"]["pools"] + [document["mount"]["path"], document["label_namespace"]]
     values += [document["name_prefix"] + "-", str(tmp_path / document["work_root"]), str((tmp_path / "work").resolve())]

@@ -6,8 +6,12 @@
 """Policy gate: the only network peer the sandbox has (the sandbox network is internal).
 
 Runs in its own container, as root with all capabilities but NET_BIND_SERVICE
-dropped, attached to the sandbox's internal network and to a bridge to reach
-the upstream. Configuration: JSON at the path in argv[1]:
+dropped (so it reads only files root owns or anyone may read: the sandbox gives it
+its keys and its token file as root's), attached to the sandbox's internal network
+and to the network it reaches the upstream on: docker's default bridge, or the
+federation's own network that `[sandbox.federation]` names, where the `hosts` are
+the zone's and the local provider's names there. Configuration: JSON at the path
+in argv[1]:
 
   {"run_key": "...", "verify_ssl": true, "log": "/var/gate/requests.jsonl",
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",

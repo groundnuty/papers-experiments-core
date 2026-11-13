@@ -310,7 +310,37 @@ what the sidecar can show of the agent's reads, per file (oneclient's options, i
 entries); `EXPCORE_LIVE_ONECLIENT_ARGS` passes oneclient further arguments, such as a trace option the first run found.
 
 The other sandbox tests (`tests/live/test_sandbox.py`) need a platform file with a `[sandbox]` table, which this one
-lacks, so they are not run against it here. The REST path's data gate does not cross to the project's network.
+lacks, so they are not run against it here.
+
+## The sandbox's REST path against it
+
+The REST path's data gate crosses on the project's network too, through the same table with the zone's name added
+(`zone`, #203):
+
+- the gate starts on `expcore-fed_fed` and is then connected to the sandbox's internal network, where the agent reaches
+  it, and to no other network;
+- it serves and dials the zone as `zone.expcore-fed.test` and the local provider as `pine.expcore-fed.test`, on port
+  443, the domains `facts.json` gives as `domain_on_project_network`; its upstream verifies them against
+  `ca/federation-ca.pem`, since each service's certificate names its domain;
+- the agent resolves those two names to the gate, trusts the run's own CA alone and never joins `expcore-fed_fed`; a
+  client that follows the zone to `pine`'s registered domain, which is its name on the project's network, comes back to
+  the gate;
+- the gate's TLS keys are root's and owner-only on the host, which the gate, root with every capability dropped but
+  `NET_BIND_SERVICE`, can read;
+- the sandbox never changes or removes `expcore-fed_fed`; its teardown removes the gate, which takes it off.
+
+The live test of the REST path (`tests/live/test_rest_path.py`) writes a copy of `platform.toml` with such a
+`[sandbox]` table into a directory of its own and reads one provisioned file through the gate, by its hash; it writes
+nothing to the federation:
+
+```sh
+EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_PLATFORM=/mnt/volume2/expcore-federation/platform.toml \
+EXPCORE_LIVE_CONTENT_PATH=hello.txt EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range> uv run pytest tests/live/test_rest_path.py
+```
+
+Run it outside any sandbox, after up: it needs Docker, `sudo` for the sandbox's mounts and the gate's keys, and
+`python:3.12-slim` on the host (never pulled), the agent's image and the gate's unless `EXPCORE_LIVE_AGENT_IMAGE` and
+`EXPCORE_LIVE_GATE_IMAGE` name others.
 
 `day0/` holds the dated reports: the day-0 checks' own (`day0-<UTC>.md` and `.json`) and the facts they do not
 measure (`<date>-federation-facts.md`): releases, live test results, the fault test, what listens on the host, the

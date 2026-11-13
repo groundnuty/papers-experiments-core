@@ -6,6 +6,7 @@ from sandbox_support import (
     COMPLETE_LEVEL,
     FED_LOCAL,
     FED_NETWORK,
+    FED_ZONE,
     GATE_IMAGE_ID,
     LEVELS,
     POOL,
@@ -428,10 +429,10 @@ def federated(tmp_path, edit=None):
 
 def test_o03_the_federation_table_gives_the_sidecar_a_network_and_the_local_providers_name_on_it(tmp_path):
     """O03: a federation whose providers the host reaches at addresses no container can use (a Compose project's
-    loopback ports) is reached on its own docker network, where the local provider has a name of its own; the table
-    names that network and the local provider's name there, and nothing else."""
+    loopback ports) is reached on its own docker network, where the zone and the local provider have names of their
+    own; the table names that network and those names there, and nothing else."""
     sandbox = federated(tmp_path)
-    assert sandbox.federation == FederationNetwork(network=FED_NETWORK, local_provider=FED_LOCAL)
+    assert sandbox.federation == FederationNetwork(network=FED_NETWORK, local_provider=FED_LOCAL, zone=FED_ZONE)
     (tmp_path / "plain").mkdir()
     assert load(tmp_path / "plain").federation is None  # optional: without it the sidecar starts as it always has
 
@@ -484,25 +485,77 @@ def test_o03_the_local_providers_name_on_the_network_is_a_host_name(tmp_path, ad
         assert address not in str(caught.value)
 
 
-def test_o05_a_federation_table_without_a_mount_data_path_is_refused(tmp_path):
-    """O05: only the mount sidecar reads the table, so with no data path a mount it would change nothing: refused, as
-    a misspelt key is, so a configuration never seems to do what it does not."""
+def with_levels(data_paths, change=None):
+    """An `edit` for `write_platform`: the `[sandbox.federation]` table of `add_federation`, with these levels."""
 
     def edit(data):
         add_federation(data)
-        data["sandbox"]["data_paths"] = {"via-gate": "rest", "isolated": "none"}
+        data["sandbox"]["data_paths"] = data_paths
+        if change is not None:
+            change(data["sandbox"]["federation"])
 
-    with pytest.raises(ConfigError, match=r"\[sandbox\]: key 'federation' is read by the mount sidecar alone"):
+    return edit
+
+
+def test_o05_a_federation_table_with_neither_a_mount_nor_a_rest_data_path_is_refused(tmp_path):
+    """O05: only the mount sidecar and the REST data path's gate read the table, so with no data path that is either
+    it would change nothing: refused, as a misspelt key is, so a configuration never seems to do what it does not."""
+    edit = with_levels({"isolated": "none"})
+    with pytest.raises(ConfigError, match=r"\[sandbox\]: key 'federation' is read by the mount sidecar and the data"):
         load_platform(write_platform(tmp_path, edit), require_secrets=False)
 
 
-def test_o05_an_unknown_key_of_the_federation_table_is_refused(tmp_path):
-    """O05: a misspelt key cannot do nothing: the table holds the network and the local provider's name only."""
+def test_o03_a_rest_data_path_alone_takes_the_federation_table_with_the_zones_name(tmp_path):
+    """O30: the REST data path's gate reaches the zone and the local provider on the federation's network (#203), so
+    the table is read with a rest level and no mount, and gives the gate both names there."""
+    edit = with_levels({"via-gate": "rest", "isolated": "none"})
+    sandbox = load_platform(write_platform(tmp_path, edit), require_secrets=False).sandbox
+    assert sandbox.federation == FederationNetwork(network=FED_NETWORK, local_provider=FED_LOCAL, zone=FED_ZONE)
+
+
+def test_o03_a_rest_data_path_on_the_federation_needs_the_zones_name_there(tmp_path):
+    """O30: the gate dials the zone on the federation's network too, by the name its certificate holds; a table that
+    gives the gate no zone there is refused at load, naming the key, rather than leaving the zone to a loopback URL."""
+    edit = with_levels({"via-gate": "rest"}, lambda table: table.pop("zone"))
+    with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: key 'zone' is required") as caught:
+        load_platform(write_platform(tmp_path, edit), require_secrets=False)
+    assert FED_NETWORK not in str(caught.value)
+
+
+def test_o05_the_zones_name_is_refused_where_no_gate_reads_it(tmp_path):
+    """O30: a mount sidecar never dials the zone, so a `zone` in a table no REST level reads would do nothing: it is
+    refused, as a misspelt key is. A mount level's table without it loads as before."""
+    edit = with_levels({"mounted": "mount", "isolated": "none"})
+    with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: key 'zone' is read by the REST data path's gate"):
+        load_platform(write_platform(tmp_path, edit), require_secrets=False)
+    (tmp_path / "mount-only").mkdir()
+    edit = with_levels({"mounted": "mount"}, lambda table: table.pop("zone"))
+    sandbox = load_platform(write_platform(tmp_path / "mount-only", edit), require_secrets=False).sandbox
+    assert sandbox.federation == FederationNetwork(network=FED_NETWORK, local_provider=FED_LOCAL)
+
+
+@pytest.mark.parametrize("address", ["zone.fed-net.test:443", "https://zone.fed-net.test", "a b", "-x", "", 7])
+def test_o03_the_zones_name_on_the_network_is_a_host_name(tmp_path, address):
+    """O30: the gate dials the zone's name on the network's port 443, so it is a plain host name: no scheme, no port,
+    no space. It is a configured value: the key is named, never the value."""
 
     def change(table):
-        table["zone"] = "zone.fed-net.test"
+        table["zone"] = address
 
-    with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: key 'zone' is not a known key"):
+    with pytest.raises(ConfigError, match="'zone'") as caught:
+        federated(tmp_path, change)
+    if isinstance(address, str) and address:
+        assert address not in str(caught.value)
+
+
+def test_o05_an_unknown_key_of_the_federation_table_is_refused(tmp_path):
+    """O05: a misspelt key cannot do nothing: the table holds the network and the zone's and the local provider's
+    names only."""
+
+    def change(table):
+        table["gate"] = "gate.fed-net.test"
+
+    with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: key 'gate' is not a known key"):
         federated(tmp_path, change)
 
 
