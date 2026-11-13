@@ -19,8 +19,9 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from expcore_onedata.sandbox.api import DataPathMode
+from expcore_onedata.sandbox.api import DataPathMode, Endpoint
 from expcore_onedata.sandbox.settings import SandboxSettings
 from expcore_onedata.sandbox.teardown import SIDECAR_MOUNT, SIDECAR_SUFFIX
 
@@ -52,7 +53,8 @@ SIDECAR_START = (
 )
 SIDECAR_SHELL_NAME = "oneclient-sidecar"  # the shell's $0, before the arguments it hands to `env`
 ENV_CA_BUNDLES = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
-DEFAULT_BRIDGE = "bridge"  # docker's default network: the sidecar's without [sandbox.federation]
+DEFAULT_BRIDGE = "bridge"  # docker's default network: the sidecar's and the gate's without [sandbox.federation]
+FEDERATION_PORT = 443  # where the gate dials the zone and the provider on [sandbox.federation]'s network
 # The published client sends through `requests.Session.send`, which merges no environment setting, so it verifies the
 # gate against the certifi bundle of the agent's image and never reads ENV_CA_BUNDLES (O23). On a REST data path the
 # sandbox asks the image's interpreter where that bundle is and extends it with the run's CA, as a trust path.
@@ -151,6 +153,37 @@ def sidecar_route(settings: SandboxSettings, provider_host: str) -> tuple[str, s
     return settings.federation.network, settings.federation.local_provider
 
 
+def gate_network(settings: SandboxSettings) -> str:
+    """The network the REST data path's gate starts on, before it is connected to the sandbox's internal one: the
+    federation's own with `[sandbox.federation]`, as the sidecar's (`sidecar_route`), else docker's default bridge."""
+    return DEFAULT_BRIDGE if settings.federation is None else settings.federation.network
+
+
+def gate_upstreams(settings: SandboxSettings, zone: Endpoint, provider: Endpoint) -> dict[str, dict[str, Any]]:
+    """The hosts the gate serves and dials, by the name the agent resolves to the gate (O03, O05): the zone and the
+    agent's pinned local provider, nothing else.
+
+    Each name is also the one the gate's certificate for it is issued for, the one it matches a request's `Host` and
+    SNI against, and, as `addr`, the one it dials upstream, verifying the certificate there as the platform's `[tls]`
+    says. With `[sandbox.federation]` these are the zone's and the local provider's names on the federation's network,
+    on its port 443 (#203): the URLs of `[zone]` and `[providers]` may be the host's published loopback ports, which a
+    container reaches only itself at. Without it they are the hosts and ports of those URLs, as always."""
+    federation = settings.federation
+    if federation is None:
+        named = (
+            ("onezone", zone.host, zone.port, zone.tls),
+            ("oneprovider", provider.host, provider.port, provider.tls),
+        )
+    elif federation.zone is None:
+        raise ValueError("a REST data path on [sandbox.federation] needs the zone's name on the federation's network")
+    else:
+        named = (
+            ("onezone", federation.zone, FEDERATION_PORT, True),
+            ("oneprovider", federation.local_provider, FEDERATION_PORT, True),
+        )
+    return {name: {"role": role, "addr": name, "port": port, "tls": tls} for role, name, port, tls in named}
+
+
 def effective_log_dir(args: Sequence[str], default: str = ONECLIENT_LOG_DIR) -> str:
     """The log directory oneclient was started with: the last --log-dir / -l in its arguments, else the default."""
     out = default
@@ -184,6 +217,11 @@ def gate_run_args(
 ) -> list[str]:
     """`docker run` for the gate: read-only root, one capability (to bind its port), its files mounted read-only.
 
+    It starts on `gate_network`'s network, the federation's own with `[sandbox.federation]`, and the sandbox then
+    connects it to the sandbox's internal network, where the agent reaches it; the agent never joins the federation's.
+    It runs as root with every other capability dropped, so it reads only files root owns or anyone may read: the run
+    gives it its TLS keys and its token file as root's, owner-only (`DockerSandbox._prepare_gate`, `_write_token_file`).
+
     The gate holds the data-path token and adds it to the requests it forwards (O05). The token never reaches docker:
     `token_file`, the run's file of it, is bound read-only at `GATE_TOKEN_PATH` in this container alone, and the gate
     reads it at its start (its configuration names the path). An environment variable given to `docker run` would be
@@ -191,7 +229,7 @@ def gate_run_args(
     the run's own copy of the verified bundle, is mounted read-only at `GATE_CA_PATH`, which the gate's configuration
     names as its upstream CA file."""
     return [
-        *("run", "-d", "--name", names.gate, "--network", "bridge", *labels),
+        *("run", "-d", "--name", names.gate, "--network", gate_network(s), *labels),
         *("--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges"),
         *("--read-only", "--user", "0", "--pids-limit", "512", "--memory", str(s.limits.gate_memory_bytes)),
         *("-v", f"{sdir / 'tls'}:/etc/gate/tls:ro", "-v", f"{sdir / 'gate.json'}:/etc/gate/gate.json:ro"),
