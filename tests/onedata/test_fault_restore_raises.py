@@ -7,6 +7,7 @@ Every test runs against `FakeServices`, whose `never_serves` knob is a provider 
 import asyncio
 import json
 import threading
+import time
 
 import pytest
 from fault_support import OUTAGE_TARGET, SERVICES, FakeServices, injector_for, write_faults
@@ -275,18 +276,50 @@ def test_o11_a_run_cancelled_while_it_clears_carries_the_failed_restore_as_a_not
     assert len(open_injections(tmp_path)) == 1
 
 
-def test_o11_a_second_cancellation_during_the_clear_of_a_cancelled_body_carries_the_failed_restore_too(tmp_path):
-    """O11: the body raised, and the clear that follows is cancelled too: the second cancellation notes the failure."""
+def test_o11_a_cancellation_during_the_clear_after_a_body_that_raised_carries_the_failed_restore_too(tmp_path):
+    """O11: the body raised, and the task is cancelled during the clear that follows: the cancellation, which replaces
+    the body's exception as the one raised, notes the restore failure."""
     cancelled, _ = cancelled_during_the_clear(tmp_path, body_raises=True)
     assert any(OUTAGE_TARGET in note and "not_serving" in note for note in cancelled.__notes__)
 
 
-def test_o11_a_clear_still_running_when_the_wait_for_it_ends_is_noted_as_not_verified(tmp_path):
+def test_o11_a_clear_that_had_not_finished_when_the_wait_for_it_ends_is_noted_as_not_verified(tmp_path):
     """O11: the wait for the clear is bounded; when it ends with the clear still running, the cancellation says so
-    without taking the injector's lock, and the injection stays open."""
+    and the injection stays open."""
     cancelled, _ = cancelled_during_the_clear(tmp_path, cancel_wait_s=0.05)
-    assert any(OUTAGE_TARGET in note and "still running" in note for note in cancelled.__notes__)
+    assert any(OUTAGE_TARGET in note and "had not finished" in note for note in cancelled.__notes__)
     assert len(open_injections(tmp_path)) == 1
+
+
+def test_o11_the_note_for_a_cancelled_clear_never_waits_for_the_injectors_lock(tmp_path):
+    """O11: a clear task that was itself cancelled (the event loop's shutdown cancels every task) says nothing of its
+    worker thread, which may still hold the injector's lock: the note is made without taking it, so the bound holds."""
+    _, injector = unserving(tmp_path)
+    held, release = threading.Event(), threading.Event()
+
+    def hold_the_lock():
+        with injector._mutex:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_the_lock)
+    holder.start()
+    held.wait(10)
+
+    async def scenario():
+        clearing = asyncio.get_running_loop().create_future()
+        clearing.cancel()
+        error = asyncio.CancelledError()
+        threading.Timer(3, release.set).start()  # a way out for a note that blocks
+        started = time.monotonic()
+        injector._note_clear(error, clearing)
+        return error, time.monotonic() - started
+
+    error, waited_s = asyncio.run(scenario())
+    release.set()
+    holder.join()
+    assert any("had not finished" in note for note in error.__notes__)
+    assert waited_s < 2
 
 
 def test_o11_running_with_a_verified_restore_raises_nothing(tmp_path):

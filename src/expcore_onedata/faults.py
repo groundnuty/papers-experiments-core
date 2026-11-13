@@ -430,9 +430,11 @@ class FaultInjector:
 
     def _note_clear(self, error: BaseException, clearing: "asyncio.Future[Any]") -> None:
         """Add to `error`, a cancellation that interrupted the clear's wait, the restore failure the clear left, or that
-        the clear was still running (then the injector's lock is not taken, so the bound holds)."""
-        if not clearing.done():
-            error.add_note(f"the clear of {self.target} was still running when the wait for it ended: not verified")
+        the clear had not finished. The injector's lock is taken only for a clear that did: a cancelled task (the event
+        loop's shutdown cancels every one) says nothing of its worker thread, which may still hold the lock, and waiting
+        for it would block the loop and defeat the bound."""
+        if not clearing.done() or clearing.cancelled():
+            error.add_note(f"the clear of {self.target} had not finished when the wait for it ended: not verified")
             return
         with self._mutex:
             failure = self._unrestored()
