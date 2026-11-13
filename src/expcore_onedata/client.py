@@ -682,11 +682,18 @@ class OnezoneClient:
             raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
 
     def get_dated(
-        self, path: str, *, provider: str | None = None, params: Mapping[str, Any] | None = None
+        self,
+        path: str,
+        *,
+        provider: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        retry: ReadRetry = ONE_ATTEMPT,
     ) -> tuple[Any, str | None]:
         """GET as `get` does with the admin credential, and return with the decoded answer its `Date` header as sent,
-        or None when it has none. The transfer log estimates a provider's clock offset from it (`transferlog.py`)."""
-        response = self._request("GET", path, provider=provider, headers=self._admin, params=params, retry=ONE_ATTEMPT)
+        or None when it has none. The transfer log and the reset's history estimate a provider's clock offset from it
+        (`transferlog.py`, `reset.py`). `retry` is the call site's choice, as for `get`: the header is the answered
+        attempt's."""
+        response = self._request("GET", path, provider=provider, headers=self._admin, params=params, retry=retry)
         return self._decoded(response, "GET", provider), response.headers.get("date")
 
     def get(
@@ -706,8 +713,8 @@ class OnezoneClient:
 
         `retry` is the call site's choice, named by every caller: a `ReadRetry` for the harness's own plumbing, which
         tries a read that timed out again, boundedly and in the log, and `ONE_ATTEMPT` (the default) for whatever
-        measures the platform, so that a timeout stays the recorded timeout it is. It is on `get` alone: no other call
-        of the client takes one. `deadline_s` bounds the whole call, its retries and pauses included (`readretry.py`).
+        measures the platform, so that a timeout stays the recorded timeout it is. Of the plain reads it is on `get`
+        and `get_dated` alone. `deadline_s` bounds the whole call, its retries and pauses included (`readretry.py`).
         """
         headers = {AUTH_HEADER: token} if token is not None else self._admin
         return self._send(

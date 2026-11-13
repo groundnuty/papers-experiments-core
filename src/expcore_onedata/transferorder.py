@@ -40,11 +40,13 @@ how far behind this host a provider's clock may run before the probes fail close
 second-level times of the listing clear of rounding at the edge.
 """
 
-from collections.abc import Callable, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from expcore_onedata.transferrecord import Unreadable
+from expcore_onedata.transferwindow import Edges, Window
 
 STOP_MARGIN_S = 10.0  # seconds a reader's cutoff lies below its window's start, beyond the clock-skew allowance
 
@@ -151,4 +153,36 @@ def _check_past_stop(
         return
 
 
-__all__ = ["STOP_MARGIN_S", "OrderBroken", "Walk", "newest_first"]
+def window_opens(
+    since: float, offsets: Mapping[str, Sequence[float | None]], allowance: float
+) -> tuple[int, dict[str, float]]:
+    """Where a window that starts at `since` on this host's clock opens on the providers' clocks, from the offsets the
+    Date headers of their listing answers gave (`offsets`, by provider label; `transferwindow.offset_of`), with the
+    record of the clock. It opens at `since` moved by the least offset, in whole seconds as the listing's times are:
+    a record's times are on the clock of the provider that wrote them, so the earliest any provider puts it.
+
+    A reader walks down to `since` less `allowance` and `STOP_MARGIN_S` on this host's clock, so the check is the
+    probes' (`transferlog.py`): the window widened by the offsets and the allowance (`transferwindow.Edges`) must not
+    open below that cutoff, which a provider clock more than the margin behind would make it do, leaving jobs of the
+    window past the stop. Raise Unreadable, naming the clock, when it would, and when an answer's Date could not be
+    read, since the window cannot then be placed. The margin decides where reading stops, never what counts."""
+    if not offsets:
+        raise ValueError("a window is placed from one provider's listing answers at least")
+    unread = [label for label, samples in offsets.items() if not samples or None in samples]
+    if unread:
+        raise Unreadable(
+            f"{', '.join(unread)}: a listing answer carried no Date header that could be read, so the provider's clock "
+            "is unknown and the window cannot be placed on it"
+        )
+    seen = [offset for samples in offsets.values() for offset in samples if offset is not None]
+    low, high = min(seen), max(seen)
+    if Edges(Window(since, since), low, high, allowance).first < since - allowance - STOP_MARGIN_S:
+        raise Unreadable(
+            f"a provider's clock runs more than {STOP_MARGIN_S:.0f} s behind this host's, beyond the margin the ended "
+            "listing is read back by, so the window may hold jobs past where the reading stopped"
+        )
+    opens = math.floor(since + low)
+    return opens, {"least_offset_s": round(low, 3), "greatest_offset_s": round(high, 3), "window_opens": opens}
+
+
+__all__ = ["STOP_MARGIN_S", "OrderBroken", "Walk", "newest_first", "window_opens"]

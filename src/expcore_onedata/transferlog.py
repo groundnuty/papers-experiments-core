@@ -142,7 +142,7 @@ class TransferLog:
 
     def _dated_page(self, path: str, provider: str, params: Mapping[str, Any]) -> Any:
         """Read one page of a provider's listing and keep the provider's clock offset its Date header gives."""
-        answer, date = self._client.get_dated(path, provider=provider, params=params)
+        answer, date = self._client.get_dated(path, provider=provider, params=params, retry=ONE_ATTEMPT)
         self._offsets.setdefault(provider, []).append(offset_of(date, self._now()))
         return answer
 

@@ -38,7 +38,11 @@ read and every check is made on each provider that supports the space, since eac
    the count of the jobs that ended since then, the newest finish time, read from the records, whether older ended
    jobs are listed too (`earlier`), and `removable` false, its limit stated. The history grows with every run, so the
    listing is read newest first down to the window less the clock-skew allowance and `transferorder.STOP_MARGIN_S`,
-   its order checked as it goes, never whole (O32); `LISTED_MAX` counts the jobs in that window.
+   its order checked as it goes, never whole (O32); `LISTED_MAX` counts the jobs read down to there. The Date headers
+   of those listing answers place the window on the providers' clocks, as the probes' transfer log does
+   (`transferorder.window_opens`, recorded under `clock`): a job counts when it finished at or after the window opens
+   there, so one read in the margin below it counts as an older job, never as one of the window's; and a Date that
+   cannot be read, or a provider clock more than the margin behind this host's, fails the stage.
 
 **Before any stage** the plan is checked (no provider to evict from or allowed to hold bytes is the data provider, by
 name or id, or one that does not support the space) and the space's live name is verified (`verify_space`).
@@ -73,8 +77,9 @@ from expcore_onedata.occupancy import physical_sizes
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferlog import PAGE_LIMIT
-from expcore_onedata.transferorder import STOP_MARGIN_S, newest_first
+from expcore_onedata.transferorder import STOP_MARGIN_S, Walk, newest_first, window_opens
 from expcore_onedata.transferrecord import Unreadable, page_of
+from expcore_onedata.transferwindow import offset_of
 
 STAGES = ("qos", "transfers", "eviction", "occupancy", "history")
 ACTIVE = ("waiting", "ongoing")  # the listing's states of a job that has not ended
@@ -398,44 +403,67 @@ class SpaceReset:
             raise Unreadable("an ended transfer's record has no finishTime that is a number")
         return float(value)
 
+    def _dated_page(self, provider: str, token: str | None) -> tuple[list[str], str | None, float | None]:
+        """One page of a provider's ended listing (its ids and the next page's token, None on the last) with the
+        provider's clock offset from this host that the answer's Date header gives, None when it cannot be read."""
+        params = {"state": "ended", "limit": PAGE_LIMIT, **({"page_token": token} if token else {})}
+        path = f"/spaces/{self._p.space_id}/transfers"
+        answer, date = self._p.client.get_dated(path, provider=provider, params=params, retry=self._p.retry)
+        ids, following = page_of(answer)
+        return ids, following, offset_of(date, self._now())
+
+    def _walk_ended(self, provider: str, cutoff: float) -> tuple[Walk, list[float | None]]:
+        """Walk one provider's ended listing newest first down to `cutoff` (`transferorder.newest_first`), and return
+        the walk with the clock offset each of its listing answers gave."""
+        settings = self._p.settings
+        offsets: list[float | None] = []
+
+        def page(token: str | None) -> tuple[list[str], str | None]:
+            ids, following, offset = self._dated_page(provider, token)
+            offsets.append(offset)  # the walk takes ids and a token alone: the offsets are kept beside it
+            return ids, following
+
+        walk = newest_first(
+            page,
+            lambda ids: consistency.bounded_map(lambda t: self._finish(provider, t), list(ids), settings.concurrency),
+            lambda moment: moment,
+            cutoff=cutoff,
+            bound=self._listed_max,
+            max_pages=self._listed_max // PAGE_LIMIT + 1,
+            where=f"{self._label(provider)}: ",
+            chunk=settings.concurrency,
+        )
+        return walk, offsets
+
     def _history(self, since: float) -> dict[str, Any]:
         """What the ended listing shows the next agent since `since`, per provider and together: the count of the jobs
-        that ended since then, the newest finish, and whether older jobs are listed too. Each provider's listing is
-        read newest first down to the window (`transferorder.newest_first`), never the whole history."""
-        settings = self._p.settings
-        cutoff = since - settings.clock_skew_allowance_s - STOP_MARGIN_S
-        per: dict[str, Any] = {}
-        ended: dict[str, float] = {}
-        newest: list[float] = []
-        earlier = False
+        that ended since then on the providers' clocks, the newest finish, and whether older jobs are listed too. Each
+        provider's listing is read newest first down to `since` less the allowance and the margin, never the whole
+        history; the Date headers of those answers place the window on the providers' clocks, and a clock that cannot
+        be read, or that puts the window below where the reading stops, fails the stage
+        (`transferorder.window_opens`)."""
+        allowance = self._p.settings.clock_skew_allowance_s
+        cutoff = since - allowance - STOP_MARGIN_S
+        walks, offsets = {}, {}
         for provider in self._providers:
-            walk = newest_first(
-                lambda token, p=provider: self._page(p, "ended", token),
-                lambda ids, p=provider: consistency.bounded_map(
-                    lambda t: self._finish(p, t), list(ids), settings.concurrency
-                ),
-                lambda moment: moment,
-                cutoff=cutoff,
-                bound=self._listed_max,
-                max_pages=self._listed_max // PAGE_LIMIT + 1,
-                where=f"{self._label(provider)}: ",
-                chunk=settings.concurrency,
-            )
-            per[self._label(provider)] = {
-                "ended": len(walk.kept),
-                "newest_finish": walk.newest,
-                "earlier": walk.earlier,
-            }
-            for tid, moment in walk.kept.items():
-                ended[tid] = max(ended.get(tid, moment), moment)
-            newest += [] if walk.newest is None else [walk.newest]
-            earlier = earlier or walk.earlier
+            walks[self._label(provider)], offsets[self._label(provider)] = self._walk_ended(provider, cutoff)
+        opens, clock = window_opens(since, offsets, allowance)
+        per: dict[str, Any] = {}
+        ended: set[str] = set()
+        for label, walk in walks.items():
+            # The margin decides where the walk stops, never what counts: a job it kept that finished before the
+            # window opens ended before `since`, and shows that older jobs are listed.
+            inside = {tid for tid, moment in walk.kept.items() if moment >= opens}
+            older = walk.earlier or len(inside) < len(walk.kept)
+            per[label] = {"ended": len(inside), "newest_finish": walk.newest, "earlier": older}
+            ended |= inside
         return {
             "removable": False,  # no call of the API removes an ended transfer (the module docstring has the evidence)
             "since": since,
             "ended": len(ended),
-            "newest_finish": max(newest, default=None),
-            "earlier": earlier,
+            "newest_finish": max((w.newest for w in walks.values() if w.newest is not None), default=None),
+            "earlier": any(row["earlier"] for row in per.values()),
+            "clock": clock,
             "providers": per,
         }
 
