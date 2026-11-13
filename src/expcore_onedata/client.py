@@ -133,7 +133,9 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   counters [S11] are confirmed. The state `waiting`, the listing answer's `Date` header (`get_dated`, the provider's
   clock), and a record's `type`, provider ids and times (epoch seconds), for a replication and an eviction, are
   confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state `transferStatus`, as
-  [S11] reads them.
+  [S11] reads them. The transfer log and the reset's history also read `GET /spaces/{space}` on Onezone with
+  `get_dated`, the read `space_name` makes ([L1]), for its `Date` header, Onezone's clock, on which a job's times are
+  stamped (`transferorder.py`); that header is cowboy's, as a provider's is, and no live run has recorded it yet.
 - The reset (`reset.py`, `eviction.py`, `occupancy.py`) sends a `POST /transfers` eviction of a directory, which covers
   every file under it, confirmed by [L1] (`day0/2026-11-11-federation-facts.md`: the mirror's block map of a file in
   the directory was empty once the directory's eviction ended), and reads a directory's `GET /data/{id}/distribution`
