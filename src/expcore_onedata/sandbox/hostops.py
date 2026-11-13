@@ -9,8 +9,17 @@ that reaches the host takes a `HostOps` as its first argument; none of them impo
 
 Secrets never travel in an argument list: `docker` takes an `env` mapping for them, and a failure is logged with the
 size and SHA-256 of the tool's own stderr, never its text and never the environment.
+
+Every command runs through `run_bounded`, which bounds it twice. In time (O39): a command past its limit is killed, and
+the wait for it to end after the kill is bounded too, since a process in an uninterruptible sleep (a read of a FUSE
+mount whose provider is gone) cannot die and `subprocess.run` waits for it for ever, holding the caller and with it
+a whole teardown. In memory (O40): with an `output_cap` the first bytes of each stream are kept and the rest is read,
+counted and dropped, so a command that writes without end is never blocked on a full pipe and never held whole;
+`Counted` says how many bytes it wrote and how many were kept.
 """
 
+import codecs
+import contextlib
 import errno
 import hashlib
 import ipaddress
@@ -20,6 +29,7 @@ import os
 import platform
 import re
 import subprocess
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,13 +43,38 @@ DOCKER_TIMEOUT_S = 120.0
 TIMED_OUT = 124  # the exit code GNU timeout uses, and what a bounded command that ran out of time reports
 
 
+KILL_WAIT_S = 10.0  # how long a command's end is waited for after its kill: one that does not die is given up on (O39)
+READER_JOIN_S = 5.0  # how long the readers of a command's output are waited for once it has ended or was given up on
+READ_BYTES = 1 << 16  # what one read of a command's output takes: the most held at once beside the kept part
+
+
+@dataclass(frozen=True)
+class Counted:
+    """What one output stream of a command held when a cap was asked for (O40): the bytes it wrote and the bytes kept of
+    them, always the first ones and a whole number of characters."""
+
+    produced: int
+    kept: int
+
+    @property
+    def cut(self) -> bool:
+        return self.produced > self.kept
+
+    def record(self) -> dict[str, int]:
+        return {"produced": self.produced, "kept": self.kept}
+
+
 @dataclass(frozen=True)
 class CmdResult:
-    """A finished command. A command that ran out of time has `returncode` 124 and says so on stderr."""
+    """A finished command. A command that ran out of time has `returncode` 124 and says so on stderr. With an output
+    cap, `stdout_count` and `stderr_count` say how much each stream wrote and how much of it is in the text (O40); they
+    are None when no cap was asked for."""
 
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    stdout_count: Counted | None = None
+    stderr_count: Counted | None = None
 
 
 @runtime_checkable
@@ -53,8 +88,11 @@ class HostOps(Protocol):
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
         input: str | None = None,
+        output_cap: int | None = None,
     ) -> CmdResult:
-        """Run `docker <args>`. With `check`, a non-zero exit raises; `env` is added to the environment."""
+        """Run `docker <args>`. With `check`, a non-zero exit raises; `env` is added to the environment. With
+        `output_cap`, each of stdout and stderr keeps at most that many bytes (a whole number of characters) and the
+        result says how many each wrote (`CmdResult.stdout_count`, O40)."""
         ...
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
@@ -130,11 +168,139 @@ def describe_stderr(text: str | bytes | None) -> str:
     return f"stderr {digest['bytes']} bytes, sha256 {digest['sha256']}"
 
 
-def _text(value: str | bytes | None) -> str:
-    """Text of a captured stream, which a timed-out process may leave as bytes or None."""
-    if value is None:
-        return ""
-    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+def _check_cap(cap: object) -> int | None:
+    if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
+        raise ValueError("an output cap is a whole number of bytes, at least 1")
+    return cap
+
+
+def _stream_text(data: bytes, produced: int, cap: int | None) -> tuple[str, Counted | None]:
+    """The text of one captured stream: `data` is its first bytes, `produced` how many it wrote. Decoded as UTF-8 with
+    bad bytes replaced and line ends made universal (`\r\n` and `\r` are `\n`), as `subprocess` did in text mode; a cut
+    never ends inside a character, so the bytes kept are those of the characters the text holds."""
+    cut = cap is not None and produced > len(data)
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    text = decoder.decode(data, final=not cut)
+    kept = len(data) - len(decoder.getstate()[0]) if cut else len(data)
+    return text.replace("\r\n", "\n").replace("\r", "\n"), (None if cap is None else Counted(produced, kept))
+
+
+def apply_output_cap(result: CmdResult, cap: int | None) -> CmdResult:
+    """`result` as `run_bounded` would have returned it under `cap`: each stream cut to its first `cap` bytes, whole
+    characters, and counted. For a host that does not run a process (the in-memory one of the tests); None leaves the
+    result as it is."""
+    cap = _check_cap(cap)
+    if cap is None:
+        return result
+    parts = []
+    for text in (result.stdout, result.stderr):
+        raw = text.encode("utf-8", "replace")
+        parts.append(_stream_text(raw[:cap], len(raw), cap))
+    (out, out_count), (err, err_count) = parts
+    return CmdResult(result.returncode, out, err, out_count, err_count)
+
+
+class _Pipe(threading.Thread):
+    """Reads one stream of a command to its end, keeping its first `cap` bytes (all of them without a cap) and counting
+    the rest, so what is held is bounded whatever the command writes. `produced` rises before `kept` does, so a
+    reader of both, `kept` first, never sees more kept than produced."""
+
+    def __init__(self, stream: Any, cap: int | None) -> None:
+        super().__init__(daemon=True, name="command-output")
+        self._stream, self._cap = stream, cap
+        self.kept = bytearray()
+        self.produced = 0
+
+    def run(self) -> None:
+        try:
+            while chunk := self._stream.read1(READ_BYTES):
+                self.produced += len(chunk)
+                room = len(chunk) if self._cap is None else self._cap - len(self.kept)
+                if room > 0:
+                    self.kept += chunk[:room]
+        except (OSError, ValueError):  # the stream was closed under it: what it read stands
+            pass
+
+    def snapshot(self) -> tuple[bytes, int]:
+        data = bytes(self.kept)
+        return data, max(self.produced, len(data))
+
+
+def _feed(stream: Any, data: bytes) -> None:
+    """Write a command's input from a thread of its own, so that output being read never waits for it."""
+    try:
+        stream.write(data)
+    except (OSError, ValueError):  # the command ended or closed its stdin before reading all of it
+        pass
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+def run_bounded(
+    argv: Sequence[str],
+    timeout_s: float,
+    *,
+    env: Mapping[str, str] | None = None,
+    input: str | None = None,
+    output_cap: int | None = None,
+) -> CmdResult:
+    """Run a command within `timeout_s` and return its output as text; never raise for what the command did.
+
+    A command past its time is killed, and its end is waited for at most `KILL_WAIT_S` more: one that does not die (a
+    process in uninterruptible sleep) is left behind, and the result is the timeout all the same (returncode 124, stderr
+    `timed out after Ns`, stdout what it had written; O39). A program that cannot be run is 127. With `output_cap`, each
+    of stdout and stderr keeps at most that many bytes and the rest is read and dropped, and `stdout_count` and
+    `stderr_count` say what was written and kept (O40). `env` is added to the environment."""
+    cap = _check_cap(output_cap)
+    merged = None if env is None else {**os.environ, **env}
+    try:
+        child = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=merged,
+        )
+    except OSError as error:
+        return CmdResult(127, "", f"{argv[0]} could not be run: {error.strerror or type(error).__name__}")
+    out, err = _Pipe(child.stdout, cap), _Pipe(child.stderr, cap)
+    readers = (out, err)
+    for reader in readers:
+        reader.start()
+    if input is not None:
+        threading.Thread(
+            target=_feed, args=(child.stdin, input.encode("utf-8", "replace")), daemon=True, name="command-input"
+        ).start()
+    timed_out = False
+    try:
+        try:
+            child.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            child.kill()
+            try:
+                child.wait(timeout=KILL_WAIT_S)
+            except subprocess.TimeoutExpired:
+                log.error("a command did not end %g s after its kill: it is left, and its caller goes on", KILL_WAIT_S)
+    except BaseException:  # an interrupt: nothing is left running behind the caller
+        with contextlib.suppress(OSError):
+            child.kill()
+        raise
+    for reader in readers:
+        reader.join(READER_JOIN_S)
+    if not any(
+        reader.is_alive() for reader in readers
+    ):  # nothing reads them any more: closed, not left to the collector
+        for stream in (child.stdout, child.stderr):
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+    (out_data, out_n), (err_data, err_n) = out.snapshot(), err.snapshot()
+    stdout, out_count = _stream_text(out_data, out_n, cap)
+    stderr, err_count = _stream_text(err_data, err_n, cap)
+    if timed_out:
+        return CmdResult(TIMED_OUT, stdout, f"timed out after {timeout_s:g}s", out_count, None)
+    return CmdResult(child.returncode, stdout, stderr, out_count, err_count)
 
 
 class DockerHost:
@@ -144,26 +310,16 @@ class DockerHost:
         self._sudo = tuple(sudo_command)
 
     def _run(
-        self, argv: Sequence[str], timeout_s: float, *, env: Mapping[str, str] | None = None, input: str | None = None
+        self,
+        argv: Sequence[str],
+        timeout_s: float,
+        *,
+        env: Mapping[str, str] | None = None,
+        input: str | None = None,
+        output_cap: int | None = None,
     ) -> CmdResult:
-        merged = None if env is None else {**os.environ, **env}
-        try:
-            done = subprocess.run(
-                list(argv),
-                input=input,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_s,
-                env=merged,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as expired:
-            return CmdResult(TIMED_OUT, _text(expired.stdout), f"timed out after {timeout_s:g}s")
-        except OSError as error:
-            return CmdResult(127, "", f"{argv[0]} could not be run: {error.strerror or type(error).__name__}")
-        return CmdResult(done.returncode, done.stdout, done.stderr)
+        """Every command of this host, bounded in time and, when asked, in the output kept (`run_bounded`)."""
+        return run_bounded(argv, timeout_s, env=env, input=input, output_cap=output_cap)
 
     def docker(
         self,
@@ -172,8 +328,15 @@ class DockerHost:
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
         input: str | None = None,
+        output_cap: int | None = None,
     ) -> CmdResult:
-        result = self._run(["docker", *args], DOCKER_TIMEOUT_S if timeout is None else timeout, env=env, input=input)
+        result = self._run(
+            ["docker", *args],
+            DOCKER_TIMEOUT_S if timeout is None else timeout,
+            env=env,
+            input=input,
+            output_cap=output_cap,
+        )
         if check and result.returncode != 0:
             # the tool's own words may name an image, a container or a path from the configuration: neither the log
             # nor the exception (which reaches a record) carries them, only the subcommand, the exit code and the

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import SandboxError
-from expcore_onedata.sandbox.hostops import CmdResult
+from expcore_onedata.sandbox.hostops import CmdResult, apply_output_cap
 from expcore_onedata.sandbox.inputs import PROBE_MARK
 
 VALUED = {
@@ -372,10 +372,12 @@ class FakeHost:
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
         input: str | None = None,
+        output_cap: int | None = None,
     ) -> CmdResult:
         with self.lock:
             self.calls.append(("docker", args[0], args[1:] if args[0] not in ("exec", "run") else ()))
-            result = self._docker(list(args), env, input)
+            # a result is cut as the real host's runner cuts it, so a test sees what a cell's caller would
+            result = apply_output_cap(self._docker(list(args), env, input), output_cap)
         if check and result.returncode != 0:
             raise SandboxError(f"docker {args[0]} failed ({result.returncode}): {result.stderr.strip()[-300:]}")
         return result
