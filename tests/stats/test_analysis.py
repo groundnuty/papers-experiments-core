@@ -6,13 +6,15 @@ import tomllib
 
 import numpy as np
 import pytest
-from stats_support import both_arms, make_row
+from stats_support import both_arms, make_row, ratio_arms, ratio_spec
 
 from expcore.campaign.factors import FactorSchema
 from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
 from expcore.stats.analysis import (
     CONCLUSIONS,
+    ContrastRefused,
+    RatioNumeratorRefused,
     TreatmentOutcomesRefused,
     analyse,
     conclude,
@@ -1032,3 +1034,135 @@ def test_s11_untestable_overrides_whatever_the_test_and_the_margin_say():
         for equivalent in (True, False):
             assert conclude(significant=significant, equivalent=equivalent, untestable=True) == "untestable"
     assert conclude(significant=False, equivalent=False) == "not_detected"
+
+
+# --- a ratio contrast through the analysis ----------------------------------------------------------------------------
+
+RATIO_TEXT = """\
+alpha = 0.05
+holm_family = ["spend-per-win"]
+
+[bootstrap]
+replicates = 300
+seed = 9
+
+[power]
+seed = 2
+n_simulations = 30
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[contrasts.spend-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+equivalence_margin = 0.2
+
+[contrasts.spend-per-win-side]
+conditions = ["cond-x", "cond-y"]
+estimator = "ratio"
+numerator = "spend"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+"""
+RATIOS = (6.0, 2.0, 3.0, 1.5, 4.0, 5.0, 2.5, 3.5)  # the ratio of ratios planted in each of eight clusters
+
+
+def ratio_prereg():
+    """A preregistration with a confirmatory and an exploratory ratio contrast."""
+    return parse(tomllib.loads(RATIO_TEXT), "inline", "d" * 64, ARMS)
+
+
+def planted_ratio_rows():
+    """Per cluster two tasks; A's spend per win is RATIOS[i] times B's, with one failed run of A on each task."""
+    rows = []
+    for i, ratio in enumerate(RATIOS):
+        for task in (f"t{i}a", f"t{i}b"):
+            rows += ratio_arms(task, "model-a", 1, (40.0 * ratio, 1.0), (20.0, 1.0), cluster=f"c{i}")
+            rows += ratio_arms(task, "model-a", 2, (40.0 * ratio, 0.0), (20.0, 1.0), cluster=f"c{i}")
+    return rows  # per cluster, A: 160 r over 2 wins, B: 80 over 4, so each cluster's log ratio is ln(4 r)
+
+
+def test_s13_a_ratio_contrast_runs_through_the_analysis_with_its_estimand_on_the_log_scale():
+    """S13: the estimate is the mean over clusters of ln(4 r); the failed runs' spend is in it, and Holm decides."""
+    result = analyse(planted_ratio_rows(), ratio_prereg())
+    contrast = result.contrast("spend-per-win")
+    expected = np.mean([math.log(4.0 * r) for r in RATIOS])
+    assert contrast.estimate == pytest.approx(expected)
+    assert contrast.ci_low < expected < contrast.ci_high
+    assert contrast.p_value == pytest.approx(2 / 2**8)  # eight positive cluster log ratios, exact
+    assert (contrast.outcome, contrast.estimator, contrast.n_pairs, contrast.n_clusters) == (
+        "spend/wins",
+        "ratio",
+        32,
+        8,
+    )
+    assert contrast.ratio.zero_denominator == "exclude"
+    assert (contrast.conclusion, contrast.in_family) == ("difference", True)
+    assert contrast.equivalence_interval is not None  # the margin is read on the same log scale
+    assert contrast.minimum_detectable_effect is not None
+    assert [d.name for d in result.holm] == ["spend-per-win"]
+
+
+def test_s13_a_contrast_whose_every_cluster_the_zero_rule_excludes_is_untestable_with_its_cause():
+    """S13, S11: no cluster left is no evidence; the row gives the pairs the rule took out, and the family keeps it."""
+    rows = []
+    for i in range(3):
+        rows += ratio_arms(f"t{i}", "model-a", 1, (50.0, 1.0), (20.0, 0.0), cluster=f"c{i}")
+    result = analyse(rows, ratio_prereg())
+    contrast = result.contrast("spend-per-win")
+    assert contrast.conclusion == "untestable"
+    assert contrast.pairs_missing["zero_denominator"] == 3
+    assert (contrast.n_pairs, contrast.n_clusters_dropped) == (0, 3)
+    assert math.isnan(contrast.estimate)
+    assert not result.holm[0].reject
+
+
+def test_s13_a_confirmatory_ratio_contrast_that_loses_a_failed_runs_numerator_is_refused():
+    """S13: a failed run's spend left None would make the cost per win a cost per win among successes alone."""
+    rows = planted_ratio_rows()
+    rows += ratio_arms("t9", "model-a", 1, (None, 0.0), (20.0, 1.0), cluster="c0")
+    with pytest.raises(RatioNumeratorRefused) as caught:
+        analyse(rows, ratio_prereg())
+    message = str(caught.value)
+    assert "confirmatory ratio contrast 'spend-per-win' drops 1 pair(s)" in message
+    assert "numerator 'spend' is None while its denominator 'wins' is 0" in message
+    assert "Make the scorer return 'spend' for every run" in message
+    assert isinstance(caught.value, ContrastRefused)
+    assert issubclass(TreatmentOutcomesRefused, ContrastRefused)  # the pipeline catches both as one
+
+
+def test_s13_an_exploratory_ratio_contrast_reports_a_failed_runs_missing_numerator_and_goes_on():
+    """S13: outside the family the loss is counted beside the result, as a treatment attempt's None is (S10)."""
+    side = [(f"s{i}", (30.0, 1.0), f"c{i}") for i in range(4)] + [("s9", (None, 0.0), "c0")]
+    rows = [
+        dataclasses.replace(row, condition={"cond-a": "cond-x", "cond-b": "cond-y"}[row.condition])
+        for task, arm_a, cluster in side
+        for row in ratio_arms(task, "model-a", 1, arm_a, (20.0, 1.0), cluster=cluster)
+    ]
+    result = analyse(planted_ratio_rows() + rows, ratio_prereg())
+    contrast = result.contrast("spend-per-win-side")
+    assert contrast.exploratory
+    assert contrast.pairs_missing["numerator_none_at_zero"] == 1
+    assert contrast.n_pairs == 4
+
+
+def test_s13_a_ratio_estimator_on_a_contrast_of_one_outcome_or_the_other_way_round_is_refused_at_run_time(prereg):
+    """S13: a spec built in code, past the loader, cannot hand an estimator the other form's input."""
+    rows = ratio_arms("t0", "model-a", 1, (40.0, 1.0), (20.0, 1.0))
+    with pytest.raises(ValueError, match=r"estimator 'wilcoxon_cluster_bootstrap' reads a difference.*a ratio"):
+        run_contrast(rows, ratio_spec(estimator="wilcoxon_cluster_bootstrap"), prereg)
+    spec = ContrastSpec("x", "score", "ratio", "group", conditions=("cond-a", "cond-b"))
+    with pytest.raises(ValueError, match="estimator 'ratio' reads a ratio"):
+        run_contrast(both_arms("task-a", "model-a", 1, 0.9, 0.5), spec, prereg)
+
+
+def test_s13_a_ratio_contrasts_pilot_power_reads_its_cluster_log_ratios():
+    """S13: the pilot SD of a ratio contrast is the SD of its cluster log ratios, the scale its test sees."""
+    result = pilot_power(planted_ratio_rows(), ratio_prereg(), names=["spend-per-win"])
+    assert result.rows[0]["sd"] == pytest.approx(np.std([math.log(4.0 * r) for r in RATIOS], ddof=1))

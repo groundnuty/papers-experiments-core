@@ -38,6 +38,11 @@ contrast's preregistered `max_unscored_treatment` (0 unless set). An exploratory
 refused.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
+
+A ratio contrast (S13, `expcore.stats.ratio`) runs the same way on its log ratios: its estimate, interval, margin and
+minimum detectable effect are natural-log ratios. A member of the Holm family that loses a pair because a run's
+numerator is None while its denominator is 0 is refused (`RatioNumeratorRefused`): its ratio would count the cost of
+successful runs alone. An exploratory one reports the count. Both refusals are `ContrastRefused`.
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ from expcore.stats import estimators, power
 from expcore.stats.estimators import ModelEstimate, PairedDifferences
 from expcore.stats.pairing import ContrastSpec, Pairing, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
+from expcore.stats.ratio import RatioForm
 from expcore.stats.rejection import rejects
 from expcore.stats.rows import AbsentRun, Row
 
@@ -60,9 +66,17 @@ UNTESTABLE = "untestable"  # the conclusion of a contrast that used no pair
 CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected", UNTESTABLE)
 
 
-class TreatmentOutcomesRefused(ValueError):
+class ContrastRefused(ValueError):
+    """A confirmatory contrast whose pairs were lost in a way that would bias it unseen; the message names the fix."""
+
+
+class TreatmentOutcomesRefused(ContrastRefused):
     """A confirmatory contrast lost pairs to treatment attempts scored None, and its preregistration either does not
     say how treatment attempts are scored for it or claims they are scored and allows fewer such pairs."""
+
+
+class RatioNumeratorRefused(ContrastRefused):
+    """A confirmatory ratio contrast lost pairs because a run's numerator is None while its denominator is 0 (S13)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,6 +114,7 @@ class ContrastResult:
     )
     conclusion: str  # one of CONCLUSIONS
     minimum_detectable_effect: float | None  # None without power settings, NaN when it cannot be reached
+    ratio: RatioForm | None = None  # a ratio contrast's form (S13): every number above is then a natural-log ratio
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -239,6 +254,32 @@ def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pa
     )
 
 
+def _refuse_unmeasured_failures(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
+    """Refuse a member of the Holm family that lost a pair to a run whose numerator is None while its denominator is
+    0 (S13): the ratio would then sum the cost of the runs that succeeded, and not of those that failed."""
+    lost = pairing.missing.get("numerator_none_at_zero", 0)
+    if spec.ratio is None or spec.name not in prereg.holm_family or not lost:
+        return
+    raise RatioNumeratorRefused(
+        f"{prereg.source}: confirmatory ratio contrast {spec.name!r} drops {lost} pair(s) because a run's numerator "
+        f"{spec.ratio.numerator!r} is None while its denominator {spec.ratio.denominator!r} is 0, so its ratio would "
+        f"count the {spec.ratio.numerator!r} of the runs with a nonzero {spec.ratio.denominator!r} and leave out "
+        f"that of the others. Make the scorer return {spec.ratio.numerator!r} for every run, a failed run's included, "
+        "or take the contrast out of holm_family"
+    )
+
+
+def _check_form(spec: ContrastSpec) -> None:
+    """Refuse a contrast whose form is not the one its estimator reads (S13): a spec built past the loader cannot hand
+    a difference estimator log ratios, or the ratio estimator differences."""
+    reads, form = estimators.form(spec.estimator), "difference" if spec.ratio is None else "ratio"
+    if reads != form:
+        raise ValueError(
+            f"contrast {spec.name!r}: estimator {spec.estimator!r} reads a {reads} contrast, and this contrast is a "
+            f"{form} contrast"
+        )
+
+
 def run_contrast(
     rows: Iterable[Row],
     spec: ContrastSpec,
@@ -252,10 +293,13 @@ def run_contrast(
     it is the raw p-value at alpha, with nothing adjusting for the family. `absent` are the planned runs with no
     analysed attempt, which say why a pair is missing. A member of the family that loses a pair to a treatment
     attempt scored None is refused (`TreatmentOutcomesRefused`), unless it declares `treatment_outcomes = "excluded"`
-    or the loss is within a "scored" contrast's preregistered `max_unscored_treatment`.
+    or the loss is within a "scored" contrast's preregistered `max_unscored_treatment`; a ratio contrast in the family
+    that loses one to a failed run's None numerator is refused too (`RatioNumeratorRefused`, S13).
     """
+    _check_form(spec)
     pairing = pair_rows(rows, spec, absent)
     _refuse_lost_treatment_pairs(spec, prereg, pairing)
+    _refuse_unmeasured_failures(spec, prereg, pairing)
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
     in_family = spec.name in prereg.holm_family
     untestable = pairing.n_pairs == 0
@@ -299,6 +343,7 @@ def run_contrast(
         equivalent=equivalent,
         conclusion=conclude(significant, equivalent, untestable),
         minimum_detectable_effect=mde,
+        ratio=spec.ratio,
     )
 
 

@@ -13,10 +13,17 @@ An estimator may also register its p-value as a function of many studies' cluste
 params) -> p-values`. The minimum detectable effect is then simulated with that function and the contrast's own
 parameters, not with a stand-in test (S06, S09). It must return for each study exactly the p-value the estimator
 reports for those differences; an estimator that registers none has no such simulation.
+
+Each estimator reads one form of contrast (`FORMS`), declared when it is registered: "difference" (the default),
+whose input holds the mean differences A - B of one outcome per cluster and model, or "ratio" (S13), whose input
+holds one log ratio of sums per cluster in a single column, `POOLED` (see `expcore.stats.ratio`). A contrast whose
+form is not its estimator's is refused, so neither can be handed the other's input. `ratio` is the second estimator
+registered.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -28,6 +35,8 @@ import numpy as np
 from expcore.stats import contrasts as kernel
 
 _NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
+FORMS = ("difference", "ratio")  # the form of contrast an estimator reads
+POOLED = "pooled"  # the one column of a ratio contrast's input: a cluster's sums pool its models
 
 
 @dataclass(frozen=True)
@@ -122,6 +131,7 @@ class _Entry:
     function: Estimator
     check_params: Callable[[Mapping[str, Any]], None]
     p_values: PValuesFunction | None = None
+    form: str = "difference"
 
 
 _REGISTRY: dict[str, _Entry] = {}
@@ -138,20 +148,24 @@ def register(
     *,
     check_params: Callable[[Mapping[str, Any]], None] | None = None,
     p_values: PValuesFunction | None = None,
+    form: str = "difference",
 ):
     """Register the decorated function under `name`.
 
     `check_params` raises ParamError for a bad parameter table. `p_values`, when given, is the estimator's p-value
     for a whole (studies x clusters) array of cluster differences under a parameter table; row by row it must equal
-    the p-value the estimator itself reports for those differences.
+    the p-value the estimator itself reports for those differences. `form` is the form of contrast it reads, one of
+    `FORMS`.
     """
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"estimator name {name!r} must be lower-case letters, digits and underscores")
+    if form not in FORMS:
+        raise ValueError(f"estimator {name!r}: form must be one of {', '.join(map(repr, FORMS))}, got {form!r}")
 
     def decorate(function: Estimator) -> Estimator:
         if name in _REGISTRY:
             raise ValueError(f"estimator {name!r} is already registered")
-        _REGISTRY[name] = _Entry(function, check_params or _no_params, p_values)
+        _REGISTRY[name] = _Entry(function, check_params or _no_params, p_values, form)
         return function
 
     return decorate
@@ -167,6 +181,12 @@ def get(name: str) -> Estimator:
     if name not in _REGISTRY:
         raise UnknownEstimator(f"unknown estimator {name!r}; registered: {', '.join(_REGISTRY) or 'none'}")
     return _REGISTRY[name].function
+
+
+def form(name: str) -> str:
+    """The form of contrast the estimator `name` reads, one of `FORMS`; raise UnknownEstimator for an unknown name."""
+    get(name)
+    return _REGISTRY[name].form
 
 
 def check_params(name: str, params: Mapping[str, Any]) -> None:
@@ -190,14 +210,25 @@ def p_values_function(name: str, params: Mapping[str, Any]) -> Callable[[np.ndar
 
 
 WILCOXON = "wilcoxon_cluster_bootstrap"
+RATIO = "ratio"
 _WILCOXON_DEFAULTS: dict[str, Any] = {"snap_decimals": kernel.DEFAULT_SNAP_DECIMALS, "method": "auto"}
 
 
 def _check_wilcoxon_params(params: Mapping[str, Any]) -> None:
-    """Accept `snap_decimals` (an integer from 1 to 15) and `method` (auto, exact or approx)."""
+    """The parameters of the Wilcoxon cluster bootstrap."""
+    _kernel_params(WILCOXON, params)
+
+
+def _check_ratio_params(params: Mapping[str, Any]) -> None:
+    """The parameters of the ratio estimator: the kernel's, as the Wilcoxon cluster bootstrap takes them."""
+    _kernel_params(RATIO, params)
+
+
+def _kernel_params(name: str, params: Mapping[str, Any]) -> None:
+    """Accept `snap_decimals` (an integer from 1 to 15) and `method` (auto, exact or approx), naming `name`."""
     for key, value in params.items():
         if key not in _WILCOXON_DEFAULTS:
-            raise ParamError(key, f"is not a parameter of {WILCOXON}; known: {', '.join(_WILCOXON_DEFAULTS)}")
+            raise ParamError(key, f"is not a parameter of {name}; known: {', '.join(_WILCOXON_DEFAULTS)}")
         if key == "snap_decimals" and (isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 15):
             raise ParamError(key, "must be an integer from 1 to 15")
         if key == "method" and value not in kernel.WILCOXON_METHODS:
@@ -228,6 +259,13 @@ def wilcoxon_cluster_bootstrap(paired: PairedDifferences, settings: EstimatorSet
     """
     params = {**_WILCOXON_DEFAULTS, **settings.params}
     _check_wilcoxon_params(params)
+    return _signed_rank_cluster_bootstrap(paired, settings, params)
+
+
+def _signed_rank_cluster_bootstrap(
+    paired: PairedDifferences, settings: EstimatorSettings, params: Mapping[str, Any]
+) -> EstimatorResult:
+    """The kernel's test and interval of the cluster differences, each model's interval from the same draws."""
     if not paired.clusters:
         return _undefined()
     boot = kernel.cluster_bootstrap(paired.matrix, settings.replicates, np.random.default_rng(list(settings.seed)))
@@ -251,3 +289,28 @@ def wilcoxon_cluster_bootstrap(paired: PairedDifferences, settings: EstimatorSet
         per_model=tuple(per_model),
         counts={"zero_dropped": kernel.zeros_dropped(differences, decimals)},
     )
+
+
+@register(RATIO, check_params=_check_ratio_params, p_values=_wilcoxon_p_values, form="ratio")
+def ratio(paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult:
+    """A ratio contrast's estimate, test and interval, on the log scale (S13; the estimand is in `expcore.stats.ratio`).
+
+    The input is one log ratio of ratios of sums per cluster, ln((N_A / D_A) / (N_B / D_B)), in the one column
+    `POOLED`. The zero rule has already excluded or corrected every cluster with a zero sum, so each value is finite.
+    The estimate is their mean, theta, a natural-log ratio: exp(theta) is the geometric mean over clusters of arm A's
+    ratio over arm B's. The p-value is the two-sided Wilcoxon signed-rank test of the cluster log ratios after float
+    noise is snapped, with zero log ratios (clusters whose arms have one ratio) dropped and counted (`zero_dropped`)
+    and all-zero input giving p = 1 (S01, S03); it assumes independent clusters whose log ratios are symmetric about
+    their centre, and tests that centre. The interval is the cluster bootstrap's percentile interval: clusters drawn
+    with replacement, the mean log ratio of each draw (S04, S05). One cluster gives an estimate, a point interval and
+    p = 1. Its parameters are the Wilcoxon cluster bootstrap's. There is no estimate by model, since each cluster's
+    sums pool its models.
+    """
+    params = {**_WILCOXON_DEFAULTS, **settings.params}
+    _check_ratio_params(params)
+    if paired.clusters and paired.models != (POOLED,):
+        raise ValueError(
+            f"the ratio estimator reads one log ratio per cluster, in the one column of the pooled models "
+            f"({POOLED!r}); got the columns {', '.join(map(repr, paired.models))}"
+        )
+    return dataclasses.replace(_signed_rank_cluster_bootstrap(paired, settings, params), per_model=())

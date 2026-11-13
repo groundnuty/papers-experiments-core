@@ -83,6 +83,29 @@ MISSING_PAIRS = [
     "- *Outcome None (other)*: both runs analysed, and the outcome is None on an ordinary run only.",
 ]
 
+RATIO_MISSING_PAIRS = [  # after MISSING_PAIRS, only in a report with a ratio contrast (S13)
+    "- *Numerator None at denominator 0*: a run of a ratio contrast has no numerator and a denominator of 0, a failed "
+    "run whose cost was not measured; a confirmatory contrast with any is refused.",
+    "- *Zero denominator*: the pair is in a cluster whose denominator sums to 0 in either arm, which the "
+    'preregistration excludes (`zero_denominator = "exclude"`).',
+    "- *Zero numerator*: the pair is in a cluster whose numerator sums to 0 in either arm, excluded by the same rule.",
+    "- `-`: a cause that does not apply: a contrast of one outcome has none of the three above.",
+]
+
+RATIO_NOTES = [
+    "A ratio contrast compares arm A's numerator per unit of denominator with arm B's, such as the cost per correct",
+    "result. In each cluster, each arm's numerator and denominator are summed over its used pairs (every task, model",
+    "and seed of the cluster together), and a run whose denominator is 0, a failure, still adds its numerator. The",
+    "cluster's value is the natural log of A's ratio over B's, ln((N_A / D_A) / (N_B / D_B)). The estimate, the",
+    "intervals, the margin and the minimum detectable effect in the contrast tables are on that log scale, and the",
+    "test is the signed-rank test of the clusters' log ratios. Ratio (A / B) is exp of the estimate, the geometric",
+    "mean over clusters of A's ratio over B's, and Ratio interval is exp of the interval. Zero total is the",
+    "preregistered rule for a cluster whose numerator or denominator sums to 0 in either arm, whose log ratio is",
+    "undefined or infinite: `exclude` (the cluster is excluded from the contrast, and its pairs are counted by",
+    "cause in the pairs tables) or `continuity correction c` (c is added to both sums of both arms in every",
+    "cluster, which keeps every cluster and pulls each log ratio toward 0).",
+]
+
 CONDITION_NOTES = [
     "Planned runs are analysed, exhausted (charged infrastructure attempts reached the limit; no scored attempt),",
     "unfinished, or left out of a partial analysis. Attempts set aside are the condition's set-aside",

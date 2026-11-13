@@ -28,6 +28,15 @@ zeros included (S10, C23). A pair is every pairing key that a run of either arm 
   partial analysis, or not in the plan (a task one arm does not run).
 The absent runs come from the export (`AbsentRun`); without them every pair with one run analysed is
 `unpaired_or_left_out` and a pair with neither is not seen.
+
+A ratio contrast (S13, `ContrastSpec.ratio`) reads two outcomes of each run, a numerator and a denominator, and a run
+misses its outcome when either is None. Its used pairs are summed per cluster, every task, model and seed of it
+together, into one log ratio per cluster (`expcore.stats.ratio`). Its missing pairs have three more causes,
+`ratio.RATIO_CAUSES`, after the five above:
+- `numerator_none_at_zero`: no treatment attempt lost an outcome, and a run's numerator is None while its denominator
+  is 0, a failed run whose cost was not measured (an ordinary None otherwise is `outcome_none`);
+- `zero_denominator`, `zero_numerator`: the pair is in a cluster the declared rule excludes for a zero sum.
+A contrast of one outcome counts the five causes alone, so its outputs are what they were before ratio contrasts.
 """
 
 from __future__ import annotations
@@ -39,11 +48,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from expcore.stats import ratio
 from expcore.stats.estimators import PairedDifferences
+from expcore.stats.ratio import RatioForm
 from expcore.stats.rows import AbsentRun, Row
 
 TREATMENT_OUTCOMES = ("scored", "excluded")  # how a contrast declares its treatment attempts enter it
 MISSING_CAUSES = ("treatment_outcome_none", "treatment_excluded", "exhausted", "unpaired_or_left_out", "outcome_none")
+NONE_CAUSES = ("treatment_outcome_none", "outcome_none", "numerator_none_at_zero")  # pairs lost to a None outcome
 
 
 @dataclass(frozen=True)
@@ -55,7 +67,9 @@ class ContrastSpec:
     conclusion that the two arms are equivalent. `treatment_outcomes` says how treatment attempts enter the contrast:
     "scored" (the scorer returns values for them), "excluded" (every pair with one is left out) or None (undeclared).
     `max_unscored_treatment` is how many pairs a "scored" member of the Holm family may still lose to a treatment
-    attempt's None: 0 unless preregistered, for a rare genuine "could not be measured".
+    attempt's None: 0 unless preregistered, for a rare genuine "could not be measured". `ratio` makes it a ratio
+    contrast (S13): it compares `ratio.numerator` per unit of `ratio.denominator`, its `outcome` is the label of the
+    two (`RatioForm.label`), and its margin is a natural-log ratio.
     """
 
     name: str
@@ -68,9 +82,19 @@ class ContrastSpec:
     equivalence_margin: float | None = None
     treatment_outcomes: str | None = None
     max_unscored_treatment: int = 0
+    ratio: RatioForm | None = None
 
     def __post_init__(self) -> None:
-        """Require exactly one form, with two different arms, a positive finite margin and a known treatment word."""
+        """Require exactly one form, with two different arms, a positive finite margin and a known treatment word; a
+        ratio contrast's outcome is its form's label."""
+        if self.ratio is not None:
+            if not isinstance(self.ratio, RatioForm):
+                raise ValueError(f"contrast {self.name!r}: ratio must be a RatioForm, got {type(self.ratio).__name__}")
+            if self.outcome != self.ratio.label:
+                raise ValueError(
+                    f"contrast {self.name!r}: a ratio contrast's outcome must be {self.ratio.label!r}, its numerator "
+                    f"over its denominator, got {self.outcome!r}"
+                )
         margin = self.equivalence_margin
         number = isinstance(margin, int | float) and not isinstance(margin, bool)
         if margin is not None and not (number and math.isfinite(margin) and margin > 0):
@@ -106,11 +130,11 @@ class Pairing:
     differences: PairedDifferences
     n_pairs: int  # pairs used
     n_treatment_measured: int  # treatment attempts with a value, of keys both arms planned, paired or not
-    n_pairs_missing: int  # pairs lost because an outcome is missing on either side (both None causes); may overlap
+    n_pairs_missing: int  # pairs lost because an outcome is missing on either side (NONE_CAUSES); may overlap
     # n_unpaired, since a treatment attempt left None with no analysed partner counts in both
     n_unpaired: int  # run keys analysed in one arm only
     n_clusters_dropped: int  # clusters seen in either arm that were left without a pair
-    missing: Mapping[str, int]  # the pairs missing, by each cause of MISSING_CAUSES, zeros included
+    missing: Mapping[str, int]  # the pairs missing by each cause of MISSING_CAUSES (and RATIO_CAUSES), zeros included
     tasks_dropped: tuple[str, ...] = ()  # tasks with runs in one arm only, sorted
 
     @property
@@ -150,22 +174,45 @@ def _cluster(row: Row, spec: ContrastSpec, known: dict[str, str]) -> str:
     return cluster
 
 
-def _value(row: Row, spec: ContrastSpec) -> float | None:
-    """Return the row's outcome as a float, or None when it is missing; refuse anything that is not a number."""
-    if spec.outcome not in row.outcomes:
-        raise ValueError(f"contrast {spec.name!r}: {row.describe()} has no outcome {spec.outcome!r}")
-    value = row.outcomes[spec.outcome]
+Value = float | tuple[float, float]  # a run's outcome: one number, or a ratio contrast's (numerator, denominator)
+
+
+def _number(row: Row, spec: ContrastSpec, outcome: str) -> float | None:
+    """Return one outcome of the row as a float, or None when it is missing; refuse anything that is not a number."""
+    if outcome not in row.outcomes:
+        raise ValueError(f"contrast {spec.name!r}: {row.describe()} has no outcome {outcome!r}")
+    value = row.outcomes[outcome]
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
-        raise ValueError(
-            f"contrast {spec.name!r}: outcome {spec.outcome!r} of {row.describe()} must be a number or None"
-        )
+        raise ValueError(f"contrast {spec.name!r}: outcome {outcome!r} of {row.describe()} must be a number or None")
     if math.isnan(value):
         return None
     if math.isinf(value):
-        raise ValueError(f"contrast {spec.name!r}: outcome {spec.outcome!r} of {row.describe()} is infinite")
+        raise ValueError(f"contrast {spec.name!r}: outcome {outcome!r} of {row.describe()} is infinite")
     return float(value)
+
+
+def _value(row: Row, spec: ContrastSpec) -> Value | None:
+    """Return the row's outcome, or None when it is missing: its one number, or for a ratio contrast its numerator and
+    denominator, None when either is, each refused when negative."""
+    if spec.ratio is None:
+        return _number(row, spec, spec.outcome)
+    numerator, denominator = (_number(row, spec, name) for name in (spec.ratio.numerator, spec.ratio.denominator))
+    for name, part in ((spec.ratio.numerator, numerator), (spec.ratio.denominator, denominator)):
+        if part is not None and part < 0:
+            raise ValueError(
+                f"contrast {spec.name!r}: outcome {name!r} of {row.describe()} is negative; a ratio contrast sums "
+                "costs and counts, which never are"
+            )
+    return None if numerator is None or denominator is None else (numerator, denominator)
+
+
+def _failed_unmeasured(row: Row, spec: ContrastSpec) -> bool:
+    """A run of a ratio contrast whose denominator is 0 and whose numerator is None: a failed run's cost, unmeasured."""
+    if spec.ratio is None:
+        return False
+    return _number(row, spec, spec.ratio.numerator) is None and _number(row, spec, spec.ratio.denominator) == 0
 
 
 def _absent_by_arm(
@@ -186,15 +233,21 @@ def _absent_by_arm(
     return reasons
 
 
-def _paired_cause(row_a: Row, row_b: Row, spec: ContrastSpec) -> tuple[str | None, float]:
-    """For a key both arms analysed: the cause it is missing for, or None and the difference A - B when it is used."""
+def _paired_cause(row_a: Row, row_b: Row, spec: ContrastSpec) -> str | tuple[Value, Value]:
+    """For a key both arms analysed: the cause it is missing for, or the two runs' values when it is used.
+
+    A treatment attempt's None comes first, then a ratio contrast's failed run with no numerator, then any other None.
+    """
     value_a, value_b = _value(row_a, spec), _value(row_b, spec)  # read first, so a bad value is refused either way
     if spec.treatment_outcomes == "excluded" and (row_a.treatment or row_b.treatment):
-        return "treatment_excluded", math.nan
+        return "treatment_excluded"
     if value_a is None or value_b is None:
-        treated = (value_a is None and row_a.treatment) or (value_b is None and row_b.treatment)
-        return ("treatment_outcome_none" if treated else "outcome_none"), math.nan
-    return None, value_a - value_b
+        if (value_a is None and row_a.treatment) or (value_b is None and row_b.treatment):
+            return "treatment_outcome_none"
+        if _failed_unmeasured(row_a, spec) or _failed_unmeasured(row_b, spec):
+            return "numerator_none_at_zero"
+        return "outcome_none"
+    return value_a, value_b
 
 
 def _planned_treatments(rows: tuple[Row | None, Row | None], reasons: tuple[str | None, str | None]) -> list[Row]:
@@ -218,8 +271,12 @@ def _unpaired_cause(
     return "exhausted" if "exhausted" in reasons else "unpaired_or_left_out"
 
 
-def _aggregate(cells: Mapping[tuple[str, str, str], list[float]]) -> PairedDifferences:
-    """Plain means in stages: the pairs of a (cluster, model, task) cell, then the tasks of a (cluster, model)."""
+def _aggregate(used: list[tuple[Row, tuple[Value, Value]]], cluster_of_task: Mapping[str, str]) -> PairedDifferences:
+    """Plain means in stages: the differences A - B of a (cluster, model, task) cell, then the tasks of a (cluster,
+    model)."""
+    cells: dict[tuple[str, str, str], list[float]] = {}
+    for row, (value_a, value_b) in used:
+        cells.setdefault((cluster_of_task[row.task], row.model, row.task), []).append(value_a - value_b)
     per_cell: dict[tuple[str, str], list[float]] = {}
     for (cluster, model, _task), differences in sorted(cells.items()):
         per_cell.setdefault((cluster, model), []).append(float(np.mean(differences)))
@@ -231,8 +288,20 @@ def _aggregate(cells: Mapping[tuple[str, str, str], list[float]]) -> PairedDiffe
     return PairedDifferences(tuple(clusters), tuple(models), matrix)
 
 
+def _ratio_input(
+    used: list[tuple[Row, tuple[Value, Value]]], cluster_of_task: Mapping[str, str], form: RatioForm
+) -> tuple[PairedDifferences, dict[str, int]]:
+    """A ratio contrast's input: the used pairs of each cluster, every model's together, summed into one log ratio
+    under the declared rule (`ratio.aggregate`); and the pairs the rule excluded, by cause."""
+    cells: dict[str, list[tuple[ratio.Totals, ratio.Totals]]] = {}
+    for row, values in used:
+        cells.setdefault(cluster_of_task[row.task], []).append(values)
+    return ratio.aggregate(cells, form)
+
+
 def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRun] = ()) -> Pairing:
-    """Pair the rows of the contrast's two arms and aggregate the differences A - B per cluster and model.
+    """Pair the rows of the contrast's two arms and aggregate the differences A - B per cluster and model, or for a
+    ratio contrast the log ratio of each cluster's sums.
 
     `absent` are the planned runs with no analysed attempt; they say why a pair is missing and nothing else.
     """
@@ -252,28 +321,30 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
         arms[arm][key] = row
     first, second = arms
     reasons = _absent_by_arm(absent, spec, arms)
-    missing = dict.fromkeys(MISSING_CAUSES, 0)
-    cells: dict[tuple[str, str, str], list[float]] = {}  # (cluster, model, task) -> pair differences
-    paired, used, measured = first.keys() & second.keys(), 0, 0
+    missing = dict.fromkeys(MISSING_CAUSES + (ratio.RATIO_CAUSES if spec.ratio is not None else ()), 0)
+    used_pairs: list[tuple[Row, tuple[Value, Value]]] = []
+    paired, measured = first.keys() & second.keys(), 0
     for key in sorted(paired):
-        cause, difference = _paired_cause(first[key], second[key], spec)
+        outcome = _paired_cause(first[key], second[key], spec)
         measured += sum(r.treatment and _value(r, spec) is not None for r in (first[key], second[key]))
-        if cause is not None:
-            missing[cause] += 1
+        if isinstance(outcome, str):
+            missing[outcome] += 1
             continue
-        used += 1
-        row = first[key]
-        cells.setdefault((cluster_of_task[row.task], row.model, row.task), []).append(difference)
+        used_pairs.append((first[key], outcome))
     for key in (first.keys() | second.keys() | reasons[0].keys() | reasons[1].keys()) - paired:
         held, why = (first.get(key), second.get(key)), (reasons[0].get(key), reasons[1].get(key))
         missing[_unpaired_cause(held, why, spec)] += 1
         measured += sum(_value(row, spec) is not None for row in _planned_treatments(held, why))
-    differences = _aggregate(cells)
+    if spec.ratio is None:
+        differences = _aggregate(used_pairs, cluster_of_task)
+    else:
+        differences, excluded = _ratio_input(used_pairs, cluster_of_task, spec.ratio)
+        missing.update(excluded)
     return Pairing(
         differences=differences,
-        n_pairs=used,
+        n_pairs=len(used_pairs) - sum(missing.get(cause, 0) for cause in ("zero_denominator", "zero_numerator")),
         n_treatment_measured=measured,
-        n_pairs_missing=missing["treatment_outcome_none"] + missing["outcome_none"],
+        n_pairs_missing=sum(missing.get(cause, 0) for cause in NONE_CAUSES),
         n_unpaired=len(first.keys() ^ second.keys()),
         n_clusters_dropped=len(seen) - len(differences.clusters),
         missing=missing,

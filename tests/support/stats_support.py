@@ -1,6 +1,7 @@
 """Row and contrast builders shared by the statistics tests; every name here is invented for the tests."""
 
 from expcore.stats.pairing import ContrastSpec
+from expcore.stats.ratio import RatioForm
 from expcore.stats.rows import Row
 
 
@@ -27,3 +28,24 @@ def both_arms(task, model, seed, a, b, *, cluster="grp-a", **kwargs):
         make_row(task, model, seed, a, condition="cond-a", cluster=cluster, **kwargs),
         make_row(task, model, seed, b, condition="cond-b", cluster=cluster, **kwargs),
     ]
+
+
+def ratio_row(task, model, seed, spend, wins, *, condition="cond-a", cluster="grp-a", treatment=False):
+    """A row with the two outcomes of a ratio contrast: `spend` (the numerator) and `wins` (the denominator)."""
+    factors = {"task": task, "model": model, "seed": seed}
+    run_key = "|".join(f"{name}={value}" for name, value in [*factors.items(), ("condition", condition)])
+    return Row(run_key, condition, factors, {"spend": spend, "wins": wins}, {"group": cluster}, treatment)
+
+
+def ratio_arms(task, model, seed, a, b, *, cluster="grp-a"):
+    """Two rows for one pair of a ratio contrast: `a` and `b` are each arm's (spend, wins)."""
+    return [
+        ratio_row(task, model, seed, *a, condition="cond-a", cluster=cluster),
+        ratio_row(task, model, seed, *b, condition="cond-b", cluster=cluster),
+    ]
+
+
+def ratio_spec(name="spend-per-win", *, zero="exclude", correction=None, estimator="ratio", **declared):
+    """A ratio contrast of spend over wins between cond-a and cond-b, clustered by `group`."""
+    form = RatioForm("spend", "wins", zero, correction)
+    return ContrastSpec(name, form.label, estimator, "group", conditions=("cond-a", "cond-b"), ratio=form, **declared)

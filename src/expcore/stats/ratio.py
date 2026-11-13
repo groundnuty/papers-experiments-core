@@ -1,0 +1,143 @@
+# Provenance: new
+"""The ratio form of a contrast: an outcome per unit of another, such as tokens per correct result (S13).
+
+A ratio contrast names a numerator outcome and a denominator outcome in place of one outcome. Its estimand is the
+mean over clusters of the cluster's log ratio of ratios of sums,
+
+    theta = mean over clusters c of  ln( (N_cA / D_cA) / (N_cB / D_cB) ),
+
+where N_ca and D_ca are the sums of the numerator and of the denominator over every run of arm a in cluster c that
+belongs to a used pair (every task, model and seed of the cluster together). It is a ratio of sums, not a mean of
+per-run ratios: a run whose denominator is 0 (a failed run, with no correct result) has no ratio of its own, and its
+numerator still counts toward its arm's sum. exp(theta) is the geometric mean over clusters of how many times arm A's
+numerator per unit of denominator is arm B's, so the log scale makes "x2" and "x1/2" symmetric thresholds. The
+cluster's value pools its models: a model with no correct result in a cluster still adds its cost there, where a
+value per model would have none to give, so the input is one column per cluster (`POOLED`). The inference on theta is
+the statistics kernel's, on these per-cluster log ratios (see `estimators.ratio`).
+
+A cluster whose sum is 0 in either arm has an undefined (0 / 0, x / 0) or infinite (ln 0) log ratio. It is never set
+to 0 or an infinity and never dropped silently: the preregistration declares one rule, `zero_denominator`,
+- "exclude": the cluster leaves this contrast, and each of its pairs is counted under its cause, `zero_denominator`
+  (a denominator sum of 0 in either arm, checked first) or `zero_numerator` (a numerator sum of 0 in either arm);
+- "continuity": a declared `continuity_correction` c > 0 is added to all four sums of every cluster, a zero or not,
+  so theta becomes the mean of ln( ((N_cA + c) / (D_cA + c)) / ((N_cB + c) / (D_cB + c)) ). It is one fixed
+  transformation of the data, not a choice made after seeing a zero, and it shrinks every log ratio toward 0, more
+  for small sums: c is in each outcome's own units.
+The same rule covers a zero numerator sum, whose log ratio is minus infinity.
+
+A pair lost because a run's numerator is None while its denominator is 0 is counted under `numerator_none_at_zero`:
+a failed run's cost left unmeasured makes the ratio one over successful runs alone, which is what it exists to avoid.
+The analysis refuses a confirmatory contrast that has any (`analysis.RatioNumeratorRefused`).
+"""
+
+from __future__ import annotations
+
+import math
+import numbers
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from fractions import Fraction
+
+import numpy as np
+
+from expcore.stats.estimators import POOLED, PairedDifferences
+
+ZERO_RULES = ("exclude", "continuity")  # what a cluster with a zero sum does, as the preregistration declares
+RATIO_CAUSES = ("numerator_none_at_zero", "zero_denominator", "zero_numerator")  # the missing causes it adds
+__all__ = ["POOLED", "RATIO_CAUSES", "ZERO_RULES", "RatioForm", "Totals", "aggregate", "log_ratio"]
+
+Totals = tuple[float, float]  # (numerator, denominator) of one run, or the sums of an arm in a cluster
+
+
+@dataclass(frozen=True)
+class RatioForm:
+    """What a ratio contrast compares: `numerator` per unit of `denominator`, and its declared rule for a zero sum.
+
+    `continuity_correction` is given with `zero_denominator = "continuity"` and only then.
+    """
+
+    numerator: str
+    denominator: str
+    zero_denominator: str
+    continuity_correction: float | None = None
+
+    def __post_init__(self) -> None:
+        """Require two different named outcomes, a declared rule, and a positive finite correction with its rule."""
+        for role in ("numerator", "denominator"):
+            value = getattr(self, role)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"a ratio contrast's {role} must name an outcome, got {value!r}")
+        if self.numerator == self.denominator:
+            raise ValueError(
+                f"a ratio's numerator and denominator must be two different outcomes, got {self.numerator!r}"
+            )
+        if self.zero_denominator not in ZERO_RULES:
+            raise ValueError(
+                f"zero_denominator must be one of {', '.join(map(repr, ZERO_RULES))}, got {self.zero_denominator!r}"
+            )
+        correction = self.continuity_correction
+        if self.zero_denominator != "continuity":
+            if correction is not None:
+                raise ValueError('continuity_correction is declared only with zero_denominator = "continuity"')
+            return
+        if correction is None:
+            raise ValueError('zero_denominator = "continuity" needs a continuity_correction')
+        number = isinstance(correction, numbers.Real) and not isinstance(correction, bool)
+        if not (number and math.isfinite(correction) and correction > 0):
+            raise ValueError(f"continuity_correction must be a positive finite number, got {correction!r}")
+
+    @property
+    def label(self) -> str:
+        """The contrast's outcome as tables show it: numerator over denominator."""
+        return f"{self.numerator}/{self.denominator}"
+
+    @property
+    def correction(self) -> float:
+        """The constant added to every sum: the declared correction, or 0 when zero sums are excluded."""
+        return float(self.continuity_correction) if self.zero_denominator == "continuity" else 0.0
+
+
+def log_ratio(arm_a: Totals, arm_b: Totals, form: RatioForm) -> tuple[str | None, float]:
+    """One cluster's value from its arms' sums: (None, ln of the ratio of ratios), or (cause, NaN) when the rule
+    excludes it.
+
+    The arithmetic is exact (rationals) up to the logarithm, so arms with one ratio give 0.0 exactly, never float noise
+    a rank test would rank, and no product or quotient of sums can overflow on the way.
+    """
+    c = Fraction(form.correction)
+    (na, da), (nb, db) = ((Fraction(n) + c, Fraction(d) + c) for n, d in (arm_a, arm_b))
+    if da == 0 or db == 0:
+        return "zero_denominator", math.nan
+    if na == 0 or nb == 0:
+        return "zero_numerator", math.nan
+    ratio = (na * db) / (da * nb)
+    return None, math.log(ratio.numerator) - math.log(ratio.denominator)
+
+
+def _sums(pairs: Sequence[tuple[Totals, Totals]]) -> tuple[Totals, Totals]:
+    """Each arm's exact sums over the pairs, whatever their order."""
+    columns = list(zip(*(a + b for a, b in pairs), strict=True))
+    na, da, nb, db = (math.fsum(column) for column in columns)
+    return (na, da), (nb, db)
+
+
+def aggregate(
+    cells: Mapping[str, Sequence[tuple[Totals, Totals]]], form: RatioForm
+) -> tuple[PairedDifferences, dict[str, int]]:
+    """The input of a ratio contrast's estimator, and the pairs the rule excluded by cause.
+
+    `cells` maps a cluster to its used pairs, each the (numerator, denominator) of the run of arm A and of arm B. A
+    cluster the rule excludes is not a row, and its pairs are counted; the one column is `POOLED`.
+    """
+    excluded = {"zero_denominator": 0, "zero_numerator": 0}
+    values: dict[str, float] = {}
+    for cluster, pairs in sorted(cells.items()):
+        cause, value = log_ratio(*_sums(pairs), form)
+        if cause is not None:
+            excluded[cause] += len(pairs)
+        else:
+            values[cluster] = value
+    if not values:
+        return PairedDifferences((), (), np.empty((0, 0))), excluded
+    clusters = tuple(values)
+    return PairedDifferences(clusters, (POOLED,), np.array([[values[c]] for c in clusters])), excluded

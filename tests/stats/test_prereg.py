@@ -11,6 +11,7 @@ from expcore.stats.pairing import ContrastSpec
 from expcore.stats.power import PowerSettings
 from expcore.stats.prereg import BootstrapSettings, Preregistration, parse
 from expcore.stats.prereg import load as load_checked
+from expcore.stats.ratio import RatioForm
 
 SCHEMA = FactorSchema(
     {"gate": ["open", "shut"]},
@@ -478,3 +479,77 @@ def test_the_target_power_is_a_setting_with_a_default(tmp_path):
     assert prereg.power.target_power == 0.9
     with pytest.raises(ConfigError, match="key 'target_power' must be strictly between 0 and 1"):
         load(write(tmp_path, edited("sd_grid = [0.1, 0.2]", "sd_grid = [0.1, 0.2]\ntarget_power = 1.0")))
+
+
+# --- a ratio contrast: a numerator and a denominator in place of an outcome, and a declared zero rule -----------------
+
+RATIO = """
+[contrasts.spend-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+"""
+
+
+def with_ratio(old="", new=""):
+    """The base text with the ratio contrast above appended, one exact piece of it replaced."""
+    contrast = RATIO if not old else edited(old, new, RATIO)
+    return BASE + contrast
+
+
+def test_s13_a_ratio_contrast_loads_with_its_two_outcomes_and_its_declared_zero_rule(tmp_path):
+    """S13: its outcome is the label numerator/denominator, and its form holds the rule as written."""
+    spec = load(write(tmp_path, with_ratio())).contrasts["spend-per-win"]
+    assert spec.ratio == RatioForm("spend", "wins", "exclude", None)
+    assert (spec.outcome, spec.estimator) == ("spend/wins", "ratio")
+
+
+def test_s13_a_ratio_contrast_may_declare_a_continuity_correction_in_place_of_exclusion(tmp_path):
+    """S13: the other rule, with the constant added to every cell's totals."""
+    text = with_ratio('zero_denominator = "exclude"', 'zero_denominator = "continuity"\ncontinuity_correction = 0.5')
+    assert load(write(tmp_path, text)).contrasts["spend-per-win"].ratio == RatioForm("spend", "wins", "continuity", 0.5)
+
+
+def test_s13_a_ratio_contrast_without_a_zero_rule_is_refused_naming_the_two_rules(tmp_path):
+    """S13: an undefined ratio is never handled by a default; the preregistration chooses."""
+    with pytest.raises(
+        ConfigError, match=r"\[contrasts.spend-per-win\]: key 'zero_denominator' is required.*'exclude'"
+    ):
+        load(write(tmp_path, with_ratio('zero_denominator = "exclude"\n', "")))
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "message"),
+    [
+        ('zero_denominator = "exclude"', 'zero_denominator = "drop"', "zero_denominator", "one of 'exclude'"),
+        ('zero_denominator = "exclude"', 'zero_denominator = "continuity"', "continuity_correction", "required"),
+        ('"exclude"', '"exclude"\ncontinuity_correction = 0.5', "continuity_correction", '"continuity"'),
+        ('"exclude"', '"continuity"\ncontinuity_correction = 0', "continuity_correction", "positive"),
+        ('"exclude"', '"continuity"\ncontinuity_correction = true', "continuity_correction", "number"),
+        ('denominator = "wins"', 'denominator = "spend"', "denominator", "two different outcomes"),
+        ('denominator = "wins"\n', "", "denominator", "is required"),
+        ('numerator = "spend"\n', 'outcome = "spend"\n', "outcome", "numerator and denominator"),
+    ],
+)
+def test_s13_a_ratio_contrast_that_is_not_fully_declared_is_refused_naming_the_key(tmp_path, old, new, key, message):
+    """S13: every key of the ratio form is checked where it is written."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_ratio(old, new)))
+
+
+@pytest.mark.parametrize("key", ["numerator", "denominator", "zero_denominator", "continuity_correction"])
+def test_s13_a_ratio_key_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
+    """S13: a difference estimator reads one outcome, so a numerator beside it would be silently ignored."""
+    text = edited('outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n',
+                  f'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n{key} = "spend"\n')  # fmt: skip
+    with pytest.raises(ConfigError, match=rf"\[contrasts.a-vs-b\]: key '{key}' belongs to a ratio contrast"):
+        load(write(tmp_path, text))
+
+
+def test_s13_a_ratio_contrast_may_declare_an_equivalence_margin_on_the_log_scale(tmp_path):
+    """S13: its margin, like its estimate, is a natural-log ratio (ln 1.25 for a quarter either way)."""
+    text = with_ratio('cluster = "group"', 'cluster = "group"\nequivalence_margin = 0.2231')
+    assert load(write(tmp_path, text)).contrasts["spend-per-win"].equivalence_margin == 0.2231

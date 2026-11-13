@@ -48,6 +48,14 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     outcome = "score"
     estimator = "wilcoxon_cluster_bootstrap"
     cluster = "group"
+
+    [contrasts.cost-per-success]   # a ratio contrast (S13): an estimator of the ratio form, two outcomes, a zero rule
+    conditions = ["cond-a", "cond-b"]
+    estimator = "ratio"
+    numerator = "tokens"       # in place of `outcome`
+    denominator = "success"
+    zero_denominator = "exclude"   # or "continuity", with `continuity_correction = 0.5` (required with it, only with it)
+    cluster = "group"
 """
 
 from __future__ import annotations
@@ -67,11 +75,13 @@ from expcore.stats import estimators
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
 from expcore.stats.pairing import TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
+from expcore.stats.ratio import ZERO_RULES, RatioForm
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
 DEFAULT_TARGET_POWER = 0.8
 _TOP_KEYS = ("alpha", "holm_family", "exploratory_only", "bootstrap", "power", "estimators", "contrasts")
+_RATIO_KEYS = ("numerator", "denominator", "zero_denominator", "continuity_correction")  # a ratio contrast's (S13)
 _CONTRAST_KEYS = (
     "conditions",
     "factor",
@@ -82,6 +92,7 @@ _CONTRAST_KEYS = (
     "equivalence_margin",
     "treatment_outcomes",
     "max_unscored_treatment",
+    *_RATIO_KEYS,
 )
 
 
@@ -364,20 +375,59 @@ def _max_unscored(section: Section, treatment: str | None) -> int:
     return value
 
 
+def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
+    """Read a ratio contrast's numerator, denominator and zero rule (S13); refuse them beside an estimator of one
+    outcome, and an outcome beside an estimator of the ratio form."""
+    if estimators.form(estimator) != "ratio":
+        for key in _RATIO_KEYS:
+            if key in section.data:
+                raise section.fail(
+                    key, f"belongs to a ratio contrast, and estimator {estimator!r} reads one outcome, its `outcome`"
+                )
+        return None
+    if "outcome" in section.data:
+        raise section.fail(
+            "outcome", f"is not read by estimator {estimator!r}, a ratio: name its numerator and denominator instead"
+        )
+    numerator, denominator = section.string("numerator"), section.string("denominator")
+    if numerator == denominator:
+        raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+    rule = section.data.get("zero_denominator")
+    if rule is None:
+        raise section.fail(
+            "zero_denominator",
+            f"is required: a ratio contrast declares what a cluster with a zero sum does, one of "
+            f"{', '.join(map(repr, ZERO_RULES))}",
+        )
+    if rule not in ZERO_RULES:
+        raise section.fail("zero_denominator", f"must be one of {', '.join(map(repr, ZERO_RULES))}, got {rule!r}")
+    correction = None
+    if rule == "continuity":
+        correction = _number(section, "continuity_correction")
+        if correction <= 0:
+            raise section.fail("continuity_correction", f"must be a positive number, got {correction}")
+    elif "continuity_correction" in section.data:
+        raise section.fail("continuity_correction", 'is only for zero_denominator = "continuity"')
+    return RatioForm(numerator, denominator, rule, correction)
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
     section.reject_unknown(_CONTRAST_KEYS)
-    outcome, estimator, cluster = section.string("outcome"), section.string("estimator"), section.string("cluster")
+    estimator, cluster = section.string("estimator"), section.string("cluster")
     try:
         estimators.get(estimator)
     except UnknownEstimator as error:
         raise section.fail("estimator", str(error)) from None
+    form = _ratio_form(section, estimator)
+    outcome = section.string("outcome") if form is None else form.label
     treatment = _treatment_outcomes(section)
     declared = {
         "equivalence_margin": _margin(section, alpha),
         "treatment_outcomes": treatment,
         "max_unscored_treatment": _max_unscored(section, treatment),
+        "ratio": form,
     }
     if "conditions" in table:
         for extra in ("factor", "levels"):
