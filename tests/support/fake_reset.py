@@ -221,21 +221,11 @@ class FakeReset(FakeData):
         if self.transfer_list_body is not None:
             return httpx.Response(200, json=self.transfer_list_body)
 
-        def here(transfer: Transfer) -> bool:  # a job on a file since deleted is listed in the study space, as before
+        def here(tid: str, transfer: Transfer) -> bool:  # a job on a file since deleted is listed in the study space
             found = self.space_of(transfer.file_id)
             return found == space or (found is None and space == self.SPACE_ID)
 
-        ids = [
-            tid
-            for tid, t in self.transfers.items()
-            if here(t)
-            and self._view(tid, provider).get("state", t.state) == query["state"]
-            and self.listings > self.listing_lag.get(tid, 0)
-        ]
-        start = int(query.get("page_token") or "0")
-        end = start + int(query.get("limit", "100"))
-        token = str(end) if end <= len(ids) else None  # a full page gets a token, so an empty last page can follow
-        return httpx.Response(200, json={"transfers": ids[start:end], "nextPageToken": token})
+        return self._transfer_page(query, provider, here)
 
     def _finish(self, transfer: Transfer) -> None:
         """An eviction of a directory evicts every file under it; anything else ends as FakeData's does."""

@@ -326,3 +326,41 @@ def test_asked_for_a_path_a_file_answers_400_as_in_25_0_and_its_attributes_name_
     file_id = fake.add_file("study/data.bin", DATA)
     assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}", params={"attribute": "path"}).status_code == 400
     assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").json()["parent_id"] == fake.id_of("study")
+
+
+# -- the transfer listing's order (O32) ------------------------------------------------------------------------------
+
+
+def listed(fake: FakeData, state: str, limit: int, token: str | None = None) -> dict:
+    """One page of the space's transfer listing in one state, as alpha answers it."""
+    params = {"state": state, "limit": limit, **({"page_token": token} if token else {})}
+    return call(fake, ALPHA_ID, "GET", f"/spaces/{fake.SPACE_ID}/transfers", params=params).json()
+
+
+def test_o32_the_transfer_listing_is_newest_first_and_a_page_resumes_after_its_token():
+    """O32: as on the 25.0 build (op-worker f118ed9, transfer_links.erl:160-164), an ended job is listed by its finish
+    time and a waiting or ongoing one by its schedule time, the newest first, whatever order they were made in; a full
+    page's token resumes the listing right after the last job it gave, and a short page ends it."""
+    fake = make_federation(clock=Ticker().clock)
+    fake.add_file("study/data.bin", DATA)
+    middle = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=100, finished=300)
+    oldest = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=150, finished=200)
+    newest = fake.add_transfer("eviction", "study/data.bin", BETA_ID, scheduled=50, finished=400)
+    late = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=90, ended=False)
+    early = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=500, ended=False)
+    first = listed(fake, "ended", 2)
+    assert first["transfers"] == [newest, middle]
+    assert listed(fake, "ended", 2, first["nextPageToken"]) == {"transfers": [oldest], "nextPageToken": None}
+    assert listed(fake, "ongoing", 10)["transfers"] == [early, late]
+
+
+def test_o32_a_listing_time_puts_a_job_out_of_its_order_for_a_test_of_a_readers_check():
+    """O32: `listing_time` gives the time a job's listing key is built from in place of its record's, so a test can
+    list an old job ahead of newer ones while its record keeps its own finish time."""
+    fake = make_federation(clock=Ticker().clock)
+    fake.add_file("study/data.bin", DATA)
+    old = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=100, finished=100)
+    new = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=200, finished=200)
+    fake.listing_time[old] = 300
+    assert listed(fake, "ended", 10)["transfers"] == [old, new]
+    assert call(fake, ALPHA_ID, "GET", f"/transfers/{old}").json()["finishTime"] == 100
