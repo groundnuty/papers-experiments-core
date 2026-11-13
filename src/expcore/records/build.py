@@ -182,6 +182,29 @@ def target_table(treatment_targets: Mapping[str, str] | None, kinds: Collection[
     return targets
 
 
+def capped_totals(
+    reserved_capped: bool | None,
+    reply_cap_unheld: bool | None,
+    schema_version: str = CURRENT,
+    schemas: Sequence[SchemaVersion] = SCHEMAS,
+) -> dict[str, bool]:
+    """Return the optional totals that say whether the attempt was held to the reservation R (C27), the ones the run
+    supplied, in the order the schema lists them.
+
+    `reserved_capped` is the bound the budget gate reserved the run by (True: the reply maximum, False: the window) and
+    `reply_cap_unheld` whether the campaign had taken the model off the reply maximum when the loop ended. None is
+    "no gate decided it": the field is left out, never written as a null. Refuse a value that is not a boolean, and one
+    for a version that predates the fields, which would be dropped without a word.
+    """
+    given = {"reserved_capped": reserved_capped, "reply_cap_unheld": reply_cap_unheld}
+    for name, value in given.items():
+        if value is not None and not isinstance(value, bool):
+            raise RecordError(f"totals.{name} is True, False or None, not {value!r}")
+        if value is not None and name not in fields_of("totals", schema_version, schemas):
+            raise RecordError(f"totals.{name}: {schema_version} predates the field")
+    return {name: value for name, value in given.items() if value is not None}
+
+
 def tool_entry(spec: ToolSpec) -> dict[str, Any]:
     """Return a tool spec as the record keeps it: as the provider gave it, before the cap sentence is added."""
     return {
@@ -336,6 +359,8 @@ def _build_record(
     models: ModelTable | None = None,
     environ: Mapping[str, str] | None = None,
     instrument_refusal: Mapping[str, Any] | None = None,
+    reserved_capped: bool | None = None,
+    reply_cap_unheld: bool | None = None,
 ) -> RunRecord:
     """Build the record of a finished attempt from the loop's result and the recording wrapper it ran through.
 
@@ -349,6 +374,9 @@ def _build_record(
     final attempt, not set aside. `treatment_targets` map a declared kind to the target the condition manipulates
     (`FactorSchema.treatment_targets`): a failure of that kind is treatment only if it names that target and the fault
     injector's reading among `instruments` records the target as injected in this attempt.
+
+    `reserved_capped` and `reply_cap_unheld` are the two optional totals that say whether the attempt was held to the
+    reservation R (`capped_totals`); None leaves one out, and a replay serves back what the record holds.
 
     The record is written as `schema_version`, and its outcome's treatment flag follows the rules of that version in
     `schemas`. Private: only a replay of an older record (its own version) and tests building older records choose a
@@ -430,6 +458,7 @@ def _build_record(
             "cleanup_timed_out": result.cleanup_timed_out,
             "abandoned_threads": result.abandoned_threads,
             "final_text": result.final_text,
+            **capped_totals(reserved_capped, reply_cap_unheld, schema_version, schemas),
         },
         "instruments": plain(dict(instruments or {})),
         "scores": {},
@@ -455,8 +484,8 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
 
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run. The
     keyword options are those of `_build_record` (`identity`, `system`, `user`, `specs`, `code`, `core_version`,
-    `instruments`, `instrument_refusal`, `treatment_kinds`, `treatment_targets`, `redactor`, `secrets`, `secret_env`,
-    `models`, `environ`); `schema_version` is refused.
+    `instruments`, `instrument_refusal`, `treatment_kinds`, `treatment_targets`, `reserved_capped`, `reply_cap_unheld`,
+    `redactor`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("build_record writes the current record version; a live run cannot choose another")
@@ -500,6 +529,8 @@ async def _record_attempt(
     environ: Mapping[str, str] | None = None,
     defect_log: DefectSink | None = None,
     on_sink_failure: Callable[[Exception], object] | None = None,
+    reserved_capped: bool | None = None,
+    reply_cap_unheld: Callable[[], bool | None] | None = None,
 ) -> RunRecord:
     """Run one attempt through the loop, recording it as `schema_version`, and return its record.
 
@@ -522,6 +553,11 @@ async def _record_attempt(
     crash, so a traceback in it is redacted with these secrets too, and each crash the loop turns into a harness defect.
     What the sink raises is handed to `on_sink_failure` once the record is built (`record_run` passes the attempt's
     log, which reports it once the result is stored), or, with no one to hand it to, warned of.
+
+    `reserved_capped` is the bound the budget gate reserved the run by, known when it was admitted; `reply_cap_unheld`
+    is read when the loop has ended, in a worker thread, since the campaign's mark of a model that is not held to the
+    reply maximum can change while the attempt runs. Both come from the request (`record_run`), and None leaves a total
+    out (C27).
     """
     secrets, secret_env = tuple(secrets), tuple(secret_env)  # read once: the early check would use up an iterator
 
@@ -546,6 +582,7 @@ async def _record_attempt(
         sleep=sleep,
         on_defect=defect_log,
     )
+    unheld = None if reply_cap_unheld is None else await asyncio.to_thread(reply_cap_unheld)
     record = _build_record(
         result,
         recording,
@@ -562,6 +599,8 @@ async def _record_attempt(
         secret_env=secret_env,
         models=models,
         environ=environ,
+        reserved_capped=reserved_capped,
+        reply_cap_unheld=unheld,
     )
     if result.sink_failure is not None:  # the record exists: now the sink's failure can be reported
         if on_sink_failure is None:
@@ -585,7 +624,7 @@ async def record_attempt(
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run.
     The keyword options are those of the private `_record_attempt` (`code`, `core_version`, `treatment_kinds`,
     `treatment_targets`, `timer`, `clock`, `sleep`, `secrets`, `secret_env`, `models`, `environ`, `defect_log`,
-    `on_sink_failure`); `schema_version` is refused.
+    `on_sink_failure`, `reserved_capped`, `reply_cap_unheld`); `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("record_attempt writes the current record version; a live run cannot choose another")

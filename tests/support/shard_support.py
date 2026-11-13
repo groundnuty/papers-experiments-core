@@ -34,6 +34,17 @@ IDENTITY = {
 
 UNIT_CAPS = ("alpha-stub = 1", "beta-stub = 1")
 
+MERGED_ONLY = ("shard_retries_by_kind", "shards")
+"""The top-level keys only a merged batch's export has, in their order at its end (C29): each shard's own
+`retries_by_kind` rows tagged with the shard, which one driver has no shards to break down by, and merge.json's list."""
+
+MERGE_TIMES = ("wall_s", "turn_latency_s")
+"""What a merged export adds to each analysed entry (C29, `study.merged_times`): the attempt's wall time from its
+shard's snapshot and its turns' latencies from its record. One driver's export has neither, and both are clock readings
+no two drivers share; tests/study/test_merge.py checks them against the store and the record they come from."""
+
+SHARD_SECTION = "## Shards"  # the report's section only a merged batch has (C29), after the conditions
+
 
 def make_study(base: Path, name: str, extra: str = "", declare: Sequence[str] = ()) -> Path:
     """A stamped copy of the example whose unit caps (1 each) are 2, which two shards can share one of each, with
@@ -164,3 +175,12 @@ def merge_into(env: dict[str, str], target: Campaign, *shards: Campaign | Path) 
 def json_meta(campaign: Campaign, key: str) -> object:
     """One JSON row of a finished shard's store meta, parsed."""
     return json.loads(meta_of(campaign)[key])
+
+
+def without_shard_section(report: str) -> str:
+    """A merged batch's report without its `## Shards` section, from that heading up to the next `## ` one or the end:
+    the one section only a merged batch's report has. Refuses a report without it."""
+    head, heading, rest = report.partition(f"\n{SHARD_SECTION}\n")
+    assert heading, "the report has no shards section"
+    _, boundary, tail = rest.partition("\n## ")
+    return head + boundary + tail
