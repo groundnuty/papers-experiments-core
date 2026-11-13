@@ -1,4 +1,4 @@
-"""O37: a direct mount on the in-memory host: its storages bound into the sidecar alone, and a start handed out only
+"""O40: a direct mount on the in-memory host: its storages bound into the sidecar alone, and a start handed out only
 once the check shows direct I/O in effect (the probe in the agent, then the sidecar's log)."""
 
 import dataclasses
@@ -69,8 +69,8 @@ def start(world, **spec):
                                **start_options(world))  # fmt: skip
 
 
-def test_o37_a_direct_mount_starts_once_its_check_shows_direct_io_and_records_it_without_an_id(direct):
-    """O37: the probe runs in the agent, after the read-only checks, and then the sidecar's log is read; the record
+def test_o40_a_direct_mount_starts_once_its_check_shows_direct_io_and_records_it_without_an_id(direct):
+    """O40: the probe runs in the agent, after the read-only checks, and then the sidecar's log is read; the record
     keeps the mode, the number of storages and the check's facts, the check file's storage by its position, and no
     storage id, host path or check file path (O12)."""
     sbx = start(direct)
@@ -91,8 +91,8 @@ def test_o37_a_direct_mount_starts_once_its_check_shows_direct_io_and_records_it
     sbx.stop()
 
 
-def test_o37_the_probe_runs_in_the_agent_on_the_check_file_and_the_log_is_read_in_the_sidecar(direct, monkeypatch):
-    """O37: the probe is a cell of the agent's on the check file under the agent's mount path; the log is oneclient's
+def test_o40_the_probe_runs_in_the_agent_on_the_check_file_and_the_log_is_read_in_the_sidecar(direct, monkeypatch):
+    """O40: the probe is a cell of the agent's on the check file under the agent's mount path; the log is oneclient's
     INFO log in its log directory, read in the sidecar, where the agent has no access."""
     probed = []
     monkeypatch.setattr(D, "probe_source", lambda path, *a: probed.append(path) or f"# {D.PROBE_MARK}\n")
@@ -105,8 +105,8 @@ def test_o37_the_probe_runs_in_the_agent_on_the_check_file_and_the_log_is_read_i
     sbx.stop()
 
 
-def test_o37_a_direct_mount_records_the_study_extra_arguments_by_name_and_hash_as_a_proxy_one_does(direct):
-    """O37, O36, O12: the study's extra arguments are recorded by name and hash in a direct mount as in a proxy one."""
+def test_o40_a_direct_mount_records_the_study_extra_arguments_by_name_and_hash_as_a_proxy_one_does(direct):
+    """O40, O36, O12: the study's extra arguments are recorded by name and hash in a direct mount as in a proxy one."""
     import hashlib
 
     extra = ("--provider-timeout", "45", "--read-buffer-max-size=4096")
@@ -121,8 +121,8 @@ def test_o37_a_direct_mount_records_the_study_extra_arguments_by_name_and_hash_a
     sbx.stop()
 
 
-def test_o37_each_storage_is_bound_into_the_sidecar_alone_and_never_into_the_agent(direct):
-    """O37: the sidecar has each storage's host directory, read-only, at its place; the agent's container has none of
+def test_o40_each_storage_is_bound_into_the_sidecar_alone_and_never_into_the_agent(direct):
+    """O40: the sidecar has each storage's host directory, read-only, at its place; the agent's container has none of
     them, in any argument (the agent and the services may share a uid on HPC, so the path must not be there at all)."""
     sbx = start(direct)
     sidecar, agent = direct.host.containers[sbx.names.sidecar], direct.host.containers[sbx.names.agent]
@@ -150,8 +150,8 @@ def test_o37_each_storage_is_bound_into_the_sidecar_alone_and_never_into_the_age
         (lambda d: setattr(d, "probe", {"read": None, "error": "ENOENT"}), "ENOENT"),
     ],
 )
-def test_o37_a_start_whose_check_does_not_show_direct_io_is_refused_and_leaves_nothing(direct, change, words):
-    """O37: a fallback to the provider, start lines that do not say forced direct, an unreadable log, a partial read,
+def test_o40_a_start_whose_check_does_not_show_direct_io_is_refused_and_leaves_nothing(direct, change, words):
+    """O40: a fallback to the provider, start lines that do not say forced direct, an unreadable log, a partial read,
     a file the local provider does not hold in full or one of an unmapped storage: the sandbox is never handed out,
     and what the start made is torn down."""
     change(direct.direct)
@@ -164,8 +164,8 @@ def test_o37_a_start_whose_check_does_not_show_direct_io_is_refused_and_leaves_n
     assert not direct.host.mounts
 
 
-def test_o37_a_direct_run_whose_log_stays_clean_is_collected_and_records_it(direct, tmp_path):
-    """O37: at collection the sidecar's log is read again; with no detection or fallback line since the start, the
+def test_o40_a_direct_run_whose_log_stays_clean_is_collected_and_records_it(direct, tmp_path):
+    """O40: at collection the sidecar's log is read again; with no detection or fallback line since the start, the
     run is collected and its record says so (`mount.direct.during_run`, the names of the lines found: none)."""
     sbx = start(direct)
     sbx.collect(tmp_path / "evidence")
@@ -181,8 +181,8 @@ def test_o37_a_direct_run_whose_log_stays_clean_is_collected_and_records_it(dire
         (lambda d: setattr(d, "log_readable", False), "could not be read"),
     ],
 )
-def test_o37_a_direct_run_that_read_through_the_provider_is_set_aside_at_collection(direct, tmp_path, change, words):
-    """O37: a file of the study's data whose direct read is refused for permissions falls back to the provider after
+def test_o40_a_direct_run_that_read_through_the_provider_is_set_aside_at_collection(direct, tmp_path, change, words):
+    """O40: a file of the study's data whose direct read is refused for permissions falls back to the provider after
     the start's check passed (`fsLogic.cc`, `readInternal`); the run then did not read directly, so its collection
     fails as the harness's (`output_collection`) and it is never scored as a direct run. An unreadable log is the
     same: unknown is never direct."""
@@ -197,8 +197,8 @@ def test_o37_a_direct_run_that_read_through_the_provider_is_set_aside_at_collect
     sbx.stop()
 
 
-def test_o37_the_lines_of_a_direct_mount_can_be_read_at_any_time_and_none_means_unknown(direct):
-    """O37: `direct_io_lines` gives the names of the marker lines the sidecar's log holds now, for a harness that checks
+def test_o40_the_lines_of_a_direct_mount_can_be_read_at_any_time_and_none_means_unknown(direct):
+    """O40: `direct_io_lines` gives the names of the marker lines the sidecar's log holds now, for a harness that checks
     a pass after its reads, and None when the log could not be read."""
     sbx = start(direct)
     assert sbx.direct_io_lines() == []
@@ -209,8 +209,8 @@ def test_o37_the_lines_of_a_direct_mount_can_be_read_at_any_time_and_none_means_
     sbx.stop()
 
 
-def test_o37_a_proxy_mount_runs_no_direct_check(world):
-    """O37: proxy reads through the provider; the start reads no oneclient log and runs no probe of a check file."""
+def test_o40_a_proxy_mount_runs_no_direct_check(world):
+    """O40: proxy reads through the provider; the start reads no oneclient log and runs no probe of a check file."""
     handled = []
     default = world.host.exec_handler
     world.host.exec_handler = lambda c, argv, stdin: handled.append(stdin or "") or default(c, argv, stdin)
@@ -220,8 +220,8 @@ def test_o37_a_proxy_mount_runs_no_direct_check(world):
     sbx.stop()
 
 
-def test_o37_a_storage_directory_that_is_not_on_the_host_refuses_the_start_before_anything_exists(direct, tmp_path):
-    """O37: `--mount` would refuse it at the sidecar's start; the start refuses first, by the entry's position."""
+def test_o40_a_storage_directory_that_is_not_on_the_host_refuses_the_start_before_anything_exists(direct, tmp_path):
+    """O40: `--mount` would refuse it at the sidecar's start; the start refuses first, by the entry's position."""
     missing = str(tmp_path / "not-there")
     mount = dataclasses.replace(direct.s.mount, storages=((STORAGE_IDS[0], missing),))
     direct.s = dataclasses.replace(direct.s, mount=mount)
@@ -232,8 +232,8 @@ def test_o37_a_storage_directory_that_is_not_on_the_host_refuses_the_start_befor
 
 
 @pytest.mark.parametrize("where", ["inside", "same", "around"])
-def test_o37_a_read_only_input_from_a_storage_directory_is_refused(direct, tmp_path, where):
-    """O37: an input is copied into the run and bound into the agent, so one taken from a provider's storage would put
+def test_o40_a_read_only_input_from_a_storage_directory_is_refused(direct, tmp_path, where):
+    """O40: an input is copied into the run and bound into the agent, so one taken from a provider's storage would put
     the storage's files in the agent's container: refused, by the input's position, whatever the nesting."""
     storage = Path(direct.storage_paths[0])
     (storage / "sub").mkdir()

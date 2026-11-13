@@ -790,7 +790,7 @@ def test_o36_the_metadata_records_the_io_mode_the_mount_runs_with_and_the_option
 
 def test_o36_the_study_extra_arguments_are_recorded_only_by_name_and_hash(world):
     """O36: the study's extra arguments are recorded by their option names and the SHA-256 of the whole list, never by
-    value (a value may be a path or an identifier, O12). A direct mount's record: test_sandbox_direct (O37)."""
+    value (a value may be a path or an identifier, O12). A direct mount's record: test_sandbox_direct (O40)."""
     from dataclasses import replace
 
     extra = ("--provider-timeout", "45", "--log-dir=/somewhere/private", "-l/attached/private")

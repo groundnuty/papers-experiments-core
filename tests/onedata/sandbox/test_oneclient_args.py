@@ -122,16 +122,16 @@ def test_o36_settings_built_in_code_need_a_known_io_mode(mode):
 @pytest.mark.parametrize(
     "argument", ["--override", "--override=abc:mountPoint:/x", "--overr", "-r", "-rabc:mountPoint:/x", "-fr"]
 )
-def test_o37_a_storage_override_in_any_spelling_is_refused_as_an_extra_argument(argument):
-    """O37: an override changes where the POSIX helper reads (`--override <storage>:mountPoint:<path>`), so only the
+def test_o40_a_storage_override_in_any_spelling_is_refused_as_an_extra_argument(argument):
+    """O40: an override changes where the POSIX helper reads (`--override <storage>:mountPoint:<path>`), so only the
     declared storage mapping sets one, in either mode."""
     assert "[sandbox.mount.storages]" in extra_arg_problem(argument)
     assert "[sandbox.mount.storages]" in mount_problem("proxy", (argument,))
 
 
 @pytest.mark.parametrize("argument", ["--disable-log-buffering", "--disable-log", "--disable-log-buffering=1"])
-def test_o37_the_log_buffering_switch_is_the_cores_own_with_direct_io_and_a_studys_with_proxy(argument):
-    """O37: with direct I/O the sidecar passes `--disable-log-buffering`, so the start check reads every line the test
+def test_o40_the_log_buffering_switch_is_the_cores_own_with_direct_io_and_a_studys_with_proxy(argument):
+    """O40: with direct I/O the sidecar passes `--disable-log-buffering`, so the start check reads every line the test
     read wrote (glog holds INFO lines up to 30 s otherwise); a second one would make oneclient refuse to start."""
     storages, check = (("0123abcd", "/srv/a"),), "space/f"
     assert "direct" in mount_problem("direct", (argument,), storages, check)

@@ -1,4 +1,4 @@
-"""O37: the start-time check that a direct mount reads the local provider's storage itself, judged offline.
+"""O40: the start-time check that a direct mount reads the local provider's storage itself, judged offline.
 
 The check has two inputs: the probe the agent runs on the check file (its size, its storage, how much of it the local
 provider holds, and a read of the whole file within a deadline) and the sidecar's oneclient log after that read. A read
@@ -39,8 +39,8 @@ def judge(probe=PROBE, text=None, storages=STORAGES):
     return D.judge(probe, log() if text is None else text, storages)
 
 
-def test_o37_a_whole_read_of_a_held_file_with_forced_direct_and_no_other_line_is_direct():
-    """O37: forced direct on, forced proxy off, the file held in full by the local provider and on a mapped storage,
+def test_o40_a_whole_read_of_a_held_file_with_forced_direct_and_no_other_line_is_direct():
+    """O40: forced direct on, forced proxy off, the file held in full by the local provider and on a mapped storage,
     read whole, and no line of detection or fallback: direct I/O is in effect. The record names the storage by its
     position, never its id."""
     problems, record = judge()
@@ -52,8 +52,8 @@ def test_o37_a_whole_read_of_a_held_file_with_forced_direct_and_no_other_line_is
     assert STORAGES[1] not in json.dumps(record)
 
 
-def test_o37_a_read_that_fell_back_to_the_provider_is_refused_though_it_read_every_byte():
-    """O37: the false pass the log exists to catch: the read returned the whole file, through the provider."""
+def test_o40_a_read_that_fell_back_to_the_provider_is_refused_though_it_read_every_byte():
+    """O40: the false pass the log exists to catch: the read returned the whole file, through the provider."""
     problems, record = judge(text=log(tail=FALLBACK))
     assert record["read"] == record["size"]
     assert any("proxy_fallback" in p for p in problems)
@@ -78,22 +78,22 @@ def test_o37_a_read_that_fell_back_to_the_provider_is_refused_though_it_read_eve
          "no_storage_helper"),
     ],
 )  # fmt: skip
-def test_o37_each_line_that_shows_direct_io_not_in_effect_refuses_the_start_and_is_named(line, name):
-    """O37: every marker line refuses, named in the problem and in the record."""
+def test_o40_each_line_that_shows_direct_io_not_in_effect_refuses_the_start_and_is_named(line, name):
+    """O40: every marker line refuses, named in the problem and in the record."""
     problems, record = judge(text=log(tail=line + "\n"))
     assert any(name in p for p in problems)
     assert record["lines"] == [name]
 
 
 @pytest.mark.parametrize(("direct", "proxy"), [("0", "0"), ("0", "1"), ("1", "1")])
-def test_o37_start_lines_that_do_not_say_forced_direct_and_no_forced_proxy_refuse(direct, proxy):
-    """O37: the start lines must say forced direct and no forced proxy."""
+def test_o40_start_lines_that_do_not_say_forced_direct_and_no_forced_proxy_refuse(direct, proxy):
+    """O40: the start lines must say forced direct and no forced proxy."""
     problems, _ = judge(text=log(direct, proxy))
     assert any("Forced" in p for p in problems)
 
 
-def test_o37_a_log_without_its_start_lines_refuses():
-    """O37: an unread or empty log shows nothing, which is never taken for direct I/O."""
+def test_o40_a_log_without_its_start_lines_refuses():
+    """O40: an unread or empty log shows nothing, which is never taken for direct I/O."""
     problems, record = judge(text="")
     assert any("Forced direct IO" in p for p in problems)
     assert record["forced_direct"] is None
@@ -112,16 +112,16 @@ def test_o37_a_log_without_its_start_lines_refuses():
         ({}, "no answer"),
     ],
 )
-def test_o37_a_probe_that_did_not_read_a_held_file_of_a_mapped_storage_whole_refuses(probe, words):
-    """O37: the read must be the whole file, of a storage the mount maps, held in full by the local provider (a read
+def test_o40_a_probe_that_did_not_read_a_held_file_of_a_mapped_storage_whole_refuses(probe, words):
+    """O40: the read must be the whole file, of a storage the mount maps, held in full by the local provider (a read
     of a block it lacks would fetch and place it), within the deadline; a file that is empty proves nothing."""
     problems, _ = judge(probe=probe)
     assert any(words in p for p in problems), problems
     assert all("ffffffffffff" not in p for p in problems)
 
 
-def test_o37_the_probe_reads_nothing_of_a_file_the_local_provider_does_not_hold_in_full(tmp_path):
-    """O37: the probe asks the mount how much of the file the local provider holds before it reads, and reads nothing
+def test_o40_the_probe_reads_nothing_of_a_file_the_local_provider_does_not_hold_in_full(tmp_path):
+    """O40: the probe asks the mount how much of the file the local provider holds before it reads, and reads nothing
     when it is not all of it, so the check never places a block. Run here on a plain file whose attributes the stand-in
     answers."""
     found = run_probe(tmp_path, held="40%")
@@ -130,16 +130,16 @@ def test_o37_the_probe_reads_nothing_of_a_file_the_local_provider_does_not_hold_
     assert "read_error" not in found
 
 
-def test_o37_the_probe_reads_a_held_file_whole_and_reports_its_storage_size_and_seconds(tmp_path):
-    """O37: a file held in full is read whole, with its storage, size and seconds."""
+def test_o40_the_probe_reads_a_held_file_whole_and_reports_its_storage_size_and_seconds(tmp_path):
+    """O40: a file held in full is read whole, with its storage, size and seconds."""
     found = run_probe(tmp_path, held="100%")
     assert found == {**found, "size": 5000, "read": 5000, "held": "100%", "storage_id": STORAGES[0]}
     assert found["seconds"] >= 0
     assert "blocked" not in found
 
 
-def test_o37_the_probe_kills_a_read_that_does_not_return_by_its_deadline(tmp_path):
-    """O37: a wrong storage path makes oneclient retry an ENOENT for minutes before the application sees it; the probe
+def test_o40_the_probe_kills_a_read_that_does_not_return_by_its_deadline(tmp_path):
+    """O40: a wrong storage path makes oneclient retry an ENOENT for minutes before the application sees it; the probe
     gives up at its deadline and says so, and the start refuses (above)."""
     import os
 
@@ -171,8 +171,8 @@ def run_probe(tmp_path, *, held, path=None, size=5000, deadline_s=30):
     return json.loads(done.stdout.decode().strip().splitlines()[-1])
 
 
-def test_o37_the_core_passes_the_log_switch_the_check_relies_on():
-    """O37: glog buffers INFO lines for up to 30 s unless told not to (`logging.cc`, `disableLogBuffering`); the
+def test_o40_the_core_passes_the_log_switch_the_check_relies_on():
+    """O40: glog buffers INFO lines for up to 30 s unless told not to (`logging.cc`, `disableLogBuffering`); the
     detection line is INFO, so the check needs every line written as it is logged."""
     assert DISABLE_LOG_BUFFERING == "--disable-log-buffering"
     assert D.LOG_FILE == "oneclient.INFO"

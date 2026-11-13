@@ -1,5 +1,5 @@
 # Provenance: new
-"""The start-time check that a direct mount reads the local provider's storage itself (O37).
+"""The start-time check that a direct mount reads the local provider's storage itself (O40).
 
 A sandbox whose `[sandbox.mount] io_mode` is `"direct"` is handed out only once this check has shown direct I/O in
 effect; otherwise its start is refused, so a direct run never reads through the provider unnoticed. It has two inputs.

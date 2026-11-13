@@ -69,7 +69,7 @@ def sandbox_table(
     """The `[sandbox]` table of one mount level on the federation: `images` maps agent and oneclient to (name, id), and
     `extra_args` are further oneclient arguments (`[sandbox.mount] extra_args`, which refuses a TLS flag). The mount
     reads through the provider unless `io_mode` is `"direct"`, which takes `storages` (storage id -> the host directory
-    that holds it) and `direct_check_file` (`<space>/<path>`, a file the local provider holds in full; O37)."""
+    that holds it) and `direct_check_file` (`<space>/<path>`, a file the local provider holds in full; O40)."""
     mount: dict[str, Any] = {"path": MOUNT_PATH, "io_mode": io_mode}
     if storages is not None:
         mount["storages"] = dict(storages)

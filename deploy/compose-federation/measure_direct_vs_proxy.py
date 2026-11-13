@@ -1,5 +1,5 @@
 """Replay the same read sequences through the sandbox's mount under proxy I/O and under direct I/O, on the same files
-and from the same starting block state, and compare what each read places on the local provider (#223, O37).
+and from the same starting block state, and compare what each read places on the local provider (#223, O40).
 
     uv run python deploy/compose-federation/measure_direct_vs_proxy.py --sequences FILE --pool CIDR --out DIR \\
         --storage ID [--storage-path PATH] [--platform PATH] [--oneclient-image REF] [--rounds N] [--control] \\

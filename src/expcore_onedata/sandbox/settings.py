@@ -51,7 +51,7 @@ io_mode = "proxy"               # required, no default: "proxy" or "direct" (O36
 extra_args = []                 # further oneclient arguments, never one that sets the TLS mode, the I/O mode, the
                                 # config file, a storage override or oneclient's environment
 direct_check_file = "space/f"   # "direct" only, and required with it: a space's directory under the mount, then a file
-                                # in it that the local provider holds in full; read at every start (O37)
+                                # in it that the local provider holds in full; read at every start (O40)
 [sandbox.mount.storages]        # "direct" only, and required with it: each storage the sidecar reads directly
 "<storage id>" = "/host/dir"    # the directory that holds it on the host, bound read-only into the sidecar alone
 
@@ -77,7 +77,7 @@ access type at the first read of each space, and for a second space on a storage
 plain mutex it already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`, the recursion at the end of
 its `!forceProxyIO` branch), so the read waits for ever and nothing is logged. `proxy` (`--force-proxy-io`) reads every
 space through the provider. `direct` (`--force-direct-io`) reads the local provider's storage itself, so it loads only
-with `[sandbox.mount.storages]` and `direct_check_file`, which a proxy mount may not have (O37): each mapped storage is
+with `[sandbox.mount.storages]` and `direct_check_file`, which a proxy mount may not have (O40): each mapped storage is
 bound read-only into the sidecar alone and named to oneclient by `--override <id>:mountPoint:<its place there>`, and
 the start reads the check file and the sidecar's log to show direct I/O in effect, or refuses the sandbox
 (`directio`). A storage is named in a message by its position, never by its id or path, and none may be, hold or lie
@@ -206,7 +206,7 @@ class MountSettings:
     path: str
     io_mode: str  # "proxy" or "direct", declared, never left to oneclient's detection (O36)
     extra_args: tuple[str, ...] = ()
-    # direct I/O only (O37): (storage id, the directory that holds it on the host), in the file's order, by which a
+    # direct I/O only (O40): (storage id, the directory that holds it on the host), in the file's order, by which a
     # message or a record names one; bound read-only into the sidecar alone, each named to oneclient by an override
     # of its POSIX mount point
     storages: tuple[tuple[str, str], ...] = ()
@@ -215,7 +215,7 @@ class MountSettings:
     def __post_init__(self) -> None:
         """Settings built in code are held to what the loader holds a file to: a known mode, no extra argument that
         sets what the core declares (O36), and a direct mount's storage mapping and check file, which a proxy mount
-        may not have (O37). `ValueError`; the message never holds an argument, an id or a path."""
+        may not have (O40). `ValueError`; the message never holds an argument, an id or a path."""
         problem = mount_problem(self.io_mode, self.extra_args, self.storages, self.direct_check_file)
         if problem is not None:
             raise ValueError(problem)
@@ -371,7 +371,7 @@ def _served_caps(section: Section) -> Caps:
 
 
 def _storages(section: Section) -> tuple[tuple[str, str], ...] | None:
-    """Read [sandbox.mount.storages] (O37), in the file's order, or None when the mount declares none. Each entry is a
+    """Read [sandbox.mount.storages] (O40), in the file's order, or None when the mount declares none. Each entry is a
     configured id and path, so a message names it by its position and never echoes either (O12)."""
     if "storages" not in section.data:
         return None
@@ -385,7 +385,7 @@ def _storages(section: Section) -> tuple[tuple[str, str], ...] | None:
 
 def _mount(section: Section) -> MountSettings:
     """Read [sandbox.mount]: the path in the agent and the oneclient options; TLS is the platform's [tls]. A direct
-    mount also maps its storages and names its check file (O37), which a proxy mount may not."""
+    mount also maps its storages and names its check file (O40), which a proxy mount may not."""
     if "tls" in section.data:
         raise moved(section, "tls")
     section.reject_unknown(("path", "io_mode", "extra_args", "storages", "direct_check_file"))
@@ -408,7 +408,7 @@ def _mount(section: Section) -> MountSettings:
 
 
 def _storages_clear_of(section: Section, mount: MountSettings, work_root: Path) -> None:
-    """Refuse a storage whose directory is, holds or lies under the work root (O37): the sandbox makes, unmounts and
+    """Refuse a storage whose directory is, holds or lies under the work root (O40): the sandbox makes, unmounts and
     removes directories there, and the reaper removes what a killed run left, so a provider's files could go."""
     table = section.section("mount").section("storages") if mount.storages else None
     for position, (_, path) in enumerate(mount.storages):

@@ -1,5 +1,5 @@
 """The proxy-against-direct comparison of deploy/compose-federation/measure_direct_vs_proxy.py, checked without a
-federation (#223, O37): its passes in order, its comparison of what each read placed, its verdict, the platform
+federation (#223, O40): its passes in order, its comparison of what each read placed, its verdict, the platform
 tables it derives, and what its help says. The live run is the coordinator's."""
 
 import json
@@ -24,8 +24,8 @@ def replay(*gains, placed=None, ended=True, **read_fields):
     return {"reads": reads, "placed": every if placed is None else placed, "ended": ended}
 
 
-def test_o37_each_round_runs_both_modes_from_the_same_state_and_alternates_which_goes_first(script):
-    """O37: round 0 runs proxy then direct, round 1 direct then proxy, so an order effect does not pass for a mode's;
+def test_o40_each_round_runs_both_modes_from_the_same_state_and_alternates_which_goes_first(script):
+    """O40: round 0 runs proxy then direct, round 1 direct then proxy, so an order effect does not pass for a mode's;
     the control is a second proxy pass in each round, compared with the first: the noise floor."""
     plan = script.pass_plan(2, control=False)
     assert [(p["round"], p["mode"], p["label"]) for p in plan] == [
@@ -36,8 +36,8 @@ def test_o37_each_round_runs_both_modes_from_the_same_state_and_alternates_which
     assert with_control[-1]["mode"] == "proxy"
 
 
-def test_o37_reads_that_place_the_same_bytes_compare_the_same(script):
-    """O37: the same gains read by read, and the same placement at the end, are the same."""
+def test_o40_reads_that_place_the_same_bytes_compare_the_same(script):
+    """O40: the same gains read by read, and the same placement at the end, are the same."""
     base = {TAG: replay([(0, 1 << 20)], [(1 << 20, 1 << 20)])}
     other = {TAG: replay([(0, 1 << 20)], [(1 << 20, 1 << 20)])}
     [found] = script.compare(base, other)
@@ -47,8 +47,8 @@ def test_o37_reads_that_place_the_same_bytes_compare_the_same(script):
     assert found["placed_same"] is True
 
 
-def test_o37_a_read_that_placed_other_bytes_is_named_with_the_bytes_only_each_pass_placed(script):
-    """O37: compared read by read, never only in total: the second read placed 1 MiB under proxy and 4 MiB under
+def test_o40_a_read_that_placed_other_bytes_is_named_with_the_bytes_only_each_pass_placed(script):
+    """O40: compared read by read, never only in total: the second read placed 1 MiB under proxy and 4 MiB under
     direct, and the totals of a sequence could still agree when two reads trade bytes."""
     base = {TAG: replay([(0, 1 << 20)], [(1 << 20, 1 << 20)])}
     other = {TAG: replay([(0, 1 << 20)], [(1 << 20, 4 << 20)])}
@@ -61,8 +61,8 @@ def test_o37_a_read_that_placed_other_bytes_is_named_with_the_bytes_only_each_pa
     assert found["placed_only_other_bytes"] == 3 << 20
 
 
-def test_o37_equal_totals_with_reads_that_trade_bytes_are_a_difference(script):
-    """O37: two reads that trade bytes differ even when the sequence's total agrees."""
+def test_o40_equal_totals_with_reads_that_trade_bytes_are_a_difference(script):
+    """O40: two reads that trade bytes differ even when the sequence's total agrees."""
     base = {TAG: replay([(0, 2 << 20)], [])}
     other = {TAG: replay([(0, 1 << 20)], [(1 << 20, 1 << 20)])}
     [found] = script.compare(base, other)
@@ -82,16 +82,16 @@ def test_o37_equal_totals_with_reads_that_trade_bytes_are_a_difference(script):
         (None, replay([(0, 10)]), "missing in a pass"),
     ],
 )
-def test_o37_a_file_whose_replay_is_not_complete_in_both_passes_is_incomplete_never_the_same(script, base, other, why):
-    """O37: a failed read, a block map that never settled or a replay that never ended leaves the comparison unknown,
+def test_o40_a_file_whose_replay_is_not_complete_in_both_passes_is_incomplete_never_the_same(script, base, other, why):
+    """O40: a failed read, a block map that never settled or a replay that never ended leaves the comparison unknown,
     never `same`, and never a difference either."""
     [found] = script.compare({TAG: base} if base else {}, {TAG: other})
     assert found["incomplete"] == why
     assert found["same"] is None
 
 
-def test_o37_the_same_reads_with_a_different_final_placement_are_not_the_same(script):
-    """O37: each read gained the same, but a late prefetch placed more under one mode before the final read of the map:
+def test_o40_the_same_reads_with_a_different_final_placement_are_not_the_same(script):
+    """O40: each read gained the same, but a late prefetch placed more under one mode before the final read of the map:
     the sequence did not place the same bytes."""
     base = {TAG: replay([(0, 10)], placed=[[0, 10]])}
     other = {TAG: replay([(0, 10)], placed=[[0, 20]])}
@@ -101,8 +101,8 @@ def test_o37_the_same_reads_with_a_different_final_placement_are_not_the_same(sc
     assert found["same"] is False
 
 
-def test_o37_every_file_of_the_measurement_is_compared_even_when_both_passes_failed_to_start(script):
-    """O37: a round whose two passes both failed gives nothing to compare; its files are still each incomplete, so the
+def test_o40_every_file_of_the_measurement_is_compared_even_when_both_passes_failed_to_start(script):
+    """O40: a round whose two passes both failed gives nothing to compare; its files are still each incomplete, so the
     round can never vanish from the verdict and leave a yes."""
     found = script.compare({}, {}, [TAG, "pread-A"])
     assert [(f["file"], f["incomplete"]) for f in found] == [
@@ -113,8 +113,8 @@ def test_o37_every_file_of_the_measurement_is_compared_even_when_both_passes_fai
     assert script.verdict(good + script.compare({}, {}, [TAG]))["same_placed_bytes_per_read_sequence"] is None
 
 
-def test_o37_a_direct_pass_whose_reads_went_through_the_provider_is_incomplete_never_the_same(script):
-    """O37: a direct pass whose sidecar logged a fallback (or whose log could not be read) after its reads did not
+def test_o40_a_direct_pass_whose_reads_went_through_the_provider_is_incomplete_never_the_same(script):
+    """O40: a direct pass whose sidecar logged a fallback (or whose log could not be read) after its reads did not
     read directly, so its files compare as incomplete, never as the same placement."""
     base = {TAG: replay([(0, 10)])}
     other = {TAG: {**replay([(0, 10)]), "not_direct": ["proxy_fallback"]}}
@@ -123,8 +123,8 @@ def test_o37_a_direct_pass_whose_reads_went_through_the_provider_is_incomplete_n
     assert found["incomplete"] == "a direct pass did not read directly, or could not be shown to"
 
 
-def test_o37_the_verdict_is_yes_only_when_every_file_compared_and_none_differs(script):
-    """O37: unknown is never yes, and one difference is a no."""
+def test_o40_the_verdict_is_yes_only_when_every_file_compared_and_none_differs(script):
+    """O40: unknown is never yes, and one difference is a no."""
     same = {"file": "a", "same": True, "incomplete": None}
     differs = {"file": "b", "same": False, "incomplete": None}
     unknown = {"file": "c", "same": None, "incomplete": "a read failed or gave no answer"}
@@ -138,8 +138,8 @@ def test_o37_the_verdict_is_yes_only_when_every_file_compared_and_none_differs(s
     }  # fmt: skip
 
 
-def test_o37_a_storage_argument_is_an_id_with_an_optional_host_path(script, tmp_path):
-    """O37: the storage's id and host directory, the Compose layout's by default."""
+def test_o40_a_storage_argument_is_an_id_with_an_optional_host_path(script, tmp_path):
+    """O40: the storage's id and host directory, the Compose layout's by default."""
     platform = tmp_path / "platform.toml"
     assert script.storage_of("0a1b2c", None, platform, "oak") == ("0a1b2c", str(tmp_path / "oak" / "storage"))
     assert script.storage_of("0a1b2c", "/srv/other", platform, "oak") == ("0a1b2c", "/srv/other")
@@ -149,8 +149,8 @@ def test_o37_a_storage_argument_is_an_id_with_an_optional_host_path(script, tmp_
         script.storage_of("0a1b2c", "relative", platform, "oak")
 
 
-def test_o37_the_direct_pass_maps_the_storage_and_names_the_check_file_and_the_proxy_pass_neither(script):
-    """O37: each pass's mount keys fit its mode, as the loader requires."""
+def test_o40_the_direct_pass_maps_the_storage_and_names_the_check_file_and_the_proxy_pass_neither(script):
+    """O40: each pass's mount keys fit its mode, as the loader requires."""
     proxy = script.mount_keys("proxy", ("0a1b2c", "/srv/s"), "space/run/check.bin")
     direct = script.mount_keys("direct", ("0a1b2c", "/srv/s"), "space/run/check.bin")
     assert proxy == {"io_mode": "proxy"}
@@ -159,8 +159,8 @@ def test_o37_the_direct_pass_maps_the_storage_and_names_the_check_file_and_the_p
     }  # fmt: skip
 
 
-def test_o37_the_help_says_what_it_compares_and_what_it_changes(script, capsys):
-    """O37: the help names the comparison, the state it starts from and what it changes."""
+def test_o40_the_help_says_what_it_compares_and_what_it_changes(script, capsys):
+    """O40: the help names the comparison, the state it starts from and what it changes."""
     with pytest.raises(SystemExit) as stop:
         script.main(["--help"])
     assert stop.value.code == 0
@@ -177,8 +177,8 @@ def test_o37_the_help_says_what_it_compares_and_what_it_changes(script, capsys):
         assert words in shown, words
 
 
-def test_o37_the_comparison_lines_hold_numbers_and_tags_never_a_path(script):
-    """O37, O12: each line the comparison writes holds a tag, offsets, lengths and counts."""
+def test_o40_the_comparison_lines_hold_numbers_and_tags_never_a_path(script):
+    """O40, O12: each line the comparison writes holds a tag, offsets, lengths and counts."""
     base = {TAG: replay([(0, 10)])}
     other = {TAG: replay([(0, 20)])}
     text = json.dumps(script.compare(base, other))

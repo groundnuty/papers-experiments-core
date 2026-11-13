@@ -311,8 +311,8 @@ def test_o03_the_mount_live_test_puts_the_sidecar_on_the_federation_network_dial
 
 
 @needs_openssl
-def test_o37_a_direct_mount_table_for_the_federation_maps_the_local_providers_storage_and_loads(fed, tmp_path):
-    """O37: the comparison harness's direct pass derives the platform as the proxy one does, with the local provider's
+def test_o40_a_direct_mount_table_for_the_federation_maps_the_local_providers_storage_and_loads(fed, tmp_path):
+    """O40: the comparison harness's direct pass derives the platform as the proxy one does, with the local provider's
     storage (the Compose layout's directory of it) mapped and a check file named; the copy loads, and the federation's
     root gets nothing written beside the original."""
     from measure_direct_vs_proxy import mount_keys, storage_of

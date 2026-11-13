@@ -149,7 +149,7 @@ CHECK_FILE = "space-invented/checks/direct.bin"
 
 
 def with_io_mode(s, mode, **mount):
-    """The settings with the mount in `mode`; a direct one maps the invented storages and names a check file (O37)."""
+    """The settings with the mount in `mode`; a direct one maps the invented storages and names a check file (O40)."""
     direct = {"storages": STORAGES, "direct_check_file": CHECK_FILE} if mode == "direct" else {}
     return dataclasses.replace(s, mount=dataclasses.replace(s.mount, io_mode=mode, **(direct | mount)))
 
@@ -256,8 +256,8 @@ def test_o36_a_direct_mount_has_one_force_option_and_the_closed_inputs_of_a_prox
     assert unset_names(command) == ["ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG"]
 
 
-def test_o37_a_direct_mount_names_each_storage_to_oneclient_at_its_place_in_the_sidecar(s):
-    """O37: one `--override <storage id>:mountPoint:<path in the sidecar>` per mapped storage, in the file's order,
+def test_o40_a_direct_mount_names_each_storage_to_oneclient_at_its_place_in_the_sidecar(s):
+    """O40: one `--override <storage id>:mountPoint:<path in the sidecar>` per mapped storage, in the file's order,
     each at a path of its position (never the host's), after the sandbox's options and before the study's arguments,
     so the POSIX helper reads each storage where the sidecar has it and never scans the sidecar's mounts for it."""
     declared = with_io_mode(s, "direct", extra_args=("--provider-timeout", "30"))
@@ -272,8 +272,8 @@ def test_o37_a_direct_mount_names_each_storage_to_oneclient_at_its_place_in_the_
     assert not any("/srv/invented" in word for word in command)  # the host's path is the bind's alone
 
 
-def test_o37_o12_the_options_a_record_keeps_hold_no_storage_id_or_path(s):
-    """O37, O12: `sidecar_options` is what a run's metadata records; a storage id and a host path are configured
+def test_o40_o12_the_options_a_record_keeps_hold_no_storage_id_or_path(s):
+    """O40, O12: `sidecar_options` is what a run's metadata records; a storage id and a host path are configured
     values, so they are in the overrides and the binds alone."""
     options = C.sidecar_options(with_io_mode(s, "direct"))
     text = " ".join(options)
@@ -283,8 +283,8 @@ def test_o37_o12_the_options_a_record_keeps_hold_no_storage_id_or_path(s):
     assert "--override" not in options
 
 
-def test_o37_each_storage_is_bound_read_only_into_the_sidecar_at_its_place(s, names):
-    """O37: each mapped storage's host directory is a `--mount` bind, read-only, into the sidecar, at the path its
+def test_o40_each_storage_is_bound_read_only_into_the_sidecar_at_its_place(s, names):
+    """O40: each mapped storage's host directory is a `--mount` bind, read-only, into the sidecar, at the path its
     override names; `--mount` refuses a source that is not there, where `-v` would create it."""
     args = C.sidecar_run_args(
         with_io_mode(s, "direct"), names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
@@ -297,8 +297,8 @@ def test_o37_each_storage_is_bound_read_only_into_the_sidecar_at_its_place(s, na
     assert not any("/srv/invented" in v for f, v in pairs(args) if f == "-v")
 
 
-def test_o37_a_proxy_mount_binds_no_storage_and_passes_no_override_or_log_switch(s, names):
-    """O37: proxy reads through the provider: the sidecar gets no storage, and oneclient no override and no log
+def test_o40_a_proxy_mount_binds_no_storage_and_passes_no_override_or_log_switch(s, names):
+    """O40: proxy reads through the provider: the sidecar gets no storage, and oneclient no override and no log
     switch of the core's."""
     command = C.sidecar_command("p.test", s)
     assert "--override" not in command
@@ -307,8 +307,8 @@ def test_o37_a_proxy_mount_binds_no_storage_and_passes_no_override_or_log_switch
     assert not any(C.DIRECT_STORAGE_ROOT in word for word in args)
 
 
-def test_o37_the_agent_never_gets_a_storage_in_a_direct_mount(s, names):
-    """O37: the providers' storage is the sidecar's alone: the agent's container is given the mount's share and its
+def test_o40_the_agent_never_gets_a_storage_in_a_direct_mount(s, names):
+    """O40: the providers' storage is the sidecar's alone: the agent's container is given the mount's share and its
     inputs, and no argument of it names a storage's host directory or its place in the sidecar."""
     declared = with_io_mode(s, "direct")
     args, env = agent(declared, names, DataPathMode.MOUNT, share=Path("/w/mount"))
@@ -318,8 +318,8 @@ def test_o37_the_agent_never_gets_a_storage_in_a_direct_mount(s, names):
     assert "0a1b2c3d4e5f" not in text
 
 
-def test_o37_the_command_refuses_a_direct_mount_whose_mapping_was_removed_past_its_check(s):
-    """O37: a mount whose fields were set past its own check (`object.__setattr__`) still raises at the command, so a
+def test_o40_the_command_refuses_a_direct_mount_whose_mapping_was_removed_past_its_check(s):
+    """O40: a mount whose fields were set past its own check (`object.__setattr__`) still raises at the command, so a
     direct oneclient never starts with no storage, and a proxy one never with one."""
     mount = dataclasses.replace(with_io_mode(s, "direct").mount)
     object.__setattr__(mount, "storages", ())

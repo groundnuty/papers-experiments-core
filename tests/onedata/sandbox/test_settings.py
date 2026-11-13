@@ -180,8 +180,8 @@ def test_o36_a_declared_io_mode_is_read_as_declared(tmp_path):
     assert load(tmp_path, edit).mount.io_mode == "proxy"
 
 
-def test_o36_o37_direct_io_without_its_storage_mapping_is_refused_at_load(tmp_path):
-    """O36, O37: `io_mode = "direct"` reads the local provider's storage itself, so a mount without the storage
+def test_o36_o40_direct_io_without_its_storage_mapping_is_refused_at_load(tmp_path):
+    """O36, O40: `io_mode = "direct"` reads the local provider's storage itself, so a mount without the storage
     mapped into the sidecar would start and then could not read: the load refuses it, naming the key, what it needs
     and the mode that needs neither. With the mapping it loads (test_settings_direct)."""
 
@@ -389,7 +389,7 @@ def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
 
 def mount_fingerprint(tmp_path, mode):
     """The platform's half of the fingerprint with the mount declared as `mode`, a direct one with an invented storage
-    mapping and check file (O37)."""
+    mapping and check file (O40)."""
 
     def edit(data):
         add_sandbox(data)

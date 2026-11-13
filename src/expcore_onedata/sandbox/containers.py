@@ -49,7 +49,7 @@ SIDECAR_TOKEN_PATH = "/run/expcore/oneclient-token"  # the mount's token, bound 
 GATE_TOKEN_PATH = "/etc/gate/token"  # the REST path's token, bound into the gate alone, read-only; gate.json names it
 ENV_SSL_CERT_FILE = "SSL_CERT_FILE"  # OpenSSL's setting of the CA file its default verify paths load
 ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image's binary
-DIRECT_STORAGE_ROOT = "/mnt/expcore-storage"  # a direct mount's storages in the sidecar, one by position (O37)
+DIRECT_STORAGE_ROOT = "/mnt/expcore-storage"  # a direct mount's storages in the sidecar, one by position (O40)
 ONECLIENT_LOG_DIR = "/tmp/oneclient/0"  # where it writes its log unless told otherwise
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
@@ -147,7 +147,7 @@ class Names:
 
 
 def _checked_mount(settings: SandboxSettings) -> MountSettings:
-    """The mount, held again to what its loader and its constructor hold it to (O36, O37), whatever built it."""
+    """The mount, held again to what its loader and its constructor hold it to (O36, O40), whatever built it."""
     mount = settings.mount
     if mount is None:
         raise ValueError("a mount data path needs [sandbox.mount]")
@@ -159,7 +159,7 @@ def _checked_mount(settings: SandboxSettings) -> MountSettings:
 
 def sidecar_options(settings: SandboxSettings) -> list[str]:
     """The oneclient options the sandbox itself sets, in the order it passes them: the read-only mount options, the
-    mode's force-I/O option, `--config /dev/null`, with direct I/O `--disable-log-buffering` (O37), and `--insecure`
+    mode's force-I/O option, `--config /dev/null`, with direct I/O `--disable-log-buffering` (O40), and `--insecure`
     when the platform's `[tls]` says so. The study's `extra_args` are not here, nor the storage overrides of a direct
     mount (`direct_overrides`), which hold storage ids: these options are what a run's record keeps (O12).
 
@@ -179,13 +179,13 @@ def sidecar_options(settings: SandboxSettings) -> list[str]:
 
 
 def direct_storage_path(position: int) -> str:
-    """Where the sidecar has the mapped storage at `position` of `[sandbox.mount.storages]` (O37): a path of its
+    """Where the sidecar has the mapped storage at `position` of `[sandbox.mount.storages]` (O40): a path of its
     position, so neither the storage's id nor its host directory is in the sidecar's paths."""
     return f"{DIRECT_STORAGE_ROOT}/{position}"
 
 
 def direct_overrides(settings: SandboxSettings) -> list[str]:
-    """The `--override <storage id>:mountPoint:<path in the sidecar>` of each mapped storage, in the file's order (O37):
+    """The `--override <storage id>:mountPoint:<path in the sidecar>` of each mapped storage, in the file's order (O40):
     oneclient's POSIX helper then reads that storage under the path `storage_binds` binds it at, and never scans the
     sidecar's mounts for it (`helpersCache.h`, `performForcedDirectIOStorageDetection`, lines 666-683). None for a
     proxy mount."""
@@ -198,7 +198,7 @@ def direct_overrides(settings: SandboxSettings) -> list[str]:
 
 
 def storage_binds(settings: SandboxSettings) -> list[str]:
-    """The read-only bind of each mapped storage's host directory into the sidecar alone (O37), at the path its override
+    """The read-only bind of each mapped storage's host directory into the sidecar alone (O40), at the path its override
     names. `--mount` refuses a source that is not there, where `-v` would create it as root's empty directory; the
     loader refused a path with a character `--mount` reads as syntax. None for a proxy mount."""
     mount = _checked_mount(settings)
@@ -253,7 +253,7 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     and `--config /dev/null` means the image's own configuration file is never parsed. The token arrives in
     `ONECLIENT_ACCESS_TOKEN` (`SIDECAR_START`) and stays, so the effective options are this argv and the token.
 
-    A direct mount names each mapped storage's place in the sidecar to oneclient (`direct_overrides`, O37), after the
+    A direct mount names each mapped storage's place in the sidecar to oneclient (`direct_overrides`, O40), after the
     sandbox's options and before the study's arguments.
     """
     mount = _checked_mount(settings)
@@ -410,7 +410,7 @@ def sidecar_run_args(
     environment before it becomes `env` with `sidecar_command`'s arguments. An environment variable given to `docker
     run` (`-e NAME`) would be kept in the container's configuration, where `docker inspect` shows it.
 
-    A direct mount's storages are bound read-only into this container alone (`storage_binds`, O37); the agent's
+    A direct mount's storages are bound read-only into this container alone (`storage_binds`, O40); the agent's
     container never gets them (`agent_run_args`)."""
     lim = s.limits
     network, dialled = sidecar_route(s, provider_host)

@@ -1,12 +1,12 @@
 # Provenance: new
-"""What a study may pass to the sidecar's oneclient, and how a run's metadata names it (O36, O37).
+"""What a study may pass to the sidecar's oneclient, and how a run's metadata names it (O36, O40).
 
 The core declares everything oneclient would otherwise decide at run time: the I/O mode (`io_mode`), the TLS check (the
 platform's `[tls]`), the configuration file (never read: `--config /dev/null`), the environment (`env -u` of the
 three variables of the image and of oneclient's own that could set an option) and, for direct I/O, where each storage
 is (one `--override` per entry of `[sandbox.mount.storages]`) and the log's buffering. A study's `extra_args` reach the
 same argv, so none of them may set what the core sets. `mount_problem` also holds a mount's direct-I/O keys to its mode:
-a direct mount needs its storage mapping and its check file, a proxy mount may have neither (O37). `extra_arg_problem`
+a direct mount needs its storage mapping and its check file, a proxy mount may have neither (O40). `extra_arg_problem`
 names the reason an argument is refused, and the same check runs where the settings are built (`MountSettings`), where
 the platform file is loaded and where the command is made, so settings built in code cannot give oneclient two
 force-I/O options or a second configuration.
@@ -32,9 +32,9 @@ DIRECT = "direct"
 CONFIG_OPTION = "--config"
 CONFIG_NULL = "/dev/null"  # an empty file: boost's parser reads no option from it, so no configuration file is parsed
 INSECURE_OPTION = "--insecure"
-OVERRIDE_OPTION = "--override"  # `-r`: one helper parameter of one storage, `<storage id>:<name>:<value>` (O37)
+OVERRIDE_OPTION = "--override"  # `-r`: one helper parameter of one storage, `<storage id>:<name>:<value>` (O40)
 # With direct I/O the sidecar passes it, so glog writes each INFO line as it is logged and the start check sees every
-# line its test read caused (`logging.cc`: FLAGS_logbuflevel -1; otherwise INFO waits up to 30 s in a buffer, O37)
+# line its test read caused (`logging.cc`: FLAGS_logbuflevel -1; otherwise INFO waits up to 30 s in a buffer, O40)
 DISABLE_LOG_BUFFERING = "--disable-log-buffering"
 UNSET_ENV = ("ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG")  # removed from the sidecar's environment
 
@@ -198,7 +198,7 @@ def check_file_problem(value: object) -> bool:
 def direct_keys_problem(
     io_mode: object, storages: Sequence[tuple[object, object]] | None, check_file: object
 ) -> tuple[str, str] | None:
-    """The key and the reason of a mount whose direct-I/O keys do not fit its mode, or None (O37). `storages` is None
+    """The key and the reason of a mount whose direct-I/O keys do not fit its mode, or None (O40). `storages` is None
     when the mount declares no mapping; `check_file` is None when it declares no check file. With `"direct"` both are
     required and must be well formed; with `"proxy"` neither may be there."""
     if io_mode != DIRECT:
@@ -225,7 +225,7 @@ def mount_problem(
 ) -> str | None:
     """Why a mount's I/O mode, extra arguments and direct-I/O keys cannot be given to oneclient, or None: the mode is
     one of `IO_MODES`, no extra argument sets what the core declares, and a direct mount maps its storages and names
-    its check file, which a proxy mount does not (O36, O37). An empty `storages` is no mapping."""
+    its check file, which a proxy mount does not (O36, O40). An empty `storages` is no mapping."""
     if io_mode not in IO_MODES:
         return f"[sandbox.mount] io_mode must be one of: {', '.join(IO_MODES)}"
     for argument in extra_args:

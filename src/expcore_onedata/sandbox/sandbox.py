@@ -268,7 +268,7 @@ class DockerSandbox:
         self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
 
     def _require_storages(self) -> None:
-        """Each storage a direct mount maps must be a directory on this host before anything exists (O37): docker's
+        """Each storage a direct mount maps must be a directory on this host before anything exists (O40): docker's
         `--mount` would refuse it only once the sidecar starts. Named by its position, never by its id or path."""
         for position, (_, path) in enumerate(self.s.mount.storages):
             if not os.path.isdir(path):
@@ -713,7 +713,7 @@ class DockerSandbox:
         self._meta["read_only_verified"] = proved
 
     def _verify_direct_io(self) -> None:
-        """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O37,
+        """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O40,
         `directio`): the agent reads the check file whole, once the mount says the local provider holds all of it,
         then the sidecar's log must say forced direct, no forced proxy, and hold no line of detection or fallback."""
         mount = self.s.mount
@@ -734,12 +734,12 @@ class DockerSandbox:
 
     def direct_io_lines(self) -> list[str] | None:
         """The names of the lines of `directio.MARKERS` the sidecar's log holds now, or None when it could not be read
-        (O37): with a direct mount, any one of them means some read since the start did not go to the storage."""
+        (O40): with a direct mount, any one of them means some read since the start did not go to the storage."""
         text = self._read_sidecar_log()
         return None if text is None else directio.marker_lines(text)
 
     def _direct_io_held(self) -> None:
-        """At collection, show that every read of a direct run went to the storage itself, or set the run aside (O37). A
+        """At collection, show that every read of a direct run went to the storage itself, or set the run aside (O40). A
         file whose direct read is refused for permissions is read again through the provider (`fsLogic.cc`,
         `readInternal`), after the start's check passed, and the log is the only trace; an unreadable log is unknown,
         never direct. The record keeps the names of the lines found (`mount.direct.during_run`)."""
@@ -1138,7 +1138,7 @@ class DockerSandbox:
         metadata, for the study's scorers; the attempt's outcome is the loop's and the scorers'. A collection that fails
         for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
         that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash,
-        a direct mount whose log shows a read that did not go to the storage, or cannot be read: O37)
+        a direct mount whose log shows a read that did not go to the storage, or cannot be read: O40)
         raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
         is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection. A run a
         cell's deadline stopped, or left with a process that outlived its kill, raises `InfraError("cell_unkillable")`
