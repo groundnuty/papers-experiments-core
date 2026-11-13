@@ -22,10 +22,15 @@ treat (O05, C01). A cell a process of which outlived its kill at the cell's dead
 `cell_unkillable`, before anything else, which no condition can treat either (O34).
 
 What is kept of a cell's output is capped per stream by the sandbox (`cells.OUTPUT_CAP_BYTES`, O43). When it cut
-one, the text the model sees ends with a notice that says how much of each cut stream was written and how much kept,
-and the call's
-`source_truncated` is True, as for any source's own limit (L07, apart from the loop's own cap), so the agent's view and
-the record agree on what was truncated; the numbers are on the cell's record too (`output_cut`).
+one, the text this tool returns ends with a notice that says how much of each cut stream was written and how much kept,
+and the call's `source_truncated` is True, as for any source's own limit (L07, apart from the loop's own cap); the
+numbers are on the cell's record too (`output_cut`).
+
+The loop's cap (`output_cap_chars`, L06) then applies to that whole text, the notice included, and the order is fixed:
+the sandbox cuts first, this tool adds its notice, and the loop cuts last, from the end of the text, with its own notice
+counted inside the cap. A cap that the text and the notice fit leaves the notice as the last line. A smaller cap cuts
+it off with the tail, and the model sees the loop's notice instead; a cap within the notice's length below the text cuts
+the notice in the middle. The record keeps the whole text and both flags either way.
 """
 
 import asyncio

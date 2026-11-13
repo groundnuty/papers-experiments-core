@@ -8,10 +8,13 @@ which cuts a result as the runner does.
 """
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from sandbox_support import make_spec, start_options
 
+from expcore.loop.toolbox import ToolBox
+from expcore.models.adapters import ToolCall
 from expcore.plugin import NO_WAITS
 from expcore_onedata.sandbox import cells
 from expcore_onedata.sandbox.api import ExecResult
@@ -126,3 +129,109 @@ def test_o43_a_failed_cell_with_cut_streams_says_so_after_the_error_text():
 def test_o43_a_cell_that_was_not_cut_says_nothing_of_the_source_limit():
     got = execute(scripted(stdout="all of it"))
     assert (got.text, got.source_truncated) == ("all of it", None)
+
+
+# What the model receives when the agent's own cap (`output_cap_chars`) meets the sandbox's cut. The order is fixed by
+# the data flow: the sandbox cuts each stream at its cap and the code tool ends the text with its notice, then the
+# loop's cap cuts the whole text from its end, its own notice counted inside it (L06). The numbers are fixed by the
+# cell below: 3 MiB of one character on stdout, of which the sandbox keeps 1 MiB.
+KEPT, PRODUCED = 1 << 20, 3 << 20
+SANDBOX_NOTE = "[output cut by the sandbox: the first 1048576 of the 3145728 bytes of stdout were kept]"
+KEPT_TEXT = "a" * KEPT + "\n" + SANDBOX_NOTE  # what the code tool returns: 1048664 characters
+
+
+@pytest.fixture
+def big_cell(world):
+    """A sandbox with the default cap, whose one cell prints 3 MiB."""
+    sandbox = DockerSandbox.start(world.host, world.s, make_spec(world, "isolated"), **start_options(world))
+    world.host.exec_handler = prints("a" * PRODUCED)
+    yield sandbox
+    sandbox.stop()
+
+
+def model_sees(sandbox: DockerSandbox, cap_chars: int):
+    box = ToolBox([CodeExecutionProvider(sandbox)], cap_chars=cap_chars)
+    return asyncio.run(box.run(ToolCall("call-1", "python", {"code": "print('a' * 3 * 1024 * 1024)"}), timeout_s=5.0))
+
+
+def test_o43_an_agent_cap_below_the_sandbox_cap_cuts_the_sandbox_note_and_the_model_sees_the_loops_notice(big_cell):
+    """O43: the sandbox cut (1 MiB of 3) applies first and the agent's cap (10,000) second, from the end of the text,
+    so the sandbox's note, which ends the text, goes with the cut tail and the model sees the loop's notice alone; the
+    call's record keeps both flags and the whole text, note included, in `raw_text`."""
+    run = model_sees(big_cell, 10_000)
+    assert run.result.text == (
+        "a" * 9923 + "\n[output truncated: 1038741 of 1048664 characters dropped by the harness cap]"
+    )
+    assert len(run.result.text) == 10_000  # the loop's notice counts inside the cap
+    assert "sandbox" not in run.result.text
+    assert (run.truncated, run.source_truncated, run.status) == (True, True, "ok")
+    assert (run.raw_text, run.raw_chars) == (KEPT_TEXT, 1_048_664)
+    assert big_cell._cells.cells[-1]["output_cut"] == {"stdout": {"produced": PRODUCED, "kept": KEPT}}
+
+
+def test_o43_the_text_the_model_sees_is_the_same_on_every_run(big_cell):
+    first = model_sees(big_cell, 10_000)
+    second = model_sees(big_cell, 10_000)
+    assert first.result.text == second.result.text
+    assert (first.raw_text, first.truncated, first.source_truncated) == (
+        second.raw_text,
+        second.truncated,
+        second.source_truncated,
+    )
+
+
+def test_o43_an_agent_cap_above_the_sandbox_cap_leaves_the_sandbox_note_as_the_last_line(big_cell):
+    """O43: with the cap above the kept text and its note (here 2 MiB), the loop cuts nothing: the model sees the
+    sandbox's note, whole, after the 1 MiB that was kept, and no notice of the loop's."""
+    run = model_sees(big_cell, 2 << 20)
+    assert run.result.text == KEPT_TEXT
+    assert run.result.text.endswith("\n" + SANDBOX_NOTE)
+    assert "harness cap" not in run.result.text
+    assert (run.truncated, run.source_truncated) == (False, True)  # only the sandbox's own cut, as L07 says
+
+
+def test_o43_an_agent_cap_that_the_kept_text_fits_but_its_note_does_not_shows_the_loops_notice_alone(big_cell):
+    run = model_sees(big_cell, KEPT)  # exactly what the sandbox kept: the note cannot follow it
+    assert run.result.text == "a" * 1_048_503 + (
+        "\n[output truncated: 161 of 1048664 characters dropped by the harness cap]"
+    )
+    assert len(run.result.text) == KEPT
+    assert (run.truncated, run.source_truncated) == (True, True)
+
+
+def test_o43_a_cap_a_few_characters_short_of_the_kept_text_and_its_note_leaves_a_piece_of_the_note(big_cell):
+    """O43: the note is part of the text the cap counts, so a cap within the note's length (87 characters) below the
+    whole text cuts it in the middle; it is the same piece on every run, and a study keeps its cap away from this."""
+    run = model_sees(big_cell, 1_048_663)
+    assert run.result.text == (
+        "a" * KEPT + "\n[output cut by\n[output truncated: 73 of 1048664 characters dropped by the harness cap]"
+    )
+    assert len(run.result.text) == 1_048_663
+
+
+def test_o43_a_cap_of_2_mib_and_1_kib_cuts_nothing_of_the_longest_text_the_default_cap_lets_the_tool_return():
+    """O43: the bound the guide states: both streams kept at 1 MiB, a failure's exit code line and both clauses of the
+    notice, with the cell's byte counts as long as they can be, are shorter than 2 MiB and 1 KiB."""
+    huge = 10**19  # a count of 20 digits
+    cut = {name: {"produced": huge, "kept": KEPT} for name in ("stdout", "stderr")}
+    got = execute(scripted(stdout="a" * KEPT, stderr="b" * KEPT, exit_code=255, output_cut=cut))
+    assert len(got.text) < (2 << 20) + 1024
+    box = ToolBox(
+        [scripted(stdout="a" * KEPT, stderr="b" * KEPT, exit_code=255, output_cut=cut)], cap_chars=(2 << 20) + 1024
+    )
+    run = asyncio.run(box.run(ToolCall("call-1", "python", {"code": "x"}), timeout_s=5.0))
+    assert (run.truncated, run.result.text) == (False, f"exit_status: {got.text}")
+
+
+def test_o43_the_study_guide_and_the_interface_notes_quote_the_strings_the_model_reads():
+    """O43: the exact notices a study freezes are written in the docs as the code and the tests have them."""
+    root = Path(__file__).resolve().parents[3]
+    guide = (root / "docs" / "study-guide.md").read_text(encoding="utf-8")
+    interfaces = (root / "docs" / "interfaces.md").read_text(encoding="utf-8")
+    template = "[output cut by the sandbox: the first K of the P bytes of stdout were kept]"
+    harness = "[output truncated: 1038741 of 1048664 characters dropped by the harness cap]"
+    harness_template = "[output truncated: D of T characters dropped by the harness cap]"
+    for quoted in (SANDBOX_NOTE, template, harness, harness_template):
+        assert quoted in guide, quoted
+    for quoted in (template, harness_template):
+        assert quoted in interfaces, quoted
