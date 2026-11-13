@@ -50,9 +50,10 @@ STATE_FIELDS = ("transferStatus", "replicationStatus", "evictionStatus")
 VISIBLE_TIMEOUT_S = 120.0
 VISIBLE_POLL_S = 0.5
 # What the visibility reads ask for. On 25.0 `GET /data/{id}` resolves only the attributes asked for: `name` reads the
-# entry's document strictly and answers 400 posix enoent once it is deleted, while `size`, `parent_id` and `file_id`
-# read it including a deleted one, so each alone keeps answering from a tombstone (14 days by default). A read that
-# includes `name` is gone when the entry is (day0/2026-11-13-federation-facts-deleted-entries-by-id.md).
+# entry's document strictly and answers 400 posix enoent once it is deleted, while `parent_id`, `file_id` and a
+# directory's `size` read it including a deleted one, so each alone keeps answering from a tombstone (14 days by
+# default; what a file's `size` alone does was not traced). A read that includes `name` is gone when the entry is
+# (day0/2026-11-13-federation-facts-deleted-entries-by-id.md).
 VISIBLE_ATTRIBUTES = ("name", "size", "parent_id")
 
 
@@ -328,8 +329,9 @@ def wait_visible(
     """Wait until a provider sees a file written through another, at its size; return the seconds it took.
 
     The file's `name`, `size` and `parent_id` are read through the provider together, and the size is checked from that
-    answer. A read of `size` or `parent_id` alone is answered from a deleted entry's tombstone for 14 days on 25.0,
-    so it would report a file deleted during the wait as visible; `name` is read strictly and refuses a deleted entry
+    answer. A read of `parent_id` alone is answered from a deleted entry's tombstone, 14 days by default on 25.0, and a
+    file's `size` alone may be (a directory's is; a file's was not traced), so either alone could report a file deleted
+    during the wait as visible; `name` is read strictly and refuses a deleted entry
     (`VISIBLE_ATTRIBUTES`). "Not visible yet" is `answered_absent` (a 404, or 25.0's 400 posix enoent), and a size other
     than `size` is a file the provider has not caught up with; both are asked again every `poll_s`. Any other failure,
     another 400 included, propagates at once (fail closed). Past `timeout_s` it raises `NotVisible`, naming the provider

@@ -48,7 +48,8 @@ DELETE_FACTS = (
 
 # What a deleted entry answers when it is read by id (`FakeData`, "Tombstones"): the facts file that records it with its
 # source references, and the live check of 12 Nov (merged separately), cited by path. The tombstone lives 14 days by
-# default on every provider (cluster-worker's `document_expiry`, 1 209 600 s), so no test of this fake waits it out.
+# default on every provider (cluster-worker's `document_expiry`, 1 209 600 s, from the source and not measured), so no
+# test of this fake waits it out.
 TOMBSTONE_FACTS = (
     "deploy/compose-federation/day0/2026-11-13-federation-facts-deleted-entries-by-id.md",
     "deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md",
@@ -143,7 +144,7 @@ class _Tombstone:
 
 # The attributes that, asked for alone, a deleted entry keeps answering (`FakeData`, "Tombstones"): the ones the
 # platform resolves without reading the entry's document strictly. Any other, `name` and `type` included, is enoent.
-# The id attribute is `file_id` on 25.0.
+# The id attribute is `file_id` on 25.0. `size` is traced for a directory only; for a file it is assumed to answer so.
 LENIENT_ATTRIBUTES = frozenset({"size", "parent_id", "file_id"})
 
 # Names the `attribute` parameter does not take on 25.0, refused before any lookup: `guid` is the internal name of the
@@ -234,28 +235,39 @@ class FakeData(FakeFederation):
     the entry as gone (`missing_answer`, 400 `posix` `enoent`); a read that asks for `size`, `parent_id` or `file_id`
     and nothing else (`LENIENT_ATTRIBUTES`) keeps answering 200 from the entry's last state, only the attributes asked
     for, on every provider, for `tombstone_s` seconds of `clock` counted from when the delete landed. Entries under a
-    deleted directory have one each; a read of its children, content or block map is the entry as gone. Source, at
-    op-worker f118ed9 (ctool 8ae7baf, cluster-worker 0e9cb40): strict `name` and the `file_meta` attributes,
-    `src/modules/fslogic/operations/utils/file_attr.erl:170-189,203-213,577-578,620-628` through
+    deleted directory have one each; a read of its children, content or block map is the entry as gone.
+
+    Source, at op-worker f118ed9 (ctool 8ae7baf, cluster-worker 0e9cb40): strict `name` and the `file_meta`
+    attributes, `src/modules/fslogic/operations/utils/file_attr.erl:170-189,203-213,577-578,620-628` through
     `src/modules/fslogic/context/file_ctx.erl:355-358` and
-    `src/modules/datastore/models/file/metadata/file_meta.erl:219-227`; lenient `parent_id`, `size` and the permission
-    check, `file_attr.erl:193-199,234-242,505-514`, `src/modules/fslogic/file_tree/file_tree.erl:236-240`,
-    `file_ctx.erl:425-431`; the tombstone keeps its value and expires after `document_expiry`,
-    `cluster-worker/src/cluster_worker.app.src:277-278`, 14 days, and replicates to every provider,
-    `src/modules/datastore/datastore_doc.erl:211-235`, `src/modules/dbsync/dbsync_changes.erl:83-110` (all in
+    `src/modules/datastore/models/file/metadata/file_meta.erl:219-227`; lenient `parent_id`, a directory's `size` and
+    the permission check, `file_attr.erl:193-199,234-242,505-514`,
+    `src/modules/fslogic/file_tree/file_tree.erl:236-240`, `file_ctx.erl:425-431`; the tombstone keeps its value and
+    expires after `document_expiry`, `cluster-worker/src/cluster_worker.app.src:277-278`, 14 days by default and not
+    measured, and replicates to every provider, `src/modules/datastore/datastore_doc.erl:211-235`,
+    `src/modules/dbsync/dbsync_changes.erl:83-110` (all in
     `deploy/compose-federation/day0/2026-11-13-federation-facts-deleted-entries-by-id.md`). Live, on 12 Nov: a deleted
     directory read with `name`, `size` and `parent_id` together answered `enoent` from about 1 s, while `parent_id`
     alone still answered at 2.0 s (`deploy/compose-federation/day0/2026-11-12-federation-facts-pending-deletes.md`,
-    merged with #192), and another study's `size` alone answered on every provider for 120 s. The default
-    `tombstone_s` is `TOMBSTONE_S`, the platform's 14 days, so no test that advances the fake's clock reaches the
-    expiry: a check of presence by `size`, `parent_id` or `file_id` alone never sees the entry go, and fails in a test
-    as it does live. A test of the expiry itself sets a short `tombstone_s`. `ERRORS_LEGACY` keeps no tombstone. The id
-    attribute is `file_id` on 25.0 and `file_id` alone answers the one key (a live read of `parent_id` and `file_id`
-    answered those two keys and nothing else); `guid` is no name the parameter takes, so `?attribute=guid` answers 400
-    `badValueNotAllowed`, with no `errno`, for every entry, deleted or not, before any lookup (`UNKNOWN_ATTRIBUTES`;
-    ctool `src/onedata_file.erl:253-270` has no clause for it, and `sanitize_attr_names`, `:134-153`, refuses it).
-    Assumed, not recorded: that a file's tombstone answers as a directory's does (the source read was of a
-    directory's), and that `size` is the entry's size when it was deleted.
+    merged with #192); another study's Day-0 reported a directory's `size` alone answering on every provider for 120 s
+    (its report, not recorded in this repository).
+
+    The default `tombstone_s` is `TOMBSTONE_S`, the platform's 14 days, so no test that advances the fake's clock
+    reaches the expiry: a check of presence by `size`, `parent_id` or `file_id` alone never sees the entry go, and
+    fails in a test, as it does live for `parent_id`, `file_id` and a directory's `size`. A test of the expiry itself
+    sets a short `tombstone_s`. `ERRORS_LEGACY` keeps no tombstone.
+
+    The id attribute is `file_id` on 25.0 and `file_id` alone answers the one key (a live read of `parent_id` and
+    `file_id` answered those two keys and nothing else); `guid` is no name the parameter takes, so `?attribute=guid`
+    answers 400 `badValueNotAllowed`, with no `errno`, for every entry, deleted or not, before any lookup
+    (`UNKNOWN_ATTRIBUTES`; ctool `src/onedata_file.erl:253-270` has no clause for it, and `sanitize_attr_names`,
+    `:134-153`, refuses it).
+
+    Assumed, not recorded: that a deleted **file's** `size` alone answers from its tombstone as a directory's does, for
+    `tombstone_s`. The source trace covered a directory's `size` (`resolve_location_attrs_for_dir`); the regular-file
+    branch (`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file location) was not read, and
+    [inference] it may answer from the file location while that exists. The fake models a file as it does a directory,
+    and a live check can correct that. Also assumed: that `size` is the entry's size when it was deleted.
 
     A delay needs a `clock` that moves. The default never does, so a delete would never land and a test of a name used
     again would pass for no reason: the first DELETE that would pend with it raises `ValueError` naming

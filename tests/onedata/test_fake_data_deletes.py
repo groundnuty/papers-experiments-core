@@ -460,6 +460,7 @@ def test_a_deleted_entry_read_with_no_attribute_or_a_strict_one_among_them_answe
 
 
 def test_a_deleted_directory_and_what_was_under_it_keep_their_last_state_for_a_lenient_read_and_not_a_strict_one():
+    """A directory's `size` alone is the traced case; what is under it is a file, whose `size` is assumed alike."""
     fake = make_federation(clock=Ticker().clock)
     inner = fake.add_file("study/deep/b.bin", DATA)
     study, deep = fake.id_of("study"), fake.id_of("study/deep")
@@ -472,6 +473,9 @@ def test_a_deleted_directory_and_what_was_under_it_keep_their_last_state_for_a_l
 
 
 def test_a_tombstone_keeps_the_size_the_entry_had_when_it_was_deleted():
+    """Pins two assumptions: the size is the one it had when its delete landed, and a deleted FILE's `size` alone
+    answers from its tombstone as a directory's does (the source trace covered a directory's; a file's branch, through
+    the file location, was not read and may answer while that exists). A live check that disproves one changes this."""
     fake = make_federation(clock=Ticker().clock)
     file_id = fake.add_file("a.bin", DATA)
     write(fake, ALPHA_ID, file_id, DATA + b"more")  # written past the end: the size it has when it is deleted

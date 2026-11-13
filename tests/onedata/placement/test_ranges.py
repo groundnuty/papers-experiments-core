@@ -112,9 +112,9 @@ def attribute_reads(fake):
 
 
 def test_o07_a_file_deleted_during_the_wait_is_never_reported_visible(client, seeded, ticker):
-    """O07: a deleted entry keeps answering a read of its `size` alone from a tombstone on 25.0, so the wait reads the
-    name with it, which a deleted entry refuses (400 posix enoent): a file deleted while the wait polls is not visible,
-    and the wait ends at its bound with `NotVisible`."""
+    """O07: a deleted entry keeps answering a read of its `parent_id` alone, and in the fake its `size` alone, from a
+    tombstone on 25.0, so the wait reads the name with them, which a deleted entry refuses (400 posix enoent): a file
+    deleted while the wait polls is not visible, and the wait ends at its bound with `NotVisible`."""
     file_id = seeded.id_of(PATH)
     seeded.unseen[(BETA_ID, file_id)] = 2  # beta does not show it yet: the wait polls, and the file goes meanwhile
 
@@ -154,9 +154,9 @@ def test_o07_a_file_deleted_before_the_provisioners_wait_is_refused_and_never_ta
 
 
 def test_o07_the_waits_read_name_size_and_parent_id_together(attribute_reads, provisioner, seeded):
-    """O07: a read of `size` alone is answered from a tombstone after a delete, so both reads of the visibility wait,
-    the data provider's and the receiver's, ask for `name`, `size` and `parent_id` together, and size is checked from
-    that answer."""
+    """O07: a read of `parent_id` alone, and in the fake of `size` alone, is answered from a tombstone after a delete,
+    so both reads of the visibility wait, the data provider's and the receiver's, ask for `name`, `size` and
+    `parent_id` together, and size is checked from that answer."""
     file_id = seeded.id_of(PATH)
     attribute_reads.clear()
     provisioner.await_visible("beta", [file_id])

@@ -2,17 +2,20 @@
 
 On the **25.0 development build (op-worker f118ed9)**, `GET /data/{id}` for a deleted entry answers by the attributes it
 is asked for. A read with no `attribute` parameter, or with `name` or `type` among them, answers 400 `posix` `enoent`.
-A read for `size`, `parent_id` or `file_id` alone, one or more of them and nothing else, keeps answering 200 from the
-entry's last state for **14 days by default**, on every provider that holds the tombstone. An entry is gone only when a
-read that includes a strict attribute answers `enoent`; never decide that from `size`, `parent_id` or `file_id` alone.
-The id attribute is named `file_id` on 25.0: `?attribute=guid` answers 400 `badValueNotAllowed` for every entry, deleted
-or not, before any lookup.
+A read for `parent_id` or `file_id` alone, or both and nothing else, keeps answering 200 from the entry's last state for
+**14 days by default** (`document_expiry`, from the source, not measured), on every provider that holds the tombstone. So
+does a read of `size` alone for a deleted **directory**, the case the source trace covered and the live 120 s
+observation was of. For a deleted regular file the `size` branch was **not traced**; **[inference]**: it may answer from
+the file location while that exists. An entry is gone only when a read that includes a strict attribute answers
+`enoent`; never decide that from `parent_id`, `file_id` or `size` alone. The id attribute is named `file_id` on 25.0:
+`?attribute=guid` answers 400 `badValueNotAllowed` for every entry, deleted or not, before any lookup.
 
 This file explains observations already recorded and amends two earlier files by naming them; neither is edited:
 
 - `2026-11-10-federation-facts-parent-walk.md`: its row "`GET /data/{deleted file}?attribute=parent_id` answers 200, the
   old parent" is a read of the tombstone, not a property of a deleted file's parent link in general. The same entry read
-  with `name`, or with no attribute, answers `enoent`, as that file's other rows say.
+  with no attribute answers `enoent`, as that file's row for `GET /data/{deleted file}`, three times in a row, says; no
+  row there reads `name`, which the source makes strict.
 - `2026-11-12-federation-facts-pending-deletes.md` (on main once #192 merges; cited by path): its rows on a deleted
   entry's `parent_id` still reading, and on the old directory's `enoent` from 1 s, are the same effect.
 
@@ -28,7 +31,9 @@ repository's own tree.
 |---|---|---|
 | no `attribute` parameter | 400 `posix` `enoent` | the default list holds `name` and `type` (ctool `include/onedata_file.hrl:142-145`) |
 | `name`, `type`, or either among others (`mode`, `shares`, `owner_id`, ...) | 400 `posix` `enoent` | read through the strict getter |
-| `size`, `parent_id`, `file_id`, or any of the three together | 200 from the last state | read through the lenient getter, or no getter (`file_id`) |
+| `parent_id`, `file_id`, or both | 200 from the last state | read through the lenient getter, or no getter (`file_id`) |
+| `size` of a deleted directory, alone or with `parent_id` and `file_id` | 200 from the last state | read through the lenient getter (`resolve_location_attrs_for_dir`) |
+| `size` of a deleted regular file, alone or with `parent_id` and `file_id` | **not traced. [inference]: may answer from the file location while it exists** | the branch (`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file location) was not read |
 | `guid`, alone or among any others | 400 `badValueNotAllowed`, for a live entry too | not a name the parameter takes: refused before any lookup |
 
 Deprecated names map `parent_id` to `parent_guid` and `file_id` to the id (ctool `src/onedata_file.erl:253-270`, which
@@ -63,6 +68,8 @@ returned.
     (`src/modules/fslogic/file_tree/file_tree.erl:118-139,236-240`), lenient.
   - `size` of a directory goes through `resolve_location_attrs` (`file_attr.erl:234-242`) and
     `dir_size_stats:get_stats`; every result is mapped without a throw (`file_attr.erl:505-514`), lenient.
+    `size` of a regular file takes another branch (`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file
+    location), which was **not traced**; **[inference]**: it may answer from the file location while it exists.
   - `name` goes through `resolve_name_attrs` (`file_attr.erl:203-213,561-578`) to `get_file_doc`
     (`file_attr.erl:620-628`; `allow_deleted_files` defaults to false), strict.
   - `type`, `mode`, `shares`, `owner_id`, `provider_id` and the rest of the `file_meta` attributes go through
@@ -108,7 +115,7 @@ returned.
 |---|---|
 | A deleted directory read with `name`, `size` and `parent_id` together answered `enoent` from about 1 s after the delete's 204 (`2026-11-12-federation-facts-pending-deletes.md`) | `name` is strict, so the combined read fails as a whole once `deleted = true` is set, here within about a second of the 204 |
 | `parent_id` read alone still answered at 0.37 s and at 2.0 s: an old file's link named its old directory, and the old directory's link named a directory that was neither its old parent nor the space root (the same file) | `parent_id` is lenient: it answers from the tombstone, not from a live entry. That other directory is the space's trash directory **[inference]**. Nothing in the source ends the window before expiry |
-| Another study's reads of `size` alone answered 200 on all three providers for 120 s after a delete, with the name already out of every listing and an empty trash | `size` is lenient, and the tombstone is on every provider. The 120 s is the length of that study's watch, not the length of the window; the source gives 14 days **[inference]** |
+| Another study's reads of a directory's `size` alone answered 200 on all three providers for 120 s after a delete, with the name already out of every listing and an empty trash. This is that study's Day-0 report; this repository does not record the reads | `size` of a directory is lenient, and the tombstone is on every provider. The 120 s is the length of that study's watch, not the length of the window; the source gives 14 days **[inference]**. It says nothing of a file's `size` |
 | In the first second the directory answered its attributes, smaller than before, with a `parent_id` that was the trash directory's | the directory was already renamed into the trash and not yet marked deleted, while its children were going **[inference]** |
 
 ## Which read decides that an entry is gone
@@ -116,18 +123,20 @@ returned.
 - **Gone:** `GET /data/{id}` with no `attribute` parameter, or with `name` or `type` among the attributes, answers 400
   `posix` `enoent`. A caller that waits for it bounds the wait by the size of the tree and expects a failed traverse
   to retry after 16 s or more.
-- **Not a test of absence:** `size`, `parent_id` or `file_id` alone, however many of them. They answer for about 14 days
-  after the delete.
+- **Not a test of absence:** `parent_id` or `file_id` alone, a directory's `size` alone, however many of them. They
+  answer for 14 days by default after the delete (`document_expiry`, not measured). A file's `size` alone was not traced
+  and may answer while the file location exists **[inference]**; do not test absence with it either.
 - **Deletion accepted, not finished:** the name is out of the old parent's listing and `parent_id` is the space's trash
   directory, which is the same for every directory of the space **[inference]**. An empty trash listing shows only that
   the link is gone, not the document.
-- **A visibility wait** that checks a file by `size` or `parent_id` alone reports a file deleted meanwhile as visible.
-  Read `name` with them.
+- **A visibility wait** that checks a file by `parent_id` alone reports a file deleted meanwhile as visible, and by
+  `size` alone it may (a file's `size` read was not traced). Read `name` with them.
 - `is_deleted` exists in the attribute record but is not exposed to the API (ctool `include/onedata_file.hrl:123-128`),
   so a client cannot ask for it.
 
 ## What was not read
 
 `data_constraints:inspect`, `file_ctx:new_by_partial_context`, cluster-worker `datastore_reader:get` (the
-`include_deleted` branch at `src/modules/datastore/datastore_reader.erl:38`), how `file_attr_translator` renders an
+`include_deleted` branch at `src/modules/datastore/datastore_reader.erl:38`), the regular-file branch of `size`
+(`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file location), how `file_attr_translator` renders an
 unset `size`, the LUMA, times and path stages, and any deployment `sys.config` override of `document_expiry`.
