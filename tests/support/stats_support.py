@@ -48,7 +48,7 @@ def ratio_arms(task, model, seed, a, b, *, cluster="grp-a"):
 
 
 def ratio_spec(name="spend-per-win", *, zero="exclude", correction=None, estimator="ratio", **declared):
-    """A ratio contrast of spend over wins between cond-a and cond-b, clustered by `group` (with `cluster_key =
-    ("model", "group")` among `declared`, by each model's cell of a group)."""
+    """A ratio contrast of spend over wins between cond-a and cond-b, clustered by `group` (with `estimation_unit =
+    ("model", "group")` among `declared`, its sums per model's cell of a group)."""
     form = RatioForm("spend", "wins", zero, correction)
     return ContrastSpec(name, form.label, estimator, "group", conditions=("cond-a", "cond-b"), ratio=form, **declared)

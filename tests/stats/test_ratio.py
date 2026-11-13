@@ -11,7 +11,6 @@ from expcore.stats.ratio import (
     RatioForm,
     aggregate,
     aggregate_by_model,
-    cell_label,
     log_ratio,
 )
 
@@ -37,11 +36,14 @@ def test_s13_a_failed_run_counts_its_spend_and_adds_nothing_to_the_wins():
     assert with_failure[0].matrix[0, 0] == pytest.approx(math.log(6.0))
     assert without[0].matrix[0, 0] == pytest.approx(math.log(2.0))
     assert with_failure[1] == {"zero_denominator": 0, "zero_numerator": 0}
+    assert with_failure[2] == {"zero_denominator": 0, "zero_numerator": 0}
 
 
 def test_s13_the_input_has_one_column_for_the_models_pooled_in_each_cluster():
     """S13: the sums of a cluster run over every model's pairs, so the estimator's input has one column, POOLED."""
-    differences, _ = aggregate({"grp-b": [((10.0, 1.0), (10.0, 1.0))], "grp-a": [((30.0, 1.0), (10.0, 1.0))]}, EXCLUDE)
+    differences, _, _ = aggregate(
+        {"grp-b": [((10.0, 1.0), (10.0, 1.0))], "grp-a": [((30.0, 1.0), (10.0, 1.0))]}, EXCLUDE
+    )
     assert differences.clusters == ("grp-a", "grp-b")
     assert differences.models == (POOLED,)
     assert differences.pooled
@@ -105,15 +107,16 @@ def test_s13_an_excluded_cluster_counts_its_pairs_and_leaves_the_input():
         "grp-b": [((10.0, 1.0), (10.0, 0.0)), ((20.0, 1.0), (10.0, 0.0))],
         "grp-c": [((0.0, 1.0), (10.0, 1.0))],
     }
-    differences, excluded = aggregate(cells, EXCLUDE)
+    differences, excluded, cells_excluded = aggregate(cells, EXCLUDE)
     assert differences.clusters == ("grp-a",)
     assert differences.matrix[0, 0] == pytest.approx(math.log(6.0))
     assert excluded == {"zero_denominator": 2, "zero_numerator": 1}
+    assert cells_excluded == {"zero_denominator": 1, "zero_numerator": 1}  # pooled, a cell is the group
 
 
 def test_no_cluster_left_gives_an_input_with_no_cluster():
     """Every cluster excluded is an empty input, which the analysis reports as untestable."""
-    differences, excluded = aggregate({"grp-a": [((1.0, 0.0), (1.0, 1.0))]}, EXCLUDE)
+    differences, excluded, _ = aggregate({"grp-a": [((1.0, 0.0), (1.0, 1.0))]}, EXCLUDE)
     assert differences.clusters == ()
     assert excluded["zero_denominator"] == 1
     assert aggregate({}, EXCLUDE)[0].clusters == ()
@@ -122,7 +125,7 @@ def test_no_cluster_left_gives_an_input_with_no_cluster():
 def test_s13_totals_past_the_float_range_are_summed_exactly():
     """S13: two runs of 1e308 in each arm sum past the largest float, and the log ratio of equal arms is still 0."""
     pairs = [((1e308, 1.0), (1e308, 1.0)), ((1e308, 1.0), (1e308, 1.0))]
-    differences, excluded = aggregate({"grp-a": pairs}, EXCLUDE)
+    differences, excluded, _ = aggregate({"grp-a": pairs}, EXCLUDE)
     assert differences.matrix[0, 0] == 0.0
     assert excluded == {"zero_denominator": 0, "zero_numerator": 0}
     _, value = log_ratio((1e308, 1.0), (1e308, 4.0), EXCLUDE)
@@ -132,8 +135,8 @@ def test_s13_totals_past_the_float_range_are_summed_exactly():
 def test_the_sums_do_not_depend_on_the_order_of_the_pairs():
     """Each total is an exact sum, so a cluster's value is a function of its set of pairs."""
     pairs = [((0.1, 1.0), (0.3, 1.0)), ((0.2, 0.0), (0.7, 2.0)), ((1e16, 1.0), (1.0, 1.0)), ((-0.0, 0.0), (1.0, 0.0))]
-    first, _ = aggregate({"grp-a": pairs}, EXCLUDE)
-    second, _ = aggregate({"grp-a": list(reversed(pairs))}, EXCLUDE)
+    first, _, _ = aggregate({"grp-a": pairs}, EXCLUDE)
+    second, _, _ = aggregate({"grp-a": list(reversed(pairs))}, EXCLUDE)
     assert first.matrix[0, 0] == second.matrix[0, 0]
 
 
@@ -164,48 +167,53 @@ def test_a_form_that_is_not_a_declared_rule_is_refused(args, message):
         RatioForm(*args)
 
 
-# --- a (model, cluster) key: one log ratio per model's cell of a cluster ------------------------------------------
+# --- a (model, group) estimation unit: a log ratio per model's cell, the group the independent unit ---------------
 
 
-def test_s13_by_model_each_cell_is_a_row_with_its_log_ratio_in_its_models_column():
-    """S13, hand-computed: model-a's cell of grp-a is ln(300 / 1) - ln(100 / 2) = ln 6; model-b's of grp-b sums
-    30 + 0 for 1 + 0 wins in A and 10 + 10 for 1 + 1 in B, ln(30 / 10) = ln 3. Each row has one defined cell."""
+def test_s13_by_cell_each_group_is_a_row_of_its_models_cell_log_ratios_averaged_with_equal_weight():
+    """S13, hand-computed nested: in grp-a model-a's two runs sum A 300 for 1 win against B 100 for 2, ln 6, and
+    model-b's one ln(60 / 20) = ln 3; in grp-b model-a's cell is ln(30 / 10) = ln 3 and model-b's ln((10 / 2) / 40) =
+    ln(1 / 8). Each group is one row, its value the mean of its two cells whatever runs each model has: (ln 6 + ln 3)
+    / 2, not the pooled ln((360 / 2) / (120 / 3)) = ln 4.5."""
     cells = {
-        ("model-b", "grp-b"): [((30.0, 1.0), (10.0, 1.0)), ((0.0, 0.0), (10.0, 1.0))],
-        ("model-a", "grp-a"): [((300.0, 1.0), (100.0, 2.0))],
+        ("model-b", "grp-b"): [((10.0, 2.0), (40.0, 1.0))],
+        ("model-a", "grp-a"): [((100.0, 1.0), (50.0, 1.0)), ((200.0, 0.0), (50.0, 1.0))],
+        ("model-b", "grp-a"): [((60.0, 1.0), (20.0, 1.0))],
+        ("model-a", "grp-b"): [((30.0, 1.0), (10.0, 1.0))],
     }
-    differences, excluded = aggregate_by_model(cells, EXCLUDE)
-    assert differences.clusters == (cell_label("model-a", "grp-a"), cell_label("model-b", "grp-b"))
-    assert differences.models == ("model-a", "model-b")
-    assert differences.matrix[0, 0] == pytest.approx(math.log(6.0))
-    assert differences.matrix[1, 1] == pytest.approx(math.log(3.0))
-    assert math.isnan(differences.matrix[0, 1])
-    assert math.isnan(differences.matrix[1, 0])
-    assert list(differences.cluster_differences) == pytest.approx([math.log(6.0), math.log(3.0)])
-    assert excluded == {"zero_denominator": 0, "zero_numerator": 0}
+    differences, excluded, cells_excluded = aggregate_by_model(cells, EXCLUDE)
+    assert (differences.clusters, differences.models, differences.pooled) == (
+        ("grp-a", "grp-b"),
+        ("model-a", "model-b"),
+        False,
+    )
+    expected = [[math.log(6.0), math.log(3.0)], [math.log(3.0), math.log(1.0 / 8.0)]]
+    assert differences.matrix.ravel().tolist() == pytest.approx([value for row in expected for value in row])
+    assert list(differences.cluster_differences) == pytest.approx([sum(row) / 2 for row in expected])
+    assert excluded == cells_excluded == {"zero_denominator": 0, "zero_numerator": 0}
 
 
-def test_s13_by_model_the_zero_rule_excludes_a_cell_and_counts_its_pairs():
-    """S13: model-b never wins in B in grp-a, so that cell's two pairs are counted under zero_denominator and it is no
-    row; model-a's cell of the same group stays. A model with no cell left is no column."""
+def test_s13_by_cell_a_lost_cell_leaves_its_group_its_other_cells_and_a_group_with_none_left_is_no_row():
+    """S13: in grp-a model-b never wins in B, so that cell's two pairs are counted under zero_denominator, the cell
+    under zero_denominator, and grp-a's value is model-a's cell alone, ln 6. Both cells of grp-b are lost (B never
+    wins; A spends nothing), so grp-b is no row; grp-c keeps model-b's ln 2."""
     cells = {
         ("model-a", "grp-a"): [((300.0, 1.0), (100.0, 2.0))],
         ("model-b", "grp-a"): [((10.0, 1.0), (10.0, 0.0)), ((20.0, 1.0), (10.0, 0.0))],
+        ("model-a", "grp-b"): [((10.0, 1.0), (10.0, 0.0))],
+        ("model-b", "grp-b"): [((0.0, 1.0), (10.0, 1.0))],
+        ("model-b", "grp-c"): [((40.0, 1.0), (20.0, 1.0))],
     }
-    differences, excluded = aggregate_by_model(cells, EXCLUDE)
-    assert differences.clusters == (cell_label("model-a", "grp-a"),)
-    assert differences.models == ("model-a",)
-    assert excluded == {"zero_denominator": 2, "zero_numerator": 0}
+    differences, excluded, cells_excluded = aggregate_by_model(cells, EXCLUDE)
+    assert (differences.clusters, differences.models) == (("grp-a", "grp-c"), ("model-a", "model-b"))
+    assert list(differences.cluster_differences) == pytest.approx([math.log(6.0), math.log(2.0)])
+    assert math.isnan(differences.matrix[0, 1])
+    assert excluded == {"zero_denominator": 3, "zero_numerator": 1}
+    assert cells_excluded == {"zero_denominator": 2, "zero_numerator": 1}
     assert aggregate_by_model({("model-b", "grp-a"): cells[("model-b", "grp-a")]}, EXCLUDE)[0].clusters == ()
-
-
-def test_a_cell_label_cannot_be_read_as_another_cell():
-    """The label of a (model, cluster) cell names both parts unambiguously, whatever characters they hold."""
-    assert cell_label("model-a", "x / y") != cell_label("model-a / x", "y")
-    assert cell_label("model-a", "grp-a") == '["model-a", "grp-a"]'
 
 
 def test_s13_a_cell_input_is_not_pooled_even_for_a_model_named_pooled():
     """S13: the input says it is by cell, so a model that happens to be called `pooled` is read as a model."""
-    differences, _ = aggregate_by_model({(POOLED, "grp-a"): [((300.0, 1.0), (100.0, 2.0))]}, EXCLUDE)
-    assert (differences.models, differences.pooled) == ((POOLED,), False)
+    differences, _, _ = aggregate_by_model({(POOLED, "grp-a"): [((300.0, 1.0), (100.0, 2.0))]}, EXCLUDE)
+    assert (differences.clusters, differences.models, differences.pooled) == (("grp-a",), (POOLED,), False)

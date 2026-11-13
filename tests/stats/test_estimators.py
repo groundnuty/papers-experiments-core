@@ -318,12 +318,6 @@ def test_s13_a_ratio_contrast_with_no_cluster_has_no_number():
     assert all(math.isnan(value) for value in (result.estimate, result.p_value, result.ci_low, result.ci_high))
 
 
-def test_s13_the_ratio_estimator_refuses_an_input_that_is_not_one_pooled_column():
-    """S13: handed a difference contrast's cells by model, it would average values that are no log ratios."""
-    with pytest.raises(ValueError, match="one column of the pooled models"):
-        estimators.get(RATIO)(paired([[0.1, 0.2], [0.3, 0.4]]), settings())
-
-
 def test_s06_s09_the_ratio_estimators_registered_p_values_are_its_own():
     """S06, S09: the minimum detectable effect of a ratio contrast is simulated with the test it reports."""
     studies = np.round(np.random.default_rng(5).normal(0.4, 0.3, size=(30, 6)), 3)
@@ -340,58 +334,69 @@ def test_the_ratio_estimators_parameters_are_checked_under_its_own_name():
         estimators.check_params(RATIO, {"depth": 1})
 
 
-# --- the ratio estimator by (model, cluster) cell: the cells are the units, and each model has its own estimate ------
+# --- the ratio estimator by (model, group) cell: estimated per cell, tested and resampled over groups -----------------
 
-CELLS = {  # each model's cells of a (model, cluster) key, as log ratios
-    "model-a": [math.log(r) for r in (6.0, 2.0, 3.0)],
-    "model-b": [math.log(r) for r in (1.5, 4.0, 0.5)],
-}
-
-
-def by_model(cells):
-    """A ratio contrast's input by cell: one row per (model, cluster) cell, its log ratio in its model's column."""
-    rows = []
-    for column, values in enumerate(cells.values()):
-        for value in values:
-            rows.append([value if j == column else math.nan for j in range(len(cells))])
-    return paired(rows, models=tuple(cells))
+CELLS = [  # one row per group, one column per model: each (model, group) cell's log ratio, NaN for a lost cell
+    [math.log(6.0), math.log(1.25)],
+    [math.log(2.0), math.log(4.0)],
+    [math.log(3.0), math.nan],
+    [math.log(0.8), math.log(0.25)],
+]  # no two of the groups' values, nor of model-a's cells, share a magnitude, so the exact test has no tie
 
 
-def test_s13_by_cell_the_estimate_and_the_test_run_on_the_cells_with_each_models_estimate_beside_them():
-    """S13, hand-computed: the estimate is the mean of the six cells' log ratios and the p-value scipy's signed-rank
-    test of them; each model's estimate is the mean of its own cells, with no test of its own."""
-    result = estimators.get(RATIO)(by_model(CELLS), settings(method="exact"))
-    every = [*CELLS["model-a"], *CELLS["model-b"]]
-    assert result.estimate == pytest.approx(sum(every) / 6)
-    assert result.p_value == pytest.approx(stats.wilcoxon(every, method="exact").pvalue)
-    assert result.n_clusters == 6
+def by_cell(cells=CELLS, models=("model-a", "model-b")):
+    """A ratio contrast's input by cell: one row per group, each model's cell log ratio in its column."""
+    return paired(cells, models=models)
+
+
+def test_s13_by_cell_the_test_runs_on_each_groups_equal_weight_mean_of_its_cells():
+    """S13, hand-computed: a group's value is the mean of its testable cells, each model weighing the same (grp-c has
+    model-a's cell alone), the estimate the mean of the four groups' values, the p-value scipy's signed-rank test of
+    those four values, and the clusters counted are the groups; each model's estimate is the mean of its own cells."""
+    result = estimators.get(RATIO)(by_cell(), settings(method="exact"))
+    groups = [(CELLS[0][0] + CELLS[0][1]) / 2, (CELLS[1][0] + CELLS[1][1]) / 2, CELLS[2][0], sum(CELLS[3]) / 2]
+    assert result.estimate == pytest.approx(sum(groups) / 4)
+    assert result.p_value == pytest.approx(stats.wilcoxon(groups, method="exact").pvalue)
+    assert result.n_clusters == 4
     assert [m.model for m in result.per_model] == ["model-a", "model-b"]
-    assert [m.estimate for m in result.per_model] == pytest.approx([sum(v) / 3 for v in CELLS.values()])
+    model_b = [row[1] for row in CELLS if not math.isnan(row[1])]
+    assert [m.estimate for m in result.per_model] == pytest.approx([sum(r[0] for r in CELLS) / 4, sum(model_b) / 3])
 
 
-def test_s13_by_cell_each_models_interval_comes_from_the_same_draws_as_the_overall_one():
-    """S13, S04: one resample of the cells serves the overall interval and every model's."""
-    paired_cells = by_model(CELLS)
+def test_s13_by_cell_the_bootstrap_draws_groups_with_all_their_cells_and_each_models_interval_from_the_same_draws():
+    """S13, S04: one resample of the groups, each with every cell it holds, serves the overall interval and every
+    model's."""
+    paired_cells = by_cell()
     result = estimators.get(RATIO)(paired_cells, settings())
     boot = kernel.cluster_bootstrap(paired_cells.matrix, 300, np.random.default_rng([7, 11]))
+    assert boot.indices.shape == (300, 4)  # a draw is of the four groups, not of the seven cells
     assert (result.ci_low, result.ci_high) == pytest.approx(kernel.percentile_interval(boot.overall, 0.95)[:2])
     for column, model in enumerate(result.per_model):
         low, high, _ = kernel.percentile_interval(boot.per_model[:, column], 0.95)
         assert (model.ci_low, model.ci_high) == pytest.approx((low, high))
 
 
-def test_s13_the_ratio_estimator_refuses_a_row_holding_more_than_one_models_cell():
-    """S13: a row by cell holds one model's log ratio; a row with two would be averaged as no ratio contrast is."""
-    with pytest.raises(ValueError, match="one column of the pooled models"):
-        estimators.get(RATIO)(paired([[0.1, math.nan], [0.3, 0.4]]), settings())
+def test_s13_by_cell_perfectly_correlated_cells_of_a_group_give_the_inference_of_one_cell_per_group():
+    """S13: two models whose cells are equal in every group carry no more evidence than one, so the estimate, the
+    p-value, the interval and the count of clusters are those of the one model: the group, not the cell, is the unit.
+    Counting the eight cells as independent would give n = 8 and a smaller p-value."""
+    column = [row[0] for row in CELLS]
+    twice = estimators.get(RATIO)(by_cell([[v, v] for v in column]), settings(method="exact"))
+    once = estimators.get(RATIO)(by_cell([[v] for v in column], models=("model-a",)), settings(method="exact"))
+    fields = ("estimate", "p_value", "ci_low", "ci_high", "n_clusters")
+    assert [getattr(twice, f) for f in fields] == [getattr(once, f) for f in fields]
+    flat = estimators.get(RATIO)(by_cell([[v] for v in column * 2], models=("model-a",)), settings())
+    assert (twice.n_clusters, flat.n_clusters) == (4, 8)
+    assert flat.p_value < twice.p_value
 
 
 def test_s13_a_model_named_pooled_keeps_its_estimate_by_cell():
     """S13: whether the models are pooled is said by the input, not read from a column's name, so the one model left
-    of a key by cell keeps its estimate whatever it is called."""
-    result = estimators.get(RATIO)(by_model({POOLED: CELLS["model-a"]}), settings())
+    of an input by cell keeps its estimate whatever it is called."""
+    column = [[row[0]] for row in CELLS]
+    result = estimators.get(RATIO)(by_cell(column, models=(POOLED,)), settings())
     assert [(m.model, m.estimate) for m in result.per_model] == [(POOLED, pytest.approx(result.estimate))]
-    assert estimators.get(RATIO)(pooled(CELLS["model-a"]), settings()).per_model == ()
+    assert estimators.get(RATIO)(pooled([row[0] for row in column]), settings()).per_model == ()
 
 
 def test_a_pooled_input_has_the_one_pooled_column():

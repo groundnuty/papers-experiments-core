@@ -16,10 +16,11 @@ reports for those differences; an estimator that registers none has no such simu
 
 Each estimator reads one form of contrast (`FORMS`), declared when it is registered: "difference" (the default),
 whose input holds the mean differences A - B of one outcome per cluster and model, or "ratio" (S13), whose input
-holds one log ratio of sums per cluster: in a single column, `POOLED`, when each cluster pools its models, or one
-(model, cluster) cell per row in its model's column when the contrast's cluster key names the model (see
-`expcore.stats.ratio`). A contrast whose form is not its estimator's is refused, so neither can be handed the other's
-input. `ratio` is the second estimator registered.
+holds log ratios of sums: one per cluster in a single column, `POOLED`, when each cluster's sums pool its models, or
+one per (model, cluster) cell, one row per cluster and one column per model, when the contrast's estimation unit
+names the model (see `expcore.stats.ratio`). Either way a row is a cluster, the unit of the test and of the
+bootstrap. A contrast whose form is not its estimator's is refused, so neither can be handed the other's input.
+`ratio` is the second estimator registered.
 """
 
 from __future__ import annotations
@@ -44,9 +45,11 @@ POOLED = "pooled"  # the one column of a ratio contrast's input when a cluster's
 class PairedDifferences:
     """Paired differences A - B per cluster and model: rows are clusters, columns models, NaN where a cell has no pair.
 
-    A cluster or a model without any paired cell is not part of the input: pairing drops it and counts it. `pooled`
-    says that each cluster's value pools its models, in the one column `POOLED` (a ratio contrast under its default
-    key, S13); it is said by the input, never read from a column's name, which a model may share.
+    A row is a cluster, the independent unit: every estimator's test and bootstrap take the rows, with all their cells,
+    as their units, and never a cell. A cluster or a model without any paired cell is not part of the input: pairing
+    drops it and counts it. `pooled` says that each cluster's value pools its models, in the one column `POOLED` (a
+    ratio contrast under its default estimation unit, S13); it is said by the input, never read from a column's name,
+    which a model may share.
     """
 
     clusters: tuple[str, ...]
@@ -305,29 +308,24 @@ def _signed_rank_cluster_bootstrap(
 def ratio(paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult:
     """A ratio contrast's estimate, test and interval, on the log scale (S13; the estimand is in `expcore.stats.ratio`).
 
-    The input is one log ratio of ratios of sums per cluster, ln((N_A / D_A) / (N_B / D_B)): in the one column
-    `POOLED` when each cluster pools its models (`PairedDifferences.pooled`), or, when the cluster key names the model,
-    one (model, cluster) cell per row in its model's column and NaN in the others. The zero rule has already excluded
-    or corrected every cluster with a zero sum, so each value is finite. The estimate is their mean, theta, a
-    natural-log ratio: exp(theta) is the geometric mean over clusters of arm A's ratio over arm B's. The p-value is
-    the two-sided Wilcoxon signed-rank test of the cluster log ratios after float noise is snapped, with zero log
-    ratios (clusters whose arms have one ratio) dropped and counted (`zero_dropped`) and all-zero input giving p = 1
-    (S01, S03); it assumes independent clusters whose log ratios are symmetric about
-    their centre, and tests that centre. The interval is the cluster bootstrap's percentile interval: clusters drawn
-    with replacement, the mean log ratio of each draw (S04, S05). One cluster gives an estimate and a point interval;
-    its p-value is the test's for one difference (1 by the exact method, 0.3173 by the normal approximation, which no
-    level a study uses rejects). Its parameters are the Wilcoxon cluster bootstrap's. Pooled, there is no estimate by
-    model. By cell, each model's estimate is the mean of its own cells' log ratios, with its interval from the same
-    cluster draws (S04): a breakdown with no test of its own.
+    The input holds log ratios of ratios of sums, ln((N_A / D_A) / (N_B / D_B)), one row per cluster: in the one
+    column `POOLED` when each cluster's sums pool its models (`PairedDifferences.pooled`), or, when the estimation
+    unit names the model, each (model, cluster) cell's in its model's column, NaN where the cell is lost. A cluster's
+    value is the equal-weight mean of its cells, each model weighing the same. The zero rule has already excluded or
+    corrected every cell with a zero sum, so each value is finite. The estimate is the mean of the clusters' values,
+    theta, a natural-log ratio: exp(theta) is a geometric mean over clusters of arm A's ratio over arm B's. The
+    p-value is the two-sided Wilcoxon signed-rank test of the clusters' values after float noise is snapped, with zero
+    values dropped and counted (`zero_dropped`) and all-zero input giving p = 1 (S01, S03); it assumes independent
+    clusters whose values are symmetric about their centre, and tests that centre. The interval is the cluster
+    bootstrap's percentile interval: clusters drawn with replacement, each with all its cells, the mean value of each
+    draw (S04, S05). The cells of a cluster are never units of either. One cluster gives an estimate and a point
+    interval; its p-value is the test's for one difference (1 by the exact method, 0.3173 by the normal
+    approximation, which no level a study uses rejects). Its parameters are the Wilcoxon cluster bootstrap's. Pooled,
+    there is no estimate by model. By cell, each model's estimate is the mean of its own cells' log ratios, with its
+    interval from the same draws of the clusters (S04): a breakdown with no test of its own.
     """
     params = {**_WILCOXON_DEFAULTS, **settings.params}
     _check_ratio_params(params)
     pooled = paired.pooled  # said by the input: a model may be called POOLED too
-    if paired.clusters and not pooled and not (np.sum(~np.isnan(paired.matrix), axis=1) == 1).all():
-        raise ValueError(
-            f"the ratio estimator reads one log ratio per cluster, in the one column of the pooled models "
-            f"({POOLED!r}) or in its model's column of a (model, cluster) cell; got rows holding more than one of the "
-            f"columns {', '.join(map(repr, paired.models))}"
-        )
     result = _signed_rank_cluster_bootstrap(paired, settings, params)
     return dataclasses.replace(result, per_model=()) if pooled else result

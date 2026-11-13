@@ -11,7 +11,7 @@ from stats_support import both_arms, by_factor, make_row, named, ratio_arms, rat
 
 from expcore.stats.estimators import WILCOXON
 from expcore.stats.pairing import MISSING_CAUSES, ContrastSpec, pair_rows
-from expcore.stats.ratio import POOLED, RATIO_CAUSES, RatioForm, cell_label
+from expcore.stats.ratio import POOLED, RATIO_CAUSES, RatioForm
 from expcore.stats.rows import AbsentRun, Row
 
 
@@ -534,7 +534,35 @@ def test_a_ratio_contrast_spec_labels_its_outcome_with_its_two_outcomes():
         ContrastSpec("x", "spend", "ratio", "group", conditions=("cond-a", "cond-b"), ratio=form)
 
 
-# --- the ratio form's cluster key: the models of a cluster pooled, or one cell per model -----------------------------
+# --- the difference form's units: estimated per (model, group) cell, the group the independent unit ----------------
+
+
+def test_a_difference_contrast_estimates_per_model_cell_and_takes_the_group_as_its_independent_unit():
+    """Two models in one group, model-a with three tasks and four runs and model-b with one task: each model's cell is
+    the mean of its tasks' means, and the group, one row, is the equal-weight mean of its two cells, (0.2 + 0.6) / 2 =
+    0.4, not the mean over its five runs (0.28) nor over its four tasks (0.3). The group is the one cluster counted."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)  # 0.4
+    rows += both_arms("task-a", "model-a", 2, 0.5, 0.5)  # 0.0: task-a's mean is 0.2
+    rows += both_arms("task-b", "model-a", 1, 0.5, 0.5)  # 0.0
+    rows += both_arms("task-c", "model-a", 1, 0.9, 0.5)  # 0.4: model-a's cell is (0.2 + 0.0 + 0.4) / 3 = 0.2
+    rows += both_arms("task-d", "model-b", 1, 0.8, 0.2)  # 0.6: model-b's cell
+    pairing = pair_rows(rows, named())
+    assert named().estimation_unit == ("model", "group")
+    assert (pairing.differences.clusters, pairing.differences.models) == (("grp-a",), ("model-a", "model-b"))
+    assert pairing.differences.matrix.ravel().tolist() == pytest.approx([0.2, 0.6])
+    assert list(pairing.differences.cluster_differences) == pytest.approx([0.4])
+    assert (pairing.n_cells, pairing.cells_lost) == (2, {"no_pair": 0})
+
+
+def test_a_difference_contrast_counts_a_cell_left_without_a_pair():
+    """model-b ran grp-a in arm A only, so its cell is seen and lost for want of a pair; the group keeps model-a's."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows.append(make_row("task-a", "model-b", 1, 0.9, condition="cond-a"))
+    pairing = pair_rows(rows, named())
+    assert (pairing.n_cells, pairing.cells_lost, pairing.n_clusters_dropped) == (1, {"no_pair": 1}, 0)
+
+
+# --- the ratio form's estimation unit: the models of a group pooled, or one cell per model of it ----------------------
 
 BY_MODEL = ("model", "group")
 
@@ -548,59 +576,79 @@ def by_model_rows():
     return rows
 
 
-def test_s13_a_model_and_cluster_key_gives_one_log_ratio_per_cell_with_exclusion_counted_per_cell():
-    """S13, hand-computed: model-a's cells are ln 6 and 0, model-b's grp-a cell ln(60 / 20) = ln 3; its grp-b cell has
-    no win in B, so that cell alone is excluded, its one pair counted under zero_denominator, and the cell dropped."""
-    pairing = pair_rows(by_model_rows(), ratio_spec(cluster_key=BY_MODEL))
-    cells = (("model-a", "grp-a"), ("model-a", "grp-b"), ("model-b", "grp-a"))
-    assert pairing.differences.clusters == tuple(cell_label(*cell) for cell in cells)
-    assert pairing.differences.models == ("model-a", "model-b")
-    assert list(pairing.differences.cluster_differences) == pytest.approx([math.log(6.0), 0.0, math.log(3.0)])
-    assert (pairing.n_pairs, pairing.missing["zero_denominator"], pairing.n_clusters_dropped) == (4, 1, 1)
+def test_s13_a_cell_estimation_unit_gives_each_group_its_cells_log_ratios_and_excludes_by_cell():
+    """S13, hand-computed nested: grp-a holds model-a's ln 6 and model-b's ln(60 / 20) = ln 3, so its value is their
+    equal-weight mean; model-b's grp-b cell has no win in B, so that cell alone is excluded, its one pair counted under
+    zero_denominator and the cell under the same cause, and grp-b keeps model-a's 0. No group is dropped."""
+    pairing = pair_rows(by_model_rows(), ratio_spec(estimation_unit=BY_MODEL))
+    assert (pairing.differences.clusters, pairing.differences.models) == (("grp-a", "grp-b"), ("model-a", "model-b"))
+    assert list(pairing.differences.cluster_differences) == pytest.approx([(math.log(6.0) + math.log(3.0)) / 2, 0.0])
+    assert (pairing.n_pairs, pairing.missing["zero_denominator"], pairing.n_clusters_dropped) == (4, 1, 0)
+    assert pairing.n_cells == 3
+    assert pairing.cells_lost == {"no_pair": 0, "zero_denominator": 1, "zero_numerator": 0}
 
 
-def test_s13_the_cluster_key_changes_the_estimand_the_pooled_sums_weigh_the_models_that_spend_most():
+def test_s13_a_group_whose_every_cell_is_lost_is_dropped_and_counted_and_a_cell_with_no_pair_is_counted():
+    """S13: in grp-c neither model ever wins in B, so both its cells are excluded and the group is dropped, counted in
+    n_clusters_dropped; model-a ran grp-d in arm A only, a cell with no pair, so grp-d is dropped too."""
+    rows = by_model_rows()
+    rows += ratio_arms("task-e", "model-a", 1, (10.0, 1.0), (10.0, 0.0), cluster="grp-c")
+    rows += ratio_arms("task-e", "model-b", 1, (10.0, 1.0), (10.0, 0.0), cluster="grp-c")
+    rows.append(ratio_row("task-f", "model-a", 1, 10.0, 1.0, condition="cond-a", cluster="grp-d"))
+    pairing = pair_rows(rows, ratio_spec(estimation_unit=BY_MODEL))
+    assert pairing.differences.clusters == ("grp-a", "grp-b")
+    assert pairing.n_clusters_dropped == 2
+    assert pairing.cells_lost == {"no_pair": 1, "zero_denominator": 3, "zero_numerator": 0}
+    assert pairing.missing["zero_denominator"] == 3
+
+
+def test_s13_the_estimation_unit_changes_the_estimand_the_pooled_sums_weigh_the_models_that_spend_most():
     """S13: on the same rows, pooling the models of a group sums A's 360 for 2 wins against B's 120 for 3 in grp-a,
-    ln 4.5, and A's 140 for 3 against B's 70 for 1 in grp-b, ln(2 / 3): model-b's zero is absorbed, not excluded."""
+    ln 4.5, and A's 140 for 3 against B's 70 for 1 in grp-b, ln(2 / 3): model-b's zero is absorbed, not excluded.
+    Each group is its own one cell."""
     pairing = pair_rows(by_model_rows(), ratio_spec())
     assert pairing.differences.models == (POOLED,)
     assert pairing.differences.matrix[:, 0] == pytest.approx([math.log(4.5), math.log(2.0 / 3.0)])
     assert (pairing.n_pairs, pairing.missing["zero_denominator"], pairing.n_clusters_dropped) == (5, 0, 0)
+    assert (pairing.n_cells, pairing.cells_lost) == (2, {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0})
 
 
-def test_s13_the_cluster_attribute_alone_is_the_default_key_and_gives_the_pooled_numbers_exactly():
-    """S13: a key of the attribute alone is the default, and pairs exactly as a contrast that declares no key."""
+def test_s13_the_cluster_attribute_alone_is_the_default_estimation_unit_and_gives_the_pooled_numbers_exactly():
+    """S13: an estimation unit of the attribute alone is the ratio form's default, and pairs exactly as a contrast
+    that declares none."""
     default = pair_rows(by_model_rows(), ratio_spec())
-    declared = pair_rows(by_model_rows(), ratio_spec(cluster_key=("group",)))
-    assert ratio_spec().cluster_key == ("group",) == named().cluster_key
+    declared = pair_rows(by_model_rows(), ratio_spec(estimation_unit=("group",)))
+    assert ratio_spec().estimation_unit == ("group",)
     assert default.differences.clusters == declared.differences.clusters
     assert default.differences.models == declared.differences.models
     assert np.array_equal(default.differences.matrix, declared.differences.matrix)
     assert dataclasses.replace(default, differences=None) == dataclasses.replace(declared, differences=None)
 
 
-def test_a_model_key_needs_the_model_in_every_pair_so_one_task_may_run_on_several_models():
+def test_a_cell_estimation_unit_puts_a_task_run_by_two_models_in_one_group_and_two_cells():
     """The task's cluster is checked on the attribute: a task run by two models is in one group, in two cells."""
     rows = ratio_arms("task-a", "model-a", 1, (10.0, 1.0), (10.0, 1.0))
     rows += ratio_arms("task-a", "model-b", 1, (10.0, 1.0), (10.0, 1.0))
-    assert pair_rows(rows, ratio_spec(cluster_key=BY_MODEL)).differences.models == ("model-a", "model-b")
+    differences = pair_rows(rows, ratio_spec(estimation_unit=BY_MODEL)).differences
+    assert (differences.clusters, differences.models) == (("grp-a",), ("model-a", "model-b"))
 
 
 @pytest.mark.parametrize(
-    ("key", "ratio", "message"),
+    ("unit", "ratio", "message"),
     [
-        (("model", "group"), False, "the model in its cluster key is for a ratio contrast"),
-        (("region",), True, "cluster_key must be"),
-        (("group", "model"), True, "cluster_key must be"),
-        (("model",), True, "cluster_key must be"),
-        (("model", "group", "seed"), True, "cluster_key must be"),
+        (("group",), False, "a contrast of one outcome estimates per model's cell"),
+        (("region",), True, "estimation_unit must be"),
+        (("group", "model"), True, "estimation_unit must be"),
+        (("model",), True, "estimation_unit must be"),
+        (("model", "region"), True, "estimation_unit must be"),
+        (("model", "group", "seed"), True, "estimation_unit must be"),
     ],
 )
-def test_a_cluster_key_that_is_not_the_attribute_or_the_model_and_the_attribute_is_refused(key, ratio, message):
-    """A spec built in code holds the canonical key: the attribute alone, or the model then the attribute, and the
-    model only for a ratio contrast, whose cells it sums."""
+def test_an_estimation_unit_that_is_not_the_attribute_or_the_model_and_the_attribute_is_refused(unit, ratio, message):
+    """A spec built in code holds the canonical unit: for a ratio contrast the attribute alone or the model then the
+    attribute, for a contrast of one outcome the model then the attribute, the cell it already averages within."""
     build = (
         ratio_spec if ratio else functools.partial(ContrastSpec, "x", "score", WILCOXON, "group", ("cond-a", "cond-b"))
     )
     with pytest.raises(ValueError, match=message):
-        build(cluster_key=key)
+        build(estimation_unit=unit)

@@ -86,32 +86,36 @@ MISSING_PAIRS = [
 RATIO_MISSING_PAIRS = [  # after MISSING_PAIRS, only in a report with a ratio contrast (S13)
     "- *Numerator None at denominator 0*: a run of a ratio contrast has no numerator and a denominator of 0, a failed "
     "run whose cost was not measured; a confirmatory contrast with any is refused.",
-    "- *Zero denominator*: the pair is in a cluster whose denominator sums to 0 in either arm, which the "
+    "- *Zero denominator*: the pair is in a cell whose denominator sums to 0 in either arm, which the "
     'preregistration excludes (`zero_denominator = "exclude"`).',
-    "- *Zero numerator*: the pair is in a cluster whose numerator sums to 0 in either arm, excluded by the same rule.",
+    "- *Zero numerator*: the pair is in a cell whose numerator sums to 0 in either arm, excluded by the same rule.",
     "- `-`: a cause that does not apply: a contrast of one outcome has none of the three above.",
 ]
 
 RATIO_NOTES = [
     "A ratio contrast compares arm A's numerator per unit of denominator with arm B's, such as the cost per correct",
-    "result. Cluster key says what one cluster is: a task attribute (each value of it is one cluster, its models",
-    "pooled), or the model and the attribute (one cluster per model and value of the attribute, so Clusters counts",
-    "these cells; each is a unit of the test and of the resampling, and the cells of one value are taken as",
-    "independent). In each cluster, each arm's numerator and denominator are summed over its used pairs, and a run",
-    "whose denominator is 0, a failure, still adds its numerator. The cluster's value is the natural log of A's ratio",
-    "over B's, ln((N_A / D_A) / (N_B / D_B)). The estimate, the intervals, the margin and the minimum detectable",
-    "effect in the contrast tables are on that log scale, and the test is the signed-rank test of the clusters' log",
-    "ratios. Ratio (A / B) is exp of the estimate, the geometric mean over clusters of A's ratio over B's, and Ratio",
-    "interval is exp of the interval. Zero total is the preregistered rule for a cluster whose numerator or",
-    "denominator sums to 0 in either arm, whose log ratio is undefined or infinite:",
-    "`exclude` (the cluster is excluded from the contrast, and its pairs are counted by cause in the pairs tables)",
-    "or `continuity correction c` (c is added to both sums of both arms in every cluster, which keeps every cluster",
+    "result. Estimation unit is the cell whose sums give one log ratio: a task attribute (each value of it, its models",
+    "pooled) or the model and the attribute (each model's cell of a value). Independent unit is the attribute whose",
+    "values are the units of the test, of the resampling and of the minimum detectable effect, and what Clusters",
+    "counts: the cells of one value share its response to the treatment, so they are never counted as independent,",
+    "and a value's log ratio is the mean of its cells', each model weighing the same. Cells is the number of cells",
+    "with a log ratio, then those lost by cause (no pair, or a zero total the rule excludes); a value is dropped only",
+    "when all its cells are lost. In each cell, each arm's numerator and denominator are summed over its used pairs,",
+    "and a run whose denominator is 0, a failure, still adds its numerator. The cell's value is the natural log of A's",
+    "ratio over B's, ln((N_A / D_A) / (N_B / D_B)). The estimate, the intervals, the margin and the minimum detectable",
+    "effect in the contrast tables are on that log scale, and the test is the signed-rank test of the values' log",
+    "ratios. Ratio (A / B) is exp of the estimate, a geometric mean over the values of A's ratio over B's, and Ratio",
+    "interval is exp of the interval. Zero total is the preregistered rule for a cell whose numerator or denominator",
+    "sums to 0 in either arm, whose log ratio is undefined or infinite:",
+    "`exclude` (the cell is excluded from the contrast, and its pairs are counted by cause in the pairs tables)",
+    "or `continuity correction c` (c is added to both sums of both arms in every cell, which keeps every cell",
     "and moves each log ratio most where its sums are small).",
 ]
 
-RATIO_BY_MODEL_NOTES = [  # after the ratio contrasts' table, only for a contrast whose cluster key names the model
+RATIO_BY_MODEL_NOTES = [  # after the ratio contrasts' table, only for a contrast estimated per model's cell
     "Each model's Estimate is the mean log ratio of its own cells, with its ratio and interval from the same",
-    "resamples of the cells as the contrast's: a breakdown with no test of its own, outside the Holm family.",
+    "resamples of the values of the independent unit as the contrast's: a breakdown with no test of its own, outside",
+    "the Holm family.",
 ]
 
 CONDITION_NOTES = [

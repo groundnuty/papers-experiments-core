@@ -39,12 +39,18 @@ refused.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
 
+Every result names its two units: `estimation_unit`, the cell one value is computed in, and `independent_unit`, the
+cluster, whose values the test, the bootstrap and the minimum detectable effect count (`n_clusters`); `n_cells` and
+`cells_lost` count the cells. A contrast of one outcome estimates per (model, cluster) cell and averages each
+cluster's cells with equal weight per model, so several models on one cluster are one unit, never several.
+
 A ratio contrast (S13, `expcore.stats.ratio`) runs the same way on its log ratios: its estimate, interval, margin and
-minimum detectable effect are natural-log ratios, and with a cluster key that names the model its clusters are
-(model, attribute) cells, so `n_clusters` counts cells and `per_model` holds each model's estimate over its own cells,
-from the same draws, with no test of its own. A member of the Holm family that loses a pair because a run's
-numerator is None while its denominator is 0 is refused (`RatioNumeratorRefused`): its ratio would count the cost of
-successful runs alone. An exploratory one reports the count. Both refusals are `ContrastRefused`.
+minimum detectable effect are natural-log ratios. With an estimation unit that names the model its sums run per
+(model, cluster) cell, each cluster's value is the equal-weight mean of its cells, `n_clusters` still counts clusters,
+and `per_model` holds each model's estimate over its own cells, from the same draws of the clusters, with no test of
+its own. A member of the Holm family that loses a pair because a run's numerator is None while its denominator is 0
+is refused (`RatioNumeratorRefused`): its ratio would count the cost of successful runs alone. An exploratory one
+reports the count. Both refusals are `ContrastRefused`.
 """
 
 from __future__ import annotations
@@ -117,9 +123,12 @@ class ContrastResult:
     conclusion: str  # one of CONCLUSIONS
     minimum_detectable_effect: float | None  # None without power settings, NaN when it cannot be reached
     ratio: RatioForm | None = None  # a ratio contrast's form (S13): every number above is then a natural-log ratio
-    # what one cluster is (S13): (cluster,), a value of the attribute, or ("model", cluster), one model's cell of a
-    # value, whose clusters, cells, are what n_clusters counts; None in a result built without one, read as (cluster,)
-    cluster_key: tuple[str, ...] | None = None
+    # the cell one value is computed in (S13): ("model", cluster) for a contrast of one outcome; for a ratio contrast
+    # (cluster,), its sums pooling a cluster's models, or ("model", cluster), its sums per model's cell
+    estimation_unit: tuple[str, ...] | None = None
+    independent_unit: str | None = None  # the cluster, whose values n_clusters, the test and the bootstrap count
+    n_cells: int | None = None  # cells of the estimation unit with a value
+    cells_lost: Mapping[str, int] = dataclasses.field(default_factory=dict)  # cells seen with no value, by cause
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -350,7 +359,10 @@ def run_contrast(
         conclusion=conclude(significant, equivalent, untestable),
         minimum_detectable_effect=mde,
         ratio=spec.ratio,
-        cluster_key=spec.cluster_key,
+        estimation_unit=spec.estimation_unit,
+        independent_unit=spec.cluster,
+        n_cells=pairing.n_cells,
+        cells_lost=dict(pairing.cells_lost),
     )
 
 

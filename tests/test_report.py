@@ -689,6 +689,7 @@ def test_c26_a_campaign_without_a_budget_hold_has_a_row_of_zeros_for_every_condi
 
 # --- a ratio contrast in the report -----------------------------------------------------------------------------------
 
+NO_CELL_LOST = {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0}
 RATIO_MISSING = {
     **NO_PAIR,
     "exhausted": 0,
@@ -705,7 +706,9 @@ EXCLUDE = RatioForm("spend", "wins", "exclude")
 def ratio_contrast(name="spend-per-win", form=EXCLUDE, conclusion="difference", **changes) -> ContrastResult:
     """A ratio contrast's result: its estimate ln 2 with the interval [ln 1.5, ln 3], and the pairs its rule took."""
     numbers = {"estimate": math.log(2.0), "ci_low": math.log(1.5), "ci_high": math.log(3.0), "n_pairs": 20}
+    units = {"estimation_unit": ("group",), "independent_unit": "group", "n_cells": 12, "cells_lost": NO_CELL_LOST}
     base = {"outcome": form.label, "estimator": "ratio", "ratio": form, "pairs_missing": RATIO_MISSING, **numbers}
+    base |= units
     return contrast(name, conclusion, **{**base, **changes})
 
 
@@ -724,14 +727,16 @@ def test_s13_the_ratio_contrasts_table_gives_the_rule_and_the_ratio_itself():
         "Contrast",
         "Numerator",
         "Denominator",
-        "Cluster key",
+        "Estimation unit",
+        "Independent unit",
+        "Cells",
         "Zero total",
         "Ratio (A / B)",
         "Ratio interval",
     ]
-    assert table["spend-per-win"][1:] == ["spend", "wins", "group", "exclude", "2", "[1.5, 3]"]
-    assert table["spend-per-win-c"][4] == "continuity correction 0.5"
-    assert "the cluster is excluded from the contrast" in report.split("## Ratio contrasts")[1]
+    assert table["spend-per-win"][1:] == ["spend", "wins", "group", "group", "12", "exclude", "2", "[1.5, 3]"]
+    assert table["spend-per-win-c"][6] == "continuity correction 0.5"
+    assert "the cell is excluded from the contrast" in report.split("## Ratio contrasts")[1]
 
 
 def test_s13_the_terminal_summary_says_a_ratio_contrasts_estimate_is_a_log_ratio():
@@ -764,7 +769,7 @@ def test_s13_an_untestable_ratio_contrast_names_the_rule_that_took_its_pairs():
     dry = ratio_contrast(conclusion="untestable", n_pairs=0, **nothing)
     report = render(analysis(dry))
     assert row(report, "spend-per-win")[11] == "0 (missing: numerator None at denominator 0 1, zero denominator 3)"
-    assert table_of(report, "## Ratio contrasts")["spend-per-win"][5:] == ["n/a", "[n/a, n/a]"]
+    assert table_of(report, "## Ratio contrasts")["spend-per-win"][7:] == ["n/a", "[n/a, n/a]"]
 
 
 BY_MODEL = (
@@ -774,16 +779,22 @@ BY_MODEL = (
 
 
 def by_model_contrast(name="spend-per-win") -> ContrastResult:
-    """A ratio contrast clustered by (model, group) cells, with each model's estimate from the same draws."""
-    return ratio_contrast(name, cluster_key=("model", "group"), per_model=BY_MODEL)
+    """A ratio contrast estimated per (model, group) cell and tested over groups, with each model's estimate from the
+    same draws of the groups; one cell lost to a zero denominator."""
+    lost = {**NO_CELL_LOST, "zero_denominator": 1}
+    return ratio_contrast(name, estimation_unit=("model", "group"), per_model=BY_MODEL, n_cells=23, cells_lost=lost)
 
 
-def test_s13_the_ratio_contrasts_table_names_each_contrasts_cluster_key():
-    """S13: the key decides the estimand and the units the Clusters column counts, so the report names it."""
-    report = render(analysis(by_model_contrast(), ratio_contrast("pooled-per-win", cluster_key=("group",))))
+def test_s13_the_ratio_contrasts_table_names_each_contrasts_estimation_and_independent_units():
+    """S13: the estimation unit decides the estimand and the independent unit what Clusters, the test and the
+    resampling count, so the report names both, with the cells used and lost."""
+    report = render(analysis(by_model_contrast(), ratio_contrast("pooled-per-win")))
     table = table_of(report, "## Ratio contrasts")
-    assert (table["spend-per-win"][3], table["pooled-per-win"][3]) == ("model, group", "group")
-    assert "one cluster per model and value of the attribute" in report.split("## Ratio contrasts")[1]
+    assert table["spend-per-win"][3:6] == ["model, group", "group", "23 (lost: zero denominator 1)"]
+    assert table["pooled-per-win"][3:6] == ["group", "group", "12"]
+    notes = report.split("## Ratio contrasts")[1]
+    assert "never counted as independent" in notes
+    assert "each model weighing the same" in notes
 
 
 def test_s13_a_ratio_contrast_by_model_shows_each_models_ratio_as_an_exploratory_breakdown():

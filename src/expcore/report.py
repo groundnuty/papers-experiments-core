@@ -37,10 +37,11 @@ are the same text: no clock, no path and no random number enters it.
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
 - A ratio contrast (S13) shows its outcome as `ln(numerator/denominator)`, since its numbers are natural-log ratios,
-  and a section "Ratio contrasts" gives each one's two outcomes, its cluster key, its preregistered rule for a zero sum
-  and exp of its estimate and interval, then, for a contrast whose key names the model, each model's estimate as an
-  exploratory breakdown. Its pairs table has three more causes, `-` for a contrast of one outcome. A report with no
-  ratio contrast has none of this, so it is the text it was before ratio contrasts existed.
+  and a section "Ratio contrasts" gives each one's two outcomes, its estimation unit and its independent unit, its
+  cells used and lost, its preregistered rule for a zero sum and exp of its estimate and interval, then, for a
+  contrast estimated per model's cell, each model's estimate as an exploratory breakdown. Its pairs table has three
+  more causes, `-` for a contrast of one outcome. A report with no ratio contrast has none of this, so it is the text
+  it was before ratio contrasts existed.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
   the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
@@ -332,14 +333,22 @@ def _zero_rule(form: RatioForm) -> str:
     return form.zero_denominator
 
 
-def _cluster_key(result: ContrastResult) -> str:
-    """The contrast's cluster key as the ratio table shows it: the attribute, or the model and the attribute."""
-    return ", ".join(result.cluster_key or (result.cluster,))
+def _estimation_unit(result: ContrastResult) -> str:
+    """The cell one value is computed in, as the ratio table shows it: the attribute, or the model and the attribute."""
+    return ", ".join(result.estimation_unit or (result.cluster,))
+
+
+def _cells(result: ContrastResult) -> str:
+    """The cells with a value, and those lost by cause when any is; `-` in a result that does not count them."""
+    if result.n_cells is None:
+        return NOT_APPLICABLE
+    lost = [f"{cause.replace('_', ' ')} {count}" for cause, count in result.cells_lost.items() if count]
+    return f"{result.n_cells} (lost: {', '.join(lost)})" if lost else str(result.n_cells)
 
 
 def _by_model(ratios: Sequence[ContrastResult]) -> list[str]:
-    """Each model's estimate of a ratio contrast whose key names the model, as a ratio (S13); nothing when none has
-    one. Exploratory: from the same draws as the contrast's, with no test of its own."""
+    """Each model's estimate of a ratio contrast estimated per model's cell, as a ratio (S13); nothing when none has
+    one. Exploratory: from the same draws of the groups as the contrast's, with no test of its own."""
     rows = [
         [
             r.name,
@@ -358,8 +367,8 @@ def _by_model(ratios: Sequence[ContrastResult]) -> list[str]:
 
 
 def _ratios(results: Sequence[ContrastResult]) -> list[str]:
-    """Each ratio contrast's two outcomes, its cluster key, its zero rule, and its estimate and interval as ratios
-    (S13), then each model's where the key names the model; nothing when there is no ratio contrast."""
+    """Each ratio contrast's two outcomes, its two units, its cells, its zero rule, and its estimate and interval as
+    ratios (S13), then each model's where it is estimated per model's cell; nothing when there is no ratio contrast."""
     ratios = [r for r in results if r.ratio is not None]
     if not ratios:
         return []
@@ -368,14 +377,26 @@ def _ratios(results: Sequence[ContrastResult]) -> list[str]:
             r.name,
             r.ratio.numerator,
             r.ratio.denominator,
-            _cluster_key(r),
+            _estimation_unit(r),
+            r.independent_unit or r.cluster,
+            _cells(r),
             _zero_rule(r.ratio),
             _num(_exp(r.estimate)),
             f"[{_num(_exp(r.ci_low))}, {_num(_exp(r.ci_high))}]",
         ]
         for r in ratios
     ]
-    header = ["Contrast", "Numerator", "Denominator", "Cluster key", "Zero total", "Ratio (A / B)", "Ratio interval"]
+    header = [
+        "Contrast",
+        "Numerator",
+        "Denominator",
+        "Estimation unit",
+        "Independent unit",
+        "Cells",
+        "Zero total",
+        "Ratio (A / B)",
+        "Ratio interval",
+    ]
     return ["## Ratio contrasts", "", *_table(header, rows), "", *RATIO_NOTES, "", *_by_model(ratios)]
 
 

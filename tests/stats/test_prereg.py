@@ -540,7 +540,9 @@ def test_s13_a_ratio_contrast_that_is_not_fully_declared_is_refused_naming_the_k
         load(write(tmp_path, with_ratio(old, new)))
 
 
-@pytest.mark.parametrize("key", ["numerator", "denominator", "zero_denominator", "continuity_correction"])
+@pytest.mark.parametrize(
+    "key", ["numerator", "denominator", "zero_denominator", "continuity_correction", "estimation_unit"]
+)
 def test_s13_a_ratio_key_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
     """S13: a difference estimator reads one outcome, so a numerator beside it would be silently ignored."""
     text = edited('outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n',
@@ -555,52 +557,73 @@ def test_s13_a_ratio_contrast_may_declare_an_equivalence_margin_on_the_log_scale
     assert load(write(tmp_path, text)).contrasts["spend-per-win"].equivalence_margin == 0.2231
 
 
-# --- a ratio contrast's cluster key: the attribute alone, or the model and the attribute -----------------------------
+# --- a ratio contrast's estimation unit, and the cluster as the independent unit of every contrast -----------------
 
 
 @pytest.mark.parametrize("written", ['["model", "group"]', '["group", "model"]'])
-def test_s13_a_ratio_contrast_may_declare_the_model_and_the_attribute_as_its_cluster_key(tmp_path, written):
-    """S13: one cluster per model's cell of a group, the key held in one order whichever way it is written; the
-    attribute is still the contrast's `cluster`, which every task must have."""
-    spec = load(write(tmp_path, with_ratio('cluster = "group"', f"cluster = {written}"))).contrasts["spend-per-win"]
-    assert (spec.cluster, spec.cluster_key) == ("group", ("model", "group"))
+def test_s13_a_ratio_contrast_may_estimate_per_models_cell_of_its_cluster(tmp_path, written):
+    """S13: the sums run per model's cell of a group, the unit held in one order whichever way it is written; the
+    group stays the contrast's `cluster`, the independent unit its test and bootstrap count."""
+    text = with_ratio('cluster = "group"', f'cluster = "group"\nestimation_unit = {written}')
+    spec = load(write(tmp_path, text)).contrasts["spend-per-win"]
+    assert (spec.cluster, spec.estimation_unit) == ("group", ("model", "group"))
 
 
-@pytest.mark.parametrize("written", ['"group"', '["group"]'])
-def test_s13_the_attribute_alone_is_the_default_key_written_bare_or_as_a_list(tmp_path, written):
-    """S13: the default, the models of a group pooled, is the key of the attribute alone."""
-    spec = load(write(tmp_path, with_ratio('cluster = "group"', f"cluster = {written}"))).contrasts["spend-per-win"]
-    assert (spec.cluster, spec.cluster_key) == ("group", ("group",))
-    assert load(write(tmp_path)).contrasts["a-vs-b"].cluster_key == ("group",)
+@pytest.mark.parametrize("written", [None, '"group"', '["group"]'])
+def test_s13_the_cluster_alone_is_the_default_estimation_unit_of_a_ratio_contrast(tmp_path, written):
+    """S13: the default, the models of a group pooled in its sums, is the unit of the attribute alone; a contrast of
+    one outcome estimates per model's cell of its cluster, as it always has."""
+    text = (
+        with_ratio()
+        if written is None
+        else with_ratio('cluster = "group"', f'cluster = "group"\nestimation_unit = {written}')
+    )
+    spec = load(write(tmp_path, text)).contrasts["spend-per-win"]
+    assert (spec.cluster, spec.estimation_unit) == ("group", ("group",))
+    assert load(write(tmp_path)).contrasts["a-vs-b"].estimation_unit == ("model", "group")
 
 
 @pytest.mark.parametrize(
     ("written", "message"),
     [
-        ('["model"]', "one task attribute"),
-        ("[]", "one task attribute"),
-        ('["group", "region"]', "one task attribute"),
-        ('["model", "group", "region"]', "one task attribute"),
+        ('["model"]', "the contrast's cluster 'group'"),
+        ("[]", "the contrast's cluster 'group'"),
+        ('["region"]', "the contrast's cluster 'group'"),
+        ('["model", "region"]', "the contrast's cluster 'group'"),
+        ('["model", "group", "region"]', "the contrast's cluster 'group'"),
         ('["model", "model"]', "twice"),
-        ('["task", "group"]', "'task' is a field of the run key"),
-        ('["seed", "group"]', "'seed' is a field of the run key"),
-        ('["gate", "group"]', "'gate' is a field of the run key"),
+        ('["task", "group"]', "the contrast's cluster 'group'"),
+        ('["seed", "group"]', "the contrast's cluster 'group'"),
         ('["model", ""]', "array of non-empty strings"),
-        ("3", "a task attribute, or an array"),
+        ("3", "an array"),
     ],
 )
-def test_s13_a_cluster_key_that_is_not_the_model_and_one_attribute_is_refused(tmp_path, written, message):
-    """S13: the key exposes the model and one task attribute, the unit the kernel resamples; anything else fails."""
-    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key 'cluster' .*{message}"):
-        load(write(tmp_path, with_ratio('cluster = "group"', f"cluster = {written}")))
-
-
-def test_s13_a_model_in_the_cluster_key_of_a_contrast_of_one_outcome_is_refused(tmp_path):
-    """S13: a difference contrast already pairs within each model and averages the models of a cluster."""
-    text = edited('estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"',
-                  'estimator = "wilcoxon_cluster_bootstrap"\ncluster = ["model", "group"]')  # fmt: skip
-    with pytest.raises(ConfigError, match=r"\[contrasts.a-vs-b\]: key 'cluster' .*ratio contrast"):
+def test_s13_an_estimation_unit_that_is_not_the_cluster_or_the_model_and_the_cluster_is_refused(
+    tmp_path, written, message
+):
+    """S13: a cell nests in the contrast's independent unit, so it is the cluster alone or the model's cell of it."""
+    text = with_ratio('cluster = "group"', f'cluster = "group"\nestimation_unit = {written}')
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key 'estimation_unit' .*{message}"):
         load(write(tmp_path, text))
-    listed = edited('estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"',
-                    'estimator = "wilcoxon_cluster_bootstrap"\ncluster = ["group"]')  # fmt: skip
-    assert load(write(tmp_path, listed)).contrasts["a-vs-b"].cluster_key == ("group",)
+
+
+@pytest.mark.parametrize("confirmatory", [True, False])
+def test_s13_cells_declared_as_the_cluster_are_refused_naming_why_they_are_not_independent(tmp_path, confirmatory):
+    """S13: (model, group) cells of one group share its response to the treatment, so a test over them as
+    independent units claims an n it does not have. The cluster names one attribute, on any contrast, and the
+    refusal names the declaration that estimates per cell and tests over groups."""
+    text = with_ratio('cluster = "group"', 'cluster = ["model", "group"]')
+    if confirmatory:
+        text = text.replace('"gate-effect"]', '"gate-effect", "spend-per-win"]', 1)
+    with pytest.raises(ConfigError, match=r"\[contrasts.spend-per-win\]: key 'cluster' .*not independent") as caught:
+        load(write(tmp_path, text))
+    assert 'estimation_unit = ["model", "group"]' in str(caught.value)
+
+
+@pytest.mark.parametrize("written", ['["group"]', '["model", "group"]'])
+def test_a_cluster_written_as_an_array_is_refused_on_a_contrast_of_one_outcome(tmp_path, written):
+    """The cluster of every contrast is one task attribute, a string."""
+    text = edited('estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"',
+                  f'estimator = "wilcoxon_cluster_bootstrap"\ncluster = {written}')  # fmt: skip
+    with pytest.raises(ConfigError, match=r"\[contrasts.a-vs-b\]: key 'cluster' .*one task attribute"):
+        load(write(tmp_path, text))

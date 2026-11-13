@@ -1197,57 +1197,128 @@ def test_s13_a_ratio_contrasts_pilot_power_reads_its_cluster_log_ratios():
     assert result.rows[0]["sd"] == pytest.approx(np.std([math.log(4.0 * r) for r in RATIOS], ddof=1))
 
 
-# --- a ratio contrast's declared cluster key: (model, group) cells as the units -------------------------------------
+# --- a ratio contrast's declared estimation unit: estimated per (model, group) cell, tested over groups ------------
 
 CELL_RATIOS = {"model-a": (6.0, 2.0, 3.0, 1.5), "model-b": (4.0, 5.0, 2.5, 3.5)}  # the planted ratio of each cell
 
 
-def cell_rows():
+def cell_rows(ratios=CELL_RATIOS):
     """Per (model, group) cell one task: A spends 40 r for 1 win and 40 r for 0 (a failed run), B 20 for 1 twice, so
     the cell's log ratio is ln((80 r / 1) / (40 / 2)) = ln(4 r)."""
     rows = []
-    for model, ratios in CELL_RATIOS.items():
-        for i, ratio in enumerate(ratios):
+    for model, planted in ratios.items():
+        for i, ratio in enumerate(planted):
             rows += ratio_arms(f"t{i}", model, 1, (40.0 * ratio, 1.0), (20.0, 1.0), cluster=f"c{i}")
             rows += ratio_arms(f"t{i}", model, 2, (40.0 * ratio, 0.0), (20.0, 1.0), cluster=f"c{i}")
     return rows
 
 
-def cell_prereg(cluster='["model", "group"]'):
-    """The ratio preregistration with its confirmatory contrast's cluster key as given."""
-    text = RATIO_TEXT.replace('cluster = "group"\nequivalence_margin', f"cluster = {cluster}\nequivalence_margin", 1)
+def cell_prereg(unit='["model", "group"]'):
+    """The ratio preregistration with its confirmatory contrast's estimation unit as given (None: not declared)."""
+    declared = "" if unit is None else f"estimation_unit = {unit}\n"
+    text = RATIO_TEXT.replace(
+        'cluster = "group"\nequivalence_margin', f'cluster = "group"\n{declared}equivalence_margin'
+    )
     return parse(tomllib.loads(text), "inline", "d" * 64, ARMS)
 
 
-def test_s13_a_model_and_group_key_makes_each_cell_a_unit_hand_computed():
-    """S13: eight cells, so the estimate is the mean of their eight ln(4 r), the exact p-value of eight positive log
-    ratios is 2 / 2**8, and each model's estimate is the mean of its own four cells."""
+def test_s13_a_cell_estimation_unit_estimates_per_cell_and_tests_over_groups_hand_computed():
+    """S13: each group's value is the equal-weight mean of its two cells' ln(4 r), the estimate the mean of the four
+    groups' values, and the exact p-value of four positive group values 2 / 2**4: four independent units, not the
+    eight cells (whose p-value would be 2 / 2**8). Each model's estimate is the mean of its own four cells."""
     contrast = analyse(cell_rows(), cell_prereg()).contrast("spend-per-win")
-    every = [math.log(4.0 * r) for ratios in CELL_RATIOS.values() for r in ratios]
-    assert contrast.estimate == pytest.approx(np.mean(every))
-    assert contrast.p_value == pytest.approx(2 / 2**8)
-    assert (contrast.n_clusters, contrast.n_pairs, contrast.cluster_key) == (8, 16, ("model", "group"))
+    groups = [np.mean([math.log(4.0 * CELL_RATIOS[m][i]) for m in CELL_RATIOS]) for i in range(4)]
+    assert contrast.estimate == pytest.approx(np.mean(groups))
+    assert contrast.p_value == pytest.approx(2 / 2**4)
+    assert (contrast.n_clusters, contrast.n_cells, contrast.n_pairs) == (4, 8, 16)
+    assert (contrast.estimation_unit, contrast.independent_unit) == (("model", "group"), "group")
     assert [(m.model, m.estimate) for m in contrast.per_model] == [
         (model, pytest.approx(np.mean([math.log(4.0 * r) for r in ratios]))) for model, ratios in CELL_RATIOS.items()
     ]
 
 
-def test_s13_the_record_names_the_cluster_key_each_contrast_used():
-    """S13: analysis.json gives every contrast its key, the attribute alone by default."""
+def test_s13_perfectly_correlated_cells_of_a_group_give_the_inference_of_one_cell_per_group():
+    """S13: when model-b's cells repeat model-a's in every group, the second model adds no independent evidence, so
+    the estimate, the p-value, both intervals, the minimum detectable effect and the clusters counted are those of
+    model-a alone: the test, the bootstrap and the power count groups, not cells. Eight groups, so the test can
+    reject at all and the minimum detectable effect is a number."""
+    planted = RATIOS
+    twice = analyse(cell_rows({"model-a": planted, "model-b": planted}), cell_prereg()).contrast("spend-per-win")
+    once = analyse(cell_rows({"model-a": planted}), cell_prereg()).contrast("spend-per-win")
+    fields = ("estimate", "p_value", "ci_low", "ci_high", "equivalence_interval", "minimum_detectable_effect")
+    assert [getattr(twice, f) for f in fields] == [getattr(once, f) for f in fields]
+    assert (twice.n_clusters, once.n_clusters, twice.n_cells, once.n_cells) == (8, 8, 16, 8)
+    assert math.isfinite(twice.minimum_detectable_effect)
+
+
+PLAIN_TEXT = """\
+alpha = 0.05
+holm_family = ["score-gain"]
+
+[bootstrap]
+replicates = 300
+seed = 9
+
+[power]
+seed = 2
+n_simulations = 30
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[contrasts.score-gain]
+conditions = ["cond-a", "cond-b"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+equivalence_margin = 0.2
+"""
+
+
+def test_difference_contrasts_take_the_group_as_the_independent_unit_however_many_models_run_it():
+    """A difference contrast already estimates per (model, group) cell and tests over groups: a second model whose
+    differences repeat the first's in every group leaves the estimate, the p-value, both intervals, the minimum
+    detectable effect and the clusters counted as they are with one model."""
+    prereg = parse(tomllib.loads(PLAIN_TEXT), "inline", "d" * 64, ARMS)
+
+    def rows(models):
+        return [
+            row
+            for i, delta in enumerate((0.3, 0.1, 0.25, -0.05, 0.2, 0.15, 0.35, 0.4))
+            for model in models
+            for row in both_arms(f"t{i}", model, 1, 0.5 + delta, 0.5, cluster=f"c{i}")
+        ]
+
+    twice = analyse(rows(("model-a", "model-b")), prereg).contrast("score-gain")
+    once = analyse(rows(("model-a",)), prereg).contrast("score-gain")
+    fields = ("estimate", "p_value", "ci_low", "ci_high", "equivalence_interval", "minimum_detectable_effect")
+    assert [getattr(twice, f) for f in fields] == [getattr(once, f) for f in fields]
+    assert (twice.n_clusters, once.n_clusters, twice.n_cells, once.n_cells) == (8, 8, 16, 8)
+    assert (twice.estimation_unit, twice.independent_unit) == (("model", "group"), "group")
+    assert math.isfinite(twice.minimum_detectable_effect)
+
+
+def test_s13_the_record_names_the_estimation_unit_and_the_independent_unit_of_each_contrast():
+    """S13: analysis.json gives every contrast the cell it estimates in and the unit its test and bootstrap count,
+    with its cells used and lost by cause."""
     result = analyse(cell_rows(), cell_prereg())
     written = {c["name"]: c for c in json.loads(_json_text({"contrasts": result.contrasts}))["contrasts"]}
-    assert written["spend-per-win"]["cluster_key"] == ["model", "group"]
-    assert written["spend-per-win-side"]["cluster_key"] == ["group"]
-    assert [m["model"] for m in written["spend-per-win"]["per_model"]] == ["model-a", "model-b"]
+    confirmatory, side = written["spend-per-win"], written["spend-per-win-side"]
+    assert (confirmatory["estimation_unit"], confirmatory["independent_unit"]) == (["model", "group"], "group")
+    assert (side["estimation_unit"], side["independent_unit"]) == (["group"], "group")
+    assert (confirmatory["n_cells"], confirmatory["n_clusters"]) == (8, 4)
+    assert confirmatory["cells_lost"] == {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0}
+    assert "cluster_key" not in confirmatory
+    assert [m["model"] for m in confirmatory["per_model"]] == ["model-a", "model-b"]
 
 
-def test_s13_the_group_key_declared_as_a_list_gives_the_numbers_of_the_default_exactly():
-    """S13: `cluster = ["group"]` is the default key, so its result is the one `cluster = "group"` gives, field for
+def test_s13_the_group_estimation_unit_declared_gives_the_numbers_of_the_default_exactly():
+    """S13: `estimation_unit = ["group"]` is the default, so its result is the one an undeclared unit gives, field for
     field: four groups, each pooling its two models, and no estimate by model."""
     listed = analyse(cell_rows(), cell_prereg('["group"]')).contrast("spend-per-win")
-    default = analyse(cell_rows(), cell_prereg('"group"')).contrast("spend-per-win")
+    default = analyse(cell_rows(), cell_prereg(None)).contrast("spend-per-win")
     assert _json_text(listed) == _json_text(default)  # NaN is null there, so an undefined number compares too
-    assert (default.n_clusters, default.cluster_key, default.per_model) == (4, ("group",), ())
+    assert (default.n_clusters, default.estimation_unit, default.per_model) == (4, ("group",), ())
 
 
 TWO_BOUNDS = """\
@@ -1264,7 +1335,8 @@ estimator = "ratio"
 numerator = "spend_low"
 denominator = "wins"
 zero_denominator = "exclude"
-cluster = ["model", "group"]
+cluster = "group"
+estimation_unit = ["model", "group"]
 
 [contrasts.high-per-win]
 conditions = ["cond-a", "cond-b"]
@@ -1272,7 +1344,8 @@ estimator = "ratio"
 numerator = "spend_high"
 denominator = "wins"
 zero_denominator = "exclude"
-cluster = ["model", "group"]
+cluster = "group"
+estimation_unit = ["model", "group"]
 """
 
 
