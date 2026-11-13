@@ -415,6 +415,13 @@ assert check["n_ok"] == check["n_records"] == len(check["replayed"]) and not che
 assert check["code"]["dirty"] is False and "campaign-snapshot.sqlite" in check["inputs"]
 ```
 
+### Lease slots on the Onedata platform
+
+Each run that uses the platform's users leases one slot: a pair of a data-path user and a tool-server user that `platform.toml` declares under `[slots]`. A slot's tool-server user holds exactly one set of rights, which the slot declares in `[slots.<name>.toolserver] rights = [...]` (required), and a run leases only from the group of slots whose rights equal its condition's. So one campaign can interleave a read-only condition and a writing one, each run getting a slot of its own kind; a condition whose rights no slot declares is refused when the campaign is built. Two planning rules follow:
+
+- **Declare at least two slots per rights group.** A teardown that cannot be proven holds its slot until it is cleared, so a group with one slot stops every run of its conditions until then.
+- **Size the slots of each group to the plan's mix.** The dispatcher does not look for a group with a free slot: when the next runs all belong to one group, workers wait for that group's slots even while another group's sit idle. Give each group roughly its share of the concurrent runs.
+
 ### Files an agent writes
 
 A file the agent writes during a run (a report, a mask, a table) has no place in the batch unless the study declares it as a side file ([below](#side-files)). Undeclared, the check takes every `.json` file under `out/runs` as a record, so a `.json` file beside a record fails the check at `load` (`unsupported record schema None`); a file of any other kind is not among the check's inputs, so nothing vouches for it; and `analyze` reads the records alone. The scorer is a pure function of the record and of its declared side files, so what it needs of an undeclared file must be in the record.

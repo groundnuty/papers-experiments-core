@@ -5,10 +5,11 @@ table is added to the platform document without that module knowing it.
 """
 
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.rights import BASELINE_RIGHTS as BASELINE
 from expcore_onedata.sandbox import teardown
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxSpec
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -45,12 +46,18 @@ FAST = teardown.Waits(
 )
 
 
-def slots_data() -> dict[str, Any]:
-    """The default `[slots]` document: two slots, each a lease key with a data-path user and a tool-server user."""
+def slots_data(rights: Mapping[str, Sequence[str]] | None = None) -> dict[str, Any]:
+    """The default `[slots]` document: two slots, each a lease key with a data-path user and a tool-server user. Each
+    tool-server user declares the baseline rights, unless `rights` gives a slot (by its name) others."""
+    declared = rights or {}
     return {
         name: {
             "data_path": {"username": f"{name}-data", "user_id": SLOT_USERS[f"{name}-data"][1]},
-            "toolserver": {"username": f"{name}-tools", "user_id": SLOT_USERS[f"{name}-tools"][1]},
+            "toolserver": {
+                "username": f"{name}-tools",
+                "user_id": SLOT_USERS[f"{name}-tools"][1],
+                "rights": list(declared.get(name, BASELINE)),
+            },
         }
         for name in ("slot-a", "slot-b")
     }

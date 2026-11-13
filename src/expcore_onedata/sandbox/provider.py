@@ -6,10 +6,12 @@
 
 Per run (never per campaign) the run leases one slot of `[slots.<name>]` (`users.py`) when it needs a data-path token or
 a tool server, and none when it needs neither. A slot gives the run both planes' users, so there is one pool of leased
-users and one lease key per run. `users.SlotTokens` mints the run's tokens on the slot's users at once, with one
-journalled expiry: the data path's (read-only and scoped to the study space, with the interface of the run's data path)
-and, for a condition with a tool server, the tool server's, each with a lifetime from the run's whole-time ceiling. The
-sandbox starts with the first; the tool server (`tool_server`) starts with the second, on the same slot's tool-server
+users and one lease key per run. A run with a tool server leases from its condition's group, the slots whose tool-server
+user declares the condition's rights (`users.group_of`, O31), so conditions of different rights interleave in one
+campaign; a run with a data path alone leases from every slot. `users.SlotTokens` mints the run's tokens on the slot's
+users at once, with one journalled expiry: the data path's (read-only and scoped to the study space, with the interface
+of the run's data path) and, for a condition with a tool server, the tool server's, each with a lifetime from the run's
+whole-time ceiling. The sandbox starts with the first; the tool server (`tool_server`) starts with the second, on the same slot's tool-server
 user. The core's lease pool (C19) holds the key for the attempt. The `ResourceProbe` (`probe`) is
 `users.SlotProbe(journal, sandbox_gone=SandboxProbe(...).resource_gone)`: a key is freed only when no container,
 network or mount of the sandbox is left and the slot's tokens have ended, by their journalled expiry plus a margin.
@@ -41,6 +43,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.lease import Lease, process_gone
+from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
 from expcore_onedata.admission import require_admission, retain_admission
@@ -288,12 +291,32 @@ class SandboxPlatform:
         return self._s.mode_of(str(factors[DATA_PATH_FACTOR]))
 
     def lease_group(self, factors: Mapping[str, Any]) -> str | None:
-        """The lease group of a run: the slots, when it needs a data-path token or a tool server; None when neither."""
-        needs = self.mode(factors) is not DataPathMode.NONE or self._tool_condition(factors) is not None
-        return GROUP if needs else None
+        """The lease group of a run (O31): with a tool server, its condition's (`condition_group`), the slots whose
+        tool-server user holds exactly the condition's rights; with a data path alone, `GROUP`, every slot; None when
+        it needs neither. The scheduler asks it of every run of the plan when the campaign is built, so a condition
+        whose rights no slot declares is refused then, never at a run's mint."""
+        mode = self.mode(factors)
+        condition = self._tool_condition(factors)
+        if condition is not None:
+            return self.condition_group(condition)
+        return GROUP if mode is not DataPathMode.NONE else None
+
+    def condition_group(self, condition: str) -> str:
+        """The lease group of a tool-server condition: the slots whose tool-server user declares its rights. Raise
+        ConfigError, naming the condition by its position and the rights, when it is not declared or no slot declares
+        its rights."""
+        rights = self._config.condition(condition).rights
+        try:
+            return self._slots.group_for(rights)
+        except ValueError:
+            raise ConfigError(
+                f"{self._config.file}: [slots]: no slot's tool-server user declares the rights of [toolserver] "
+                f"{self._config.condition_label(condition)} ({', '.join(rights)}), so its runs could lease no slot"
+            ) from None
 
     def lease_keys(self, group: str) -> Sequence[str]:
-        """The keys of a lease group: the names of `[slots]`; a group this layer does not declare is refused."""
+        """The keys of a lease group: every slot of `[slots]` for `GROUP`, those of one set of tool-server rights for its
+        group; a group the slots do not declare is refused."""
         return self._slots.keys_of(group)
 
     def sandbox_probe(self) -> SandboxProbe:
