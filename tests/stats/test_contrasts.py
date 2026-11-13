@@ -335,6 +335,8 @@ def test_s15_clusters_with_no_spread_give_no_tost_p():
     """S15: equal differences have a standard error of 0, and a t-test of them is no number, never certainty."""
     assert math.isnan(tost_t([0.0, 0.0, 0.0], 0.2))
     assert math.isnan(tost_t([0.1 + 0.2, 0.3, 0.3], 0.2))  # equal in arithmetic, after the float noise is snapped
+    assert math.isnan(tost_t([0.1, 0.1, 0.1], 0.2))  # their float mean is not 0.1, so their float SD is not 0
+    assert all(math.isnan(v) for v in tost_t_interval([0.1, 0.1, 0.1], 0.05))
 
 
 @pytest.mark.parametrize("margin", [0.0, -1.0, math.inf, math.nan, True])

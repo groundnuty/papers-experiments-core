@@ -166,8 +166,11 @@ def _mean_and_se(studies: np.ndarray, decimals: int) -> tuple[np.ndarray, np.nda
         return nan, nan, n
     mean = snapped.mean(axis=1)
     sd = snapped.std(axis=1, ddof=1)
+    # Equal values have no spread, though their float SD can be 1e-17 (three 0.1s do not average to 0.1): compare the
+    # snapped values themselves, never the SD with 0.
+    spread = snapped.max(axis=1) > snapped.min(axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        se = np.where(sd > 0, sd / math.sqrt(n), math.nan)
+        se = np.where(spread, sd / math.sqrt(n), math.nan)
     return mean, se, n
 
 

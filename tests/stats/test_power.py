@@ -278,6 +278,7 @@ def test_s15_the_simulation_judges_each_study_by_the_rule_the_analysis_uses():
         assert tost_t_p_values(studies, margin) == pytest.approx(kernel.tost_t_studies(studies, margin), rel=1e-9)
     never = feasibility(0.01, p_values=lambda studies, margin: np.ones(studies.shape[0]))
     assert never == [0.0, 0.0]
+    assert np.isnan(tost_t_p_values(np.full((2, 3), 0.1), 0.2)).all()  # equal values: no spread, whatever the float SD
 
 
 def test_s15_the_feasibility_is_a_function_of_its_seed():
