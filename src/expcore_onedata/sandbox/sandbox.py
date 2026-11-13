@@ -77,10 +77,12 @@ from expcore_onedata.sandbox.containers import (
     certifi_bundle,
     certifi_probe_args,
     effective_log_dir,
+    extra_args_record,
     gate_run_args,
     gate_upstreams,
     sidecar_abort_args,
     sidecar_command,
+    sidecar_options,
     sidecar_run_args,
     trust_targets,
 )
@@ -579,7 +581,9 @@ class DockerSandbox:
         command = sidecar_command(host_name, s)
         self._log_dir = effective_log_dir(command)
         self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
-            "io_mode": s.mount.io_mode,
+            "io_mode": s.mount.io_mode,  # the declared one, always: oneclient's own detection never runs (O36)
+            "options": sidecar_options(s),  # what the sandbox itself passes to oneclient, in order
+            "extra_args": extra_args_record(s.mount.extra_args),  # the study's, by option name and one hash (O12)
             "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
             "network": "federation" if s.federation is not None else "default bridge",  # `sidecar_route`'s, by kind
         }

@@ -15,6 +15,7 @@ alone.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
-from expcore_onedata.sandbox.settings import SandboxSettings
+from expcore_onedata.sandbox.settings import IO_MODE_FLAGS, IO_MODES, SandboxSettings
 from expcore_onedata.sandbox.teardown import SIDECAR_MOUNT, SIDECAR_SUFFIX
 
 AGENT_OOM_SCORE_ADJ = 1000  # the host's out-of-memory killers take the agent's processes before anything else
@@ -117,6 +118,33 @@ class Names:
         return cls(sid, agent, agent + "-net", agent + "-gate", agent + SIDECAR_SUFFIX)
 
 
+def sidecar_options(settings: SandboxSettings) -> list[str]:
+    """The oneclient options the sandbox itself sets, in the order it passes them: the read-only mount options, the
+    mode's force-I/O option, and `--insecure` when the platform's `[tls]` says so. The study's `extra_args` are not
+    here.
+
+    The I/O mode is always declared (O36): oneclient 25.0 started with neither force option detects each storage's
+    access type at the first read of each space, and its detection for a second space on one storage waits on a mutex
+    its own thread already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`), so that read never
+    returns. A mount without a known `io_mode` raises here rather than start oneclient without one."""
+    mount = settings.mount
+    if mount is None:
+        raise ValueError("a mount data path needs [sandbox.mount]")
+    if mount.io_mode not in IO_MODE_FLAGS:
+        raise ValueError(f"[sandbox.mount] io_mode must be one of: {', '.join(IO_MODES)}")
+    return [
+        *("-o", "ro,allow_other", IO_MODE_FLAGS[mount.io_mode]),
+        *(["--insecure"] if settings.tls.insecure else []),
+    ]
+
+
+def extra_args_record(extra_args: Sequence[str]) -> dict[str, Any]:
+    """The study's extra oneclient arguments as a run's metadata keeps them: the option names, and the SHA-256 of the
+    whole list, never a value (a value may be a path or an identifier, O12)."""
+    names = [a.split("=", 1)[0] for a in extra_args if a.startswith("-")]
+    return {"names": names, "sha256": hashlib.sha256("\0".join(extra_args).encode()).hexdigest()}
+
+
 def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     """The arguments the sidecar's shell hands to `env` once it has read the token file (`sidecar_run_args`).
 
@@ -125,17 +153,16 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     check: by default oneclient verifies against the image's CAs; with `ca_file`, `env` sets `SSL_CERT_FILE` to the
     run's copy that `sidecar_run_args` mounts read-only, the CA file OpenSSL's default verify paths load (oneclient has
     no option of its own for a CA, and `tests/live/test_sandbox.py` checks the image honours it); `--insecure` is passed
-    only with `insecure_tls`. `-f` keeps the client in the foreground. The mount is read-only (`-o ro`).
+    only with `insecure_tls`. `-f` keeps the client in the foreground. The mount is read-only (`-o ro`), and how the
+    client reaches storage is the table's `io_mode`, always passed (`sidecar_options`, O36).
     """
     mount = settings.mount
     if mount is None:
         raise ValueError("a mount data path needs [sandbox.mount]")
-    io = {"direct": ["--force-direct-io"], "proxy": ["--force-proxy-io"]}.get(mount.io_mode or "", [])
     trust = [f"{ENV_SSL_CERT_FILE}={SIDECAR_CA_PATH}"] if settings.tls.ca_file is not None else []
     return [
         *("-u", "ONECLIENT_INSECURE", *trust, ONECLIENT_BIN, "-f", "-H", provider_host),
-        *("-o", "ro,allow_other", *io),
-        *(["--insecure"] if settings.tls.insecure else []),
+        *sidecar_options(settings),
         *mount.extra_args,
         SIDECAR_MOUNT,
     ]

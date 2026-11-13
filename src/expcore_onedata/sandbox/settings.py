@@ -47,8 +47,8 @@ gate_memory_bytes = 1073741824  # optional
 
 [sandbox.mount]                 # required when a data path is a mount
 path = "/data"                  # where the agent sees the space, read-only
-io_mode = "direct"              # optional: "direct" or "proxy"
-extra_args = []                 # further oneclient arguments, never one that changes the TLS mode
+io_mode = "proxy"               # required, no default: "proxy" or "direct" (O36); the core never leaves it to oneclient
+extra_args = []                 # further oneclient arguments, never one that changes the TLS mode or the I/O mode
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
@@ -66,6 +66,14 @@ zone = "host"                   # the zone's host name on that network, the one 
 providers.<local> = "host"      # the local provider's host name on that network, the one its certificate holds;
                                 # keyed by [support] local, the only provider accepted (the agent is pinned to it)
 ```
+
+`io_mode` is declared, never detected (O36). oneclient 25.0 started with neither force option detects each storage's
+access type at the first read of each space, and for a second space on a storage already detected as proxied it takes a
+plain mutex it already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`, the recursion at the end of
+its `!forceProxyIO` branch), so the read waits for ever and nothing is logged. `proxy` (`--force-proxy-io`) reads every
+space through the provider; `direct` (`--force-direct-io`) reads the storage itself and so needs the storage to be
+reachable from the sidecar, which the sandbox does not arrange. There is no third word for oneclient's own detection,
+and the extra arguments may not carry either force option.
 
 `listing` is a REST data path's option (O21): `paged`, the default, passes the server's page of a listing as it comes,
 and `complete` has the data gate answer every listing with all of the directory's entries (`gatepolicy`). It is refused
@@ -122,7 +130,11 @@ SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under t
 # drops it, so it is printable ASCII without white space; the default is a plain word no one takes for a real token.
 PLACEHOLDER_TOKEN = "placeholder"
 PLACEHOLDER_RE = re.compile(r"[!-~]{1,128}")
-IO_MODES = ("direct", "proxy")
+IO_MODE_FLAGS = {
+    "direct": "--force-direct-io",
+    "proxy": "--force-proxy-io",
+}  # oneclient's own option for each mode (O36)
+IO_MODES = tuple(IO_MODE_FLAGS)
 FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by the platform's [tls] only
 NETWORK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a docker network's name; no `container:<id>`
 NOT_A_FEDERATION_NETWORK = ("bridge", "default", "host", "none")  # docker's own: no name resolves, or no isolation
@@ -131,6 +143,21 @@ KILL_GRACE_S = 5.0  # [sandbox] kill_grace_s unless declared: a few seconds, so 
 # a cell's whole escalation past its cap is bounded by `deadline.margin_s`: two graces (after the kill, after an
 # abort) and `deadline.COMMANDS_S` for its commands; 30 s at the default grace, 140 s at this maximum
 KILL_GRACE_MAX_S = 60.0
+
+
+IO_MODE_REFUSAL = (
+    'is required and must be "proxy" or "direct": a mount never leaves the storage access to oneclient\'s own '
+    "detection, which hangs the first read of a second space backed by the same storage (oneclient 25.0, "
+    'src/cache/helpersCache.h, performAutoIOStorageDetection takes its access-type mutex twice). "proxy" reads every '
+    'space through the provider; "direct" needs the storage reachable from the sidecar'
+)
+
+
+def sets_io_mode(argument: str) -> bool:
+    """Whether a oneclient argument is, or abbreviates, one of the two force-I/O options (boost's parser takes any
+    unique prefix of a long option), which only `io_mode` may set."""
+    name = argument.split("=", 1)[0]
+    return len(name) > 2 and name.startswith("--") and any(flag.startswith(name) for flag in IO_MODE_FLAGS.values())
 
 
 @dataclass(frozen=True)
@@ -169,7 +196,7 @@ class MountSettings:
     """How the oneclient sidecar mounts the space and where the agent sees it; its TLS is `SandboxSettings.tls`."""
 
     path: str
-    io_mode: str | None = None
+    io_mode: str  # "proxy" or "direct", declared, never left to oneclient's detection (O36)
     extra_args: tuple[str, ...] = ()
 
 
@@ -319,12 +346,14 @@ def _mount(section: Section) -> MountSettings:
     path = section.string("path")
     if not path.startswith("/") or path == "/" or ".." in path.split("/") or any(c.isspace() for c in path):
         raise section.fail("path", "must be an absolute path inside the agent, not the root")
-    io_mode = section.optional_string("io_mode")
-    if io_mode is not None and io_mode not in IO_MODES:
-        raise section.fail("io_mode", f"must be one of: {', '.join(IO_MODES)}")
+    io_mode = section.data.get("io_mode")
+    if io_mode not in IO_MODES:
+        raise section.fail("io_mode", IO_MODE_REFUSAL)
     extra = section.strings("extra_args") if "extra_args" in section.data else ()
     if any(a in FORBIDDEN_ARGS or (a.startswith("-") and not a.startswith("--") and "i" in a[1:]) for a in extra):
         raise section.fail("extra_args", "must not carry the TLS flag: the platform's [tls] alone sets it")
+    if any(sets_io_mode(a) for a in extra):
+        raise section.fail("extra_args", "must not carry a force-I/O option: the table's io_mode alone sets it")
     return MountSettings(path, io_mode, tuple(extra))
 
 

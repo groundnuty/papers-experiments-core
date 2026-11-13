@@ -1,5 +1,6 @@
 """The sandbox over an in-memory host: the three data paths, images pinned by id, read-only at every point, teardown."""
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -764,13 +765,45 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     sbx = start(world, "mounted")
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
-    assert set(meta["mount"]) == {"io_mode", "log_dir_from", "network", "wait_s"}
+    assert set(meta["mount"]) == {"io_mode", "options", "extra_args", "log_dir_from", "network", "wait_s"}
     assert meta["mount"]["log_dir_from"] == "default"
     assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)
     assert world.s.network.pools[0] not in text
     assert str(world.s.work_root) not in text
     assert world.s.mount.path not in text
+    sbx.stop()
+
+
+def test_o36_the_metadata_records_the_io_mode_the_mount_runs_with_and_the_options_the_sandbox_set(world):
+    """O36: the mount's I/O mode is the one the table declares, never None, and the run's options are recorded as the
+    sandbox set them: the mode's force option, the read-only mount options and no TLS flag by default."""
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()["mount"]
+    assert meta["io_mode"] == "proxy"
+    assert meta["options"] == ["-o", "ro,allow_other", "--force-proxy-io"]
+    assert meta["extra_args"] == {"names": [], "sha256": hashlib.sha256(b"").hexdigest()}
+    sbx.stop()
+
+
+def test_o36_a_direct_mount_records_direct_and_the_study_extra_arguments_only_by_name_and_hash(world):
+    """O36: the effective mode is `direct` when declared; the study's extra arguments are recorded by their option
+    names and the SHA-256 of the whole list, never by value (a value may be a path or an identifier, O12)."""
+    from dataclasses import replace
+
+    extra = ("--provider-timeout", "45", "--log-dir=/somewhere/private")
+    world.s = replace(world.s, mount=replace(world.s.mount, io_mode="direct", extra_args=extra))
+    sbx = start(world, "mounted")
+    meta = sbx.metadata()
+    assert meta["mount"]["io_mode"] == "direct"
+    assert meta["mount"]["options"] == ["-o", "ro,allow_other", "--force-direct-io"]
+    assert meta["mount"]["extra_args"] == {
+        "names": ["--provider-timeout", "--log-dir"],
+        "sha256": hashlib.sha256("\0".join(extra).encode()).hexdigest(),
+    }
+    text = json.dumps(meta, default=str)
+    assert "/somewhere/private" not in text
+    assert "45" not in meta["mount"]["extra_args"]["names"]
     sbx.stop()
 
 

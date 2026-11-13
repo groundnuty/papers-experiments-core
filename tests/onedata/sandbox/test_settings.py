@@ -153,6 +153,59 @@ def test_a_mount_data_path_needs_the_mount_table_and_the_sidecar_image(tmp_path)
         load(tmp_path, edit)
 
 
+def test_o36_a_mount_that_does_not_declare_its_io_mode_is_refused_naming_both_choices_and_why(tmp_path):
+    """O36: `io_mode` has no default. Without it the mount would leave the storage's access type to oneclient's own
+    detection, which hangs the first read of a second space on one storage; the load refuses, naming the two choices,
+    the reason and the source."""
+
+    def edit(data):
+        del data["sandbox"]["mount"]["io_mode"]
+
+    with pytest.raises(ConfigError, match="io_mode") as caught:
+        load(tmp_path, edit)
+    message = str(caught.value)
+    assert '"proxy"' in message
+    assert '"direct"' in message
+    assert "second space" in message
+    assert "helpersCache.h" in message
+
+
+@pytest.mark.parametrize("mode", ["proxy", "direct"])
+def test_o36_a_declared_io_mode_is_read_as_declared(tmp_path, mode):
+    """O36: the two modes, and only they, load, each as the file says."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["io_mode"] = mode
+
+    assert load(tmp_path, edit).mount.io_mode == mode
+
+
+@pytest.mark.parametrize("mode", ["auto", "detect", ""])
+def test_o36_there_is_no_mode_that_leaves_the_detection_to_oneclient(tmp_path, mode):
+    """O36: no word stands for oneclient's own detection, and an empty one is not a declaration."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["io_mode"] = mode
+
+    with pytest.raises(ConfigError, match="io_mode") as caught:
+        load(tmp_path, edit)
+    assert '"proxy"' in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "flag", ["--force-proxy-io", "--force-direct-io", "--force-proxy-io=true", "--force-direct", "--force-p"]
+)
+def test_o36_the_io_mode_cannot_be_set_or_changed_through_the_extra_arguments(tmp_path, flag):
+    """O36: the I/O mode is the table's `io_mode` alone: an extra argument naming either force option, or an
+    abbreviation of one, would give oneclient two, or the wrong one, so it is refused at load."""
+
+    def edit(data):
+        data["sandbox"]["mount"]["extra_args"] = [flag]
+
+    with pytest.raises(ConfigError, match="io_mode"):
+        load(tmp_path, edit)
+
+
 def test_the_tls_flag_cannot_be_smuggled_through_the_extra_arguments(tmp_path):
     def edit(data):
         data["sandbox"]["mount"]["extra_args"] = ["--insecure"]

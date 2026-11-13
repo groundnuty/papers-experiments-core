@@ -138,6 +138,55 @@ def test_o05_the_gate_takes_its_token_from_a_read_only_file_and_docker_is_given_
     assert f"{gate_token}:{C.GATE_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
 
 
+def with_io_mode(s, mode):
+    return dataclasses.replace(s, mount=dataclasses.replace(s.mount, io_mode=mode))
+
+
+def test_o36_the_default_world_mounts_with_proxied_io(s):
+    """O36: the sidecar's oneclient carries `--force-proxy-io`, from the table's `io_mode = "proxy"`."""
+    assert s.mount.io_mode == "proxy"
+    assert C.sidecar_command("p.test", s).count("--force-proxy-io") == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "flag", "other"),
+    [("proxy", "--force-proxy-io", "--force-direct-io"), ("direct", "--force-direct-io", "--force-proxy-io")],
+)
+def test_o36_the_sidecar_is_always_told_how_to_reach_storage_by_exactly_one_force_option(s, names, mode, flag, other):
+    """O36: whichever mode is declared, oneclient is started with its own force option, once, and never the other:
+    what it would otherwise detect at its first read is declared up front."""
+    declared = with_io_mode(s, mode)
+    command = C.sidecar_command("p.test", declared)
+    assert command.count(flag) == 1
+    assert other not in command
+    args = C.sidecar_run_args(
+        declared, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
+    )
+    assert args[args.index("-c") + 1 :].count(flag) == 1
+
+
+@pytest.mark.parametrize("mode", [None, "", "auto", "x"])
+def test_o36_a_mount_with_no_known_io_mode_never_gets_an_argv_that_leaves_it_to_oneclient(s, mode):
+    """O36: settings built without the loader's checks fail at the command, not into oneclient's own detection."""
+    with pytest.raises(ValueError, match="io_mode"):
+        C.sidecar_command("p.test", with_io_mode(s, mode))
+
+
+def test_o36_the_options_the_sandbox_sets_are_the_commands_own(s):
+    """O36: what the metadata records as the sandbox's options are exactly the ones in the command, and none of the
+    study's extra arguments is among them."""
+    declared = dataclasses.replace(
+        s, mount=dataclasses.replace(s.mount, io_mode="direct", extra_args=("--provider-timeout", "30"))
+    )
+    options = C.sidecar_options(declared)
+    command = C.sidecar_command("p.test", declared)
+    assert options == ["-o", "ro,allow_other", "--force-direct-io"]
+    at = command.index(options[0])
+    assert command[at : at + len(options)] == options
+    assert command[-3:-1] == ["--provider-timeout", "30"]
+    assert command[-1] == C.SIDECAR_MOUNT
+
+
 def test_the_sidecar_command_sets_tls_from_the_settings_alone(s):
     assert "--insecure" not in C.sidecar_command("p.test", s)
     insecure = s.__class__(**{**s.__dict__, "tls": TlsSettings(insecure=True)})
