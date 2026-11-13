@@ -627,11 +627,11 @@ def test_a_requirement_added_through_one_provider_is_found_by_the_listing_throug
     qid = scratch_requirement(provisioner, receiver, ids[0])
     try:
         began = time.monotonic()
-        found = resetqos.by_listing(provisioner, holder)
+        found = resetqos.by_listing(provisioner, [holder])
         while qid not in found.where:
             assert time.monotonic() - began < QOS_SEEN_S, "the data provider's listing never showed the requirement"
             time.sleep(2.0)
-            found = resetqos.by_listing(provisioner, holder)
+            found = resetqos.by_listing(provisioner, [holder])
         print(f"a requirement added through another provider was found after {time.monotonic() - began:.1f} s")
         assert ids[0] in found.files[qid]
     finally:

@@ -47,12 +47,12 @@ def test_o33_the_runs_requirements_are_removed_and_the_baselines_kept(scanned, f
     assert not added & set(fake.qos)
 
 
-def test_o33_the_listing_costs_a_page_per_thousand_entries_and_a_summary_per_entry_a_requirement_is_on(
+def test_o33_the_listing_costs_a_page_per_thousand_entries_on_each_provider_and_a_summary_per_direct_entry(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O33: 2500 files more: the listing scan reads three pages of the recursive listing on one provider, the summaries
-    of the two entries a requirement is on and the two requirements' records, where the summaries scan reads a summary
-    per leaf on each of the two providers."""
+    """O33: 2500 files more: the listing scan reads three pages of the recursive listing on each of the two providers,
+    the summary of each of the two entries a requirement is on, on each provider that marks it, and the two
+    requirements' records once, where the summaries scan reads a summary per leaf on each of the two providers."""
     for i in range(2500):
         fake.add_file(f"bulk/f-{i:04d}.bin", b"x")
     fake.add_qos(FILES[2])
@@ -62,14 +62,57 @@ def test_o33_the_listing_costs_a_page_per_thousand_entries_and_a_summary_per_ent
     assert len(SpaceReset(listing).qos_requirements()) == 2
     made = fake.provider_calls[before:]
     entries = 1 + 2 + len(FILES) + 2500  # the root, two directories, the files
-    assert len([c for c in made if c[2].endswith("/files")]) == math.ceil(entries / resetqos.LISTING_PAGE) == 3
-    assert len([c for c in made if c[2].endswith("/qos/summary")]) == 2
+    pages = math.ceil(entries / resetqos.LISTING_PAGE)
+    assert len([c for c in made if c[2].endswith("/files")]) == 2 * pages == 6
+    assert len([c for c in made if c[2].endswith("/qos/summary")]) == 2 * 2
     assert len([c for c in made if c[2].startswith("/qos_requirements/")]) == 2
+    found = resetqos.by_listing(listing, ["alpha", "beta"])
+    assert found.reads == {"listings": 2, "listing_pages": 2 * pages, "summaries": 4, "records": 2}
     summaries = provisioner_with(client, config, platform_file, ticker, tmp_path)
     before = len(fake.provider_calls)
     SpaceReset(summaries).qos_requirements()
     read = [c for c in fake.provider_calls[before:] if c[2].endswith("/qos/summary")]
     assert len(read) == 2 * (1 + len(FILES) + 2500)
+
+
+def test_o33_a_requirement_only_the_provider_it_was_added_through_has_is_found_and_removed(scanned, fake, ticker):
+    """O33: an agent adds a requirement through beta just before the reset; alpha, the data provider, has not received
+    it through dbsync. The scan of alpha finds nothing, so the reset reads every supporting provider, finds it on
+    beta, removes it through beta, and shows it gone on both."""
+    qid = fake.add_qos("study")
+    fake.qos_hidden_on[qid] = {fake.PROVIDER_ID}
+    record = SpaceReset(scanned, now=ticker.clock).run({"beta": ["study"]})
+    stage = record["stages"]["qos"]
+    assert (stage["found"], stage["removed"], stage["affected_files"]) == (1, 1, len(FILES))
+    assert qid not in fake.qos
+
+
+def test_o33_the_listing_of_the_data_provider_alone_misses_what_the_other_providers_listings_find(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O33: the defect the scan of every provider closes: the requirement beta has and alpha has not received is found
+    by beta's listing and not by alpha's, and the union of the two finds it, with the files it applies to."""
+    qid = fake.add_qos("study")
+    fake.qos_hidden_on[qid] = {fake.PROVIDER_ID}
+    listing = provisioner_with(client, config, platform_file, ticker, tmp_path, scan="listing")
+    assert resetqos.by_listing(listing, ["alpha"]).where == {}
+    both = resetqos.by_listing(listing, ["alpha", "beta"])
+    assert both.where == {qid: "beta"}
+    assert set(both.files[qid]) == {fake.id_of(path) for path in FILES}
+
+
+def test_o33_one_entry_two_providers_mark_holds_the_requirements_each_of_them_shows(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O33: two requirements on the one directory, the second not yet received by alpha: both providers mark the
+    directory as having a requirement on itself, so its summary is read on each, and the second is found, where one
+    summary read on the first provider to mark it would have shown the first alone."""
+    first, second = fake.add_qos("study"), fake.add_qos("study", expression="other")
+    fake.qos_hidden_on[second] = {fake.PROVIDER_ID}
+    listing = provisioner_with(client, config, platform_file, ticker, tmp_path, scan="listing")
+    found = resetqos.by_listing(listing, ["alpha", "beta"])
+    assert found.where == {first: "alpha", second: "beta"}
+    assert found.reads["summaries"] == 2
 
 
 def test_o33_a_listing_page_without_its_end_marker_fails_the_qos_stage(
@@ -183,7 +226,7 @@ def test_o33_the_listing_sends_no_token_on_its_first_page_and_follows_the_ones_i
     listing = provisioner_with(client, config, platform_file, ticker, tmp_path, scan="listing")
     resetqos.LISTING_PAGE, page = 2, resetqos.LISTING_PAGE
     try:
-        found = resetqos.by_listing(listing, "alpha")
+        found = resetqos.by_listing(listing, ["alpha"])
     finally:
         resetqos.LISTING_PAGE = page
     assert set(found.where) == set(fake.qos)

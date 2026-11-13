@@ -13,22 +13,31 @@ qos_scan` chooses how the reset finds them:
   the root and of every leaf is read; a leaf's summary holds the requirements on it and on every ancestor
   (`file_middleware_get_handler.erl:493-500`), so together they hold every requirement. One read per leaf per
   provider: about 52,000 reads for a large tree (#209).
-- `listing`: on the data provider, one recursive listing of the space root, `GET /data/{root}/files` with
-  `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`, `include_directories=true` and `limit`, its pages
-  followed by `token` until `nextPageToken` is null (`basic_file_operations_rest_routes.erl:59-70`; the parameters,
-  query or JSON body, `file_middleware_get_handler.erl:124-138`, `rest_handler.erl:313-325`; the answer, `files`,
-  `inaccessiblePaths` and `nextPageToken`, `file_rest_translator.erl:92-97`, with no `isLast` whatever the REST
-  description says; `path` is relative to the root, itself `"."`, `recursive_listing.erl:486-498,576-584`; the trash
-  is never listed, `trash_dir.erl:98-101`). A listing that could not enter a path (`inaccessiblePaths`) is incomplete
-  and fails closed. An entry whose `effQosInheritancePath` is `direct` or `directAndAncestor` has a requirement on
-  itself (`src/modules/datastore/models/qos/file_qos.erl:262-291`); only those entries' summaries are read, and each
-  requirement's record then names its entry (`fileId`, `qos_middleware_plugin.erl:241-245,300-312`).
-  **Two facts it rests on are not verified live:** that the listing takes `include_directories` (the code does,
-  `file_middleware_get_handler.erl:131,404`; the REST description omits it), and that a requirement added through one
-  provider is found through another once dbsync settles (each provider's QoS view is built from the synced requirement
-  documents, `src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`). The gated live tests
-  in `tests/live/test_contract.py` (O33) check both; until they have passed on the federation, `summaries` stays the
-  default.
+- `listing`: on **every provider that supports the space**, one recursive listing of the space root, `GET
+  /data/{root}/files` with `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`,
+  `include_directories=true` and `limit`, its pages followed by `token` until `nextPageToken` is null
+  (`basic_file_operations_rest_routes.erl:59-70`; the parameters, query or JSON body,
+  `file_middleware_get_handler.erl:124-138`, `rest_handler.erl:313-325`; the answer, `files`, `inaccessiblePaths` and
+  `nextPageToken`, `file_rest_translator.erl:92-97`, with no `isLast` whatever the REST description says; `path` is
+  relative to the root, itself `"."`, `recursive_listing.erl:486-498,576-584`; the trash is never listed,
+  `trash_dir.erl:98-101`). A listing that could not enter a path (`inaccessiblePaths`) is incomplete and fails closed.
+  An entry whose `effQosInheritancePath` is `direct` or `directAndAncestor` has a requirement on itself
+  (`src/modules/datastore/models/qos/file_qos.erl:262-291`); only those entries' summaries are read, each on the
+  provider whose listing marked the entry, and each requirement's record then names its entry (`fileId`,
+  `qos_middleware_plugin.erl:241-245,300-312`), read on the provider whose summary showed it. **Every provider is
+  listed because a requirement is visible at once only on the provider it was added through:** an agent that adds one
+  through one provider just before the reset leaves the others without it until dbsync delivers it, so a listing of the
+  data provider alone can find none, and the removal and the second scan are then skipped. The entries of the
+  listings are united by id. Two providers can mark one entry and hold different requirements on it, so its summary is
+  read on each provider that marks it. For N supporting providers the scan makes, besides each provider's read of the
+  space root, N x ceil(E / `LISTING_PAGE`) page reads for E entries, one summary per entry per provider that marks it
+  (a handful), and one record per requirement; the record gives `listings`, `listing_pages`, `summaries` and `records`.
+  **A fact it rests on is not verified live:** that the listing takes `include_directories` (the code does,
+  `file_middleware_get_handler.erl:131,404`; the REST description omits it). The gated live tests in
+  `tests/live/test_contract.py` (O33) check it, and also that a requirement added through one provider is found
+  through another once dbsync settles (each provider's QoS view is built from the synced requirement documents,
+  `src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`), which the reset itself no longer
+  needs to find a requirement; until the first has passed on the federation, `summaries` stays the default.
 
 **The run's own.** A requirement present at the run's start (`SpaceReset.qos_requirements()`, the caller's baseline)
 is kept; every other one is the run's and is removed. The regular files at or under a removed requirement's entry are
@@ -247,14 +256,32 @@ def listed(p: Provisioner, provider: str) -> tuple[dict[str, _Listed], int]:
             return entries, pages
 
 
-def by_listing(p: Provisioner, provider: str) -> Found:
-    """Every requirement on the space, from one recursive listing on `provider`, the summaries of the entries a
-    requirement is on, and each requirement's record."""
-    entries, pages = listed(p, provider)
-    hits = [e.file_id for e in entries.values() if e.inheritance in DIRECT]
-    found = consistency.bounded_map(lambda f: _summary(p, f, provider), hits, p.settings.concurrency)
-    qids = sorted(set().union(*found))
-    on = consistency.bounded_map(lambda q: _requirement_entry(p, q, provider), qids, p.settings.concurrency)
+def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
+    """Every requirement any of `providers` shows, from the recursive listing of each, the summaries of the entries a
+    requirement is on (each read on the provider whose listing marked the entry), and each requirement's record (read
+    on the provider whose summary showed it first).
+
+    A requirement is at once visible on the provider it was added through, and reaches the others through dbsync, so
+    a listing of one provider can miss one the reset needs to remove. The entries of the listings are united, by id:
+    an entry a provider marks `direct` or `directAndAncestor` has its summary read on that provider, and on each other
+    provider that marks it so, since two providers can hold different requirements on one entry. The calls it makes:
+    one listing of the space root per provider (a read of its root and `listing_pages` pages of `LISTING_PAGE`
+    entries), one summary per entry per provider that marks it, one record per requirement."""
+    listings = [(provider, *listed(p, provider)) for provider in providers]
+    entries: dict[str, _Listed] = {}
+    hits: list[tuple[str, str]] = []  # (entry id, the provider that marks it as having a requirement on itself)
+    for provider, found, _ in listings:
+        for entry in found.values():
+            entries.setdefault(entry.file_id, entry)
+            if entry.inheritance in DIRECT:
+                hits.append((entry.file_id, provider))
+    summaries = consistency.bounded_map(lambda hit: _summary(p, hit[0], hit[1]), hits, p.settings.concurrency)
+    where: dict[str, str] = {}
+    for (_, provider), held in zip(hits, summaries, strict=True):
+        for qid in sorted(held):
+            where.setdefault(qid, provider)
+    qids = sorted(where)
+    on = consistency.bounded_map(lambda q: _requirement_entry(p, q, where[q]), qids, p.settings.concurrency)
     files: dict[str, dict[str, int]] = {}
     for qid, entry_id in zip(qids, on, strict=True):
         top = entries.get(entry_id)
@@ -262,15 +289,20 @@ def by_listing(p: Provisioner, provider: str) -> Found:
             raise Unreadable("a QoS requirement is on an entry the recursive listing does not hold")
         under = (e for e in entries.values() if not e.directory and _under(e.path, top.path))
         files[qid] = {e.file_id: len(e.path.split("/")) for e in under}
-    reads = {"listing_pages": pages, "summaries": len(hits), "records": len(qids)}
+    reads = {
+        "listings": len(listings),
+        "listing_pages": sum(pages for *_, pages in listings),
+        "summaries": len(hits),
+        "records": len(qids),
+    }
     deepest = max((len(e.path.split("/")) for e in entries.values() if not e.directory), default=0)
-    return Found(dict.fromkeys(qids, provider), files, reads, deepest)
+    return Found(where, files, reads, deepest)
 
 
 def scan(p: Provisioner, providers: Sequence[str]) -> Found:
-    """Find every requirement of the space as `[placement] qos_scan` says."""
+    """Find every requirement of the space, on every provider that supports it, as `[placement] qos_scan` says."""
     if p.settings.qos_scan == "listing":
-        return by_listing(p, p.settings.holder)
+        return by_listing(p, providers)
     return by_summaries(p, providers)
 
 
