@@ -57,7 +57,18 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool, reap, tokenfiles
+from expcore_onedata.sandbox import (
+    copyout,
+    directio,
+    gatelog,
+    gatepolicy,
+    hostops,
+    inputs,
+    kinds,
+    netpool,
+    reap,
+    tokenfiles,
+)
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
@@ -91,6 +102,7 @@ from expcore_onedata.sandbox.containers import (
 )
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
+from expcore_onedata.sandbox.oneclient_args import DIRECT
 from expcore_onedata.sandbox.oneclient_log import summarize as summarize_oneclient_log
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -263,8 +275,17 @@ class DockerSandbox:
                 self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
+        if sp.mode is DataPathMode.MOUNT:
+            self._require_storages()
         # in every data path, so an input never differs by condition; a declared one is hashed again here
-        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s))
+        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
+
+    def _require_storages(self) -> None:
+        """Each storage a direct mount maps must be a directory on this host before anything exists (O40): docker's
+        `--mount` would refuse it only once the sidecar starts. Named by its position, never by its id or path."""
+        for position, (_, path) in enumerate(self.s.mount.storages):
+            if not os.path.isdir(path):
+                raise StartRefused(f"[sandbox.mount.storages] entry {position}: is not a directory on this host")
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -350,6 +371,8 @@ class DockerSandbox:
         )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
+        if share and s.mount.io_mode == DIRECT:
+            self._verify_direct_io()
         self._verify_inputs()
         self._cells.sample_pids()
         self._start_sampler()
@@ -605,6 +628,8 @@ class DockerSandbox:
             "log_dir_from": "sandbox",  # always: `extra_args` may not give oneclient a log directory
             "network": "federation" if s.federation is not None else "default bridge",  # `sidecar_route`'s, by kind
         }
+        if s.mount.io_mode == DIRECT:  # how many storages it reads directly, never an id or a path; the check's below
+            self._meta["mount"]["direct"] = {"storages": len(s.mount.storages), "check": None}
         log_dir = self.dir / LOG_DIR  # oneclient's log is bound here, owner-only, and kept with the run's evidence
         log_dir.mkdir(mode=0o700)
         log_dir.chmod(0o700)  # whatever the driver's umask
@@ -717,6 +742,57 @@ class DockerSandbox:
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
+
+    def _verify_direct_io(self) -> None:
+        """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O40,
+        `directio`): the agent reads the check file whole, once the mount says the local provider holds all of it,
+        then the sidecar's log must say forced direct, no forced proxy, and hold no line of detection or fallback."""
+        mount = self.s.mount
+        probe = self._cells.run(
+            directio.probe_source(f"{mount.path}/{mount.direct_check_file}"), directio.READ_DEADLINE_S + 30,
+            record=False,
+        )  # fmt: skip
+        text = self._read_sidecar_log()
+        problems, record = directio.judge(
+            directio.parse_probe(probe.stdout), text or "", [storage_id for storage_id, _ in mount.storages]
+        )
+        self._meta["mount"]["direct"]["check"] = record
+        if text is None:
+            problems.insert(0, "the sidecar's oneclient log could not be read")
+        if problems:
+            log.error("direct I/O check: %s", "; ".join(problems))
+            raise SandboxError(f"direct I/O is not in effect for the mount: {'; '.join(problems)}")
+
+    def direct_io_lines(self) -> list[str] | None:
+        """The names of the lines of `directio.MARKERS` the sidecar's log holds now, or None when it could not be read
+        (O40): with a direct mount, any one of them means some read since the start did not go to the storage."""
+        text = self._read_sidecar_log()
+        return None if text is None else directio.marker_lines(text)
+
+    def _direct_io_held(self) -> None:
+        """At collection, show that every read of a direct run went to the storage itself, or set the run aside (O40). A
+        file whose direct read is refused for permissions is read again through the provider (`fsLogic.cc`,
+        `readInternal`), after the start's check passed, and the log is the only trace; an unreadable log is unknown,
+        never direct. The record keeps the names of the lines found (`mount.direct.during_run`)."""
+        lines = self.direct_io_lines()
+        self._meta["mount"]["direct"]["during_run"] = lines
+        if lines is None:
+            raise kinds.collection_error(
+                "the direct mount's log", "the sidecar's oneclient log could not be read, so no read is shown direct"
+            )
+        if lines:
+            raise kinds.collection_error(
+                "the direct mount",
+                f"the sidecar's oneclient logged {', '.join(lines)}: a read did not go to the storage",
+            )
+
+    def _read_sidecar_log(self) -> str | None:
+        """The sidecar's oneclient INFO log, read as root in the sidecar, or None when it could not be read."""
+        found = self.host.docker(
+            "exec", "-u", "0", self.names.sidecar, "cat", f"{SIDECAR_LOG_DIR}/{directio.LOG_FILE}",
+            check=False, timeout=60,
+        )  # fmt: skip
+        return found.stdout if found.returncode == 0 else None
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory and record its hash, its files and bytes, and its path in
@@ -1092,7 +1168,8 @@ class DockerSandbox:
         object named by its path and what it is, never a link's target, under `refused_output` in its result and in the
         metadata, for the study's scorers; the attempt's outcome is the loop's and the scorers'. A collection that fails
         for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
-        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash)
+        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash,
+        a direct mount whose log shows a read that did not go to the storage, or cannot be read: O40)
         raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
         is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection. A run a
         cell's deadline stopped, or left with a process that outlived its kill, raises `InfraError("cell_unkillable")`
@@ -1128,6 +1205,8 @@ class DockerSandbox:
         except SandboxError as failed:  # the copy command, the disk or the copy failed: the harness's own failure
             raise kinds.collection_error("the run's outputs", str(failed)) from None
         self._inputs_unchanged()
+        if self.spec.mode is DataPathMode.MOUNT and self.s.mount.io_mode == DIRECT:
+            self._direct_io_held()  # while the sidecar runs: its log is read in it
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if refused is not None:
