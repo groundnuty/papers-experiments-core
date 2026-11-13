@@ -139,3 +139,127 @@ def test_read_only_imports_may_share_one_source(fed, tmp_path):
 def test_a_layout_with_no_import_still_loads_with_every_space_unimported(fed, tmp_path):
     spec = fed.spec.load_spec(write(tmp_path, MINIMAL))
     assert [space.imported for space in spec.spaces] == [None]
+
+
+# -- where an import's directories are ---------------------------------------------------------------------------------
+
+
+def import_layout(fed, tmp_path: Path, text: str = WITH_WRITABLE_IMPORT):
+    """A layout over a root and a source directory of its own, both below a resolved temp directory."""
+    base = tmp_path.resolve()
+    (base / "data").mkdir()
+    spec = fed.spec.load_spec(write(base, text))
+    return fed.layout.Layout(base / "fed", spec=spec), base / "data"
+
+
+def test_an_imported_space_has_a_storage_named_after_it_mounted_under_the_import_directory(fed):
+    assert fed.layout.IMPORT_MOUNT == "/volumes/import"
+    assert fed.layout.import_storage_name("fern-space") == "import-fern-space"
+
+
+def test_a_writable_copy_lies_in_the_owners_directory_of_the_root(fed, tmp_path):
+    layout, _ = import_layout(fed, tmp_path)
+    assert layout.import_dir("moss-space") == layout.root / "oak" / "import" / "moss-space"
+    assert layout.import_dir("fern-space") == layout.root / "elm" / "import" / "fern-space"
+
+
+def test_the_source_is_the_directory_the_variable_names(fed, tmp_path):
+    layout, data = import_layout(fed, tmp_path)
+    assert layout.import_source("fern-space", {"EXPCORE_FED_IMPORT_FERN": str(data)}) == data
+
+
+def test_a_trailing_slash_on_the_source_changes_nothing(fed, tmp_path):
+    layout, data = import_layout(fed, tmp_path)
+    assert layout.import_source("fern-space", {"EXPCORE_FED_IMPORT_FERN": f"{data}/"}) == data
+
+
+def source_problem(fed, tmp_path: Path, value: str | None, *, make=None) -> str:
+    """The message the layout refuses a source with; `make(base)` builds what `value` names, `{base}` standing for the
+    resolved temp directory."""
+    layout, _ = import_layout(fed, tmp_path)
+    base = tmp_path.resolve()
+    if make is not None:
+        make(base)
+    given = None if value is None else value.replace("{base}", str(base))
+    with pytest.raises(ValueError, match="EXPCORE_FED_IMPORT_FERN") as found:
+        layout.import_source("fern-space", {} if given is None else {"EXPCORE_FED_IMPORT_FERN": given})
+    assert not given or given not in str(found.value)  # never the value itself
+    return str(found.value)
+
+
+def test_a_source_variable_that_is_not_set_is_refused(fed, tmp_path):
+    assert "is not set" in source_problem(fed, tmp_path, None)
+
+
+def test_a_source_variable_that_is_empty_is_refused(fed, tmp_path):
+    assert "must be an absolute path" in source_problem(fed, tmp_path, "")
+
+
+def test_a_relative_source_is_refused_without_echoing_it(fed, tmp_path):
+    assert "must be an absolute path" in source_problem(fed, tmp_path, "relative/data")
+
+
+def test_a_source_with_a_parent_step_is_refused(fed, tmp_path):
+    """`a/link/../b` is not `a/b` when `link` is a symbolic link, so the check never normalises a path away."""
+    assert "'..'" in source_problem(fed, tmp_path, "{base}/data/../data")
+
+
+def test_a_source_that_does_not_exist_is_refused(fed, tmp_path):
+    assert "must be an existing directory" in source_problem(fed, tmp_path, "{base}/absent")
+
+
+def test_a_source_that_is_a_file_is_refused(fed, tmp_path):
+    def make(base):
+        (base / "file").write_text("x", encoding="utf-8")
+
+    assert "must be an existing directory" in source_problem(fed, tmp_path, "{base}/file", make=make)
+
+
+def test_a_source_that_is_a_symbolic_link_is_refused(fed, tmp_path):
+    def make(base):
+        (base / "link").symlink_to(base / "data")
+
+    assert "symbolic link" in source_problem(fed, tmp_path, "{base}/link", make=make)
+
+
+def test_a_source_below_a_symbolic_link_is_refused(fed, tmp_path):
+    def make(base):
+        (base / "link").symlink_to(base / "data")
+        (base / "data" / "inner").mkdir()
+
+    assert "symbolic link" in source_problem(fed, tmp_path, "{base}/link/inner", make=make)
+
+
+def test_a_source_that_is_the_root_is_refused(fed, tmp_path):
+    def make(base):
+        (base / "fed").mkdir()
+
+    assert "is the root" in source_problem(fed, tmp_path, "{base}/fed", make=make)
+
+
+def test_a_source_inside_the_root_is_refused(fed, tmp_path):
+    """Down empties the root, so a dataset inside it would go with it."""
+
+    def make(base):
+        (base / "fed" / "oak").mkdir(parents=True)
+
+    assert "inside the root" in source_problem(fed, tmp_path, "{base}/fed/oak", make=make)
+
+
+def test_a_source_that_holds_the_root_is_refused(fed, tmp_path):
+    def make(base):
+        (base / "fed").mkdir()
+
+    assert "holds the root" in source_problem(fed, tmp_path, "{base}", make=make)
+
+
+def test_the_filesystem_root_as_a_source_is_refused(fed, tmp_path):
+    assert "holds the root" in source_problem(fed, tmp_path, "/")
+
+
+def test_a_space_that_is_not_imported_has_no_source_and_no_copy(fed, tmp_path):
+    layout, _ = import_layout(fed, tmp_path)
+    with pytest.raises(ValueError, match="alpha-space"):
+        layout.import_source("alpha-space", {})
+    with pytest.raises(ValueError, match="alpha-space"):
+        layout.import_dir("alpha-space")
