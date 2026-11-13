@@ -35,7 +35,9 @@ none but the baseline's. The affected files' block maps are settled next (`reset
 had in flight.
 
 **The residual.** A requirement an agent adds and removes during the run is gone by the reset, and its cancel ran then.
-**An agent's add-then-remove during the run whose cancel missed may still be replicating one file at the reset**: a
+**A fulfilment whose cancel missed may still be replicating one file at the reset**, whether its requirement was the
+agent's, added and removed during the run, or one the reset removed after a reconciliation restarted between its
+fulfilled status and its deletion reaching the replicating provider: a
 cancel misses a file whose request was not registered yet, one shared with a client's read, or one on another node of
 the provider (`replica_synchronizer.erl:607,1148-1157,377-382`), and that file then replicates whole. It is at most one
 file's size, and rare, since it needs a missed cancel. It may land after T, the instant the quiet stage certifies

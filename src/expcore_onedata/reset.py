@@ -52,9 +52,11 @@ read and every check is made on each provider that supports the space, since eac
    occupancy read, and the stage then passes. The block maps decide for the plan's files; a zero occupancy is never
    taken alone as nothing having landed, since it lags. The stage runs unless the caller knows that no run since the
    last verified reset could have set a QoS requirement (`run(qos_rights=...)`, below), whether or not a requirement is
-   left at the reset. **The residual:** an agent's add-then-remove during the run whose cancel missed may still be
-   replicating one file, with no requirement left and no transfer document to show it; it is at most one file's size,
-   and rare, since it needs a missed cancel; it may land after T, and is then caught by the next start's reset. The
+   left at the reset. **The residual:** a fulfilment whose cancel missed may still be replicating one file, with no
+   requirement left and no transfer document to show it: of a requirement the agent added and removed during the
+   run, or of one the reset removed after a reconciliation restarted between its fulfilled status and its deletion
+   reaching the replicating provider. It is at most one file's size per missed cancel, and rare; it may land after
+   T, and is then caught by the next start's reset. The
    record gives `ran`, `why` (`requirements`, `rights` or
    `default`, `resetheld.py`), `held_files` and `held_source` (`"eviction plan"`), `files`, `block_maps` and the stage's
    seconds. It costs the wait, 20 s for files one directory below the root and 5 s more per further level (the depth
@@ -201,7 +203,7 @@ class SpaceReset:
         reset runs at the start of each run and clears what earlier runs left, so this is not the rights of the run
         about to start: a read-only run that follows a writing one would skip the quiet check exactly when it is
         needed. `True` or `None` (the fail-safe default) runs the check, whether or not a requirement is left at the
-        reset, since an agent's add-then-remove whose cancel missed may still be replicating one file; pass
+        reset, since a fulfilment whose cancel missed may still be replicating one file; pass
         `False` only when you know that no run since the last verified reset had the right to manage QoS, and then
         only a reset that removed no requirement skips it. `Condition.manages_qos` describes one condition: combine it
         over every run since the last verified reset (O33)."""
