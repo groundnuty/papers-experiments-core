@@ -98,7 +98,7 @@ a slot's users hold are checked, direct and effective, before every token is min
 
 **A slot's tool-server user must be a member of no space outside the tool-server plane's, hold no Onezone admin
 privilege, and be a member of no cluster.** A tool-server token carries no data-access caveat, a read-only condition's
-as a writing one's (`tokens.tool_server_spec`, O37), so what it can reach is what its user's memberships and admin
+as a writing one's (`tokens.tool_server_spec`, O39), so what it can reach is what its user's memberships and admin
 privileges give, and a user who is a member of a provider's cluster can act through that provider: with
 `cluster_update` it can mint that provider's tokens and change its configuration, with `cluster_delete` delete it.
 Setting the user up so is the operator's part of the slot; the harness reads all three (`tokenscope`) when it mints a

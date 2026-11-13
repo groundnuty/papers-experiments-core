@@ -9,7 +9,7 @@
 The data path and the tool server are separate planes (architecture.md, "Tokens and permissions"): each has its own
 platform user and its own token, and nothing is shared. The data path is read-only on the study space and its user holds
 exactly view and read. The tool server's user holds the condition's declared rights, no more and no less, and its token
-carries no data-access caveat, whether the condition declares a write right or none (`tool_server_spec`, O37).
+carries no data-access caveat, whether the condition declares a write right or none (`tool_server_spec`, O39).
 
 What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
 1. derives the lifetime from the run's whole-time ceiling and checks it against the platform's limit, before anything is minted
@@ -193,7 +193,7 @@ def tool_server_spec(space_id: str | Sequence[str], condition: Condition) -> Pla
     user must hold no Onezone admin privilege; and the clusters the token acts in, read as the token, must be none,
     since a member of a provider's cluster can act through that provider (`tokenscope`).
 
-    **A read-only condition stays read-only through its user (O37).** Its declared rights hold no write right
+    **A read-only condition stays read-only through its user (O39).** Its declared rights hold no write right
     (`rights.declares_write`), and the user must hold exactly those, so it holds none of `rights.WRITE_RIGHTS` and,
     since the set is exact, no other privilege either, `space_write_data` among them: Onedata refuses its replication,
     eviction and QoS requirement for the missing privilege, where it refused them for the caveat before. The data path

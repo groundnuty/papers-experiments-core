@@ -1,4 +1,4 @@
-"""O37 live: a read-only condition's tool server sees its transfer and QoS views and is refused every write.
+"""O39 live: a read-only condition's tool server sees its transfer and QoS views and is refused every write.
 
     EXPCORE_LIVE_PLATFORM=/path/to/platform.toml EXPCORE_LIVE_MUTATE=1 uv run pytest tests/live
     EXPCORE_LIVE_OUTSIDE_SPACE=<space id> ...   # also the views of a space the condition does not hold
@@ -133,9 +133,9 @@ def plane(day0, tmp_path_factory):
         pytest.skip("platform.toml declares no [principals.toolserver] user")
     holder = day0.placement.settings.holder
     receiver = next(p for p in config.support.providers if p != holder)
-    log = tmp_path_factory.mktemp("o37") / "log.jsonl"
+    log = tmp_path_factory.mktemp("o39") / "log.jsonl"
     provisioner = Provisioner(day0.client, config, day0.placement.settings, provider_ids=day0.provider_ids, log=log)
-    directory = f"expcore-live-o37-{int(time.time())}"
+    directory = f"expcore-live-o39-{int(time.time())}"
     files = [provisioner.put_file(f"{directory}/part-{i}.bin", CONTENT) for i in range(2)]
     qid = None
     try:
@@ -234,8 +234,8 @@ def require_unseen(error, what):
     assert 400 <= error.status < 500, f"{what}: a server error ({error.status}, {error.code})"
 
 
-def test_o37_a_read_only_conditions_view_tools_answer_and_its_server_examines_its_token(plane, capfd):
-    """O37: the views the 12 Nov run saw refused now serve, the two under `/data/{id}` still serve, and the server's
+def test_o39_a_read_only_conditions_view_tools_answer_and_its_server_examines_its_token(plane, capfd):
+    """O39: the views the 12 Nov run saw refused now serve, the two under `/data/{id}` still serve, and the server's
     own examination of its token answers, so its log holds no fail-open warning."""
     outputs = call_tools(plane, [(tool, values_of(plane)) for tool in VIEW_TOOLS])
     failed = [tool for tool, out in zip(VIEW_TOOLS, outputs, strict=True) if out.is_error or not out.text]
@@ -245,8 +245,8 @@ def test_o37_a_read_only_conditions_view_tools_answer_and_its_server_examines_it
     assert as_token(plane, "POST", "/tokens/examine", zone=True, json={"token": token}) is None
 
 
-def test_o37_a_read_only_conditions_write_tools_answer_an_error_and_change_nothing(plane):
-    """O37: the replication and the QoS requirement asked for through the tools are refused by Onedata for the
+def test_o39_a_read_only_conditions_write_tools_answer_an_error_and_change_nothing(plane):
+    """O39: the replication and the QoS requirement asked for through the tools are refused by Onedata for the
     privilege the user lacks: each tool answers an error, and with the admin credential no transfer of the space and no
     requirement of the file appears."""
     file_id = plane["files"][0]
@@ -257,8 +257,8 @@ def test_o37_a_read_only_conditions_write_tools_answer_an_error_and_change_nothi
     assert nothing_new(plane, file_id) == before
 
 
-def test_o37_the_read_only_token_is_refused_every_transfer_and_qos_write_straight_at_the_provider(plane):
-    """O37: sent straight to the provider, without the tool server, the token is refused a replication, an eviction,
+def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straight_at_the_provider(plane):
+    """O39: sent straight to the provider, without the tool server, the token is refused a replication, an eviction,
     a QoS requirement, the removal of the admin's requirement, a rerun of the ended transfer and the cancel of a
     running one, and none of them happened."""
     client, holder, provisioner, file_id = plane["client"], plane["holder"], plane["provisioner"], plane["files"][0]
@@ -286,14 +286,14 @@ def test_o37_the_read_only_token_is_refused_every_transfer_and_qos_write_straigh
     assert state != "cancelled", "the running transfer was cancelled"
 
 
-def test_o37_the_read_only_token_is_refused_a_file_and_a_write_of_content(plane):
-    """O37: with no `data.readonly` caveat, the user's lack of `space_write_data` is what refuses a data write: a file
+def test_o39_the_read_only_token_is_refused_a_file_and_a_write_of_content(plane):
+    """O39: with no `data.readonly` caveat, the user's lack of `space_write_data` is what refuses a data write: a file
     created in the scratch directory and a write of a file's content are both refused, the file is not there and the
     content is what it was."""
     provisioner, file_id = plane["provisioner"], plane["files"][1]
     directory_id = provisioner.resolve(plane["directory"]).file_id
     before = provisioner.read_file(file_id)
-    name = "o37-refused.bin"
+    name = "o39-refused.bin"
     created = as_token(plane, "POST", f"/data/{directory_id}/children", params={"name": name, "type": "REG"})
     written = as_token(
         plane,
@@ -328,8 +328,8 @@ def served_to_the_admin(plane, path, params=None):
 
 
 @OUTSIDE
-def test_o37_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plane):
-    """O37: the token's reach is its user's spaces. Another space's root and transfer listing, which the local
+def test_o39_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plane):
+    """O39: the token's reach is its user's spaces. Another space's root and transfer listing, which the local
     provider serves to the admin credential, are not served to the token through the tool or straight at that
     provider."""
     path, ended = f"/spaces/{OUTSIDE_SPACE}", {"state": "ended"}
@@ -342,8 +342,8 @@ def test_o37_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plan
 
 
 @OUTSIDE
-def test_o37_a_read_only_condition_cannot_view_a_transfer_of_a_space_it_does_not_hold(plane):
-    """O37: a transfer of another space, which the local provider lists and serves to the admin credential, is not
+def test_o39_a_read_only_condition_cannot_view_a_transfer_of_a_space_it_does_not_hold(plane):
+    """O39: a transfer of another space, which the local provider lists and serves to the admin credential, is not
     served to the condition, through `get_transfer` or straight. Skipped, saying so, when the space has no ended
     transfer to view."""
     path = f"/spaces/{OUTSIDE_SPACE}/transfers"

@@ -1,7 +1,7 @@
 """The one-space day-0 report is kept byte for byte: the golden file was written by the day-0 code before it learned
 several spaces (8be2cdd), and every check of a one-space platform must still report exactly what it reported then.
 One line changed on purpose since: the `tokens` check's read-only condition mints its tool-server token with its expiry
-and the rest interface alone (#181, O37), so its caveats are those two.
+and the rest interface alone (#181, O39), so its caveats are those two.
 
 The fake answers in Onedata 25.0's error shape by default; the golden file holds the answers of the fake's first shape,
 so the test asks for that one. What it pins is the day-0 code, not the fake."""

@@ -297,7 +297,7 @@ def test_o05_o06_the_plane_is_checked_before_the_spawn_and_again_after_the_stop(
     """O05, O06: the launch reads the token's examination, the principal's two privilege lists and its Onezone admin
     privileges, as admin reads, then the token's scope and the clusters it acts in, before the server starts, and the
     same six at teardown, so a run that held reads the plane twice. A read-only condition's token has no data-access
-    caveat (O37), so its plane is read as a writing condition's is."""
+    caveat (O39), so its plane is read as a writing condition's is."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
     before = len(fake.requests)
@@ -583,7 +583,7 @@ BOUNDARY_IDS = ["joined an outside space", "became an admin", "joined a cluster"
 def test_o09_a_tool_planes_user_who_joined_a_space_a_cluster_or_became_an_admin_starts_no_server(
     change, reason, condition, world, fake, tmp_path
 ):
-    """O09: a tool-server token, a read-only condition's (O37) as a writing one's, is bounded by its user alone, so the
+    """O09: a tool-server token, a read-only condition's (O39) as a writing one's, is bounded by its user alone, so the
     launch reads its scope, the user's admin privileges and the clusters the token acts in again: a user who became a
     member of a space outside the plane, another study's say, or of a provider's cluster, or an admin of Onezone,
     after the mint starts nothing, and the refusal names no space and no cluster."""
@@ -623,7 +623,7 @@ def test_o09_a_writing_plane_is_read_for_its_scope_admin_privileges_and_clusters
     """O09: a writing condition's launch adds three reads to the examination and the two privilege reads: the user's
     admin privileges, as an admin read, the token's scope, which Onezone answers to the token in the body and no
     header, and the clusters the token acts in, which the token reads itself, so it is the credential of that request
-    and the admin is not. A read-only condition's launch makes the same six (O37)."""
+    and the admin is not. A read-only condition's launch makes the same six (O39)."""
     config, issuer, launcher = world
     token = manage_token(issuer, config, fake)
     before = len(fake.requests)
@@ -643,10 +643,10 @@ WRITES = [*WRITE_RIGHTS, "space_write_data"]  # every write right a condition ca
 
 
 @pytest.mark.parametrize("right", WRITES)
-def test_o37_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_starts_no_server(
+def test_o39_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_starts_no_server(
     right, world, fake, tmp_path
 ):
-    """O37: a read-only condition's token has no data-access caveat, so its user's rights are what keep it from writing;
+    """O39: a read-only condition's token has no data-access caveat, so its user's rights are what keep it from writing;
     a user who gained any write right between the mint and the launch, if only through a group, starts nothing."""
     config, issuer, launcher = world
     token = read_token(issuer, config)
@@ -658,8 +658,8 @@ def test_o37_a_read_only_planes_user_who_gained_a_write_right_after_the_mint_sta
 
 
 @pytest.mark.parametrize("right", WRITES)
-def test_o37_a_read_only_planes_user_who_gained_a_write_right_during_the_run_is_set_aside(right, world, fake, events):
-    """O37: a write right granted to a read-only condition's user while its server ran is found at teardown: the run is
+def test_o39_a_read_only_planes_user_who_gained_a_write_right_during_the_run_is_set_aside(right, world, fake, events):
+    """O39: a write right granted to a read-only condition's user while its server ran is found at teardown: the run is
     set aside as infrastructure of the tool-plane kind, with the rights event, whatever the body did."""
     config, issuer, launcher = world
     token = read_token(issuer, config)

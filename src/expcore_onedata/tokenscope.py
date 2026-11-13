@@ -2,7 +2,7 @@
 """What a token without a data-access caveat reaches, read back from Onezone: its scope, its user's admin privileges
 and its user's clusters.
 
-A tool-server token carries no data-access caveat, a writing condition's (#177) as a read-only one's (#181, O37)
+A tool-server token carries no data-access caveat, a writing condition's (#177) as a read-only one's (#181, O39)
 (`tokens.tool_server_spec`), so nothing in the token keeps it to the tool-server plane's spaces. Its reach is its
 user's: every space the user is an effective member of, directly or through a group; every Onezone operation an admin
 privilege of the user allows; and every provider a cluster of the user lets it act through. Three reads bound that

@@ -237,7 +237,7 @@ def test_each_condition_mints_and_examines_its_tool_server_token(index, config, 
 
 
 def test_the_tool_server_user_holds_no_onezone_admin_privilege(config, client):
-    """O09: a tool-server token carries no data-access caveat, a read-only condition's as a writing one's (O37), so its
+    """O09: a tool-server token carries no data-access caveat, a read-only condition's as a writing one's (O39), so its
     user's Onezone admin privileges are live on it. The admin credential reads them in the shape the layer parses
     (`tokenscope.admin_privileges`), and the tool-server user holds none."""
     # covers: GET /users/{id}/effective_privileges
@@ -248,7 +248,7 @@ def test_the_tool_server_user_holds_no_onezone_admin_privilege(config, client):
 
 @pytest.mark.parametrize("index", range(CONDITIONS), ids=lambda index: f"condition{index}")
 def test_a_tool_server_token_acts_in_no_cluster(index, config, client, issuer):
-    """O09, O37: a member of a provider's cluster can act through that provider whatever its spaces, so a tool-server
+    """O09, O39: a member of a provider's cluster can act through that provider whatever its spaces, so a tool-server
     token's user must be a member of none, a read-only condition's as a writing one's. Onezone's read of another user's
     clusters does not exist, so the call is the current user's, sent as the token itself: it answers 200 with a list of
     cluster ids (`tokenscope.effective_clusters`), and the tool-server user's is empty. The token has no data-access

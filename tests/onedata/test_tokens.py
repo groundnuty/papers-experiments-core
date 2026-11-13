@@ -129,8 +129,8 @@ def tool_spec(config, condition):
     return tool_server_spec("spmock0001", config.condition(condition))
 
 
-def test_o37_a_read_only_conditions_tool_server_token_carries_no_data_access_caveat(issuer, fake, config):
-    """O37: a read-only condition's tool-server token is its expiry and the rest interface, as a writing condition's
+def test_o39_a_read_only_conditions_tool_server_token_carries_no_data_access_caveat(issuer, fake, config):
+    """O39: a read-only condition's tool-server token is its expiry and the rest interface, as a writing condition's
     is. On Onedata 25.0 a data-access caveat limits a token to data access, and the 12 Nov live run saw the read-only
     token's `data.readonly` and `data.path` refuse its transfer and QoS-requirement views (#181)."""
     reading = issuer.mint(tool_spec(config, "read"), TOOLS, ceiling_s=CEILING_S)
@@ -142,7 +142,7 @@ def test_o37_a_read_only_conditions_tool_server_token_carries_no_data_access_cav
 
 def test_o05_each_plane_and_condition_kind_mints_exactly_its_caveat_list(issuer, fake, config):
     """O05: the data path mints the same list it did before the tool-server tokens changed, byte for byte; a
-    read-only condition and a writing one each mint their expiry and the rest interface alone (O37)."""
+    read-only condition and a writing one each mint their expiry and the rest interface alone (O39)."""
     expiry = int(NOW) + token_window(CEILING_S, SETTINGS).mint_ttl_s
     data_path = (
         f'[{{"type": "time", "validUntil": {expiry}}}, {{"type": "data.readonly"}}, '
@@ -183,8 +183,8 @@ WRITES = [*WRITE_RIGHTS, "space_write_data"]  # every write right a condition ca
 
 @pytest.mark.parametrize("right", WRITES)
 @pytest.mark.parametrize("held", ["direct", "effective"])
-def test_o37_a_read_only_conditions_user_who_holds_any_write_right_gets_no_token(right, held, issuer, fake, config):
-    """O37: with no data-access caveat, what keeps a read-only condition's token from writing is its user, who must
+def test_o39_a_read_only_conditions_user_who_holds_any_write_right_gets_no_token(right, held, issuer, fake, config):
+    """O39: with no data-access caveat, what keeps a read-only condition's token from writing is its user, who must
     hold exactly the condition's rights: one write right more, held directly or only through a group, and nothing is
     minted. `space_write_data` is no right a condition can declare, so no read-only condition admits it either."""
     effective = [*BASELINE, right]
@@ -205,7 +205,7 @@ PROVIDER_CLUSTER = "cl-provider-0001"  # the id of a provider's cluster, which n
 def test_o09_a_tool_server_token_whose_user_is_a_member_of_a_space_outside_the_plane_is_dropped(
     condition, issuer, fake, config
 ):
-    """O09: a tool-server token carries no data-access caveat, a read-only condition's (O37) as a writing one's, so
+    """O09: a tool-server token carries no data-access caveat, a read-only condition's (O39) as a writing one's, so
     Onezone's scope of it is every space its user is a member of. After minting, a scope with one space more than the
     plane's is refused, so another study's space is out of reach: the token is dropped with the expiry it is known to
     have, and the message counts the space without naming it or giving its id."""
@@ -294,10 +294,10 @@ def test_o05_the_data_path_reads_no_scope_admin_privileges_or_clusters(issuer, f
     assert not [r for r in fake.requests if r.path in (SCOPE, admin_read, CLUSTERS)]
 
 
-def test_o37_a_read_only_condition_reads_its_scope_admin_privileges_and_clusters_as_a_writing_one_does(
+def test_o39_a_read_only_condition_reads_its_scope_admin_privileges_and_clusters_as_a_writing_one_does(
     issuer, fake, config
 ):
-    """O37: a read-only condition's token has no data.path caveat to keep it to the plane, so its mint reads what a
+    """O39: a read-only condition's token has no data.path caveat to keep it to the plane, so its mint reads what a
     writing condition's does, in the same order: its user's privileges and admin privileges as the admin, and the
     token's scope and clusters, the clusters as the token itself."""
     reading = issuer.mint(tool_spec(config, "read"), TOOLS, ceiling_s=CEILING_S)

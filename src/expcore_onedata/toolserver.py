@@ -14,7 +14,7 @@ again against the condition's exact caveat set, and reads the token's principal'
 effective, requiring exactly the condition's declared rights, no more and no less. An unexamined or drifted token, a
 token minted for another condition's rights, and a principal whose privileges changed since the token was minted
 cannot start the plane: every condition's token carries the same caveats, a read-only condition's as a writing one's
-(O37), so only the privileges tell them apart, and only they keep a read-only condition from writing. The token carries
+(O39), so only the privileges tell them apart, and only they keep a read-only condition from writing. The token carries
 no data-access caveat, so its user is its boundary: the launcher also reads Onezone's scope of the token, which must be
 exactly the tool-server plane's spaces, the user's Onezone admin privileges, which must be none, and the clusters the
 user is an effective member of, read as the token, which must be none (`tokenscope`), and reads all three again at

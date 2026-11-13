@@ -71,7 +71,7 @@ def without_spaces(*space_ids):
 
 def test_o05_each_planes_token_reaches_exactly_the_spaces_it_is_scoped_to(tmp_path, fake):
     """O05: with three spaces, the data path's token is scoped to the two its plane names, one data.path entry each.
-    The tool server's, a read-only condition's, has no data.path (O37): it reaches the two its plane names through its
+    The tool server's, a read-only condition's, has no data.path (O39): it reaches the two its plane names through its
     user's memberships, which Onezone's scope of it must equal, so a user who is also a member of the space declared
     for the data path alone gets no token, the refusal naming that space by its position."""
 

@@ -12,7 +12,7 @@ and what is accepted have one source.
 
 The two planes differ only in their spec: the data path is read-only on the space by its caveats and its principal holds
 exactly view and read; the tool-server plane's principal privileges equal the condition's declared rights, and its token
-carries no data-access caveat at all, whether the condition declares a write right or none (`CaveatSpec`, O37).
+carries no data-access caveat at all, whether the condition declares a write right or none (`CaveatSpec`, O39).
 
 A message names the caveat type or the right that was wrong and never a path, an id or a token value.
 """
@@ -70,7 +70,7 @@ class CaveatSpec:
     `readonly` makes the token read-only by its caveats, a data-access token, as the data path's is: its caveats are
     the expiry, `data.readonly`, the interface and a `data.path` whitelist with each space's subtree as one entry.
     Without it the token carries no data-access caveat, only the expiry and the interface, as every tool-server token
-    does, a read-only condition's included (O37): on Onedata 25.0 a token with any of `DATA_ACCESS_CAVEATS` is usable
+    does, a read-only condition's included (O39): on Onedata 25.0 a token with any of `DATA_ACCESS_CAVEATS` is usable
     for data access alone, and its request to schedule a transfer (#177) or to view one or a QoS requirement (#181) is
     refused (`tokenCaveatUnverified`). Its spaces are then not a caveat but the scope its principal's rights are read
     in (`tokens.TokenIssuer.check_user`), and whether it writes is its principal's rights.

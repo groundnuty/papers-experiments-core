@@ -1,5 +1,5 @@
 """O05: the live contract test of a condition's token skips only on a privileges mismatch, which is checked offline.
-O37: the live test of a read-only condition's tools fills their arguments from their schemas, counts only refusals."""
+O39: the live test of a read-only condition's tools fills their arguments from their schemas, counts only refusals."""
 
 import pytest
 from live_support import mint_for_condition, refused, tool_arguments
@@ -72,7 +72,7 @@ def refuse_by_dropping(type_):
     ],
 )
 def test_o05_any_other_refusal_is_a_failure_not_a_skip(break_it, reason, config, issuer, fake):
-    """O05: a missing caveat, a data-access caveat on a tool-server token (O37), an expiry, a malformed examination or
+    """O05: a missing caveat, a data-access caveat on a tool-server token (O39), an expiry, a malformed examination or
     another principal's token is a TokenRefused that the live test lets through as a failure, whatever the rights the
     user holds."""
     break_it(fake)
@@ -88,8 +88,8 @@ def test_o05_a_privilege_answer_that_cannot_be_read_is_a_failure_not_a_skip(conf
         mint_for_condition(issuer, config, "read", TOOLS, CEILING_S)
 
 
-def test_o37_a_tools_arguments_come_from_its_own_input_schema_by_what_each_name_says():
-    """O37: the live test of a read-only condition's tools never assumes the server's argument names: it reads each
+def test_o39_a_tools_arguments_come_from_its_own_input_schema_by_what_each_name_says():
+    """O39: the live test of a read-only condition's tools never assumes the server's argument names: it reads each
     property's kind from its name, the more specific word first (a state before a transfer, a transfer or a
     requirement before a file, a provider before replicas), and gives each the value of that kind, as text when the
     schema types it a string."""
@@ -136,8 +136,8 @@ def test_o37_a_tools_arguments_come_from_its_own_input_schema_by_what_each_name_
     }
 
 
-def test_o37_a_tool_whose_required_arguments_cannot_be_filled_is_unmeasured_not_guessed():
-    """O37: a required property whose name says no known kind, or a kind the test has no value of, leaves the tool
+def test_o39_a_tool_whose_required_arguments_cannot_be_filled_is_unmeasured_not_guessed():
+    """O39: a required property whose name says no known kind, or a kind the test has no value of, leaves the tool
     unmeasured, with the reason naming the properties; an optional one is left out."""
     schema = {"properties": {"file_id": {}, "mode": {}, "limit": {}}, "required": ["mode", "file_id"]}
     known = {"file": "file-0001"}
@@ -161,8 +161,8 @@ def test_o37_a_tool_whose_required_arguments_cannot_be_filled_is_unmeasured_not_
         (None, None, None, False),
     ],
 )
-def test_o37_only_a_refusal_counts_as_a_refused_write(status, code, errno, is_refusal):
-    """O37: a write of a read-only condition passes the live test only when Onedata refused it: 401, 403, or 400 posix
+def test_o39_only_a_refusal_counts_as_a_refused_write(status, code, errno, is_refusal):
+    """O39: a write of a read-only condition passes the live test only when Onedata refused it: 401, 403, or 400 posix
     eacces. A write that failed for another reason, a missing file, a bad value, a server error or no answer at all,
     is not a refusal, so it cannot make the test pass."""
     error = PlatformError("x", status=status, code=code, errno=errno, transport=status is None)

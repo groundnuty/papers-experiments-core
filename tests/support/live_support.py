@@ -122,7 +122,7 @@ def require_cleaned(entry: Entry) -> None:
         assert facts["cleanup_verified"] is True, f"the {entry.name} check did not show its scratch entry gone"
 
 
-# -- a read-only condition's tool server, live (O37) -------------------------------------------------------------------
+# -- a read-only condition's tool server, live (O39) -------------------------------------------------------------------
 
 VIEW_TOOLS = (
     "get_transfer",

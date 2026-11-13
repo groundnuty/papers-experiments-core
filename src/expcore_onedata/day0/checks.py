@@ -146,7 +146,7 @@ def tokens(ctx: Context) -> Result:
     Each token is the one a run mints (`TokenIssuer.mint_run_tokens`): scoped to every space its plane reaches
     (`space_ids`), with its principal's rights checked in each of them, so with several spaces a refusal names the
     space by its position and each plane's facts list the positions it reaches. Every condition's token is minted as a
-    run mints it too, a read-only condition's included (O37): its user must hold no Onezone admin privilege, and
+    run mints it too, a read-only condition's included (O39): its user must hold no Onezone admin privilege, and
     Onezone's scope of the token must be exactly the plane's spaces, so a fixed tool-server user who is a member of
     another space fails the check, and so does one who is a member of a cluster."""
     principals = ctx.config.principals
