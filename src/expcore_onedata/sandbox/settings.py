@@ -48,7 +48,7 @@ gate_memory_bytes = 1073741824  # optional
 [sandbox.mount]                 # required when a data path is a mount
 path = "/data"                  # where the agent sees the space, read-only
 io_mode = "direct"              # optional: "direct" or "proxy"
-extra_args = []                 # further oneclient arguments, never one that changes the TLS mode
+extra_args = []                 # further oneclient arguments, never one that changes the TLS mode or its log directory
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
@@ -311,6 +311,44 @@ def _served_caps(section: Section) -> Caps:
     )
 
 
+# The sandbox owns oneclient's log directory: it declares `--log-dir` itself and binds the run's own directory there
+# (`containers.sidecar_command`, `sidecar_run_args`, O05), so `extra_args` never gives one. oneclient reads its command
+# line with boost::program_options in its default style (`command_line_parser(...).run()`, no style set), which has
+# more forms of the option than `-l` and `--log-dir`: a short option's value may be attached (`-l/x`), short switches
+# may be clustered before it (`-fl /x`), and a long option may be abbreviated to any prefix that is no other option's
+# (`--log-d`; `--l`, `--lo`, `--log` and `--log-` also start `--log-read-write-perf`, which oneclient itself refuses as
+# ambiguous). A short option that takes a value ends a cluster, the rest being its value (`-oallow_root`).
+LOG_DIR_LONG = "log-dir"
+CLUSTERABLE_SHORT = frozenset("hVuifds")  # oneclient's short switches (options.cc); c H Z P t l r v o take a value
+
+
+def log_dir_option(args: Sequence[str]) -> str | None:
+    """The first of oneclient's `args` that is its log-directory option, in any form its parser reads, named as written
+    without a value attached to it (`-l`, `--log-d`), or None. An abbreviation that oneclient would refuse as ambiguous
+    counts too: it has no other use, and the refusal need not say which. The option is found by its token, wherever it
+    stands and whether or not a value follows."""
+    for arg in args:
+        if arg.startswith("--"):
+            name = arg[2:].split("=", 1)[0]
+            if name and LOG_DIR_LONG.startswith(name):
+                return f"--{name}"
+        elif arg.startswith("-"):
+            for letter in arg[1:]:
+                if letter == "l":
+                    return "-l"
+                if letter not in CLUSTERABLE_SHORT:
+                    break
+    return None
+
+
+def log_dir_refusal(option: str) -> str:
+    """Why `[sandbox.mount] extra_args` may not carry `option`, the log directory's (no value of it is repeated)."""
+    return (
+        f"must not carry oneclient's log directory ({option}): the sandbox sets it, and binds the run's own directory "
+        "there so the log is part of the run's evidence"
+    )
+
+
 def _mount(section: Section) -> MountSettings:
     """Read [sandbox.mount]: the path in the agent and the oneclient options; TLS is the platform's [tls]."""
     if "tls" in section.data:
@@ -325,6 +363,8 @@ def _mount(section: Section) -> MountSettings:
     extra = section.strings("extra_args") if "extra_args" in section.data else ()
     if any(a in FORBIDDEN_ARGS or (a.startswith("-") and not a.startswith("--") and "i" in a[1:]) for a in extra):
         raise section.fail("extra_args", "must not carry the TLS flag: the platform's [tls] alone sets it")
+    if (option := log_dir_option(extra)) is not None:
+        raise section.fail("extra_args", log_dir_refusal(option))
     return MountSettings(path, io_mode, tuple(extra))
 
 

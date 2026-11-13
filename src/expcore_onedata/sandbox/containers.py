@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint
-from expcore_onedata.sandbox.settings import SandboxSettings
+from expcore_onedata.sandbox.settings import SandboxSettings, log_dir_option, log_dir_refusal
 from expcore_onedata.sandbox.teardown import SIDECAR_MOUNT, SIDECAR_SUFFIX
 
 AGENT_OOM_SCORE_ADJ = 1000  # the host's out-of-memory killers take the agent's processes before anything else
@@ -43,9 +43,9 @@ SIDECAR_TOKEN_PATH = "/run/expcore/oneclient-token"  # the mount's token, bound 
 GATE_TOKEN_PATH = "/etc/gate/token"  # the REST path's token, bound into the gate alone, read-only; gate.json names it
 ENV_SSL_CERT_FILE = "SSL_CERT_FILE"  # OpenSSL's setting of the CA file its default verify paths load
 ONECLIENT_BIN = "/opt/oneclient/bin/oneclient"  # the published oneclient image's binary
-# Where the sidecar's oneclient writes its log, by `--log-dir` (`sidecar_command`), and where the run's own directory
-# for it is bound (`sidecar_run_args`): the log is then part of the run's evidence, read from the host, never copied
-# out of a running container with `docker cp` (O05).
+# Where the sidecar's oneclient writes its log, by `--log-dir` (`sidecar_command`, always: `extra_args` may not give
+# one), and where the run's own directory for it is bound (`sidecar_run_args`): the log is then part of the run's
+# evidence, read from the host, never copied out of a running container with `docker cp` (O05).
 SIDECAR_LOG_DIR = "/var/log/oneclient"
 # The published REST client's settings (its environment), not names of any federation.
 ENV_ZONE_HOST = "ONEDATA_ONEZONE_HOST"
@@ -136,20 +136,22 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     run's copy that `sidecar_run_args` mounts read-only, the CA file OpenSSL's default verify paths load (oneclient has
     no option of its own for a CA, and `tests/live/test_sandbox.py` checks the image honours it); `--insecure` is passed
     only with `insecure_tls`. `-f` keeps the client in the foreground. The mount is read-only (`-o ro`). The log
-    directory is declared, `--log-dir SIDECAR_LOG_DIR`, unless `[sandbox.mount] extra_args` gives one (oneclient takes
-    the option once): `sidecar_run_args` binds whichever it is to the run's own directory.
+    directory is always the sandbox's, `--log-dir SIDECAR_LOG_DIR` (`sidecar_run_args` binds the run's own directory
+    there): oneclient takes the option once, so `[sandbox.mount] extra_args` giving it in any form is refused here as
+    it is at load (`settings.log_dir_option`), which settings built in code would otherwise bypass.
     """
     mount = settings.mount
     if mount is None:
         raise ValueError("a mount data path needs [sandbox.mount]")
+    if (option := log_dir_option(mount.extra_args)) is not None:
+        raise ValueError(f"[sandbox.mount] extra_args {log_dir_refusal(option)}")
     io = {"direct": ["--force-direct-io"], "proxy": ["--force-proxy-io"]}.get(mount.io_mode or "", [])
     trust = [f"{ENV_SSL_CERT_FILE}={SIDECAR_CA_PATH}"] if settings.tls.ca_file is not None else []
-    log_dir = [] if declared_log_dir(mount.extra_args) is not None else ["--log-dir", SIDECAR_LOG_DIR]
     return [
         *("-u", "ONECLIENT_INSECURE", *trust, ONECLIENT_BIN, "-f", "-H", provider_host),
         *("-o", "ro,allow_other", *io),
         *(["--insecure"] if settings.tls.insecure else []),
-        *log_dir,
+        *("--log-dir", SIDECAR_LOG_DIR),
         *mount.extra_args,
         SIDECAR_MOUNT,
     ]
@@ -217,23 +219,6 @@ def gate_upstreams(settings: SandboxSettings, zone: Endpoint, provider: Endpoint
             ("oneprovider", federation.local_provider, FEDERATION_PORT, True),
         )
     return {name: {"role": role, "addr": name, "port": port, "tls": tls} for role, name, port, tls in named}
-
-
-def declared_log_dir(args: Sequence[str]) -> str | None:
-    """The last --log-dir / -l in oneclient's arguments, or None when they give none."""
-    out = None
-    for i, a in enumerate(args):
-        if a in ("--log-dir", "-l") and i + 1 < len(args):
-            out = args[i + 1]
-        elif a.startswith("--log-dir="):
-            out = a.split("=", 1)[1]
-    return out
-
-
-def effective_log_dir(args: Sequence[str], default: str = SIDECAR_LOG_DIR) -> str:
-    """The log directory oneclient was started with: the last --log-dir / -l in its arguments, else the default."""
-    declared = declared_log_dir(args)
-    return default if declared is None else declared
 
 
 def bind(source: Path, destination: str, *, readonly: bool = True) -> tuple[str, str]:
@@ -319,14 +304,12 @@ def sidecar_run_args(
     `--mount` bind, which refuses a missing source (`bind`).
 
     `log_dir`, the run's own directory for oneclient's log (owner-only; `DockerSandbox._start_mount`), is bound
-    read-write at the directory oneclient logs to (`effective_log_dir` of its arguments), so the log is read from the
-    host as part of the run's evidence, outlives the container, and is never copied out of a running one (O05)."""
+    read-write at the directory oneclient logs to (`SIDECAR_LOG_DIR`, the sandbox's own: `sidecar_command`), so the
+    log is read from the host as part of the run's evidence, outlives the container, and is never copied out of a
+    running one (O05)."""
     lim = s.limits
     network, dialled = sidecar_route(s, provider_host)
     command = sidecar_command(dialled, s)
-    in_container = effective_log_dir(command)
-    if not in_container.startswith("/") or in_container == "/":
-        raise ValueError("oneclient's log directory must be an absolute path inside the sidecar, not the root")
     return [
         *("run", "-d", "--name", names.sidecar, "--network", network, *labels),
         *("--cpus", str(lim.cpus), "--memory", str(lim.memory_bytes), "--memory-swap", str(lim.memory_bytes)),
@@ -334,7 +317,7 @@ def sidecar_run_args(
         *("--security-opt", "apparmor:unconfined", "--tmpfs", "/root/.local:size=1g"),
         *_ca_mount(s, ca_copy, SIDECAR_CA_PATH),
         *bind(token_file, SIDECAR_TOKEN_PATH),
-        *bind(log_dir, in_container, readonly=False),
+        *bind(log_dir, SIDECAR_LOG_DIR, readonly=False),
         *("--mount", f"type=bind,src={share},dst={SIDECAR_MOUNT},bind-propagation=rshared"),
         *("--entrypoint", "sh", image_id, "-c", SIDECAR_START, SIDECAR_SHELL_NAME, *command),
     ]

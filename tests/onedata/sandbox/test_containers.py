@@ -334,12 +334,6 @@ def test_o05_on_the_federation_network_the_gate_joins_it_and_the_rest_agent_neve
     assert env[C.ENV_ZONE_HOST] == FED_ZONE
 
 
-def test_the_oneclient_log_directory_is_the_last_one_given():
-    assert C.effective_log_dir(["-f"]) == C.SIDECAR_LOG_DIR
-    assert C.effective_log_dir(["--log-dir", "/a", "--log-dir=/b"]) == "/b"
-    assert C.effective_log_dir(["-l", "/c"]) == "/c"
-
-
 def test_o05_the_sidecar_declares_oneclients_log_directory_and_binds_the_runs_own_directory_there(s, names):
     """O05: oneclient is told where to log (`--log-dir`, once, as its option takes one value) and the run's own
     owner-only directory is bound read-write at that path, so the log is read from the host and collecting it never
@@ -350,20 +344,43 @@ def test_o05_the_sidecar_declares_oneclients_log_directory_and_binds_the_runs_ow
     assert command[command.index("--log-dir") + 1] == C.SIDECAR_LOG_DIR
     assert command.index("--log-dir") < command.index(C.SIDECAR_MOUNT)
     assert f"type=bind,src={LOG_DIR},dst={C.SIDECAR_LOG_DIR}" in mounts(args)  # no `readonly`: it writes there
-    assert C.effective_log_dir(command) == C.SIDECAR_LOG_DIR
+    assert [a for a in command if a.startswith("-l") or a.startswith("--l")] == ["--log-dir"]
 
 
-def test_o05_a_log_directory_the_operator_gives_oneclient_is_the_one_the_run_binds(s, names):
-    """O05: `[sandbox.mount] extra_args` may set the log directory; oneclient takes the option once, so the sandbox
-    adds none of its own, and binds the run's directory at the operator's path, so the log is still the run's."""
-    given = dataclasses.replace(s, mount=dataclasses.replace(s.mount, extra_args=("--log-dir=/var/lib/oc-log",)))
-    args = sidecar_args(given, names)
-    command = args[args.index("-c") + 3 :]
-    assert [a for a in command if a.startswith("--log-dir")] == ["--log-dir=/var/lib/oc-log"]
-    assert f"type=bind,src={LOG_DIR},dst=/var/lib/oc-log" in mounts(args)
-    relative = dataclasses.replace(s, mount=dataclasses.replace(s.mount, extra_args=("--log-dir", "logs")))
+@pytest.mark.parametrize(
+    ("extra", "option"),
+    [
+        (("-l/var/lib/oc-log",), "-l"),
+        (("-l", "/var/lib/oc-log"), "-l"),
+        (("-fl/var/lib/oc-log",), "-l"),
+        (("--log-dir", "/var/lib/oc-log"), "--log-dir"),
+        (("--log-dir=/var/lib/oc-log",), "--log-dir"),
+        (("--log-d=/var/lib/oc-log",), "--log-d"),  # an abbreviation oneclient accepts
+        (("--log", "/var/lib/oc-log"), "--log"),  # one it refuses as ambiguous: refused here all the same
+        (("-f", "--log-dir"), "--log-dir"),  # no value: oneclient would take the mountpoint
+    ],
+)
+def test_o05_the_sidecars_command_refuses_a_log_directory_in_extra_args_in_every_form(s, names, extra, option):
+    """O05: the sandbox owns oneclient's log directory, whatever `[sandbox.mount] extra_args` holds when the settings
+    are built in code rather than loaded: the command is never built with a second `--log-dir`, which oneclient
+    takes once and would fail to start on."""
+    given = dataclasses.replace(s, mount=dataclasses.replace(s.mount, extra_args=extra))
+    with pytest.raises(ValueError, match="log directory") as e:
+        C.sidecar_command("p.test", given)
+    assert f"({option})" in str(e.value)
+    assert "oc-log" not in str(e.value)
     with pytest.raises(ValueError, match="log directory"):
-        sidecar_args(relative, names)
+        sidecar_args(given, names)
+
+
+def test_o05_other_extra_args_follow_the_log_directory_the_sandbox_declares(s):
+    """O05: the arguments the operator may give come after the sandbox's own, with the one `--log-dir`."""
+    given = dataclasses.replace(s, mount=dataclasses.replace(s.mount, extra_args=("--provider-timeout=30", "-d")))
+    command = C.sidecar_command("p.test", given)
+    assert command.count("--log-dir") == 1
+    assert command[command.index("--log-dir") + 1] == C.SIDECAR_LOG_DIR
+    assert command[-3:-1] == ["--provider-timeout=30", "-d"]
+    assert command[-1] == C.SIDECAR_MOUNT
 
 
 @pytest.mark.parametrize("path", ["/w/a,b/token", '/w/a"b/token', "/w/a\nb/token"])

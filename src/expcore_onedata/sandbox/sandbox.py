@@ -80,11 +80,9 @@ from expcore_onedata.sandbox.containers import (
     agent_run_args,
     certifi_bundle,
     certifi_probe_args,
-    effective_log_dir,
     gate_run_args,
     gate_upstreams,
     sidecar_abort_args,
-    sidecar_command,
     sidecar_run_args,
     trust_targets,
 )
@@ -178,7 +176,6 @@ class DockerSandbox:
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
-        self._log_dir = SIDECAR_LOG_DIR  # where oneclient logs in the sidecar: the run's `LOG_DIR` is bound there
         self.keep_evidence = False
         self._init_sleep: dict[str, Any] | None = None  # the agent's init's `sleep`, by pid and start time (O34)
         self._uptime0: float | None = None
@@ -598,11 +595,9 @@ class DockerSandbox:
         self.host.run(["mount", "--make-rshared", str(share)], 60, sudo=True)  # so the sidecar's mount propagates out
         self._note_mounted(share)
         host_name = sp.provider.host
-        command = sidecar_command(host_name, s)
-        self._log_dir = effective_log_dir(command)
         self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
             "io_mode": s.mount.io_mode,
-            "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != SIDECAR_LOG_DIR else "default",
+            "log_dir_from": "sandbox",  # always: `extra_args` may not give oneclient a log directory
             "network": "federation" if s.federation is not None else "default bridge",  # `sidecar_route`'s, by kind
         }
         log_dir = self.dir / LOG_DIR  # oneclient's log is bound here, owner-only, and kept with the run's evidence
@@ -1231,7 +1226,7 @@ class DockerSandbox:
         if self.spec.mode is not DataPathMode.MOUNT:
             return None
         r = self.host.docker(
-            "exec", self.names.sidecar, "cat", f"{self._log_dir}/oneclient.INFO", check=False, timeout=60
+            "exec", self.names.sidecar, "cat", f"{SIDECAR_LOG_DIR}/oneclient.INFO", check=False, timeout=60
         )
         if r.returncode != 0:
             return {"unavailable": "the oneclient log could not be read", "stderr": stderr_digest(r.stderr)}

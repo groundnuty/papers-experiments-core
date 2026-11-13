@@ -533,7 +533,7 @@ def test_o05_the_sidecars_oneclient_log_is_in_an_owner_only_directory_of_the_run
     sidecar = world.host.containers[sbx.names.sidecar]
     assert f"type=bind,src={log_dir},dst={SIDECAR_LOG_DIR}" in sidecar.options["--mount"]
     assert sidecar.command[sidecar.command.index("--log-dir") + 1] == SIDECAR_LOG_DIR
-    assert sbx.metadata()["mount"]["log_dir_from"] == "default"  # the sandbox's own `--log-dir`, not `extra_args`'s
+    assert sbx.metadata()["mount"]["log_dir_from"] == "sandbox"  # the sandbox's own `--log-dir`, never `extra_args`'s
     (log_dir / "oneclient.INFO").write_text("I1113 00:00:00.000000 1 main.cc:1] a start-up line\n", encoding="utf-8")
     sbx.keep_evidence = True
     sbx.stop()
@@ -907,7 +907,7 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     meta = sbx.metadata()
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
     assert set(meta["mount"]) == {"io_mode", "log_dir_from", "network", "wait_s"}
-    assert meta["mount"]["log_dir_from"] == "default"
+    assert meta["mount"]["log_dir_from"] == "sandbox"
     assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)
     assert world.s.network.pools[0] not in text
