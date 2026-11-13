@@ -144,8 +144,14 @@ def test_o05_the_gate_takes_its_token_from_a_read_only_file_and_docker_is_given_
     assert f"{gate_token}:{C.GATE_TOKEN_PATH}:ro" in [v for f, v in pairs(args) if f == "-v"]
 
 
-def with_io_mode(s, mode):
-    return dataclasses.replace(s, mount=dataclasses.replace(s.mount, io_mode=mode))
+STORAGES = (("0a1b2c3d4e5f", "/srv/invented/one"), ("6a7b8c9d0e1f", "/srv/invented/two"))  # invented, in file order
+CHECK_FILE = "space-invented/checks/direct.bin"
+
+
+def with_io_mode(s, mode, **mount):
+    """The settings with the mount in `mode`; a direct one maps the invented storages and names a check file (O37)."""
+    direct = {"storages": STORAGES, "direct_check_file": CHECK_FILE} if mode == "direct" else {}
+    return dataclasses.replace(s, mount=dataclasses.replace(s.mount, io_mode=mode, **(direct | mount)))
 
 
 def test_o36_the_default_world_mounts_with_proxied_io(s):
@@ -181,12 +187,10 @@ def test_o36_a_mount_with_no_known_io_mode_never_gets_an_argv_that_leaves_it_to_
 def test_o36_the_options_the_sandbox_sets_are_the_commands_own(s):
     """O36: what the metadata records as the sandbox's options are exactly the ones in the command, and none of the
     study's extra arguments is among them."""
-    declared = dataclasses.replace(
-        s, mount=dataclasses.replace(s.mount, io_mode="direct", extra_args=("--provider-timeout", "30"))
-    )
+    declared = with_io_mode(s, "direct", extra_args=("--provider-timeout", "30"))
     options = C.sidecar_options(declared)
     command = C.sidecar_command("p.test", declared)
-    assert options == ["-o", "ro,allow_other", "--force-direct-io", "--config", "/dev/null"]
+    assert options == ["-o", "ro,allow_other", "--force-direct-io", "--config", "/dev/null", "--disable-log-buffering"]
     at = command.index(options[0])
     assert command[at : at + len(options)] == options
     assert command[-3:-1] == ["--provider-timeout", "30"]
@@ -242,14 +246,92 @@ def test_o36_the_command_refuses_settings_that_would_give_oneclient_two_force_op
         C.sidecar_command("p.test", dataclasses.replace(s, mount=mount))
 
 
-def test_o36_a_direct_mount_still_has_its_argv_for_the_storage_mapping_that_will_lift_the_refusal(s):
-    """O36: the loader refuses `direct` until the providers' storage is mapped into the sidecar (#223), but the command
-    for it stays: exactly one force option, the config file and the closed environment as for proxy."""
+def test_o36_a_direct_mount_has_one_force_option_and_the_closed_inputs_of_a_proxy_one(s):
+    """O36: a direct mount's command has exactly one force option, the config file and the closed environment, as for
+    proxy."""
     declared = with_io_mode(s, "direct")
     command = C.sidecar_command("p.test", declared)
     assert command.count("--force-direct-io") == 1
     assert "--force-proxy-io" not in command
     assert unset_names(command) == ["ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG"]
+
+
+def test_o37_a_direct_mount_names_each_storage_to_oneclient_at_its_place_in_the_sidecar(s):
+    """O37: one `--override <storage id>:mountPoint:<path in the sidecar>` per mapped storage, in the file's order,
+    each at a path of its position (never the host's), after the sandbox's options and before the study's arguments,
+    so the POSIX helper reads each storage where the sidecar has it and never scans the sidecar's mounts for it."""
+    declared = with_io_mode(s, "direct", extra_args=("--provider-timeout", "30"))
+    command = C.sidecar_command("p.test", declared)
+    overrides = [command[i + 1] for i, word in enumerate(command) if word == "--override"]
+    assert overrides == [
+        f"0a1b2c3d4e5f:mountPoint:{C.DIRECT_STORAGE_ROOT}/0",
+        f"6a7b8c9d0e1f:mountPoint:{C.DIRECT_STORAGE_ROOT}/1",
+    ]
+    assert command.index("--disable-log-buffering") < command.index("--override")
+    assert command.index("--override") < command.index("--provider-timeout")
+    assert not any("/srv/invented" in word for word in command)  # the host's path is the bind's alone
+
+
+def test_o37_o12_the_options_a_record_keeps_hold_no_storage_id_or_path(s):
+    """O37, O12: `sidecar_options` is what a run's metadata records; a storage id and a host path are configured
+    values, so they are in the overrides and the binds alone."""
+    options = C.sidecar_options(with_io_mode(s, "direct"))
+    text = " ".join(options)
+    for storage_id, path in STORAGES:
+        assert storage_id not in text
+        assert path not in text
+    assert "--override" not in options
+
+
+def test_o37_each_storage_is_bound_read_only_into_the_sidecar_at_its_place(s, names):
+    """O37: each mapped storage's host directory is a `--mount` bind, read-only, into the sidecar, at the path its
+    override names; `--mount` refuses a source that is not there, where `-v` would create it."""
+    args = C.sidecar_run_args(
+        with_io_mode(s, "direct"), names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE
+    )
+    binds = [v for f, v in pairs(args) if f == "--mount" and "/srv/invented" in v]
+    assert binds == [
+        f"type=bind,src=/srv/invented/one,dst={C.DIRECT_STORAGE_ROOT}/0,readonly",
+        f"type=bind,src=/srv/invented/two,dst={C.DIRECT_STORAGE_ROOT}/1,readonly",
+    ]
+    assert not any("/srv/invented" in v for f, v in pairs(args) if f == "-v")
+
+
+def test_o37_a_proxy_mount_binds_no_storage_and_passes_no_override_or_log_switch(s, names):
+    """O37: proxy reads through the provider: the sidecar gets no storage, and oneclient no override and no log
+    switch of the core's."""
+    command = C.sidecar_command("p.test", s)
+    assert "--override" not in command
+    assert "--disable-log-buffering" not in command
+    args = C.sidecar_run_args(s, names, LABELS, Path("/w/mount"), s.oneclient.id, "p.test", token_file=TOKEN_FILE)
+    assert not any(C.DIRECT_STORAGE_ROOT in word for word in args)
+
+
+def test_o37_the_agent_never_gets_a_storage_in_a_direct_mount(s, names):
+    """O37: the providers' storage is the sidecar's alone: the agent's container is given the mount's share and its
+    inputs, and no argument of it names a storage's host directory or its place in the sidecar."""
+    declared = with_io_mode(s, "direct")
+    args, env = agent(declared, names, DataPathMode.MOUNT, share=Path("/w/mount"))
+    text = " ".join(args) + json.dumps(env)
+    assert "/srv/invented" not in text
+    assert C.DIRECT_STORAGE_ROOT not in text
+    assert "0a1b2c3d4e5f" not in text
+
+
+def test_o37_the_command_refuses_a_direct_mount_whose_mapping_was_removed_past_its_check(s):
+    """O37: a mount whose fields were set past its own check (`object.__setattr__`) still raises at the command, so a
+    direct oneclient never starts with no storage, and a proxy one never with one."""
+    mount = dataclasses.replace(with_io_mode(s, "direct").mount)
+    object.__setattr__(mount, "storages", ())
+    with pytest.raises(ValueError, match="storages"):
+        C.sidecar_command("p.test", dataclasses.replace(s, mount=mount))
+    proxy = dataclasses.replace(s.mount)
+    object.__setattr__(proxy, "storages", STORAGES)
+    with pytest.raises(ValueError, match="storages"):
+        C.sidecar_run_args(
+            dataclasses.replace(s, mount=proxy), C.Names.make("sbx", "k"), LABELS, Path("/w/mount"), "img", "p.test",
+            token_file=TOKEN_FILE,
+        )  # fmt: skip
 
 
 HELP = """General options:

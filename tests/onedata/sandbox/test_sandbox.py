@@ -788,17 +788,17 @@ def test_o36_the_metadata_records_the_io_mode_the_mount_runs_with_and_the_option
     sbx.stop()
 
 
-def test_o36_a_direct_mount_records_direct_and_the_study_extra_arguments_only_by_name_and_hash(world):
-    """O36: the effective mode is `direct` when declared; the study's extra arguments are recorded by their option
-    names and the SHA-256 of the whole list, never by value (a value may be a path or an identifier, O12)."""
+def test_o36_the_study_extra_arguments_are_recorded_only_by_name_and_hash(world):
+    """O36: the study's extra arguments are recorded by their option names and the SHA-256 of the whole list, never by
+    value (a value may be a path or an identifier, O12). A direct mount's record: test_sandbox_direct (O37)."""
     from dataclasses import replace
 
     extra = ("--provider-timeout", "45", "--log-dir=/somewhere/private", "-l/attached/private")
-    world.s = replace(world.s, mount=replace(world.s.mount, io_mode="direct", extra_args=extra))
+    world.s = replace(world.s, mount=replace(world.s.mount, extra_args=extra))
     sbx = start(world, "mounted")
     meta = sbx.metadata()
-    assert meta["mount"]["io_mode"] == "direct"
-    assert meta["mount"]["options"] == ["-o", "ro,allow_other", "--force-direct-io", "--config", "/dev/null"]
+    assert meta["mount"]["io_mode"] == "proxy"
+    assert meta["mount"]["options"] == ["-o", "ro,allow_other", "--force-proxy-io", "--config", "/dev/null"]
     assert meta["mount"]["extra_args"] == {
         "names": ["--provider-timeout", "--log-dir", "-l"],  # a short option's attached value is never kept
         "sha256": hashlib.sha256("\0".join(extra).encode()).hexdigest(),

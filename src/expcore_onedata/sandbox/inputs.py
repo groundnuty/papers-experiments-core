@@ -4,10 +4,11 @@
 A `ReadOnlyInput` names a directory on the host and the absolute path the agent sees it at. Before anything exists, the
 start checks both (`validate`): the path is plain and absolute, and is not, does not hold and does not lie under another
 mount of the agent or another input; the directory holds at least one regular file, and nothing but regular files and
-directories. Once the run's directory exists, each input is copied into it (`snapshot`): every file is read once, its
-bytes hashed and written to the copy, which is the driver's, mode 0755 where the source is executable by anyone and
-0644 otherwise, directories 0755. The copy, not the source, is mounted read-only in the agent's container (`readonly`),
-so the bytes hashed are the bytes the agent sees, whatever happens to the source during the run.
+directories, and is not, does not hold and does not lie under a storage a direct mount reads (O37). Once the run's
+directory exists, each input is copied into it (`snapshot`): every file is read once, its bytes hashed and written to
+the copy, which is the driver's, mode 0755 where the source is executable by anyone and 0644 otherwise, directories
+0755. The copy, not the source, is mounted read-only in the agent's container (`readonly`), so the bytes hashed are the
+bytes the agent sees, whatever happens to the source during the run.
 
 The hash covers each entry's path relative to the input, whether it is a directory, and for a file whether it is
 executable, its size and its SHA-256, in path order (`digest`). The plugin declares its inputs once (`declare`), which
@@ -101,13 +102,24 @@ def taken_paths(settings: SandboxSettings) -> list[str]:
     return [*TAKEN, CA_PATH, *settings.trust_paths, *([settings.mount.path] if settings.mount else [])]
 
 
-def validate(items: Sequence[ReadOnlyInput], taken: Sequence[str]) -> tuple[ReadOnlyInput, ...]:
+def storage_paths(settings: SandboxSettings) -> list[str]:
+    """The host directories of a direct mount's storages, resolved (O37): an input's source may not be, hold or lie
+    under one, or the agent's container would get a copy of a provider's storage. None without a direct mount."""
+    return [str(Path(path).resolve()) for _, path in (settings.mount.storages if settings.mount else ())]
+
+
+def validate(
+    items: Sequence[ReadOnlyInput], taken: Sequence[str], *, storages: Sequence[str] = ()
+) -> tuple[ReadOnlyInput, ...]:
     """The inputs with their sources resolved, or `StartRefused` naming the first bad one by its position, never a path.
-    `taken` are the paths in the agent that its other mounts take (`taken_paths`). An input with a declared `sha256`
-    whose content no longer has it is refused too."""
+    `taken` are the paths in the agent that its other mounts take (`taken_paths`), and `storages` the host directories
+    of a direct mount's storages (`storage_paths`), which no source may be, hold or lie under (O37). An input with a
+    declared `sha256` whose content no longer has it is refused too."""
     checked: list[ReadOnlyInput] = []
     for n, item in enumerate(items):
         where = f"read-only input {n}"
+        if any(_overlap(str(Path(item.source).resolve()), storage) for storage in storages):
+            raise StartRefused(f"{where}: its source is, holds or lies under a storage the mount reads directly")
         target = item.target if isinstance(item.target, str) else ""
         parts = target.split("/")[1:] if target.startswith("/") else []
         if not parts or len(target) > MAX_TARGET or any(p in (".", "..") or not PART.fullmatch(p) for p in parts):
@@ -214,7 +226,7 @@ def declare(
     `StartRefused`, naming its position, never a path."""
     out: dict[str, tuple[ReadOnlyInput, ...]] = {}
     for name, items in declared.items():
-        checked = validate(items, taken_paths(settings))
+        checked = validate(items, taken_paths(settings), storages=storage_paths(settings))
         out[str(name)] = tuple(
             ReadOnlyInput(item.source, item.target, _hash_of(item.source, f"read-only input {n}"))
             for n, item in enumerate(checked)
@@ -362,6 +374,7 @@ __all__ = [
     "probe_source",
     "probe_targets",
     "snapshot",
+    "storage_paths",
     "taken_paths",
     "validate",
 ]
