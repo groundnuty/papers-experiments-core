@@ -1237,6 +1237,10 @@ class DockerSandbox:
     def _stop_locked(self, force: bool = False) -> None:
         if self._stopped and not force:
             return
+        if self._cells is not None and self._cells.ended is not None:
+            # a run a cell's deadline ended is set aside as infrastructure: its disks are kept, as a failed collection's
+            # are, whichever stop comes first, the deadline's own or the driver's (O30)
+            self.keep_evidence = True
         with self._created_lock:
             created = self._created
         errors: list[str] = []
@@ -1305,11 +1309,12 @@ class DockerSandbox:
             self._step(unmount_errors, self.host.unmount, m)
         errors.extend(unmount_errors)
         if self.keep_evidence:
-            self._meta["evidence_kept"] = {
-                "under": "sandbox.work_root",
-                "directory_id": self.sid.rsplit("-", 1)[-1],
-                "relocated": False,
-            }
+            with self._meta_lock:  # `metadata()` may be reading it from another thread
+                self._meta["evidence_kept"] = {
+                    "under": "sandbox.work_root",
+                    "directory_id": self.sid.rsplit("-", 1)[-1],
+                    "relocated": False,
+                }
         if self._mounts_may_be_live(unmount_errors):
             # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
@@ -1318,7 +1323,8 @@ class DockerSandbox:
             )
             return
         if self.keep_evidence and self._token_files_left():  # a secret is never evidence: the run stays where it is
-            self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
+            with self._meta_lock:
+                self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
             errors.append(
                 "the run directory is left where it is: a copy of the data-path token in it could not be removed, "
                 "so it is not kept as evidence"
@@ -1332,7 +1338,8 @@ class DockerSandbox:
             kept = self.s.work_root / "_kept_evidence"
             self._step(errors, lambda: self.host.run(["mkdir", "-p", str(kept)], 20, sudo=True))
             self._step(errors, lambda: self.host.run(["mv", str(self.dir), str(kept / self.sid)], 60, sudo=True))
-            self._meta["evidence_kept"]["relocated"] = True
+            with self._meta_lock:
+                self._meta["evidence_kept"]["relocated"] = True
             if self.dir.exists() or not (kept / self.sid).exists():
                 errors.append("the evidence could not be moved to the place it is kept")
         else:

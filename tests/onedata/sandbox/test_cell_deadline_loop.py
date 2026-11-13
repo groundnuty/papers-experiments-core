@@ -137,6 +137,7 @@ def test_o30_a_cell_that_outlives_its_kill_in_the_agent_loop_ends_the_run_as_cel
     record = sandbox._cells.ended
     assert record["outcome"] == "mount_aborted"
     assert [s["step"] for s in record["steps"]] == ["kill", "survived", "abort", "ended"]
+    assert sandbox.metadata()["evidence_kept"]["relocated"] is True  # launch's stop keeps a set-aside run's disks
 
 
 def test_o30_collect_settles_a_cell_still_running_before_it_decides(world, mounted):

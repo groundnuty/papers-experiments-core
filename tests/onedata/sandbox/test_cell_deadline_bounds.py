@@ -86,6 +86,9 @@ def test_o30_the_sandboxs_stop_runs_after_the_run_is_classified_and_outside_the_
     assert stopped_step(record)["ok"] is True
     assert seen == [record]  # classified before the teardown began
     assert mounted.stopped is True
+    kept = mounted.metadata()["evidence_kept"]  # set aside as infrastructure: its disks are kept, never deleted
+    assert kept["relocated"] is True
+    assert (world.s.work_root / "_kept_evidence" / mounted.sid).is_dir()
 
 
 # ---------------------------------------------------------------------------------------------- the init's own sleep
