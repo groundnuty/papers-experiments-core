@@ -249,6 +249,23 @@ def test_o05_a_token_scope_inference_carries_the_gates_token_in_its_body(world):
     conn.close()
 
 
+def test_o30_a_token_scope_inference_goes_to_the_zone_without_the_gates_token_in_a_header(world):
+    """O30: Onezone serves the inference to anyone (oz-worker token_routes.erl, `scope = public`), but a request that
+    carries a token in a header is first authenticated with it, and a data-path token's data-access caveats make that
+    fail with 401 (live, 13 Nov). So the inference goes without the gate's token in any header, the token it asks about
+    in its body; every other call keeps the header."""
+    conn = connect(world, ZONE)
+    conn.request("POST", SCOPE, body=b"{}", headers={"Content-Type": "application/json", "X-Auth-Token": "agent-sent"})
+    assert conn.getresponse().read() == b"{}"
+    conn.close()
+    method, path, sent = world.upstream.seen[-1]
+    assert (method, path) == ("POST", SCOPE)
+    headers = {k.lower(): v for k, v in sent.items()}
+    assert not set(headers) & {"x-auth-token", "authorization", "macaroon"}, headers
+    assert GATE_TOKEN not in json.dumps(headers)
+    assert json.loads(world.upstream.bodies[-1])["token"] == GATE_TOKEN
+
+
 # What an agent may send as a token: the placeholder its environment holds on a REST data path by default (O23), and
 # an invented one shaped like a real token, which the agent could have guessed.
 AGENT_TOKENS = (PLACEHOLDER_TOKEN, "MDAx-guessed-by-the-agent-0123")
@@ -391,8 +408,9 @@ def test_o23_white_space_inside_a_header_line_is_no_fold(world):
 def test_o05_a_scope_inference_carries_the_gates_token_whatever_the_agent_put_in_its_body_and_headers(
     world, agent_token
 ):
-    """O05: the token-scope inference names its token in the body; the agent's value there, and in every header the
-    platform reads one from, is replaced by the gate's token, and no byte of the agent's value reaches the zone."""
+    """O05, O30: the token-scope inference names its token in the body; the agent's value there is replaced by the
+    gate's token, every header the platform reads one from is dropped and none is added (Onezone serves the inference to
+    anyone), and no byte of the agent's value reaches the zone."""
     every_form = [line for form in FORWARDED_FORMS for line in TOKEN_FORMS[form](agent_token)]
     conn = connect(world, ZONE)
     body = json.dumps({"token": agent_token}).encode()
@@ -400,7 +418,8 @@ def test_o05_a_scope_inference_carries_the_gates_token_whatever_the_agent_put_in
     conn.close()
     assert json.loads(world.upstream.bodies[0]) == {"token": GATE_TOKEN}
     (lines,) = world.upstream.header_lines
-    assert [v for k, v in lines if k.lower() == "x-auth-token"] == [GATE_TOKEN]
+    assert not [k for k, _ in lines if k.lower() in TOKEN_FORMS]
+    assert GATE_TOKEN not in json.dumps(lines)
     assert agent_token not in json.dumps(lines) + world.upstream.bodies[0].decode()
 
 
