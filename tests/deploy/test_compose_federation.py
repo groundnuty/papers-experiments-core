@@ -314,7 +314,7 @@ def test_o03_the_mount_live_test_puts_the_sidecar_on_the_federation_network_dial
 def test_o03_the_rest_live_test_puts_the_gate_on_the_federation_network_dialling_names_the_certificates_hold(
     fed, tmp_path
 ):
-    """O03 (#203): the live REST-path test runs with a copy of the federation's platform.toml and a `[sandbox]` table
+    """O30 (#203): the live REST-path test runs with a copy of the federation's platform.toml and a `[sandbox]` table
     of one REST level, whose `[sandbox.federation]` names the project's network, the zone's domain and the local
     provider's. The gate then serves and dials those domains on port 443, never the loopback ports the platform file's
     URLs give, and each is a name the certificate the federation issues that service holds, so the gate's check of it

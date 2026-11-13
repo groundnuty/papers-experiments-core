@@ -264,7 +264,7 @@ LOOPBACK_ZONE, LOOPBACK_PROVIDER = Endpoint("127.0.0.1", 9443), Endpoint("127.0.
 
 
 def test_o03_with_a_federation_network_the_gate_starts_on_it_and_dials_the_zone_and_provider_by_their_names(s, names):
-    """O03 (#203): with `[sandbox.federation]` the gate starts on the federation's own network, never also on the
+    """O30 (#203): with `[sandbox.federation]` the gate starts on the federation's own network, never also on the
     default bridge, and serves and dials the zone and the local provider by their names there, on the network's port
     443: never the host's loopback, where the platform file publishes them and where a container reaches only itself.
     The sandbox's internal network is joined afterwards (`docker network connect`), as before."""
@@ -280,7 +280,7 @@ def test_o03_with_a_federation_network_the_gate_starts_on_it_and_dials_the_zone_
 
 
 def test_o03_without_the_table_the_gate_is_on_the_default_bridge_and_dials_the_urls_hosts_as_before(s, names):
-    """O03: without `[sandbox.federation]` the gate starts as it always has: on docker's default bridge, serving and
+    """O30: without `[sandbox.federation]` the gate starts as it always has: on docker's default bridge, serving and
     dialling the hosts and ports of the zone's and the local provider's URLs."""
     args = C.gate_run_args(s, names, LABELS, Path("/w"), Path("/pkg"), s.gate.id, token_file=GATE_TOKEN_FILE)
     assert [v for f, v in pairs(args) if f == "--network"] == ["bridge"]
@@ -292,7 +292,7 @@ def test_o03_without_the_table_the_gate_is_on_the_default_bridge_and_dials_the_u
 
 
 def test_o03_a_federation_table_without_the_zones_name_gives_the_gate_no_upstreams(s):
-    """O03: the load refuses a REST level whose table has no zone; a table built without one in code is refused too,
+    """O30: the load refuses a REST level whose table has no zone; a table built without one in code is refused too,
     rather than letting the zone fall back to the platform file's URL, which no container on the network reaches."""
     federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL))
     with pytest.raises(ValueError, match="zone"):
@@ -300,7 +300,7 @@ def test_o03_a_federation_table_without_the_zones_name_gives_the_gate_no_upstrea
 
 
 def test_o05_on_the_federation_network_the_gate_joins_it_and_the_rest_agent_never_does(s, names):
-    """O05 (#203): the REST agent stays on its own internal network, whose one peer is the gate; the gate alone is on
+    """O30 (#203): the REST agent stays on its own internal network, whose one peer is the gate; the gate alone is on
     the federation's network. The agent resolves the names the gate serves to the gate's address, so it reaches the
     federation through the gate and nothing else."""
     federated = dataclasses.replace(s, federation=FederationNetwork(FED_NETWORK, FED_LOCAL, FED_ZONE))

@@ -182,7 +182,7 @@ def attempt(tmp_path_factory):
 
 
 def test_o05_the_gate_starts_as_root_with_one_capability_on_keys_given_to_root(attempt):
-    """O05 (#203): the gate said it was ready, so it loaded its keys; it ran as root with every capability dropped but
+    """O30 (#203): the gate said it was ready, so it loaded its keys; it ran as root with every capability dropped but
     NET_BIND_SERVICE, the flags that kept it from reading keys the driver owned."""
     gate = attempt["containers"]["gate"]
     assert gate["running"] is True
@@ -190,7 +190,7 @@ def test_o05_the_gate_starts_as_root_with_one_capability_on_keys_given_to_root(a
 
 
 def test_o03_the_gate_alone_is_on_the_federation_network_and_serves_the_names_there(attempt):
-    """O03, O05 (#203): the gate is on the federation's network and the sandbox's; the agent on the sandbox's alone.
+    """O30 (#203): the gate is on the federation's network and the sandbox's; the agent on the sandbox's alone.
     The gate serves the zone and the local provider by their domains on the federation's network."""
     containers = attempt["containers"]
     assert containers["gate"]["networks"] == ["federation", "sandbox"]
@@ -200,7 +200,7 @@ def test_o03_the_gate_alone_is_on_the_federation_network_and_serves_the_names_th
 
 
 def test_o08_a_file_read_through_the_gate_is_the_files_bytes(attempt):
-    """O08 (#203): through the gate, the zone answers and the local provider serves the provisioned file whole, and its
+    """O30 (#203): through the gate, the zone answers and the local provider serves the provisioned file whole, and its
     SHA-256 is the one read from the host through the provider's own URL."""
     read, expected = attempt["read"], attempt["expected"]
     assert read.get("zone_status") == 200, read

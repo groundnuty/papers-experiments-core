@@ -506,7 +506,7 @@ def test_o05_a_federation_table_with_neither_a_mount_nor_a_rest_data_path_is_ref
 
 
 def test_o03_a_rest_data_path_alone_takes_the_federation_table_with_the_zones_name(tmp_path):
-    """O03: the REST data path's gate reaches the zone and the local provider on the federation's network (#203), so
+    """O30: the REST data path's gate reaches the zone and the local provider on the federation's network (#203), so
     the table is read with a rest level and no mount, and gives the gate both names there."""
     edit = with_levels({"via-gate": "rest", "isolated": "none"})
     sandbox = load_platform(write_platform(tmp_path, edit), require_secrets=False).sandbox
@@ -514,7 +514,7 @@ def test_o03_a_rest_data_path_alone_takes_the_federation_table_with_the_zones_na
 
 
 def test_o03_a_rest_data_path_on_the_federation_needs_the_zones_name_there(tmp_path):
-    """O03: the gate dials the zone on the federation's network too, by the name its certificate holds; a table that
+    """O30: the gate dials the zone on the federation's network too, by the name its certificate holds; a table that
     gives the gate no zone there is refused at load, naming the key, rather than leaving the zone to a loopback URL."""
     edit = with_levels({"via-gate": "rest"}, lambda table: table.pop("zone"))
     with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: key 'zone' is required") as caught:
@@ -523,7 +523,7 @@ def test_o03_a_rest_data_path_on_the_federation_needs_the_zones_name_there(tmp_p
 
 
 def test_o05_the_zones_name_is_refused_where_no_gate_reads_it(tmp_path):
-    """O05: a mount sidecar never dials the zone, so a `zone` in a table no REST level reads would do nothing: it is
+    """O30: a mount sidecar never dials the zone, so a `zone` in a table no REST level reads would do nothing: it is
     refused, as a misspelt key is. A mount level's table without it loads as before."""
     edit = with_levels({"mounted": "mount", "isolated": "none"})
     with pytest.raises(ConfigError, match=r"\[sandbox\.federation\]: key 'zone' is read by the REST data path's gate"):
@@ -536,7 +536,7 @@ def test_o05_the_zones_name_is_refused_where_no_gate_reads_it(tmp_path):
 
 @pytest.mark.parametrize("address", ["zone.fed-net.test:443", "https://zone.fed-net.test", "a b", "-x", "", 7])
 def test_o03_the_zones_name_on_the_network_is_a_host_name(tmp_path, address):
-    """O03: the gate dials the zone's name on the network's port 443, so it is a plain host name: no scheme, no port,
+    """O30: the gate dials the zone's name on the network's port 443, so it is a plain host name: no scheme, no port,
     no space. It is a configured value: the key is named, never the value."""
 
     def change(table):

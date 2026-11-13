@@ -202,7 +202,7 @@ def test_o05_the_gate_takes_the_rest_token_from_a_root_owned_file_bound_into_it_
 
 
 def test_o05_the_gates_tls_keys_are_given_to_its_user_read_only_as_its_token_file_is(world):
-    """O05 (#203): the gate runs as root with every capability dropped but NET_BIND_SERVICE, so it reads only a file
+    """O30 (#203): the gate runs as root with every capability dropped but NET_BIND_SERVICE, so it reads only a file
     root owns or one anyone may read. Each key it serves a name with is made owner-only (0400) and then root's, as the
     token file is, so the gate can load it and no other user of the host can; each certificate, which is no secret, is
     readable by anyone (0444), and so are the directory the keys are mounted from and the gate's configuration."""
@@ -223,7 +223,7 @@ def test_o05_the_gates_tls_keys_are_given_to_its_user_read_only_as_its_token_fil
 
 
 def test_o05_keys_that_cannot_be_given_to_the_gates_user_refuse_the_start_and_leave_nothing(world):
-    """O05 (#203): a key the gate could not read would end the gate before it says it is ready; a key that cannot be
+    """O30 (#203): a key the gate could not read would end the gate before it says it is ready; a key that cannot be
     given to root fails the start at once, naming what failed, and the teardown leaves nothing."""
     world.host.run_handlers["chown"] = lambda argv: CmdResult(1, "", "not permitted")
     with pytest.raises(SandboxError, match="TLS keys could not be given to the gate's user"):
@@ -1163,7 +1163,7 @@ def test_o15_a_federation_network_that_is_not_there_refuses_the_start_before_any
 
 
 def test_o03_a_rest_gate_reaches_the_federation_on_its_network_by_the_names_there_and_the_agent_stays_off(fed_world):
-    """O03, O05 (#203): with `[sandbox.federation]` the REST data path's gate starts on the federation's own network
+    """O30 (#203): with `[sandbox.federation]` the REST data path's gate starts on the federation's own network
     and is then connected to the sandbox's internal network, and to no other. It serves and dials the zone and the
     local provider by their names on the federation's network, port 443, never the loopback addresses of the platform
     file's URLs; its certificates are issued for those names, which the agent resolves to the gate and whose zone is
@@ -1186,7 +1186,7 @@ def test_o03_a_rest_gate_reaches_the_federation_on_its_network_by_the_names_ther
 
 
 def test_o03_without_the_table_a_rest_gate_starts_on_the_default_bridge_and_dials_the_urls_as_before(world):
-    """O03: without `[sandbox.federation]` nothing changes: the gate is on docker's default bridge and the sandbox's
+    """O30: without `[sandbox.federation]` nothing changes: the gate is on docker's default bridge and the sandbox's
     internal network, and serves and dials the hosts and ports of the zone's and the local provider's URLs."""
     sbx = start(world, "via-gate")
     gate, agent = (world.host.containers[n] for n in (sbx.names.gate, sbx.names.agent))
