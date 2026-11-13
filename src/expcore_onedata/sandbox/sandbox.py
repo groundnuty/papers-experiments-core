@@ -853,10 +853,19 @@ class DockerSandbox:
                 )
             self._steps_running += 1
 
+    def settle_deadline(self) -> dict[str, Any] | None:
+        """Before anyone decides how the run ended (`launch`, `collect`): a cell still running has its deadline enforced
+        now, and one under way is waited for (`CellRunner.settle`, O30). The record of the deadline that ended the run,
+        or None. It never raises."""
+        return self._cells.settle() if self._cells is not None else None
+
     def _refuse_if_ended(self, *, unless: tuple[str, ...] = ()) -> None:
         """Raise `InfraError("cell_unkillable")` once a cell's deadline ended the run (O30), unless it ended as one of
         `unless`: after an abort the mount is dead, and no later cell may read it as if it were an empty directory."""
-        record = self._cells.ended if self._cells is not None else None
+        if self._cells is None:
+            return
+        with self._meta_lock:
+            record = self._cells.ended
         if record is not None and record["outcome"] not in unless:
             raise kinds.run_ended_error(record)
 
@@ -1038,7 +1047,9 @@ class DockerSandbox:
         raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
         is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection. A run a
         cell's deadline stopped, or left with a process that outlived its kill, raises `InfraError("cell_unkillable")`
-        (O30); after the mount's abort alone the outputs are collected as usual."""
+        (O30); after the mount's abort alone the outputs are collected as usual. A cell still running has its deadline
+        settled first (`settle_deadline`), so none fires while the agent is frozen and its outputs are copied."""
+        self.settle_deadline()
         self._refuse_if_ended(unless=(DL.MOUNT_ABORTED,))
         try:
             state = self._cells.quiesce("before collection")
@@ -1208,7 +1219,10 @@ class DockerSandbox:
         One teardown at a time: the sampler's thread and the driver's `finally` may both stop; the second waits, then
         finds it stopped. A SIGTERM cannot cut it short (termination.py): that would leave what it exists to remove.
         A stop that ran while a start was still creating things does not count as the last: whatever was registered
-        after it began leaves the sandbox not stopped, and `force` runs the teardown again whatever is believed."""
+        after it began leaves the sandbox not stopped, and `force` runs the teardown again whatever is believed. A
+        cell's deadline under way is waited for first, at most its margin, so the teardown never races it (O30)."""
+        if self._cells is not None:
+            self._cells.wait_decided()
         with TERM.sigterm_deferred(), self._stop_lock:
             self._stop_locked(force)
 

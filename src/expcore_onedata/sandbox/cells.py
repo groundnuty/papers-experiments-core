@@ -44,6 +44,7 @@ QUIESCE_ROUNDS = (
 )
 HOST_CALL_MARGIN_S = 30.0  # what the docker client may take beyond the cell's own limit before it is given up on
 KILL_S = 20.0  # a `kill` of the agent's processes through the host's privilege
+SETTLE_SLACK_S = 30.0  # beyond a deadline's margin, what its commands' own timeouts may overrun it by
 
 
 def docker_failed(rc: int, err: str) -> bool:
@@ -94,6 +95,24 @@ class CellTimer:
             self._decided.set()
         if then is not None:
             then()
+
+    def fire_now(self, timeout_s: float) -> bool | None:
+        """The run's body is over while the cell still runs (the loop cut it at the agent's cap, which is the cell's):
+        fire now, in a thread of the timer's own, unless the cell has ended or the timer has fired; then wait for the
+        outcome, at most `timeout_s`. Whether the timer fired; None when its outcome was not decided in time."""
+        if self._claim():
+            self._timer.cancel()
+            threading.Thread(target=self._run_kill, name="cell-deadline", daemon=True).start()
+        return self.wait_decided(timeout_s)
+
+    def wait_decided(self, timeout_s: float) -> bool | None:
+        """Whether the timer fired, once its kill's outcome is decided, waited for at most `timeout_s`; never fires it.
+        None when it fired and the outcome was not decided in time."""
+        with self._lock:
+            fired = self._fired
+        if fired and not self._decided.wait(timeout_s):
+            return None
+        return fired
 
     def end(self) -> bool:
         """The cell has ended: from now on the timer does nothing. Whether it fired, after its kill's outcome is
@@ -156,6 +175,7 @@ class CellRunner:
         self.init_sleep: dict[str, Any] | None = None
         self._deadline: dict[str, Any] | None = None  # the record of the running cell's deadline, once it fired
         self.ended: dict[str, Any] | None = None  # the deadline that ended the run: a process outlived its kill
+        self._running: CellTimer | None = None  # the timer of the cell running now, while its `run` lasts
         self.cells: list[dict[str, Any]] = []
         self._events_seen: dict[str, int] | None = None
         self._earlyoom_seen = 0
@@ -279,6 +299,29 @@ class CellRunner:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
         return (lambda: self._stop_after(record)) if outcome in DL.STOPS else None
 
+    def settle(self) -> dict[str, Any] | None:
+        """The run's body is over (`launch` leaves it, or `collect` begins): a cell still running is past its cap, the
+        agent's own, so its deadline is enforced now if its timer has not fired, and one under way is waited for, at
+        most its margin and `SETTLE_SLACK_S`. Only then may anyone decide how the run ended (O30). The deadline that
+        ended the run, or None; a deadline whose outcome was not decided in that time ends it too, as `survived_kill`:
+        unknown is never a clean kill. It never raises."""
+        with self.meta_lock:
+            timer = self._running
+        if timer is not None and timer.fire_now(self._escalation.margin_s + SETTLE_SLACK_S) is None:
+            log.error("a cell's deadline was not decided within its margin: the run is ended as %s", DL.SURVIVED)
+            with self.meta_lock:
+                self.ended = self.ended or {"outcome": DL.SURVIVED, "why": "not decided within its margin", "steps": []}
+        with self.meta_lock:
+            return self.ended
+
+    def wait_decided(self) -> None:
+        """Wait for the outcome of a cell's deadline already under way, at most its margin and `SETTLE_SLACK_S`; never
+        fire one. A stop calls this first, so that its teardown never races an escalation (O30)."""
+        with self.meta_lock:
+            timer = self._running
+        if timer is not None:
+            timer.wait_decided(self._escalation.margin_s + SETTLE_SLACK_S)
+
     def _stop_after(self, record: dict[str, Any]) -> None:
         """The sandbox's stop a deadline ordered, once its outcome is recorded; how it went is the record's last step,
         `stopped`. It never raises."""
@@ -334,6 +377,8 @@ class CellRunner:
         gave_up = fired = False
         try:
             if record:  # the probes kill nothing of the agent's
+                with self.meta_lock:
+                    self._running = timer  # what `settle` enforces when the run's body ends while it runs
                 timer.start()
             done = self._host.docker(*argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False)
             fired = timer.end()
@@ -346,6 +391,9 @@ class CellRunner:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, wall0)
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
             timer.end()
+            with self.meta_lock:
+                if self._running is timer:
+                    self._running = None
         return res
 
     def _not_started(self, record: bool) -> ExecResult:
