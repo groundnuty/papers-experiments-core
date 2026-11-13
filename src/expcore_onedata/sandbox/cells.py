@@ -12,7 +12,9 @@ bytes that are not UTF-8 is the agent's own outcome: they are replaced, never an
 That limit is a hard deadline (deadline.py, O34): at the cap every process of the cell is killed, and one that outlives
 the kill past the grace period has the mount aborted under it, or the sandbox stopped. Its record is the cell's
 `deadline`, and a cell that outlived its kill is `kill_survived`, infrastructure, and ends the run (`ended`). The record
-is published from the timer's thread under `meta_lock`, before the sandbox's stop, which runs after it.
+is published from the timer's thread under `meta_lock`, before the sandbox's stop, which runs after it. Every wait for
+that outcome, the cell's own included, lasts at most the margin and `SETTLE_SLACK_S`: an outcome not decided by then,
+like an escalation that raised and whose quiesce did not show the cell gone, is `survived_kill`, never a clean kill.
 """
 
 from __future__ import annotations
@@ -62,7 +64,8 @@ class CellTimer:
     never has a fired timer, and one this timer ended always has. No time limit is inferred from how long a cell ran.
 
     The kill may hand back what is to run once its outcome is decided (the sandbox's stop a deadline ordered, O34): the
-    timer runs it after it marks the outcome decided, so `end`, which waits for the outcome, never waits for that."""
+    timer runs it after it marks the outcome decided, so `end`, which waits for the outcome, never waits for that. Every
+    wait for the outcome is bounded by the caller's seconds: an escalation that stalls never holds a cell for ever."""
 
     def __init__(self, seconds: float, kill: Callable[[], Callable[[], None] | None]) -> None:
         self._lock = threading.Lock()
@@ -114,15 +117,16 @@ class CellTimer:
             return None
         return fired
 
-    def end(self) -> bool:
+    def end(self, timeout_s: float) -> bool | None:
         """The cell has ended: from now on the timer does nothing. Whether it fired, after its kill's outcome is
-        decided, so that what is read next is read after it."""
+        decided, so that what is read next is read after it; waited for at most `timeout_s`, never for ever (O34): None
+        when it fired and the outcome was not decided in that time."""
         with self._lock:
             self._ended = True
             fired = self._fired
         self._timer.cancel()
-        if fired:
-            self._decided.wait()
+        if fired and not self._decided.wait(timeout_s):
+            return None
         return fired
 
 
@@ -144,6 +148,12 @@ class _CellProcesses:
     def kill(self, procs: list[dict], timeout_s: float) -> None:
         pids = [str(p["pid"]) for p in procs]
         TD._sudo(self._runner._host, "kill", "-s", "KILL", *pids, timeout_s=min(KILL_S, timeout_s))
+
+    def fallback(self) -> list[dict] | None:
+        """After a step of the deadline raised: the sandbox's quiesce kills what is left; what it left, None when the
+        processes could not be listed. Not bounded by the margin: the cell's own wait for the outcome is (O34)."""
+        state = self._runner.quiesce("time cap")
+        return None if state["killed"] is None else state["left"]
 
 
 class CellRunner:
@@ -282,13 +292,21 @@ class CellRunner:
         kill past the grace has the mount aborted or the sandbox's stop ordered. The record is published under the
         metadata's lock, under `cell_deadlines` and, when a process outlived the kill, as `ended`: the run is classified
         before anything else happens. The stop is handed back to the timer, which runs it only once the outcome is
-        decided, so its teardown neither holds up the classification nor counts in the cell's time. It never raises."""
+        decided, so its teardown neither holds up the classification nor counts in the cell's time. A listing or kill
+        that raises ends in the quiesce (`deadline.enforce`, `_CellProcesses.fallback`): a clean kill only when it
+        shows every process gone, and not even then once the mount was aborted (an outcome never gets less severe than a
+        step already taken). Anything else that raises is `survived_kill`, never a clean kill. It never raises."""
+        procs = _CellProcesses(self)
         try:
-            record = DL.enforce(_CellProcesses(self), self._escalation)
-        except Exception as e:
+            record = DL.enforce(procs, self._escalation, fallback=procs.fallback)
+        except Exception as e:  # past the escalation's own steps: its outcome is unknown, so never a clean kill
             log.error("the deadline of a cell failed: %s", describe_error(e))
-            self.quiesce("time cap")
-            return None
+            record = self._unknown(f"the deadline raised {type(e).__name__}")
+        return self._publish(cell, record)
+
+    def _publish(self, cell: int, record: dict[str, Any]) -> Callable[[], None] | None:
+        """Publish a deadline's record under the metadata's lock, under `cell_deadlines` and, for an escalated outcome,
+        as `ended`; the sandbox's stop it orders, for the timer to run once the outcome is decided."""
         outcome = record["outcome"]
         with self.meta_lock:
             self._deadline = record
@@ -299,6 +317,35 @@ class CellRunner:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
         return (lambda: self._stop_after(record)) if outcome in DL.STOPS else None
 
+    def _unknown(self, why: str) -> dict[str, Any]:
+        """The record of a deadline whose outcome is not known: `survived_kill`, since unknown is never a clean kill. It
+        is the most severe outcome (`deadline.SEVERITY`), so never below a step the escalation took."""
+        esc = self._escalation
+        return {"grace_s": esc.grace_s, "margin_s": esc.margin_s, "outcome": DL.SURVIVED, "why": why, "steps": []}
+
+    @property
+    def decide_s(self) -> float:
+        """The most anyone waits for a deadline's outcome: its margin and `SETTLE_SLACK_S` (O34)."""
+        return self._escalation.margin_s + SETTLE_SLACK_S
+
+    def _end(self, timer: CellTimer, cell: int) -> tuple[bool, dict[str, Any] | None]:
+        """End the cell's timer: whether it fired, and its deadline's record. The outcome is waited for at most
+        `decide_s`, as `settle` waits; one not decided by then, or decided with no record, is published for the cell as
+        `survived_kill` and ends the run, as a settle's does: unknown is never a clean kill (O34). It never raises."""
+        fired = timer.end(self.decide_s)
+        if fired is False:
+            return False, None
+        with self.meta_lock:
+            record = self._deadline if fired else None
+            if record is not None:
+                return True, record
+            why = "not decided within its margin" if fired is None else "decided with no record"
+            record = self._unknown(why)
+            self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})
+            self.ended = self.ended or record
+        log.error("a cell's deadline was %s: the run is ended as %s", why, DL.SURVIVED)
+        return True, record
+
     def settle(self) -> dict[str, Any] | None:
         """The run's body is over (`launch` leaves it, or `collect` begins): a cell still running is past its cap, the
         agent's own, so its deadline is enforced now if its timer has not fired, and one under way is waited for, at
@@ -307,10 +354,10 @@ class CellRunner:
         unknown is never a clean kill. It never raises."""
         with self.meta_lock:
             timer = self._running
-        if timer is not None and timer.fire_now(self._escalation.margin_s + SETTLE_SLACK_S) is None:
+        if timer is not None and timer.fire_now(self.decide_s) is None:
             log.error("a cell's deadline was not decided within its margin: the run is ended as %s", DL.SURVIVED)
             with self.meta_lock:
-                self.ended = self.ended or {"outcome": DL.SURVIVED, "why": "not decided within its margin", "steps": []}
+                self.ended = self.ended or self._unknown("not decided within its margin")
         with self.meta_lock:
             return self.ended
 
@@ -320,7 +367,7 @@ class CellRunner:
         with self.meta_lock:
             timer = self._running
         if timer is not None:
-            timer.wait_decided(self._escalation.margin_s + SETTLE_SLACK_S)
+            timer.wait_decided(self.decide_s)
 
     def _stop_after(self, record: dict[str, Any]) -> None:
         """The sandbox's stop a deadline ordered, once its outcome is recorded; how it went is the record's last step,
@@ -374,23 +421,24 @@ class CellRunner:
             self._deadline = None  # this cell's, once its timer fires
         cell = len(self.cells) + 1
         timer = CellTimer(remaining, lambda: self._kill_at_the_cap(cell))
-        gave_up = fired = False
+        gave_up = fired = timer_ended = False
         try:
             if record:  # the probes kill nothing of the agent's
                 with self.meta_lock:
                     self._running = timer  # what `settle` enforces when the run's body ends while it runs
                 timer.start()
             done = self._host.docker(*argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False)
-            fired = timer.end()
+            (fired, deadline), timer_ended = self._end(timer, cell), True  # its outcome waited for at most `decide_s`
             rc, out, err = done.returncode, done.stdout, done.stderr
             if rc == TIMED_OUT and err.startswith("timed out after"):
                 gave_up, err = True, "docker exec did not return"
             used = time.monotonic() - entered
             res = ExecResult(out, err, rc, time.monotonic() - t0, timed_out=gave_up or fired)
             if record:
-                self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, wall0)
+                self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, deadline, wall0)
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
-            timer.end()
+            if not timer_ended:  # one wait for the outcome, bounded, whichever way the cell ended
+                self._end(timer, cell)
             with self.meta_lock:
                 if self._running is timer:
                     self._running = None
@@ -422,6 +470,7 @@ class CellRunner:
         timeout_s: float,
         gave_up: bool,
         fired: bool,
+        deadline: dict[str, Any] | None,
         wall0: float,
     ) -> None:
         rc = res.exit_code
@@ -451,7 +500,7 @@ class CellRunner:
             self._meta.setdefault("cell_kills", []).append({"cell": entry["cell"], **kill})
         self._events_seen = events
         res.kill = self._with_earlyoom(res, entry, before, up0, used, timeout_s, gave_up, fired, wall0)
-        escalated = self._with_deadline(res, entry, fired)
+        escalated = self._with_deadline(res, entry, deadline)
         if res.kill:  # from what caused it, not from an exit code that a memory kill shares
             res.timed_out = entry["timed_out"] = gave_up or res.kill["reason"] in ("time_limit", KC.KILL_SURVIVED)
         entry["timed_out"] = res.timed_out
@@ -459,13 +508,13 @@ class CellRunner:
             self.quiesce("time cap")  # not run on (after an escalation the deadline has done all a kill can)
         self.cells.append(entry)
 
-    def _with_deadline(self, res: ExecResult, entry: dict[str, Any], fired: bool) -> bool:
-        """The record of the cell's deadline, when its timer fired (the timer's thread has put it under `cell_deadlines`
-        already); and when a process of the cell outlived its kill, its kill becomes `kill_survived`, whatever else the
-        counters said (after an abort or a stop they describe the harness's doing); the timer's thread has already ended
-        the run (`ended`). Whether that happened."""
+    def _with_deadline(self, res: ExecResult, entry: dict[str, Any], record: dict[str, Any] | None) -> bool:
+        """The record of the cell's deadline, when its timer fired (`_end`: the timer's thread has put it under
+        `cell_deadlines` already, or `_end` did, for one not decided in time); and when a process of the cell outlived
+        its kill, or the outcome is not known, its kill becomes `kill_survived`, whatever else the counters said (after
+        an abort or a stop they describe the harness's doing); the run is already ended (`ended`). Whether that
+        happened."""
         with self.meta_lock:
-            record = self._deadline if fired else None
             if record is None:
                 return False
             entry["deadline"] = record
