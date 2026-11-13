@@ -20,6 +20,7 @@ def fed():
         import fedlayout
         import fedpki
         import fedspec
+        import make_import_tree
 
         yield type(
             "Fed",
@@ -34,6 +35,7 @@ def fed():
                 "boot": fedboot,
                 "facts": fedfacts,
                 "importing": fedimport,
+                "tree": make_import_tree,
             },
         )
 

@@ -1,8 +1,14 @@
 """The layout of the storage-import slot (deploy/compose-federation/layouts/storage-import.toml, #184), its platform
 template, and the script that makes a dataset to import (make_import_tree.py)."""
 
+import ast
+import hashlib
+import os
+import sys
 import tomllib
+from pathlib import Path
 
+import pytest
 from federation_support import DEPLOY, STORAGE_IMPORT
 
 TEMPLATE = DEPLOY / "layouts" / "storage-import.platform.toml.template"
@@ -121,3 +127,149 @@ def test_the_template_names_no_variable_and_no_path(fed):
     assert "EXPCORE_FED_IMPORT" not in text
     for host_path in ("/srv", "/mnt", "/home"):
         assert host_path not in text
+
+
+# -- the script that makes a dataset to import ------------------------------------------------------------------------
+
+
+def tree_of(root: Path) -> dict[str, tuple[str, int]]:
+    """Every file below `root` by its relative path: the SHA-256 of its bytes and its mode."""
+    return {
+        str(p.relative_to(root)): (hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mode & 0o777)
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def make(fed, out: Path, *args: str) -> int:
+    return fed.tree.main([str(out), *args])
+
+
+def test_the_script_imports_nothing_of_the_core_or_the_deploy_scripts(fed):
+    """It runs on its own, on any machine that has Python, to make the dataset a layout's variable names."""
+    source = ast.parse(Path(fed.tree.__file__).read_text(encoding="utf-8"))
+    imported = {
+        (node.module if isinstance(node, ast.ImportFrom) else alias.name).split(".")[0]
+        for node in ast.walk(source)
+        if isinstance(node, ast.Import | ast.ImportFrom)
+        for alias in (node.names if isinstance(node, ast.Import) else [None])
+    }
+    assert imported <= set(sys.stdlib_module_names)
+
+
+def test_the_stream_is_the_sha256_counter_stream_of_the_baseline_files_whatever_the_piece_size(fed):
+    wanted = fed.layout.BaselineFile("d00/file-000000.bin", 300).content()
+    for piece in (1, 7, 32, 100, 300, 1 << 20):
+        assert b"".join(fed.tree.stream("d00/file-000000.bin", 300, piece)) == wanted
+
+
+def test_the_stream_never_holds_more_than_a_piece(fed):
+    pieces = list(fed.tree.stream("large.bin", 1000, 64))
+    assert [len(p) for p in pieces] == [64] * 15 + [40]
+
+
+def test_two_runs_make_the_same_tree_with_the_same_modes(fed, tmp_path, capsys):
+    assert make(fed, tmp_path / "one", "--small", "25", "--dirs", "4", "--large-bytes", "500") == 0
+    assert make(fed, tmp_path / "two", "--small", "25", "--dirs", "4", "--large-bytes", "500") == 0
+    first = tree_of(tmp_path / "one")
+    assert first == tree_of(tmp_path / "two")
+    assert len(first) == 26
+
+
+def test_the_files_are_spread_over_numbered_directories_and_named_in_order(fed, tmp_path):
+    assert make(fed, tmp_path / "out", "--small", "7", "--dirs", "3") == 0
+    names = sorted(str(p.relative_to(tmp_path / "out")) for p in (tmp_path / "out").rglob("*") if p.is_file())
+    assert names == [
+        "d00/file-000000.bin",
+        "d00/file-000003.bin",
+        "d00/file-000006.bin",
+        "d01/file-000001.bin",
+        "d01/file-000004.bin",
+        "d02/file-000002.bin",
+        "d02/file-000005.bin",
+    ]
+
+
+def test_the_default_is_a_thousand_small_files_in_ten_directories_and_no_large_one(fed, tmp_path, capsys):
+    assert make(fed, tmp_path / "out") == 0
+    listed = [p for p in (tmp_path / "out").rglob("*") if p.is_file()]
+    assert len(listed) == 1000
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [f"d{i:02d}" for i in range(10)]
+    assert not (tmp_path / "out" / "large.bin").exists()
+
+
+def test_the_sizes_lie_between_one_and_65536_bytes_and_differ_from_file_to_file(fed, tmp_path):
+    assert make(fed, tmp_path / "out", "--small", "60", "--dirs", "5") == 0
+    sizes = [p.stat().st_size for p in (tmp_path / "out").rglob("*") if p.is_file()]
+    assert min(sizes) >= 1
+    assert max(sizes) <= 65536
+    assert len(set(sizes)) > 30
+
+
+def test_the_files_are_0664_and_the_directories_0775_whatever_the_umask(fed, tmp_path):
+    old = os.umask(0o077)
+    try:
+        assert make(fed, tmp_path / "out", "--small", "6", "--dirs", "2", "--large-bytes", "10") == 0
+    finally:
+        os.umask(old)
+    out = tmp_path / "out"
+    assert {p.stat().st_mode & 0o777 for p in out.rglob("*") if p.is_file()} == {0o664}
+    assert {p.stat().st_mode & 0o777 for p in [out, *out.rglob("*")] if p.is_dir()} == {0o775}
+
+
+def test_the_large_file_is_written_in_pieces_and_holds_the_streams_bytes(fed, tmp_path, monkeypatch):
+    monkeypatch.setattr(fed.tree, "PIECE", 128)
+    written = []
+    real = fed.tree.stream
+
+    def watching(path, size, piece=None):
+        for chunk in real(path, size, piece):
+            written.append((path, len(chunk)))
+            yield chunk
+
+    monkeypatch.setattr(fed.tree, "stream", watching)
+    assert make(fed, tmp_path / "out", "--small", "0", "--large-bytes", "300") == 0
+    assert written == [("large.bin", 128), ("large.bin", 128), ("large.bin", 44)]
+    assert (tmp_path / "out" / "large.bin").read_bytes() == fed.layout.BaselineFile("large.bin", 300).content()
+    assert [p.name for p in (tmp_path / "out").iterdir()] == ["large.bin"]  # no small file, so no directory
+
+
+def test_it_prints_the_file_count_and_the_total_bytes(fed, tmp_path, capsys):
+    assert make(fed, tmp_path / "out", "--small", "9", "--dirs", "2", "--large-bytes", "400") == 0
+    on_disk = [p.stat().st_size for p in (tmp_path / "out").rglob("*") if p.is_file()]
+    assert capsys.readouterr().out.strip() == f"{len(on_disk)} files, {sum(on_disk)} bytes"
+    assert len(on_disk) == 10
+
+
+def test_an_empty_existing_output_directory_is_taken(fed, tmp_path):
+    (tmp_path / "out").mkdir()
+    assert make(fed, tmp_path / "out", "--small", "3") == 0
+    assert len(tree_of(tmp_path / "out")) == 3
+
+
+def test_a_non_empty_output_is_refused_and_left_as_it_was(fed, tmp_path, capsys):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "mine.txt").write_text("keep", encoding="utf-8")
+    assert make(fed, out, "--small", "3") == 2
+    assert "is not empty" in capsys.readouterr().err
+    assert [p.name for p in out.iterdir()] == ["mine.txt"]
+    assert (out / "mine.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_an_output_that_is_a_file_or_a_symbolic_link_is_refused(fed, tmp_path, capsys):
+    (tmp_path / "file").write_text("x", encoding="utf-8")
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "empty")
+    assert make(fed, tmp_path / "file") == 2
+    assert make(fed, tmp_path / "link") == 2
+    assert list((tmp_path / "empty").iterdir()) == []
+    assert capsys.readouterr().err.count("error:") == 2
+
+
+@pytest.mark.parametrize("args", [["--small", "-1"], ["--dirs", "0"], ["--large-bytes", "-5"], ["--small", "many"]])
+def test_a_count_that_makes_no_sense_is_refused_before_anything_is_written(fed, tmp_path, args, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        make(fed, tmp_path / "out", *args)
+    assert stopped.value.code == 2
+    assert not (tmp_path / "out").exists()
