@@ -32,10 +32,27 @@ def gib(value: int | None) -> str:
     return "unknown" if value is None else f"{value / (1 << 30):.2f} GiB"
 
 
+def import_sources(layout: Layout) -> dict[str, str]:
+    """Each read-only import's variable with its checked source, read from this process's environment; a source the
+    layout would not take is a RuntimeError, so no command meets it as a traceback."""
+    found = {}
+    for space in layout.spec.spaces:
+        if space.imported is not None and space.imported.readonly:
+            try:
+                found[space.imported.source_env] = str(layout.import_source(space.name, os.environ))
+            except ValueError as error:
+                raise RuntimeError(str(error)) from None
+    return found
+
+
 def compose(layout: Layout, *args: str, capture: bool = False) -> str:
     """Run docker compose on the layout's generated file, under its project name, with this directory as the project
-    directory; raise on failure."""
-    env = {**os.environ, "EXPCORE_FED_ROOT": str(layout.root)}
+    directory; raise on failure.
+
+    The environment names the root and, for each read-only import, the checked source of its dataset: the generated
+    file binds that directory by its variable. A command of such a layout therefore needs the variable set, down
+    included. A writable import binds its copy in the root, so its source is not needed here."""
+    env = {**os.environ, "EXPCORE_FED_ROOT": str(layout.root), **import_sources(layout)}
     project = layout.spec.project
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f"{project}-", suffix=".compose.yaml") as file:
         file.write(render(layout.spec))
