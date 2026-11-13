@@ -166,6 +166,7 @@ deployment answers otherwise.
 
 import base64
 import hashlib
+import logging
 import re
 import socket
 import threading
@@ -181,7 +182,7 @@ from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
-from expcore_onedata.readretry import ONE_ATTEMPT, Exhausted, ReadRetry, Trace, run_attempts
+from expcore_onedata.readretry import ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
 from expcore_onedata.streamed import Digest, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
@@ -260,6 +261,7 @@ _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 _FILE_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a file's object id: one plain path segment
 _SPACE_ID = re.compile(r"[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}")  # one plain path segment, never "." or ".."
 DEFAULT_TIMEOUT_S = 15.0
+log = logging.getLogger(__name__)
 # The only failures a read is retried on (`readretry.py`): a wait that ran out for the answer, the connection or a slot
 # of the pool. A write timeout, an error answer and every other transport failure are final.
 RETRIED_TIMEOUTS = (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout)
@@ -546,27 +548,29 @@ class OnezoneClient:
         timeout_s: float | None = None,
         retry: ReadRetry = ONE_ATTEMPT,
         deadline_s: float | None = None,
+        fresh: bool = False,
     ) -> httpx.Response:
         """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError.
 
         A transport failure (a reset, a refusal, a timeout) has `transport` set and a real answer has its status, so
         a caller that retries can tell the two apart (O08). Only a GET under a policy of more than one attempt is
-        retried, and only when it timed out (`readretry.py`); anything else is sent once.
+        retried, and only when it timed out (`readretry.py`); anything else is sent once. With `fresh` the request,
+        sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
         """
         base, label = self._base(provider)
         url = base + _check_path(path)
         wait = timeout_s if timeout_s is not None else self._timeout_s
 
-        def send(timeout: float, trace: Trace, fresh: bool) -> httpx.Response:
+        def send(timeout: float, trace: Trace | None, new_connection: bool) -> httpx.Response:
             options: dict[str, Any] = {
                 "headers": dict(headers),
                 "json": json,
                 "params": dict(params) if params else None,
                 "content": content,
                 "timeout": timeout,
-                "extensions": {"trace": trace} if retry.attempts > 1 else None,
+                "extensions": None if trace is None else {"trace": trace},
             }
-            if fresh and self._owns_http:  # a retry gets a connection of its own, never one of the pool's idle ones
+            if new_connection and self._owns_http:  # a connection of its own, never one of the pool's idle ones
                 with _build_http(self._config, self._timeout_s) as one_shot:
                     return one_shot.request(method, url, **options)
             return self._http.request(method, url, **options)
@@ -582,8 +586,10 @@ class OnezoneClient:
                     deadline_s=deadline_s,
                     served=self._served_before,
                 )
+            elif method == "PUT" and content is not None:
+                response = self._send_content(send, label, len(content), wait, fresh)
             else:
-                response = send(wait, lambda name, info: None, False)
+                response = send(wait, None, fresh)
         except Exhausted as spent:
             raise PlatformError(
                 f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts",
@@ -601,6 +607,40 @@ class OnezoneClient:
             )
         return response
 
+    def _send_content(
+        self,
+        send: Callable[[float, Trace | None, bool], httpx.Response],
+        label: str,
+        size: int,
+        wait: float,
+        fresh: bool,
+    ) -> httpx.Response:
+        """Send a write of content once, and say in the log how its connection began (`new`, or `reused` with the
+        requests it had served), with the seconds it took, so that a write that stalls can be set against its connection
+        (#186). The line names the provider by its label and holds no path, id or token."""
+        probe, began = Attempt(self._served_before), time.monotonic()
+        try:
+            response = send(wait, probe.trace, fresh)
+        except httpx.HTTPError as error:
+            log.warning(
+                "%s: a PUT of %d bytes failed (%s) after %.2f s (connection %s)",
+                label,
+                size,
+                type(error).__name__,
+                time.monotonic() - began,
+                probe.connection,
+            )
+            raise
+        log.info(
+            "%s: a PUT of %d bytes was answered with %d after %.2f s (connection %s)",
+            label,
+            size,
+            response.status_code,
+            time.monotonic() - began,
+            probe.connection,
+        )
+        return response
+
     def _send(
         self,
         method: str,
@@ -614,6 +654,7 @@ class OnezoneClient:
         timeout_s: float | None = None,
         retry: ReadRetry = ONE_ATTEMPT,
         deadline_s: float | None = None,
+        fresh: bool = False,
     ) -> Any:
         """Send one request and return the decoded JSON; map every failure to a PlatformError without detail."""
         response = self._request(
@@ -627,6 +668,7 @@ class OnezoneClient:
             timeout_s=timeout_s,
             retry=retry,
             deadline_s=deadline_s,
+            fresh=fresh,
         )
         return self._decoded(response, method, provider)
 
@@ -979,6 +1021,7 @@ class OnezoneClient:
         space: Space | None = None,
         content_type: str | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        fresh: bool = False,
     ) -> Any:
         """Send a request that can change state; refuse it, before it is sent, unless it acts on a study space.
 
@@ -998,6 +1041,12 @@ class OnezoneClient:
         a read that timed out is tried again under it (`readretry.py`), each attempt answered is read afresh, and after
         the last timeout the target is unread and nothing is sent (`ScopeUnread`). The request itself is sent once,
         whatever the policy, and a caller that measures the platform leaves the default, one attempt.
+
+        With `fresh` the request goes on a connection of its own, opened for it by a one-shot client built as the pool's
+        is (the same `[tls]`) and closed when the answer is in, never on an idle connection of the pool: a write of a
+        large body stalled on a reused keep-alive connection and never on a new one (#186). It is a client's own pool
+        that this can steer; a client given an HTTP client by its caller sends through that, whose connections are the
+        caller's. A write of content, `fresh` or not, is logged with how its connection began (`_send_content`).
         """
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
@@ -1017,6 +1066,7 @@ class OnezoneClient:
             params=params,
             content=content,
             timeout_s=timeout_s,
+            fresh=fresh,
         )
 
     def read_range(
