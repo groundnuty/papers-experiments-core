@@ -122,6 +122,24 @@ def test_the_templates_ids_and_users_are_those_the_layout_declares(fed, tmp_path
     assert {"space", "support"}.isdisjoint(data)  # the one-space form is never beside [[spaces]]
 
 
+def test_o37_the_template_is_a_platform_file_the_core_loads_with_its_placement_as_the_live_tests_read_it(fed, tmp_path):
+    """O37: the rendered template loads in the platform layer as tests/live/test_storage_import.py loads it: the two
+    spaces by their labels, the imported one read-only, the other regular, and a `[placement]` table whose data
+    provider is the owner, which a provisioner needs."""
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.rangemap import load_placement
+    from expcore_onedata.spaces import ImportedStorage
+
+    platform = tmp_path / "platform.toml"
+    platform.write_text(rendered(fed, tmp_path), encoding="utf-8")
+    (tmp_path / "ca").mkdir()
+    fed.pki.make_ca(tmp_path / "ca" / "federation-ca.pem", tmp_path / "ca.key", "test CA")
+    config = load_platform(platform, require_secrets=False)
+    assert config.space_named("imported").imported == ImportedStorage(readonly=True)
+    assert config.space_named("uploaded").imported is None
+    assert load_placement(platform, config).settings.holder == "pine"
+
+
 def test_the_template_names_no_variable_and_no_path(fed):
     text = TEMPLATE.read_text(encoding="utf-8")
     assert "EXPCORE_FED_IMPORT" not in text

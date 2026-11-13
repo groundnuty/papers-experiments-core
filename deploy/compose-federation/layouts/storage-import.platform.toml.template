@@ -16,6 +16,7 @@ principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-re
 principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-tools@" }
 principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
 tls = { ca_file = "ca/federation-ca.pem" }
+placement = { holder = "pine" }  # each entry's holder is its data provider; a provisioner also needs the table
 
 [[spaces]]
 label = "imported"
