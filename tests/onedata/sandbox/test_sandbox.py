@@ -3,12 +3,22 @@
 import ipaddress
 import json
 import os
+import stat
 import time
 from pathlib import Path
 
 import pytest
 from fake_host import CERTIFI_BUNDLE
-from sandbox_support import COMPLETE_LEVEL, FED_LOCAL, FED_NETWORK, TOKEN, fail_copies, make_spec, start_options
+from sandbox_support import (
+    COMPLETE_LEVEL,
+    FED_LOCAL,
+    FED_NETWORK,
+    FED_ZONE,
+    TOKEN,
+    fail_copies,
+    make_spec,
+    start_options,
+)
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox.api import DataPathMode, ExecResult, SandboxError, StartRefused
@@ -189,6 +199,37 @@ def test_o05_the_gate_takes_the_rest_token_from_a_root_owned_file_bound_into_it_
     assert not [f for f in files_under(sbx.dir) if TOKEN in f.read_text(encoding="utf-8", errors="replace")]
     assert TOKEN not in json.dumps(sbx.metadata())
     sbx.stop()
+
+
+def test_o05_the_gates_tls_keys_are_given_to_its_user_read_only_as_its_token_file_is(world):
+    """O05 (#203): the gate runs as root with every capability dropped but NET_BIND_SERVICE, so it reads only a file
+    root owns or one anyone may read. Each key it serves a name with is made owner-only (0400) and then root's, as the
+    token file is, so the gate can load it and no other user of the host can; each certificate, which is no secret, is
+    readable by anyone (0444), and so are the directory the keys are mounted from and the gate's configuration."""
+    sbx = start(world, "via-gate")
+    tls = sbx.dir / "tls"
+    served = list(json.loads((sbx.dir / "gate.json").read_text())["hosts"])
+    assert served
+    for name in served:
+        key, cert = tls / f"{name}.key", tls / f"{name}.pem"
+        assert stat.S_IMODE(key.stat().st_mode) == 0o400
+        assert ["chown", "0:0", str(key)] in world.host.sudo_commands
+        assert stat.S_IMODE(cert.stat().st_mode) == 0o444
+    assert stat.S_IMODE(tls.stat().st_mode) == 0o755
+    assert stat.S_IMODE((sbx.dir / "gate.json").stat().st_mode) == 0o444
+    gate = world.host.containers[sbx.names.gate].options
+    assert (gate["--user"], gate["--cap-drop"], gate["--cap-add"]) == ("0", ["ALL"], ["NET_BIND_SERVICE"])
+    sbx.stop()
+
+
+def test_o05_keys_that_cannot_be_given_to_the_gates_user_refuse_the_start_and_leave_nothing(world):
+    """O05 (#203): a key the gate could not read would end the gate before it says it is ready; a key that cannot be
+    given to root fails the start at once, naming what failed, and the teardown leaves nothing."""
+    world.host.run_handlers["chown"] = lambda argv: CmdResult(1, "", "not permitted")
+    with pytest.raises(SandboxError, match="TLS keys could not be given to the gate's user"):
+        start(world, "via-gate")
+    assert nothing_left(world)
+    assert not [c for c in world.host.calls if c[:2] == ("docker", "run")]
 
 
 def test_o05_the_gates_token_file_is_gone_after_a_gate_that_never_became_ready_and_after_a_kept_run(world, tmp_path):
@@ -1105,19 +1146,75 @@ def test_o03_without_the_table_the_record_says_the_sidecar_was_on_the_default_br
     sbx.stop()
 
 
-def test_o15_a_federation_network_that_is_not_there_refuses_the_start_before_anything_is_created(fed_world):
+@pytest.mark.parametrize("level", ["mounted", "via-gate"])
+def test_o15_a_federation_network_that_is_not_there_refuses_the_start_before_anything_is_created(fed_world, level):
     """O15: the federation's network is the federation deployment's, never the sandbox's to make; one that is not on
-    the host refuses a mount sandbox's start before any container, network, mount or directory exists, so there is
-    nothing to tear down, and the message names the table and not the network. A run with another data path never
+    the host refuses a mount or a REST sandbox's start before any container, network, mount or directory exists, so
+    there is nothing to tear down, and the message names the table and not the network. A run with no data path never
     asks for that network, and starts."""
     del fed_world.host.networks[FED_NETWORK]
     with pytest.raises(StartRefused, match=r"\[sandbox\.federation\]") as caught:
-        start(fed_world, "mounted")
+        start(fed_world, level)
     assert FED_NETWORK not in str(caught.value)
     assert nothing_left(fed_world)
     assert not fed_world.s.work_root.exists() or not list(fed_world.s.work_root.iterdir())
     start(fed_world, "isolated").stop()
     assert nothing_left(fed_world)
+
+
+def test_o03_a_rest_gate_reaches_the_federation_on_its_network_by_the_names_there_and_the_agent_stays_off(fed_world):
+    """O03, O05 (#203): with `[sandbox.federation]` the REST data path's gate starts on the federation's own network
+    and is then connected to the sandbox's internal network, and to no other. It serves and dials the zone and the
+    local provider by their names on the federation's network, port 443, never the loopback addresses of the platform
+    file's URLs; its certificates are issued for those names, which the agent resolves to the gate and whose zone is
+    the agent's `ONEDATA_ONEZONE_HOST`. The agent is on the sandbox's internal network alone."""
+    sbx = start(fed_world, "via-gate")
+    gate, agent = (fed_world.host.containers[n] for n in (sbx.names.gate, sbx.names.agent))
+    assert set(gate.networks) == {FED_NETWORK, sbx.names.net}
+    assert gate.options["--network"] == FED_NETWORK
+    assert set(agent.networks) == {sbx.names.net}
+    hosts = json.loads((sbx.dir / "gate.json").read_text())["hosts"]
+    assert hosts == {
+        FED_ZONE: {"role": "onezone", "addr": FED_ZONE, "port": 443, "tls": True},
+        FED_LOCAL: {"role": "oneprovider", "addr": FED_LOCAL, "port": 443, "tls": True},
+    }
+    assert ("make_ca", (FED_ZONE, FED_LOCAL)) in fed_world.host.calls
+    assert {a.split(":")[0] for a in agent.options["--add-host"]} == {FED_ZONE, FED_LOCAL}
+    assert agent.options["_env"]["ONEDATA_ONEZONE_HOST"] == FED_ZONE
+    sbx.stop()
+    assert set(fed_world.host.networks) == {FED_NETWORK}
+
+
+def test_o03_without_the_table_a_rest_gate_starts_on_the_default_bridge_and_dials_the_urls_as_before(world):
+    """O03: without `[sandbox.federation]` nothing changes: the gate is on docker's default bridge and the sandbox's
+    internal network, and serves and dials the hosts and ports of the zone's and the local provider's URLs."""
+    sbx = start(world, "via-gate")
+    gate, agent = (world.host.containers[n] for n in (sbx.names.gate, sbx.names.agent))
+    assert set(gate.networks) == {"bridge", sbx.names.net}
+    spec = make_spec(world, "via-gate")
+    hosts = json.loads((sbx.dir / "gate.json").read_text())["hosts"]
+    assert {name: (h["addr"], h["port"]) for name, h in hosts.items()} == {
+        spec.zone.host: (spec.zone.host, spec.zone.port),
+        spec.provider.host: (spec.provider.host, spec.provider.port),
+    }
+    assert agent.options["_env"]["ONEDATA_ONEZONE_HOST"] == spec.zone.host
+    sbx.stop()
+
+
+def test_o15_the_teardown_takes_the_gate_off_the_federation_network_and_leaves_the_network_as_it_was(fed_world):
+    """O15 (#203): the gate is on the federation's network while a REST sandbox runs; the teardown removes it, which
+    takes it off, and the network itself is never disconnected, removed or reaped: only looked up by name."""
+    from expcore_onedata.sandbox.provider import SandboxProbe
+
+    before = dict(fed_world.host.networks[FED_NETWORK])
+    sbx = start(fed_world, "via-gate", lease_key=KEY)
+    sbx.stop()
+    assert set(fed_world.host.networks) == {FED_NETWORK}
+    assert fed_world.host.networks[FED_NETWORK] == before
+    assert not fed_world.host.containers
+    touched = [c for c in fed_world.host.calls if c[0] == "docker" and c[1] == "network" and FED_NETWORK in c[2][1:]]
+    assert touched == [], "only a lookup of the federation network by name is allowed"
+    assert SandboxProbe(fed_world.host, fed_world.s).resource_gone(KEY, {}) is True
 
 
 def test_o15_the_teardown_takes_the_sidecar_off_the_federation_network_and_leaves_the_network_as_it_was(fed_world):

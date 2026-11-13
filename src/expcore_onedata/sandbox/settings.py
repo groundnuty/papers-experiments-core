@@ -54,9 +54,12 @@ extra_args = []                 # further oneclient arguments, never one that ch
 [sandbox.served_bytes]          # optional: how much a run's tables of the bytes served list (gatelog.Caps, O22)
 max_files = 1000                # files, the first read; max_directories = 1000; max_ranges_per_file = 64
 
-[sandbox.federation]            # optional, with a mount level: the federation reached on a docker network of its own
+[sandbox.federation]            # optional, with a mount or rest level: the federation on a docker network of its own
 network = "fed_net"             # an existing network of the federation's deployment (a Compose project's); the
-                                # oneclient sidecar starts on it instead of docker's default bridge; the agent never
+                                # oneclient sidecar and the data gate start on it instead of docker's default bridge;
+                                # the agent never
+zone = "host"                   # the zone's host name on that network, the one its certificate holds; the gate's
+                                # alone: required with a rest level, refused without one
 providers.<local> = "host"      # the local provider's host name on that network, the one its certificate holds;
                                 # keyed by [support] local, the only provider accepted (the agent is pinned to it)
 ```
@@ -68,12 +71,14 @@ condition gives its `data_path` factor. The run's metadata records it (`listing`
 (`config.PlatformConfig.fingerprint`, from `data_path_record`), so two modes are never one experiment. A declared
 `[sandbox.served_bytes]` is in the fingerprint too (`served_caps_declared`); an absent one leaves it as it was.
 
-Without `[sandbox.federation]` the sidecar starts on docker's default bridge and dials the host of the local provider's
-URL, which suits a federation with public addresses. A federation the host reaches at addresses no container can use,
-such as a Compose project whose ports are published on the host's loopback, needs the table: the sidecar joins the
-federation's network, where the provider's name resolves, and dials it on oneclient's default port. The network must
-exist when a mount sandbox starts (it is never made, changed or removed by the sandbox), and the REST data path's gate
-does not use it.
+Without `[sandbox.federation]` the sidecar and the REST data path's gate start on docker's default bridge and dial the
+hosts of the zone's and the local provider's URLs, which suits a federation with public addresses. A federation the
+host reaches at addresses no container can use, such as a Compose project whose ports are published on the host's
+loopback, needs the table: the sidecar and the gate join the federation's network, where the names resolve, and dial
+them on port 443 (oneclient's default, and the port a Compose service listens on inside its network). The gate serves
+the agent those same names, so a client that follows the zone to the provider's registered domain (its name on that
+network, in a Compose federation) comes back to the gate. The network must exist when a mount or REST sandbox starts
+(it is never made, changed or removed by the sandbox).
 
 `placeholder_token` is what the agent's environment holds as `ONEDATA_TOKEN` on a REST data path (O23): the published
 client (`onedatarestfsspec`) refuses to start without a token, and the agent holds none, since the gate adds its own to
@@ -163,10 +168,12 @@ class MountSettings:
 
 @dataclass(frozen=True)
 class FederationNetwork:
-    """The docker network the oneclient sidecar reaches the federation on, and the local provider's name there."""
+    """The docker network the oneclient sidecar and the REST data path's gate reach the federation on, and the names
+    they dial there."""
 
-    network: str  # an existing network of the federation's own deployment; the sidecar joins it, the agent never
-    local_provider: str  # the host name the sidecar dials on it: the local provider's, which its certificate holds
+    network: str  # an existing network of the federation's deployment; the sidecar or gate joins it, the agent never
+    local_provider: str  # the host name the sidecar and the gate dial on it: the local provider's, its certificate's
+    zone: str | None = None  # the zone's host name there, which the gate dials; required with a rest level, else None
 
 
 @dataclass(frozen=True)
@@ -366,13 +373,27 @@ def _data_paths(section: Section) -> tuple[Mapping[str, DataPathMode], Mapping[s
     return MappingProxyType(modes), MappingProxyType(listings)
 
 
-def _federation(section: Section, providers: Sequence[str], local: str | None) -> FederationNetwork:
-    """Read [sandbox.federation]: the docker network the sidecar joins, and the local provider's name on it (O03).
+def _federation_zone(section: Section, rest: bool) -> str | None:
+    """The zone's name on the federation's network, which the REST data path's gate alone dials (O03, #203): required
+    with a rest level, refused without one, where it would do nothing. A configured value: a message names the key."""
+    if not rest:
+        if "zone" in section.data:
+            raise section.fail("zone", "is read by the REST data path's gate alone, and no data path is rest")
+        return None
+    zone = section.string("zone")
+    if not HOST_NAME.fullmatch(zone):
+        raise section.fail("zone", "must be a host name on that network, with no scheme or port")
+    return zone
 
-    The name is keyed by the provider it belongs to, and only the local one's is accepted, so a `[support] local`
-    changed without this table is refused here and never mounts through another provider. Every name is configured,
-    so a message names a provider entry by its position and never echoes the network or a name."""
-    section.reject_unknown(("network", "providers"))
+
+def _federation(section: Section, providers: Sequence[str], local: str | None, *, rest: bool) -> FederationNetwork:
+    """Read [sandbox.federation]: the docker network the sidecar and the gate join, and the names they dial there: the
+    local provider's, and with a rest level the zone's (O03).
+
+    The provider's name is keyed by the provider it belongs to, and only the local one's is accepted, so a `[support]
+    local` changed without this table is refused here and never mounts or reads through another provider. Every name
+    is configured, so a message names a provider entry by its position and never echoes the network or a name."""
+    section.reject_unknown(("network", "zone", "providers"))
     network = section.string("network")
     if not NETWORK_NAME.fullmatch(network) or network in NOT_A_FEDERATION_NETWORK:
         raise section.fail(
@@ -392,7 +413,7 @@ def _federation(section: Section, providers: Sequence[str], local: str | None) -
             raise table.fail(None, f"entry {position}: must be a host name on that network, with no scheme or port")
     if address is None:
         raise table.fail(None, "must name the local provider (the support's `local`), which the agent is pinned to")
-    return FederationNetwork(network, address)
+    return FederationNetwork(network, address, _federation_zone(section, rest))
 
 
 def _space_path(section: Section, key: str) -> str | None:
@@ -470,9 +491,12 @@ def load_sandbox(
         raise section.fail("mount", "and [sandbox.images.oneclient] are required when a data path is a mount")
     federation = None
     if "federation" in section.data:
-        if DataPathMode.MOUNT not in data_paths.values():
-            raise section.fail("federation", "is read by the mount sidecar alone, and no data path is a mount")
-        federation = _federation(section.section("federation"), providers, local)
+        if not {DataPathMode.MOUNT, DataPathMode.REST} & set(data_paths.values()):
+            raise section.fail(
+                "federation", "is read by the mount sidecar and the data gate alone, and no data path is mount or rest"
+            )
+        rest = DataPathMode.REST in data_paths.values()
+        federation = _federation(section.section("federation"), providers, local, rest=rest)
     check_file = _space_path(section, "content_check_file")
     if DataPathMode.REST in data_paths.values() and check_file is None:
         raise section.fail(

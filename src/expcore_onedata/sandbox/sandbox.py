@@ -77,6 +77,7 @@ from expcore_onedata.sandbox.containers import (
     certifi_probe_args,
     effective_log_dir,
     gate_run_args,
+    gate_upstreams,
     sidecar_command,
     sidecar_run_args,
     trust_targets,
@@ -231,6 +232,8 @@ class DockerSandbox:
             raise StartRefused("a data path needs the agent's local provider")
         if sp.mode is DataPathMode.REST and sp.zone is None:
             raise StartRefused("a REST data path needs the zone")
+        if sp.mode is DataPathMode.REST and s.federation is not None and s.federation.zone is None:
+            raise StartRefused("a REST data path on [sandbox.federation] needs the zone's name on its network (zone)")
         if sp.mode is DataPathMode.REST and sp.token is not None and s.placeholder_token == sp.token.reveal():
             raise StartRefused(  # the agent's environment would hold the run's token (O05, O23)
                 "[sandbox] placeholder_token is the run's data-path token: the agent may hold no credential"
@@ -267,11 +270,11 @@ class DockerSandbox:
             self._meta["images"][role] = resolved
 
     def _require_federation_network(self) -> None:
-        """A mount sidecar that joins `[sandbox.federation]`'s network needs it on this host: it is the federation's own
-        deployment's, never the sandbox's to make, so one docker does not show refuses the start before anything
-        exists (O15). Only a lookup by name: the network is never inspected for more, changed or removed."""
+        """A mount sidecar or a REST gate that joins `[sandbox.federation]`'s network needs it on this host: it is the
+        federation's own deployment's, never the sandbox's to make, so one docker does not show refuses the start before
+        anything exists (O15). Only a lookup by name: the network is never inspected for more, changed or removed."""
         federation = self.s.federation
-        if self.spec.mode is not DataPathMode.MOUNT or federation is None:
+        if self.spec.mode is DataPathMode.NONE or federation is None:
             return
         found = hostops.network_exists(self.host, federation.network)
         if found is None:
@@ -332,16 +335,32 @@ class DockerSandbox:
         self._start_sampler()
 
     def _gate_hosts(self) -> dict[str, dict[str, Any]]:
-        """The zone and the agent's pinned local provider: the gate serves these two and nothing else (O03, O05)."""
-        zone, provider = self.spec.zone, self.spec.provider
-        return {
-            ep.host: {"role": role, "addr": ep.host, "port": ep.port, "tls": ep.tls}
-            for role, ep in (("onezone", zone), ("oneprovider", provider))
-            if ep is not None
-        }
+        """The zone and the agent's pinned local provider: the gate serves these two and nothing else (O03, O05), by
+        their names on `[sandbox.federation]`'s network when it is declared (`gate_upstreams`)."""
+        return gate_upstreams(self.s, self.spec.zone, self.spec.provider)
+
+    def _agent_zone_host(self) -> str:
+        """The zone's name as the agent's client is given it (`ONEDATA_ONEZONE_HOST`): one the gate serves."""
+        return self.s.federation.zone if self.s.federation is not None else self.spec.zone.host
+
+    def _give_gate_its_tls(self, names: Sequence[str]) -> None:
+        """The gate runs as root with every capability dropped but NET_BIND_SERVICE, so it reads only what root owns or
+        anyone may read (#203). Each key it serves a name with is made owner-only and then root's, as its token file is
+        (`_write_token_file`), so the gate loads it and no other user of the host can; each certificate, no secret, and
+        the directory they are mounted from are made readable to anyone, whatever the driver's umask. The run's CA key
+        stays the driver's, owner-only: the gate never reads it."""
+        tls = self.dir / "tls"
+        tls.chmod(0o755)
+        for name in names:
+            (tls / f"{name}.pem").chmod(0o444)
+            key = tls / f"{name}.key"
+            key.chmod(0o400)
+            if self.host.run(["chown", "0:0", str(key)], 20, sudo=True).returncode != 0:
+                raise SandboxError("the gate's TLS keys could not be given to the gate's user")
 
     def _prepare_gate(self, hosts: dict[str, dict[str, Any]]) -> None:
         self.host.make_ca(self.dir / "tls", list(hosts))
+        self._give_gate_its_tls(list(hosts))
         (self.dir / "gatelog").mkdir()
         (self.dir / "gatelog").chmod(0o777)  # the gate runs as root without DAC_OVERRIDE
         (self.dir / "gatelog" / "requests.jsonl").touch()  # there from the start: a log that is missing is unreadable
@@ -359,6 +378,7 @@ class DockerSandbox:
         if self._ca_copy is not None:
             config["upstream_ca_file"] = GATE_CA_PATH  # the run's copy, which `gate_run_args` mounts there read-only
         (self.dir / "gate.json").write_text(json.dumps(config), encoding="utf-8")
+        (self.dir / "gate.json").chmod(0o444)  # no secret; the gate, root without DAC_OVERRIDE, reads it as anyone
 
     def _pool_position(self, subnet: str) -> int | None:
         """Which pool of `[sandbox.network] pools`, by position in the file, a subnet was taken from."""
@@ -617,7 +637,7 @@ class DockerSandbox:
         args, env = agent_run_args(
             s, self.names, self._label_args(), image_id=s.agent.id, mode=sp.mode, work=work, share=share,
             gate_ip=gate_ip, gate_hosts=gate_hosts, ca=self.dir / "tls" / "ca.pem" if rest else None,
-            trust_bundles=self._trust_bundles() if rest else {}, zone_host=sp.zone.host if rest and sp.zone else None,
+            trust_bundles=self._trust_bundles() if rest else {}, zone_host=self._agent_zone_host() if rest else None,
             inputs=self._input_copies,
         )  # fmt: skip
         self._register_container(self.names.agent)
