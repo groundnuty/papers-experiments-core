@@ -14,7 +14,19 @@ of the run's data path) and, for a condition with a tool server, the tool server
 whole-time ceiling. The sandbox starts with the first; the tool server (`tool_server`) starts with the second, on the same slot's tool-server
 user. The core's lease pool (C19) holds the key for the attempt. The `ResourceProbe` (`probe`) is
 `users.SlotProbe(journal, sandbox_gone=SandboxProbe(...).resource_gone)`: a key is freed only when no container,
-network or mount of the sandbox is left and the slot's tokens have ended, by their journalled expiry plus a margin.
+network or mount of the sandbox is left and the slot's tokens have ended, by their journalled expiry plus a margin or
+by a revocation, confirmed and settled.
+
+**A run's end revokes its slot's tokens (C19).** When a launch that held a lease ends, however it ends, it revokes
+every temporary token of the slot's two users (`users.SlotTokens.revoke`): after the sandbox's stop, inside the same
+`sandbox_lifecycle` wait, so after everything the sandbox started is torn down; only once the run's tool server has
+stopped, since its teardown reads its plane again as its token; and only when no mint or start thread of the key still
+runs, since a mint that finished after the bump would hold a token of the new generation, which stays valid. The
+journalled settle end then frees the key about `revocation_settle_s` (330 s) after the run, plus the pool's next look,
+instead of at the tokens' expiry. A revocation that is skipped or fails is logged and recorded under `token_revocation`
+in the sandbox's metadata, never fails the run, and journals no revoked line, so the expiry rule stands; a sandbox that
+is not shown gone keeps its key quarantined whatever the tokens. A run without a lease (the fixed `[principals.data_path]`
+user, shared with day-0, health and the live checks) revokes nothing.
 
 `SandboxPlatform` takes a required `events` (a change of interface): the platform's event sink, the one its
 tool-server launcher records through, so that the slots' minting can record `token_expiry_beyond_request`
@@ -47,6 +59,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
 from expcore_onedata.admission import require_admission, retain_admission
+from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.sandbox import gatelog, kinds
@@ -57,7 +70,7 @@ from expcore_onedata.sandbox.inputs import InputsRecord
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.sandbox import MOUNT_RECORDS, DockerSandbox
 from expcore_onedata.sandbox.settings import SandboxSettings
-from expcore_onedata.tokens import MintedToken, Plane, RunTokens, TokenIssuer, data_path_spec
+from expcore_onedata.tokens import MintedToken, Plane, RevocationUnconfirmed, RunTokens, TokenIssuer, data_path_spec
 from expcore_onedata.users import GROUP, SlotProbe, Slots, SlotTokens, TokenJournal
 
 if TYPE_CHECKING:
@@ -246,6 +259,15 @@ class _ToolPlane:
     principal: Principal
 
 
+@dataclasses.dataclass(frozen=True)
+class _Revocable:
+    """What a run's end revokes: the slot its lease holds, and the tokens it still has to confirm (None when the mint
+    gave none back)."""
+
+    lease: Lease
+    tokens: RunTokens | None
+
+
 class SandboxPlatform:
     """The sandbox half of the platform for a study: which data path a run has, which slot it leases, and the launch.
 
@@ -284,6 +306,8 @@ class SandboxPlatform:
         self._threads = _StartThreads()
         self._declared = {item for items in (read_only_inputs or {}).values() for item in items}
         self._planes: weakref.WeakKeyDictionary[DockerSandbox, _ToolPlane] = weakref.WeakKeyDictionary()
+        self._revocable: weakref.WeakKeyDictionary[DockerSandbox, _Revocable] = weakref.WeakKeyDictionary()
+        self._serving: weakref.WeakSet[DockerSandbox] = weakref.WeakSet()  # sandboxes whose tool server runs
 
     # ------------------------------------------------------------------------------------------------ the plugin's hooks
     def mode(self, factors: Mapping[str, Any]) -> DataPathMode:
@@ -324,7 +348,8 @@ class SandboxPlatform:
         return SandboxProbe(self._host, self._s, starting=self._threads.active)
 
     def probe(self) -> SlotProbe:
-        """The `ResourceProbe` for the plugin: a key is free once its sandbox is proven gone and its tokens have ended."""
+        """The `ResourceProbe` for the plugin: a key is free once its sandbox is proven gone and its tokens have ended,
+        by their expiry or by a revocation that has settled."""
         return SlotProbe(self._journal, sandbox_gone=self.sandbox_probe().resource_gone, clock=self._clock)
 
     @staticmethod
@@ -470,7 +495,10 @@ class SandboxPlatform:
         the key from before it is dispatched, so the probe shows nothing gone while it runs, and a launch cancelled or
         failed during the mint waits for it, however often it is cancelled meanwhile, with the same deadline, before it
         re-raises. Its tokens are journalled by `SlotTokens` as they are minted, so a slot whose run was cancelled
-        stays held until they have ended (C19).
+        stays held until they have ended, or have been revoked once the mint thread ended (C19).
+
+        On leaving, however it leaves, a launch that held a lease revokes the slot's tokens after the sandbox's stop,
+        in the same wait (this module's docstring says when it does not).
 
         The start runs in a thread, and cancelling the launch does not stop a thread: it goes on creating the sandbox.
         So the sandbox is built before the thread begins, and the launch holds it. On cancellation, or any failure of
@@ -497,6 +525,7 @@ class SandboxPlatform:
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None
         minting: asyncio.Future[RunTokens | None] | None = None
+        revoking = lease if mode is not DataPathMode.NONE or condition is not None else None  # its slot's, at the end
         try:
             async with ctx.infrastructure_wait(WAIT_KIND):
                 minted = self._threads.began(lease.key if lease is not None else None)  # before the thread exists
@@ -506,6 +535,8 @@ class SandboxPlatform:
                 minting.add_done_callback(lambda _: minted())  # a task that never got to run has no thread to end
                 tokens = await asyncio.shield(minting)
                 sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
+                if revoking is not None:  # from here the sandbox's stop revokes them (`_stop`)
+                    self._revocable[sandbox] = _Revocable(revoking, tokens)
                 ended = self._threads.began(lease.key if lease is not None else None)
                 share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
@@ -521,6 +552,8 @@ class SandboxPlatform:
             if sandbox is not None and started is not None:
                 await self._settle_start(sandbox, started)
                 await self._stop(ctx, sandbox, quiet=True)
+            elif revoking is not None and minting is not None:  # a mint that may have left a token, and no start
+                await self._revoke_unstarted(ctx, revoking, minting, sandbox)
             raise
         try:
             yield sandbox
@@ -548,10 +581,14 @@ class SandboxPlatform:
             )
         if self._launcher is None:
             raise ValueError("the platform was built without a tool-server launcher")
-        async with self._launcher.launch(
-            ctx, plane.condition, plane.token, ceiling_s=ceiling_s, extra_env=extra_env, principal=plane.principal
-        ) as provider:
-            yield provider
+        self._serving.add(sandbox)  # the run's end revokes nothing while it runs: its teardown reads as the token
+        try:
+            async with self._launcher.launch(
+                ctx, plane.condition, plane.token, ceiling_s=ceiling_s, extra_env=extra_env, principal=plane.principal
+            ) as provider:
+                yield provider
+        finally:
+            self._serving.discard(sandbox)
 
     async def _end_run(self, ctx: CallContext, sandbox: DockerSandbox, error: Exception | None) -> None:
         """Stop a run whose body ended, by returning (`error` None) or raising `error`, and raise how it ended; return
@@ -597,13 +634,78 @@ class SandboxPlatform:
         await _wait_through_cancellation(started, self._cancel_wait_s)
 
     async def _stop(self, ctx: CallContext, sandbox: DockerSandbox, *, quiet: bool) -> None:
+        """Stop the sandbox, verified, and then, in the same wait and whatever the stop did, revoke its run's slot's
+        tokens when the launch registered them (`_revoke_now`)."""
         async with ctx.infrastructure_wait(WAIT_KIND):
             try:
-                await _complete(asyncio.to_thread(sandbox.stop))
-            except SandboxError as error:
-                if not quiet:
-                    raise InfraError("sandbox", f"the sandbox could not be torn down: {error}"[:600]) from None
-                log.error("the sandbox of an ended run could not be torn down: %s", error)
+                try:
+                    await _complete(asyncio.to_thread(sandbox.stop))
+                except SandboxError as error:
+                    if not quiet:
+                        raise InfraError("sandbox", f"the sandbox could not be torn down: {error}"[:600]) from None
+                    log.error("the sandbox of an ended run could not be torn down: %s", error)
+            finally:
+                revocable = self._revocable.pop(sandbox, None)
+                if revocable is not None:
+                    await _complete(asyncio.to_thread(self._revoke_now, revocable, sandbox))
+
+    async def _revoke_unstarted(
+        self,
+        ctx: CallContext,
+        lease: Lease,
+        minting: asyncio.Future[RunTokens | None],
+        sandbox: DockerSandbox | None,
+    ) -> None:
+        """Revoke the slot's tokens of a launch that failed before its sandbox started: its mint may have left one."""
+        revocable = self._revocable.pop(sandbox, None) if sandbox is not None else None
+        if revocable is None:
+            done = minting.done() and not minting.cancelled() and minting.exception() is None
+            revocable = _Revocable(lease, minting.result() if done else None)
+        async with ctx.infrastructure_wait(WAIT_KIND):
+            await _complete(asyncio.to_thread(self._revoke_now, revocable, None))
+
+    def _revoke_now(self, revocable: _Revocable, sandbox: DockerSandbox | None) -> None:
+        """Blocking: revoke the slot's tokens once its run has ended, and record what happened; never raise.
+
+        Nothing is revoked while a mint or start thread of the key runs, or while the run's tool server has not
+        stopped; a failure is logged and recorded. Either way no revoked line is journalled, so the expiry rule
+        stands."""
+        lease = revocable.lease
+        reason: str | None = None
+        if self._threads.active(lease.key):
+            reason = "a mint or start thread of the slot still runs"
+        elif sandbox is not None and sandbox in self._serving:
+            reason = "the run's tool server has not stopped"
+        if reason is None:
+            try:
+                self._slots.users_of(lease)  # a held lease of one of the slots: refused otherwise
+                done = self._tokens.revoke(lease.key, revocable.tokens)
+            except Exception as error:
+                reason = f"the revocation was not confirmed ({_described(error)})"
+        label = self._slot_label(lease.key)
+        if reason is not None:
+            log.error("%s: its tokens were not revoked: %s; the slot is held until they expire", label, reason)
+            record: dict[str, Any] = {"revoked": False, "reason": reason}
+        else:
+            log.info("%s: its tokens were revoked; the slot counts as free from %.0f", label, done.settle_until)
+            record = done.record()
+        if sandbox is not None:
+            sandbox.record(token_revocation=record)
+
+    def _slot_label(self, key: str) -> str:
+        """A slot by its position in the file (O12), or a role when the key names none."""
+        try:
+            return self._slots.label(key)
+        except ValueError:
+            return "a slot"
+
+
+def _described(error: Exception) -> str:
+    """An error of a revocation for a log line or a record: the message of the layer's own errors, which hold no value
+    of the configuration, and the type alone of any other."""
+    if isinstance(error, PlatformError | RevocationUnconfirmed):
+        return str(error)
+    return type(error).__name__
 
 
 async def _wait_through_cancellation(future: asyncio.Future[Any], seconds: float) -> bool:

@@ -5,7 +5,7 @@
 """The read-only day-0 checks: reachability, health, tokens and listing.
 
 Each check reads and reports; none changes a space, a file or a privilege. Tokens are minted (the examination of a
-token needs one) and, as everywhere in the layer, never revoked: they end with their short lifetime. Facts are by
+token needs one) as the fixed principals, which nothing revokes: they end with their short lifetime. Facts are by
 provider name as platform.toml gives it, in numbers and words; no host, address or URL is ever put in a result.
 
 Their sources: the reachability check samples TCP connect times, reads the provider's public configuration and Onezone's
