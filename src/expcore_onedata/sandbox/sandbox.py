@@ -54,6 +54,7 @@ from typing import Any
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
 from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool, reap
+from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
@@ -78,6 +79,7 @@ from expcore_onedata.sandbox.containers import (
     effective_log_dir,
     gate_run_args,
     gate_upstreams,
+    sidecar_abort_args,
     sidecar_command,
     sidecar_run_args,
     trust_targets,
@@ -97,6 +99,7 @@ TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run director
 GATE_TOKEN_FILE = Path("gate-secret", "gate-token")  # likewise while the gate starts, owned by the gate's user
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 RUN_START_POLLS = 50  # reads of the gate's log, 0.1 s apart, for the mark of the run's start it was signalled to write
+INIT_SLEEP_POLLS = 50  # reads of the agent's cgroup, 0.1 s apart, for the `sleep` its init starts (O34)
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
 NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
@@ -125,9 +128,11 @@ class DockerSandbox:
         sample_period_s: float | None = 1.0,
         sleep: Callable[[float], None] = time.sleep,
         config_sha256: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.host, self.s, self.spec, self.registry = host, settings, spec, registry
         self.waits, self._sample_period, self._sleep = waits or TD.WAITS, sample_period_s, sleep
+        self._clock = clock  # what a cell's deadline counts its graces and its margin by (O34), with `sleep`
         key = spec.lease_key or re.sub(r"[^A-Za-z0-9_.-]", "_", spec.run_key)[:48]
         self.sid = f"{key}-{uuid.uuid4().hex[:8]}"
         self.names = Names.make(settings.name_prefix, self.sid)
@@ -150,7 +155,10 @@ class DockerSandbox:
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
             "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O23); never the bundle's path
+            # each cell's deadline: `cell_deadlines`, each bounded by the margin past its cap (deadline.margin_s, O34)
+            "cell_deadline": {"grace_s": settings.kill_grace_s, "margin_s": DL.margin_s(settings.kill_grace_s)},
         }
+        self._meta_lock = threading.RLock()  # a cell's deadline writes here from its timer's thread (cells.py)
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -167,6 +175,7 @@ class DockerSandbox:
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
         self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
+        self._init_sleep: dict[str, Any] | None = None  # the agent's init's `sleep`, by pid and start time (O34)
         self._uptime0: float | None = None
         self.teardown_log: list[dict] = []
 
@@ -324,11 +333,17 @@ class DockerSandbox:
         share = self._start_mount() if mode is DataPathMode.MOUNT else None
         self._checkpoint()
         self._start_agent(work, share, gate_ip, list(hosts))
+        self._init_sleep = self._identify_init_sleep()  # before any cell: a probe's process would be one more
         self._checkpoint()
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
         if share:
             roles["sidecar"] = self.names.sidecar
-        self._cells = CellRunner(self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started)
+        escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock)
+        self._cells = CellRunner(
+            self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation,
+            stop=self._stop_at_deadline, meta_lock=self._meta_lock,
+        )  # fmt: skip
+        self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
         self._verify_inputs()
         self._cells.sample_pids()
@@ -645,6 +660,22 @@ class DockerSandbox:
         self._register_container(self.names.agent)
         self.host.docker(*args, env=env)
 
+    def _identify_init_sleep(self) -> dict[str, Any]:
+        """The agent's init's `sleep infinity`, by its pid and start time, read once the container has started and before
+        any cell runs (`teardown.init_sleep`): the one process the kill at a cell's deadline, the quiesce and the
+        teardown spare besides the init. A process of the agent's can name itself `sleep` and be reparented to the init,
+        but it cannot take this start time (O34). The init starts it just after docker returns, so it is looked for a few
+        times; a container whose `sleep` cannot be told from the agent's processes could not bound a cell, so its start
+        fails."""
+        for _ in range(INIT_SLEEP_POLLS):
+            info = TD._inspect(self.host, self.names.agent, self.waits)
+            if info is not None and info["running"] and info["pid"] > 0:
+                found = TD.init_sleep(self.host, info)
+                if found is not None:
+                    return found
+            self._sleep(0.1)
+        raise SandboxError("the agent container's init and its sleep could not be identified at its start")
+
     def _verify_read_only(self) -> None:
         """Prove the root and the mount refuse a write, from inside the agent, and refuse to hand out a sandbox that does not."""
         paths = {"root": "/ro-probe"}
@@ -811,7 +842,12 @@ class DockerSandbox:
         is recorded under `harness_steps` with its exit status, its refusals and the host killer's kills it met, none
         of which the agent's first cell takes. Its only time limit is the backstop `timeout` in the container
         (`CAP_MARGIN_S` after `timeout_s`): the harness's timer, which would stop the agent's processes, is not started,
-        and no kill cause is read."""
+        and no kill cause is read.
+
+        A cell's limit is a hard deadline (deadline.py, O34): a process of the cell that outlives its kill has the
+        mount aborted from the sidecar (`_abort_mount`), or the sandbox stopped (`_stop_at_deadline`), and the run is
+        over: every later `exec` and the collection of a stopped run raise `InfraError("cell_unkillable")`."""
+        self._refuse_if_ended()
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
         self._enter(record)
@@ -838,6 +874,64 @@ class DockerSandbox:
                     "a harness step runs only before the agent's run: its start is marked or a cell began"
                 )
             self._steps_running += 1
+
+    def settle_deadline(self) -> dict[str, Any] | None:
+        """Before anyone decides how the run ended (`launch`, `collect`): a cell still running has its deadline enforced
+        now, and one under way is waited for (`CellRunner.settle`, O34). The record of the deadline that ended the run,
+        or None. It never raises."""
+        return self._cells.settle() if self._cells is not None else None
+
+    def _refuse_if_ended(self, *, unless: tuple[str, ...] = ()) -> None:
+        """Raise `InfraError("cell_unkillable")` once a cell's deadline ended the run (O34), unless it ended as one of
+        `unless`: after an abort the mount is dead, and no later cell may read it as if it were an empty directory."""
+        if self._cells is None:
+            return
+        with self._meta_lock:
+            record = self._cells.ended
+        if record is not None and record["outcome"] not in unless:
+            raise kinds.run_ended_error(record)
+
+    def _abort_mount(self, timeout_s: float) -> dict[str, Any]:
+        """At a cell's deadline, when a process of the cell outlived its kill (O34): abort the run's FUSE connection from
+        the sidecar, which holds the mount and SYS_ADMIN (`containers.sidecar_abort_args`), nothing in the agent's
+        container, within `timeout_s`, what the deadline's margin has left. The connection is the device of the run's
+        mount in the host's table, read without touching the mount. `ok` is None when there is no mount to abort; once it
+        is True the mount is dead for the rest of the run."""
+        if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
+            return {"ok": None, "why": "the run has no FUSE mount"}
+        until = self._clock() + timeout_s
+        found = TD._fuse_at(self.host, TD.host_path(self.dir / "mount"), self.waits)
+        connections = sorted({n for m in found or [] if (n := TD._conn(m["dev"])) is not None})
+        if not connections:
+            return {"ok": None, "why": "the mount's FUSE connection is not in the host's mount table"}
+        failed = []
+        for n in connections:
+            left = min(self.waits.command_s, until - self._clock())
+            if left <= 0:
+                return {"ok": False, "connections": len(connections), "why": "the deadline's margin ran out"}
+            done = self.host.docker(*sidecar_abort_args(self.names, n), check=False, timeout=left)
+            if done.returncode != 0:
+                failed.append(done)
+        note: dict[str, Any] = {"ok": not failed, "connections": len(connections)}
+        if failed:
+            note.update(rc=failed[0].returncode, stderr=stderr_digest(failed[0].stderr))
+            log.error("the sidecar could not abort the mount's FUSE connection: %s", describe_stderr(failed[0].stderr))
+        else:
+            with self._meta_lock:
+                self._meta.setdefault("mount", {})["aborted"] = True  # dead for the rest of the run
+        return note
+
+    def _stop_at_deadline(self) -> dict[str, Any]:
+        """At a cell's deadline, when the abort could not end the cell (O34): stop the sandbox, from the timer's thread,
+        once the deadline's outcome is recorded and the run classified (`cells.CellRunner._stop_after`); the ordered
+        teardown has its own last resorts, and the driver's later stop finds it stopped. A stop that fails is recorded,
+        never raised here."""
+        try:
+            self.stop()
+        except SandboxError as e:
+            log.error("the sandbox could not be stopped at a cell's deadline: %s", describe_error(e))
+            return {"ok": False, "error": "the sandbox's teardown was incomplete"}
+        return {"ok": True}
 
     def _new_refusals(self) -> tuple[str, ...]:
         """The data gate's refusals since the last cell or step; an unreadable log stands for them, unknown never none."""
@@ -973,7 +1067,12 @@ class DockerSandbox:
         for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
         that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash)
         raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
-        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection."""
+        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection. A run a
+        cell's deadline stopped, or left with a process that outlived its kill, raises `InfraError("cell_unkillable")`
+        (O34); after the mount's abort alone the outputs are collected as usual. A cell still running has its deadline
+        settled first (`settle_deadline`), so none fires while the agent is frozen and its outputs are copied."""
+        self.settle_deadline()
+        self._refuse_if_ended(unless=(DL.MOUNT_ABORTED,))
         try:
             state = self._cells.quiesce("before collection")
             if not CellRunner.quiet(state):
@@ -1116,7 +1215,8 @@ class DockerSandbox:
 
     def metadata(self) -> dict[str, Any]:
         """The facts of the run for its record. Never a secret: tokens are not in it, and the sidecar's log is summarised."""
-        meta = json.loads(json.dumps(self._meta, default=str))
+        with self._meta_lock:  # a cell's deadline may be writing its record from its timer's thread (O34)
+            meta = json.loads(json.dumps(self._meta, default=str))
         if not self._stopped and self._cells is not None:
             meta["cells"] = len(self._cells.cells)
             meta["memory"] = {k: v for k, v in self.obs.memory_facts(self.names.agent).items() if k != "events"}
@@ -1141,7 +1241,10 @@ class DockerSandbox:
         One teardown at a time: the sampler's thread and the driver's `finally` may both stop; the second waits, then
         finds it stopped. A SIGTERM cannot cut it short (termination.py): that would leave what it exists to remove.
         A stop that ran while a start was still creating things does not count as the last: whatever was registered
-        after it began leaves the sandbox not stopped, and `force` runs the teardown again whatever is believed."""
+        after it began leaves the sandbox not stopped, and `force` runs the teardown again whatever is believed. A
+        cell's deadline under way is waited for first, at most its margin, so the teardown never races it (O34)."""
+        if self._cells is not None:
+            self._cells.wait_decided()
         with TERM.sigterm_deferred(), self._stop_lock:
             self._stop_locked(force)
 
@@ -1156,6 +1259,10 @@ class DockerSandbox:
     def _stop_locked(self, force: bool = False) -> None:
         if self._stopped and not force:
             return
+        if self._cells is not None and self._cells.ended is not None:
+            # a run a cell's deadline ended is set aside as infrastructure: its disks are kept, as a failed collection's
+            # are, whichever stop comes first, the deadline's own or the driver's (O34)
+            self.keep_evidence = True
         with self._created_lock:
             created = self._created
         errors: list[str] = []
@@ -1172,7 +1279,13 @@ class DockerSandbox:
                 log_path = self.s.work_root / TD.TEARDOWN_LOG_DIR / f"{self.sid}.jsonl"
                 agent = self.names.agent if self.names.agent in self._containers else None
                 res = TD.ordered_fuse_teardown(
-                    self.host, agent, self.names.sidecar, self.dir / "mount", waits=self.waits, log_path=log_path
+                    self.host,
+                    agent,
+                    self.names.sidecar,
+                    self.dir / "mount",
+                    waits=self.waits,
+                    log_path=log_path,
+                    agent_sleep=self._init_sleep,
                 )
                 self.teardown_log = res.log
                 errors.extend(res.errors)
@@ -1218,11 +1331,12 @@ class DockerSandbox:
             self._step(unmount_errors, self.host.unmount, m)
         errors.extend(unmount_errors)
         if self.keep_evidence:
-            self._meta["evidence_kept"] = {
-                "under": "sandbox.work_root",
-                "directory_id": self.sid.rsplit("-", 1)[-1],
-                "relocated": False,
-            }
+            with self._meta_lock:  # `metadata()` may be reading it from another thread
+                self._meta["evidence_kept"] = {
+                    "under": "sandbox.work_root",
+                    "directory_id": self.sid.rsplit("-", 1)[-1],
+                    "relocated": False,
+                }
         if self._mounts_may_be_live(unmount_errors):
             # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
@@ -1231,7 +1345,8 @@ class DockerSandbox:
             )
             return
         if self.keep_evidence and self._token_files_left():  # a secret is never evidence: the run stays where it is
-            self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
+            with self._meta_lock:
+                self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
             errors.append(
                 "the run directory is left where it is: a copy of the data-path token in it could not be removed, "
                 "so it is not kept as evidence"
@@ -1245,7 +1360,8 @@ class DockerSandbox:
             kept = self.s.work_root / "_kept_evidence"
             self._step(errors, lambda: self.host.run(["mkdir", "-p", str(kept)], 20, sudo=True))
             self._step(errors, lambda: self.host.run(["mv", str(self.dir), str(kept / self.sid)], 60, sudo=True))
-            self._meta["evidence_kept"]["relocated"] = True
+            with self._meta_lock:
+                self._meta["evidence_kept"]["relocated"] = True
             if self.dir.exists() or not (kept / self.sid).exists():
                 errors.append("the evidence could not be moved to the place it is kept")
         else:

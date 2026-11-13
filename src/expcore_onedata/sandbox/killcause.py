@@ -23,17 +23,24 @@ attempts per condition and model).
 is one, whatever its elapsed time, since a cell killed by something else just before its limit has run as long. A failure of
 docker itself without that flag is no time limit either: a dead container is infrastructure, anything else nothing attributes.
 
+`kill_survived` is the harness's own record too (deadline.py, O34): a process of the cell outlived its kill at the cap
+(a read waiting in the kernel on the FUSE mount), so the mount was aborted or the sandbox stopped. It overrides what the
+counters say, since after an abort or a stop they describe the harness's doing, not the cell's.
+
 One cause per run, in this order (kills can correlate with the condition, since a download may be charged to memory twice, so a cause must not depend on which
-was looked at first): `earlyoom` (its journal, whatever the counters and the exit code), `container_dead`, `host_oom`, `memory_limit`, `time_limit`, `killed_other`,
-`unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause` applies the
-order to a run's cells.
+was looked at first): `kill_survived`, `earlyoom` (its journal, whatever the counters and the exit code), `container_dead`, `host_oom`, `memory_limit`, `time_limit`,
+`killed_other`, `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause`
+applies the order to a run's cells.
 """
 
 from __future__ import annotations
 
 import re
 
-REASONS = ("memory_limit", "host_oom", "earlyoom", "container_dead", "time_limit", "killed_other", "unknown")
+KILL_SURVIVED = "kill_survived"
+REASONS = (
+    "memory_limit", "host_oom", "earlyoom", "container_dead", "time_limit", "killed_other", "unknown", KILL_SURVIVED,
+)  # fmt: skip
 CATEGORY = {
     "memory_limit": "agent",
     "time_limit": "agent",
@@ -42,10 +49,24 @@ CATEGORY = {
     "container_dead": "infrastructure",
     "killed_other": "unknown",
     "unknown": "unknown",
+    KILL_SURVIVED: "infrastructure",
 }
 
 
-PRECEDENCE = ("earlyoom", "container_dead", "host_oom", "memory_limit", "time_limit", "killed_other", "unknown")
+PRECEDENCE = (
+    KILL_SURVIVED, "earlyoom", "container_dead", "host_oom", "memory_limit", "time_limit", "killed_other", "unknown",
+)  # fmt: skip
+
+
+def survived_cause(record: dict) -> dict:
+    """A cell whose process outlived its kill at the cap (`deadline.enforce`'s record): infrastructure, whatever the
+    counters, the container's state and the exit code say, with how its deadline ended."""
+    return {
+        "reason": KILL_SURVIVED,
+        "category": CATEGORY[KILL_SURVIVED],
+        "basis": f"a process of the cell outlived its kill at the cap; the deadline ended as {record.get('outcome')}",
+        "deadline": record,
+    }
 
 
 def run_cause(reasons) -> str | None:

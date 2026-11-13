@@ -141,6 +141,27 @@ def sidecar_command(provider_host: str, settings: SandboxSettings) -> list[str]:
     ]
 
 
+# At a cell's deadline, when a process of the cell outlived its kill (O34): abort the mount's FUSE connection from the
+# sidecar, which holds the mount, SYS_ADMIN and /dev/fuse (the agent's container has none of them). The connection's
+# fusectl entry is mounted in the sidecar's own mount namespace first when it is not there (a container's /sys does not
+# carry fusectl), then its `abort` is written, which ends every request waiting on the connection with an errno. A lazy
+# unmount (`fusermount -uz`) would not do: it detaches the sidecar's and the host's copies of the mount and leaves the
+# agent's, and the requests waiting on it, alive (teardown.py). `$1` is the connection's number, from the host's table.
+SIDECAR_ABORT = (
+    'd=/sys/fs/fuse/connections; [ -e "$d/$1/abort" ] || mount -t fusectl fusectl "$d" || exit 3; '
+    '[ -e "$d/$1/abort" ] || exit 4; echo 1 > "$d/$1/abort"'
+)
+SIDECAR_ABORT_NAME = "sidecar-abort"  # the shell's $0
+
+
+def sidecar_abort_args(names: Names, connection: str) -> list[str]:
+    """`docker exec` of the abort of the mount's FUSE connection `connection` (its number, the minor of the mount's
+    device `0:N` in the host's mount table) in the sidecar, as root. Nothing runs in the agent's container."""
+    if not (connection.isascii() and connection.isdigit()):
+        raise ValueError("a FUSE connection is named by its number")
+    return ["exec", "-u", "0", names.sidecar, "sh", "-c", SIDECAR_ABORT, SIDECAR_ABORT_NAME, connection]
+
+
 def sidecar_route(settings: SandboxSettings, provider_host: str) -> tuple[str, str]:
     """The network the sidecar starts on and the provider host it dials there (O03).
 
