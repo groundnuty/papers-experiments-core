@@ -124,7 +124,14 @@ from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
 from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED
 from expcore_onedata.sandbox.hostops import strict_networks
-from expcore_onedata.sandbox.oneclient_args import IO_MODES, extra_arg_problem, mount_problem
+from expcore_onedata.sandbox.oneclient_args import (
+    IO_MODES,
+    direct_keys_problem,
+    mode_arg_problem,
+    mount_problem,
+    nested,
+    storages_problem,
+)
 from expcore_onedata.tls import TlsSettings, moved
 
 PREFIX_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
@@ -149,12 +156,8 @@ IO_MODE_REFUSAL = (
     'is required and must be "proxy" or "direct": a mount never leaves the storage access to oneclient\'s own '
     "detection, which hangs the first read of a second space backed by the same storage (oneclient 25.0, "
     'src/cache/helpersCache.h, performAutoIOStorageDetection takes its access-type mutex twice). "proxy" reads every '
-    'space through the provider; "direct" is not supported yet (see #223)'
-)
-DIRECT_REFUSAL = (
-    'is "direct", which is not supported yet: direct I/O reads the providers\' storage itself, so it needs that '
-    'storage mapped into the sidecar, which the sandbox does not do (see #223). Declare "proxy", which reads every '
-    "space through the provider"
+    'space through the provider; "direct" reads the local provider\'s storage itself and needs it mapped in '
+    "[sandbox.mount.storages] (#223)"
 )
 
 
@@ -196,11 +199,17 @@ class MountSettings:
     path: str
     io_mode: str  # "proxy" or "direct", declared, never left to oneclient's detection (O36)
     extra_args: tuple[str, ...] = ()
+    # direct I/O only (O37): (storage id, the directory that holds it on the host), in the file's order, by which a
+    # message or a record names one; bound read-only into the sidecar alone, each named to oneclient by an override
+    # of its POSIX mount point
+    storages: tuple[tuple[str, str], ...] = ()
+    direct_check_file: str | None = None  # direct I/O only: `<space>/<path>` under the mount, read at every start
 
     def __post_init__(self) -> None:
-        """Settings built in code are held to what the loader holds a file to: a known mode and no extra argument that
-        sets what the core declares (O36). `ValueError`; the message never holds an argument."""
-        problem = mount_problem(self.io_mode, self.extra_args)
+        """Settings built in code are held to what the loader holds a file to: a known mode, no extra argument that
+        sets what the core declares (O36), and a direct mount's storage mapping and check file, which a proxy mount
+        may not have (O37). `ValueError`; the message never holds an argument, an id or a path."""
+        problem = mount_problem(self.io_mode, self.extra_args, self.storages, self.direct_check_file)
         if problem is not None:
             raise ValueError(problem)
 
@@ -354,25 +363,51 @@ def _served_caps(section: Section) -> Caps:
     )
 
 
+def _storages(section: Section) -> tuple[tuple[str, str], ...] | None:
+    """Read [sandbox.mount.storages] (O37), in the file's order, or None when the mount declares none. Each entry is a
+    configured id and path, so a message names it by its position and never echoes either (O12)."""
+    if "storages" not in section.data:
+        return None
+    table = section.section("storages")
+    declared = tuple(table.data.items())
+    problem = storages_problem(declared)
+    if problem is not None:
+        raise table.fail(None, problem)
+    return declared
+
+
 def _mount(section: Section) -> MountSettings:
-    """Read [sandbox.mount]: the path in the agent and the oneclient options; TLS is the platform's [tls]."""
+    """Read [sandbox.mount]: the path in the agent and the oneclient options; TLS is the platform's [tls]. A direct
+    mount also maps its storages and names its check file (O37), which a proxy mount may not."""
     if "tls" in section.data:
         raise moved(section, "tls")
-    section.reject_unknown(("path", "io_mode", "extra_args"))
+    section.reject_unknown(("path", "io_mode", "extra_args", "storages", "direct_check_file"))
     path = section.string("path")
     if not path.startswith("/") or path == "/" or ".." in path.split("/") or any(c.isspace() for c in path):
         raise section.fail("path", "must be an absolute path inside the agent, not the root")
     io_mode = section.data.get("io_mode")
     if io_mode not in IO_MODES:
         raise section.fail("io_mode", IO_MODE_REFUSAL)
-    if io_mode == "direct":  # the argv code for it stays; #223 adds the storage mapping and lifts this
-        raise section.fail("io_mode", DIRECT_REFUSAL)
     extra = section.strings("extra_args") if "extra_args" in section.data else ()
     for argument in extra:
-        problem = extra_arg_problem(argument)
+        problem = mode_arg_problem(io_mode, argument)
         if problem is not None:
             raise section.fail("extra_args", problem)
-    return MountSettings(path, io_mode, tuple(extra))
+    storages, check = _storages(section), section.data.get("direct_check_file")
+    found = direct_keys_problem(io_mode, storages, check)
+    if found is not None:
+        raise section.fail(*found)
+    return MountSettings(path, io_mode, tuple(extra), storages or (), check)
+
+
+def _storages_clear_of(section: Section, mount: MountSettings, work_root: Path) -> None:
+    """Refuse a storage whose directory is, holds or lies under the work root (O37): the sandbox makes, unmounts and
+    removes directories there, and the reaper removes what a killed run left, so a provider's files could go."""
+    table = section.section("mount").section("storages") if mount.storages else None
+    for position, (_, path) in enumerate(mount.storages):
+        if table is not None and nested(str(Path(path).resolve()), str(work_root)):
+            why = "is, holds or lies under [sandbox] work_root, where the sandbox makes and removes directories"
+            raise table.fail(None, f"entry {position}: {why}")
 
 
 def _entry_string(section: Section, key: str, position: int) -> str:
@@ -553,6 +588,8 @@ def load_sandbox(
     mount = _mount(section.section("mount")) if "mount" in section.data else None
     if DataPathMode.MOUNT in data_paths.values() and (mount is None or oneclient is None):
         raise section.fail("mount", "and [sandbox.images.oneclient] are required when a data path is a mount")
+    if mount is not None:
+        _storages_clear_of(section, mount, work_root)
     federation = None
     if "federation" in section.data:
         if not {DataPathMode.MOUNT, DataPathMode.REST} & set(data_paths.values()):

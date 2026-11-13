@@ -15,6 +15,8 @@ read from `src/options/options.cc`. A run's metadata keeps an extra argument's n
 
 from __future__ import annotations
 
+import itertools
+import posixpath
 import re
 from collections.abc import Sequence
 
@@ -23,9 +25,14 @@ IO_MODE_FLAGS = {
     "proxy": "--force-proxy-io",
 }  # oneclient's own option for each mode (O36)
 IO_MODES = tuple(IO_MODE_FLAGS)
+DIRECT = "direct"
 CONFIG_OPTION = "--config"
 CONFIG_NULL = "/dev/null"  # an empty file: boost's parser reads no option from it, so no configuration file is parsed
 INSECURE_OPTION = "--insecure"
+OVERRIDE_OPTION = "--override"  # `-r`: one helper parameter of one storage, `<storage id>:<name>:<value>` (O37)
+# With direct I/O the sidecar passes it, so glog writes each INFO line as it is logged and the start check sees every
+# line its test read caused (`logging.cc`: FLAGS_logbuflevel -1; otherwise INFO waits up to 30 s in a buffer, O37)
+DISABLE_LOG_BUFFERING = "--disable-log-buffering"
 UNSET_ENV = ("ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG")  # removed from the sidecar's environment
 
 # The long options of the oneclient binary (`options.cc`, `withLongName`), without OneS3's, which it does not accept.
@@ -63,7 +70,20 @@ ENV_REFUSAL = (
     "must not carry an environment setting of oneclient (ONECLIENT_...): its environment is closed, except for the "
     "token the sidecar hands it"
 )
+OVERRIDE_REFUSAL = (
+    "must not carry a storage override (--override, -r): it changes where oneclient reads a storage, which "
+    "[sandbox.mount.storages] alone declares, for direct I/O"
+)
+LOG_BUFFERING_REFUSAL = (
+    "must not carry --disable-log-buffering with direct I/O: the sidecar passes it, and oneclient refuses a switch "
+    "given twice"
+)
 ENV_SETTING = re.compile(r"ONECLIENT_[A-Za-z0-9_]*=", re.IGNORECASE)
+# A storage id as oneclient takes it in an override: it splits the value at every ':' (`options.h`,
+# `getOverrideParams`), so an id has none, and none of the characters a docker or a shell argument would read
+STORAGE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+HOST_PATH_UNSAFE = re.compile(r'[,"\x00-\x1f\x7f]')  # in a `--mount` value a comma ends the field, a quote opens one
+SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under the mount
 
 
 def abbreviates(argument: str, option: str) -> bool:
@@ -100,21 +120,117 @@ def extra_arg_problem(argument: str) -> str | None:
         return IO_MODE_ARGS_REFUSAL
     if abbreviates(argument, CONFIG_OPTION) or "c" in short_letters(argument):
         return CONFIG_REFUSAL
+    if abbreviates(argument, OVERRIDE_OPTION) or "r" in short_letters(argument):
+        return OVERRIDE_REFUSAL
     if ENV_SETTING.match(argument):
         return ENV_REFUSAL
     return None
 
 
-def mount_problem(io_mode: object, extra_args: Sequence[str]) -> str | None:
-    """Why a mount's I/O mode and extra arguments cannot be given to oneclient, or None: the mode is one of `IO_MODES`
-    and no extra argument sets what the core declares."""
+def mode_arg_problem(io_mode: object, argument: str) -> str | None:
+    """Why an extra argument may not reach oneclient in this I/O mode, or None: `extra_arg_problem`'s reasons, and with
+    direct I/O the log-buffering switch, which the sidecar then passes itself."""
+    problem = extra_arg_problem(argument)
+    if problem is None and io_mode == DIRECT and abbreviates(argument, DISABLE_LOG_BUFFERING):
+        return LOG_BUFFERING_REFUSAL
+    return problem
+
+
+DIRECT_NEEDS = (
+    'is "direct", which reads the local provider\'s storage itself, so the mount needs [sandbox.mount.storages], each '
+    "storage the sidecar reads by its id and the directory that holds it on the host, and direct_check_file, a file "
+    'that provider holds in full, which the start reads to show direct I/O in effect; or declare "proxy", which reads '
+    "every space through the provider and needs neither"
+)
+PROXY_REFUSES = (
+    'is read with io_mode = "direct" alone: a "proxy" mount reads every space through the provider and never a '
+    "storage, so it would do nothing"
+)
+STORAGE_ID_RULE = (
+    "the storage id must be letters, digits, '.', '_' and '-', at most 255, starting with a letter or a digit "
+    "(oneclient splits an override at every ':')"
+)
+HOST_PATH_RULE = (
+    "must be the directory that holds the storage on the host: one absolute, normalised path, not the root, without a "
+    "comma, a quote or a control character (it is bound with --mount)"
+)
+CHECK_FILE_RULE = (
+    "must be a space's directory under the mount, then the path of a file in that space: plain names joined by '/', at "
+    "least two, no '.' or '..'"
+)
+
+
+def host_path_problem(path: object) -> bool:
+    """Whether a host path of a storage is not one plain absolute directory path `--mount` can carry."""
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//") or path == "/":
+        return True
+    return posixpath.normpath(path) != path or HOST_PATH_UNSAFE.search(path) is not None
+
+
+def nested(one: str, other: str) -> bool:
+    """Whether one directory path is, holds or lies under the other."""
+    return one == other or one.startswith(other.rstrip("/") + "/") or other.startswith(one.rstrip("/") + "/")
+
+
+def storages_problem(storages: Sequence[tuple[object, object]]) -> str | None:
+    """Why a storage mapping, in its declared order, cannot be given to the sidecar, or None. An entry is named by its
+    position, never by its id or its path (O12): every one is a configured value."""
+    for position, (storage_id, path) in enumerate(storages):
+        if not isinstance(storage_id, str) or not STORAGE_ID.fullmatch(storage_id):
+            return f"entry {position}: {STORAGE_ID_RULE}"
+        if host_path_problem(path):
+            return f"entry {position}: {HOST_PATH_RULE}"
+    for (i, (_, a)), (j, (_, b)) in itertools.combinations(enumerate(storages), 2):
+        if nested(str(a), str(b)):
+            return f"entries {i} and {j}: one storage's directory is, holds or lies under the other's"
+    return None
+
+
+def check_file_problem(value: object) -> bool:
+    """Whether the direct check file is not a space's directory and a path in it, under the mount."""
+    parts = value.split("/") if isinstance(value, str) else []
+    return len(parts) < 2 or any(part in (".", "..") or not SPACE_PART.fullmatch(part) for part in parts)
+
+
+def direct_keys_problem(
+    io_mode: object, storages: Sequence[tuple[object, object]] | None, check_file: object
+) -> tuple[str, str] | None:
+    """The key and the reason of a mount whose direct-I/O keys do not fit its mode, or None (O37). `storages` is None
+    when the mount declares no mapping; `check_file` is None when it declares no check file. With `"direct"` both are
+    required and must be well formed; with `"proxy"` neither may be there."""
+    if io_mode != DIRECT:
+        if storages is not None:
+            return "storages", PROXY_REFUSES
+        return ("direct_check_file", PROXY_REFUSES) if check_file is not None else None
+    if storages is None:
+        return "io_mode", DIRECT_NEEDS
+    if not storages:
+        return "storages", "must map at least one storage, the local provider's that the sidecar reads"
+    problem = storages_problem(storages)
+    if problem is not None:
+        return "storages", problem
+    if check_file is None:
+        return "direct_check_file", "is required with direct I/O: the start reads it to show direct I/O in effect"
+    return ("direct_check_file", CHECK_FILE_RULE) if check_file_problem(check_file) else None
+
+
+def mount_problem(
+    io_mode: object,
+    extra_args: Sequence[str],
+    storages: Sequence[tuple[object, object]] = (),
+    check_file: object = None,
+) -> str | None:
+    """Why a mount's I/O mode, extra arguments and direct-I/O keys cannot be given to oneclient, or None: the mode is
+    one of `IO_MODES`, no extra argument sets what the core declares, and a direct mount maps its storages and names
+    its check file, which a proxy mount does not (O36, O37). An empty `storages` is no mapping."""
     if io_mode not in IO_MODES:
         return f"[sandbox.mount] io_mode must be one of: {', '.join(IO_MODES)}"
     for argument in extra_args:
-        problem = extra_arg_problem(argument)
+        problem = mode_arg_problem(io_mode, argument)
         if problem is not None:
             return f"[sandbox.mount] extra_args {problem}"
-    return None
+    found = direct_keys_problem(io_mode, tuple(storages) or None, check_file)
+    return None if found is None else f"[sandbox.mount] {found[0]} {found[1]}"
 
 
 def option_name(argument: str) -> str | None:
