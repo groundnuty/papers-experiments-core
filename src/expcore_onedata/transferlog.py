@@ -2,7 +2,8 @@
 #   merged: onedata-mcp @ 0cc17ce, benchmark/fixture_runner.py:269-281 (paged until nextPageToken is empty)
 #   merged: onedata-mcp @ 0cc17ce, benchmark/fixture_runner.py:226-245 (a fresh transfer lags in the listing)
 #   merged: icsa-2027-experiments @ 6fc798cf, day0/scripts/otf_rest_test.py:50-56 (listed by state)
-"""Every transfer of the space in a run's window, whoever started it, read from the space's transfer listing (O08).
+"""The transfers of the space in a run's window, whoever started them, read from the space's transfer listing (O08):
+every one that ran, and of those cancelled before they started only the ones the walk reaches (below).
 
 At run end `TransferLog` observes every tracked provider: it lists the space's transfers there, `GET
 /spaces/{space}/transfers` with `state` waiting, ongoing and ended in that order (a job only moves forward, so one that
@@ -29,7 +30,10 @@ before the cutoff: Onezone's clock more than the margin behind this host's leave
 clock. The band at each edge of the window, from Onezone's least offset less the allowance to its greatest plus it,
 is where a time may lie on either side: a job with a time in one is recorded with `near_window_edge` and leaves its
 target's bound unknown (`transfer_near_window_edge`), never part of a known figure. The providers' Date offsets are
-recorded beside Onezone's, a diagnostic that places nothing.
+recorded beside Onezone's, a diagnostic that places nothing. A job cancelled before it started is given no finish
+time, so the ended listing puts it last, past where the walk stops: `records` and `listed` hold it only when the
+listing is read to its end, so neither counts every transfer that ended in the window. It moved no bytes, so no
+figure of bytes misses it.
 
 **One provider's observation at a time.** A job's state and counters are always taken from one provider's listing and
 record together, never one provider's state with another's counters. A provider lists a job only after a lag (a

@@ -158,3 +158,18 @@ def test_o32_a_providers_date_unread_places_nothing_and_fails_nothing(provisione
     history = history_of(provisioner, ticker)
     assert (history["ended"], history["uncertain"]) == (1, 0)
     assert None in history["clock"]["provider_offsets_s"].values()
+
+
+def test_o32_a_job_the_reset_cancels_while_scheduled_is_in_cancelled_never_in_ended(provisioner, stocked, ticker):
+    """O32: a replication scheduled at the window's start and still waiting when the reset runs is cancelled by its
+    transfers stage. Cancelled before it started, it is given no finish time, so the ended listing puts it last, and
+    `ended`, the jobs that ended with a finish time in the window, never holds it: it counts the reset's own eviction
+    alone. The stage's `cancelled` counts it, from the reset's own cancel, and the short listing, read to its end,
+    makes it neither uncertain nor an older job."""
+    tid = stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=SINCE, ended=False, waiting=True)
+    assert ticker.now == SINCE
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, since=SINCE)
+    assert record["stages"]["transfers"]["cancelled"] == 1
+    assert stocked.transfers[tid].finished == 0
+    history = record["stages"]["history"]
+    assert (history["ended"], history["uncertain"], history["earlier"]) == (1, 0, False)

@@ -42,7 +42,8 @@ the source is what runs. The check past the stop guards that assumption where it
 window, at the stop; it is not a proof of the order beyond it. A job cancelled while still scheduled, before it was
 enqueued, is given no finish time (`replication_status.erl:264-271`, `replica_eviction_status.erl:257-262`; one
 cancelled once enqueued is stamped): its `finishTime` stays 0, so the ended listing puts it last, past every stop, and
-no walk reads it.
+no walk that stops reads it. It moved no bytes; a reader's count of ended jobs is a count of finish times in its
+window, which never holds it.
 
 **Never** a page token built by hand to start at a time: the token's form is undocumented. The walk starts at the
 first page and follows the tokens the platform gives.

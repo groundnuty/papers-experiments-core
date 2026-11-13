@@ -19,7 +19,9 @@ read and every check is made on each provider that supports the space, since eac
    gate (bound to this space, its record's `spaceId` resolved); a cancel answered 400 is a job that has ended, never
    one the gate refused unsent. Each must then report an ended state on that provider, and the listings must show
    nothing waiting or ongoing on every provider in `transfer_settle_polls` observations in a row, `transfer_settle_s`
-   apart (the listing's lag, O07), within twice that many observations.
+   apart (the listing's lag, O07), within twice that many observations. `cancelled` counts the distinct jobs the stage
+   sent a cancel to, from its own actions, so a job it cancelled while still scheduled, which the history cannot see,
+   is never invisible.
 3. **eviction**: the files the caller names leave each provider named (`eviction.py`): a directory in one transfer, a
    set of files in parallel under `[placement] concurrency`, each scheduled again while its block map still shows bytes
    after the transfers ended (an eviction on 25.0 can complete having evicted nothing), up to `EVICTION_ATTEMPTS`.
@@ -35,9 +37,12 @@ read and every check is made on each provider that supports the space, since eac
    listing (`GET /spaces/{sid}/transfers`) only reads. So the next agent sees every ended transfer, the reset's own
    included, and the stage records what the listing shows it, per provider and together, since the window's start
    (`since`: the run's start when the caller gives it, else the reset's own start, on the reset's epoch clock `now`):
-   the count of the jobs that ended since then (`ended`), the count of those that may have ended on either side of
-   `since` (`uncertain`), the newest finish time, read from the records, whether older ended jobs are listed too
-   (`earlier`), and `removable` false, its limit stated. The history grows with every run, so the listing is read
+   the count of the jobs that ended with a finish time since then (`ended`), the count of those that may have ended on
+   either side of `since` (`uncertain`), the newest finish time, read from the records, whether older ended jobs are
+   listed too (`earlier`), and `removable` false, its limit stated. A job cancelled before it started carries no finish
+   time (its `finishTime` is 0), so the listing puts it last, past where a walk stops, and neither count holds it,
+   nor `earlier`, even when a short listing is read to its end; it moved no bytes, and the reset's own such cancels
+   are in the transfers stage's `cancelled`. The history grows with every run, so the listing is read
    newest first down to the window less the clock-skew allowance and `transferorder.STOP_MARGIN_S`, its order checked
    as it goes, never whole (O32); `LISTED_MAX` counts the jobs read down to there. A finish time is stamped on the
    platform's global clock, Onezone's, and a provider's Date header gives its system clock (`transferorder.py` has the
@@ -330,7 +335,9 @@ class SpaceReset:
 
     def _transfers(self) -> dict[str, Any]:
         """Cancel every job that has not ended, on every provider that lists it, until `transfer_settle_polls`
-        observations in a row show none, within twice that many."""
+        observations in a row show none, within twice that many. `cancelled` counts the distinct jobs the reset sent a
+        cancel to (one answered 400, a job that had just ended, included): the history's `ended` cannot hold one it
+        cancelled while still scheduled, which is given no finish time."""
         settings = self._p.settings
         cancelled: set[tuple[str, str]] = set()
         clean = observations = 0
@@ -410,13 +417,14 @@ class SpaceReset:
         return {"physical_bytes": {self._label(p): held for p, held in sizes.items()}}
 
     # -- 5. ended-transfer history ------------------------------------------------------
-    def _finish(self, provider: str, tid: str) -> float:
-        """An ended job's finish time, from its record; one without a number there is unreadable."""
+    def _finish(self, provider: str, tid: str) -> float | None:
+        """An ended job's finish time, from its record; None for 0, a job cancelled before it started, which was given
+        no finish time (`transferorder.py`). One without a number there is unreadable."""
         record = self._p.client.get(f"/transfers/{tid}", provider=provider, retry=self._p.retry)
         value = record.get("finishTime") if isinstance(record, dict) else None
         if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
             raise Unreadable("an ended transfer's record has no finishTime that is a number")
-        return float(value)
+        return float(value) or None
 
     def _zone_offset(self) -> float | None:
         """Onezone's clock offset from this host, the clock finish times are stamped on, from the Date header of its
@@ -459,11 +467,12 @@ class SpaceReset:
 
     def _history(self, since: float) -> dict[str, Any]:
         """What the ended listing shows the next agent since `since`, per provider and together: the count of the jobs
-        that surely ended since then, the count of those that may have ended on either side of it, the newest finish,
-        and whether older jobs are listed too. Each provider's listing is read newest first down to `since` less the
-        allowance and the margin, never the whole history; Onezone's Date headers, read before and after the listings,
-        place the band at the window's start (`transferorder.start_band`), and a clock of Onezone's that cannot be read,
-        or that puts the band below where the reading stops, fails the stage."""
+        that surely ended with a finish time since then, the count of those that may have ended on either side of it,
+        the newest finish, and whether older jobs are listed too. A job cancelled before it started has no finish time
+        and is in neither count (`_transfers` counts the reset's own cancels). Each provider's listing is read newest
+        first down to `since` less the allowance and the margin, never the whole history; Onezone's Date headers, read
+        before and after the listings, place the band at the window's start (`transferorder.start_band`), and a clock
+        of Onezone's that cannot be read, or that puts the band below where the reading stops, fails the stage."""
         allowance = self._p.settings.clock_skew_allowance_s
         cutoff = since - allowance - STOP_MARGIN_S
         walks, offsets = {}, {}
@@ -478,7 +487,8 @@ class SpaceReset:
         for label, walk in walks.items():
             # The margin decides where the walk stops, never what counts: a job it kept that finished before the band
             # ended before `since` and shows that older jobs are listed; one in the band is neither counted nor older.
-            mine = {tid: band.place(moment) for tid, moment in walk.kept.items()}
+            # A job with no finish time, cancelled before it started, is placed nowhere: `ended` counts finish times.
+            mine = {tid: band.place(moment) for tid, moment in walk.kept.items() if moment is not None}
             for tid, place in mine.items():
                 places.setdefault(tid, set()).add(place)
             per[label] = {
