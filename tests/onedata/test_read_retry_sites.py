@@ -103,7 +103,7 @@ ONE_ATTEMPT_SITES = {
     ("linkcheck.py", "_Check._schedule_eviction", "client.mutate"): ["ONE_ATTEMPT"],
     ("linkcheck.py", "_Check.prepare", "consistency.wait_visible"): ["ONE_ATTEMPT"],
     ("linkprobe.py", "ProbeFiles._create", "client.mutate"): ["ONE_ATTEMPT"],
-    ("linkprobe.py", "ProbeFiles._probes", "client.get"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._children", "client.get"): ["ONE_ATTEMPT"],
     ("linkprobe.py", "ProbeFiles._root", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("linkprobe.py", "ProbeFiles._write", "client.mutate"): ["ONE_ATTEMPT"],
     ("linkprobe.py", "ProbeFiles.delete", "client.mutate"): ["ONE_ATTEMPT"],

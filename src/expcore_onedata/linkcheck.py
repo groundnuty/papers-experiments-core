@@ -13,7 +13,7 @@ space no agent can see, and keeps: `expcore-link-probe-` and 16 hex digits of th
 study's data: the study spaces are where agents work and their transfer listings are a run's evidence, so the check
 touches nothing there, and a probe of known bytes lets the fetch be checked byte for byte. It is written when it is
 missing (the Compose federation's `reset --clean` empties the probe space) or not the probe's bytes, and kept
-otherwise, until a fetch of it fails: then it is retired and the next check uses another file (below).
+otherwise, until a fetch of it fails: then its file is retired for good and the next check uses another (below).
 
 **Each pair**:
 
@@ -38,14 +38,20 @@ otherwise, until a fetch of it fails: then it is retired and the next check uses
    same file in a later one**: a provider waits on its rtransfer synchronizer with no timeout (op-worker f118ed9,
    `gen_server2:call(..., infinity)`) and a later read of the same file range joins the same outstanding job until
    the synchronizer restarts it after 1,800 s, so a second read of that file would only wait on the same stuck job,
-   even once the link works again. A failed probe is therefore **retired** (`linkprobe.ProbeFiles.retire`): the next
-   generation of the probe is written through the source, a new name and a new file id, and the failed file and any
-   lower generation are deleted (a file with a stuck job may be deleted). The next check reads the new file, so a
-   recovered link passes at once. When neither the new file can be written nor the old one deleted, the failure says
-   so and the next check reads the old file once more, retiring it again if it fails. The retired files a later
-   check of the pair finds when it passes are deleted then, so the retired files that stay are those a deletion
-   failed on, and every later check retries them. The probe space is the check's alone, so no other reader has the
-   file open.
+   even once the link works again. A failed probe is therefore **retired** (`linkprobe.ProbeFiles.retire`), and **a
+   file id whose fetch ever failed is never read again**, whatever the file's name or generation and whether it still
+   exists. The retirement is recorded first, as a marker file in the probe space (`expcore-link-retired-`, digests of
+   the source's id and of the retired file's id) written through the local provider, which the next check lists the
+   same way: no probe file a marker names is chosen. Then the next generation of the probe is written through the
+   source, a new name and a new file id, and the failed file and the source's other probe files are deleted (a file
+   with a stuck job may be deleted). The next check reads the new file, so a recovered link passes at once. When no
+   probe file is left that a marker does not retire and a fresh one cannot be written, the pair fails closed, "no fresh
+   probe for <source> to <local>: creation failed", and no retired file is read in its place. The deletions are
+   best-effort: a retired file that stays is deleted by a later check of the pair that passes, and stays excluded
+   until then; a marker is deleted once the source no longer lists its file, so the record is bounded by the retired
+   files that remain. Only when the marker, the new file and the deletion all fail is the failed file not excluded:
+   the failure says so, and the next check reads it once more, retiring it again if it fails. The probe space is the
+   check's alone, so no other reader has the file open.
 3. *Evict afterwards*, only when every pair passed: each probe is evicted from the local provider once, the eviction
    waited for and the local block map read. On Onedata 25.0 an eviction scheduled right after a fetch completes having
    evicted nothing (the same eviction about 30 s later works), so one that did not take is recorded, never retried and
@@ -59,8 +65,8 @@ never a Compose `down`). Waiting also clears it, after the synchronizer's 1,800 
 
 **Fail closed.** A pair whose probe cannot be found, written, seen or made cold was not tested, and fails naming the
 pair and why; so does every pair when platform.toml declares none of `[link_check]`; so does a pair whose probe a
-provider outside `[link_check].providers` holds, or whose holding by any provider cannot be read. Unknown is never a
-pass.
+provider outside `[link_check].providers` holds, or whose holding by any provider cannot be read, and a pair whose probe
+files are all retired when a fresh one cannot be written. Unknown is never a pass.
 
 **The record** (`LinkReport.to_json()`): each pair by position (`providers[i]`, never a name, O12), whether it passed,
 the seconds and bytes of its fetch, whether its probe was written now, the evictions that made it cold and those that
@@ -100,6 +106,7 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.linkprobe import (
     PROBE_PREFIX,
+    NoFreshProbe,
     Probe,
     ProbeFiles,
     ProbeNotReady,
@@ -137,7 +144,7 @@ class PairResult:
     reason: str | None = None
     remedy: str | None = None  # set when the fetch failed: the link needs it before the pair can pass
     retired: bool | None = (
-        None  # when the fetch failed: whether its probe is retired, so the next check reads a new file
+        None  # when the fetch failed: whether its probe's file is retired, so no later check reads it again
     )
     purged: int = 0  # the retired probes of the source that a passing check deleted
     unpurged: int = 0  # those it could not delete, which the next passing check deletes
@@ -292,7 +299,7 @@ class _Check:
     def prepare(self, pair: Pair) -> _Ready:
         """Make the pair's probe ready: written, seen by the local provider, held by the source alone."""
         local, source = pair
-        probe = self._files.provision(source)
+        probe = self._files.provision(source, local)
         consistency.wait_visible(
             self._client,
             local,
@@ -377,14 +384,15 @@ class _Check:
             return PairResult(*names, False, seconds, reason=reason)
         return PairResult(*names, True, seconds, size)
 
-    def _settle(self, source: str, ready: _Ready, result: PairResult) -> PairResult:
+    def _settle(self, pair: Pair, ready: _Ready, result: PairResult) -> PairResult:
         """What follows a pair's fetch. A probe that passed is kept, and the retired probes of its source are deleted. A
-        probe whose fetch failed is retired, so the next check reads another file than the one a stuck fetch may
-        still be waiting on (`linkprobe.py`)."""
+        probe whose fetch failed is retired, recorded in the probe space, so no later check reads the file a stuck
+        fetch may still be waiting on (`linkprobe.py`)."""
+        local, source = pair
         if result.ok:
-            deleted, undeleted = self._files.delete(source, ready.probe.older)
-            return _with(result, purged=len(deleted), unpurged=undeleted)
-        retired = self._files.retire(source, ready.probe)
+            deleted, undeleted = self._files.purge(source, ready.probe)
+            return _with(result, purged=deleted, unpurged=undeleted)
+        retired = self._files.retire(source, local, ready.probe)
         note = ""
         if not retired.ok:
             cause = retired.why or "not deleted"
@@ -397,10 +405,12 @@ class _Check:
         ready: dict[Pair, _Ready] = {}
         results: dict[Pair, PairResult] = {}
         for pair in pairs:
+            local, source = (self._label(name) for name in pair)
             try:
                 ready[pair] = self.prepare(pair)
+            except NoFreshProbe as error:
+                results[pair] = PairResult(local, source, False, reason=str(error))
             except (PlatformError, consistency.WaitTimeout, ProbeNotReady) as error:
-                local, source = (self._label(name) for name in pair)
                 why = f"{source} -> {local} was not tested: its probe could not be made ready ({error})"
                 results[pair] = PairResult(local, source, False, reason=why)
         fetched = consistency.bounded_map(
@@ -408,7 +418,7 @@ class _Check:
         )
         for pair, result in zip(ready, fetched, strict=True):
             made = _with(result, provisioned=ready[pair].probe.written, cooled=ready[pair].cooled)
-            results[pair] = self._settle(pair[1], ready[pair], made)
+            results[pair] = self._settle(pair, ready[pair], made)
         if ready and all(result.ok for result in results.values()):
             results = self._evict_after(pairs, ready, results)
         return tuple(results[pair] for pair in pairs)

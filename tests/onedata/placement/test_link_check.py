@@ -10,7 +10,7 @@ from expcore_onedata.client import OnezoneClient, OutOfScope
 from expcore_onedata.config import load_platform
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.linkcheck import PROBE_PREFIX, check_links, probe_content, probe_name
-from expcore_onedata.linkprobe import generation_of
+from expcore_onedata.linkprobe import RETIRED_PREFIX, generation_of
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, SPACE_NAME, with_placement, write_platform
 from expcore_onedata.testing.world import PROBE_SPACE_ID, PROBE_SPACE_NAME, with_link_check
 from expcore_onedata.tokens import TokenIssuer
@@ -59,6 +59,12 @@ def probes_of(fake, provider_id):
     found = {generation_of(n.name, provider_id): n.file_id for n in fake.nodes.values() if n.parent == root}
     found.pop(None, None)
     return found
+
+
+def markers_of(fake):
+    """The names of the retirement markers in the probe space's tree: the durable record of the retired files."""
+    root = fake.space_roots[PROBE_SPACE_ID]
+    return sorted(n.name for n in fake.nodes.values() if n.parent == root and n.name.startswith(RETIRED_PREFIX))
 
 
 def probe_of(fake, provider_id):
@@ -466,8 +472,8 @@ def test_o35_a_probe_that_failed_is_replaced_whatever_the_failure_was(fake, conf
 
 
 def test_o35_a_retired_file_that_could_not_be_deleted_is_deleted_by_a_later_passing_check(fake, config, client, ticker):
-    """O35: the cleanup of retired files is bounded: a deletion that failed is counted, the fresh probe is used, and
-    the next check that passes deletes the retired file."""
+    """O35: the cleanup of retired files is bounded: a deletion that failed is counted, the fresh probe is used, the
+    next check that passes deletes the retired file, and the record of it is dropped once the file is gone."""
     fake.joins_stuck_jobs = True
     stuck_beta(fake, ticker)
     fake.fail_deletes = True
@@ -476,24 +482,137 @@ def test_o35_a_retired_file_that_could_not_be_deleted_is_deleted_by_a_later_pass
     assert failed.retired is True  # the successor was written, so the next check reads it
     assert failed.unpurged == 1
     assert set(probes_of(fake, BETA_ID)) == {0, 1}
+    assert len(markers_of(fake)) == 1  # the failed file is recorded as retired, though it is still there
     fake.fail_deletes = False
     del fake.links[(ALPHA_ID, BETA_ID)]
     second = run(config, client, ticker)
     assert second.ok, second.detail
     assert second.pairs[0].purged == 1
     assert set(probes_of(fake, BETA_ID)) == {1}
+    assert len(markers_of(fake)) == 1  # the file went after the check looked, so its record goes at the next one
     assert json.loads(json.dumps(second.to_json()))["pairs"][0]["purged"] == 1
+    assert run(config, client, ticker).ok
+    assert markers_of(fake) == []  # no file of it is left, so nothing of it is kept
 
 
-def test_o35_a_probe_that_could_not_be_retired_is_said_so_and_retired_by_the_next_failure(fake, config, client, ticker):
-    """O35: when neither the successor can be written nor the failed file deleted, the failure says the next check may
-    read it again, and the check after that retires it."""
+def test_o35_when_the_successor_and_the_deletion_both_fail_the_failed_file_is_still_never_read_again(
+    fake, config, client, ticker
+):
+    """O35: the retirement is recorded in the probe space through the local provider, apart from the source's writes:
+    a failed file whose successor could not be written and that could not be deleted is not read by the next check,
+    which fails closed naming the pair until a fresh probe can be written, and then reads the fresh file."""
     fake.joins_stuck_jobs = True
     fake.links[(ALPHA_ID, BETA_ID)] = "hang"
 
     def hang(seconds):
         ticker.sleep(seconds)
-        fake.resets.append(["/children", 1, BETA_ID])  # the successor's creation, after the fetch, is reset
+        fake.fail_creates.add(BETA_ID)  # the source writes nothing now: no successor
+        fake.fail_deletes = True
+
+    fake.hang_hook = hang
+    failed = run(config, client, ticker).pairs[0]
+    assert failed.retired is True  # recorded, though neither the successor nor the deletion took
+    assert failed.unpurged == 1
+    old = probe_of(fake, BETA_ID)  # still there
+    (marker,) = markers_of(fake)
+    assert old not in marker  # a digest of its id, never the id
+
+    fake.hang_hook = ticker.sleep
+    calls = len(fake.provider_calls)
+    second = run(config, client, ticker)
+    stuck, other = second.pairs
+    assert not second.ok
+    assert stuck.reason.startswith("no fresh probe for providers[1] to providers[0]: creation failed")
+    assert stuck.seconds is None  # nothing was fetched
+    assert other.ok
+    assert old not in alpha_reads(fake, calls)
+    assert not any(value in second.detail for value in (*CONFIGURED, old))
+
+    fake.fail_creates.clear()
+    fake.fail_deletes = False
+    del fake.links[(ALPHA_ID, BETA_ID)]  # the link works again; the job on the old file is still outstanding
+    calls = len(fake.provider_calls)
+    third = run(config, client, ticker)
+    assert third.ok, third.detail
+    fresh = probe_of(fake, BETA_ID)  # the retired file went with the passing check
+    assert fresh != old
+    assert fresh in alpha_reads(fake, calls)
+    assert old not in alpha_reads(fake, calls)
+    assert third.pairs[0].purged == 1
+
+
+def test_o35_retiring_a_later_probe_never_brings_back_an_older_failed_one(fake, config, client, ticker):
+    """O35: g0 fails and cannot be deleted, so g1 is the probe; g1 fails, g2 cannot be written, g1 is deleted and g0
+    cannot be again. The next check must not read g0: the failed file ids are never read again, whatever remains."""
+    fake.joins_stuck_jobs = True
+    fake.links[(ALPHA_ID, BETA_ID)] = "hang"
+
+    def first_hang(seconds):
+        ticker.sleep(seconds)
+        fake.fail_deletes = True
+
+    fake.hang_hook = first_hang
+    assert run(config, client, ticker).pairs[0].retired is True
+    both = probes_of(fake, BETA_ID)
+    assert set(both) == {0, 1}
+    g0 = both[0]
+    fake.fail_deletes = False
+
+    def second_hang(seconds):
+        ticker.sleep(seconds)
+        fake.fail_creates.add(BETA_ID)  # no g2
+        fake.statuses.append([f"/data/{g0}", 1, 500])  # g1 is deleted, g0 is not, again
+
+    fake.hang_hook = second_hang
+    second = run(config, client, ticker)
+    assert second.pairs[0].retired is True
+    assert probes_of(fake, BETA_ID) == {0: g0}
+
+    fake.fail_creates.clear()
+    fake.hang_hook = ticker.sleep
+    del fake.links[(ALPHA_ID, BETA_ID)]
+    calls = len(fake.provider_calls)
+    third = run(config, client, ticker)
+    assert third.ok, third.detail
+    assert g0 not in alpha_reads(fake, calls)
+    fresh = probe_of(fake, BETA_ID)
+    assert fresh != g0
+    assert third.pairs[0].purged == 1  # g0 went at last
+
+
+def test_o35_a_retired_file_that_still_exists_is_never_selected_as_the_probe(fake, config, client, ticker):
+    """O35: selection leaves out every retired file id, whatever its name or generation: with only the retired file
+    listed, a new probe is written under the next generation's name and read, and the retired file is deleted."""
+    fake.joins_stuck_jobs = True
+    stuck_beta(fake, ticker)
+    fake.fail_deletes = True
+    assert run(config, client, ticker).pairs[0].retired is True
+    old, successor = probes_of(fake, BETA_ID)[0], probes_of(fake, BETA_ID)[1]
+    del fake.nodes[successor]  # the successor is lost, so the retired file is the only one the source lists
+    fake.fail_deletes = False
+    del fake.links[(ALPHA_ID, BETA_ID)]
+    calls = len(fake.provider_calls)
+    second = run(config, client, ticker)
+    assert second.ok, second.detail
+    assert second.pairs[0].provisioned
+    assert old not in alpha_reads(fake, calls)
+    fresh = probe_of(fake, BETA_ID)
+    assert fresh not in (old, successor)
+    assert fake.nodes[fresh].name == probe_name(BETA_ID, 1)
+    assert old not in fake.nodes
+
+
+def test_o35_a_probe_that_could_not_be_retired_at_all_is_said_so_and_retired_by_the_next_failure(
+    fake, config, client, ticker
+):
+    """O35: when the record, the successor and the deletion all fail, nothing excludes the failed file: the failure
+    says the next check may read it again, and the check after that retires it."""
+    fake.joins_stuck_jobs = True
+    fake.links[(ALPHA_ID, BETA_ID)] = "hang"
+
+    def hang(seconds):
+        ticker.sleep(seconds)
+        fake.fail_creates.update({ALPHA_ID, BETA_ID})  # neither the record nor the successor can be written
         fake.fail_deletes = True
 
     fake.hang_hook = hang
@@ -503,10 +622,13 @@ def test_o35_a_probe_that_could_not_be_retired_is_said_so_and_retired_by_the_nex
     assert "could not be retired" in failed.reason
     assert "may read it again" in failed.reason
     assert set(probes_of(fake, BETA_ID)) == {0}
+    assert markers_of(fake) == []
+    fake.fail_creates.clear()
     fake.fail_deletes = False
     fake.hang_hook = ticker.sleep
     second = run(config, client, ticker)
-    assert second.pairs[0].retired is True  # the same file failed again, and now it is retired
+    assert second.pairs[0].retired is True  # the same file failed again, and now it is recorded
+    assert len(markers_of(fake)) == 1
     del fake.links[(ALPHA_ID, BETA_ID)]
     assert run(config, client, ticker).ok
 

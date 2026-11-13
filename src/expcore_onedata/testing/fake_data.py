@@ -406,6 +406,7 @@ class FakeData(FakeQos, FakeFederation):
       whose route contains the substring (to that provider, when named) fail with a connection reset;
     - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status;
     - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
+    - `fail_creates`: provider ids through which every creation of a file or directory answers 500;
     - `delete_delay_s` (also a constructor argument): seconds of `clock` a delete stays under way after it is answered
       (0: none); `land_deletes()` ends every one now (see "Pending deletes");
     - `lose_recreated` (also a constructor argument): True makes the landing of a directory's delete take the files of a
@@ -520,6 +521,7 @@ class FakeData(FakeQos, FakeFederation):
         self.page_size = 1000
         self.id_suffix = ""  # appended to every file id made from now on, for ids with characters like "="
         self.fail_deletes = False  # every DELETE answers 500
+        self.fail_creates: set[str] = set()  # provider ids through which every creation answers 500
         self.omit_blocks = False  # the block map's storage backends carry no "blocks" field
         self.omit_providers: set[str] = set()  # provider ids the block map leaves out (a partial answer)
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
@@ -1006,6 +1008,8 @@ class FakeData(FakeQos, FakeFederation):
             if part == "/children" and method == "GET":
                 return self._list(node, query, provider)
             if part == "/children" and method == "POST":
+                if provider in self.fail_creates:
+                    return self._error(500, "internalServerError")
                 return self._make(node, query, provider)
             if part == "/content" and method == "PUT":
                 return self._put_content(request, node, provider)
