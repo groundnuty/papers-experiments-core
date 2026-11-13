@@ -16,6 +16,7 @@ def fed():
         import feddocker
         import federation
         import fedfacts
+        import fedimport
         import fedlayout
         import fedpki
         import fedspec
@@ -32,6 +33,7 @@ def fed():
                 "docker": feddocker,
                 "boot": fedboot,
                 "facts": fedfacts,
+                "importing": fedimport,
             },
         )
 

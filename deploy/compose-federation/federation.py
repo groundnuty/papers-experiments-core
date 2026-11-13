@@ -6,13 +6,16 @@ declares it.
     uv run python deploy/compose-federation/federation.py [--layout PATH] down
     uv run python deploy/compose-federation/federation.py [--layout PATH] status | memory | describe | compose
 
-- up: from nothing, make the root, the CA, the certificates and the secrets, start the zone, bootstrap it, start the
-  providers, register and support, add the fixed users, write the baseline files (into every space but those the layout
-  declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform template). On a
-  federation that is already up it starts what is stopped and checks every step again, and leaves the files as they are.
+- up: from nothing, make the root, the CA, the certificates and the secrets (and a writable import's copy of its
+  dataset, fedimport.py), start the zone, bootstrap it, start the providers, register and support (an imported space on
+  its imported storage, and wait for its scan), add the fixed users, write the baseline files (into every space but
+  those the layout declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform
+  template). On a federation that is already up it starts what is stopped and checks every step again, and leaves the
+  files as they are.
 - reset --clean: start whatever is stopped, check every step again, and bring every space's content back to the
   baseline, removing whatever was ingested; a space declared `baseline = false` is left empty. The ids of the
-  providers, the spaces and the users stay, so platform.toml stays valid.
+  providers, the spaces and the users stay, so platform.toml stays valid. A layout with an imported space is refused:
+  down, then up, brings it back to clean.
 - reset --replicas: start whatever is stopped, check every step again, keep every owner's data, and evict only what
   the mirrors hold, verified on the block maps (fedreplicas.py). For between runs. A bare `reset` is refused, naming
   both, so nobody wipes ingested datasets by accident.
@@ -32,6 +35,7 @@ pulled, and nothing is pruned.
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -55,6 +59,7 @@ from feddocker import (
     require_ports_free,
 )
 from fedfacts import baseline_left_behind, describe, root_parent, write_facts
+from fedimport import copy_imports, pending_copies
 from fedlayout import NODE, ROOT_MARKER, Layout
 from fedpki import (
     ensure_secret,
@@ -142,6 +147,7 @@ def prepare(layout: Layout) -> None:
             f"the root holds files and is not marked as this federation's ({ROOT_MARKER} naming {spec.project}); "
             "refused"
         )
+    copies = pending_copies(layout, os.environ)  # every import's source is checked before the root is touched
     private_directory(layout.root)
     if not owned:
         layout.marker.write_text(spec.project + "\n", encoding="utf-8")
@@ -176,6 +182,7 @@ def prepare(layout: Layout) -> None:
             storage.mkdir()
             storage.chmod(0o777)
     work.rmdir()
+    copy_imports(layout, copies)
 
 
 # -- the commands ----------------------------------------------------------------------------------------------------
