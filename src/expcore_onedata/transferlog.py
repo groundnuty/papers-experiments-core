@@ -18,10 +18,11 @@ can bear on the run. The ended listing, newest first by finish time, is read dow
 it ended (a final state) before the cutoff, `ended_since`: the window's start less `[placement]
 clock_skew_allowance_s` and `transferorder.STOP_MARGIN_S`, on this host's clock and fixed for the whole reading, so
 every observation reads alike. Such a job can be neither in the window, nor carried over into it, nor near its edge;
-one that finished before the cutoff but whose record does not say it ended is read, and may be carried over. The
-order is checked as the listing is read, and a listing out of that order is unknown (`transferorder.py`). The window
-on the providers' clocks must not open before the cutoff: a provider's clock more than the margin behind this host's
-leaves the listing unknown, naming the clock.
+one that finished before the cutoff but whose record does not say it ended is read, and may be carried over; if its
+record says it ended by the next observation, the walk stops at it and it leaves the listing, which flags every bound
+(`transfer_left_listing`), so a record that catches up errs closed. The order is checked as the listing is read, and
+a listing out of that order is unknown (`transferorder.py`). The window on the providers' clocks must not open before
+the cutoff: a provider's clock more than the margin behind this host's leaves the listing unknown, naming the clock.
 
 **One provider's observation at a time.** A job's state and counters are always taken from one provider's listing and
 record together, never one provider's state with another's counters. A provider lists a job only after a lag (a
