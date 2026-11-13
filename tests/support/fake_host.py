@@ -12,6 +12,7 @@ commands the package uses; anything else fails loudly, so a new command shows up
 pass.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -36,6 +37,8 @@ REPEATED = {"--label", "-l", "-v", "--volume", "--mount", "-e", "--env", "--add-
 BOOT_ID = "0f0f0f0f-1111-2222-3333-444455556666"
 CERTIFI_BUNDLE = "/usr/lib/python3/site-packages/certifi/cacert.pem"  # where the fake agent image keeps certifi's
 PID_NS = "pid:[4026531836]"
+ONECLIENT_CONFIG_PATH = "/etc/invented/oneclient.conf"  # where the fake oneclient image keeps the file its help names
+ONECLIENT_CONFIG_SHA256 = hashlib.sha256(b"an invented oneclient configuration file\n").hexdigest()
 
 
 @dataclass
@@ -476,6 +479,7 @@ class FakeHost:
         return CmdResult(0, container.id + "\n")
 
     def _mount_oneclient(self, container: FakeContainer) -> None:
+        container.logs = f"expcore-oneclient-config sha256={ONECLIENT_CONFIG_SHA256} path={ONECLIENT_CONFIG_PATH}\n"
         for spec in container.options.get("--mount", []):
             fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
             if fields.get("dst") == "/mnt/oneclient":

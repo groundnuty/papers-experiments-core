@@ -94,7 +94,20 @@ ONE_ATTEMPT_SITES = {
     ("precampaign.py", "_child", "client.get"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "client.content_answer"): ["<one attempt>", "<one attempt>"],
-    ("fault_serves.py", "provider_serves.probe", "client.get"): ["ONE_ATTEMPT"],
+    ("fault_serves.py", "ServingProbe.__call__", "client.get"): ["ONE_ATTEMPT"],
+    # the link check (O35): its fetch is the measurement, and every read and write of setting its probe up is part of
+    # the health gate's check, one attempt like the content-type check's
+    ("linkcheck.py", "_Check._empty_on", "client.get"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._evict", "consistency.wait_transfers"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._holdings", "client.get"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._schedule_eviction", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check.prepare", "consistency.wait_visible"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._create", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._children", "client.get"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._root", "consistency.space_root"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._write", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles.delete", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles.digest", "client.read_content"): ["ONE_ATTEMPT"],
     # the placement probes: the transfer records they record, the transfer log, the block map
     ("probes.py", "PlatformProbes._transfer_records", "client.get"): ["ONE_ATTEMPT"],
     ("probes.py", "PlatformProbes._read_maps", "provisioner.blocks"): ["<default>"],
@@ -137,6 +150,8 @@ CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient.mutate", "self._target"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient.read_range", "self._target"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient.read_range", "self._request(GET)"): ["ONE_ATTEMPT"],  # it may have fetched bytes
+    # a revocation's confirmation: a failed read writes no revoked line, so the slot stays held (fail closed)
+    ("client.py", "OnezoneClient.own_temporary_generation", "self._send(GET)"): ["ONE_ATTEMPT"],
     ("client.py", "OnezoneClient.read_content", "self._target"): ["gate", "gate"],  # bounded by the deadline left
     ("client.py", "OnezoneClient._stream_range", "http.stream"): ["<streamed>"],
     ("client.py", "OnezoneClient.content_answer", "self._target"): ["_ONE_ATTEMPT"],  # the pre-campaign measurement
@@ -240,6 +255,8 @@ MEASURING_MODULES = {
     "probes.py",
     "transferlog.py",
     "precampaign.py",
+    "linkcheck.py",
+    "linkprobe.py",
     "fault_serves.py",
     "tokens.py",
     "tokenscope.py",
