@@ -578,6 +578,88 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
     assert all(isinstance(stage["seconds"], float) for stage in record["stages"].values())
 
 
+# -- the reset's QoS listing and the occupancy's lag (issue #209, O33) -----------------------------------------------
+# `[placement] qos_scan = "listing"` rests on two facts the source states and no live run has shown: the first two
+# tests check them, and "summaries" stays the default until both pass. The third measures how long the space root's
+# physical size lags a placement, which the reset's quiet wait assumes from the source. Each prints its figures for
+# the dated facts file and leaves nothing behind: its requirement is removed and the scratch files are torn down.
+
+QOS_SEEN_S = 120.0  # the longest a requirement added through one provider is waited for through another
+
+
+def scratch_requirement(provisioner, provider, file_id):
+    """Put an `anyStorage` requirement on an entry through one provider and return its id."""
+    body = {"fileId": file_id, "expression": "anyStorage", "replicasNum": 1}
+    return provisioner.client.mutate("POST", "/qos_requirements", provider=provider, json=body)["qosRequirementId"]
+
+
+@MUTATE
+def test_the_recursive_listing_takes_include_directories_and_marks_a_requirements_entry(scratch):
+    """O33: the space root's recursive listing with `include_directories`, which the REST description omits, holds
+    the root as "." and the scratch directory, and with a requirement on the directory, the directory says `direct`
+    and its two files `ancestor`; the pages read are printed."""
+    # covers: GET /data/{id}/files
+    from expcore_onedata import resetqos
+
+    provisioner, _, directory, _ = scratch
+    holder = provisioner.settings.holder
+    qid = scratch_requirement(provisioner, holder, provisioner.resolve(directory).file_id)
+    try:
+        entries, pages = resetqos.listed(provisioner, holder)
+        by_path = {entry.path: entry for entry in entries.values()}
+        assert "." in by_path
+        assert by_path[directory].directory
+        assert by_path[directory].inheritance in resetqos.DIRECT
+        assert [by_path[f"{directory}/part-{i}.bin"].inheritance for i in range(2)] == ["ancestor", "ancestor"]
+        print(f"recursive listing: {len(entries)} entries in {pages} page(s) of {resetqos.LISTING_PAGE}")
+    finally:
+        provisioner.client.mutate("DELETE", f"/qos_requirements/{qid}", provider=holder)
+
+
+@MUTATE
+def test_a_requirement_added_through_one_provider_is_found_by_the_listing_through_another(scratch):
+    """O33: a requirement put on a scratch file through the receiver is found by the listing scan on the data
+    provider once dbsync settles, within `QOS_SEEN_S`, and applies to that file; the seconds it took are printed."""
+    from expcore_onedata import resetqos
+
+    provisioner, receiver, _, ids = scratch
+    holder = provisioner.settings.holder
+    qid = scratch_requirement(provisioner, receiver, ids[0])
+    try:
+        began = time.monotonic()
+        found = resetqos.by_listing(provisioner, [holder])
+        while qid not in found.where:
+            assert time.monotonic() - began < QOS_SEEN_S, "the data provider's listing never showed the requirement"
+            time.sleep(2.0)
+            found = resetqos.by_listing(provisioner, [holder])
+        print(f"a requirement added through another provider was found after {time.monotonic() - began:.1f} s")
+        assert ids[0] in found.files[qid]
+    finally:
+        provisioner.client.mutate("DELETE", f"/qos_requirements/{qid}", provider=receiver)
+
+
+@MUTATE
+def test_the_space_roots_occupancy_follows_a_placement_within_the_sources_bound(scratch):
+    """O33: a scratch file one directory below the root is replicated to the receiver, and the space root's physical
+    size there is read every quarter second until it has grown by the file's bytes. The seconds are printed, and must
+    be within the source's bound for that depth (`resetqos.occupancy_lag_s(2)`, the quiet wait less its margin), plus a
+    second for the reads themselves."""
+    from expcore_onedata import resetqos
+    from expcore_onedata.occupancy import physical_sizes
+
+    provisioner, receiver, directory, _ = scratch
+    providers = list(provisioner.space.support.providers)
+    before = physical_sizes(provisioner, providers)[receiver]
+    provisioner.replicate(f"{directory}/part-0.bin", receiver)
+    placed, size = time.monotonic(), 1024  # the scratch files are 1024 bytes each
+    while physical_sizes(provisioner, providers)[receiver] < before + size:
+        assert time.monotonic() - placed < resetqos.quiet_wait_s(2), "the root's physical size never showed the file"
+        time.sleep(0.25)
+    lag = time.monotonic() - placed
+    print(f"the space root's physical size showed the placement after {lag:.2f} s")
+    assert lag <= resetqos.occupancy_lag_s(2) + 1.0
+
+
 # -- large files (issue #127) -----------------------------------------------------------------------------------------
 
 LARGE_FILE_BYTES = 40 << 20  # tens of MB: ten chunks of the size below, quick to move

@@ -53,6 +53,7 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
         ("GET", "/data/{id}/qos/summary"),
         ("GET", "/qos_requirements/{qid}"),
         ("DELETE", "/qos_requirements/{qid}"),
+        ("GET", "/data/{id}/files"),  # the QoS scan's recursive listing, from the source only (O33)
         ("GET", "/users/{id}/effective_privileges"),
         ("GET", "/user/effective_clusters"),
         ("GET", "/provider/public/get_current_time"),
