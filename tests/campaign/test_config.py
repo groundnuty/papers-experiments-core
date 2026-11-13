@@ -121,6 +121,8 @@ def test_o06_a_ceiling_is_part_of_the_caps_so_another_one_is_another_experiment(
         ("ceiling_s = inf", ("[agent]", "ceiling_s must be finite and not below time_cap_s")),
         ("ceiling_factor = 0.5", ("[agent]", "ceiling_factor must be a finite number, at least 1")),
         ("ceiling_factor = nan", ("[agent]", "ceiling_factor must be a finite number, at least 1")),
+        # a finite factor whose product with the cap is not finite (Codex, 13 Nov)
+        ("ceiling_factor = 1e308", ("[agent]", "the ceiling the factor gives must be finite")),
         ('ceiling_s = "long"', ("[agent]", "ceiling_s", "must be a float")),
         ("ceiling_factor = true", ("[agent]", "ceiling_factor", "must be a float")),
     ],

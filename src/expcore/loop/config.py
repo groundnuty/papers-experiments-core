@@ -107,6 +107,10 @@ class AgentConfig:
             factor = CEILING_FACTOR if factor is None else factor
             object.__setattr__(self, "ceiling_factor", factor)
             object.__setattr__(self, "ceiling_s", cap * factor)
+            if not math.isfinite(self.ceiling_s):  # a finite factor can still overflow with the cap
+                problems.append(
+                    "the ceiling the factor gives must be finite (time_cap_s times ceiling_factor overflows)"
+                )
         elif not (math.isfinite(self.ceiling_s) and cap <= self.ceiling_s):
             problems.append("ceiling_s must be finite and not below time_cap_s")
         elif factor is not None and not math.isclose(self.ceiling_s, cap * factor):
