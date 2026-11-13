@@ -14,7 +14,7 @@ Source keys (full refs in [`inventory.md`](inventory.md#sources)):
 | ICSOC | icsoc-2026-code-agent @ `c1e76c2`; `ICSOC-pkg` is its replication package @ `06223f1` |
 | WWW | www-2027-experiments, branch `feat/sib-u-compose` @ `46a5828d` |
 | ICSA | icsa-2027-experiments, branch `feat/37-artifact-clear` @ `6fc798cf`; `ICSA-snap` is `feat/34-final-snapshot-code` @ `debba6d6` |
-| OMCP | onedata-mcp @ `0cc17ce` |
+| OMCP | onedata-mcp @ `8c9b10c34efdad29498362fc4be4e785ff2a102b` |
 
 Line numbers come from `git archive` snapshots of these refs. A few WWW scoring and statistics lines were located by a sweep and may be off by a few lines; every other location was read directly.
 
