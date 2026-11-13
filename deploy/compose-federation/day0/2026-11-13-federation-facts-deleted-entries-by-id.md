@@ -5,8 +5,7 @@ is asked for. A read with no `attribute` parameter, or with `name` or `type` amo
 A read for `parent_id` or `file_id` alone, or both and nothing else, keeps answering 200 from the entry's last state for
 **14 days by default** (`document_expiry`, from the source, not measured), on every provider that holds the tombstone. So
 does a read of `size` alone for a deleted **directory**, the case the source trace covered and the live 120 s
-observation was of. For a deleted regular file the `size` branch was **not traced**; **[inference]**: it may answer from
-the file location while that exists. An entry is gone only when a read that includes a strict attribute answers
+observation was of. For a deleted regular file the `size` branch was **not traced** in the source, but it was reported live by another study's Day-0 probe on 13 Nov: a deleted file's `size` alone kept answering for its whole 300 s at all three providers. An entry is gone only when a read that includes a strict attribute answers
 `enoent`; never decide that from `parent_id`, `file_id` or `size` alone. The id attribute is named `file_id` on 25.0:
 `?attribute=guid` answers 400 `badValueNotAllowed` for every entry, deleted or not, before any lookup.
 
@@ -33,7 +32,7 @@ repository's own tree.
 | `name`, `type`, or either among others (`mode`, `shares`, `owner_id`, ...) | 400 `posix` `enoent` | read through the strict getter |
 | `parent_id`, `file_id`, or both | 200 from the last state | read through the lenient getter, or no getter (`file_id`) |
 | `size` of a deleted directory, alone or with `parent_id` and `file_id` | 200 from the last state | read through the lenient getter (`resolve_location_attrs_for_dir`) |
-| `size` of a deleted regular file, alone or with `parent_id` and `file_id` | **not traced. [inference]: may answer from the file location while it exists** | the branch (`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file location) was not read |
+| `size` of a deleted regular file, alone or with `parent_id` and `file_id` | **answers** (reported by another study's Day-0 probe on 13 Nov: a deleted file's `size` alone kept answering for its whole 300 s at all three providers); the source branch was not traced | the branch (`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file location) was not read |
 | `guid`, alone or among any others | 400 `badValueNotAllowed`, for a live entry too | not a name the parameter takes: refused before any lookup |
 
 Deprecated names map `parent_id` to `parent_guid` and `file_id` to the id (ctool `src/onedata_file.erl:253-270`, which
@@ -69,7 +68,7 @@ returned.
   - `size` of a directory goes through `resolve_location_attrs` (`file_attr.erl:234-242`) and
     `dir_size_stats:get_stats`; every result is mapped without a throw (`file_attr.erl:505-514`), lenient.
     `size` of a regular file takes another branch (`file_attr.erl:458-459`, `file_ctx:get_file_size` through the file
-    location), which was **not traced**; **[inference]**: it may answer from the file location while it exists.
+    location), which was **not traced**; reported live by another study's Day-0 probe on 13 Nov: a deleted file's `size` alone kept answering for its whole 300 s at all three providers.
   - `name` goes through `resolve_name_attrs` (`file_attr.erl:203-213,561-578`) to `get_file_doc`
     (`file_attr.erl:620-628`; `allow_deleted_files` defaults to false), strict.
   - `type`, `mode`, `shares`, `owner_id`, `provider_id` and the rest of the `file_meta` attributes go through
@@ -124,13 +123,13 @@ returned.
   `posix` `enoent`. A caller that waits for it bounds the wait by the size of the tree and expects a failed traverse
   to retry after 16 s or more.
 - **Not a test of absence:** `parent_id` or `file_id` alone, a directory's `size` alone, however many of them. They
-  answer for 14 days by default after the delete (`document_expiry`, not measured). A file's `size` alone was not traced
-  and may answer while the file location exists **[inference]**; do not test absence with it either.
+  answer for 14 days by default after the delete (`document_expiry`, not measured). A file's `size` alone answered for
+  300 s in another study's live probe (13 Nov); do not test absence with it either.
 - **Deletion accepted, not finished:** the name is out of the old parent's listing and `parent_id` is the space's trash
   directory, which is the same for every directory of the space **[inference]**. An empty trash listing shows only that
   the link is gone, not the document.
 - **A visibility wait** that checks a file by `parent_id` alone reports a file deleted meanwhile as visible, and by
-  `size` alone it may (a file's `size` read was not traced). Read `name` with them.
+  `size` alone it did too in another study's live probe (13 Nov). Read `name` with them.
 - `is_deleted` exists in the attribute record but is not exposed to the API (ctool `include/onedata_file.hrl:123-128`),
   so a client cannot ask for it.
 
