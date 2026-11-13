@@ -9,6 +9,7 @@ The campaigns are built once per module (the module-scoped fixtures) and each te
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -544,6 +545,17 @@ def test_the_report_is_identical_across_two_runs_with_the_same_seeds_and_across_
     assert clean_pair.first.codes == clean_pair.second.codes == {"run": 0, "check": 0, "analyze": 0, "report": 0}
     assert clean_pair.first.report == clean_pair.second.report
     assert "tiny-study" in clean_pair.first.report
+
+
+def test_c29_the_report_of_an_unsharded_campaign_is_the_bytes_it_was_before_shards_existed(clean_pair):
+    """C29: a campaign run without `--shard` has no shard section and its report is the one the core made before shards:
+    `tests/data/tiny_study_report.md` was made by the code of that time. Only the two lines that name the code and the
+    core version are masked, so a release or a change of the example's code does not break the pin; any other change
+    of the unsharded report's text is a deliberate one, and regenerates the file."""
+    golden = (ROOT / "tests" / "data" / "tiny_study_report.md").read_text(encoding="utf-8")
+    report = re.sub(r"^- (Code|Core version): .*$", r"- \1: (not pinned)", clean_pair.first.report, flags=re.M)
+    assert report == golden
+    assert "Shards" not in clean_pair.first.report
 
 
 def test_every_output_regenerates_from_the_records_byte_for_byte_and_regenerating_writes_nothing(clean_pair, tmp_path):

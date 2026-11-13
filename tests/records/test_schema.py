@@ -114,18 +114,22 @@ def test_R02_version_three_adds_the_extra_usage_fields_to_the_usage_section_and_
 def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_version_has_any_optional_field():
     """R02: until v0.1.0 an extension of version 3 is additive, so a field it adds is optional: a record of version 3
     written before the field existed lacks it, and is valid. Version 3 adds the extra usage fields, the target of a
-    fault, the outcome's and the declared ones, and the refusal of an instrument's post-run check."""
+    fault, the outcome's and the declared ones, the refusal of an instrument's post-run check, and the two totals that
+    say whether the attempt was held to the reservation R."""
     from expcore.records import schema as rules
 
     assert SCHEMAS[-1].optional == {
         "usage": ("extra", "extra_cut"),
         "record": ("treatment_targets", "instrument_refusal"),
         "outcome": ("infra_target",),
+        "totals": ("reserved_capped", "reply_cap_unheld"),
     }
     assert SCHEMAS[-1].optional == SCHEMAS[-1].added
     assert rules.optional_in("usage", "expcore-record/3") == {"extra", "extra_cut"}
     assert rules.optional_in("record", "expcore-record/3") == {"treatment_targets", "instrument_refusal"}
     assert rules.optional_in("outcome", "expcore-record/3") == {"infra_target"}
+    assert rules.optional_in("totals", "expcore-record/3") == {"reserved_capped", "reply_cap_unheld"}
+    assert rules.optional_in("totals", "expcore-record/2") == frozenset()
     assert rules.optional_in("record", "expcore-record/2") == rules.optional_in("outcome", "expcore-record/2") == set()
     assert rules.optional_in("usage", "expcore-record/2") == frozenset()
     assert rules.optional_in("turn", "expcore-record/3") == frozenset()

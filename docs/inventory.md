@@ -52,12 +52,12 @@ Evidence was read from `git archive` snapshots of these commits; the source repo
 | WWW | WWW 2027 | www-2027-experiments | `feat/sib-u-compose` @ `46a5828d` | 18–26 Oct |
 | ICSA | ICSA 2027 | icsa-2027-experiments | `feat/37-artifact-clear` @ `6fc798cf` | 30 Oct–6 Nov |
 | ICSA-snap | ICSA 2027 | icsa-2027-experiments | `feat/34-final-snapshot-code` @ `debba6d6` | 6 Nov |
-| OMCP | — | onedata-mcp | `0cc17ce` | 6 Jul |
+| OMCP | — | onedata-mcp | `8c9b10c34efdad29498362fc4be4e785ff2a102b` | 12 Nov |
 
 Why these refs:
 - **WWW:** `main` holds 13 files; the harness is on unmerged branches. `feat/sib-u-compose` holds the newest `replay_check.py` (three review fixes on 24 Oct: 48b81fc5, 9beb5831, 71f8f2e2). `feat/sib-u-union-push6`, dated later, is not a descendant and has the 21 Oct version, 95 lines shorter.
 - **ICSA:** the checkout's HEAD (`docs/34-alarm-runbook`, 2 Nov) is stale. `6fc798cf` is the newest ref and the source commit named in the replication package's `BUILD-REPORT.md`. For every generic component it matches the two other final refs, `debba6d6` (the code that cut the final snapshot) and `main` @ `f1c9dd94`; they differ in `inspection/` and `faults/`, and `debba6d6` lacks the 30-line `boverride` wiring in `campaign/cli.py`. `snapshot/` is cited from `debba6d6`.
-- **OMCP:** `0cc17ce` contains the newest `onedata_mcp/token_policy.py` (4e815e2) and is the commit ICSA pinned (`protocol/knowledge/pin.json`).
+- **OMCP:** `8c9b10c34efdad29498362fc4be4e785ff2a102b` is `0cc17ce` (6 Jul), which contains the newest `onedata_mcp/token_policy.py` (4e815e2) and is the commit ICSA pinned (`protocol/knowledge/pin.json`), plus one commit that resolves a space name from the Oneprovider's `GET /spaces` instead of Onezone's admin listing, which answers 403 for names (#191), and restores `providerName` in file distributions. The 7-tool writing manifest is byte-identical at both commits (SHA-256 `ec5565bc0d6e1368d961b08838a87ea25a803f92583f5aa0c0f84d0c6344fe07`). The `onedata-mcp @ 0cc17ce` lines in module headers stay: they name the commit the code was read from, and the line numbers they cite in `api/spaces.py` moved at the new one.
 
 ### ICSA replication package versus the code that ran
 

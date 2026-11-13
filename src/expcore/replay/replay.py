@@ -173,6 +173,8 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
             core_version=rec.core_version,
             instruments=rec.instruments,
             instrument_refusal=rec.instrument_refusal,  # carried over like the instruments; absent when absent
+            reserved_capped=rec.totals.get("reserved_capped"),  # the campaign's, not the loop's: served as recorded
+            reply_cap_unheld=rec.totals.get("reply_cap_unheld"),
             treatment_kinds=rec.treatment_kinds,
             treatment_targets=rec.treatment_targets,
             schema_version=rec.schema_version,  # the rule of the record's own version decides its treatment flag

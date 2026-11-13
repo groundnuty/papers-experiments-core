@@ -112,6 +112,8 @@ class Parts:
     ledger: Ledger | None = None  # with a budget: the top-ups of the sends a run's token cap cannot account for (C26)
     # with a budget: whether the assessment that admitted the run reserved it by the reply maximum (C27); None: unknown
     reserved_capped: Callable[[str], bool | None] = lambda run_key: None
+    # with a budget: whether the store has taken the model off the reply maximum now (C27); None: no budget, no maximum
+    reply_cap_unheld: Callable[[str], bool | None] = lambda model: None
 
 
 class AttemptRunner:
@@ -315,6 +317,8 @@ class AttemptRunner:
             treatment_targets=targets,
             models=p.models,
             defect_log=defects,
+            reserved_capped=decided,  # the row's value, so the record and the store say one thing (C27)
+            reply_cap_unheld=lambda: p.reply_cap_unheld(model),
         )
 
         async def go() -> Any:
