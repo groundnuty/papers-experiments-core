@@ -7,8 +7,9 @@
 # `alpha-import` is held by its owner on an imported POSIX storage that is read-only: the platform finds the files by one
 # scan of the directory the variable names and never writes there. `alpha-upload` is an ordinary space, empty after up,
 # for a study to upload the same dataset into. A space with an import declares no baseline, and `reset --clean` is
-# refused for this layout: run down, then up (README.md, "An imported space"). Every command of this layout, down
-# included, needs the variable set, since the generated Compose file binds the directory it names.
+# refused for this layout: run down, then up (README.md, "An imported space"). Every command that runs Docker Compose
+# for this layout (up, reset --replicas, down) needs the variable set, since the generated file binds the directory it
+# names.
 #
 # Every name is invented. Its project, domain and ports differ from the other layouts', so none shares a container, a
 # network or a port with them. A root holds one federation at a time: run it after the others are down, or in a root of
