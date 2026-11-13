@@ -1010,8 +1010,12 @@ class FakeData(FakeFederation):
         )
 
     def _list_recursive(self, top: Node, query: httpx.QueryParams, provider: str) -> httpx.Response:
-        """A page of the recursive listing under an entry, in path order: its regular files, and with
-        `include_directories` its directories and the entry itself as "."; each with the attributes asked for."""
+        """A page of the recursive listing under an entry, as the 25.0 build answers it (`resetqos.py` cites the
+        source): in path order, its regular files, and with `include_directories` its directories and the entry itself
+        as "."; each with the `attributes` asked for (`fileId` and `path` by default); `nextPageToken` null on the last
+        page, no `isLast`, and `inaccessiblePaths` empty. A null `token` is refused, as the build reads it as "null"."""
+        if query.get("token") == "null":
+            return self._error(400, "badValueNotAllowed")
         directories = query.get("include_directories") == "true"
         entries: list[tuple[str, Node]] = [(".", top)] if directories else []
         pending = [(top, "")]
@@ -1028,17 +1032,14 @@ class FakeData(FakeFederation):
         entries.sort(key=lambda item: item[0])
         start, limit = int(query.get("token") or "0"), int(query.get("limit", "1000"))
         page = entries[start : start + limit]
-        asked = query.get_list("attribute") or ["fileId", "path"]
+        asked = query.get_list("attributes") or ["fileId", "path"]
         files = []
         for path, node in page:
             known = {"fileId": node.file_id, "path": path, "type": node.kind, "name": node.name}
             known["effQosInheritancePath"] = self._inheritance(node.file_id, provider)
             files.append({k: known[k] for k in asked if k in known})
-        truncated = start + limit < len(entries)
-        return httpx.Response(
-            200,
-            json={"files": files, "isTruncated": truncated, "nextPageToken": str(start + limit) if truncated else None},
-        )
+        token = str(start + limit) if start + limit < len(entries) else None
+        return httpx.Response(200, json={"files": files, "inaccessiblePaths": [], "nextPageToken": token})
 
     def _space_root(self, space: str) -> httpx.Response:
         if space != self.SPACE_ID:

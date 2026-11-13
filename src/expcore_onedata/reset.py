@@ -31,8 +31,9 @@ read and every check is made on each provider that supports the space, since eac
    distribution gives each provider's physical size, the bytes its storage holds of the space; never the logical
    figures, which lag. A provider other than the data provider that holds more than the caller allows (nothing by
    default) fails the reset, so a reset without an eviction plan still shows that only the owner holds data.
-   **quiet**: when a requirement was removed, its files' block maps are read, again after `resetqos.QUIET_WAIT_S`, and
-   the occupancy with them: a provider holding more of one of those files, or a provider other than the data provider
+   **quiet**: when a requirement was removed, its files' block maps are read, again after `resetqos.quiet_wait_s`
+   (twice the occupancy's longest lag for the deepest of them, from the source), and the occupancy with them: a
+   provider holding more of one of those files, or a provider other than the data provider
    holding more of the space than at the occupancy stage, fails the reset (a replication that landed after the
    eviction). The block maps decide; the occupancy, which grows late, is a second sign and never alone the proof.
 5. **history**: ended transfers cannot be removed. The 25.0 REST description offers, for a transfer, only `GET` and
@@ -149,7 +150,7 @@ class SpaceReset:
         if isinstance(qos_baseline, str) or not all(isinstance(q, str) for q in qos_baseline):
             raise ValueError("the QoS baseline is a collection of requirement ids")
         history_since = float(self._now() if since is None else since)
-        run: dict[str, Any] = {"affected": frozenset(), "occupancy": {}}  # what one stage hands a later one
+        run: dict[str, Any] = {"affected": {}, "occupancy": {}}  # what one stage hands a later one
         plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (evict or {}).items()}
         bounds = dict(allowed or {})
         for provider in [*plan, *bounds]:

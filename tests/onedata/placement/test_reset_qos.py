@@ -25,6 +25,7 @@ from expcore_onedata.testing import (
 from expcore_onedata.testing.fake_data import ROOT_ID
 
 FILES = [f"study/part-{i:02d}.bin" for i in range(6)]
+WAIT_S = resetqos.quiet_wait_s(2)  # the quiet wait for files one directory below the root: twice 10 s + 5 s
 
 
 @pytest.fixture
@@ -128,11 +129,11 @@ def test_o33_a_listing_page_without_its_end_marker_fails_the_qos_stage(
     def unmarked(*args):
         answer = original(*args)
         body = answer.json()
-        del body["isTruncated"]
+        del body["nextPageToken"]
         return type(answer)(200, json=body)
 
     fake._list_recursive = unmarked
-    with pytest.raises(ResetFailed, match=r"qos stage.*isTruncated"):
+    with pytest.raises(ResetFailed, match=r"qos stage.*nextPageToken"):
         SpaceReset(listing).run({"beta": ["study"]})
     assert len(fake.qos) == 1
 
@@ -147,7 +148,7 @@ def test_o33_a_quiet_reset_records_both_stages_and_their_seconds(scanned, fake, 
     settled, quiet = record["stages"]["qos_settle"], record["stages"]["quiet"]
     assert settled["files"] == quiet["files"] == len(FILES)
     assert resetqos.SETTLE_STABLE_S <= settled["seconds"] < resetqos.SETTLE_BOUND_S
-    assert quiet["seconds"] >= resetqos.QUIET_WAIT_S == quiet["waited_s"]
+    assert quiet["seconds"] >= WAIT_S == quiet["waited_s"]
     assert quiet["physical_bytes"]["providers[1]"] == 0
 
 
@@ -158,7 +159,7 @@ def test_o33_with_no_requirement_removed_the_settle_and_the_quiet_wait_are_skipp
     record = reset.run({"beta": ["study"]}, qos_baseline=reset.qos_requirements())
     assert record["stages"]["qos_settle"]["polls"] == 0
     assert record["stages"]["quiet"]["waited_s"] == 0.0
-    assert resetqos.QUIET_WAIT_S not in ticker.slept
+    assert WAIT_S not in ticker.slept
 
 
 def test_o33_a_replication_landing_after_the_eviction_fails_the_reset_at_its_quiet_stage(
@@ -171,7 +172,7 @@ def test_o33_a_replication_landing_after_the_eviction_fails_the_reset_at_its_qui
 
     def sleep(seconds):
         ticker.sleep(seconds)
-        if seconds == resetqos.QUIET_WAIT_S:  # the replication lands while the reset waits
+        if seconds == WAIT_S:  # the replication lands while the reset waits
             fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
 
     provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
@@ -179,7 +180,7 @@ def test_o33_a_replication_landing_after_the_eviction_fails_the_reset_at_its_qui
     with pytest.raises(ResetFailed, match=r"quiet stage.*grew after the eviction") as caught:
         SpaceReset(provisioner).run({"beta": ["study"]})
     assert list(caught.value.record["stages"]) == list(STAGES[:-1])
-    assert caught.value.record["stages"]["quiet"]["seconds"] >= resetqos.QUIET_WAIT_S
+    assert caught.value.record["stages"]["quiet"]["seconds"] >= WAIT_S
 
 
 def test_o33_block_maps_that_change_once_settle_and_ones_that_keep_changing_fail_within_the_bound(
@@ -236,11 +237,62 @@ def test_o33_the_fakes_recursive_listing_marks_requirements_on_an_entry_and_its_
     answer = client.get(
         f"/data/{ROOT_ID}/files",
         provider="alpha",
-        params={"attribute": ["path", "effQosInheritancePath"], "include_directories": "true", "limit": 1000},
+        params={"attributes": ["path", "effQosInheritancePath"], "include_directories": "true", "limit": 1000},
     )
     paths = {e["path"]: e["effQosInheritancePath"] for e in answer["files"]}
     assert paths["."] == "none"
     assert paths["study"] == "direct"
     assert paths[FILES[0]] == "directAndAncestor"
     assert paths[FILES[1]] == "ancestor"
-    assert answer["isTruncated"] is False
+    assert (answer["nextPageToken"], answer["inaccessiblePaths"]) == (None, [])
+
+
+def test_o33_a_listing_that_could_not_enter_a_path_fails_the_qos_stage(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O33: an answer with `inaccessiblePaths` is a listing that skipped part of the tree, where a requirement could
+    lie: the scan is incomplete, so the reset fails and removes nothing."""
+    fake.add_qos(FILES[1])
+    listing = provisioner_with(client, config, platform_file, ticker, tmp_path, scan="listing")
+    original = fake._list_recursive
+
+    def partial(*args):
+        body = original(*args).json()
+        return type(original(*args))(200, json={**body, "inaccessiblePaths": ["study/locked"]})
+
+    fake._list_recursive = partial
+    with pytest.raises(ResetFailed, match=r"qos stage.*inaccessiblePaths"):
+        SpaceReset(listing).run({"beta": ["study"]})
+    assert len(fake.qos) == 1
+
+
+def test_o33_the_listing_sends_no_token_on_its_first_page_and_follows_the_ones_it_gets(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O33: the build reads a null token as the text "null", so the first page has none; with a page of two entries
+    the scan follows each token to the null that ends the listing."""
+    fake.add_qos(FILES[0])
+    listing = provisioner_with(client, config, platform_file, ticker, tmp_path, scan="listing")
+    resetqos.LISTING_PAGE, page = 2, resetqos.LISTING_PAGE
+    try:
+        found = resetqos.by_listing(listing, "alpha")
+    finally:
+        resetqos.LISTING_PAGE = page
+    assert set(found.where) == set(fake.qos)
+    assert found.reads["listing_pages"] == math.ceil((1 + 1 + len(FILES)) / 2)
+
+
+@pytest.mark.parametrize(("depth", "lag"), [(1, 10.0), (2, 15.0), (3, 20.0)])
+def test_o33_the_quiet_wait_is_twice_the_occupancys_longest_lag_for_the_deepest_file(depth, lag):
+    """O33: from the source, a placement reaches the space root's physical size after the file location's flush
+    (10 s) and 5 s more for each directory level above the file's parent; the quiet wait doubles that."""
+    assert resetqos.occupancy_lag_s(depth) == lag
+    assert resetqos.quiet_wait_s(depth) == 2 * lag
+
+
+def test_o33_a_deeper_affected_file_makes_the_quiet_wait_longer(scanned, fake, ticker):
+    """O33: a requirement on a file three directories down waits for that depth's lag, not the shallow one's."""
+    fake.add_file("deep/er/still/data.bin", DATA)
+    fake.add_qos("deep")
+    record = SpaceReset(scanned).run({"beta": ["study"]})
+    assert record["stages"]["quiet"]["waited_s"] == resetqos.quiet_wait_s(4)

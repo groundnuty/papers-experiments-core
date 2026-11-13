@@ -47,7 +47,7 @@ PLUMBING = {
     # block maps, whose failure fails the stage (a read that fails is no poll that did not match)
     ("resetqos.py", "_summary", "client.get"): ["p.retry"],
     ("resetqos.py", "by_summaries", "consistency.space_root"): ["p.retry"],
-    ("resetqos.py", "by_listing", "consistency.space_root"): ["p.retry"],
+    ("resetqos.py", "listed", "consistency.space_root"): ["p.retry"],
     ("resetqos.py", "_listing_page", "client.get"): ["p.retry"],
     ("resetqos.py", "_requirement_entry", "client.get"): ["p.retry"],
     ("resetqos.py", "read_maps", "provisioner.blocks"): ["p.retry"],
@@ -211,7 +211,7 @@ HELPER_USERS = {
         "layer.evict_ids",
         "layer.evict_tree",
     },
-    "resetqos.py": {"provisioner.walk", "provisioner.mutate"},
+    "resetqos.py": {"provisioner.children", "provisioner.mutate"},
 }
 
 # Calls that have a provisioner helper's name and are the method of another object (module, function, receiver).
