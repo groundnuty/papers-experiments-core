@@ -1,12 +1,20 @@
-"""The walk of the ended-transfer listing, newest first down to a cutoff, its order checked as it goes, and where a
-window opens on the providers' clocks (O32).
+"""The walk of the ended-transfer listing, newest first down to a cutoff, its order checked as it goes, and the band
+at a window's start on the clocks that stamp finish times (O32).
 
 Each test of the walk hands `newest_first` a listing of its own: pages of ids with the next token, and each id's finish
 time as its record. The walk reads pages through `page` and records through `read`, so a test sees each read made."""
 
 import pytest
 
-from expcore_onedata.transferorder import STOP_MARGIN_S, OrderBroken, newest_first, window_opens
+from expcore_onedata.transferorder import (
+    EARLIER,
+    INSIDE,
+    STOP_MARGIN_S,
+    UNCERTAIN,
+    OrderBroken,
+    newest_first,
+    start_band,
+)
 from expcore_onedata.transferrecord import Unreadable
 
 CUTOFF = 985.0  # a window that opens at 1000, less an allowance of 5 s and the margin of 10 s
@@ -101,30 +109,50 @@ def test_o32_a_listing_that_ends_inside_the_window_says_no_older_job_exists():
     assert (list(found.kept), found.earlier, found.pages) == (["run", "also"], False, 2)
 
 
-# -- where the window opens on the providers' clocks -----------------------------------------------------------------
+# -- the band at the window's start ----------------------------------------------------------------------------------
 
 
-def test_o32_the_window_opens_where_the_least_offset_puts_it_in_whole_seconds():
-    """O32: a record's times are on the clock of the provider that wrote them, so the window opens at its start moved
-    by the least offset any listing answer gave, rounded down to the listing's whole seconds."""
-    opens, clock = window_opens(1000.0, {"providers[0]": [0.2, -0.4], "providers[1]": [-3.5]}, 5.0)
-    assert opens == 996
-    assert clock == {"least_offset_s": -3.5, "greatest_offset_s": 0.2, "window_opens": 996}
+def test_o32_the_band_runs_from_the_least_offset_less_the_allowance_to_the_greatest_plus_it():
+    """O32: a finish time is on the platform's global clock, not the system clock a Date header gives, so the band at
+    the window's start spans every place the start may have: the least offset less the allowance, rounded down, to the
+    greatest plus it, rounded up, in the listing's whole seconds."""
+    band, clock = start_band(1000.0, {"providers[0]": [0.2, -0.4], "providers[1]": [-3.5]}, 5.0)
+    assert (band.first, band.last) == (991, 1006)
+    assert clock == {"least_offset_s": -3.5, "greatest_offset_s": 0.2, "allowance_s": 5.0, "band": [991, 1006]}
+
+
+def test_o32_a_job_one_provider_stamped_before_the_window_is_uncertain_never_inside():
+    """O32: the delta review's case: offsets A 0 and B -8 and a job finishing at 995, which A's clock puts before a
+    window that starts at 1000. The least offset alone would open the window at 992 and count it; the record cannot
+    say whose clock stamped it, so it lies in the band and is uncertain, never inside."""
+    band, _ = start_band(1000.0, {"providers[0]": [0.0], "providers[1]": [-8.0]}, 5.0)
+    assert band.place(995.0) == UNCERTAIN
+
+
+@pytest.mark.parametrize(
+    ("moment", "place"), [(986.0, EARLIER), (987.0, UNCERTAIN), (1005.0, UNCERTAIN), (1006.0, INSIDE)]
+)
+def test_o32_the_bands_edges_are_uncertain_and_a_second_past_either_is_not(moment, place):
+    """O32: with offsets A 0 and B -8 and an allowance of 5 s, the band at a start of 1000 is 987 to 1005, both ends
+    included: a finish a second before it ended before the start, and one a second after it ended after the start."""
+    band, clock = start_band(1000.0, {"providers[0]": [0.0], "providers[1]": [-8.0]}, 5.0)
+    assert clock["band"] == [987, 1005]
+    assert band.place(moment) == place
 
 
 @pytest.mark.parametrize(("behind", "fails"), [(STOP_MARGIN_S, False), (STOP_MARGIN_S + 1, True)])
 def test_o32_a_clock_more_than_the_margin_behind_leaves_the_window_unplaced(behind, fails):
     """O32: a reader walks down to the start less the allowance and the margin; a provider clock behind by the margin
-    still opens the window at that cutoff, and one a second further behind opens it below, past the stop."""
+    still opens the band at that cutoff, and one a second further behind opens it below, past the stop."""
     offsets = {"providers[0]": [0.0], "providers[1]": [-behind]}
     if fails:
         with pytest.raises(Unreadable, match="clock runs more than"):
-            window_opens(1000.0, offsets, 5.0)
+            start_band(1000.0, offsets, 5.0)
     else:
-        assert window_opens(1000.0, offsets, 5.0)[0] == 1000 - STOP_MARGIN_S
+        assert start_band(1000.0, offsets, 5.0)[0].first == 1000 - 5 - STOP_MARGIN_S
 
 
 def test_o32_an_answer_without_a_readable_date_leaves_the_window_unplaced():
     """O32: one listing answer whose Date could not be read leaves its provider's clock unknown, named by its label."""
     with pytest.raises(Unreadable, match=r"providers\[1\]: a listing answer carried no Date"):
-        window_opens(1000.0, {"providers[0]": [0.0], "providers[1]": [0.0, None]}, 5.0)
+        start_band(1000.0, {"providers[0]": [0.0], "providers[1]": [0.0, None]}, 5.0)

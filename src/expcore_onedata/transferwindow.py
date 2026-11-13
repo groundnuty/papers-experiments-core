@@ -91,9 +91,15 @@ class Edges:
         return math.floor(edge + self.low - self.allowance), math.ceil(edge + self.high + self.allowance)
 
     @property
+    def opening(self) -> tuple[float, float]:
+        """The band at the window's start, both ends included: a provider time in it may lie on either side of the
+        start, one before it lies before the start, and one after it lies after the start."""
+        return self._band(self.window.start)
+
+    @property
     def first(self) -> float:
         """The earliest provider time in the widened window."""
-        return self._band(self.window.start)[0]
+        return self.opening[0]
 
     @property
     def last(self) -> float:

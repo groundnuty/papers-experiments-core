@@ -258,7 +258,8 @@ def test_o32_the_history_reads_its_window_alone_past_a_bound_the_whole_history_e
     """O32: 120 ended jobs of earlier runs and a bound of 50 ids: the history stage reads the ended listing newest
     first from the reset's own start and stops at the first older job, so the reset passes. Three old jobs still
     running are all cancelled, since the waiting and ongoing listings are read whole. The history records the
-    window's jobs (those three and the reset's eviction), the newest finish, and that older ones exist."""
+    window's jobs, the newest finish, and that older ones exist: the reset's eviction in `ended`, and the three its
+    transfers stage ended within the clock-skew allowance of its start in `uncertain`, never folded into `ended`."""
     for i in range(120):
         stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=100 + i, finished=100 + i)
     for i in range(3):
@@ -268,7 +269,7 @@ def test_o32_the_history_reads_its_window_alone_past_a_bound_the_whole_history_e
     record = SpaceReset(provisioner, listed_max=50, now=ticker.clock).run({"beta": ["study"]})
     assert record["stages"]["transfers"]["cancelled"] == 3
     history = record["stages"]["history"]
-    assert (history["ended"], history["since"], history["earlier"]) == (4, began, True)
+    assert (history["ended"], history["uncertain"], history["since"], history["earlier"]) == (1, 3, began, True)
     assert history["newest_finish"] >= began
     assert all(row["earlier"] for row in history["providers"].values())
 

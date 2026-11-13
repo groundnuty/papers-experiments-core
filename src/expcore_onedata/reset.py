@@ -35,14 +35,19 @@ read and every check is made on each provider that supports the space, since eac
    listing (`GET /spaces/{sid}/transfers`) only reads. So the next agent sees every ended transfer, the reset's own
    included, and the stage records what the listing shows it, per provider and together, since the window's start
    (`since`: the run's start when the caller gives it, else the reset's own start, on the reset's epoch clock `now`):
-   the count of the jobs that ended since then, the newest finish time, read from the records, whether older ended
-   jobs are listed too (`earlier`), and `removable` false, its limit stated. The history grows with every run, so the
-   listing is read newest first down to the window less the clock-skew allowance and `transferorder.STOP_MARGIN_S`,
-   its order checked as it goes, never whole (O32); `LISTED_MAX` counts the jobs read down to there. The Date headers
-   of those listing answers place the window on the providers' clocks, as the probes' transfer log does
-   (`transferorder.window_opens`, recorded under `clock`): a job counts when it finished at or after the window opens
-   there, so one read in the margin below it counts as an older job, never as one of the window's; and a Date that
-   cannot be read, or a provider clock more than the margin behind this host's, fails the stage.
+   the count of the jobs that ended since then (`ended`), the count of those that may have ended on either side of
+   `since` (`uncertain`), the newest finish time, read from the records, whether older ended jobs are listed too
+   (`earlier`), and `removable` false, its limit stated. The history grows with every run, so the listing is read
+   newest first down to the window less the clock-skew allowance and `transferorder.STOP_MARGIN_S`, its order checked
+   as it goes, never whole (O32); `LISTED_MAX` counts the jobs read down to there. A finish time is on the platform's
+   global clock and a listing answer's Date header on the provider's system clock (`transferorder.py` has the source),
+   so no provider's offset places a job by itself: the Date headers of those answers give the band at the window's
+   start (`transferorder.start_band`, recorded under `clock`), from `since` moved by the least offset less the
+   allowance to `since` moved by the greatest plus it, the band in which the probes flag a job near the window's edge.
+   A job counts in `ended` when every provider's record puts its finish after the band; one in the band, or put on
+   both sides, counts in `uncertain` alone; one before it is an older job, as is one read in the margin. `ended` is
+   exact when `uncertain` is 0, and a lower bound otherwise. A Date that cannot be read, or a provider clock more than
+   the margin behind this host's, fails the stage.
 
 **Before any stage** the plan is checked (no provider to evict from or allowed to hold bytes is the data provider, by
 name or id, or one that does not support the space) and the space's live name is verified (`verify_space`).
@@ -77,7 +82,15 @@ from expcore_onedata.occupancy import physical_sizes
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferlog import PAGE_LIMIT
-from expcore_onedata.transferorder import STOP_MARGIN_S, Walk, newest_first, window_opens
+from expcore_onedata.transferorder import (
+    EARLIER,
+    INSIDE,
+    STOP_MARGIN_S,
+    UNCERTAIN,
+    Walk,
+    newest_first,
+    start_band,
+)
 from expcore_onedata.transferrecord import Unreadable, page_of
 from expcore_onedata.transferwindow import offset_of
 
@@ -437,30 +450,38 @@ class SpaceReset:
 
     def _history(self, since: float) -> dict[str, Any]:
         """What the ended listing shows the next agent since `since`, per provider and together: the count of the jobs
-        that ended since then on the providers' clocks, the newest finish, and whether older jobs are listed too. Each
-        provider's listing is read newest first down to `since` less the allowance and the margin, never the whole
-        history; the Date headers of those answers place the window on the providers' clocks, and a clock that cannot
-        be read, or that puts the window below where the reading stops, fails the stage
-        (`transferorder.window_opens`)."""
+        that surely ended since then, the count of those that may have ended on either side of it, the newest finish,
+        and whether older jobs are listed too. Each provider's listing is read newest first down to `since` less the
+        allowance and the margin, never the whole history; the Date headers of those answers place the band at the
+        window's start (`transferorder.start_band`), and a clock that cannot be read, or that puts the band below where
+        the reading stops, fails the stage."""
         allowance = self._p.settings.clock_skew_allowance_s
         cutoff = since - allowance - STOP_MARGIN_S
         walks, offsets = {}, {}
         for provider in self._providers:
             walks[self._label(provider)], offsets[self._label(provider)] = self._walk_ended(provider, cutoff)
-        opens, clock = window_opens(since, offsets, allowance)
+        band, clock = start_band(since, offsets, allowance)
         per: dict[str, Any] = {}
-        ended: set[str] = set()
+        places: dict[str, set[str]] = {}  # job id -> where each provider's record puts it
         for label, walk in walks.items():
-            # The margin decides where the walk stops, never what counts: a job it kept that finished before the
-            # window opens ended before `since`, and shows that older jobs are listed.
-            inside = {tid for tid, moment in walk.kept.items() if moment >= opens}
-            older = walk.earlier or len(inside) < len(walk.kept)
-            per[label] = {"ended": len(inside), "newest_finish": walk.newest, "earlier": older}
-            ended |= inside
+            # The margin decides where the walk stops, never what counts: a job it kept that finished before the band
+            # ended before `since` and shows that older jobs are listed; one in the band is neither counted nor older.
+            mine = {tid: band.place(moment) for tid, moment in walk.kept.items()}
+            for tid, place in mine.items():
+                places.setdefault(tid, set()).add(place)
+            per[label] = {
+                "ended": sum(place == INSIDE for place in mine.values()),
+                "uncertain": sum(place == UNCERTAIN for place in mine.values()),
+                "newest_finish": walk.newest,
+                "earlier": walk.earlier or EARLIER in mine.values(),
+            }
         return {
             "removable": False,  # no call of the API removes an ended transfer (the module docstring has the evidence)
             "since": since,
-            "ended": len(ended),
+            # A job counts when every provider that read it puts it after the band; one any puts in the band, or that
+            # providers put on both sides, is uncertain, never folded into `ended`.
+            "ended": sum(found == {INSIDE} for found in places.values()),
+            "uncertain": sum(found not in ({INSIDE}, {EARLIER}) for found in places.values()),
             "newest_finish": max((w.newest for w in walks.values() if w.newest is not None), default=None),
             "earlier": any(row["earlier"] for row in per.values()),
             "clock": clock,

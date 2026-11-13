@@ -2,7 +2,10 @@
 
 The stage reads the ended listing newest first down to `since` less the clock-skew allowance and the margin
 (`transferorder.STOP_MARGIN_S`); the providers' clocks, from the Date headers of those listing answers, must not put
-the window's start below that cutoff, and only the jobs that ended since `since`, on the providers' clocks, count."""
+the band at the window's start below that cutoff. A finish time is on the platform's global clock and a Date header on
+a provider's system clock, so a job counts in `ended` only when it finished after that band, and one in it counts in
+`uncertain`, never in `ended`. The fake stamps finish times on its own clock and moves only the Date headers by a
+provider's skew, as the source does."""
 
 import pytest
 from fake_reset import FakeReset
@@ -72,21 +75,51 @@ def test_o32_a_job_in_the_margin_below_the_window_is_not_counted_and_says_older_
     listed. The margin decides where reading stops, never what counts."""
     stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=990.0, finished=990.0)
     history = history_of(provisioner, ticker)
-    assert (history["ended"], history["earlier"]) == (1, True)
+    assert (history["ended"], history["uncertain"], history["earlier"]) == (1, 0, True)
     assert all((row["ended"], row["earlier"]) == (1, True) for row in history["providers"].values())
 
 
-def test_o32_a_provider_clock_behind_moves_the_window_onto_it(provisioner, stocked, ticker):
-    """O32: beta's clock runs 3 s behind this host's, within the margin; a job beta finished one second into the
-    window reports 998, below the window's start on this host's clock, and is counted, since the window opens on the
-    providers' clocks at 997. A record's times are on the clock of the provider that wrote them, so the window opens
-    where the least offset puts it, on every provider's listing."""
+def test_o32_a_provider_clock_behind_widens_the_band_and_a_job_in_it_is_uncertain(provisioner, stocked, ticker):
+    """O32: beta's Date headers run 3 s behind this host's, within the margin, so the band at the window's start runs
+    from 1000 less 3 s and the allowance to 1000 plus the allowance. A job that finished at 998 lies in it: it may
+    have ended on either side of the start, so it counts in `uncertain`, never in `ended`, and is no older job."""
     stocked.provider_skew[BETA_ID] = -3.0
     stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=998.0, finished=998.0)
     history = history_of(provisioner, ticker)
-    assert (history["ended"], history["earlier"]) == (2, False)
+    assert (history["ended"], history["uncertain"], history["earlier"]) == (1, 1, False)
     assert -4.0 < history["clock"]["least_offset_s"] <= -3.0  # a Date header gives whole seconds
-    assert history["clock"]["window_opens"] in (996, 997)
+    assert history["clock"]["band"][0] in (991, 992)
+    assert history["clock"]["band"][1] == SINCE + ALLOWANCE_S
+
+
+def test_o32_a_job_one_provider_stamped_before_the_window_is_never_counted_in_it(provisioner, stocked, ticker):
+    """O32: the delta review's case: alpha's clock agrees with this host's, beta's Date headers run 8 s behind, and a
+    job finished at 995, before the window that starts at 1000 on alpha's clock. The least offset alone opened the
+    window at 992 and counted it, `ended` 2 with no older job. The record cannot say whose clock stamped the job, so
+    it lies in the band (987 to 1005): `uncertain` 1, `ended` the reset's own eviction alone, on each provider."""
+    stocked.provider_skew[BETA_ID] = -8.0
+    stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=995.0, finished=995.0)
+    history = history_of(provisioner, ticker)
+    assert history["clock"]["band"] == [987, 1005]
+    assert (history["ended"], history["uncertain"], history["earlier"]) == (1, 1, False)
+    rows = history["providers"].values()
+    assert all((row["ended"], row["uncertain"], row["earlier"]) == (1, 1, False) for row in rows)
+
+
+@pytest.mark.parametrize(
+    ("finished", "ended", "uncertain", "earlier"),
+    [(986.0, 1, 0, True), (987.0, 1, 1, False), (1005.0, 1, 1, False), (1006.0, 2, 0, False)],
+)
+def test_o32_the_bands_edges_are_uncertain_and_a_second_past_either_is_not(
+    provisioner, stocked, ticker, finished, ended, uncertain, earlier
+):
+    """O32: with beta's Date headers 8 s behind, the band at 1000 runs from 987 to 1005, both ends included. A job a
+    second before it ended before the window and shows an older job, one at either end is uncertain, and one a second
+    after it counts beside the reset's own eviction. `ended` is exact only when `uncertain` is 0."""
+    stocked.provider_skew[BETA_ID] = -8.0
+    stocked.add_transfer("replication", FILES[0], BETA_ID, scheduled=finished, finished=finished)
+    history = history_of(provisioner, ticker)
+    assert (history["ended"], history["uncertain"], history["earlier"]) == (ended, uncertain, earlier)
 
 
 def test_o32_a_provider_clock_behind_by_more_than_the_margin_fails_the_reset(provisioner, stocked, ticker):

@@ -39,6 +39,25 @@ def test_o08_a_transfer_timed_by_a_provider_10_s_behind_is_counted_or_makes_the_
     assert "transfer_near_window_edge" in beta["unknown"]
 
 
+def test_o32_a_job_one_provider_stamped_before_the_run_is_flagged_never_a_known_bound(probes, seeded, ticker):
+    """O32: the reset's delta-review case, on the probes: alpha's clock agrees with this host's, beta's Date headers
+    run 8 s behind, and a replication into beta was scheduled and finished at 995, before a run that starts at 1000 on
+    alpha's clock. The window opens at the least offset less the allowance, so the job is recorded, but it lies in the
+    band at the window's start: its record says so and beta's bound is unknown, transfer_near_window_edge. No single
+    offset makes it part of a known figure, so the probes need no change for it."""
+    seeded.provider_skew[BETA_ID] = -8.0
+    probes.start({})
+    start = ticker.now
+    tid = seeded.add_transfer("replication", MORE, BETA_ID, scheduled=start - 5, finished=start - 5)
+    ticker.sleep(30)
+    snapshot = probes.finish()
+    records = {r["transfer_id"]: r for r in snapshot["space_transfers"]["records"]}
+    assert records[tid]["near_window_edge"] is True
+    beta = snapshot["on_demand"]["providers[1]"]
+    assert beta["on_demand_lower_bound"] is None
+    assert "transfer_near_window_edge" in beta["unknown"]
+
+
 def test_o08_a_transfer_that_ended_just_before_the_runs_end_makes_its_targets_bound_unknown(probes, seeded, ticker):
     """O08: a job into beta that finished a second before the block maps were read at the run's end lies within the
     allowance of the window's edge, so on clocks that only agree within an estimate it may have landed after that

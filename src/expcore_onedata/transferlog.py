@@ -23,6 +23,10 @@ record says it ended by the next observation, the walk stops at it and it leaves
 (`transfer_left_listing`), so a record that catches up errs closed. The order is checked as the listing is read, and
 a listing out of that order is unknown (`transferorder.py`). The window on the providers' clocks must not open before
 the cutoff: a provider's clock more than the margin behind this host's leaves the listing unknown, naming the clock.
+A job's times are on the platform's global clock, not the system clock a Date header gives (`transferorder.py` has
+the source), so no provider's offset places a job by itself; the band at each edge of the window, from the least
+offset less the allowance to the greatest plus it, is where none can: a job with a time in one is recorded with
+`near_window_edge` and leaves its target's bound unknown (`transfer_near_window_edge`), never part of a known figure.
 
 **One provider's observation at a time.** A job's state and counters are always taken from one provider's listing and
 record together, never one provider's state with another's counters. A provider lists a job only after a lag (a

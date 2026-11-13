@@ -39,7 +39,9 @@ walk rests there on the order holding by construction: an ended job's link is ad
 timestamp (`transfer_links.erl:83-95`, `add_ended`) and its key is `9999999999 - T` ahead of the id
 (`:160-164`, `link_key`), so the listing cannot put a job that finished later after one that finished earlier while
 the source is what runs. The check past the stop guards that assumption where its failure would cost a job of the
-window, at the stop; it is not a proof of the order beyond it.
+window, at the stop; it is not a proof of the order beyond it. A job cancelled while still waiting is given no finish
+time (`replication_status.erl:264-271`, `replica_eviction_status.erl:257-262`): its `finishTime` stays 0, so the ended
+listing puts it last, past every stop, and no walk reads it.
 
 **Never** a page token built by hand to start at a time: the token's form is undocumented. The walk starts at the
 first page and follows the tokens the platform gives.
@@ -47,9 +49,29 @@ first page and follows the tokens the platform gives.
 `STOP_MARGIN_S` widens a reader's cutoff below its window's start (and below the clock-skew allowance it adds): it is
 how far behind this host a provider's clock may run before the probes fail closed (`transferlog.py`), and it keeps the
 second-level times of the listing clear of rounding at the edge.
+
+**The clock a finish time is on, from the source.** The provider that runs a job stamps its finish: a replication's
+(`replicatingProviderId` in the record), an eviction's (`evictingProviderId`), and for a migration the evicting one
+when its replication completed and the replicating one when that part failed or was cancelled. Each status change runs
+only on that provider (`transfer_changes.erl:21-28,75-89,121-135`), and a completed migration's replication leaves the
+finish to its eviction (`replication_status.erl:222-231`; `replica_eviction_status.erl:223-229`). It stamps it with
+`global_clock:monotonic_timestamp_seconds`, which ctool (op-worker's pin `8ae7baf`, `global_clock.erl:8-46`) defines
+as Onezone's cluster time: the provider's system clock moved by a bias measured against Onezone, with an error "below
+a second" that "can grow to a couple of seconds", or the system clock itself while it is not synchronised; by default a
+provider connects to Onezone only once it is (`gs_channel_service.erl:41-46`). A listing answer's `Date` header is
+cowboy's `erlang:universaltime()` (cowboy 2.9.0, ctool's pin, `cowboy_clock.erl:61,74,97`), the system clock. So the
+offset a provider's Date header gives is not the offset of the clock its finish times are on, and a record cannot say
+which offset applies: no job can be placed by its stamping provider's offset alone.
+
+**The band at the window's start.** A reader that counts the jobs that ended since a window's start places each finish
+time against a band, `start_band`: from the start moved by the least offset less the clock-skew allowance to the start
+moved by the greatest offset plus the allowance, in whole seconds (`transferwindow.Edges.opening`, the band in which
+the probes flag a job `transfer_near_window_edge`). A finish before the band ended before the start (`EARLIER`), one
+after it ended after the start (`INSIDE`), and one in it may lie on either side (`UNCERTAIN`), which the reader reports
+apart and never counts as either. The places are exact when the clock that stamped each finish lies within the
+allowance of the offsets the Date headers gave, the assumption the cutoff rests on as well.
 """
 
-import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -174,19 +196,37 @@ def _check_past_stop(
             order.check(moment, "a job on the page past the one that ends the walk finished later than one before it")
 
 
-def window_opens(
-    since: float, offsets: Mapping[str, Sequence[float | None]], allowance: float
-) -> tuple[int, dict[str, float]]:
-    """Where a window that starts at `since` on this host's clock opens on the providers' clocks, from the offsets the
-    Date headers of their listing answers gave (`offsets`, by provider label; `transferwindow.offset_of`), with the
-    record of the clock. It opens at `since` moved by the least offset, in whole seconds as the listing's times are:
-    a record's times are on the clock of the provider that wrote them, so the earliest any provider puts it.
+EARLIER, UNCERTAIN, INSIDE = "earlier", "uncertain", "inside"  # where a finish time lies against a window's start
+
+
+@dataclass(frozen=True)
+class Band:
+    """The band at a window's start on the clocks that stamp finish times, both ends included, in whole seconds."""
+
+    first: int
+    last: int
+
+    def place(self, moment: float) -> str:
+        """`EARLIER` for a finish before the band (it ended before the start), `INSIDE` for one after it (it ended
+        after the start), `UNCERTAIN` for one in it, which may lie on either side."""
+        if moment < self.first:
+            return EARLIER
+        return UNCERTAIN if moment <= self.last else INSIDE
+
+
+def start_band(since: float, offsets: Mapping[str, Sequence[float | None]], allowance: float) -> tuple[Band, dict]:
+    """The band at a window that starts at `since` on this host's clock, from the offsets the Date headers of the
+    listing answers gave (`offsets`, by provider label; `transferwindow.offset_of`), with the record of the clock:
+    `since` moved by the least offset less `allowance` to `since` moved by the greatest plus it, in whole seconds
+    (`transferwindow.Edges.opening`). A Date header gives the provider's system clock and a finish time is on the
+    platform's global clock (the module docstring has the source), so no one provider's offset places a job: the band
+    holds every place the start may have on the clock that stamped it, within the allowance.
 
     A reader walks down to `since` less `allowance` and `STOP_MARGIN_S` on this host's clock, so the check is the
-    probes' (`transferlog.py`): the window widened by the offsets and the allowance (`transferwindow.Edges`) must not
-    open below that cutoff, which a provider clock more than the margin behind would make it do, leaving jobs of the
-    window past the stop. Raise Unreadable, naming the clock, when it would, and when an answer's Date could not be
-    read, since the window cannot then be placed. The margin decides where reading stops, never what counts."""
+    probes' (`transferlog.py`): the band must not open below that cutoff, which a provider clock more than the margin
+    behind would make it do, leaving jobs that may be the window's past the stop. Raise Unreadable, naming the clock,
+    when it would, and when an answer's Date could not be read, since the band cannot then be placed. The margin decides
+    where reading stops, never what counts."""
     if not offsets:
         raise ValueError("a window is placed from one provider's listing answers at least")
     unread = [label for label, samples in offsets.items() if not samples or None in samples]
@@ -197,13 +237,30 @@ def window_opens(
         )
     seen = [offset for samples in offsets.values() for offset in samples if offset is not None]
     low, high = min(seen), max(seen)
-    if Edges(Window(since, since), low, high, allowance).first < since - allowance - STOP_MARGIN_S:
+    first, last = Edges(Window(since, since), low, high, allowance).opening
+    if first < since - allowance - STOP_MARGIN_S:
         raise Unreadable(
             f"a provider's clock runs more than {STOP_MARGIN_S:.0f} s behind this host's, beyond the margin the ended "
             "listing is read back by, so the window may hold jobs past where the reading stopped"
         )
-    opens = math.floor(since + low)
-    return opens, {"least_offset_s": round(low, 3), "greatest_offset_s": round(high, 3), "window_opens": opens}
+    band = Band(int(first), int(last))
+    clock = {
+        "least_offset_s": round(low, 3),
+        "greatest_offset_s": round(high, 3),
+        "allowance_s": allowance,
+        "band": [band.first, band.last],
+    }
+    return band, clock
 
 
-__all__ = ["STOP_MARGIN_S", "OrderBroken", "Walk", "newest_first", "window_opens"]
+__all__ = [
+    "EARLIER",
+    "INSIDE",
+    "STOP_MARGIN_S",
+    "UNCERTAIN",
+    "Band",
+    "OrderBroken",
+    "Walk",
+    "newest_first",
+    "start_band",
+]
