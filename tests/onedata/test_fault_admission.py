@@ -17,7 +17,14 @@ from fault_support import LOCAL_TARGET, OUTAGE_TARGET, SERVICES, FakeServices, i
 from expcore.campaign.factors import load_factor_schema
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
-from expcore_onedata.admission import AdmissionRefused, FederationLock, require_admission, run_admission
+from expcore_onedata.admission import (
+    FEDERATION_INTENT,
+    FEDERATION_LOCK,
+    AdmissionRefused,
+    FederationLock,
+    require_admission,
+    run_admission,
+)
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import INJECTOR_FAILURE, load_faults
@@ -55,8 +62,8 @@ def federation(tmp_path):
     return platform, FederationLock(settings)
 
 
-def in_thread(work):
-    """Run `work` in a thread; return the thread and the list its result or exception lands in."""
+def in_thread(work, name=None):
+    """Run `work` in a thread (named `name`); return the thread and the list its result or exception lands in."""
     landed: list = []
 
     def run():
@@ -65,9 +72,34 @@ def in_thread(work):
         except BaseException as error:
             landed.append(error)
 
-    thread = threading.Thread(target=run)
+    thread = threading.Thread(target=run, name=name)
     thread.start()
     return thread, landed
+
+
+class WatchedLock(FederationLock):
+    """The federation's lock, noting when each named thread took the turnstile and the main lock (`taken`), and
+    setting `at_turnstile[name]` once that thread holds the turnstile, so a test sequences arrivals on the lock's own
+    state instead of on how soon a thread starts."""
+
+    def __init__(self, settings, names):
+        super().__init__(settings)
+        self.taken: dict[tuple[str, str], float] = {}
+        self.at_turnstile = {name: threading.Event() for name in names}
+
+    def _try(self, name, mode):
+        held = super()._try(name, mode)
+        who = threading.current_thread().name
+        if held is not None and who in self.at_turnstile:
+            self.taken[who, name] = time.monotonic()
+            if name == FEDERATION_INTENT:
+                self.at_turnstile[who].set()
+        return held
+
+
+def overlapping(one, other):
+    """Whether two holds, each its `in` and `out` times, share any instant."""
+    return one["in"] < other["out"] and other["in"] < one["out"]
 
 
 def test_o11_two_outage_runs_on_different_targets_never_overlap(tmp_path):
@@ -264,34 +296,43 @@ def test_o11_a_baseline_health_check_waits_for_an_injection_in_progress_and_pass
 
 def test_o11_a_writer_is_admitted_once_the_readers_at_its_arrival_finish_and_later_readers_wait_for_it(tmp_path):
     """O11: a turnstile in front of the federation's lock: readers present when an outage run arrives finish, the
-    outage run gets in, and readers arriving after it wait for it, so a steady stream of readers cannot starve it."""
-    _, lock = federation(tmp_path)
-    times: dict[str, float] = {}
+    outage run gets in, and readers arriving after it wait for it, so a steady stream of readers cannot starve it. No
+    hold overlaps the outage run's.
 
-    def reader(name, hold_s):
+    Each arrival waits on the lock's state, not on a sleep: the writer starts once both present readers are in, and the
+    later readers once the writer holds the turnstile, so a slow thread start cannot turn a present reader into a later
+    one and falsify the premise."""
+    platform = write_faults(tmp_path)
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    present, later = ["first", "second"], [f"later{i}" for i in range(3)]
+    lock = WatchedLock(settings, [*present, "writer", *later])
+    holds: dict[str, dict[str, float]] = {}
+    entered = {name: threading.Event() for name in lock.at_turnstile}
+
+    def holder(name, exclusive, hold_s):
         def run():
-            with lock.held(exclusive=False, timeout_s=10):
-                times[f"{name} in"] = time.monotonic()
+            with lock.held(exclusive=exclusive, timeout_s=10):
+                holds[name] = {"in": time.monotonic()}
+                entered[name].set()
                 time.sleep(hold_s)
-                times[f"{name} out"] = time.monotonic()
+                holds[name]["out"] = time.monotonic()
 
-        return run
+        return in_thread(run, name=name)
 
-    def writer():
-        with lock.held(exclusive=True, timeout_s=10):
-            times["writer in"] = time.monotonic()
-            time.sleep(0.2)
-            times["writer out"] = time.monotonic()
-
-    present = [in_thread(reader("first", 0.4))[0], in_thread(reader("second", 0.6))[0]]
-    time.sleep(0.1)
-    arrived = [in_thread(writer)[0]]
-    time.sleep(0.1)
-    later = [in_thread(reader(f"later{i}", 0.4))[0] for i in range(3)]
-    for thread in present + arrived + later:
+    threads = [holder("first", False, 0.4), holder("second", False, 0.6)]
+    assert all(entered[name].wait(10) for name in present)  # both readers are on the federation
+    threads.append(holder("writer", True, 0.2))
+    assert lock.at_turnstile["writer"].wait(10)  # the outage run has arrived: it holds the turnstile
+    threads += [holder(name, False, 0.4) for name in later]
+    for thread, landed in threads:
         thread.join(15)
-    assert times["writer in"] >= max(times["first out"], times["second out"])
-    assert all(times[f"later{i} in"] >= times["writer out"] for i in range(3)), times
+        assert landed == [None]
+    writer = holds["writer"]
+    assert [name for name in present + later if overlapping(holds[name], writer)] == [], holds
+    assert writer["in"] >= max(holds[name]["out"] for name in present), holds
+    assert all(holds[name]["in"] >= writer["out"] for name in later), holds
+    # the turnstile held the later readers back until the writer had the main lock
+    assert all(lock.taken[name, FEDERATION_INTENT] >= lock.taken["writer", FEDERATION_LOCK] for name in later)
 
 
 def test_o11_the_first_health_check_recovers_a_crashed_runs_injection_and_admits_runs(tmp_path, fake):
@@ -356,9 +397,10 @@ def test_o11_an_exclusive_control_holds_the_federation_exclusively_and_never_ove
     settings = load_faults(platform, config)
     timeline: list[tuple[str, str, float]] = []
 
-    def run(name, exclusive, hold_s):
+    def run(name, exclusive, hold_s, entered):
         with admit((), {}, threading.Event(), exclusive) as mode:
             timeline.append((name, "in", time.monotonic()))
+            entered.set()
             if exclusive:
                 record = json.loads((settings.journal / "federation.holder").read_text(encoding="utf-8"))
                 timeline.append((name, f"{mode}:{record['purpose']}", time.monotonic()))
@@ -366,9 +408,11 @@ def test_o11_an_exclusive_control_holds_the_federation_exclusively_and_never_ove
             timeline.append((name, "out", time.monotonic()))
         return mode
 
-    control, landed = in_thread(lambda: run("control", True, 0.4))
-    time.sleep(0.1)
-    baseline, after = in_thread(lambda: run("baseline", False, 0.1))
+    # the run that arrives second starts once the first is in, not after a sleep a slow thread start could outlast
+    control_in, baseline_in = threading.Event(), threading.Event()
+    control, landed = in_thread(lambda: run("control", True, 0.4, control_in))
+    assert control_in.wait(10)
+    baseline, after = in_thread(lambda: run("baseline", False, 0.1, threading.Event()))
     control.join(10)
     baseline.join(10)
     assert landed == ["exclusive"]
@@ -377,9 +421,9 @@ def test_o11_an_exclusive_control_holds_the_federation_exclusively_and_never_ove
     assert ("control", "exclusive:exclusive_run") in marks
     assert marks["baseline", "in"] >= marks["control", "out"]  # it waited for the control to leave
 
-    first, _ = in_thread(lambda: run("baseline", False, 0.4))
-    time.sleep(0.1)
-    second, _ = in_thread(lambda: run("control", True, 0.1))
+    first, _ = in_thread(lambda: run("baseline", False, 0.4, baseline_in))
+    assert baseline_in.wait(10)
+    second, _ = in_thread(lambda: run("control", True, 0.1, threading.Event()))
     first.join(10)
     second.join(10)
     marks = {(name, what): at for name, what, at in timeline[-5:]}
