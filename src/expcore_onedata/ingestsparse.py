@@ -38,10 +38,13 @@ hold are written from the staged source, checked first, at their offsets; the wh
 hash, and written whole again at its offsets when that differs (a written range damaged). It is verified by the hash,
 the data provider's block map covering it and every provider that must see it showing it at its size. A file the
 ingest did not make is left as it is when its bytes are its staged source's (the dataset's own, before a first run)
-and refused otherwise; a name removed by a crashed start is written back from the staged source once every provider
+and refused otherwise, but for an empty file at a path whose journal ends with the start's intent to make it again: a
+creation whose answer was lost, or whose change-log line a crash cut, which holds nothing, so it is removed and the
+file written back whole. A name removed by a crashed start is written back from the staged source once every provider
 answers the old id absent. So a crash at any point ends with the complete file after the next start.
 """
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,9 +61,11 @@ from expcore_onedata.streamed import Digest
 @dataclass(frozen=True)
 class Layout:
     """A file's distribution as one provider shows it: the data provider's `virtualSize` (None when unreadable) and
-    each provider's merged blocks, by name."""
+    blocks, and the merged blocks of every provider the answer lists, by provider id, those of the space and any
+    other alike."""
 
     virtual_size: int | None
+    holder: tuple[Range, ...]
     blocks: dict[str, tuple[Range, ...]]
 
 
@@ -83,28 +88,38 @@ class SparseBaseline(Baseline):
         space as unknown. One attempt, as a poll reads it, unless the caller names a policy: the check before a part,
         whose failure ends the schedule, passes the provisioner's (O29)."""
         answer = self._p.client.get(f"/data/{plain(file_id)}/distribution", provider=reader, retry=retry)
-        try:
-            blocks = {p: tuple(merged(provider_blocks(answer, self._p.provider_id(p)))) for p in self.providers}
+        listed = answer.get("distributionPerProvider") if isinstance(answer, dict) else None
+        if not isinstance(listed, dict):
+            raise PlatformError("the block map is unreadable (no 'distributionPerProvider' table)")
+        holder = self._p.provider_id(self.holder)
+        ids = {self._p.provider_id(p) for p in self.providers} | {str(pid) for pid in listed}
+        try:  # every provider of the space must be listed (one that is not is unknown), and any other listed is read
+            blocks = {pid: tuple(merged(provider_blocks(answer, pid))) for pid in sorted(ids)}
         except ValueError as error:
             raise PlatformError(f"the block map is unreadable ({error})") from None
-        entry = answer["distributionPerProvider"][self._p.provider_id(self.holder)]
+        entry = listed[holder]
         virtual = entry.get("virtualSize") if isinstance(entry, dict) else None
         exact = isinstance(virtual, int) and not isinstance(virtual, bool)
-        return Layout(virtual if exact else None, blocks)
+        return Layout(virtual if exact else None, blocks[holder], blocks)
+
+    def _label(self, provider_id: str) -> str:
+        name = self._p.provider_named(provider_id)
+        return self._p.client.provider_label(name) if name is not None else "a provider platform.toml does not declare"
 
     def _beyond(self, label: str, layout: Layout, end: int, reader: str) -> None:
-        """Refuse at once a provider that holds a byte outside `[0, end)`: no wait makes that the plan's state."""
-        for provider, blocks in layout.blocks.items():
+        """Refuse at once a provider, of the space or not, that holds a byte outside `[0, end)`: no wait makes that the
+        plan's state."""
+        for provider_id, blocks in layout.blocks.items():
             if uncovered(written_ranges(end), blocks):
                 raise NotPlaced(
-                    f"{self._p.where}{label}: {self._p.client.provider_label(provider)} holds bytes beyond the written "
-                    f"ranges, as {self._p.client.provider_label(reader)} shows it"
+                    f"{self._p.where}{label}: {self._label(provider_id)} holds bytes beyond the written ranges, as "
+                    f"{self._p.client.provider_label(reader)} shows it"
                 )
 
     def _exact(self, planned: PlannedFile, layouts: dict[str, Layout], end: int) -> bool:
         for reader, layout in layouts.items():
             self._beyond(planned.label, layout, end, reader)
-            if layout.virtual_size != planned.size or layout.blocks[self.holder] != written_ranges(end):
+            if layout.virtual_size != planned.size or layout.holder != written_ranges(end):
                 return False
         return True
 
@@ -155,7 +170,10 @@ class SparseBaseline(Baseline):
 
     # -- the start state -----------------------------------------------------------------------------------------------
     def _preallocate(self, planned: PlannedFile, old: str) -> str:
-        """Make the file again at its final size, its id recorded as soon as it exists, a failed extension's too."""
+        """Make the file again at its final size, its id recorded as soon as it exists, a failed extension's too. The
+        intent is journalled first, so a creation whose answer was lost, or whose change-log line a crash cut, is
+        known as the ingest's at the next restore (`_lost_creation`)."""
+        self.journal(entry="intent", label=planned.label, action="preallocate", file_id=old, phase="start")
         made_before = self._made_at(planned.path)
         try:
             file_id = self._p.preallocate(planned.path, planned.size)
@@ -193,7 +211,7 @@ class SparseBaseline(Baseline):
             )
         before = self.layout(file_id, self.holder, retry=self._p.retry)
         self._beyond(planned.label, before, step.start, self.holder)
-        if before.virtual_size != planned.size or before.blocks[self.holder] != written_ranges(step.start):
+        if before.virtual_size != planned.size or before.holder != written_ranges(step.start):
             raise ProvisionError(
                 f"{self._p.where}{planned.label}: before part {step.part} the data provider's block map is not the "
                 "plan's ranges at the file's final size; nothing was written"
@@ -225,12 +243,31 @@ class SparseBaseline(Baseline):
                 "nothing was written"
             )
         if not self._made_by_ingest(before):
+            if before.size == 0 and self._lost_creation(planned.label):
+                self.remove(planned, before, phase)  # empty, so nothing is lost; then written back whole
+                return self._write_back(planned, phase, None)
             return self._keep(planned, phase, before)
         self.check_source(planned)
         action = self._complete(planned, before)
         self.record_id(planned.label, "restored", phase, before.file_id, before.file_id, action=action)
         self.confirm(before.file_id, planned.size)
         return {"action": action, "file_id": before.file_id}
+
+    def _lost_creation(self, label: str) -> bool:
+        """The journal's last word on the file is the start's intent to make it again, with no id after it: a creation
+        whose answer was lost or whose change-log line was never written. An empty file at its path is then the
+        ingest's own, made after its baseline was removed."""
+        if not self._journal.exists():
+            return False
+        last = None
+        for text in self._journal.read_text(encoding="utf-8").splitlines():
+            try:
+                line = json.loads(text)
+            except json.JSONDecodeError:
+                continue  # a torn line, which a crash can leave; `read_journal` refuses any other
+            if isinstance(line, dict) and line.get("space") == self._p.space.position and line.get("label") == label:
+                last = line if line.get("entry") in ("intent", "id") else last
+        return last is not None and last.get("entry") == "intent" and last.get("action") == "preallocate"
 
     def _keep(self, planned: PlannedFile, phase: str, before: Entry) -> dict[str, Any]:
         """A file the ingest did not make is the dataset's own: kept when its bytes are its staged source's, refused

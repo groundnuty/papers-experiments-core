@@ -374,7 +374,7 @@ class ProgressiveIngest:
         if self._start is None or not self._start["ok"]:
             why = f": {self._start['detail']}" if self._start is not None else ": it never ran"
             self._refuse(f"at the start, which did not set the start state{why}")
-        if self._sparse and self._steps and self._t0 is None:
+        if self._unanchored():
             self._refuse("before its schedule began: the agent's first model turn, which anchors it, never came")
         if self._failure is not None:
             step = "an arrival" if self._failure["phase"] == "arrival" else "the stop of its schedule"
@@ -383,6 +383,10 @@ class ProgressiveIngest:
         if self._restore is None or not self._restore["ok"]:
             why = f": {self._restore['detail']}" if self._restore is not None else ": it never ran"
             self._refuse(f"at the restore, which did not bring the baseline back{why}")
+
+    def _unanchored(self) -> bool:
+        """A preallocated plan with parts whose schedule never began: its first turn never came."""
+        return self._sparse and bool(self._steps) and self._t0 is None
 
     def _refuse(self, what: str) -> None:
         raise InfraError(INGEST_FAILURE, f"{self._p.where}the progressive ingest failed {what}"[:600])
@@ -410,7 +414,13 @@ class ProgressiveIngest:
             state = "failed" if failed == planned.label else state
             files[planned.label] = {"baseline": planned.baseline, "state": state, "parts_confirmed": parts}
             files[planned.label].update(self._files[planned.label])
-        ok = self._failure is None and self._defect is None and bool(self._restore and self._restore["ok"])
+        ok = (  # what `check` passes, and nothing else
+            bool(self._start and self._start["ok"])
+            and not self._unanchored()
+            and self._failure is None
+            and self._defect is None
+            and bool(self._restore and self._restore["ok"])
+        )
         return {
             "version": VERSION,
             **({} if self._space is None else {"space": self._space}),

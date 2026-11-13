@@ -10,6 +10,7 @@ import pytest
 from expcore.errors import InfraError
 from expcore.loop.timer import AgentTimer
 from expcore.records.instruments import first_turn_instruments
+from expcore_onedata.client import PlatformError
 from expcore_onedata.ingest import ProgressiveIngest
 from expcore_onedata.ingestplan import load_ingest_plan
 from expcore_onedata.ingestsparse import SparseBaseline
@@ -232,6 +233,50 @@ def test_o44_a_block_beyond_the_written_ranges_fails_the_next_part_with_nothing_
     assert bytes(node(fake).content) == DAY
 
 
+def test_o44_a_provider_platform_toml_does_not_declare_holding_bytes_beyond_fails_the_part(make, fake, ticker):
+    """O44: the distribution lists a provider the configuration does not know, holding bytes in the gap; it is read
+    like the space's own, so the next part fails closed with nothing written."""
+    fake.add_provider("pr-stranger", "stranger.test", supports=False)
+    ingest = make(ROW)
+    ingest.start({})
+    t0 = first_turn(ingest, ticker)
+    file_id = fake.id_of(DAY_PATH)
+    fake.blocks[(file_id, "pr-stranger")] = [[9000, 100]]
+    sent = len(content_writes(fake, file_id))
+    ticker.now = t0 + 30
+    until(lambda: ingest.failure is not None)
+    assert "a provider platform.toml does not declare holds bytes beyond" in ingest.failure["detail"]
+    assert len(content_writes(fake, file_id)) == sent
+    ingest.stop()
+
+
+def test_o44_a_creation_whose_answer_was_lost_is_taken_back_and_the_file_written_whole(make, fake, provisioner):
+    """O44: the provider made the new file but its answer never came, so no change-log line holds it; the journal's
+    intent says the start was making it, so the start's own recovery removes the empty file and writes the day back
+    whole, and the next start sets the start state."""
+    real = provisioner.mutate
+    lost = []
+
+    def answer_lost(method, path, **options):
+        answer = real(method, path, **options)
+        if method == "POST" and path.endswith("/children") and options["params"]["type"] == "REG" and not lost:
+            lost.append(answer["fileId"])
+            raise PlatformError("providers[0]: POST failed (ReadTimeout)", transport=True)
+        return answer
+
+    provisioner.mutate = answer_lost
+    failed = make(ROW)
+    with pytest.raises(InfraError):
+        failed.start({})
+    assert fake.id_of(DAY_PATH) != lost[0]  # the empty file the answer was lost for was removed
+    assert bytes(node(fake).content) == DAY  # and the recovery wrote the day back whole
+    del provisioner.mutate
+    again = make(ROW)
+    again.start({})
+    assert fake.held(DAY_PATH, ALPHA_ID) == [[0, PREFIX]]
+    again.stop()
+
+
 def test_o44_a_part_out_of_order_is_refused_before_anything_is_written(provisioner, config, fake, tmp_path):
     """O44: a part that does not start where the written ranges end is out of order: refused, nothing sent."""
     plan = load_ingest_plan(write_plan(tmp_path, [ROW]), config)
@@ -253,6 +298,7 @@ def test_o44_a_run_whose_first_turn_never_came_is_refused_and_still_restored(mak
     snapshot = ingest.finish()
     assert [s["step"] for s in snapshot["steps"] if s["step"] != "planned"] == ["not_due"] * 3
     assert snapshot["files"]["day-13"]["state"] == "prefix_only"
+    assert (snapshot["ok"], snapshot["first_turn"]) == (False, None)  # as the check says: no manipulation
     with pytest.raises(InfraError, match="first model turn"):
         ingest.check()
     assert bytes(node(fake).content) == DAY
