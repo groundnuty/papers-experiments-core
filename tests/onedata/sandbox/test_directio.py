@@ -79,6 +79,7 @@ def test_o37_a_read_that_fell_back_to_the_provider_is_refused_though_it_read_eve
     ],
 )  # fmt: skip
 def test_o37_each_line_that_shows_direct_io_not_in_effect_refuses_the_start_and_is_named(line, name):
+    """O37: every marker line refuses, named in the problem and in the record."""
     problems, record = judge(text=log(tail=line + "\n"))
     assert any(name in p for p in problems)
     assert record["lines"] == [name]
@@ -86,6 +87,7 @@ def test_o37_each_line_that_shows_direct_io_not_in_effect_refuses_the_start_and_
 
 @pytest.mark.parametrize(("direct", "proxy"), [("0", "0"), ("0", "1"), ("1", "1")])
 def test_o37_start_lines_that_do_not_say_forced_direct_and_no_forced_proxy_refuse(direct, proxy):
+    """O37: the start lines must say forced direct and no forced proxy."""
     problems, _ = judge(text=log(direct, proxy))
     assert any("Forced" in p for p in problems)
 
@@ -129,6 +131,7 @@ def test_o37_the_probe_reads_nothing_of_a_file_the_local_provider_does_not_hold_
 
 
 def test_o37_the_probe_reads_a_held_file_whole_and_reports_its_storage_size_and_seconds(tmp_path):
+    """O37: a file held in full is read whole, with its storage, size and seconds."""
     found = run_probe(tmp_path, held="100%")
     assert found == {**found, "size": 5000, "read": 5000, "held": "100%", "storage_id": STORAGES[0]}
     assert found["seconds"] >= 0

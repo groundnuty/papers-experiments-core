@@ -65,6 +65,7 @@ def test_o37_a_direct_mount_without_its_storage_mapping_is_refused_naming_what_i
 
 
 def test_o37_a_direct_mount_with_an_empty_mapping_is_refused(tmp_path):
+    """O37: an empty table maps no storage, so the sidecar could read nothing directly."""
     with pytest.raises(ConfigError, match="storages"):
         load(tmp_path, direct({}))
 
@@ -131,6 +132,7 @@ def test_o37_o12_a_host_path_that_is_not_one_plain_absolute_directory_is_refused
 
 
 def test_o37_a_host_path_that_is_not_a_string_is_refused_by_position(tmp_path):
+    """O37: a host path is a string, named by its entry's position when it is not."""
     with pytest.raises(ConfigError, match="entry 0"):
         load(tmp_path, direct({STORAGE_A: 7}))
 
@@ -143,6 +145,7 @@ def test_o37_two_storages_whose_directories_nest_are_refused(tmp_path, a, b):
 
 
 def test_o37_two_storages_on_one_directory_are_refused(tmp_path):
+    """O37: two storages on one directory would read each other's files."""
     with pytest.raises(ConfigError, match="entries 0 and 1"):
         load(tmp_path, direct({STORAGE_A: "/srv/one", STORAGE_B: "/srv/one"}))
 

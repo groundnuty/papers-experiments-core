@@ -37,6 +37,7 @@ def test_o37_each_round_runs_both_modes_from_the_same_state_and_alternates_which
 
 
 def test_o37_reads_that_place_the_same_bytes_compare_the_same(script):
+    """O37: the same gains read by read, and the same placement at the end, are the same."""
     base = {TAG: replay([(0, 1 << 20)], [(1 << 20, 1 << 20)])}
     other = {TAG: replay([(0, 1 << 20)], [(1 << 20, 1 << 20)])}
     [found] = script.compare(base, other)
@@ -61,6 +62,7 @@ def test_o37_a_read_that_placed_other_bytes_is_named_with_the_bytes_only_each_pa
 
 
 def test_o37_equal_totals_with_reads_that_trade_bytes_are_a_difference(script):
+    """O37: two reads that trade bytes differ even when the sequence's total agrees."""
     base = {TAG: replay([(0, 2 << 20)], [])}
     other = {TAG: replay([(0, 1 << 20)], [(1 << 20, 1 << 20)])}
     [found] = script.compare(base, other)
@@ -89,6 +91,7 @@ def test_o37_a_file_whose_replay_is_not_complete_in_both_passes_is_incomplete_ne
 
 
 def test_o37_the_verdict_is_yes_only_when_every_file_compared_and_none_differs(script):
+    """O37: unknown is never yes, and one difference is a no."""
     same = {"file": "a", "same": True, "incomplete": None}
     differs = {"file": "b", "same": False, "incomplete": None}
     unknown = {"file": "c", "same": None, "incomplete": "a read failed or gave no answer"}
@@ -103,6 +106,7 @@ def test_o37_the_verdict_is_yes_only_when_every_file_compared_and_none_differs(s
 
 
 def test_o37_a_storage_argument_is_an_id_with_an_optional_host_path(script, tmp_path):
+    """O37: the storage's id and host directory, the Compose layout's by default."""
     platform = tmp_path / "platform.toml"
     assert script.storage_of("0a1b2c", None, platform, "oak") == ("0a1b2c", str(tmp_path / "oak" / "storage"))
     assert script.storage_of("0a1b2c", "/srv/other", platform, "oak") == ("0a1b2c", "/srv/other")
@@ -113,6 +117,7 @@ def test_o37_a_storage_argument_is_an_id_with_an_optional_host_path(script, tmp_
 
 
 def test_o37_the_direct_pass_maps_the_storage_and_names_the_check_file_and_the_proxy_pass_neither(script):
+    """O37: each pass's mount keys fit its mode, as the loader requires."""
     proxy = script.mount_keys("proxy", ("0a1b2c", "/srv/s"), "space/run/check.bin")
     direct = script.mount_keys("direct", ("0a1b2c", "/srv/s"), "space/run/check.bin")
     assert proxy == {"io_mode": "proxy"}
@@ -122,6 +127,7 @@ def test_o37_the_direct_pass_maps_the_storage_and_names_the_check_file_and_the_p
 
 
 def test_o37_the_help_says_what_it_compares_and_what_it_changes(script, capsys):
+    """O37: the help names the comparison, the state it starts from and what it changes."""
     with pytest.raises(SystemExit) as stop:
         script.main(["--help"])
     assert stop.value.code == 0
@@ -139,7 +145,7 @@ def test_o37_the_help_says_what_it_compares_and_what_it_changes(script, capsys):
 
 
 def test_o37_the_comparison_lines_hold_numbers_and_tags_never_a_path(script):
-    """O12: each line the comparison writes holds a tag, offsets, lengths and counts."""
+    """O37, O12: each line the comparison writes holds a tag, offsets, lengths and counts."""
     base = {TAG: replay([(0, 10)])}
     other = {TAG: replay([(0, 20)])}
     text = json.dumps(script.compare(base, other))

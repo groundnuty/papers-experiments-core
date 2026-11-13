@@ -1,12 +1,15 @@
 # Provenance: new
-"""What a study may pass to the sidecar's oneclient, and how a run's metadata names it (O36).
+"""What a study may pass to the sidecar's oneclient, and how a run's metadata names it (O36, O37).
 
 The core declares everything oneclient would otherwise decide at run time: the I/O mode (`io_mode`), the TLS check (the
-platform's `[tls]`), the configuration file (never read: `--config /dev/null`) and the environment (`env -u` of the
-three variables of the image and of oneclient's own that could set an option). A study's `extra_args` reach the same
-argv, so none of them may set what the core sets. `extra_arg_problem` names the reason an argument is refused, and the
-same check runs where the settings are built (`MountSettings`), where the platform file is loaded and where the
-command is made, so settings built in code cannot give oneclient two force-I/O options or a second configuration.
+platform's `[tls]`), the configuration file (never read: `--config /dev/null`), the environment (`env -u` of the
+three variables of the image and of oneclient's own that could set an option) and, for direct I/O, where each storage
+is (one `--override` per entry of `[sandbox.mount.storages]`) and the log's buffering. A study's `extra_args` reach the
+same argv, so none of them may set what the core sets. `mount_problem` also holds a mount's direct-I/O keys to its mode:
+a direct mount needs its storage mapping and its check file, a proxy mount may have neither (O37). `extra_arg_problem`
+names the reason an argument is refused, and the same check runs where the settings are built (`MountSettings`), where
+the platform file is loaded and where the command is made, so settings built in code cannot give oneclient two
+force-I/O options or a second configuration.
 
 `LONG_OPTIONS` and `SHORT_OPTIONS` are the option names oneclient 25.0 (tag `bb8a63e3`) accepts on its command line,
 read from `src/options/options.cc`. A run's metadata keeps an extra argument's name only when it is one of them

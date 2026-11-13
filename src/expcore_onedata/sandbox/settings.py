@@ -47,9 +47,13 @@ gate_memory_bytes = 1073741824  # optional
 
 [sandbox.mount]                 # required when a data path is a mount
 path = "/data"                  # where the agent sees the space, read-only
-io_mode = "proxy"               # required, no default: "proxy" (O36); "direct" is refused until #223 maps the storage
+io_mode = "proxy"               # required, no default: "proxy" or "direct" (O36)
 extra_args = []                 # further oneclient arguments, never one that sets the TLS mode, the I/O mode, the
-                                # config file or oneclient's environment
+                                # config file, a storage override or oneclient's environment
+direct_check_file = "space/f"   # "direct" only, and required with it: a space's directory under the mount, then a file
+                                # in it that the local provider holds in full; read at every start (O37)
+[sandbox.mount.storages]        # "direct" only, and required with it: each storage the sidecar reads directly
+"<storage id>" = "/host/dir"    # the directory that holds it on the host, bound read-only into the sidecar alone
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
@@ -72,10 +76,13 @@ providers.<local> = "host"      # the local provider's host name on that network
 access type at the first read of each space, and for a second space on a storage already detected as proxied it takes a
 plain mutex it already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`, the recursion at the end of
 its `!forceProxyIO` branch), so the read waits for ever and nothing is logged. `proxy` (`--force-proxy-io`) reads every
-space through the provider. `direct` (`--force-direct-io`) reads the storage itself and so needs the providers' storage
-mapped into the sidecar, which the sandbox does not do yet: it is refused at load (#223), and the command's code for it
-stays for the mapping to lift the refusal. There is no third word for oneclient's own detection, and the extra
-arguments may not carry either force option. The sidecar's oneclient reads no configuration file (`--config
+space through the provider. `direct` (`--force-direct-io`) reads the local provider's storage itself, so it loads only
+with `[sandbox.mount.storages]` and `direct_check_file`, which a proxy mount may not have (O37): each mapped storage is
+bound read-only into the sidecar alone and named to oneclient by `--override <id>:mountPoint:<its place there>`, and
+the start reads the check file and the sidecar's log to show direct I/O in effect, or refuses the sandbox
+(`directio`). A storage is named in a message by its position, never by its id or path, and none may be, hold or lie
+under `work_root`. There is no third word for oneclient's own detection, and the extra arguments may not carry either
+force option, nor an override. The sidecar's oneclient reads no configuration file (`--config
 /dev/null`) and its environment holds the token alone (`env -u` of `ONECLIENT_INSECURE`, `ONECLIENT_OVERRIDE` and
 `ONECLIENT_CONFIG`), so its effective options are the argv and the token. The I/O mode is in the campaign fingerprint,
 for each mount level, as the listing is for a REST level.
