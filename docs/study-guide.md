@@ -245,6 +245,7 @@ from expcore.campaign.abandoned_bound import abandoned_request_bound, held_to_re
 entry = {
     "reason": "read_timeout", "usage": "unknown", "prompt_bound_tokens": 100_500, "prompt_bound_by": "bytes",
     "reply_max_tokens": 8000, "window_tokens": 200_000, "bound_checked": 3, "bound_exceeded": 0, "bound_unreported": 0,
+    "bound_overlapped": 0,
 }
 totals = {"reserved_capped": True, "reply_cap_unheld": False}  # as the record's totals say
 tight = abandoned_request_bound(model, limits, entry, reply_capped=held_to_reply_maximum(totals))
@@ -254,7 +255,7 @@ loose = abandoned_request_bound(model, limits, {"reason": "read_timeout", "usage
 assert (loose.prompt_by, round(loose.request_bound_usd, 6)) == ("window", 0.145)  # an older record: `overshoot_usd`
 ```
 
-The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows. Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `bound_exceeded` before trusting an entry. A backend of your own that does not record the bound keeps the window's.
+The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows (checked by digest, with the window as the answer when it fails). Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `bound_exceeded` before trusting an entry. A backend of your own that does not record the bound keeps the window's.
 
 ### The federation's certificate
 

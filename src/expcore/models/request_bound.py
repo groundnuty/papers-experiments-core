@@ -23,7 +23,7 @@ Messages API, `adapters._anthropic_counts`), and `out_k`, its completion. Let n 
 request k's prompt, plus what the model generated and the harness appended after k was built, plus the framing the
 template writes around each message:
 
-    P(n) <= in_k + out_k + bytes(messages appended after k) + bytes(growth of the system prompt, tools, extras)
+    P(n) <= in_k + out_k + bytes(messages appended after k) + bytes(system prompt, tools, extras, if they changed)
             + FRAMING_MARGIN_TOKENS x (1 + messages appended)
 
 `bytes` is the length of each message as the adapter sends it, as JSON written the way a chat template writes it
@@ -38,9 +38,13 @@ P(n) is replaced by W (`BY_WINDOW`) when no reply has reported both counts (the 
 on, and a provider adds text of its own to it, a tool-use preamble or a template's rendering of the tool list, that its
 bytes do not show); when the reply of the request just before reported a count short (`unreported`: the chain
 re-anchors at the next reply that reports both, which holds the hidden part); when the bound is W or more, since the
-endpoint refuses a prompt above its window (the assumption of C25); when the history is no extension of the anchor's or
-a message cannot be written as JSON; and for the rest of the conversation once the byte assumption has been shown false
-(below). With no W and nothing to anchor on there is no bound (`BY_NONE`), and the entry says so.
+endpoint refuses a prompt above its window (the assumption of C25); when the history is no extension of the anchor's
+(its first messages are not the anchor's, digest for digest: a replaced, reordered or shortened history) or a message
+cannot be written as JSON; and for the rest of the conversation once the byte assumption has been shown false (below)
+or a request was built while another was in flight (`overlapped`: the anchor rests on one request at a time, as the
+retrier sends them, and nothing would say whose reply came first). With no W and nothing to anchor on there is no
+bound (`BY_NONE`), and the entry says so. A change to the system prompt, the tools or the extras counts all of their
+bytes as appended: the anchor's prompt held the old text, and the new text costs at most its bytes.
 
 **The reply, R.** The reply of the request is at most the `max_tokens` it carried, kept as `reply_max_tokens`. Whether
 the endpoint applies it is the campaign's decision (C27), made after the adapter built the request, so the entry holds
@@ -63,15 +67,18 @@ abandoned request keeps the entry the retrier makes, which a scorer prices by th
    JSON of a large nested object, say) breaks the assumption, and the tripwire below is what shows it.
 2. A reply's reported prompt count is the tokens of the whole prompt it was billed, the assumption the token cap makes
    (C25), and its completion count is every token it generated.
-3. The history only grows, and the part of a request outside its messages (system prompt, tool list, extras) is the
-   same or grows: a template that drops earlier reasoning, or a part that shrinks, only makes the real prompt smaller.
+3. The history only grows: every message is appended and none is changed, which the tracker checks by digest and
+   answers with the window when it does not hold. A template that drops earlier reasoning only makes the real prompt
+   smaller.
 Assumption 1 and the template's framing are tested by every completed request bounded by bytes: a reply that reports a
 prompt above the bound it was sent with (`exceeded`) shows the assumption false for this endpoint, and every later
 request of the conversation is bounded by W; the entry counts what was checked and what failed (`bound_checked`,
-`bound_exceeded`) and the replies that left a count out (`bound_unreported`). That is a tripwire, not a proof: an
+`bound_exceeded`), the replies that left a count out (`bound_unreported`) and the requests built while another was in
+flight (`bound_overlapped`). That is a tripwire, not a proof: an
 endpoint that is wrong only on the request that hangs is not seen, and the guarantee is the assumptions above.
 """
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -87,11 +94,17 @@ BOUND_BASES = (BY_BYTES, BY_WINDOW, BY_NONE)
 # is at least a byte, so this is a margin on top of a margin.
 FRAMING_MARGIN_TOKENS = 32
 
-
 # The characters Jinja's `tojson` (the filter chat templates write tool-call arguments with) escapes so its output is
 # safe in HTML: each is one byte in the arguments the adapter sends and six, `<` and its kin, in the template's text.
 _TEMPLATE_ESCAPED = "<>&'"
 _TEMPLATE_ESCAPE_EXTRA = 5
+
+
+def _measure(value: Any) -> tuple[int, bytes]:
+    """Return the bytes of a value as a chat template can write it, and a digest of its text (see `message_bytes`)."""
+    text = json.dumps(value, ensure_ascii=True, default=str)
+    size = len(text) + _TEMPLATE_ESCAPE_EXTRA * sum(text.count(c) for c in _TEMPLATE_ESCAPED)
+    return size, hashlib.blake2b(text.encode("ascii"), digest_size=16).digest()
 
 
 def message_bytes(value: Any) -> int:
@@ -103,8 +116,7 @@ def message_bytes(value: Any) -> int:
     tool result decoded with errors kept can hold, is escaped like any other. Raises ValueError or TypeError for a
     value that cannot be written as JSON at all (a circular reference).
     """
-    text = json.dumps(value, ensure_ascii=True, default=str)
-    return len(text) + _TEMPLATE_ESCAPE_EXTRA * sum(text.count(c) for c in _TEMPLATE_ESCAPED)
+    return _measure(value)[0]
 
 
 @dataclass(frozen=True)
@@ -113,7 +125,8 @@ class RequestBound:
 
     `prompt_tokens` bounds the prompt and `by` says how: None only when `by` is `BY_NONE`. `reply_max_tokens` is the
     `max_tokens` the request carried. `checked` and `exceeded` count the completed requests of the conversation whose
-    byte bound was tested against the prompt they reported, and failed; `unreported` the replies that left a count out.
+    byte bound was tested against the prompt they reported, and failed; `unreported` the replies that left a count out;
+    `overlapped` the requests built while another was still in flight.
     """
 
     prompt_tokens: int | None
@@ -123,6 +136,7 @@ class RequestBound:
     checked: int = 0
     exceeded: int = 0
     unreported: int = 0
+    overlapped: int = 0
 
     def entry(self) -> dict[str, Any]:
         """Return the fields an abandoned request adds to the record, in plain values."""
@@ -134,26 +148,40 @@ class RequestBound:
             "bound_checked": self.checked,
             "bound_exceeded": self.exceeded,
             "bound_unreported": self.unreported,
+            "bound_overlapped": self.overlapped,
         }
 
 
 @dataclass(frozen=True)
 class _Anchor:
-    """A request whose reply reported both counts: the two, how many messages the request carried, and the bytes of
-    its body outside the messages."""
+    """A request whose reply reported both counts: the two, a digest of each message the request carried, and the
+    digest of its body outside the messages. A later request is an extension of it only when its first messages have
+    these digests, in this order."""
 
     prompt_tokens: int
     completion_tokens: int
-    messages: int
-    fixed_bytes: int
+    messages: tuple[bytes, ...]
+    fixed: bytes
+
+
+@dataclass(frozen=True)
+class _InFlight:
+    """The request sent and not yet answered: its bound, and what it would anchor, None when it cannot be measured."""
+
+    bound: RequestBound
+    messages: tuple[bytes, ...] | None
+    fixed: bytes | None
 
 
 class PromptBound:
     """Bounds the prompt of each request of one conversation, as the module docstring derives, and tests the bound.
 
-    One per backend. `begin` starts a conversation, `sent` is called with the body of each request as it is built,
-    `replied` with the counts its reply reported (None for one it left out), `gave_up` when the request ended with no
-    reply. The tracker holds conversation state that changes with every request, by design: it is the point of it.
+    One per backend, for requests sent one at a time. `begin` starts a conversation, `sent` is called with the body of
+    each request as it is built, `replied` with the counts its reply reported (None for one it left out), `gave_up`
+    when the request ended with no reply. A request built while another is in flight breaks the one-at-a-time rule the
+    anchor rests on, since a reply could then be taken for the other request's: it is counted in `overlapped`, and the
+    conversation is bounded by the window from then on. The tracker holds conversation state that changes with every
+    request, by design: it is the point of it.
     """
 
     def __init__(self, window: int | None, reply_max: int | None):
@@ -163,10 +191,11 @@ class PromptBound:
     def begin(self) -> None:
         """Start a conversation: no anchor, no check, no lost trust."""
         self._anchor: _Anchor | None = None
-        self._current: tuple[RequestBound, int, int | None] | None = None  # the bound, its messages, its fixed bytes
+        self._current: _InFlight | None = None
         self._checked = 0
         self._exceeded = 0
         self._unreported = 0
+        self._overlapped = 0
 
     def sent(self, request: Mapping[str, Any]) -> RequestBound:
         """Bound the request just built and keep it as the one in flight.
@@ -174,17 +203,22 @@ class PromptBound:
         `request` is the body as it goes out: its `messages`, and everything else (system prompt, tools, extras) as the
         fixed part. The reply maximum is the body's own `max_tokens`.
         """
-        messages = request["messages"]
+        if self._current is not None:
+            self._overlapped += 1  # the earlier request has not ended: nothing says whose reply will come first
         reply_max = request.get("max_tokens")
         reply_max = reply_max if isinstance(reply_max, int) and not isinstance(reply_max, bool) else self.reply_max
         try:
-            fixed: int | None = message_bytes({k: v for k, v in request.items() if k != "messages"})
-            prompt, by = self._prompt_bound(messages, fixed or 0)
+            fixed_size, fixed = _measure({k: v for k, v in request.items() if k != "messages"})
+            measured = [_measure(message) for message in request["messages"]]
         except (TypeError, ValueError):  # not written as JSON: nothing to measure, so the window's bound, said so
-            fixed, (prompt, by) = None, self._window_bound()
-        bound = RequestBound(prompt, by, reply_max, self.window, self._checked, self._exceeded, self._unreported)
-        self._current = (bound, len(messages), fixed)
-        return bound
+            prompt, by = self._window_bound()
+            held = _InFlight(self._bound(prompt, by, reply_max), None, None)
+        else:
+            digests = tuple(digest for _, digest in measured)
+            prompt, by = self._prompt_bound([size for size, _ in measured], digests, fixed_size, fixed)
+            held = _InFlight(self._bound(prompt, by, reply_max), digests, fixed)
+        self._current = held
+        return held.bound
 
     def replied(self, prompt_tokens: int | None, completion_tokens: int | None) -> None:
         """The request in flight was answered, reporting these counts (None: left out).
@@ -195,18 +229,17 @@ class PromptBound:
         """
         if self._current is None:
             return
-        bound, messages, fixed = self._current
-        self._current = None
-        if prompt_tokens is not None and bound.by == BY_BYTES and bound.prompt_tokens is not None:
+        held, self._current = self._current, None
+        if prompt_tokens is not None and held.bound.by == BY_BYTES and held.bound.prompt_tokens is not None:
             self._checked += 1
-            self._exceeded += prompt_tokens > bound.prompt_tokens
+            self._exceeded += prompt_tokens > held.bound.prompt_tokens
         if prompt_tokens is None or completion_tokens is None:
             self._anchor = None
             self._unreported += 1
-        elif fixed is None:
+        elif held.messages is None or held.fixed is None:
             self._anchor = None  # a body that cannot be measured anchors nothing
         else:
-            self._anchor = _Anchor(prompt_tokens, completion_tokens, messages, fixed)
+            self._anchor = _Anchor(prompt_tokens, completion_tokens, held.messages, held.fixed)
 
     def gave_up(self) -> None:
         """The request in flight ended with no reply (an error, a cancel): nothing is in flight any more. The anchor is
@@ -217,26 +250,36 @@ class PromptBound:
         """Return the entry for a request given up now: the one sent and not answered; with none in flight, the
         window's bound, which holds for any request."""
         if self._current is not None:
-            return self._current[0].entry()
+            return self._current.bound.entry()
         prompt, by = self._window_bound()
-        bound = RequestBound(prompt, by, self.reply_max, self.window, self._checked, self._exceeded, self._unreported)
-        return bound.entry()
+        return self._bound(prompt, by, self.reply_max).entry()
+
+    def _bound(self, prompt: int | None, by: str, reply_max: int | None) -> RequestBound:
+        return RequestBound(
+            prompt, by, reply_max, self.window, self._checked, self._exceeded, self._unreported, self._overlapped
+        )
 
     def _window_bound(self) -> tuple[int | None, str]:
         """The bound that needs no assumption about bytes: the window, or none without one."""
         return (None, BY_NONE) if self.window is None else (self.window, BY_WINDOW)
 
-    def _prompt_bound(self, messages: list[Any], fixed: int) -> tuple[int | None, str]:
-        """The bytes bound of a request, or the window's when the bytes cannot be trusted or do not tighten it."""
+    def _prompt_bound(
+        self, sizes: list[int], digests: tuple[bytes, ...], fixed_size: int, fixed: bytes
+    ) -> tuple[int | None, str]:
+        """The bytes bound of a request, or the window's when the bytes cannot be trusted or do not tighten it.
+
+        The request has to be an extension of the anchor's: its first messages are the anchor's, digest for digest. A
+        replaced, reordered or shortened history is not, and the window bounds it. The part of the body outside the
+        messages is free to differ; if it does, all of it is counted as appended, since the anchor's prompt held the
+        old text and the new text costs at most its bytes.
+        """
         anchor = self._anchor
-        if anchor is None or self._exceeded or len(messages) < anchor.messages:
+        held = len(anchor.messages) if anchor is not None else 0
+        if anchor is None or self._exceeded or self._overlapped or digests[:held] != anchor.messages:
             return self._window_bound()
-        appended = messages[anchor.messages :]
-        grown = max(0, fixed - anchor.fixed_bytes)
-        framing = FRAMING_MARGIN_TOKENS * (1 + len(appended))
-        bytes_bound = (
-            anchor.prompt_tokens + anchor.completion_tokens + sum(map(message_bytes, appended)) + grown + framing
-        )
+        grown = 0 if fixed == anchor.fixed else fixed_size
+        framing = FRAMING_MARGIN_TOKENS * (1 + len(sizes) - held)
+        bytes_bound = anchor.prompt_tokens + anchor.completion_tokens + sum(sizes[held:]) + grown + framing
         if self.window is not None and bytes_bound >= self.window:
             return self.window, BY_WINDOW
         return bytes_bound, BY_BYTES

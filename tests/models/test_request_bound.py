@@ -53,6 +53,13 @@ def tracker(window=WINDOW):
     return bound
 
 
+def asked(bound, body):
+    """Build a request and let it end with no reply, so the next one is built with none in flight."""
+    sent = bound.sent(body)
+    bound.gave_up()
+    return sent
+
+
 def expected(prompt, completion, appended) -> int:
     """The bound the derivation gives: both reported counts, the bytes appended after them and a margin each."""
     return prompt + completion + sum(rendered(m) for m in appended) + FRAMING_MARGIN_TOKENS * (1 + len(appended))
@@ -253,19 +260,24 @@ def test_b19_a_new_conversation_starts_over():
     assert bound.sent(request([user(), assistant(), tool()])).by == BY_BYTES
 
 
-def test_b19_growth_of_the_part_outside_the_messages_is_paid_for_and_shrinkage_is_not_credited():
-    """B19: the system prompt and the tool list are in the reported prompt; if either grew since, the growth is appended
-    text like any other. If one shrank, the real prompt only got smaller, and nothing is taken off."""
+def test_b19_a_change_to_the_part_outside_the_messages_is_counted_in_full_and_an_unchanged_part_is_not_counted():
+    """B19: the system prompt and the tool list are in the reported prompt, so an unchanged part adds nothing. A part
+    that changed in any way, longer, shorter or the same length with other words, is counted in full as appended: the
+    anchor's prompt held the old text, and the new text costs at most its bytes. Nothing is taken off for a shorter."""
     bound = tracker()
     history = [user()]
     bound.sent(request(history, system="short" * 20))
     bound.replied(100, 5)
     history += [assistant(), tool()]
-    same = bound.sent(request(history, system="short" * 20))
-    grown = bound.sent(request(history, system="short" * 20 + "s" * 300))
-    shrunk = bound.sent(request(history, system=""))
-    assert grown.prompt_tokens - same.prompt_tokens == 300
-    assert shrunk.prompt_tokens == same.prompt_tokens
+    same = asked(bound, request(history, system="short" * 20))
+    longer = asked(bound, request(history, system="short" * 20 + "s" * 300))
+    shorter = asked(bound, request(history, system=""))
+    swapped = asked(bound, request(history, system="other" * 20))  # as long as the anchor's, and not the same words
+    fixed = {"model": "m", "max_tokens": REPLY}
+    assert longer.prompt_tokens - same.prompt_tokens == message_bytes({**fixed, "system": "short" * 20 + "s" * 300})
+    assert shorter.prompt_tokens - same.prompt_tokens == message_bytes({**fixed, "system": ""})
+    assert swapped.prompt_tokens - same.prompt_tokens == message_bytes({**fixed, "system": "other" * 20})
+    assert min(longer.prompt_tokens, shorter.prompt_tokens, swapped.prompt_tokens) > same.prompt_tokens
 
 
 def test_b19_a_history_shorter_than_the_anchor_is_no_extension_of_it_and_the_window_bounds_it():
@@ -276,6 +288,54 @@ def test_b19_a_history_shorter_than_the_anchor_is_no_extension_of_it_and_the_win
     bound.replied(100, 5)
     sent = bound.sent(request([user()]))
     assert (sent.prompt_tokens, sent.by) == (WINDOW, BY_WINDOW)
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        [user("x" * 10_000)],  # the one message replaced by one of another content, and of another length
+        [user("b")],  # replaced by one of the same length: only the words differ
+        [assistant("a")],  # the same words under another role
+    ],
+    ids=["longer", "same-length", "other-role"],
+)
+def test_b19_a_history_whose_first_messages_are_not_the_anchors_is_bounded_by_the_window(later):
+    """B19: the anchor's counts describe the messages it carried, so a request that replaced one, whatever its length,
+    is no extension of it: a one-token-per-byte tokenizer reads 10,000 tokens in the first case; the window holds."""
+    bound = tracker(window=20_000)
+    bound.sent(request([user("a")]))
+    bound.replied(1, 1)
+    sent = bound.sent(request(later))
+    assert (sent.prompt_tokens, sent.by) == (20_000, BY_WINDOW)
+
+
+def test_b19_a_reordered_history_is_bounded_by_the_window_and_an_appended_one_is_not():
+    """B19: the same messages in another order are no extension of the anchor's; the same messages with more after them
+    are."""
+    bound = tracker()
+    first, second = user("one"), assistant("two")
+    bound.sent(request([first, second]))
+    bound.replied(100, 5)
+    assert asked(bound, request([second, first, tool()])).by == BY_WINDOW
+    assert asked(bound, request([first, second, tool()])).by == BY_BYTES
+
+
+def test_b19_a_request_built_while_another_is_in_flight_loses_the_byte_bound_for_the_conversation():
+    """B19: the anchor rests on one request at a time. Request A is in flight when B is built; A's reply then arrives
+    and would anchor B's history with A's counts. The tracker counts the overlap, bounds B by the window, and takes
+    the byte bound away from every later request, so request C is bounded by the window though A's counts are
+    truthful and the history only grew."""
+    bound = tracker(window=20_000)
+    first = [user("a")]
+    bound.sent(request(first))
+    second = [*first, assistant("z"), tool("t" * 10_000)]
+    overlapping = bound.sent(request(second))  # A has not been answered
+    assert (overlapping.prompt_tokens, overlapping.by, overlapping.overlapped) == (20_000, BY_WINDOW, 1)
+    bound.replied(1, 1)  # A's reply, taken for the request in flight, which is B
+    bound.gave_up()  # B ends with no reply
+    third = bound.sent(request([*second, assistant("again")]))
+    assert (third.prompt_tokens, third.by, third.overlapped) == (20_000, BY_WINDOW, 1)
+    assert bound.in_flight()["bound_overlapped"] == 1
 
 
 def test_b19_a_body_that_cannot_be_measured_is_bounded_by_the_window_and_anchors_nothing():
@@ -337,6 +397,7 @@ def test_b19_the_entry_names_its_basis_the_reply_maximum_the_window_and_what_it_
         "bound_checked": 0,
         "bound_exceeded": 0,
         "bound_unreported": 0,
+        "bound_overlapped": 0,
     }
     json.dumps(sent.entry())  # plain values, so the record keeps it as it is
 

@@ -89,6 +89,7 @@ def test_b19_a_request_after_a_reply_is_bounded_by_its_reported_counts_and_the_b
         "bound_checked": 0,
         "bound_exceeded": 0,
         "bound_unreported": 0,
+        "bound_overlapped": 0,
     }
     assert sent["max_tokens"] == entry["reply_max_tokens"]
     assert bound < 2_000  # a few hundred tokens over the 150 reported, not the 200,000 of the window
@@ -271,6 +272,32 @@ def test_b19_a_request_that_failed_is_not_the_one_in_flight_when_a_probe_is_aban
         asyncio.run(backend.probe())
     entry = backend.info()["abandoned_request"]
     assert (entry["prompt_bound_by"], entry["prompt_bound_tokens"]) == ("window", WINDOW)
+
+
+def test_b19_two_requests_in_flight_at_once_cost_the_conversation_its_byte_bound(
+    make_spec, limits, first_reply, fake_client, make_timeout
+):
+    """B19: the loop sends one request at a time and the adapters are written for that, but a caller that does not
+    leaves the anchor resting on a reply that cannot be matched to its request. The overlap is counted, and the
+    abandoned request after it is bounded by the window though every count was truthful."""
+    client = fake_client(first_reply, first_reply, make_timeout(read=True))
+    answer = client.chat.completions.create
+
+    async def slow(**request):
+        await asyncio.sleep(0)  # a real send is not over before the next one starts
+        return await answer(**request)
+
+    client.chat.completions.create = slow
+    backend = openai_backend(make_spec(context_tokens=WINDOW), limits, client)
+    backend.begin("be brief", "go", TOOLS)
+
+    async def both():
+        return await asyncio.gather(backend.step(), backend.step())
+
+    asyncio.run(both())
+    entry = abandon_next(backend)
+    assert (entry["prompt_bound_by"], entry["prompt_bound_tokens"]) == ("window", WINDOW)
+    assert entry["bound_overlapped"] == 1
 
 
 def test_b19_a_new_conversation_on_the_same_backend_is_not_bounded_from_the_old_one(
