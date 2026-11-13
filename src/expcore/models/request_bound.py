@@ -74,8 +74,10 @@ Assumption 1 and the template's framing are tested by every completed request bo
 prompt above the bound it was sent with (`exceeded`) shows the assumption false for this endpoint, and every later
 request of the conversation is bounded by W; the entry counts what was checked and what failed (`bound_checked`,
 `bound_exceeded`), the replies that left a count out (`bound_unreported`) and the requests built while another was in
-flight (`bound_overlapped`). That is a tripwire, not a proof: an
-endpoint that is wrong only on the request that hangs is not seen, and the guarantee is the assumptions above.
+flight (`bound_overlapped`). That is a tripwire, not a proof: an endpoint that is wrong only on the request that hangs
+is not seen, and the guarantee is the assumptions above. The counts are per backend and so per model per run, and
+`abandoned_bound.abandoned_request_bound` returns them in the basis it prices, so a study can report what a tight bound
+rests on.
 """
 
 import hashlib

@@ -46,6 +46,7 @@ def entry(prompt=100_000, by="bytes", reply=REPLY, **more):
         "bound_checked": 0,
         "bound_exceeded": 0,
         "bound_unreported": 0,
+        "bound_overlapped": 0,
         **more,
     }
 
@@ -54,7 +55,7 @@ def test_b19_a_request_held_to_its_reply_maximum_costs_the_prompt_bound_and_the_
     """B19: the issue's case: a 1,000,000-token window and a run that had sent 100,000 tokens. The loose bound adds
     1,000,000 x 3 + 8,000 x 15 = 3.12 dollars; the tight one 100,000 x 3 + 8,000 x 15 = 0.42."""
     bound = abandoned_request_bound(spec(), LIMITS, entry(), reply_capped=True)
-    assert bound == AbandonedBound(108_000, pytest.approx(0.42), "bytes", "reply_maximum")
+    assert bound == AbandonedBound(108_000, pytest.approx(0.42), "bytes", "reply_maximum", 0, 0, 0, 0)
     assert overshoot_usd(spec(), LIMITS, reply_capped=True) == pytest.approx(3.12)
 
 
@@ -188,8 +189,24 @@ def test_b19_a_window_bounded_entry_of_a_model_without_a_window_is_refused_and_a
         entry(prompt=None, by="bytes"),
         entry(reply=-5),
         entry(reply="many"),
+        entry(bound_checked=-1),
+        entry(bound_exceeded=True),
+        entry(bound_unreported="2"),
+        entry(bound_overlapped=1.5),
     ],
-    ids=["basis", "negative", "bool", "text", "bytes-without-a-count", "negative-reply", "text-reply"],
+    ids=[
+        "basis",
+        "negative",
+        "bool",
+        "text",
+        "bytes-without-a-count",
+        "negative-reply",
+        "text-reply",
+        "negative-checked",
+        "bool-exceeded",
+        "text-unreported",
+        "float-overlapped",
+    ],
 )
 def test_b19_an_entry_that_is_not_what_the_adapters_write_is_refused_naming_the_field(bad):
     """B19: the entry is read from a record, so it is checked at the boundary and not trusted."""
@@ -230,3 +247,80 @@ def test_b19_whether_an_attempt_was_held_to_its_reply_maximum_is_read_from_its_t
     """B19 and C27: the attempt was held only when the gate reserved it by the reply maximum and the totals say the
     campaign had not taken its model off it; a record that says less is not held, which can only charge more."""
     assert held_to_reply_maximum(totals) is held
+
+
+# --- what the tight bound rests on: the tripwire's account of the run so far ----------------------------------------
+
+
+def tripwire(bound: AbandonedBound) -> tuple:
+    """The basis's account of the tripwire: the requests checked, then the three counts that mean it was not clean."""
+    return (
+        bound.tripwire_checked,
+        bound.tripwire_exceeded,
+        bound.tripwire_unreported,
+        bound.tripwire_overlapped,
+    )
+
+
+def test_b19_a_clean_run_says_how_many_requests_its_tight_bound_was_checked_on_and_that_nothing_fired():
+    """B19: three requests were bounded by bytes and each reply came in under its bound: the basis carries the checked
+    count and zeros, and the tripwire had not fired."""
+    bound = abandoned_request_bound(spec(), LIMITS, entry(bound_checked=3), reply_capped=True)
+    assert bound.prompt_by == "bytes"
+    assert tripwire(bound) == (3, 0, 0, 0)
+    assert bound.tripwire_fired_before is False
+
+
+def test_b19_a_run_whose_earlier_reply_exceeded_its_bound_says_so_and_how_many_it_had_checked():
+    """B19: of four requests checked, one reply reported a prompt above its bound. The conversation was bounded by the
+    window from then on, so the entry arrives by the window, and the basis says why and on what evidence."""
+    fired = entry(prompt=WINDOW, by="window", bound_checked=4, bound_exceeded=1)
+    bound = abandoned_request_bound(spec(), LIMITS, fired, reply_capped=True)
+    assert bound.prompt_by == "window"
+    assert tripwire(bound) == (4, 1, 0, 0)
+    assert bound.tripwire_fired_before is True
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ({"bound_exceeded": 2}, (5, 2, 0, 0)),
+        ({"bound_unreported": 1}, (5, 0, 1, 0)),
+        ({"bound_overlapped": 3}, (5, 0, 0, 3)),
+    ],
+    ids=["exceeded", "unreported", "overlapped"],
+)
+def test_b19_each_of_the_three_ways_the_tripwire_is_not_clean_fires_it_and_keeps_its_own_count(counts, expected):
+    """B19: a reply over its bound, a reply that left a count out and a request built while another was in flight
+    each fire the tripwire; the basis keeps them as separate counts and never merges them into one."""
+    bound = abandoned_request_bound(spec(), LIMITS, entry(bound_checked=5, **counts), reply_capped=True)
+    assert tripwire(bound) == expected
+    assert bound.tripwire_fired_before is True
+
+
+def test_b19_an_entry_without_the_counts_is_not_recorded_and_never_a_clean_zero():
+    """B19: a record from before the bound, or from a backend of a study's own, has no account of the tripwire. Its
+    basis says None, so a study cannot read a run that was never tested as one that passed every test."""
+    bound = abandoned_request_bound(spec(), LIMITS, {"reason": "read_timeout", "usage": "unknown"}, reply_capped=True)
+    assert tripwire(bound) == (None, None, None, None)
+    assert bound.tripwire_fired_before is None
+
+
+def test_b19_a_count_the_entry_lacks_is_unknown_and_the_ones_it_has_still_answer_whether_the_tripwire_fired():
+    """B19: with one of the three counts missing, a nonzero one still fires it and zeros alone cannot say it did not."""
+    partial = {k: v for k, v in entry(bound_exceeded=1).items() if k != "bound_overlapped"}
+    assert abandoned_request_bound(spec(), LIMITS, partial, reply_capped=True).tripwire_fired_before is True
+    partial = {k: v for k, v in entry().items() if k != "bound_overlapped"}
+    bound = abandoned_request_bound(spec(), LIMITS, partial, reply_capped=True)
+    assert tripwire(bound) == (0, 0, 0, None)
+    assert bound.tripwire_fired_before is None
+
+
+def test_b19_the_basis_is_read_per_entry_so_two_models_of_a_run_keep_their_own_account():
+    """B19: the entries of two models of one run are priced separately, and each basis carries its own counts."""
+    clean = abandoned_request_bound(spec(), LIMITS, entry(bound_checked=7), reply_capped=True)
+    fired = abandoned_request_bound(
+        spec(), LIMITS, entry(prompt=WINDOW, by="window", bound_checked=2, bound_exceeded=1), reply_capped=True
+    )
+    assert (tripwire(clean), clean.tripwire_fired_before) == ((7, 0, 0, 0), False)
+    assert (tripwire(fired), fired.tripwire_fired_before) == ((2, 1, 0, 0), True)

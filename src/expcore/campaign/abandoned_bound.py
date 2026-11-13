@@ -5,10 +5,10 @@ When the loop gives up a request already in flight, the record says `backend_inf
 bound the adapter took when it built that request (`expcore.models.request_bound`, which derives the prompt bound and
 lists its assumptions): `prompt_bound_tokens` and how it was reached (`prompt_bound_by`: `bytes`, `window` or `none`),
 the `reply_max_tokens` the request carried, and what the conversation tested (`bound_checked`, `bound_exceeded`,
-`bound_unreported`). This module prices it. **It is recorded only: the budget gate never reads it.** The gate's
-reservation is the bound of C25 and C27, which already covers every request of an attempt, this one included; a study
-that charges an abandoned run for the request it gave up (a cost scorer, an adverse bound on a cost contrast) calls
-`abandoned_request_bound` instead of `W x p_in + R x p_out`, and reports which basis it used.
+`bound_unreported`, `bound_overlapped`). This module prices it. **It is recorded only: the budget gate never reads
+it.** The gate's reservation is the bound of C25 and C27, which already covers every request of an attempt, this one
+included; a study that charges an abandoned run for the request it gave up (a cost scorer, an adverse bound on a cost
+contrast) calls `abandoned_request_bound` instead of `W x p_in + R x p_out`, and reports which basis it used.
 
 **The bound, P the prompt bound and W the context window** (`ModelSpec.context_tokens`), at the dearest rates of the
 tiers a prompt of P tokens can fall in (a tier takes its prompt's whole request, reply included, C24):
@@ -25,6 +25,18 @@ The prompt bound is sound only under the assumptions `expcore.models.request_bou
 byte, a reply's reported prompt is the whole prompt, history only grows); the entry's `bound_exceeded` is the tripwire,
 and a conversation that tripped it is bounded by the window from then on. The bound on the reply is sound only where
 the campaign showed the endpoint applies `max_tokens` (C27), which is why a caller says whether the attempt was held.
+
+**What the tight bound rests on.** The basis returned also carries the tripwire's account of the run so far, for the
+model of the entry: the requests it had checked (`tripwire_checked`) and the three counts that mean the tripwire was
+not clean, kept apart: `tripwire_exceeded` (an earlier reply reported a prompt above its bound), `tripwire_unreported`
+(a reply left a count out) and `tripwire_overlapped` (a request was built while another was in flight, the
+abandoned one included).
+`tripwire_fired_before` is true when any of the three is above zero. The entry is one model's, in one run, since the
+adapters keep one tracker per backend and start it over with each conversation, so the account is per model per run and
+nothing of another model's is in it. A count the entry lacks (a record from before the bound, a backend of a study's
+own) is None and never 0: a run that was never tested has not passed every test, and `tripwire_fired_before` is None
+unless a nonzero count answers it or all three are present. An entry that fired `bound_exceeded` or `bound_overlapped`
+arrives bounded by the window, so there the account says why.
 """
 
 from collections.abc import Mapping
@@ -47,12 +59,32 @@ class AbandonedBound:
     prompt was bounded by the last reported prompt and the bytes appended since, and `window` when by the model's
     window; `reply_by` is `reply_maximum` when the reply was bounded by the `max_tokens` the request carried and
     `window` when only the window held the request.
+
+    The `tripwire_*` fields say what a tight bound rests on, for the model and the run the entry belongs to.
+    `tripwire_checked` counts the earlier requests bounded by bytes whose reply was tested against its bound. The other
+    three count what was not clean: `exceeded`, replies that reported a prompt above their bound; `unreported`, replies
+    that left a count out; `overlapped`, requests built while another was in flight, the abandoned one included. Each
+    is None ("not recorded") when the entry lacks it, and never 0.
     """
 
     request_bound_tokens: int
     request_bound_usd: float | None
     prompt_by: str
     reply_by: str
+    tripwire_checked: int | None = None
+    tripwire_exceeded: int | None = None
+    tripwire_unreported: int | None = None
+    tripwire_overlapped: int | None = None
+
+    @property
+    def tripwire_fired_before(self) -> bool | None:
+        """Whether the tripwire had fired earlier in the run: True when an earlier reply exceeded its bound, left a
+        count out, or a request overlapped another. False when all three counts are recorded and zero; None when
+        none is above zero and one is not recorded, since an untested run has not passed."""
+        counts = (self.tripwire_exceeded, self.tripwire_unreported, self.tripwire_overlapped)
+        if any(count for count in counts if count is not None):
+            return True
+        return None if None in counts else False
 
 
 def held_to_reply_maximum(totals: Mapping[str, Any]) -> bool:
@@ -64,7 +96,7 @@ def held_to_reply_maximum(totals: Mapping[str, Any]) -> bool:
 
 
 def _count(entry: Mapping[str, Any], name: str) -> int | None:
-    """Read one token count of the entry: a non-negative integer, or None when it is absent or null."""
+    """Read one count of the entry (tokens, requests, replies): a non-negative integer, or None when absent or null."""
     value = entry.get(name)
     if value is None:
         return None
@@ -133,9 +165,11 @@ def abandoned_request_bound(
     """Return the most the request an attempt gave up can cost, from the `abandoned_request` entry of its record.
 
     `reply_capped` says whether the attempt was held to its reply maximum: `held_to_reply_maximum(record.totals)`.
-    An entry without the bound fields (an older record, a backend of a study's own) is bounded by the window. Raises
-    ValueError for an entry that is not what the adapters write, naming the field, and for a model with no
-    `context_tokens` where the window is needed: a bound by bytes with a reply held to its maximum needs none.
+    An entry without the bound fields (an older record, a backend of a study's own) is bounded by the window. The
+    basis carries the entry's account of the tripwire (`tripwire_checked`, `tripwire_exceeded`, `tripwire_unreported`,
+    `tripwire_overlapped`, `tripwire_fired_before`): None for what the entry lacks. Raises ValueError for an entry that
+    is not what the adapters write, naming the field, and for a model with no `context_tokens` where the window is
+    needed: a bound by bytes with a reply held to its maximum needs none.
     """
     if not isinstance(entry, Mapping):
         raise ValueError(f"abandoned_request is the record's entry for the request given up, not {entry!r}")
@@ -155,4 +189,13 @@ def abandoned_request_bound(
         usd = None
     else:
         usd = _usd(spec.price, prompt, held, window)
-    return AbandonedBound(tokens, usd, prompt_by, reply_by)
+    return AbandonedBound(
+        tokens,
+        usd,
+        prompt_by,
+        reply_by,
+        tripwire_checked=_count(entry, "bound_checked"),
+        tripwire_exceeded=_count(entry, "bound_exceeded"),
+        tripwire_unreported=_count(entry, "bound_unreported"),
+        tripwire_overlapped=_count(entry, "bound_overlapped"),
+    )

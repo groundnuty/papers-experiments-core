@@ -251,11 +251,15 @@ totals = {"reserved_capped": True, "reply_cap_unheld": False}  # as the record's
 tight = abandoned_request_bound(model, limits, entry, reply_capped=held_to_reply_maximum(totals))
 assert (tight.request_bound_tokens, tight.prompt_by, tight.reply_by) == (108_500, "bytes", "reply_maximum")
 assert round(tight.request_bound_usd, 8) == 0.04140625  # 100,500 x 0.3125 + 8,000 x 1.25, per million
+assert (tight.tripwire_checked, tight.tripwire_fired_before) == (3, False)  # what the tight bound rests on
 loose = abandoned_request_bound(model, limits, {"reason": "read_timeout", "usage": "unknown"}, reply_capped=True)
 assert (loose.prompt_by, round(loose.request_bound_usd, 6)) == ("window", 0.145)  # an older record: `overshoot_usd`
+assert (loose.tripwire_checked, loose.tripwire_fired_before) == (None, None)  # not recorded, which is not a clean run
 ```
 
-The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows (checked by digest, with the window as the answer when it fails). Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `bound_exceeded` before trusting an entry. A backend of your own that does not record the bound keeps the window's.
+The basis says what its bound rests on: `tripwire_checked`, the requests of that model in that run that were bounded by bytes and tested against the reply that came back, and `tripwire_exceeded`, `tripwire_unreported` and `tripwire_overlapped`, the replies that reported a prompt above their bound, the replies that left a count out and the requests built while another was in flight, each kept as its own count. `tripwire_fired_before` is true when any of the three is above zero. Report them beside the cost: a tight bound with `tripwire_checked` of 3 and nothing fired rests on three tests, and one with 0 rests on none. The counts are None for a record that lacks them, never 0.
+
+The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows (checked by digest, with the window as the answer when it fails). Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `tripwire_exceeded` (the entry's `bound_exceeded`) before trusting an entry. A backend of your own that does not record the bound keeps the window's.
 
 ### The federation's certificate
 

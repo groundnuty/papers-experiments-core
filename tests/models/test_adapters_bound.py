@@ -11,6 +11,7 @@ import json
 import anthropic
 import pytest
 
+from expcore.campaign.abandoned_bound import abandoned_request_bound
 from expcore.errors import RequestAbandoned
 from expcore.models.adapters import AnthropicAdapter, OpenAICompatAdapter, ToolResult
 from expcore.models.request_bound import FRAMING_MARGIN_TOKENS
@@ -366,3 +367,44 @@ def test_b19_a_system_prompt_and_tool_list_are_in_the_reported_prompt_and_are_no
     usage = {"input_tokens": 700, "output_tokens": 5}
     entry, client = anthropic_abandoned(make_spec, limits, message, fake_client, make_timeout, [TOOL_USE], usage)
     assert entry["prompt_bound_tokens"] == bytes_bound(700, 5, client.requests[1]["messages"][1:])
+
+
+# --- two models in one run ------------------------------------------------------------
+
+
+def test_b19_two_models_of_one_run_keep_their_own_tripwire_account_and_the_basis_carries_it(
+    make_spec, limits, completion, message, fake_client, make_timeout
+):
+    """B19: one run drives two models, one on each adapter, their steps interleaved. The first model's second reply
+    reports a prompt a million tokens long, over its bound; the second model's replies are all within theirs. Each
+    backend counts only its own requests, and the basis priced from each entry says so: the tripwire fired for the
+    first model and stayed clean for the second, which keeps its tight bound."""
+    over = [
+        completion(None, finish="tool_calls", tool_calls=[("run", "{}")], usage=(100, 5)),
+        completion(None, finish="tool_calls", tool_calls=[("run", "{}")], usage=(1_000_000, 5)),
+        make_timeout(read=True),
+    ]
+    within = [
+        message([TOOL_USE], stop="tool_use", usage={"input_tokens": 100, "output_tokens": 5}),
+        message([TOOL_USE], stop="tool_use", usage={"input_tokens": 110, "output_tokens": 5}),
+        make_timeout(read=True, sdk=anthropic),
+    ]
+    first_spec = make_spec(key="first", context_tokens=2_000_000)
+    second_spec = make_spec(key="second", backend="anthropic", context_tokens=WINDOW)
+    first = openai_backend(first_spec, limits, fake_client(*over))
+    second = anthropic_backend(second_spec, limits, fake_client(*within, api="anthropic"))
+    first.begin("", "go", TOOLS)
+    second.begin("", "go", TOOLS)
+    for _ in range(2):
+        for backend in (first, second):
+            (call,) = step(backend).tool_calls
+            backend.add_tool_results([ToolResult(call, "r")])
+    entries = (abandon_next(first), abandon_next(second))
+    bases = [
+        abandoned_request_bound(spec, limits, entry, reply_capped=True)
+        for spec, entry in zip((first_spec, second_spec), entries, strict=True)
+    ]
+    assert [b.prompt_by for b in bases] == ["window", "bytes"]
+    assert [(b.tripwire_checked, b.tripwire_exceeded) for b in bases] == [(1, 1), (1, 0)]
+    assert [(b.tripwire_unreported, b.tripwire_overlapped) for b in bases] == [(0, 0), (0, 0)]
+    assert [b.tripwire_fired_before for b in bases] == [True, False]
