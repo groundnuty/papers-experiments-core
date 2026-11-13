@@ -110,6 +110,7 @@ from expcore.study.config import (
     shard_budgets_of,
 )
 from expcore.study.factory_version import check_factory_version
+from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
 
@@ -653,7 +654,8 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
     parts = {}
     for index, snapshot in verified.snapshots.items():
         held = {row["run_key"] for row in snapshot.q("SELECT run_key FROM runs")}
-        parts[index] = export_run_state(snapshot, excluded={key: why for key, why in left_out.items() if key in held})
+        own = export_run_state(snapshot, excluded={key: why for key, why in left_out.items() if key in held})
+        parts[index] = timed_export(own, walls_of(snapshot), verified.record_for)  # the merged export's only (#154)
     return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
 
 
