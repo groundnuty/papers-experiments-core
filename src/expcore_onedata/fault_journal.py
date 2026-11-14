@@ -243,6 +243,9 @@ class InjectionJournal:
                 entries[key]["clear_failed"] = str(line.get("how"))  # still open: its restore failed
                 if line.get("healing") is True:  # a link heal ran for it (O35): no process heals it again
                     entries[key]["healed"] = True
+                held = line.get("settle_until")  # a heal's settle (O35): no process reads through the links before it
+                if isinstance(held, int | float) and not isinstance(held, bool):
+                    entries[key]["settle_until"] = max(held, entries[key].get("settle_until", held))
             elif event == "cleared":
                 entries.pop(key, None)
             else:
