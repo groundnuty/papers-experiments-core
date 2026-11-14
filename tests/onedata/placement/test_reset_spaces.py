@@ -100,7 +100,7 @@ def root_reads(fake, ticker) -> dict[str, list[float]]:
 
 
 def test_o07_the_transfer_settle_is_waited_once_for_every_space(resets, fake, ticker):
-    """O07: three spaces with nothing to cancel take their first observations, one `transfer_settle_s` covers every
+    """O51: three spaces with nothing to cancel take their first observations, one `transfer_settle_s` covers every
     space's second, and each space settles on two observations: the stage waits once, not once per space."""
     record = SpacesReset(resets, concurrency=1).run(evicting())
     assert record["ok"] is True
@@ -112,7 +112,7 @@ def test_o07_the_transfer_settle_is_waited_once_for_every_space(resets, fake, ti
 
 
 def test_o07_a_space_with_a_job_takes_its_full_polls_while_the_others_settle_on_two(resets, fake, ticker):
-    """O07: the second space's running job is cancelled and that space needs `transfer_settle_polls` clean
+    """O51: the second space's running job is cancelled and that space needs `transfer_settle_polls` clean
     observations after it; the others still settle on two, within the same waits."""
     fake.add_file("other/left.bin", DATA, space=SPACE_IDS[1])
     tid = fake.add_transfer("replication", "study/part-00.bin", BETA_ID, scheduled=ticker.now, ended=False)
@@ -124,7 +124,7 @@ def test_o07_a_space_with_a_job_takes_its_full_polls_while_the_others_settle_on_
 
 
 def test_o46_one_occupancy_wait_and_one_quiet_wait_and_look_cover_every_space(resets, fake, ticker):
-    """O46: the occupancy stage's wait counts from each space's eviction end; one wait, to the latest of those
+    """O51: the occupancy stage's wait counts from each space's eviction end; one wait, to the latest of those
     deadlines, covers every space, and each space's occupancy is read no earlier than its own. The quiet stage's wait
     from each space's T and its late look at the listings are taken once for all three likewise."""
     seen = root_reads(fake, ticker)
@@ -142,7 +142,7 @@ def test_o46_one_occupancy_wait_and_one_quiet_wait_and_look_cover_every_space(re
 
 
 def test_o11_the_spaces_reset_at_once_within_the_bound(resets, fake, ticker, monkeypatch):
-    """O11: with `reset_concurrency` 2 three spaces' qos stages run two at once, never three: the first two wait for
+    """O51: with `reset_concurrency` 2 three spaces' qos stages run two at once, never three: the first two wait for
     each other, so they cannot pass one at a time."""
     running, peak, calls, lock = [0], [0], [0], threading.Lock()
     together = threading.Barrier(2, timeout=10)
@@ -169,7 +169,7 @@ def test_o11_the_spaces_reset_at_once_within_the_bound(resets, fake, ticker, mon
 
 
 def test_o11_a_failure_in_one_space_fails_the_reset_with_every_spaces_record(resets, fake, ticker):
-    """O11: the second space's plan names a path that is not there, so its eviction stage fails; the other spaces end
+    """O51: the second space's plan names a path that is not there, so its eviction stage fails; the other spaces end
     that stage, no space runs a later one, and the failure holds every space's record: what each did, and where it
     stopped."""
     seen = root_reads(fake, ticker)
@@ -191,7 +191,7 @@ def test_o11_a_failure_in_one_space_fails_the_reset_with_every_spaces_record(res
 
 
 def test_o09_a_reset_of_several_spaces_names_each_space_once(resets):
-    """O09: two resets of one space would run its stages twice over; the reset is refused before anything is sent."""
+    """O51: two resets of one space would run its stages twice over; the reset is refused before anything is sent."""
     with pytest.raises(ValueError, match="once"):
         SpacesReset([resets[0], resets[1], resets[0]])
     with pytest.raises(ValueError, match="one plan per space"):

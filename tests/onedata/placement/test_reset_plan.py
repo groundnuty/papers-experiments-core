@@ -30,7 +30,7 @@ def listings(fake) -> list:
 
 
 def test_o46_one_listing_gives_the_files_and_each_files_holdings_at_every_provider_that_can_hold(listing, fake, ticker):
-    """O46: the planner lists each provider once and reads each regular file's block map at beta, the one provider
+    """O51: the planner lists each provider once and reads each regular file's block map at beta, the one provider
     that can hold the space's bytes; the data provider is never read. The plan names only the files beta holds."""
     fake.blocks.pop((fake.id_of(FILES[0]), BETA_ID))  # beta holds every file of `study` but the first
     holdings = SpaceReset(listing, now=ticker.clock).plan_scan()
@@ -47,7 +47,7 @@ def test_o46_one_listing_gives_the_files_and_each_files_holdings_at_every_provid
 
 
 def test_o46_a_provider_declared_never_to_hold_has_no_file_read_and_the_counter_never_skips_one(listing, fake, ticker):
-    """O46: a provider the caller declares never holds the space's bytes is not read; one that can hold them is read
+    """O51: a provider the caller declares never holds the space's bytes is not read; one that can hold them is read
     whatever the space root's counter says, since the counter under-counts."""
     fake.counter_offset[BETA_ID] = -(len(FILES) * len(DATA))  # the counter reads 0 for beta
     reset = SpaceReset(listing, now=ticker.clock)
@@ -56,7 +56,7 @@ def test_o46_a_provider_declared_never_to_hold_has_no_file_read_and_the_counter_
 
 
 def test_o33_a_reset_given_the_planners_reading_lists_the_space_no_second_time(listing, fake, ticker):
-    """O33: the planner's scan is the qos stage's first: the reset reads no page of the recursive listing of its own
+    """O51: the planner's scan is the qos stage's first: the reset reads no page of the recursive listing of its own
     when it removes nothing, and records that the scan was given, with its age."""
     reset = SpaceReset(listing, now=ticker.clock)
     holdings = reset.plan_scan()
@@ -71,7 +71,7 @@ def test_o33_a_reset_given_the_planners_reading_lists_the_space_no_second_time(l
 def test_o33_a_requirement_the_planners_scan_found_is_removed_and_the_second_scan_is_the_resets_own(
     listing, fake, ticker
 ):
-    """O33: the planner's scan finds a requirement the run added; the reset removes it and makes the scan after the
+    """O51: the planner's scan finds a requirement the run added; the reset removes it and makes the scan after the
     removal itself, which lists the space again."""
     fake.add_qos(FILES[2])
     reset = SpaceReset(listing, now=ticker.clock)
@@ -84,7 +84,7 @@ def test_o33_a_requirement_the_planners_scan_found_is_removed_and_the_second_sca
 
 
 def test_o09_a_planners_reading_of_another_space_or_providers_is_refused_before_any_stage(listing, fake, ticker):
-    """O09: a reading made through a reset of other providers stands for no scan of this reset; it is refused before
+    """O51: a reading made through a reset of other providers stands for no scan of this reset; it is refused before
     anything is sent."""
     holdings = SpaceReset(listing, providers=["alpha"], now=ticker.clock).plan_scan()
     calls_before = len(fake.provider_calls)

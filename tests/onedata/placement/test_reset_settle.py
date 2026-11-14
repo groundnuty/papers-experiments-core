@@ -61,7 +61,7 @@ def listings_during_the_stage(fake, ticker) -> list[float]:
 
 
 def test_o07_a_space_with_nothing_to_cancel_settles_on_two_observations_one_settle_apart(provisioner, fake, ticker):
-    """O07: nothing waiting or ongoing at the first observation and nothing cancelled: one more observation after one
+    """O51: nothing waiting or ongoing at the first observation and nothing cancelled: one more observation after one
     `transfer_settle_s`, by when a job scheduled before the first is listed, is enough. The stage waits that once,
     where four observations in a row waited it three times."""
     seen = listings_during_the_stage(fake, ticker)
@@ -74,7 +74,7 @@ def test_o07_a_space_with_nothing_to_cancel_settles_on_two_observations_one_sett
 def test_o07_a_job_listed_only_at_the_second_observation_is_cancelled_and_takes_the_full_polls(
     provisioner, fake, ticker
 ):
-    """O07: the first observation misses a job the listings show late; the second sees it, cancels it, and from
+    """O51: the first observation misses a job the listings show late; the second sees it, cancels it, and from
     then on the stage needs `transfer_settle_polls` clean observations in a row, as before."""
     fake.add_file("other/late.bin", DATA)
     tid = fake.add_transfer("replication", "other/late.bin", BETA_ID, scheduled=ticker.now, ended=False)
@@ -85,7 +85,7 @@ def test_o07_a_job_listed_only_at_the_second_observation_is_cancelled_and_takes_
 
 
 def test_o07_a_job_seen_at_the_first_observation_keeps_the_full_polls(provisioner, fake, ticker):
-    """O07: anything waiting or ongoing at the first observation is cancelled, and the stage needs the full
+    """O51: anything waiting or ongoing at the first observation is cancelled, and the stage needs the full
     `transfer_settle_polls` clean observations after it, each `transfer_settle_s` apart."""
     fake.add_file("other/left.bin", DATA)
     fake.add_transfer("replication", "other/left.bin", BETA_ID, scheduled=ticker.now, ended=False)

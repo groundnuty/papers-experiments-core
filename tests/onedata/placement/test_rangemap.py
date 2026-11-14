@@ -121,7 +121,7 @@ def test_o07_the_transfer_listing_is_waited_out_by_default_for_30_s_and_up_to_4_
 
 
 def test_o11_a_reset_of_several_spaces_works_on_4_at_once_by_default_and_at_least_one(tmp_path):
-    """O11: `reset_concurrency` bounds the spaces a reset of several spaces works on at once (`resetspaces.py`): 4 by
+    """O51: `reset_concurrency` bounds the spaces a reset of several spaces works on at once (`resetspaces.py`): 4 by
     default, settable, a whole number of at least one."""
     assert load(tmp_path).settings.reset_concurrency == 4
     assert load(tmp_path, reset_concurrency=1).settings.reset_concurrency == 1

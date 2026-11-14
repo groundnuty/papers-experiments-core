@@ -48,7 +48,7 @@ def platform_file(tmp_path):
 
 
 def test_o07_the_eviction_stage_records_each_wait_it_took_with_its_reason(provisioner, fake, ticker):
-    """O07: the stage says what it waited for and how long: the eviction's transfer to end (one poll here), and its
+    """O51: the stage says what it waited for and how long: the eviction's transfer to end (one poll here), and its
     block maps to show the files empty on consecutive polls (one poll between two reads); no listing showed a job
     running, so nothing was waited for that."""
     eviction = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})["stages"]["eviction"]
@@ -59,7 +59,7 @@ def test_o07_the_eviction_stage_records_each_wait_it_took_with_its_reason(provis
 
 
 def test_o07_the_resets_own_eviction_still_listed_ongoing_after_it_ended_holds_nothing_up(provisioner, fake, ticker):
-    """O07: the listings show a job ended late, so the reset's own eviction, its record ended on the provider it ran
+    """O51: the listings show a job ended late, so the reset's own eviction, its record ended on the provider it ran
     on, is still listed ongoing when the block maps are due; it changes no map, and the stage reads them at once,
     where it waited `transfer_settle_s` twice for the listing to catch up."""
     fake.ended_listed_ongoing_s = LINGER_S
@@ -71,7 +71,7 @@ def test_o07_the_resets_own_eviction_still_listed_ongoing_after_it_ended_holds_n
 
 
 def test_o01_a_job_the_reset_did_not_send_still_listed_ongoing_is_waited_for(provisioner, fake, ticker):
-    """O01: a replication no stage sent ends as the eviction does and is still listed ongoing; the reset cannot tell
+    """O51: a replication no stage sent ends as the eviction does and is still listed ongoing; the reset cannot tell
     from the listing that it has stopped changing maps, so it waits for the listings to show none, and records the
     waits."""
     fake.ended_listed_ongoing_s = LINGER_S
