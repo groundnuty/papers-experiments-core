@@ -12,6 +12,7 @@ from expcore.loop.timer import AgentTimer
 from expcore.records.instruments import first_turn_instruments
 from expcore_onedata.client import PlatformError
 from expcore_onedata.ingest import ProgressiveIngest
+from expcore_onedata.ingestbind import PlanMismatch, check_recorded_plan
 from expcore_onedata.ingestplan import load_ingest_plan
 from expcore_onedata.ingestsparse import SparseBaseline
 from expcore_onedata.provision import ProvisionError
@@ -212,6 +213,24 @@ def test_o44_a_part_with_the_wrong_hash_fails_closed_and_the_reset_still_complet
     assert refused.value.kind == INGEST_FAILURE
     assert snapshot["restore"]["files"]["day-13"]["action"] == "rewritten"
     assert (bytes(node(fake).content), fake.held(DAY_PATH, ALPHA_ID)) == (DAY, [[0, len(DAY)]])
+
+
+def test_o44_a_real_snapshot_binds_to_its_plan_and_not_to_another_prefix_or_schedule(
+    make, fake, ticker, config, tmp_path
+):
+    """O44 (#262): the snapshot of a preallocated run, read back as JSON, binds to its own plan, loaded again, and is
+    refused by the same file with another prefix, a schedule 300 s later or a part count the plan does not have."""
+    ingest = make(ROW)
+    ingest.start({})
+    t0 = first_turn(ingest, ticker)
+    run_to(ingest, ticker, t0, 30, 1)
+    recorded = json.loads(json.dumps(ingest.finish()))
+    check_recorded_plan(load_ingest_plan(tmp_path / "ingest.toml", config), recorded)
+    for change, field in (({"prefix": 2048}, "prefix"), ({"at_s": 330}, "at_s"), ({"parts": 2}, "parts")):
+        other = load_ingest_plan(write_plan(tmp_path, [{**ROW, **change}]), config)
+        with pytest.raises(PlanMismatch) as caught:
+            check_recorded_plan(other, recorded)
+        assert (caught.value.label, caught.value.field) == ("day-13", field)
 
 
 def test_o44_a_block_beyond_the_written_ranges_fails_the_next_part_with_nothing_written(make, fake, ticker):
