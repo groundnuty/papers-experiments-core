@@ -76,23 +76,26 @@ def _shards_by_index(export: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return sorted(export["shards"], key=lambda shard: shard["index"])
 
 
-def _by_selection(export: Mapping[str, Any]) -> bool:
-    """Whether the batch was merged from selections of its campaign (C35) rather than from shards."""
-    return any("selection" in shard for shard in export["shards"])
-
-
-def _selection_text(shard: Mapping[str, Any]) -> str:
-    """A selection's label with its levels, as `run --select` gave them: `first (stage=early,mid)`."""
-    levels = " ".join(f"{name}={','.join(map(str, values))}" for name, values in sorted(shard["selection"].items()))
-    return f"{shard['label']} ({levels})"
+def _selections(export: Mapping[str, Any]) -> dict[int, str]:
+    """Each selection of a batch merged from selections of its campaign (C35), by index: its label with its levels,
+    as `run --select` gave them (`first (stage=early,mid)`); empty for a batch merged from shards."""
+    shards = export["shards"]
+    named = {}
+    for shard in shards if isinstance(shards, list) else ():
+        if isinstance(shard, Mapping) and isinstance(shard.get("selection"), Mapping):
+            levels = sorted(shard["selection"].items())
+            text = " ".join(f"{name}={','.join(map(str, values))}" for name, values in levels)
+            named[shard.get("index")] = f"{shard.get('label')} ({text})"
+    return named
 
 
 def _runs_table(export: Mapping[str, Any], table: Table) -> list[str]:
     """One row per shard and condition: the runs by how they ended, and the rates of the first three. A merge of
     selections names each selection with its levels, so the report says which batch ran which runs."""
-    first = "Selection" if _by_selection(export) else "Shard"
-    named = {shard["index"]: _selection_text(shard) for shard in export["shards"] if "selection" in shard}
-    header = [first, "Started (UTC)", "Condition", "Planned", "Analysed", "Exhausted", "Unfinished", "Left out"]
+    cells = shard_accounting(export)  # refuses a `shards` that cannot account for the runs, first
+    named = _selections(export)
+    header = ["Selection" if named else "Shard", "Started (UTC)", "Condition", "Planned", "Analysed", "Exhausted"]
+    header += ["Unfinished", "Left out"]
     rows = [
         [
             named.get(cell["shard"], cell["label"]),
@@ -101,7 +104,7 @@ def _runs_table(export: Mapping[str, Any], table: Table) -> list[str]:
             *(cell[field] for field in RUN_COUNTS),
             *(_rate(cell[field], cell["planned"]) for field in RATES),
         ]
-        for cell in shard_accounting(export)
+        for cell in cells
     ]
     return table([*header, "Analysed %", "Exhausted %", "Unfinished %"], rows)
 
@@ -211,7 +214,7 @@ def shard_lines(export: Mapping[str, Any], table: Table) -> list[str]:
         "",
         *_runs_table(export, table),
         "",
-        *(SELECTION_NOTES if _by_selection(export) else SHARD_NOTES),
+        *(SELECTION_NOTES if _selections(export) else SHARD_NOTES),
         "",
         "### Infrastructure attempts by shard and kind",
         "",

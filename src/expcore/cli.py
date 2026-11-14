@@ -190,6 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None) -> int:
+    refusal = _selection_refusal(args)
+    if refusal is not None:
+        raise ShardError(refusal)
     shard: Spec | None = None
     if args.shard is not None:
         shard = ShardSpec.parse(args.shard, args.shard_label, wide_label=args.shard_label_wide)
@@ -220,19 +223,26 @@ def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None
 
 
 def _check_run_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """The combinations of `run`'s shard and selection options that are usage errors (C30, C35)."""
-    if args.shard is not None and args.select:
-        parser.error("--select cannot be combined with --shard in this version: run a selection, or a shard")
+    """The combinations of `run`'s shard options that are usage errors (C30); a label goes with a shard or a
+    selection."""
     if args.shard is None and not args.select and (args.shard_label is not None or args.shard_label_wide):
         parser.error("--shard-label and --shard-label-wide need --shard")
     if args.shard_label_wide and args.shard_label is None:
         parser.error("--shard-label-wide needs --shard-label")
+
+
+def _selection_refusal(args: argparse.Namespace) -> str | None:
+    """Why `run`'s selection options do not combine (C35), said as a refusal (a usage error's message is never
+    shown, and these name only options); None when they do."""
+    if args.shard is not None and args.select:
+        return "--select cannot be combined with --shard in this version: run a selection, or a shard"
     if args.select and args.shard_label is None:
-        parser.error("--select needs --shard-label: name the selection, with a name that names no machine")
+        return "--select needs --shard-label: name the selection, with a name that names no machine"
     if not args.select and (args.sequential or args.after):
-        parser.error("--sequential and --after need --select")
+        return "--sequential and --after need --select"
     if args.after and not args.sequential:
-        parser.error("--after needs --sequential: it names the selections this one runs after")
+        return "--after needs --sequential: it names the selections this one runs after"
+    return None
 
 
 def _merge(args: argparse.Namespace) -> int:
