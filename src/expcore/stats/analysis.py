@@ -38,6 +38,28 @@ contrast's preregistered `max_unscored_treatment` (0 unless set). An exploratory
 refused.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
+
+Every result names its two units: `estimation_unit`, the cell one value is computed in, and `independent_unit`, the
+cluster, whose values the test, the bootstrap and the minimum detectable effect count (`n_clusters`); `n_cells` and
+`cells_lost` count the cells. A contrast of one outcome estimates per (model, cluster) cell and averages each
+cluster's cells with equal weight per model, so several models on one cluster are one unit, never several.
+
+A ratio contrast (S13, `expcore.stats.ratio`) runs the same way on its log ratios: its estimate, interval, margin and
+minimum detectable effect are natural-log ratios. With an estimation unit that names the model its sums run per
+(model, cluster) cell, each cluster's value is the equal-weight mean of its cells, `n_clusters` still counts clusters,
+and `per_model` holds each model's estimate over its own cells, from the same draws of the clusters, with no test of
+its own. A member of the Holm family that loses a pair because a run's numerator is None while its denominator is 0
+is refused (`RatioNumeratorRefused`): its ratio would count the cost of successful runs alone. An exploratory one
+reports the count. Both refusals are `ContrastRefused`.
+
+A preregistration may declare an equivalence family (S15): members of the Holm family with a margin, whose equivalence
+claims are decided together. Each member's TOST p-value comes from its estimator's own resamples, Holm adjusts them
+over the family, and a member is equivalent only when Holm rejects; the interval at 1 - 2 times its Holm level is
+reported with it. `equivalence_feasibility` simulates, before the campaign, how often each claim would be reached.
+
+Each contrast's result carries what became of each arm's own planned runs (`arm_runs`, S14), and the analysis carries
+every preregistered one-arm estimate (`descriptives`, `expcore.stats.onearm`), which is descriptive: no test, no
+conclusion and no place in the Holm family.
 """
 
 from __future__ import annotations
@@ -45,14 +67,18 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 
 from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
+from expcore.stats.armruns import ArmRuns
 from expcore.stats.estimators import ModelEstimate, PairedDifferences
+from expcore.stats.onearm import DescriptiveResult, describe
 from expcore.stats.pairing import ContrastSpec, Pairing, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
+from expcore.stats.ratio import RatioForm
 from expcore.stats.rejection import rejects
 from expcore.stats.rows import AbsentRun, Row
 
@@ -60,9 +86,17 @@ UNTESTABLE = "untestable"  # the conclusion of a contrast that used no pair
 CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected", UNTESTABLE)
 
 
-class TreatmentOutcomesRefused(ValueError):
+class ContrastRefused(ValueError):
+    """A confirmatory contrast whose pairs were lost in a way that would bias it unseen; the message names the fix."""
+
+
+class TreatmentOutcomesRefused(ContrastRefused):
     """A confirmatory contrast lost pairs to treatment attempts scored None, and its preregistration either does not
     say how treatment attempts are scored for it or claims they are scored and allows fewer such pairs."""
+
+
+class RatioNumeratorRefused(ContrastRefused):
+    """A confirmatory ratio contrast lost pairs because a run's numerator is None while its denominator is 0 (S13)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,6 +134,21 @@ class ContrastResult:
     )
     conclusion: str  # one of CONCLUSIONS
     minimum_detectable_effect: float | None  # None without power settings, NaN when it cannot be reached
+    ratio: RatioForm | None = None  # a ratio contrast's form (S13): every number above is then a natural-log ratio
+    # the cell one value is computed in (S13): ("model", cluster) for a contrast of one outcome; for a ratio contrast
+    # (cluster,), its sums pooling a cluster's models, or ("model", cluster), its sums per model's cell
+    estimation_unit: tuple[str, ...] | None = None
+    independent_unit: str | None = None  # the cluster, whose values n_clusters, the test and the bootstrap count
+    n_cells: int | None = None  # cells of the estimation unit with a value
+    cells_lost: Mapping[str, int] = dataclasses.field(default_factory=dict)  # cells seen with no value, by cause
+    # An equivalence family's member (S15): `equivalent` is Holm's decision over the family's TOST p-values, not the
+    # 1 - 2 alpha interval's; the interval at 1 - 2 x the level Holm compared it with is beside it. None outside one.
+    in_equivalence_family: bool = False
+    tost_p: float | None = None  # the larger of the two one-sided p-values; NaN for an untestable member
+    tost_p_holm: float | None = None  # Holm-adjusted over the equivalence family, for reports; NaN when untestable
+    equivalence_level: float | None = None  # 1 - 2 x the member's Holm level
+    equivalence_interval_adjusted: tuple[float, float] | None = None  # the interval at equivalence_level
+    arm_runs: tuple[ArmRuns, ...] = ()  # arm A's and arm B's planned runs, measured or lost by cause (S14)
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -131,6 +180,8 @@ class AnalysisResult:
     alpha: float
     manifest: Mapping[str, str]
     exploratory_only: bool = False
+    equivalence_holm: tuple[HolmDecision, ...] = ()  # Holm over the equivalence family's TOST p-values (S15)
+    descriptives: tuple[DescriptiveResult, ...] = ()  # the one-arm estimates, in declared order (S14)
 
     def contrast(self, name: str) -> ContrastResult:
         """Return the result of the contrast with this name."""
@@ -165,6 +216,29 @@ def _equivalence(
     result = estimators.get(spec.estimator)(differences, settings)
     interval = (result.ci_low, result.ci_high)
     return interval, bool(-margin <= result.ci_low and result.ci_high <= margin)
+
+
+def _tost_p(spec: ContrastSpec, prereg: Preregistration, differences: PairedDifferences, untestable: bool) -> float:
+    """An equivalence family member's TOST p-value (S15), from its estimator's own resamples; NaN with no pair."""
+    tost = estimators.tost_function(spec.estimator)
+    if tost is None or spec.equivalence_margin is None:  # the loader refuses both for a member
+        raise ValueError(
+            f"contrast {spec.name!r}: a member of the equivalence family needs a margin and a TOST p-value"
+        )
+    if untestable:
+        return math.nan
+    return float(tost.p(differences, prereg.estimator_settings(spec), spec.equivalence_margin))
+
+
+def _adjusted_interval(
+    spec: ContrastSpec, prereg: Preregistration, differences: PairedDifferences, level: float, untestable: bool
+) -> tuple[float, float]:
+    """The member's TOST interval at 1 - 2 x its Holm level, the test's dual (S15); NaN with no pair."""
+    tost = estimators.tost_function(spec.estimator)
+    if untestable or tost is None:
+        return math.nan, math.nan
+    low, high = tost.interval(differences, prereg.estimator_settings(spec), level)
+    return float(low), float(high)
 
 
 def _minimum_detectable_effect(
@@ -239,6 +313,33 @@ def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pa
     )
 
 
+def _refuse_unmeasured_failures(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
+    """Refuse a member of the Holm family that lost a pair holding an ordinary run whose numerator is None while its
+    denominator is 0 (S13): the ratio would then sum the cost of the runs that succeeded, and not of those that failed.
+    Such a pair may be counted under a treatment attempt's None, which a tolerance excuses, so the count is its own."""
+    lost = pairing.n_unmeasured_failures
+    if spec.ratio is None or spec.name not in prereg.holm_family or not lost:
+        return
+    raise RatioNumeratorRefused(
+        f"{prereg.source}: confirmatory ratio contrast {spec.name!r} drops {lost} pair(s) because a run's numerator "
+        f"{spec.ratio.numerator!r} is None while its denominator {spec.ratio.denominator!r} is 0, so its ratio would "
+        f"count the {spec.ratio.numerator!r} of the runs with a nonzero {spec.ratio.denominator!r} and leave out "
+        f"that of the others. Make the scorer return {spec.ratio.numerator!r} for every run, a failed run's included, "
+        "or take the contrast out of holm_family"
+    )
+
+
+def _check_form(spec: ContrastSpec) -> None:
+    """Refuse a contrast whose form is not the one its estimator reads (S13): a spec built past the loader cannot hand
+    a difference estimator log ratios, or the ratio estimator differences."""
+    reads, form = estimators.form(spec.estimator), "difference" if spec.ratio is None else "ratio"
+    if reads != form:
+        raise ValueError(
+            f"contrast {spec.name!r}: estimator {spec.estimator!r} reads a {reads} contrast, and this contrast is a "
+            f"{form} contrast"
+        )
+
+
 def run_contrast(
     rows: Iterable[Row],
     spec: ContrastSpec,
@@ -252,10 +353,27 @@ def run_contrast(
     it is the raw p-value at alpha, with nothing adjusting for the family. `absent` are the planned runs with no
     analysed attempt, which say why a pair is missing. A member of the family that loses a pair to a treatment
     attempt scored None is refused (`TreatmentOutcomesRefused`), unless it declares `treatment_outcomes = "excluded"`
-    or the loss is within a "scored" contrast's preregistered `max_unscored_treatment`.
+    or the loss is within a "scored" contrast's preregistered `max_unscored_treatment`; a ratio contrast in the family
+    that loses one to a failed run's None numerator is refused too (`RatioNumeratorRefused`, S13).
+
+    A member of the equivalence family gets its TOST p-value (S15), and, called alone, `equivalent` is that p-value
+    at alpha, with nothing adjusting for the family; `analyse` replaces it with Holm's decision over the family.
     """
+    return _run_contrast(rows, spec, prereg, significant, absent)[0]
+
+
+def _run_contrast(
+    rows: Iterable[Row],
+    spec: ContrastSpec,
+    prereg: Preregistration,
+    significant: bool | None = None,
+    absent: Iterable[AbsentRun] = (),
+) -> tuple[ContrastResult, Pairing]:
+    """`run_contrast`, with the pairing it estimated from, which an equivalence family's adjusted interval reads."""
+    _check_form(spec)
     pairing = pair_rows(rows, spec, absent)
     _refuse_lost_treatment_pairs(spec, prereg, pairing)
+    _refuse_unmeasured_failures(spec, prereg, pairing)
     estimate = estimators.get(spec.estimator)(pairing.differences, prereg.estimator_settings(spec))
     in_family = spec.name in prereg.holm_family
     untestable = pairing.n_pairs == 0
@@ -268,8 +386,12 @@ def run_contrast(
         interval, equivalent = (None if spec.equivalence_margin is None else (math.nan, math.nan)), False
     else:
         interval, equivalent = _equivalence(spec, prereg, pairing.differences)
+    member = spec.name in prereg.equivalence_family
+    tost = _tost_p(spec, prereg, pairing.differences, untestable) if member else None
+    if member:  # the family decides, and alone its raw TOST p-value at alpha does (S15)
+        equivalent = bool(rejects(tost, prereg.alpha))  # False for a NaN p-value
     mde = None if untestable else _minimum_detectable_effect(spec, prereg, pairing.differences, in_family)
-    return ContrastResult(
+    result = ContrastResult(
         name=spec.name,
         outcome=spec.outcome,
         estimator=spec.estimator,
@@ -299,16 +421,62 @@ def run_contrast(
         equivalent=equivalent,
         conclusion=conclude(significant, equivalent, untestable),
         minimum_detectable_effect=mde,
+        ratio=spec.ratio,
+        estimation_unit=spec.estimation_unit,
+        independent_unit=spec.cluster,
+        n_cells=pairing.n_cells,
+        cells_lost=dict(pairing.cells_lost),
+        in_equivalence_family=member,
+        tost_p=tost,
+        arm_runs=pairing.arm_runs,
     )
+    return result, pairing
+
+
+def _equivalence_family(
+    results: tuple[ContrastResult, ...], pairings: Mapping[str, Pairing], prereg: Preregistration
+) -> tuple[tuple[ContrastResult, ...], tuple[HolmDecision, ...]]:
+    """Holm over the equivalence family's TOST p-values (S15): each member is equivalent only when Holm rejects its
+    two one-sided nulls, and carries the interval at 1 - 2 x the level Holm compared it with. An untestable member's
+    NaN counts as p = 1, so the family keeps its size and it is never equivalent (S02)."""
+    if not prereg.equivalence_family:
+        return results, ()
+    by_name = {result.name: result for result in results}
+    names = prereg.equivalence_family
+    p_values = [by_name[name].tost_p for name in names]
+    outcome = kernel.holm(p_values, prereg.alpha)
+    decisions = tuple(
+        HolmDecision(name, p, adjusted, level, reject)
+        for name, p, adjusted, level, reject in zip(
+            names, p_values, outcome.adjusted, outcome.levels, outcome.reject, strict=True
+        )
+    )
+    decided = {}
+    for d in decisions:
+        r, spec = by_name[d.name], prereg.contrasts[d.name]
+        untestable = r.n_pairs == 0
+        decided[d.name] = dataclasses.replace(
+            r,
+            equivalent=d.reject,
+            tost_p_holm=d.p_holm,
+            equivalence_level=1 - 2 * d.level,
+            equivalence_interval_adjusted=_adjusted_interval(
+                spec, prereg, pairings[d.name].differences, d.level, untestable
+            ),
+            conclusion=conclude(r.significant, d.reject, untestable=untestable),
+        )
+    return tuple(decided.get(r.name, r) for r in results), decisions
 
 
 def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[AbsentRun] = ()) -> AnalysisResult:
-    """Run every declared contrast, then Holm over the declared family at the preregistered alpha.
+    """Run every declared contrast, then Holm over the declared family at the preregistered alpha, and Holm over the
+    equivalence family's TOST p-values when one is declared (S15).
 
     `absent` are the planned runs with no analysed attempt (exhausted, unfinished, left out), from the export.
     """
     rows, absent = list(rows), list(absent)
-    results = tuple(run_contrast(rows, spec, prereg, absent=absent) for spec in prereg.contrasts.values())
+    runs = {spec.name: _run_contrast(rows, spec, prereg, absent=absent) for spec in prereg.contrasts.values()}
+    results = tuple(result for result, _ in runs.values())
     by_name = {result.name: result for result in results}
     p_values = [by_name[name].p_value for name in prereg.holm_family]
     outcome = kernel.holm(p_values, prereg.alpha)
@@ -329,7 +497,20 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
         else r
         for r in results
     )
-    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest(), prereg.exploratory_only)
+    pairings = {name: pairing for name, (_, pairing) in runs.items()}
+    decided, equivalence = _equivalence_family(decided, pairings, prereg)
+    described = tuple(
+        describe(rows, spec, prereg.descriptive_settings(spec), absent) for spec in prereg.descriptives.values()
+    )
+    return AnalysisResult(
+        decided,
+        decisions,
+        prereg.alpha,
+        prereg.manifest(),
+        prereg.exploratory_only,
+        equivalence_holm=equivalence,
+        descriptives=described,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -367,3 +548,67 @@ def pilot_power(rows: Iterable[Row], prereg: Preregistration, names: Sequence[st
         raise ValueError(f"{prereg.source}: no contrast named {unknown[0]!r}; declared: {', '.join(prereg.contrasts)}")
     pilot = {name: pair_rows(rows, prereg.contrasts[name]).differences.cluster_differences for name in chosen}
     return PowerResult(tuple(power.pilot_power(pilot, prereg.power, prereg.alpha)), prereg.manifest())
+
+
+def _studies_test(tost: estimators.Tost, params: Mapping[str, Any]) -> power.TostPValues:
+    """An estimator's TOST of many studies under its preregistered parameters, as the power module calls it."""
+    return lambda studies, margin: tost.p_values(studies, margin, params)
+
+
+def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None = None) -> PowerResult:
+    """Whether each equivalence claim can be reached before the campaign (S15): for each member of the equivalence
+    family, the chance of concluding equivalent when the true difference is 0 and when it is half the margin.
+
+    The simulation (`power.equivalence_feasibility`) judges each simulated study by the member's estimator's own TOST
+    (`Tost.p_values`, with the estimator's preregistered parameters), the test the analysis decides it by, at the
+    [power] section's target clusters, simulations and seed (with a digest of the contrast's name). The SD is each of
+    the [power] sd_grid's, declared; or, given pilot rows, the contrast's own between-cluster SD of its paired
+    differences, estimated. The level is alpha divided by the family's size, Holm's first and hardest step, so the
+    figure is conservative for every member but the one with the smallest p-value. A claim is `reachable` when its
+    chance at 0 meets the target power; a preregistration should state an equivalence hypothesis only if it is, and
+    say so if it is not. Only members are simulated: a contrast whose margin no family names is judged by the 1 - 2
+    alpha bootstrap interval, another rule.
+    """
+    if prereg.power is None:
+        raise ValueError(f"{prereg.source}: has no [power] section, so there is no feasibility study to run")
+    family = prereg.equivalence_family
+    if not family:
+        raise ValueError(f"{prereg.source}: declares no equivalence_family, so no equivalence claim is decided by TOST")
+    pilot = list(rows) if rows is not None else None
+    settings = prereg.power
+    table = []
+    for name in family:
+        spec = prereg.contrasts[name]
+        margin = float(spec.equivalence_margin or 0.0)
+        alpha = prereg.alpha / len(family)
+        tost = estimators.tost_function(spec.estimator)
+        if tost is None:  # the loader refuses such a member
+            raise ValueError(f"{prereg.source}: contrast {name!r} has an estimator with no TOST")
+        test = _studies_test(tost, prereg.estimator_settings(spec).params)
+        if pilot is None:
+            sds = list(settings.sd_grid)
+        else:
+            sds = [power.pilot_cluster_sd(pair_rows(pilot, spec).differences.cluster_differences)]
+        rng = np.random.default_rng([settings.seed, name_digest(spec.name)])
+        for sd in sds:
+            deltas = (0.0, margin / 2)
+            if math.isfinite(sd) and sd > 0:
+                chances = power.equivalence_feasibility(
+                    sd, settings.target_clusters, margin, alpha, settings.n_simulations, rng, deltas, test
+                )
+            else:  # a pilot with fewer than two clusters, or no spread: nothing to simulate, and a gap shows
+                chances = [math.nan, math.nan]
+            for delta, chance in zip(deltas, chances, strict=True):
+                table.append(
+                    {
+                        "contrast": spec.name,
+                        "sd": sd,
+                        "n_clusters": settings.target_clusters,
+                        "margin": margin,
+                        "alpha": alpha,
+                        "delta": delta,
+                        "probability": chance,
+                        "reachable": bool(chances[0] >= settings.target_power),  # False for NaN
+                    }
+                )
+    return PowerResult(tuple(table), prereg.manifest())

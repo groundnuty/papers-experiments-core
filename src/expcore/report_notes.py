@@ -56,6 +56,22 @@ def contrast_notes(alpha: float, family: bool = True) -> list[str]:
     ]
 
 
+def equivalence_family_notes(alpha: float) -> list[str]:
+    """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces."""
+    return [
+        "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two",
+        "one-sided tests' p-values, for an effect above minus the margin and for one below the margin (for the",
+        "Wilcoxon cluster bootstrap, t-tests of the mean cluster difference on clusters - 1 degrees of freedom; n/a",
+        "with fewer than two clusters or no spread between them). Holm TOST p: Holm-adjusted over the family, for",
+        "reading; the decision compares each raw TOST p with its step's level. A member is `equivalent` only when Holm",
+        "rejects,",
+        f"so for these contrasts the conclusion rests on this table, not the {equivalence_header(alpha)} beside it,",
+        "which can lie inside the margin while the family's decision is no. Adjusted interval: the test's own interval",
+        "at 1 - 2 times the level Holm compared the member with (Interval level), inside the margin exactly when the",
+        "TOST p is at most that level; an untestable member has none and counts as p = 1.",
+    ]
+
+
 NO_CLAIM = (  # the summary line of a preregistration with no Holm family (S12)
     "the preregistration declares `exploratory_only = true`, so it makes no confirmatory claim: every contrast is "
     "exploratory, judged by its raw p-value at alpha with nothing adjusting for multiplicity, and none may be read as "
@@ -81,6 +97,64 @@ MISSING_PAIRS = [
     "- *Unpaired or left out*: the other run is unfinished, left out of a partial analysis, or not in the plan (a "
     "task one arm does not run).",
     "- *Outcome None (other)*: both runs analysed, and the outcome is None on an ordinary run only.",
+]
+
+RATIO_MISSING_PAIRS = [  # after MISSING_PAIRS, only in a report with a ratio contrast (S13)
+    "- *Numerator None at denominator 0*: a run of a ratio contrast has no numerator and a denominator of 0, a failed "
+    "run whose cost was not measured; a confirmatory contrast with any is refused.",
+    "- *Zero denominator*: the pair is in a cell whose denominator sums to 0 in either arm, which the "
+    'preregistration excludes (`zero_denominator = "exclude"`).',
+    "- *Zero numerator*: the pair is in a cell whose numerator sums to 0 in either arm, excluded by the same rule.",
+    "- `-`: a cause that does not apply: a contrast of one outcome has none of the three above.",
+]
+
+RATIO_NOTES = [
+    "A ratio contrast compares arm A's numerator per unit of denominator with arm B's, such as the cost per correct",
+    "result. Estimation unit is the cell whose sums give one log ratio: a task attribute (each value of it, its models",
+    "pooled) or the model and the attribute (each model's cell of a value). Independent unit is the attribute whose",
+    "values are the units of the test, of the resampling and of the minimum detectable effect, and what Clusters",
+    "counts: the cells of one value share its response to the treatment, so they are never counted as independent,",
+    "and a value's log ratio is the mean of its cells', each model weighing the same. Cells is the number of cells",
+    "with a log ratio, then those lost by cause (no pair, or a zero total the rule excludes); a value is dropped only",
+    "when all its cells are lost. In each cell, each arm's numerator and denominator are summed over its used pairs,",
+    "and a run whose denominator is 0, a failure, still adds its numerator. The cell's value is the natural log of A's",
+    "ratio over B's, ln((N_A / D_A) / (N_B / D_B)). The estimate, the intervals, the margin and the minimum detectable",
+    "effect in the contrast tables are on that log scale, and the test is the signed-rank test of the values' log",
+    "ratios. Ratio (A / B) is exp of the estimate, a geometric mean over the values of A's ratio over B's, and Ratio",
+    "interval is exp of the interval. Zero total is the preregistered rule for a cell whose numerator or denominator",
+    "sums to 0 in either arm, whose log ratio is undefined or infinite:",
+    "`exclude` (the cell is excluded from the contrast, and its pairs are counted by cause in the pairs tables)",
+    "or `continuity correction c` (c is added to both sums of both arms in every cell, which keeps every cell",
+    "and moves each log ratio most where its sums are small).",
+]
+
+RATIO_BY_MODEL_NOTES = [  # after the ratio contrasts' table, only for a contrast estimated per model's cell
+    "Each model's Estimate is the mean log ratio of its own cells, with its ratio and interval from the same",
+    "resamples of the values of the independent unit as the contrast's: a breakdown with no test of its own, outside",
+    "the Holm family.",
+]
+
+ARM_LOST_HEADINGS = ["Treatment outcome None", "Outcome None", "Exhausted", "Unfinished", "Left out"]  # LOST_CAUSES
+
+ARM_RUNS_NOTES = [
+    "Each arm's own planned runs on the contrast's tasks (S14), whatever became of their partners: a pair lost to one",
+    "run's None is one run lost here, in the arm that lost it. Finished: the runs with an analysed attempt, the",
+    "population the contrast's outcome is defined over, and Finish rate their share of the planned runs (n/a for an",
+    "arm with none planned). Measured: the finished runs whose outcome is known. The other columns give the runs",
+    "lost by cause: the outcome None on a treatment attempt or on another run, or no analysed attempt (exhausted,",
+    "unfinished, or left out of a partial analysis). An arm that finished fewer of its runs is compared on fewer, and",
+    "perhaps other, runs than its partner.",
+]
+
+DESCRIPTIVE_NOTES = [
+    "Each one-arm estimate is descriptive: no test is made, it has no conclusion word, and it is in no Holm family.",
+    "A rate is the mean of its outcome over the arm's runs that have it, averaged per task and model, then per",
+    "cluster and model, then over each cluster's models and over the clusters, each with equal weight (a share for an",
+    "outcome of 0 or 1). A ratio of totals is the sum of the numerator over the sum of the denominator across every",
+    "run of the arm that has both. The interval resamples whole clusters at the preregistration's bootstrap; a",
+    "replicate whose drawn denominators sum to 0 has no ratio and is counted under Undefined replicates, and the",
+    "interval is n/a when fewer than half are defined. Finish rate is the share of the arm's planned runs that",
+    "finished.",
 ]
 
 CONDITION_NOTES = [

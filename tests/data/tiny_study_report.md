@@ -76,6 +76,25 @@ in the pairs tables above:
 - *Unpaired or left out*: the other run is unfinished, left out of a partial analysis, or not in the plan (a task one arm does not run).
 - *Outcome None (other)*: both runs analysed, and the outcome is None on an ordinary run only.
 
+### Runs of each arm
+
+Each arm's own planned runs on the contrast's tasks (S14), whatever became of their partners: a pair lost to one
+run's None is one run lost here, in the arm that lost it. Finished: the runs with an analysed attempt, the
+population the contrast's outcome is defined over, and Finish rate their share of the planned runs (n/a for an
+arm with none planned). Measured: the finished runs whose outcome is known. The other columns give the runs
+lost by cause: the outcome None on a treatment attempt or on another run, or no analysed attempt (exhausted,
+unfinished, or left out of a partial analysis). An arm that finished fewer of its runs is compared on fewer, and
+perhaps other, runs than its partner.
+
+| Contrast | Arm | Planned | Finished | Finish rate | Measured | Treatment outcome None | Outcome None | Exhausted | Unfinished | Left out |
+|---|---|---|---|---|---|---|---|---|---|---|
+| extended-vs-baseline | extended | 6 | 6 | 100% | 6 | 0 | 0 | 0 | 0 | 0 |
+| extended-vs-baseline | baseline | 6 | 6 | 100% | 6 | 0 | 0 | 0 | 0 | 0 |
+| relay-vs-baseline | relay-down | 8 | 8 | 100% | 8 | 0 | 0 | 0 | 0 | 0 |
+| relay-vs-baseline | baseline | 8 | 8 | 100% | 8 | 0 | 0 | 0 | 0 | 0 |
+| tools-effect-on-rounds | extended | 6 | 6 | 100% | 6 | 0 | 0 | 0 | 0 | 0 |
+| tools-effect-on-rounds | basic | 6 | 6 | 100% | 6 | 0 | 0 | 0 | 0 | 0 |
+
 ## Conditions
 
 Planned runs are analysed, exhausted (charged infrastructure attempts reached the limit; no scored attempt),

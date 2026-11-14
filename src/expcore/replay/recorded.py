@@ -18,7 +18,7 @@ import asyncio
 import copy
 import dataclasses
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
@@ -265,10 +265,20 @@ class ReplayToolBox(ToolBox):
     still has the provider serve it, so the call's identity and arguments are checked, but it returns the recorded
     shown text, raw text, its length, error class and truncation flag as they are. Every other call is rendered, and
     the cap is recomputed, as the loop did.
+
+    The one provider of a replay serves every recorded call, so it cannot say which tools were a tool server's; the
+    record does, in the names of `agent_config.tool_server_tools`, and the box is given them (L17).
     """
 
-    def __init__(self, providers: Sequence[ToolProvider], *, cap_chars: int, recorded: Sequence[dict[str, Any]]):
-        super().__init__(providers, cap_chars=cap_chars)
+    def __init__(
+        self,
+        providers: Sequence[ToolProvider],
+        *,
+        cap_chars: int,
+        recorded: Sequence[dict[str, Any]],
+        tool_servers: Collection[str] = (),
+    ):
+        super().__init__(providers, cap_chars=cap_chars, tool_servers=tool_servers)
         self._unrendered = {c["call_id"]: c for c in recorded if not c.get("rendering_verified", True)}
 
     async def run(self, call: ToolCall, *, timeout_s: float, ctx: CallContext = NO_WAITS) -> ToolRun:
