@@ -90,6 +90,24 @@ def test_c31_the_first_turn_hook_gets_one_reading_of_the_runs_clock_which_the_re
     assert not timer.started  # the loop starts the agent's clock; the hook runs before it, outside the agent's time
 
 
+def test_c31_the_first_turn_hook_stays_in_list_order_while_the_finishes_run_in_reverse():
+    """C31: the first turn is one moment, not a nest, so the hooks run in list order, while the finishes of the same
+    instruments run in the reverse of it."""
+    log = []
+    watchers = [Watcher(name, log=log) for name in ("first", "second", "third")]
+    start_instruments(watchers, {"run": "r1"})
+    first_turn_instruments(watchers, timer_on(FakeClock()))
+    finish_instruments(hand_made(), watchers)
+    assert [call for call in log if call.endswith((".at_first_turn", ".finish"))] == [
+        "first.at_first_turn",
+        "second.at_first_turn",
+        "third.at_first_turn",
+        "third.finish",
+        "second.finish",
+        "first.finish",
+    ]
+
+
 def test_c31_no_reading_is_taken_when_no_instrument_has_the_hook_so_a_run_without_one_is_unchanged():
     """C31: the clock gets no new reading from a study that declares no hook; the record of such a run is the one it
     was before the hook existed."""
@@ -145,7 +163,8 @@ def test_c31_the_hook_runs_before_the_loop_starts_the_timer_and_not_after():
 
 
 def test_c31_a_check_runs_after_every_finish_and_a_run_whose_checks_pass_leaves_the_record_as_it_was():
-    """C31: all snapshots are taken first; then each check runs in order; a pass adds nothing to the record."""
+    """C31: all snapshots are taken first, the last listed instrument's first; then each check runs in list order; a
+    pass adds nothing to the record."""
     log, record = [], hand_made()
     first, second = Watcher("first", log=log), Watcher("second", log=log)
     start_instruments([first, second], {"run": "r1"})
@@ -156,8 +175,8 @@ def test_c31_a_check_runs_after_every_finish_and_a_run_whose_checks_pass_leaves_
         "second.start",
         "first.at_first_turn",
         "second.at_first_turn",
-        "first.finish",
         "second.finish",
+        "first.finish",
         "first.check",
         "second.check",
     ]
@@ -191,7 +210,7 @@ def test_c31_a_check_that_refuses_puts_the_verdict_in_the_record_and_keeps_every
         "detail": "the plan failed mid-run",
     }
     assert set(out.instruments) == {"first", "refusing", "later"}
-    assert log == ["refusing.finish", "later.finish", "refusing.check", "later.check"]
+    assert log == ["later.finish", "refusing.finish", "refusing.check", "later.check"]
     assert record.instrument_refusal is None  # the argument is not mutated
 
 
