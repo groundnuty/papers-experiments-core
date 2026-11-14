@@ -50,7 +50,7 @@ from expcore.records.digest import digest
 from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
 from expcore.records.redact import Redactor
-from expcore.records.schema import SCHEMAS, RecordError, SchemaVersion, config_defaults
+from expcore.records.schema import SCHEMAS, TOOL_SERVER_TOOLS, RecordError, SchemaVersion, config_defaults
 from expcore.replay.clock import EXECUTOR_CLOCK_LABELS, ReplayClock
 from expcore.replay.compare import compare
 from expcore.replay.divergence import Halt, ReplayDivergence
@@ -73,6 +73,7 @@ def config_of(record: RunRecord, schemas: Sequence[SchemaVersion] = SCHEMAS) -> 
     """
     merged = {**config_defaults(record.schema_version, schemas), **record.agent_config}
     merged.pop("terminal_tools", None)  # the tool box adds it to the record; it follows from the recorded tools
+    merged.pop(TOOL_SERVER_TOOLS, None)  # so does this one: the box is given the recorded names (L17)
     try:
         limits = Limits(**merged.pop("limits"))
         return AgentConfig(limits, **merged)
@@ -136,7 +137,12 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
     timer = config.timer(clock, cleanup_waiter=_cleanup_waiter_for(clock))
     backend, provider = RecordedBackend(rec, clock, timer.infrastructure_wait), RecordedToolProvider(rec, clock)
     try:
-        box = ReplayToolBox([provider], cap_chars=config.limits.output_cap_chars, recorded=rec.tool_calls)
+        box = ReplayToolBox(
+            [provider],
+            cap_chars=config.limits.output_cap_chars,
+            recorded=rec.tool_calls,
+            tool_servers=rec.agent_config.get(TOOL_SERVER_TOOLS, ()),  # the record says which tools the bound reached
+        )
     except ValueError as exc:
         raise ReplayDivergence("tools", f"the recorded tools cannot be offered ({exc})") from None
     _check_inputs(rec, box)
