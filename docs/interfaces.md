@@ -556,7 +556,42 @@ Core guarantees, in `check` and again wherever the analysis reads the batch (R14
 - a hash or a side file in a directory that holds more than one record is refused, since it cannot be paired;
 - the side files are found in exactly the batch directory the check parses, however the command names the study and the batch.
 
-Implementer must guarantee: the executor writes the side file into `request.run_dir` with the record, and the record names it. An attempt killed after writing its side file and before writing its record leaves an orphan, which `check` refuses, naming it, until it is removed. A side file holds at most 64 MiB (`MAX_SIDE_FILE_BYTES`). A measure computed from a side file's content is a [scorer](#scorer) that takes `side_files`, which is handed the bytes the analysis read once and verified; the scorer never opens the file.
+Implementer must guarantee: the executor writes the side file into `request.run_dir` with the record, and the record names it, in the order [below](#placing-a-side-file-beside-its-record) (`stage_side_file`, then the record, then `commit`), so that a kill leaves a state `check` settles and never one it refuses for a reason the study did not cause. A side file holds at most 64 MiB (`MAX_SIDE_FILE_BYTES`). A measure computed from a side file's content is a [scorer](#scorer) that takes `side_files`, which is handed the bytes the analysis read once and verified; the scorer never opens the file.
+
+#### Placing a side file beside its record
+
+`expcore.replay.side_file_placement`. One helper takes a declared side file out of the sandbox's `/work` and puts it beside the record, in two calls, because the record that names its hash is written between them:
+
+```python
+def stage_side_file(sandbox, request, side_files, name, *, source=None) -> StagedSideFile | None
+def settle_side_files(batch, side_files, *, attempts_running=False) -> list[Settled]  # what `check` runs first
+def temporary_name(pattern: str, attempt: int) -> str                                 # ".<pattern>.tmp-<attempt>"
+
+@dataclass(frozen=True)
+class StagedSideFile:
+    declaration: SideFile; sha256: str; size: int
+    path: Path                         # where the file lies once committed: request.run_dir / pattern
+    def commit(self) -> Path           # rename into place; refused until the record on disk names sha256
+    def discard(self) -> None          # remove the staged file, for an attempt that fails before its record
+```
+
+- **`stage_side_file`** calls `sandbox.collect(scratch, outputs=[source or name])` itself, so the file reaches the driver through the copy of O19 (never a link, a special file or a hard link out of the output). The sandbox must not have stopped, and a second collection is as safe as the executor's own. The scratch directory is outside the batch and is removed. The file is then streamed into `request.run_dir` under the temporary name, hashed as it goes, fsynced, with the directory fsynced too. `side_files` is the study's declaration (`context.study.side_files`) and `name` one of its patterns; `source` is the file's relative path in `/work` when that is not `name`.
+- **It refuses** a `name` no declaration holds (`UndeclaredSideFile`, a `ValueError`) and a collected file over `MAX_SIDE_FILE_BYTES` (`SideFileTooLarge`), each before anything is written into the attempt directory, and a `source` that is absolute or holds `..`. Raised in an executor they are harness defects (C10); an executor that wants the oversized file to cost the run only its side file catches `SideFileTooLarge` and leaves the record's field out.
+- **It returns `None`** when the sandbox copied nothing: the file is not in `/work`, or the agent made it a link or the like, which the collection refuses and records for the scorers (`refused_output`). The run made no side file, and the record then holds no hash for it.
+- **The order is the temporary file, then the record with its hash, then the rename.** The executor puts `staged.sha256` in the record's `hash_field` (inside an instrument's snapshot, typically), writes the record, and only then calls `staged.commit()`, which renames the file to its declared name and refuses, renaming nothing, while the record on disk is missing or names another hash. Nothing but `commit` and `check` ever gives the file its declared name.
+
+**The rule `check` keeps, by the state a kill leaves.** A kill at each step is a state that `check` settles (`settle_side_files`, before it parses the batch, and printed on stderr as `check: finished ...` or `check: removed ...`), and `check` never refuses one for a reason the study did not cause:
+
+| Killed | The attempt directory holds | `check` |
+|---|---|---|
+| after the temporary file, before the record | `.<pattern>.tmp-<attempt>`, no record | passes it as it stands (a dot-name is never read), then removes the file: no record names it. A check made while attempts run (`check --partial`) leaves it, since an attempt that has staged its file and not yet written its record looks the same |
+| after the record, before the rename | the record naming `H`, and the temporary file | finds that the file's SHA-256 is `H`, the one the record names at the declared field, and renames it; the pairing then hashes it and compares it with the record like any side file. Done while attempts run too, and the attempt's own `commit` then finds the file in place |
+| after the rename | the record and the file | nothing to settle |
+
+- **A file is renamed only when** its directory holds exactly one record, that record names its SHA-256 at the declared field, and nothing lies at the declared name. The pairing of the check re-verifies every file in place, so the check never accepts a wrong file: a temporary file with another hash than the record's is removed, never renamed, and the record's hash with no file is refused as before; a directory of several records is left as it is, and refused as before; a file already at the declared name is never overwritten (the same bytes make the temporary copy redundant and it is removed, any other file is refused as changed).
+- **A temporary file no record names is removed**: no record beside it (unless attempts run), or a record that names another hash or none.
+- **What it never touches:** a dot-file of another name (a record's own interrupted write), a temporary name of no declared pattern, one without an attempt number, and anything that is not a regular file. A second `check` finds nothing to do.
+- **Only a `check` of the campaign's own batch settles** (`check` of a study with a store, `partial` or not). `merge` does not: it refuses a shard whose placement was left unfinished, as it refuses any side file that does not pair, so run `check` in a shard's own output first.
 
 One namespace is read by the core: a fault injector writes under `fault_injector` (`expcore.records.injections.FAULT_NAMESPACE`) a snapshot holding the run key, the attempt and a list of `injections`, each with its `target` and `injected` (true only once the injector verified the target was down). Under a condition that declares a kind with a target, the treatment flag needs that target in this list for this run and attempt; a missing, failed or stale snapshot gives none, so the attempt is set aside. Once the injector has taken a target down, the snapshot also holds `restore_verified` (an optional, additive field of the reading: `true` when the restore was verified, `false`, with `how`, `identity_changed` and `serving`, when it was not). The core refuses to score a record that carries it as anything but `true`, in any instrument's reading (`expcore.records.injections.restore_refusal`): `RunRecord.set_aside` is true for it, so `rescore` hands it back unscored, and the scheduler sets its attempt aside as infrastructure of kind `injector_failure`, whatever its outcome was, whether or not an instrument's own check refused it, and whatever the post-run health check decided, and runs it again (an attempt the health check or an outage already set aside keeps that outcome, and is not scored either). The platform that writes the reading registers the kind; a process that has not registered it, the core alone with a reading filed by hand, sets the attempt aside as `post_check_unverified`, the core's own untreatable kind for a result nobody verified, and never fails for an unknown kind.
 
@@ -610,6 +645,7 @@ Core guarantees:
 
 Implementer must guarantee:
 - Return the record `record_run` produced, and **write it to `request.run_dir`** (`record.write(request.run_dir)`) before returning: the core reads, checks and exports records from disk and does not write them for you.
+- A run that writes a declared [side file](#side-files-of-a-record) places it with `stage_side_file` and `StagedSideFile.commit` ([order and recovery](#placing-a-side-file-beside-its-record)): stage, put `sha256` in the record, write the record, commit, and call `discard` when the attempt fails before its record.
 - Script or configure the backend through the request; never build one.
 - Pass `request.treatment_kinds` and `request.treatment_targets` unchanged (`record_run` does) and the code identity from `StudyContext.code`.
 - Add the instruments' snapshots with `finish_instruments` before writing the record: it derives the treatment flag again, because under a declared target the fault injector's reading decides it.

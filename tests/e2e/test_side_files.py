@@ -252,6 +252,50 @@ def test_r14_check_finds_side_files_in_exactly_the_batch_it_parses_however_the_c
     assert list(side_failures(copy.runs)) == [SIDE]
 
 
+def temporary_of(path: Path) -> Path:
+    """The temporary name a side file has until its rename (`side_file_placement.temporary_name`), of attempt 1."""
+    return path.with_name(f".{path.name}.tmp-1")
+
+
+def test_r15_check_finishes_the_rename_an_attempt_killed_after_its_record_left_and_passes(copy, clean_environment):
+    """R15: a kill after the record that names a side file and before the rename leaves the file under its temporary
+    name; `check` renames it, since its hash is the one the record names, and passes, hashing it into its inputs."""
+    placed = side_files(copy.runs)[0]
+    placed.rename(temporary_of(placed))
+    assert check(clean_environment, copy.runs) == 0
+    assert placed.is_file()
+    assert not temporary_of(placed).exists()
+    assert stored_check(copy.runs)["failures"] == []
+    assert rel(copy.runs, placed) in stored_check(copy.runs)["hashed_only"]
+
+
+def test_r15_check_removes_a_temporary_file_no_record_names_and_passes(copy, clean_environment):
+    """R15: a kill after the temporary file and before the record leaves a dot-name no record names, in a directory
+    that holds no record or beside a record that names no hash for it; `check` removes it and passes."""
+    beside_a_record = temporary_of(records_without_side_file(copy.runs)[0].parent / SIDE)
+    beside_no_record = temporary_of(side_files(copy.runs)[0].parent.parent / "try9" / SIDE)
+    beside_no_record.parent.mkdir()
+    for stray in (beside_a_record, beside_no_record):
+        stray.write_bytes(b"killed before its record")
+    assert check(clean_environment, copy.runs) == 0
+    assert not beside_a_record.exists()
+    assert not beside_no_record.exists()
+    assert stored_check(copy.runs)["failures"] == []
+
+
+def test_r15_check_never_puts_a_file_in_place_that_is_not_the_one_its_record_names(copy, clean_environment):
+    """R15: a temporary file whose bytes are not the ones the record names is removed, never renamed, and the record's
+    hash with no file beside it fails the check, as it must."""
+    placed = side_files(copy.runs)[0]
+    subject = record_beside(placed)
+    placed.rename(temporary_of(placed))
+    temporary_of(placed).write_bytes(b"not what the record names")
+    assert check(clean_environment, copy.runs) == 1
+    assert not placed.exists()
+    assert not temporary_of(placed).exists()
+    assert side_failures(copy.runs)[rel(copy.runs, subject)].startswith(CHANGES["removed"][1])
+
+
 # --- analyze and regenerate ------------------------------------------------------------------------------------------
 
 

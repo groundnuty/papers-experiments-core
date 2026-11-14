@@ -95,6 +95,7 @@ from expcore.replay.check import (
     write_check,
 )
 from expcore.replay.native import has_native_parser
+from expcore.replay.side_file_placement import settle_side_files
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
@@ -424,6 +425,8 @@ def _check_batch_of(
         running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
         raise Refused(str(error)) from None
+    for settled in settle_side_files(directory, study.side_files, attempts_running=bool(running)):
+        print(f"check: {settled}", file=sys.stderr)  # what a kill left of a side file's placement (R15)
     check = verify_batch(
         directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
     )
