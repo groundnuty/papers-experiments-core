@@ -44,7 +44,8 @@ each further level. **The figure it holds the occupancy to is read after a wait 
 stage waits the same lag and margin from the eviction stage's end, for the deepest regular file of the space whatever
 `qos_rights` says, since an eviction's change lags as a placement's does (`resetqos`, the 14 Nov live slot). Without
 it the figure could still count bytes already evicted, and a growth up to their size would pass here. For the same
-reason the check fails when a transfer ran or ended after that figure was read (`reset.py`).
+reason the check fails when a transfer ran or ended since that wait began, as the transfer listings show
+`transfer_settle_s` after its own reading (`reset.py`).
 """
 
 from collections.abc import Iterable, Mapping

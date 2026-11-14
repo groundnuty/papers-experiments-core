@@ -49,11 +49,16 @@ read and every check is made on each provider that supports the space, since eac
    page of each provider's ended listing, newest first by finish time, read at the eviction stage's end and again
    after the reading, holds no new job, and no transfer is waiting or ongoing. Otherwise a job no stage sent changed
    the space after the instant the wait counts from, and its change may not show: the stage lets it end and waits
-   again from then, up to `OCCUPANCY_ROUNDS` (3) waits, and then fails. A provider other than the data provider that
-   holds more than the caller allows (nothing by default) fails the reset, so a reset without an eviction plan still
-   shows that only the owner holds data. Read before the evictions could show, the figure held evicted bytes: a reset
-   that allows nothing failed after a good eviction, and the quiet stage, held to that figure, passed a growth up to
-   their size. The record gives `waited_s` (every wait together), `depth` and `rounds`.
+   again from then, up to `OCCUPANCY_ROUNDS` (3) waits, and then fails. A listing shows a job up to
+   `transfer_settle_s` late (O07), so the look that vouches for a reading is made that long after it: the stage's own
+   when the quiet stage is skipped, else the quiet stage's, after its own reading and against the same first pages,
+   which fails the reset on a job either look missed. The reset's own jobs, the evictions it sent and the jobs it
+   cancelled, all seen to end before the wait, never count as new, however late they are listed. A provider other
+   than the data provider that holds more than the caller allows (nothing by default) fails the reset, so a reset
+   without an eviction plan still shows that only the owner holds data. Read before the evictions could show, the
+   figure held evicted bytes: a reset that allows nothing failed after a good eviction, and the quiet stage, held to
+   that figure, passed a growth up to their size. The record gives `waited_s` (every wait together), `depth`, `rounds`
+   and `listings_after_s`.
    **quiet**: the block maps of the eviction plan's own files (the files the reset evicts from a provider other than
    the data provider, each on the providers it evicted it from) and of the files a removed requirement applied to are
    read at one instant T, and none may hold more than the eviction (nothing, where it verified them empty) or the
@@ -64,22 +69,24 @@ read and every check is made on each provider that supports the space, since eac
    margin shows every placement that landed by T, whichever file it is on, so it alone catches a replication that lands
    before T on a file that is not in the plan, since no block map of the rest of the space is read. **It does not prove
    that nothing lands after T:** a replication still running at T can place its bytes later, may not show in the
-   occupancy read, and the stage then passes. **A transfer that ran or ended after the occupancy stage's reading fails
-   the stage** (the same first pages and listings, read after its occupancy read, O45): an eviction in that window can
-   hide a growth in the second reading, which then certifies nothing. The block maps decide for the plan's files; a
-   zero occupancy is never taken alone as nothing having landed, since it lags. The stage runs unless the caller
-   knows that no run since the last verified reset could have set a QoS requirement (`run(qos_rights=...)`, below),
-   whether or not a requirement is left at the reset. **The residual:** a fulfilment whose cancel missed may still be
-   replicating one file, with no requirement left and no transfer document to show it: of a requirement the agent
-   added and removed during the run, or of one the reset removed after a reconciliation restarted between its
+   occupancy read, and the stage then passes. **A transfer that ran or ended since the occupancy stage's wait began
+   fails the stage** (the same first pages and listings, looked at `transfer_settle_s` after its occupancy read,
+   O45): an eviction in that window can hide a growth in the second reading, which then certifies nothing, and a job
+   listed too late for the occupancy stage's own look made its figure wrong. The block maps decide for the plan's
+   files; a zero occupancy is never taken alone as nothing having landed, since it lags. The stage runs unless the
+   caller knows that no run since the last verified reset could have set a QoS requirement (`run(qos_rights=...)`,
+   below), whether or not a requirement is left at the reset. **The residual:** a fulfilment whose cancel missed may
+   still be replicating one file, with no requirement left and no transfer document to show it: of a requirement the
+   agent added and removed during the run, or of one the reset removed after a reconciliation restarted between its
    fulfilled status and its deletion reaching the replicating provider. It is at most one file's size per missed
    cancel, and rare; it may land after T, and is then caught by the next start's reset. The record gives `ran`, `why`
    (`requirements`, `rights` or `default`, `resetheld.py`), `held_files` and `held_source` (`"eviction plan"`),
-   `files`, `block_maps` and the stage's seconds. It costs the wait, 20 s for files one directory below the root and
-   5 s more per further level (the depth of the deepest file of the space, as the QoS scan saw it), and one block-map
-   read per evicted (file, provider) pair of the plan and per (file, provider) of a removed requirement's files, once:
-   bounded by the plan, never by the size of the space. The occupancy stage's wait comes on top, on every reset: the
-   same lag and margin, for the deepest regular file of the space.
+   `files`, `block_maps`, `listings_after_s` and the stage's seconds. It costs the wait, 20 s for files one directory
+   below the root and 5 s more per further level (the depth of the deepest file of the space, as the QoS scan saw
+   it), `transfer_settle_s` for the late look, and one block-map read per evicted (file, provider) pair of the plan
+   and per (file, provider) of a removed requirement's files, once: bounded by the plan, never by the size of the
+   space. The occupancy stage's wait comes on top, on every reset: the same lag and margin, for the deepest regular
+   file of the space.
 5. **history**: ended transfers cannot be removed. The 25.0 REST description offers, for a transfer, only `GET` and
    `DELETE /transfers/{tid}`, a cancel that answers 400 for a job that has ended, and `POST .../rerun`; the space's
    listing (`GET /spaces/{sid}/transfers`) only reads. So the next agent sees every ended transfer, the reset's own
@@ -245,6 +252,7 @@ class SpaceReset:
             "evicted": set(),
             "evicted_at": None,
             "ended_head": {},
+            "own": set(),  # the ids of the jobs the reset sent or cancelled, all ended before the occupancy's wait
             "settled": {},
             "occupancy": {},
             "qos_rights": qos_rights,
@@ -259,7 +267,7 @@ class SpaceReset:
         steps: dict[str, Callable[[], dict[str, Any]]] = {
             "qos": lambda: self._qos(qos_baseline, run),
             "qos_settle": lambda: self._qos_settle(run),
-            "transfers": self._transfers,
+            "transfers": lambda: self._transfers(run),
             "eviction": lambda: self._evict(plan, run),
             "occupancy": lambda: self._occupancy(bounds, run),
             "quiet": lambda: self._quiet(run),
@@ -316,9 +324,11 @@ class SpaceReset:
         """Read, at one instant, the block maps of the eviction plan's files and of the files a removed requirement
         applied to, against what the eviction and the settle left; wait; read the occupancy and set it against the
         occupancy stage's. It proves that no replica of the plan's files, and no occupancy growth, had landed by that
-        instant, and not that nothing lands after it. A transfer that ran or ended after the occupancy stage's reading
-        fails it (O45): an eviction there can hide a growth in the second reading. Skipped, and recorded so, for a
-        caller that knows no run could have set a requirement, when none was removed."""
+        instant, and not that nothing lands after it. A transfer that ran or ended since the occupancy stage's wait
+        began fails it (O45): an eviction there can hide a growth in the second reading, and a job the occupancy
+        stage's own look at the listings missed, listed late, made its figure wrong. The listings are looked at
+        `transfer_settle_s` after the reading, by when a job that ended before it is listed (O07). Skipped, and
+        recorded so, for a caller that knows no run could have set a requirement, when none was removed."""
         why, evicted = run["why"], run["evicted"]
         if why is None:
             return {"ran": False, "why": None, "qos_rights": run["qos_rights"], "files": 0, "waited_s": 0.0}
@@ -326,11 +336,13 @@ class SpaceReset:
         depth = resetheld.quiet_depth(run["affected"], run["deepest"], run["qos_rights"])
         expected = resetheld.expected_maps(run["settled"], evicted)
         facts = resetqos.quiet(self._p, expected, sizes, run["occupancy"], depth=depth)
-        moved = self._moved(run["ended_head"], self._ended_heads())
+        settle = self._p.settings.transfer_settle_s
+        self._p.sleep(settle)  # a job that ended by the reading is listed by now (O07)
+        moved = self._moved(run["ended_head"], self._ended_heads(), run["own"])
         if moved:
             raise ProvisionError(
-                f"a transfer ran or ended on {', '.join(moved)} after the occupancy stage's reading: an eviction then "
-                "can hide a growth in the quiet stage's reading, so it certifies nothing"
+                f"a transfer ran or ended on {', '.join(moved)} after the occupancy stage's wait began: an eviction "
+                "then can hide a growth in the quiet stage's reading, so it certifies nothing"
             )
         return {
             "ran": True,
@@ -339,6 +351,7 @@ class SpaceReset:
             "held_files": len({file_id for file_id, _ in evicted}),
             "held_source": resetheld.SOURCE,
             **facts,
+            "listings_after_s": settle,
         }
 
     # -- 2. running transfers ---------------------------------------------------------
@@ -368,16 +381,20 @@ class SpaceReset:
 
     def _ended_heads(self) -> dict[str, frozenset[str]]:
         """The ids on the first page of each provider's ended listing. The listing is newest first by finish time, so
-        a job that ends later is listed on that page, and an id there that an earlier reading lacked is a job that
-        ended since (O45). A job that ended just before the earlier reading but was not listed yet counts so too: a
-        wait more, never a job missed."""
+        a job that ends later is listed on that page once the listing shows it, and an id there that an earlier reading
+        lacked is a job that ended since (O45). A job that ended just before the earlier reading but was not listed yet
+        counts so too, a wait more. A job is seen only once listed: a reading that must hold every job ended by an
+        instant is made at least `transfer_settle_s`, the listing's lag (O07), after it."""
         return {p: frozenset(self._page(p, "ended", None)[0]) for p in self._providers}
 
-    def _moved(self, before: Mapping[str, frozenset[str]], now: Mapping[str, frozenset[str]]) -> list[str]:
+    def _moved(
+        self, before: Mapping[str, frozenset[str]], now: Mapping[str, frozenset[str]], own: Collection[str]
+    ) -> list[str]:
         """The labels of the providers whose ended listing's first page holds a job `before` did not (it ended
         between the two readings), or that list a transfer waiting or ongoing now; none when no transfer has run or
-        ended since `before`."""
-        moved = [p for p in self._providers if now[p] - before.get(p, frozenset())]
+        ended since `before`. A job of the reset's own (`own`, which it sent or cancelled and saw end before the
+        occupancy's wait began) is never new, though its listing may come late (O07)."""
+        moved = [p for p in self._providers if now[p] - before.get(p, frozenset()) - frozenset(own)]
         moved += [p for p, _ in self._active()]
         return [self._label(p) for p in dict.fromkeys(moved)]
 
@@ -412,11 +429,12 @@ class SpaceReset:
                 f"{self._label(provider)}: {what}",
             )
 
-    def _transfers(self) -> dict[str, Any]:
+    def _transfers(self, run: dict[str, Any]) -> dict[str, Any]:
         """Cancel every job that has not ended, on every provider that lists it, until `transfer_settle_polls`
         observations in a row show none, within twice that many. `cancelled` counts the distinct jobs the reset sent a
         cancel to (one answered 400, a job that had just ended, included): the history's `ended` cannot hold one it
-        cancelled while still scheduled, which is given no finish time."""
+        cancelled while still scheduled, which is given no finish time. Their ids join the reset's own
+        (`run["own"]`, O45)."""
         settings = self._p.settings
         cancelled: set[tuple[str, str]] = set()
         clean = observations = 0
@@ -430,6 +448,7 @@ class SpaceReset:
             self._wait_ended(fresh, "a cancelled transfer")
             clean = 0 if active else clean + 1
             if clean >= settings.transfer_settle_polls:
+                run["own"].update(tid for _, tid in cancelled)
                 return {"cancelled": len({tid for _, tid in cancelled}), "observations": observations}
             if observations >= 2 * settings.transfer_settle_polls:
                 raise ProvisionError(
@@ -464,13 +483,15 @@ class SpaceReset:
         (`run["evicted_at"]`, an empty plan included), with the first page of each provider's ended listing then
         (`run["ended_head"]`): every eviction and every transfer had ended by that instant, the reset's own and an
         earlier run's, and the occupancy stage waits from it and checks against those pages that none ended since
-        (O45)."""
+        (O45). The ids of the jobs it sends join the reset's own (`run["own"]`), which that check never takes for new
+        when a listing shows them late."""
         try:
             resolved = self._p.resolve_many(path for paths in plan.values() for path in paths)
         except KeyError:
             raise ProvisionError(NOT_IN_SPACE) from None
         out: dict[str, Any] = {}
         evicted: set[tuple[str, str]] = run["evicted"]  # mutated on purpose: what this stage hands the quiet stage
+        own: set[str] = run["own"]  # mutated on purpose: the jobs it sends, which the occupancy stage knows as its own
         for provider, paths in plan.items():
             entries = [resolved[path] for path in paths]
             results = [
@@ -480,6 +501,7 @@ class SpaceReset:
                     provider,
                     quiet=self._require_quiet,
                     listed=lambda ids, q=provider: evicted.update((file_id, q) for file_id in ids),
+                    scheduled=own.update,
                 )
                 for entry in entries
                 if entry.kind == "DIR"
@@ -487,7 +509,7 @@ class SpaceReset:
             files = [entry.file_id for entry in entries if entry.kind != "DIR"]
             evicted.update((file_id, provider) for file_id in files)
             if files:
-                results.append(evict_ids(self._p, files, provider, quiet=self._require_quiet))
+                results.append(evict_ids(self._p, files, provider, quiet=self._require_quiet, scheduled=own.update))
             out[self._label(provider)] = {
                 "trees": sum(1 for entry in entries if entry.kind == "DIR"),
                 "files": sum(r["files"] for r in results),
@@ -508,10 +530,15 @@ class SpaceReset:
         Then, with no transfer running, read each provider's physical size of the space, and keep the reading only when
         no transfer ran or ended since the wait began (the ended listings' first pages, and the waiting and ongoing
         listings, read after it): a job no stage sent may have, after the instant the wait counts from. Otherwise wait
-        again from when none runs, up to `OCCUPANCY_ROUNDS` waits in all. Refuse a provider other than the data
-        provider that holds more than it is allowed; keep the sizes for the quiet re-check, which would otherwise hold
-        the occupancy to a figure still showing evicted bytes."""
+        again from when none runs, up to `OCCUPANCY_ROUNDS` waits in all. A listing shows a job up to
+        `transfer_settle_s` late (O07): when the quiet stage is skipped, the listings are looked at that long after the
+        reading, so the reading is kept only when it holds every job's change; when it runs, they are looked at at once,
+        and the quiet stage's own look, that long after its reading, against the same first pages, covers the rest and
+        fails the reset. Refuse a provider other than the data provider that holds more than it is allowed; keep the
+        sizes for the quiet re-check, which would otherwise hold the occupancy to a figure still showing evicted
+        bytes."""
         depth = max(run["deepest"], 1)
+        settle = self._p.settings.transfer_settle_s if run["why"] is None else 0.0
         anchor, before, waited, rounds = run["evicted_at"], run["ended_head"], 0.0, 0
         while True:
             rounds += 1
@@ -521,8 +548,9 @@ class SpaceReset:
                 waited += wait
             self._require_quiet()
             sizes = physical_sizes(self._p, self._providers, retry=self._p.retry)
-            after = self._ended_heads()
-            if not self._moved(before, after):
+            if settle > 0:
+                self._p.sleep(settle)  # a job that ended by the reading is listed by now (O07)
+            if not self._moved(before, self._ended_heads(), run["own"]):
                 break
             if rounds == OCCUPANCY_ROUNDS:
                 raise ProvisionError(
@@ -531,7 +559,7 @@ class SpaceReset:
                 )
             self._require_quiet()  # a job ran or ended since the wait began: let it end, then wait from then
             before, anchor = self._ended_heads(), self._p.clock()
-        run["occupancy"], run["ended_head"] = sizes, after
+        run["occupancy"], run["ended_head"] = sizes, before  # the quiet stage looks for jobs since this wait began
         over = [p for p, held in sizes.items() if p != self._p.settings.holder and held > allowed.get(p, 0)]
         if over:
             where = ", ".join(self._label(p) for p in over)
@@ -541,6 +569,7 @@ class SpaceReset:
             "waited_s": round(waited, 3),
             "depth": depth,
             "rounds": rounds,
+            "listings_after_s": settle,
         }
 
     # -- 5. ended-transfer history ------------------------------------------------------

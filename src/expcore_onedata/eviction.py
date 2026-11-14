@@ -183,16 +183,19 @@ def _evict_verified(
     files: Sequence[str],
     schedule: Callable[[Sequence[str]], list[str]],
     quiet: Callable[[], None] | None,
+    scheduled: Callable[[Sequence[str]], None] | None = None,
 ) -> dict[str, Any]:
-    """Schedule the evictions (`schedule` takes the files still holding bytes and returns the transfer ids), wait for
-    them to end, and judge them by the block maps alone, scheduling again what still holds bytes after
-    `EVICTION_CHECK_S`, up to `EVICTION_ATTEMPTS` in all; the last attempt waits the whole settle bound. Return the
-    transfers, their end states, the last attempt's counters, the polls and the attempts; raise `EvictionIncomplete`
-    when files still hold bytes then."""
+    """Schedule the evictions (`schedule` takes the files still holding bytes and returns the transfer ids, which
+    `scheduled` is given when set), wait for them to end, and judge them by the block maps alone, scheduling again
+    what still holds bytes after `EVICTION_CHECK_S`, up to `EVICTION_ATTEMPTS` in all; the last attempt waits the whole
+    settle bound. Return the transfers, their end states, the last attempt's counters, the polls and the attempts;
+    raise `EvictionIncomplete` when files still hold bytes then."""
     pending, transfers, polls = list(files), 0, 0
     states: dict[str, int] = {}
     for attempt in range(1, EVICTION_ATTEMPTS + 1):
         tids = schedule(pending)
+        if scheduled is not None:
+            scheduled(tids)
         transfers += len(tids)
         done = _wait_ended(provisioner, provider, tids)
         for state, count in done.states().items():
@@ -221,9 +224,12 @@ def evict_ids(
     from_provider: str,
     *,
     quiet: Callable[[], None] | None = None,
+    scheduled: Callable[[Sequence[str]], None] | None = None,
 ) -> dict[str, Any]:
     """Evict files, given by id, from a provider, at most `concurrency` requests at once, and return a record once
-    every file's block map there shows nothing held. Never from the data provider; no id means nothing to do."""
+    every file's block map there shows nothing held. Never from the data provider; no id means nothing to do.
+    `scheduled`, when given, is called with the ids of each attempt's transfers: the reset tells its own jobs from
+    others' by them (O45)."""
     provisioner.check_eviction(from_provider)
     ids = list(dict.fromkeys(file_ids))
     if not ids:
@@ -249,7 +255,7 @@ def evict_ids(
             provisioner.settings.concurrency,
         )
 
-    done = _evict_verified(provisioner, from_provider, ids, schedule, quiet)
+    done = _evict_verified(provisioner, from_provider, ids, schedule, quiet, scheduled)
     return {"files": len(ids), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 
 
@@ -260,13 +266,14 @@ def evict_tree(
     *,
     quiet: Callable[[], None] | None = None,
     listed: Callable[[Sequence[str]], None] | None = None,
+    scheduled: Callable[[Sequence[str]], None] | None = None,
 ) -> dict[str, Any]:
     """Evict every file under a directory from a provider with one transfer, then verify all of them together, the
     tree listed once; return the record. Never from the data provider; `path` (or the entry a caller resolved
     already) must be a directory. An attempt that left bytes schedules the directory's eviction again. `listed`, when
     given, is called with the ids of the files the listing found, before the transfer: the reset's quiet check holds
     those files' block maps on this provider to the empty map the eviction verified (O33), so it never lists the tree a
-    second time."""
+    second time. `scheduled`, when given, is called with each attempt's transfer id (O45), as `evict_ids` does."""
     provisioner.check_eviction(from_provider)
     began = provisioner.clock()
     provisioner.verify_space()
@@ -282,6 +289,7 @@ def evict_tree(
         files,
         lambda _pending: [provisioner.schedule_transfer("eviction", directory.file_id, from_provider)],
         quiet,
+        scheduled,
     )
     return {"files": len(files), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 

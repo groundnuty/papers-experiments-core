@@ -13,6 +13,8 @@ from expcore_onedata.testing import BETA_ID, DATA, write_platform
 from expcore_onedata.testing.fake_data import ROOT_ID, Transfer
 
 HELD = len(FILES) * len(DATA)  # what beta holds of the space at the start: every file of `study`
+SLOW_SETTLE_S = 30.0  # the default `transfer_settle_s`: at least a transfer listing's lag behind a job (O07)
+LISTING_LAG_S = 25.0  # how long after it ends an outside job is first listed, within that bound
 
 
 @pytest.fixture
@@ -85,6 +87,30 @@ def during_the_occupancy_wait(ticker, act):
             act()
 
     return sleep
+
+
+def slow_listings(fake, ticker, tmp_path, late=lambda tid, job: tid.startswith("tid-outside")):
+    """Hide each ended job `late` picks (an outside job by default) from every transfer listing until `LISTING_LAG_S`
+    after it ended, and return a platform file whose `transfer_settle_s` is `SLOW_SETTLE_S`, the bound the reset takes
+    such a lag to be within."""
+    original = fake._transfer_page
+
+    def page(query, provider, include):
+        def shown(tid, job):
+            hidden = job.ended and late(tid, job) and ticker.now < job.finished + LISTING_LAG_S
+            return include(tid, job) and not hidden
+
+        return original(query, provider, shown)
+
+    fake._transfer_page = page
+    directory = tmp_path / "slow"
+    directory.mkdir()
+
+    def edit(data):
+        two_providers(data)
+        data["placement"]["transfer_settle_s"] = SLOW_SETTLE_S
+
+    return write_platform(directory, edit)
 
 
 def root_reads(fake, ticker) -> list[float]:
@@ -257,6 +283,59 @@ def test_o45_an_eviction_that_ends_during_the_quiet_stage_fails_it(
     with pytest.raises(ResetFailed, match=r"quiet stage.*ran or ended.*certifies nothing") as caught:
         SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, {"beta": len(DATA)}, qos_rights=True)
     assert caught.value.record["stages"]["occupancy"]["physical_bytes"]["providers[1]"] == len(DATA)
+
+
+def test_o45_a_replication_listed_late_after_the_occupancy_wait_is_still_waited_for(
+    client, config, ticker, tmp_path, fake
+):
+    """O45, O07: a transfer listing shows a job up to `transfer_settle_s` late. A replication into beta ends as the
+    wait ends and is listed 25 s later; observed at once, the listings showed nothing new and the reading, beta holding
+    nothing, passed with the quiet check skipped. With that check skipped the stage observes the listings
+    `transfer_settle_s` after its reading, sees the job, waits again, and beta holds bytes beyond what it may."""
+    for path in FILES:
+        fake.blocks.pop((fake.id_of(path), BETA_ID))  # the setup's: beta holds nothing of the space
+    late = fake.add_file("other/late.bin", DATA)
+    platform = slow_listings(fake, ticker, tmp_path)
+    sleep = during_the_occupancy_wait(ticker, lambda: outside_job(fake, ticker, "replication", late))
+    provisioner = provisioner_with(client, config, platform, ticker, tmp_path, sleep=sleep)
+    with pytest.raises(ResetFailed, match=r"occupancy stage.*beyond what the reset allows"):
+        SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
+
+
+def test_o45_an_eviction_listed_late_during_the_quiet_stage_fails_it(
+    client, config, ticker, tmp_path, fake, monkeypatch
+):
+    """O45, O07: an eviction of a file beta may keep ends at T, beside a landing of its size, and is listed 25 s later.
+    The quiet stage's reading at T + 20 s shows the drop and the landing together, no more than the figure, and
+    observed at once the listings showed nothing new; the stage observes them `transfer_settle_s` after its reading,
+    sees the job, and fails."""
+    kept, late = fake.add_file("other/kept.bin", DATA), fake.add_file("other/late.bin", DATA)
+    fake.blocks[(kept, BETA_ID)] = [[0, len(DATA)]]
+    platform = slow_listings(fake, ticker, tmp_path)
+    original = resetqos.read_pairs
+
+    def at_t(p, pairs):
+        outside_job(fake, ticker, "eviction", kept)
+        fake.blocks[(late, BETA_ID)] = [[0, len(DATA)]]
+        return original(p, pairs)
+
+    monkeypatch.setattr(resetqos, "read_pairs", at_t)
+    provisioner = provisioner_with(client, config, platform, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"quiet stage.*ran or ended.*certifies nothing"):
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, {"beta": len(DATA)}, qos_rights=True)
+
+
+@pytest.mark.parametrize("rights", [True, False])
+def test_o45_the_resets_own_evictions_listed_late_are_no_new_job(client, config, ticker, tmp_path, fake, rights):
+    """O45, O07: the reset's own eviction jobs can be listed late too, after the first pages read at the eviction
+    stage's end. They had ended by then, so a look that finds them later counts no new job: the reset passes in one
+    wait, whether the quiet stage runs or not, where taking them for new would fail every reset that evicts."""
+    platform = slow_listings(fake, ticker, tmp_path, late=lambda tid, job: job.kind == "eviction")
+    provisioner = provisioner_with(client, config, platform, ticker, tmp_path)
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=rights)
+    assert record["ok"]
+    assert record["stages"]["occupancy"]["rounds"] == 1
+    assert record["stages"]["quiet"]["ran"] is rights
 
 
 def test_o45_transfers_that_keep_ending_during_the_occupancy_wait_fail_the_stage_at_its_bound(
