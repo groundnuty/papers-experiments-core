@@ -103,6 +103,7 @@ class _Space:
             "evicted_at": None,
             "ended_head": {},
             "own": set(),  # the ids of the jobs the reset sent or cancelled, all ended before the occupancy's wait
+            "ended": set(),  # those of them whose records have reported them ended: they hold no read up
             "settled": {},
             "occupancy": {},
             "qos_rights": rights,
@@ -335,6 +336,7 @@ class SpacesReset:
         settle = space.settle
         if settle.settled:
             space.run["own"].update(tid for _, tid in settle.cancelled)
+            space.run["ended"].update(tid for _, tid in settle.cancelled)  # each was waited on until it ended
             cancelled = len({tid for _, tid in settle.cancelled})
             space.done("transfers", {"cancelled": cancelled, "observations": settle.observations, "fast": settle.fast})
             return True

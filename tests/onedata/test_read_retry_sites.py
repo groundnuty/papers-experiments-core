@@ -50,8 +50,8 @@ PLUMBING = {
     ],  # the global clock, Onezone's reading
     ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._occupancy", "physical_sizes"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._quiet", "physical_sizes"): ["self._p.retry"],
+    ("reset.py", "SpaceReset._occupancy_read", "physical_sizes"): ["self._p.retry"],
+    ("reset.py", "SpaceReset._quiet_sizes", "physical_sizes"): ["self._p.retry"],
     # the reset's QoS stages (O33): the scans, each requirement's record, and the settle's and the quiet stage's
     # block maps, whose failure fails the stage (a read that fails is no poll that did not match)
     ("resetqos.py", "_summary", "client.get"): ["p.retry"],
@@ -248,12 +248,12 @@ HELPER_USERS = {
         "provisioner.read_through",
     },
     "reset.py": {
-        "provisioner.verify_space",
         "provisioner.mutate",
         "provisioner.resolve_many",
         "layer.evict_ids",
         "layer.evict_tree",
     },
+    "resetspaces.py": {"provisioner.verify_space"},  # the driver verifies each space before any stage
     "resetqos.py": {"provisioner.children"},
     "resetremove.py": {"provisioner.mutate"},
     "storageimport.py": {  # the check of a space provisioned by storage import (O41): plumbing, as a baseline's

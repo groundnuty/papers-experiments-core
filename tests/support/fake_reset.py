@@ -23,8 +23,10 @@ and with these changes to the calls it inherits:
 
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
 `spawn_on_evict` (a provider id: an eviction that ends starts a replication of the same data into it, a job begun
-while a reset runs), and `dir_stats_disabled` (a directory's distribution answers its physical sizes as failed, as a
-space without directory statistics does).
+while a reset runs), `dir_stats_disabled` (a directory's distribution answers its physical sizes as failed, as a
+space without directory statistics does), and `ended_listed_ongoing_s` (seconds of `clock` after its finish during
+which a job that ended, not cancelled, is still on the first page of every provider's ongoing listing while its record
+says it ended: a listing that lags the record; 0, the default, models none).
 
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
 `distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and an
@@ -106,6 +108,7 @@ class FakeReset(FakeData):
         self.ignore_cancels = False
         self.spawn_on_evict: str | None = None
         self.dir_stats_disabled = False
+        self.ended_listed_ongoing_s = 0.0
         self.blocks_flush_delay_s = 10.0  # the file location's flush after its first change (rel/files/app.config:511)
         self.dir_stats_flush_s = 5.0  # each directory level's collector flush (dir_stats_collector.erl:168)
         self._called = False
@@ -246,7 +249,20 @@ class FakeReset(FakeData):
             found = self.space_of(transfer.file_id)
             return found == space or (found is None and space == self.SPACE_ID)
 
-        return self._transfer_page(query, provider, here)
+        answer = self._transfer_page(query, provider, here)
+        if query.get("state") != "ongoing" or query.get("page_token") or not self.ended_listed_ongoing_s:
+            return answer
+        body = answer.json()
+        lingering = [
+            tid
+            for tid, job in self.transfers.items()
+            if here(tid, job)
+            and job.ended
+            and not getattr(job, "cancelled", False)
+            and self.clock() < job.finished + self.ended_listed_ongoing_s
+            and tid not in body["transfers"]
+        ]
+        return httpx.Response(200, json={**body, "transfers": [*body["transfers"], *lingering]})
 
     def _finish(self, transfer: Transfer) -> None:
         """An eviction of a directory evicts every file under it; anything else ends as FakeData's does."""

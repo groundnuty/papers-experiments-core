@@ -141,6 +141,7 @@ at once; `run` is that driver with this space alone.
 
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from functools import partial
 from typing import Any
 
 from expcore_onedata import consistency, resetheld, resetqos, resetremove
@@ -410,17 +411,22 @@ class SpaceReset:
         self._wait_ended(fresh, "a cancelled transfer")
         return bool(active)
 
-    def _require_quiet(self) -> None:
+    def _require_quiet(self, run: Mapping[str, Any], waits: consistency.WaitLog | None = None) -> None:
         """Require the listings of every provider to show no transfer waiting or ongoing, observing again after the
         settle time up to `transfer_settle_polls` times (a job that has just ended may still be listed); raise when
-        one is still listed at the bound. A block map or a physical size is read only after this passes."""
-        settings = self._p.settings
+        one is still listed at the bound. A block map or a physical size is read only after this passes. A job of the
+        reset's own whose record has reported an ended state on the provider it ran on (`run["ended"]`: an eviction it
+        sent, a job it cancelled) holds nothing up, whatever a listing still shows: a listing lags the record (O07),
+        and a job that has ended changes no map. Any other job listed holds the read until no listing shows it. Each
+        wait is logged in `waits`, when given, as `listed_running`."""
+        settings, ended = self._p.settings, run["ended"]
+        sleep = self._p.sleep if waits is None else waits.sleeper("listed_running", self._p.sleep)
         for observation in range(1, settings.transfer_settle_polls + 1):
-            active = self._active()
+            active = [(provider, tid) for provider, tid in self._active() if tid not in ended]
             if not active:
                 return
             if observation < settings.transfer_settle_polls:
-                self._p.sleep(settings.transfer_settle_s)
+                sleep(settings.transfer_settle_s)
         where = ", ".join(self._label(p) for p in dict.fromkeys(p for p, _ in active))
         raise ProvisionError(
             f"{len(active)} transfer(s) still waiting or ongoing on {where}; nothing is read until none"
@@ -437,7 +443,8 @@ class SpaceReset:
         (`run["ended_head"]`): every eviction and every transfer had ended by that instant, the reset's own and an
         earlier run's, and the occupancy stage waits from it and checks against those pages that none ended since
         (O46). The ids of the jobs it sends join the reset's own (`run["own"]`), which that check never takes for new
-        when a listing shows them late."""
+        when a listing shows them late, and, once their records have reported them ended, the ones that hold no read
+        up (`run["ended"]`, `_require_quiet`). The record gives every wait the stage took, by why (`waits`)."""
         try:
             resolved = self._p.resolve_many(path for paths in plan.values() for path in paths)
         except KeyError:
@@ -445,6 +452,9 @@ class SpaceReset:
         out: dict[str, Any] = {}
         evicted: set[tuple[str, str]] = run["evicted"]  # mutated on purpose: what this stage hands the quiet stage
         own: set[str] = run["own"]  # mutated on purpose: the jobs it sends, which the occupancy stage knows as its own
+        waits = consistency.WaitLog()
+        watched = {"scheduled": own.update, "ended": run["ended"].update, "waits": waits}
+        quiet = partial(self._require_quiet, run, waits)
         for provider, paths in plan.items():
             entries = [resolved[path] for path in paths]
             results = [
@@ -452,9 +462,9 @@ class SpaceReset:
                     self._p,
                     entry,
                     provider,
-                    quiet=self._require_quiet,
+                    quiet=quiet,
                     listed=lambda ids, q=provider: evicted.update((file_id, q) for file_id in ids),
-                    scheduled=own.update,
+                    **watched,
                 )
                 for entry in entries
                 if entry.kind == "DIR"
@@ -462,7 +472,7 @@ class SpaceReset:
             files = [entry.file_id for entry in entries if entry.kind != "DIR"]
             evicted.update((file_id, provider) for file_id in files)
             if files:
-                results.append(evict_ids(self._p, files, provider, quiet=self._require_quiet, scheduled=own.update))
+                results.append(evict_ids(self._p, files, provider, quiet=quiet, **watched))
             out[self._label(provider)] = {
                 "trees": sum(1 for entry in entries if entry.kind == "DIR"),
                 "files": sum(r["files"] for r in results),
@@ -471,10 +481,10 @@ class SpaceReset:
                 "attempts": max((r["attempts"] for r in results), default=0),
                 **sum_counts(results),
             }
-        self._require_quiet()
+        quiet()
         run["ended_head"] = self._ended_heads()
         run["evicted_at"] = self._p.clock()
-        return {"providers": out}
+        return {"providers": out, "waits": waits.facts()}
 
     # -- 4. occupancy -----------------------------------------------------------------
     # The occupancy stage, in the steps `resetspaces` takes for every space, with one wait between each
@@ -499,7 +509,7 @@ class SpaceReset:
         against the same first pages, covers the rest and fails the reset."""
         state = run["occupancy_wait"]
         state["waited"] += waited
-        self._require_quiet()
+        self._require_quiet(run)
         state["sizes"] = physical_sizes(self._p, self._providers, retry=self._p.retry)
         return self._p.settings.transfer_settle_s if run["why"] is None else 0.0
 
@@ -516,7 +526,7 @@ class SpaceReset:
                 f"transfers kept ending or running during the occupancy stage's wait, {OCCUPANCY_ROUNDS} waits in "
                 "all: no reading of the occupancy is shown to hold their changes"
             )
-        self._require_quiet()  # a job ran or ended since the wait began: let it end, then wait from then
+        self._require_quiet(run)  # a job ran or ended since the wait began: let it end, then wait from then
         state["before"], state["anchor"] = self._ended_heads(), self._p.clock()
         return False
 
