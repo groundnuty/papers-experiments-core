@@ -22,9 +22,14 @@ or at the settle's end.
    dial a link mid-sequence;
 4. `restart_link` on **every** provider, the restored one and the crashed source included, one after another with no
    fetch in between, so one settle covers them all (`ComposeDriver.restart_link`; each result is a word, and a
-   `badrpc_timeout` is never retried);
-5. one settle of `heal_settle_s` (180 s, provisional) with no probe, no fetch and no run, then no active transfer again
-   (as in 3), then the session gate of the restored provider, then every ordered pair, with fresh probes.
+   `badrpc_timeout` is never retried); before each later restart the listings are read once, not waited for, and an
+   active transfer stops the sequence there, closed, after the settle;
+5. one settle of `heal_settle_s` (180 s, provisional) with no probe, no fetch and no run, then the listings read once
+   (an active transfer fails it closed), then the session gate of the restored provider, then every ordered pair,
+   with fresh probes.
+
+The settle is enforced after every restart that was sent, in both modes: an interrupted sequence, an unverified
+container restart and a step that raised all get it before the heal returns.
 
 If a pair still fails, the **container fallback**: the readers of the stuck pairs, one at a time in label order, each
 container restarted by the injector's own stop and start (`Recovery.restart_container`: journalled as an injection of
@@ -201,21 +206,24 @@ class LinkHeal:
         self._record(label, "restart_link", result, start)
         return result
 
-    def _no_transfers(self, phase: str) -> bool:
-        """Wait, polling every `poll_s` for at most `gate_timeout_s` (cut to what is left), until no transfer is
-        active in the probe space or a study space; record the reading; False when one stays active or the listings
-        cannot be read."""
-        start, began, bound = self._utc(), self._clock(), max(0.0, min(self._gate_s, self._left()))
+    def _no_transfers(self, phase: str, *, wait: bool = True) -> bool:
+        """Whether no transfer is active in the probe space or a study space; record the reading. Before a restart
+        (`wait`), it polls every `poll_s` for at most `gate_timeout_s` (cut to what is left) until none is; once a
+        restart has been issued (`wait=False`: the next restart of a sequence, the end of a settle), one reading
+        decides, since a transfer active then may already have fetched through a restarting link. False when one is
+        active, the listings cannot be read, or the driver cannot tell."""
+        start, began = self._utc(), self._clock()
+        bound = max(0.0, min(self._gate_s, self._left())) if wait else 0.0
         while True:
             try:
                 active = self._transfers()
             except Exception:  # a listing that cannot be read shows no quiet: fail closed
                 active = -1
-            if active is None or active == 0 or self._clock() - began >= bound:
+            if not wait or active is None or active == 0 or self._clock() - began >= bound:
                 break
             self._sleep(max(0.0, min(self._poll_s, bound - (self._clock() - began))))
         # a driver that cannot tell (None) shows no quiet, and neither does a quiet reading seen past the bound
-        quiet = active == 0 and self._clock() - began <= bound
+        quiet = active == 0 and (not wait or self._clock() - began <= bound)
         result = "unknown" if active is None else ("quiet" if quiet else "active")
         waited = round(self._clock() - began, 3)
         self._record("all", "transfers", result, start, phase=phase, active=active, waited_s=waited)
@@ -245,21 +253,25 @@ class LinkHeal:
         if not self._fits(cost):
             return "links_stuck", before, f"heal_timeout_s leaves no time for the {action} on {label}"
         start, extra = self._utc(), {}
-        if action == "restart_link":
-            self._linked.add(label)
-            try:
-                result = str(self._driver.restart_link(service))
-            except DriverError:
-                result = "not_run"
-        else:  # its waits end by what its reserve leaves after the margin and the settle: never past the bound
-            budget = max(0.0, self._left() - self._margin_s - self._settle_s)
-            done = self._restart(label, service, budget)
-            result, extra = str(done.get("how")), {"serves_after_s": done.get("serves_after_s")}
-            if done.get("ok") is not True:
-                self._record(label, action, result, start, **extra)
-                return "heal_restart_failed", before, f"the container of {label} was not restored ({result})"
-        settled = self._settle()
-        if not self._no_transfers("after"):
+        try:
+            if action == "restart_link":
+                self._linked.add(label)
+                try:
+                    result = str(self._driver.restart_link(service))
+                except DriverError:
+                    result = "not_run"
+            else:  # its waits end by what its reserve leaves after the margin and the settle: never past the bound
+                budget = max(0.0, self._left() - self._margin_s - self._settle_s)
+                done = self._restart(label, service, budget)
+                result, extra = str(done.get("how")), {"serves_after_s": done.get("serves_after_s")}
+        except Exception:
+            self._settle()  # whatever broke after the restart was sent, nothing reads through it before the settle
+            raise
+        settled = self._settle()  # enforced after every restart sent, a failed or unverified one included
+        if action != "restart_link" and done.get("ok") is not True:
+            self._record(label, action, result, start, settle_s=settled, **extra)
+            return "heal_restart_failed", before, f"the container of {label} was not restored ({result})"
+        if not self._no_transfers("after", wait=False):
             self._record(label, action, result, start, settle_s=settled, **extra)
             return "transfers_active", before, f"a transfer was active at the end of the {action}'s settle on {label}"
         gate = self._gate_within(service)
@@ -289,12 +301,21 @@ class LinkHeal:
         pinged = len(labels) * (self._link_cost - self._restart_cost)  # the pings' share of the reserve, now spent
         if not self._fits(self._all_links_cost - pinged):
             return "links_stuck", before, "heal_timeout_s leaves no time for the all-links restarts"
-        opened = self._utc()
-        for label in labels:  # one after another, nothing fetched in between
-            self._restart_link(label, self._services[label])
-        settled = self._settle()
+        opened, interrupted = self._utc(), None
+        try:
+            for index, label in enumerate(labels):  # one after another, nothing fetched in between
+                if index and not self._no_transfers("between", wait=False):  # a transfer could dial a restarted link
+                    interrupted = f"a transfer became active during the all-links sequence, before {label}'s restart"
+                    break
+                self._restart_link(label, self._services[label])
+        except Exception:
+            self._settle()  # whatever broke after a restart was sent, nothing reads through it before the settle
+            raise
+        settled = self._settle()  # enforced once any restart was sent, an interrupted sequence included
         self._window = {"start_utc": opened, "end_utc": self._utc(), "settle_s": settled}
-        if not self._no_transfers("after"):
+        if interrupted is not None:
+            return "transfers_active", before, interrupted
+        if not self._no_transfers("after", wait=False):
             return "transfers_active", before, "a transfer was active at the end of the all-links window"
         restored = self._services.get(self._restored)
         gate = self._gate_within(restored) if restored is not None else {"ok": True, "how": "none"}

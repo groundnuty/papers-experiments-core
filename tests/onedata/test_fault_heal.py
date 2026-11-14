@@ -714,10 +714,8 @@ def test_o35_all_links_heals_every_stale_pair_in_one_round(tmp_path):
     heal = step(injector_, "heal")
     assert (heal["outcome"], heal["shared_source"]) == ("healed", CRASHED)
     assert heal["window"]["settle_s"] == 30
-    assert [a["action"] for a in heal["actions"]] == ["ping"] * 4 + ["transfers"] + ["restart_link"] * 4 + [
-        "transfers",
-        "check",
-    ]
+    sequence = ["transfers", "restart_link"] * 4  # a reading before each restart: waited for before the first only
+    assert [a["action"] for a in heal["actions"]] == ["ping"] * 4 + sequence + ["transfers", "check"]
     assert heal["actions"][-1]["matrix_after"]["ok"] is True
 
 
@@ -742,7 +740,8 @@ def test_o35_all_links_waits_for_an_active_transfer_to_end_before_its_restarts(t
     injector_.start(RUN)
     assert injector_.clear() is True
     readings = [a for a in step(injector_, "heal")["actions"] if a["action"] == "transfers"]
-    assert [(a["phase"], a["result"]) for a in readings] == [("before", "quiet"), ("after", "quiet")]
+    phases = [("before", "quiet")] + [("between", "quiet")] * 3 + [("after", "quiet")]
+    assert [(a["phase"], a["result"]) for a in readings] == phases
     assert readings[0]["waited_s"] == 2
 
 
@@ -760,7 +759,7 @@ def test_o35_all_links_fails_closed_on_a_transfer_that_stays_active(tmp_path):
 def test_o35_all_links_fails_closed_on_a_transfer_active_at_the_end_of_its_window(tmp_path):
     """O35: a transfer active at the end of the settle, past the bound, fails it closed before any check."""
     services = stale()
-    services.transfers = [0] + [1] * 1000
+    services.transfers = [0, 0, 0, 0, 1]  # quiet before and between the restarts, active at the window's end
     injector_, services = injector(tmp_path, services, heal="all_links", gate_timeout_s=10)
     injector_.start(RUN)
     checks = services.checks
@@ -768,6 +767,47 @@ def test_o35_all_links_fails_closed_on_a_transfer_active_at_the_end_of_its_windo
     assert step(injector_, "cleared")["how"] == "transfers_active"
     assert len(acted(services, "restart_link")) == 4
     assert services.checks - checks == 2  # the restore's check and the heal's fresh one: none after the window
+    (last,) = [a for a in step(injector_, "heal")["actions"] if a.get("phase") == "after"]
+    assert last["waited_s"] == 0  # read once, never waited for: a transfer then may have fetched mid-settle
+
+
+def test_o35_a_transfer_that_starts_mid_sequence_stops_it_after_the_settle(tmp_path):
+    """O35: a transfer active before a later restart of the sequence stops it there, closed, and the links already
+    restarted still get their whole settle before anything else is read."""
+    services = stale()
+    services.transfers = [0, 0, 1]  # quiet before the first two restarts, active before the third
+    injector_, services = injector(tmp_path, services, heal="all_links")
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "transfers_active"
+    assert acted(services, "restart_link") == [("restart_link", CRASHED), ("restart_link", RESTORED)]
+    assert step(injector_, "heal")["window"]["settle_s"] == 30
+    last = max(at for verb, _, at in services.at if verb == "restart_link")
+    assert not [checked for checked in services.checked_at if last < checked < last + 30]
+
+
+def test_o35_a_per_reader_settle_ends_closed_on_a_transfer_active_at_its_end(tmp_path):
+    """O35: the per-reader settle's end is read once, never waited out: an active transfer then fails the heal."""
+    services = HealServices()
+    services.transfers = [0, 1]  # quiet before the restart, active at the end of its settle
+    injector_, services = injector(tmp_path, services, heal="link_then_container")
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "transfers_active"
+
+
+def test_o35_a_container_restart_that_is_not_verified_still_gets_its_whole_settle(tmp_path):
+    """O35: a reader's container restart that does not serve is unverified, and the settle after it is enforced all
+    the same before the heal returns, so no later read reaches its link early."""
+    services = HealServices()
+    services.link_fixes[READER] = ()
+    services.never_serving = {READER}
+    injector_, services = injector(tmp_path, services, heal="link_then_container")
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "heal_restart_failed"
+    (restart,) = [a for a in step(injector_, "heal")["actions"] if a["action"] == "container_restart"]
+    assert restart["settle_s"] == 30
 
 
 def test_o35_all_links_restarts_nothing_when_a_provider_gives_no_pong(tmp_path):
