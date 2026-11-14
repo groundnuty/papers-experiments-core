@@ -67,13 +67,15 @@ from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, S
 @dataclass(frozen=True)
 class ResetPlan:
     """What one space's reset is given, as `SpaceReset.run` takes it: the eviction plan (provider to paths), the
-    physical bytes each provider may keep, the history's window start, the QoS baseline and `qos_rights`."""
+    physical bytes each provider may keep, the history's window start, the QoS baseline, `qos_rights` and the
+    providers declared never to hold the space's bytes (`never_holds`)."""
 
     evict: Mapping[str, Iterable[str]] | None = None
     allowed: Mapping[str, int] | None = None
     since: float | None = None
     qos_baseline: Collection[str] = ()
     qos_rights: bool | None = None
+    never_holds: Collection[str] = ()
 
 
 class _Space:
@@ -88,6 +90,9 @@ class _Space:
             raise ValueError("the QoS baseline is a collection of requirement ids")
         if rights is not None and not isinstance(rights, bool):
             raise ValueError("qos_rights is True, False, or None for a caller that does not say")
+        never_holds = plan.never_holds
+        if isinstance(never_holds, str) or not all(isinstance(q, str) for q in never_holds):
+            raise ValueError("never_holds is a collection of provider names")
         self.reset, self.p = reset, reset.provisioner
         self.since = float(reset.now() if since is None else since)
         self.baseline = baseline
@@ -105,12 +110,14 @@ class _Space:
             "own": set(),  # the ids of the jobs the reset sent or cancelled, all ended before the occupancy's wait
             "ended": set(),  # those of them whose records have reported them ended: they hold no read up
             "settled": {},
-            "occupancy": {},
+            "occupancy": None,  # the occupancy stage's kept reading (`occupancy.Reading`)
             "qos_rights": rights,
+            "files": {},  # the ids of the regular files each provider's listing showed the QoS scan (O46)
+            "never_holds": frozenset(never_holds),
         }
         self.plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (plan.evict or {}).items()}
         self.allowed = dict(plan.allowed or {})
-        for provider in [*self.plan, *self.allowed]:
+        for provider in [*self.plan, *self.allowed, *never_holds]:
             self.p.check_eviction(provider)
         if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in self.allowed.values()):
             raise ProvisionError(f"{self.p.where}an allowed holding is a whole number of bytes, zero or more")

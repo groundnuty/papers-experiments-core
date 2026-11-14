@@ -24,9 +24,12 @@ and with these changes to the calls it inherits:
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
 `spawn_on_evict` (a provider id: an eviction that ends starts a replication of the same data into it, a job begun
 while a reset runs), `dir_stats_disabled` (a directory's distribution answers its physical sizes as failed, as a
-space without directory statistics does), and `ended_listed_ongoing_s` (seconds of `clock` after its finish during
-which a job that ended, not cancelled, is still on the first page of every provider's ongoing listing while its record
-says it ended: a listing that lags the record; 0, the default, models none).
+space without directory statistics does), `counter_offset` (provider id to bytes: what a space root's physical size
+shows for that provider beyond, or below, its files' blocks, never below 0; the directory statistics wrong for good,
+as op-worker f118ed9 showed a root crediting a provider 1,048,576 B that no file held, O46), and
+`ended_listed_ongoing_s` (seconds of `clock` after its finish during which a job that ended, not cancelled, is still
+on the first page of every provider's ongoing listing while its record says it ended: a listing that lags the record;
+0, the default, models none).
 
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
 `distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and an
@@ -109,6 +112,7 @@ class FakeReset(FakeData):
         self.spawn_on_evict: str | None = None
         self.dir_stats_disabled = False
         self.ended_listed_ongoing_s = 0.0
+        self.counter_offset: dict[str, int] = {}
         self.blocks_flush_delay_s = 10.0  # the file location's flush after its first change (rel/files/app.config:511)
         self.dir_stats_flush_s = 5.0  # each directory level's collector flush (dir_stats_collector.erl:168)
         self._called = False
@@ -302,6 +306,8 @@ class FakeReset(FakeData):
         per: dict = {}
         for provider in self.providers:
             held = sum(self.blocks.reported((f, provider), lags[f]) for f in files)
+            if node.file_id in self.space_roots.values():
+                held = max(0, held + self.counter_offset.get(provider, 0))
             backend = (
                 {"success": False, "error": {"id": "dirStatsDisabledForSpace"}}
                 if self.dir_stats_disabled
