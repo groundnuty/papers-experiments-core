@@ -7,7 +7,7 @@ counter says, the counter may skip only a provider declared never to hold them, 
 import pytest
 from qos_world import FILES, federation, provisioner_with, two_providers
 
-from expcore_onedata import occupancy
+from expcore_onedata import occupancy, resetqos
 from expcore_onedata.reset import ResetFailed, SpaceReset
 from expcore_onedata.testing import BETA_ID, DATA, write_platform
 from expcore_onedata.testing.fake_data import ROOT_ID
@@ -95,6 +95,7 @@ def test_o46_a_counter_reading_0_while_a_file_holds_bytes_fails_naming_the_bytes
         "files_bytes": 1024,
         "allowed_bytes": 0,
         "counter_bytes": 0,
+        "links_bytes": 0,
         "files": {"files[2]": 1024},
     }
 
@@ -238,3 +239,104 @@ def test_o46_a_counter_that_is_null_is_unknown_never_0(client, config, platform_
     provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
     with pytest.raises(ResetFailed, match=r"occupancy stage.*physical size of the space is unknown"):
         SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
+
+
+def test_o46_a_file_a_providers_own_listing_missed_is_still_read_there(
+    monkeypatch, client, config, platform_file, ticker, tmp_path, fake
+):
+    """O46: beta's listing misses a file alpha's shows, and beta holds it whole. Every listed file is read at every
+    provider, so the reset fails on it rather than pass beta on the files its own listing showed."""
+    for path in FILES:
+        fake.blocks.pop((fake.id_of(path), BETA_ID))
+    missed = fake.id_of(FILES[4])
+    fake.blocks[(missed, BETA_ID)] = [[0, len(DATA)]]
+    original = resetqos.tree
+
+    def tree(p, provider):
+        root, leaves = original(p, provider)
+        return root, [leaf for leaf in leaves if provider != "beta" or leaf[0] != missed]
+
+    monkeypatch.setattr(resetqos, "tree", tree)
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"occupancy stage") as caught:
+        SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
+    assert f"providers[1] holds {len(DATA)} bytes of the space in 1 file(s)" in str(caught.value)
+
+
+def test_o46_a_provider_no_declaration_fits_fails_the_occupancy_whatever_its_counter(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O46: a provider no declaration fits supports the space, its counter at 0. Its files cannot be read there, and
+    the counter is no verdict, so the reset fails, closed, rather than pass it on that 0."""
+    fake.add_provider("gamma-id", "gamma.test")
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"occupancy stage.*no declaration fits supports the space"):
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=False)
+
+
+def test_o46_a_provider_declared_never_to_hold_that_the_counter_leaves_out_is_read(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O46: the fast path needs a 0 read. Declared never to hold, beta is left out of the space root's answer, and the
+    reset lists alpha alone: beta is read all the same, and the files it holds fail the reset."""
+    original = fake._distribution
+
+    def without_beta(node):
+        answer = original(node)
+        if node.file_id == ROOT_ID:
+            answer["distributionPerProvider"].pop(BETA_ID)
+        return answer
+
+    fake._distribution = without_beta
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"occupancy stage") as caught:
+        SpaceReset(provisioner, providers=["alpha"], now=ticker.clock).run(None, never_holds=["beta"])
+    assert f"providers[1] holds {len(FILES) * len(DATA)} bytes" in str(caught.value)
+
+
+def test_o46_bytes_in_a_hard_link_are_counted_and_the_refusal_says_so(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O46: a hard link is listed with its own id and shares its target's blocks. Its bytes are counted, so a target
+    deleted under its link never hides them; a refusal with bytes in a link says they may be counted twice."""
+    for path in FILES:
+        fake.blocks.pop((fake.id_of(path), BETA_ID))
+    link = fake._create(fake.id_of("study"), "link.bin", "LNK")
+    fake.nodes[link].content = bytearray(DATA)
+    fake.blocks[(link, BETA_ID)] = [[0, len(DATA)]]
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"occupancy stage") as caught:
+        SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
+    assert f"{len(DATA)} bytes of it are in hard link(s)" in str(caught.value)
+
+
+def test_o46_the_time_bound_is_looked_at_after_the_last_batch(
+    monkeypatch, client, config, platform_file, ticker, tmp_path, fake
+):
+    """O46: a reading whose only batch ends past the bound fails, closed, rather than return a verdict read too
+    slowly."""
+    monkeypatch.setattr(occupancy, "READ_BOUND_S", 0.5)
+    original = fake._distribution
+
+    def slow(node):
+        if node.file_id != ROOT_ID:
+            ticker.sleep(1.0)
+        return original(node)
+
+    fake._distribution = slow
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"occupancy stage.*past its bound"):
+        SpaceReset(provisioner, now=ticker.clock).run(None, {"beta": len(FILES) * len(DATA)}, qos_rights=False)
+
+
+def test_o46_one_budget_covers_every_call_of_a_reading(
+    monkeypatch, client, config, platform_file, ticker, tmp_path, fake
+):
+    """O46: the request budget is the reading's, its calls together: a second call that would pass it fails."""
+    monkeypatch.setattr(occupancy, "READS_MAX", len(FILES) + 2)
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    ids = sorted(fake.id_of(path) for path in FILES)
+    budget = occupancy.Budget(ticker.now)
+    occupancy.read_files(provisioner, {"beta": ids}, provisioner.client.provider_label, budget)
+    with pytest.raises(occupancy.ProvisionError, match=rf"needs {2 * len(FILES)} block-map read\(s\)"):
+        occupancy.read_files(provisioner, {"beta": ids}, provisioner.client.provider_label, budget)

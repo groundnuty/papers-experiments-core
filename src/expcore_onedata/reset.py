@@ -269,7 +269,7 @@ class SpaceReset:
             "settled": {},
             "occupancy": None,
             "qos_rights": qos_rights,
-            "files": {},  # the ids of the regular files each provider's listing showed the QoS scan (O46)
+            "files": occupancy.Listing(),  # the files and hard links any listing showed the QoS scan (O46)
             "never_holds": frozenset(never_holds),
         }
         plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (evict or {}).items()}
