@@ -1067,7 +1067,7 @@ else:
 
 To test whether an agent notices that its data are incomplete before it computes, a condition can make part of a dataset arrive while the agent works, as if its owner were still ingesting it. The Onedata layer's `ProgressiveIngest` (from `expcore_onedata.ingest`, namespace `progressive_ingest`) is the instrument that does it. Declare the plan in a TOML file of your own, one per condition, and load it with `load_ingest_plan(path, config)` from `expcore_onedata.ingestplan`. The plan names a staging directory of sources you keep and, for each file, a label (how the record names it, never by its path), its path in the space, its source, when it arrives (`at_s`, seconds after the instrument's start), whether it is written whole or in `parts` over `over_s` seconds, and its `baseline`. Use `"complete"` for a file your other conditions read: it is removed before the run and written back from its staged source after. Use `"absent"` for new data: it is removed again after the run. Put `ingestplan.fingerprint({condition: plan})` into the platform half of the campaign fingerprint, so a resume after the schedule or a staged source changed is refused.
 
-Give the instrument a provisioner of its own, whose change log is the ingest's and never goes to a teardown, and a journal file that lasts across runs. The instrument claims the log when you build it: a log another provisioner already wrote to is refused, and so is a teardown over the ingest's log. Start it with your other instruments and finish it with them through `finish_instruments`, which runs its post-run check ([An instrument that refuses an attempt](#an-instrument-that-refuses-an-attempt)). A part that could not be written or confirmed, or a baseline that could not be restored, makes the check refuse with `InfraError("ingest_failure")`, a kind no condition may declare, so the attempt is set aside, charged and run again, never scored; `raise_if_failed()` makes the same check, as a second guard once the record is written. Each file is restored on its own, so one that cannot be restored leaves no other file missing. In your executor's `finally`, call `restore()` through `asyncio.to_thread`, since it blocks. A file that has not arrived when the run ends is the manipulation, never a failure. A start that cannot set the start state raises the same kind before the agent runs. The snapshot gives each part's planned, written and confirmed times on the loop's clock (`steps`) and every file id the ingest removed, created or restored, with the old and new id (`ids`), so a scorer can compare the agent's reads with the arrivals from the record alone, and you can map a data gate's errors to files after the run. Until the core admits such conditions exclusively (#27), keep the runs that use an ingest apart from any other run on the same owner's space.
+Give the instrument a provisioner of its own, whose change log is the ingest's and never goes to a teardown, and a journal file that lasts across runs. The instrument claims the log when you build it: a log another provisioner already wrote to is refused, and so is a teardown over the ingest's log. Start it with your other instruments and finish it with them through `finish_instruments`, which runs its post-run check ([An instrument that refuses an attempt](#an-instrument-that-refuses-an-attempt)). A part that could not be written or confirmed, or a baseline that could not be restored, makes the check refuse with `InfraError("ingest_failure")`, a kind no condition may declare, so the attempt is set aside, charged and run again, never scored; `raise_if_failed()` makes the same check, as a second guard once the record is written. Each file is restored on its own, so one that cannot be restored leaves no other file missing. In your executor's `finally`, call `restore()` through `asyncio.to_thread`, since it blocks. A file that has not arrived when the run ends is the manipulation, never a failure. A start that cannot set the start state raises the same kind before the agent runs. The snapshot gives each part's planned, written and confirmed times on the loop's clock (`steps`) and every file id the ingest removed, created or restored, with the old and new id (`ids`), so a scorer can compare the agent's reads with the arrivals from the record alone, and you can map a data gate's errors to files after the run. Before your checker reads an arrival time relative to a plan, bind the snapshot to that plan with `check_recorded_plan(plan, snapshot)` from `expcore_onedata.ingestbind`: it compares the plan's hash and each file's schedule, size, source and prefix, the mode, and every part's due time, and raises `PlanMismatch` naming the file and the field (`day-13: at_s differs`) for a plan that is not the one the run used, however alike its labels. Matching by labels alone accepts a plan whose every part is 300 s later. A snapshot that records no plan hash is refused, never passed. Until the core admits such conditions exclusively (#27), keep the runs that use an ingest apart from any other run on the same owner's space.
 
 The block runs a plan of one file in two parts against the fakes. The run ends after the first part, so the day is half there, and the finish writes it back whole from the staged copy.
 
@@ -1075,6 +1075,7 @@ The block runs a plan of one file in two parts against the fakes. The run ends a
 import time
 
 from expcore_onedata.ingest import ProgressiveIngest
+from expcore_onedata.ingestbind import check_recorded_plan
 from expcore_onedata.ingestplan import load_ingest_plan
 from expcore_onedata.testing import ALPHA_ID, with_placement, write_platform
 
@@ -1123,6 +1124,7 @@ while ingest.progress < 1:
 assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 300]]  # half of the day has arrived
 snapshot = ingest.finish()  # the run ended before the second half
 ingest.check()  # what finish_instruments asks after the snapshots: nothing to refuse
+check_recorded_plan(plan, snapshot)  # the snapshot was recorded under this plan, by its content, not by its labels
 assert [s["step"] for s in snapshot["steps"] if s["step"] != "planned"] == ["written", "confirmed", "not_due"]
 assert [e["event"] for e in snapshot["ids"]] == ["restored", "removed", "created", "restored"]
 assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]  # whole again, from the staged copy
@@ -1280,6 +1282,36 @@ def script_if_stub(backend, script):
 
 script_if_stub(StubAdapter([]), ["deep"])  # the rehearsal: the stub plays the script
 script_if_stub(object(), ["deep"])  # the real campaign: a backend without `use` is left to answer
+```
+
+### A smoke built in code
+
+A smoke runs a cut of the plan (one model, a few seeds) before the whole campaign, to see that the executor, the tools and the scorers hold on the real platform. The cut is a `StudyConfig` the study builds from the loaded one with `dataclasses.replace`, so there is no directory for `run` to name: `expcore.study.pipeline.run_built_study(study)` runs it, and `run STUDY` is that call on what `load_study` returns. Call it, never the pipeline's private `_run_campaign`: that skips the study's own infrastructure kinds, so an `InfraError` of a kind the study declares in `[study.kinds]` is refused as unknown in the executor's thread and stops the campaign as an unexpected error.
+
+`run_built_study` first holds the config to what `load_study` holds a study to, and refuses it with a `ConfigError` naming the key before it touches a store: a model the model table lacks, a task a condition still names after the cut dropped it, a schema edited so that a condition's treatment names an unknown kind or a kind that is a fault on one target with no target, a task without the attribute a contrast clusters by. It does not import `[study] platforms` again, so build the cut from a study that was loaded in this process, which imported them.
+
+The store is `<study.root>/out` and the campaign fingerprint covers the plan, so a cut run in the real directory is a different experiment from the whole campaign: the real `run` would refuse to resume it, and it would refuse the whole campaign's store. Run the smoke from a copy of the study directory, as the rehearsal is, and give `code_root` the real directory, so the smoke's records carry the real study's code identity (the commit and the hash of the files `[study] code` names), which must be clean as for any run.
+
+```python
+import dataclasses
+
+from expcore.study.pipeline import run_built_study
+
+smoke_dir = Path("smoke-study")
+shutil.copytree("my-study", smoke_dir, ignore=shutil.ignore_patterns("out"))
+whole = load_study(smoke_dir)
+smoke = dataclasses.replace(whole, campaign=dataclasses.replace(whole.campaign, models=("alpha-stub",)))
+summary = run_built_study(smoke, code_root="my-study")  # the same call, and the same checks, as `run`
+assert summary.statuses == {"done": len(smoke.manifest.rows)}
+assert (smoke_dir / "out" / "state.sqlite").is_file()  # the smoke has a store of its own
+
+unknown = dataclasses.replace(whole.campaign, models=("alpha-stub", "gamma-stub"))
+try:
+    run_built_study(dataclasses.replace(whole, campaign=unknown), code_root="my-study")
+    raise AssertionError("a cut that names a model the table lacks was accepted")
+except ConfigError as error:
+    assert "models.toml does not define" in str(error)
+shutil.rmtree(smoke_dir)
 ```
 
 ## 8. Ship a replication package
