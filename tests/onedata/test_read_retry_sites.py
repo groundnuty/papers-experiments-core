@@ -160,8 +160,8 @@ CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient.own_temporary_generation", "self._send(GET)"): ["ONE_ATTEMPT"],
     ("client.py", "OnezoneClient.read_content", "self._target"): ["gate", "gate"],  # bounded by the deadline left
     ("client.py", "OnezoneClient.content_answer", "self._target"): ["_ONE_ATTEMPT"],  # the pre-campaign measurement
-    # a streamed range and a content head both stream through `_streamed`, which releases the answer (O47)
-    ("client.py", "_streamed", "http.stream"): ["<streamed>"],
+    # a streamed range and a content head both go through `_streamed`, which sends once and releases the answer (O47)
+    ("client.py", "_streamed", "http.send"): ["<transport>"],
     ("client.py", "OnezoneClient.space_name", "self._space_name"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_id", "self._file_space_id"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_name", "self._space_name"): ["reads"],

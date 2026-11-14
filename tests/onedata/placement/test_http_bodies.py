@@ -362,6 +362,62 @@ def test_o47_a_streamed_read_that_httpx_itself_fails_on_is_released_too(config, 
     assert lingering == 0
 
 
+class Whole(httpx.SyncByteStream):
+    """A body of three bytes, read once."""
+
+    def __iter__(self):
+        yield b"abc"
+
+
+def test_o47_an_answer_of_another_request_is_left_alone_when_the_exchange_fails(config, seen):
+    """O47: the answers a failure carried off are released only when they answer this exchange's request. A handler that
+    holds an unread answer of its own in a local, and fails before it returns it, finds it still readable."""
+    spare = httpx.Response(200, stream=Whole())
+
+    def answer(request):
+        held = spare  # noqa: F841 - a local of the handler's frame, which the failure passes through
+        raise httpx.ConnectError("reset", request=request)
+
+    client = answering_client(config, answer, seen)
+    assert fails(partial(client._request, "PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE)))
+    assert spare.read() == b"abc"
+
+
+class Megabyte(httpx.SyncByteStream):
+    """A body of a MiB, which a hook reads."""
+
+    def __iter__(self):
+        yield bytes(MIB)
+
+
+def refuse_after_reading(response):
+    """A hook of an HTTP client that reads what an error answer carries, and then refuses it."""
+    if response.status_code >= 500:
+        response.read()
+        response.raise_for_status()
+
+
+def test_o47_the_bytes_a_hook_read_before_it_failed_count_toward_the_budget(config, fake, seen, collections):
+    """O47: the failure that carried an answer off carries its bytes too: a hook read a MiB of each of three answers
+    and refused them, on the request path and on the streamed one, and the third of each finds two spent."""
+
+    def answer(request):
+        if request.url.path.endswith("/content") or request.url.path.endswith("/spaces/s"):
+            return httpx.Response(500, stream=Megabyte())
+        return fake.respond(request)
+
+    file_id = fake.add_file("study/part.bin", bytes(MIB))
+    requested = answering_client(config, answer, seen, hooks=[refuse_after_reading], collect_after_bytes=2 * MIB)
+    for _ in range(3):
+        assert fails(partial(requested.get, "/spaces/s"))
+    assert collections == [2]
+    collections.clear()
+    streamed = answering_client(config, answer, seen, hooks=[refuse_after_reading], collect_after_bytes=2 * MIB)
+    for _ in range(3):
+        assert fails(partial(streamed.content_answer, f"/data/{file_id}/content", provider="alpha", first_byte=True))
+    assert collections == [2]
+
+
 # -- what the fakes keep ---------------------------------------------------------------------------------------------
 
 

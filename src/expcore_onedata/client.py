@@ -221,6 +221,7 @@ import re
 import socket
 import threading
 import time
+import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -414,21 +415,43 @@ def _release(response: httpx.Response) -> httpx.Response:
     return response
 
 
-def _release_stranded(error: BaseException) -> None:
-    """Release the answers a failure inside httpx's own send carried off with it (#259, O47).
+def _answers(response: httpx.Response, request: httpx.Request) -> bool:
+    """Tell whether an answer is the answer to this request. An answer no request was set on, a mock transport handler's
+    own, answers none."""
+    try:
+        return response.request is request
+    except RuntimeError:
+        return False
+
+
+def _release_stranded(error: BaseException, request: httpx.Request) -> int:
+    """Release the answers to `request` that a failure inside httpx's own send carried off with it, and return the
+    bytes of body they had delivered (#259, O47).
 
     httpx can fail on an answer after the transport has delivered it and before it returns it: a redirect whose
     Location it cannot parse, a hook of the HTTP client that raises. It closes the answer and leaves it in its cycle
     with the request, and the failure reaches the caller before the caller holds the answer. The answer is a local of
-    the frames the failure passed through, so each answer found there is released. A close that fails on top of the
-    failure being reported adds nothing to it, and the stream is let go whatever the close does (`_release`)."""
-    step = error.__traceback__
+    the frames the failure passed through, so each answer to `request` found there is released, once. An answer of
+    another request, which a mock transport's handler may hold in a local of its own, is left as it is.
+
+    The first frame of the failure's traceback is the caller's own, and is not read: its locals hold the failure
+    itself, and before Python 3.13 reading them copies them into a cache the frame keeps, a cycle of the frame, the
+    failure and its traceback that holds the request and the body written. The frames below it are cleared at the end,
+    which drops the copies reading them made and whatever else they held."""
+    first = error.__traceback__
+    below = None if first is None else first.tb_next
+    delivered: dict[int, int] = {}  # by the answer's identity: the same answer is a local of more than one frame
+    step = below
     while step is not None:
         for value in step.tb_frame.f_locals.values():
-            if isinstance(value, httpx.Response):
+            if isinstance(value, httpx.Response) and id(value) not in delivered and _answers(value, request):
+                delivered[id(value)] = _received(value)
                 with suppress(httpx.HTTPError):
                     _release(value)
         step = step.tb_next
+    if below is not None:
+        traceback.clear_frames(below)
+    return sum(delivered.values())
 
 
 def _received(response: httpx.Response) -> int:
@@ -456,8 +479,7 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
     try:
         response = http.send(request, stream=True, follow_redirects=False)
     except BaseException as error:
-        _release_stranded(error)
-        budget.spent(sent)
+        budget.spent(sent + _release_stranded(error, request))
         raise
     try:
         response.read()
@@ -474,22 +496,23 @@ def _streamed(
     http: httpx.Client, budget: CollectBudget, url: str, *, headers: Mapping[str, str], timeout: float
 ) -> Iterator[httpx.Response]:
     """Stream a GET as `http.stream` does, release the answer however the block ends, an error in it included, so that
-    an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47)."""
-    entered = False
+    an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47).
+
+    The request is sent here, as `_exchange` sends one, so that an answer httpx fails on inside its send can be found
+    and released, which `http.stream` leaves to its caller who never holds it."""
+    request = http.build_request("GET", url, headers=headers, timeout=timeout)
     try:
-        with http.stream("GET", url, headers=headers, timeout=timeout, follow_redirects=False) as response:
-            entered = True
-            try:
-                yield response
-            finally:
-                try:
-                    _release(response)
-                finally:
-                    budget.spent(_received(response))
+        response = http.send(request, stream=True, follow_redirects=False)
     except BaseException as error:
-        if not entered:  # httpx failed in its send, before there was a block to release the answer in
-            _release_stranded(error)
+        budget.spent(_release_stranded(error, request))
         raise
+    try:
+        yield response
+    finally:
+        try:
+            _release(response)
+        finally:
+            budget.spent(_received(response))
 
 
 class PlatformError(RuntimeError):
