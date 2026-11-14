@@ -52,8 +52,10 @@ is the 180 s cap of a peer's session renewal backoff (op-worker f118ed9) and a m
 of every provider in quick succession, settles with no fetch, checks every pair, and falls back to restarting a stuck
 pair's reader's container. `"link_then_container"` and `"link"` are the per-reader design, kept: each stuck pair's
 reader's link restarted in turn, then (in the first) its container. A container restart is itself an outage of that
-provider, so declare a mode that can make one knowingly. `heal_settle_s` is the wait after the restarts, with no
-probe, no fetch and no run. `heal_timeout_s` bounds the heal: no step starts whose declared bounds would carry the heal
+provider, so declare a mode that can make one knowingly. `heal_settle_s` is the enforced settle after every link or
+container restart: no probe, no gate read, no check and no run until it has passed, since a fetch through a provider
+soon after its link restarts can leave the pair stale (seen live 23 s after a restart; a clean 3-minute settle left
+every pair healthy). `heal_timeout_s` bounds the heal: no step starts whose declared bounds would carry the heal
 past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming the key and
 the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a ping and a
 link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one container
@@ -61,8 +63,7 @@ restart (`heal_container_reserve`: four commands and a margin of three, `settle_
 and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one
 settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in
 `"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it. **Both
-durations are provisional:** the settle and the idle period that leaves a peer's connection stale are being measured,
-and the defaults will be tuned from it.
+durations are provisional,** to be tuned as live heals are measured.
 """
 
 import hashlib

@@ -225,6 +225,11 @@ class ComposeDriver:
         transfers = getattr(self._probe, "transfers", None)
         return None if transfers is None else transfers()
 
+    @property
+    def has_sessions(self) -> bool:
+        """Whether the probe has a session gate: without one the restore records no gate reading."""
+        return getattr(self._probe, "sessions", None) is not None
+
     def sessions_ready(self, service: str, gate_probe: str | None) -> str | None:
         """One reading of the session gate for the provider behind a service: None when it passes, else why not."""
         sessions = getattr(self._probe, "sessions", None)

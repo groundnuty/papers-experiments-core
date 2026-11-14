@@ -67,7 +67,7 @@ def await_sessions(
     `timeout_s` is no pass either: each read has its own bound (`ZONE_TIMEOUT_S`, `DISTRIBUTION_TIMEOUT_S`), so the
     wait can end one reading past the bound, closed."""
     read = getattr(driver, "sessions_ready", None)
-    if read is None:
+    if read is None or getattr(driver, "has_sessions", True) is False:
         return {"ok": True, "how": "none", "waited_s": 0.0, "detail": None}
     started, detail = clock(), None
     polls = max(1, math.ceil(timeout_s / poll_s)) + 1

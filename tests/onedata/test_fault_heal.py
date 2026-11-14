@@ -43,12 +43,11 @@ class HealServices(FakeServices):
     `link_breaks[reader]` is the pairs it breaks, `container_fixes` the readers a container restart mends, and `grow`
     adds pairs to `stuck` before the given check.
 
-    With `stale_model`, the hypothesis that fits the live data (provisional): each passing fetch leaves its reader
-    holding a connection toward its source (`conns`); when a provider's link restarts, its own connections drop (it
-    dials afresh, so its own stale pairs clear), and every peer still holding a connection toward it is left stale,
-    failing every fetch from it, until that peer's own link restarts. A container restart only clears the restarted
-    reader (an assumption of the fake: its peers see the sockets close). `transfers` is the script of active-transfer
-    readings, 0 once it runs out.
+    `wedge_s` is the rule the live data settled: after a provider's link restarts, a fetch from it (any link check)
+    within `wedge_s` seconds wedges every pair with it as the source, failing until that pair's reader's own link
+    restarts; a fetch after the window finds the link up. (Live: a check 23 s after a restart left a reverse pair
+    stale, while a clean 3-minute settle left every reverse pair healthy, even one minutes old.) `transfers` is the
+    script of active-transfer readings, 0 once it runs out.
     """
 
     def __init__(self, **knobs):
@@ -68,19 +67,13 @@ class HealServices(FakeServices):
         self.ping_s = 0.0  # seconds a ping takes on the clock
         self.on_ping = None  # called with the reader's label while it is pinged
         self.on_check = None  # called before each link check
-        self.stale_model = False
-        self.conns: set[tuple[str, str]] = set()  # (reader, source): the reader holds a connection toward the source
+        self.wedge_s = 0.0
+        self.restarted_at: dict[str, float] = {}  # each provider's last link restart, on the clock
         self.transfers: list[int] = []
         self.never_serving: set[str] = set()  # providers whose container, restarted, never serves
         self.actions: list[tuple[str, str]] = []
         self.at: list[tuple[str, str, float]] = []  # each action with the clock's time
         self.checked_at: list[float] = []  # each link check's time
-
-    def connected(self) -> "HealServices":
-        """Every passing pair holds a connection, as after the checks before the outage's restore."""
-        self.conns = {(r, s) for r in LABEL.values() for s in LABEL.values() if r != s} - self.stuck
-        self.stale_model = True
-        return self
 
     def _matrix(self) -> LinkMatrix:
         labels = list(LABEL.values())
@@ -97,12 +90,12 @@ class HealServices(FakeServices):
         self.actions.append((verb, label))
         self.at.append((verb, label, self.clock.now if self.clock is not None else 0.0))
 
-    def _link_restarted(self, provider: str) -> None:
-        """The stale model's link restart: the provider's own connections drop and its stale pairs clear; every peer
-        still holding a connection toward it is left stale."""
-        self.stuck = {pair for pair in self.stuck if pair[0] != provider}
-        self.conns = {pair for pair in self.conns if pair[0] != provider}
-        self.stuck |= {(reader, source) for reader, source in self.conns if source == provider}
+    def _fetch_through_restarting_links(self) -> None:
+        """A link check fetches every pair: those from a provider whose link restarted under `wedge_s` ago wedge."""
+        now = self.clock.now if self.clock is not None else 0.0
+        for source, began in self.restarted_at.items():
+            if now < began + self.wedge_s:
+                self.stuck |= {(reader, source) for reader in LABEL.values() if reader != source}
 
     def link_matrix(self, service):
         self.checks += 1
@@ -110,10 +103,8 @@ class HealServices(FakeServices):
         if self.on_check is not None:
             self.on_check()
         self.stuck |= self.grow.get(self.checks, set())
-        matrix = self._matrix()
-        if self.stale_model:  # every passing fetch holds its connection afterwards
-            self.conns |= {(pair.reader, pair.source) for pair in matrix.pairs if pair.ok}
-        return matrix
+        self._fetch_through_restarting_links()
+        return self._matrix()
 
     def active_transfers(self):
         return self.transfers.pop(0) if self.transfers else 0
@@ -143,9 +134,7 @@ class HealServices(FakeServices):
         self._note("restart_link", reader)
         if self.clock is not None:
             self.clock.sleep(self.link_s)
-        if self.stale_model:
-            self._link_restarted(reader)
-            return self.link_result.get(reader, "ok")
+        self.restarted_at[reader] = self.clock.now if self.clock is not None else 0.0
         fixes = self.link_fixes.get(reader)
         mended = {pair for pair in self.stuck if pair[0] == reader} if fixes is None else set(fixes)
         self.stuck = (self.stuck - mended) | set(self.link_breaks.get(reader, ()))
@@ -160,7 +149,6 @@ class HealServices(FakeServices):
         super().start(service)
         if LABEL[service] in self.container_fixes:
             self.stuck = {pair for pair in self.stuck if pair[0] != LABEL[service]}
-            self.conns = {pair for pair in self.conns if pair[0] != LABEL[service]}
 
 
 def four_providers(data, **faults):
@@ -171,6 +159,7 @@ def four_providers(data, **faults):
 
 
 def injector(tmp_path, services=None, **faults):
+    tmp_path.mkdir(parents=True, exist_ok=True)  # a test may build a second federation under a subdirectory
     platform = write_platform(tmp_path, lambda data: four_providers(data, **faults))
     services = services or HealServices()
     clock = FakeClock()
@@ -257,9 +246,12 @@ def test_o35_a_stuck_pair_is_healed_by_its_readers_link_restart_and_the_restore_
     assert (heal["ok"], heal["outcome"], heal["shared_source"]) == (True, "healed", CRASHED)
     assert [(a["action"], a["provider"], a["result"]) for a in heal["actions"]] == [
         ("ping", READER, "pong"),
+        ("transfers", "all", "quiet"),  # before the restart
+        ("transfers", "all", "quiet"),  # at the end of its settle; the restart's own record follows, once it is read
         ("restart_link", READER, "ok"),
     ]
-    restart = heal["actions"][1]
+    restart = heal["actions"][3]
+    assert restart["settle_s"] == 30
     assert restart["gate"]["ok"] is True
     assert restart["matrix_after"]["ok"] is True
     assert restart["start_utc"] <= restart["end_utc"]
@@ -277,12 +269,13 @@ def test_o35_a_pair_only_a_container_restart_mends_is_healed_in_link_then_contai
     injector_.start(RUN)
     assert injector_.clear() is True
     heal = step(injector_, "heal")
-    assert [(a["action"], a["provider"]) for a in heal["actions"]] == [
+    steps = [a for a in heal["actions"] if a["action"] != "transfers"]
+    assert [(a["action"], a["provider"]) for a in steps] == [
         ("ping", READER),
         ("restart_link", READER),
         ("container_restart", READER),
     ]
-    assert heal["actions"][2]["result"] == "restored"
+    assert steps[2]["result"] == "restored"
     assert acted(services, "stop", "start") == [
         ("stop", RESTORED),
         ("start", RESTORED),
@@ -675,17 +668,32 @@ def test_o35_a_clear_after_the_runs_exclusive_admission_ended_never_heals(tmp_pa
 
 
 def stale():
-    """The stale model after the live pattern: the crashed source's readers stale, the rest connected."""
+    """The live pattern under the settled rule: the crashed source's readers stale, and a fetch from a provider within
+    20 s of its link restart (the tests' settle is 30 s) wedging the pair."""
     services = HealServices()
     services.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
-    return services.connected()
+    services.wedge_s = 20.0
+    return services
 
 
-def test_o35_under_the_stale_model_a_per_reader_link_restart_leaves_its_own_peers_stale_and_stops_closed(tmp_path):
-    """O35: the hypothesis that fits the live data: a provider's link restart leaves every peer holding a recent
-    connection to it stale. So healing one reader's link, as the per-reader design does, strands the pairs from that
-    reader (seen live), which the strict rule stops at once."""
+def test_o35_the_per_reader_heal_with_its_enforced_settle_heals_each_reader_and_leaves_reverse_pairs_healthy(tmp_path):
+    """O35: the rule the live data settled: after a link restart on a reader, nothing fetches from it until the settle
+    ends. The per-reader design restarts each stale reader's link in turn, each followed by the settle with no fetch,
+    so every reverse pair stays healthy and the restore is verified."""
     injector_, services = injector(tmp_path, stale(), heal="link_then_container")
+    injector_.start(RUN)
+    assert injector_.clear() is True
+    assert acted(services, "restart_link") == [("restart_link", READER), ("restart_link", SECOND)]
+    for verb, _, at in services.at:
+        if verb == "restart_link":
+            assert not [checked for checked in services.checked_at if at < checked < at + 30]
+
+
+def test_o35_a_check_made_during_a_restarts_window_wedges_the_reverse_pairs_and_the_heal_stops_closed(tmp_path):
+    """O35: a heal that read the pairs before the window ended (here a settle of 5 s against a 20 s window), as the
+    live check 23 s after a restart did, wedges every pair from the restarted reader; the strict rule stops it at
+    once, closed, rather than chasing the wedged pairs."""
+    injector_, services = injector(tmp_path, stale(), heal="link_then_container", heal_settle_s=5)
     injector_.start(RUN)
     assert injector_.clear() is False
     assert step(injector_, "cleared")["how"] == "heal_broke_pair"
@@ -694,9 +702,8 @@ def test_o35_under_the_stale_model_a_per_reader_link_restart_leaves_its_own_peer
 
 def test_o35_all_links_heals_every_stale_pair_in_one_round(tmp_path):
     """O35: every provider is pinged, then every link restarted in label order with nothing fetched in between, the
-    restored provider and the crashed source included: a provider restarted earlier holds no connection when a later
-    one restarts, so no peer is left stale. One settle, then every pair passes and the restore is verified, with every
-    step and the settle window recorded."""
+    restored provider and the crashed source included, then one settle with no fetch at all, then every pair passes
+    and the restore is verified, with every step and the settle window recorded."""
     injector_, services = injector(tmp_path, stale(), heal="all_links")
     injector_.start(RUN)
     assert injector_.clear() is True

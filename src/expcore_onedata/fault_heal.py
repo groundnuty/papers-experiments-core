@@ -4,13 +4,15 @@
 On the live slot of 14 Nov 2026 a provider that fetched from a stopped owner had its `rtransfer_link` crash and come
 back, and a reader whose link to it never reconnected failed every fetch from it, while every other pair transferred.
 Another study's federation then showed every pair with the crashed provider as source failing but the one whose reader
-started after the crash, and, after one reader's `restart_link`, that reader's pair healed while a pair with that reader
-as its source failed and stayed failed. The hypothesis that fits (provisional, being measured): when a provider's link
-restarts, every peer holding a recent connection to it is left stale, until the peer's own link restarts; a peer whose
-connection had idled out (over 9 minutes, under 31, live) dials afresh. op-worker sets no idle bound for the native
-link, and the link's code is private.
+started after the crash. **The rule its live tests settled:** after `restart_link` on a provider R, nothing may fetch
+through R until a settle has ended. A restart followed by a clean 3-minute settle with no fetch healed R's own pair and
+left every pair with R as its source healthy, one whose connection was minutes old included; the one reverse pair left
+stale came from a check made 23 s after R's restart. (Why a fetch so early wedges the pair is in the link's private
+code.) So every restart here is followed by an **enforced settle**: no probe, no gate read, no check and no run (the
+injector holds the federation exclusively) until `heal_settle_s` has passed, with no active transfer before the restart
+or at the settle's end.
 
-**`"all_links"`, the primary mode.** Between runs, under the injector's exclusive admission:
+**`"all_links"`, the one-round mode.** Between runs, under the injector's exclusive admission:
 
 1. a fresh matrix of every pair (`LinkMatrix`); nothing more is done when it passes;
 2. `ping` every provider with a declared service, in label order (`ComposeDriver.ping`); one with no `pong` fails the
@@ -19,8 +21,8 @@ link, and the link's code is private.
    listings, read only), waited for at most `gate_timeout_s`, else closed (`transfers_active`): a replication could
    dial a link mid-sequence;
 4. `restart_link` on **every** provider, the restored one and the crashed source included, one after another with no
-   fetch in between: a provider restarted earlier holds no connection when a later one restarts, so no peer is left
-   holding a stale one (`ComposeDriver.restart_link`; each result is a word, and a `badrpc_timeout` is never retried);
+   fetch in between, so one settle covers them all (`ComposeDriver.restart_link`; each result is a word, and a
+   `badrpc_timeout` is never retried);
 5. one settle of `heal_settle_s` (180 s, provisional) with no probe, no fetch and no run, then no active transfer again
    (as in 3), then the session gate of the restored provider, then every ordered pair, with fresh probes.
 
@@ -29,10 +31,10 @@ container restarted by the injector's own stop and start (`Recovery.restart_cont
 its own before the stop, cleared only once every pair passes), then settled, gated and checked again; never a provider
 that is the source of a failing pair, and never the restored provider (that is the outage again).
 
-**The per-reader modes, kept:** `"link_then_container"` (and `"link"`, the same without containers) heal each stuck
-pair's reader in turn: `ping`, a fresh matrix (a reader that is now the source of a failing pair, or whose pairs pass,
-is left alone), `restart_link`, the settle, the gate, a fresh matrix; then the container step. Under the hypothesis
-above a reader's restart leaves its own peers stale, which the strict rule below then stops, closed.
+**The per-reader mode:** `"link_then_container"` (and `"link"`, the same without containers, kept as it costs nothing)
+heals each stuck pair's reader in turn: `ping`, a fresh matrix (a reader that is now the source of a failing pair, or
+whose pairs pass, is left alone), then no active transfer, `restart_link`, the same enforced settle, no active transfer,
+the gate and a fresh matrix; then the container step, enforced the same way.
 
 **Bounds.** At most one `restart_link` and one container restart per provider per restore: the restore journals that
 it heals before the first action, so neither a later clear nor another process's recovery heals the same injection
@@ -234,8 +236,14 @@ class LinkHeal:
             return "heal_broke_pair", after, f"the {action} on {label} broke {shown}, which passed before it"
         return None, after, ""
 
-    def _act(self, label: str, service: str, action: str, before: LinkMatrix) -> Step:
-        """One reader's link or container restart, then the settle, its gate and a fresh matrix."""
+    def _act(self, label: str, service: str, action: str, before: LinkMatrix, cost: float) -> Step:
+        """One reader's link or container restart, enforced as the all-links sequence's is: no active transfer before
+        it, then the settle with no fetch at all, no active transfer at its end, then its gate and a fresh matrix.
+        `cost` is the step's declared bounds, checked again once the transfers are quiet."""
+        if not self._no_transfers("before"):
+            return "transfers_active", before, f"a transfer stayed active before the {action} on {label}"
+        if not self._fits(cost):
+            return "links_stuck", before, f"heal_timeout_s leaves no time for the {action} on {label}"
         start, extra = self._utc(), {}
         if action == "restart_link":
             self._linked.add(label)
@@ -251,6 +259,9 @@ class LinkHeal:
                 self._record(label, action, result, start, **extra)
                 return "heal_restart_failed", before, f"the container of {label} was not restored ({result})"
         settled = self._settle()
+        if not self._no_transfers("after"):
+            self._record(label, action, result, start, settle_s=settled, **extra)
+            return "transfers_active", before, f"a transfer was active at the end of the {action}'s settle on {label}"
         gate = self._gate_within(service)
         if gate.get("ok") is not True:
             self._record(label, action, result, start, settle_s=settled, gate=gate, **extra)
@@ -312,7 +323,7 @@ class LinkHeal:
             if pong:
                 if not self._fits(self._restart_cost):
                     return "links_stuck", current, "heal_timeout_s leaves no time for the link restart after the ping"
-                stop, current, why = self._act(label, service, "restart_link", current)
+                stop, current, why = self._act(label, service, "restart_link", current, self._restart_cost)
                 if stop is not None:
                     return stop, current, why
             elif self._mode == "link":
@@ -325,7 +336,7 @@ class LinkHeal:
                 return None, current, ""
             if not self._fits(self._container_cost):
                 return "links_stuck", current, "heal_timeout_s leaves no time for a container restart"
-            return self._act(label, service, "container_restart", current)
+            return self._act(label, service, "container_restart", current, self._container_cost)
         return None, current, ""
 
     def _readers(self, current: LinkMatrix, before: LinkMatrix) -> HealResult | LinkMatrix:

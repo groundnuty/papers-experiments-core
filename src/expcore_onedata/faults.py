@@ -447,9 +447,10 @@ class FaultInjector:
             ) from None
 
     def _record_links(self, record: Mapping[str, Any]) -> None:
-        """The session gate's reading and the heal's record of the latest restore, as steps of the snapshot (O35)."""
+        """The session gate's reading and the heal's record of the latest restore, as steps of the snapshot (O35). A
+        driver with no session gate (`how` none) records no gate step, so its readings stay as they were."""
         gate = record.get("gate")
-        if isinstance(gate, Mapping):
+        if isinstance(gate, Mapping) and gate.get("how") != "none":
             self._step("gate", gate.get("ok") is True, **{k: v for k, v in gate.items() if k != "ok"})
         heal = record.get("heal")
         if isinstance(heal, Mapping):
