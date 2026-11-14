@@ -163,10 +163,11 @@ def test_c32_at_21_and_27_shards_the_parts_sum_within_max_usd_and_each_pays_at_l
 
 
 @pytest.mark.parametrize("count", sorted(SCALE_LAYOUTS))
-def test_c32_a_max_usd_above_what_the_plan_reserves_lets_every_shard_reserve_every_one_of_its_runs(count):
+def test_c32_a_max_usd_above_what_the_plan_reserves_pays_every_shards_reservation_of_every_one_of_its_runs(count):
     """C32: shares are never pooled, and a study's hold is not released, so a shard whose share runs out keeps its
-    runs unfinished for good. A `max_usd` of a little more than the plan's reserved total rules that out for first
-    attempts: every shard's part pays the reservation of every run it plans, whatever those runs cost."""
+    runs unfinished for good. With a `max_usd` of a little more than the plan's reserved total, every shard's part of
+    `max_usd` pays the reservation of every run it plans once, whatever those runs cost. Only that part: a
+    `per_model_usd` ceiling is held on its own, and probes, top-ups, retries and interrupted attempts take more."""
     layout = SCALE_LAYOUTS[count]
     bounds = reserved_bounds(layout)
     parts = shard_budgets(

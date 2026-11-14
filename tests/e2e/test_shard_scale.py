@@ -1,6 +1,6 @@
 """The rehearsal of #154 at a main study's shard counts: 4 models, 2 arms, 2 seeds, sharded by model
 (`expcore-shard/3`) into N = 27 and N = 21, every shard a driver process of its own with its own study copy, store and
-`out/`, as hosts would run them. The plan has 30 pairs of task and seed per model, or a main study's 150 with
+`out/`, as hosts would run them. The plan has 24 pairs of task and seed per model, or a main study's 150 with
 `EXPCORE_SCALE_TASKS=75` (`shard_scale_support`, "The size").
 
 **Campaign A, N = 27, clean: the determinism claim.** The same plan, fakes and seeds are run once by one unsharded
