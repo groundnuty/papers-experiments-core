@@ -1,7 +1,10 @@
 name: ci
 
+# A push to a branch with an open pull request would otherwise run twice, once as a push and once as a pull request.
+# Pushes are built for main only; every other change is built by its pull request, whatever branch it is based on.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -12,6 +15,11 @@ on:
 
 permissions:
   contents: read
+
+# A newer run on the same ref supersedes an older one that is still going.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   # Pinned to the uv that made uv.lock, so CI does not look up "latest" on every run.
