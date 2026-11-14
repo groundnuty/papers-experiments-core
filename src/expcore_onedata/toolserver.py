@@ -61,7 +61,7 @@ from pathlib import Path
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
-from expcore_onedata.admission import require_admission
+from expcore_onedata.admission import TOOL_SERVER_STEP, require_admission, token_step
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.credentials import Principal
@@ -260,12 +260,19 @@ class ToolServerLauncher:
         change from the condition's declared rights records `tool_plane_rights_changed` and raises `InfraError` of kind
         `tool_plane_integrity`, which replaces any exception of the run's body, because the run is set aside whatever
         it did.
+
+        From before its first check to the end of that last one, the launch is a step of the run that uses its token,
+        counted on the run's admission (`admission.token_step`), so the fault injector's restore can tell that it
+        still runs and that a heal might outlast the token (O35).
         """
         if principal is not None and token.subject != principal.user_id:
             raise ValueError("the tool-server token was not minted for the leased slot's tool-server user")
         require_admission(self._config)  # a platform with a fault injector: the run holds the federation (O11)
         server, chosen = _server(self._config), self._config.condition(condition)
-        with _private_bundle(self._config) as ca_copy:  # the run's copy of the verified CA bytes, gone with the server
+        with (
+            token_step(TOOL_SERVER_STEP),  # ended only once the re-verification at teardown has ended
+            _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
+        ):
             env = server_environment(self._config, chosen, token, extra_env, ca_copy=ca_copy)
             provider = McpToolProvider(
                 server.command,

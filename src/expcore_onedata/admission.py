@@ -32,6 +32,14 @@ The fault half of the platform's health check, which reads the holder record thi
 gate's `RECOVERY`) first writes a holder record beside the lock, whole and fsynced (`fault_journal.HOLDER`): its pid and
 boot id, its purpose, the target's label and the time it took the lock; it removes the record before it lets the lock
 go, and a shared admission clears any record left behind, since no exclusive holder can then exist.
+
+**The run's token steps (O35).** An admission also counts the steps of its run that use the run's tokens and have
+begun but not ended (`token_step`, `Admission.open_steps`): the tool server's launch (`TOOL_SERVER_STEP`), up to the
+end of its stop's re-verification of the plane, which examines its token, and the sandbox's (`SANDBOX_STEP`), from its
+mint up to the end of its stop. Both launches note their own. The fault injector reads them at the start of a restore
+or of its start's recovery, either of which may heal for up to `heal_timeout_s`: a step still running then could find
+its token expired after the heal (`expcore_onedata.faults`, "The token's window"). A copy of the context (a worker
+thread, a task) sees the same admission, and so the same count.
 """
 
 import asyncio
@@ -62,6 +70,7 @@ FEDERATION_LOCK = "federation.lock"
 FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock
 OUTAGE_RUN, INJECTOR, RECOVERY = "outage_run", "injector", "recovery"  # why the federation is held exclusively
 EXCLUSIVE_RUN = "exclusive_run"  # a run whose condition declares `exclusive = true`: a matched control, no fault
+TOOL_SERVER_STEP, SANDBOX_STEP = "tool_server", "sandbox"  # the run's steps that use its tokens (`token_step`)
 _ADMISSION: ContextVar["Admission | None"] = ContextVar("expcore_onedata_admission", default=None)
 
 
@@ -98,6 +107,14 @@ class _Shares:
         self.count, self.owner_left = 1, False
 
 
+class _Steps:
+    """The run's steps that use its tokens and have begun, by name, each with how many have not ended yet."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.running: dict[str, int] = {}
+
+
 @dataclass(frozen=True)
 class Admission:
     """The federation's lock as one run holds it, shared or exclusive, and which federation it is; held exclusively,
@@ -112,10 +129,31 @@ class Admission:
     journal: InjectionJournal | None = None
     record: Mapping[str, Any] | None = None
     shares: _Shares = field(default_factory=_Shares, compare=False, repr=False)
+    steps: _Steps = field(default_factory=_Steps, compare=False, repr=False)
 
     @property
     def held(self) -> bool:
         return self.lock.held
+
+    def begin_step(self, name: str) -> Callable[[], None]:
+        """Count a step of the run that uses its tokens (`TOOL_SERVER_STEP`, `SANDBOX_STEP`) as begun; return the call
+        that counts it ended (only the first call counts)."""
+        with self.steps.lock:
+            self.steps.running[name] = self.steps.running.get(name, 0) + 1
+        ended = [False]  # under the steps' lock: one end per begin, however often the call is made
+
+        def end() -> None:
+            with self.steps.lock:
+                if not ended[0]:
+                    ended[0] = True
+                    self.steps.running[name] -= 1
+
+        return end
+
+    def open_steps(self) -> tuple[str, ...]:
+        """The names of the run's steps that use its tokens and have begun but not ended, sorted."""
+        with self.steps.lock:
+            return tuple(sorted(name for name, count in self.steps.running.items() if count > 0))
 
     def retain(self) -> Callable[[], None]:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
@@ -173,6 +211,19 @@ def retain_admission() -> Callable[[], None]:
     gives up nothing when the context holds none."""
     admission = current_admission()
     return admission.retain() if admission is not None else (lambda: None)
+
+
+@contextlib.contextmanager
+def token_step(name: str) -> Iterator[None]:
+    """For the body of a `with`, a step of the run that uses its tokens, counted on the running context's admission
+    from its start to its end however the body ends (`Admission.begin_step`); nothing is counted without an admission,
+    as on a platform without `[faults]`, which has no injector to read it."""
+    admission = current_admission()
+    end = admission.begin_step(name) if admission is not None else (lambda: None)
+    try:
+        yield
+    finally:
+        end()
 
 
 class FederationLock:

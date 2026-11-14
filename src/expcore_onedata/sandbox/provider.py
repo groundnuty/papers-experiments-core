@@ -71,7 +71,7 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
-from expcore_onedata.admission import require_admission, retain_admission
+from expcore_onedata.admission import SANDBOX_STEP, require_admission, retain_admission, token_step
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
@@ -569,7 +569,38 @@ class SandboxPlatform:
         check, so it covers the start, the run, the teardown and the check. Its wait is before the agent's clock starts. Without it `launch` raises `AdmissionRefused` before
         it mints a token or enters a wait (O11). An injector's own admission, taken when its run holds none, is not
         the run's: the run must be admitted before it launches.
+
+        From its start to the end of its stop (the slot's revocation included) the launch is a step of the run that
+        uses its tokens, counted on the run's admission (`admission.token_step`), so the fault injector's restore can
+        tell that it still runs (O35).
         """
+        with token_step(SANDBOX_STEP):  # ended only once the stop below has ended, however the launch ends
+            async with self._launch(
+                ctx,
+                run_key=run_key,
+                level=level,
+                ceiling_s=ceiling_s,
+                lease=lease,
+                condition=condition,
+                inputs=inputs,
+                inputs_record=inputs_record,
+            ) as sandbox:
+                yield sandbox
+
+    @contextlib.asynccontextmanager
+    async def _launch(
+        self,
+        ctx: CallContext,
+        *,
+        run_key: str,
+        level: str,
+        ceiling_s: float,
+        lease: Lease | None = None,
+        condition: str | None = None,
+        inputs: Sequence[ReadOnlyInput] = (),
+        inputs_record: InputsRecord | None = None,
+    ) -> AsyncIterator[DockerSandbox]:
+        """The launch itself (see `launch`)."""
         if lease is not None:  # a lease-less platform has no slot for it (O38): refused before anything else
             self._slots_needed("take a lease")
         if condition is not None:

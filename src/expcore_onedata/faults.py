@@ -190,9 +190,9 @@ from expcore_onedata.admission import (
 from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
-from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreNotVerified, digest
+from expcore_onedata.fault_recovery import RUN_NOT_STOPPED, FaultDriver, Recovery, RestoreNotVerified, digest
 from expcore_onedata.fault_serves import provider_serves
-from expcore_onedata.fault_settings import FaultSettings, compose_driver, load_faults
+from expcore_onedata.fault_settings import FaultSettings, compose_driver, heal_token_margin_s, load_faults
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 __all__ = [
@@ -262,6 +262,8 @@ class FaultInjector:
         self._gate_probe: str | None = None  # the open injection's session gate probe file (`fault_sessions`)
         self._lock: HeldLock | None = None
         self._federation = FederationLock(settings)
+        # the study declared the long token margin: a heal may run while the run's launches still run (heal_token_margin_s)
+        self._long_margin = config.tokens.margin_s >= heal_token_margin_s(settings)
         self._admission: Admission | None = None  # the exclusive admission it took itself, when its run held none
         self._cancel = threading.Event()  # set when `running` is cancelled: an admission still awaited is given up
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
@@ -328,7 +330,10 @@ class FaultInjector:
         self._run = {"run_key": run_key, "attempt": attempt}
         self._admit()
         self._step("sanctioned", True)
-        unsettled = self._recover(heal=self._holds_exclusive())  # under the exclusive admission just taken
+        withheld = self._token_steps_running()  # the run's launches already run: no heal may outlast their token
+        if withheld:
+            self._step("heal_withheld", True, steps=list(withheld))
+        unsettled = self._recover(heal=self._holds_exclusive() and not withheld)  # under the exclusive admission
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
             raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
         self._lock = self._journal.try_lock(self.target)
@@ -402,6 +407,16 @@ class FaultInjector:
         except AdmissionRefused:
             return False
         return True
+
+    def _token_steps_running(self) -> tuple[str, ...]:
+        """The steps of the run that use its tokens and still run, when a heal begun now could outlast their token: a
+        heal is declared, the federation is held exclusively for this injector, so one could run, and the study has not
+        declared the long margin. Empty otherwise, and when the run's launches counted none on its admission (see
+        "The token's window")."""
+        if self._long_margin or self._settings.heal == "off" or not self._holds_exclusive():
+            return ()
+        held = current_admission()
+        return held.open_steps() if held is not None else ()
 
     def _release_admission(self) -> None:
         if self._admission is not None:
@@ -645,6 +660,9 @@ class FaultInjector:
             return True
         entry, digest = self._pending
         injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
+        running = self._token_steps_running()
+        if running:  # a heal could outlast the token a step still running examines: the restore is not started
+            return self._not_started(entry, injection, running)
         try:
             done, how, after, ready_after_s = self._recovery.settle(
                 {
@@ -677,6 +695,18 @@ class FaultInjector:
             self._unlock()
             self._release_admission()
         return done
+
+    def _not_started(self, entry: str, injection: Mapping[str, Any], running: tuple[str, ...]) -> bool:
+        """Leave the restore unstarted, failed closed: the target stays down and its injection open and pending,
+        journalled `clear_failed` (`run_not_stopped`) so the health gate refuses it, and the snapshot says the restore
+        is not verified, naming the steps that still ran, so the run is never scored. A later clear, finish or start
+        that finds every step ended starts the restore."""
+        with contextlib.suppress(OSError):  # the journal may be what fails: the injection stays open all the same
+            self._journal.append({"event": "clear_failed", "id": entry, "how": RUN_NOT_STOPPED})
+        self._injection = {**injection, "cleared": False, "verified": False}
+        self._step("cleared", False, how=RUN_NOT_STOPPED, steps=list(running))
+        self._step("verified", False, identity_changed=False, identity_after_sha256=None, ready_after_s=None)
+        return False
 
     def recover(self) -> list[str]:
         """Clear and verify every open injection of the journal that no live injector holds; raise InfraError of kind

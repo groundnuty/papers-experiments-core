@@ -2,7 +2,9 @@
 
 The campaign admits a run before it launches anything (shared for a baseline condition, exclusive for an outage run),
 and holds it until after the post-run check; `SandboxPlatform.launch` refuses to start without one, before it mints
-a token or enters a wait, so a baseline run's sandbox never starts on a federation an outage run holds.
+a token or enters a wait, so a baseline run's sandbox never starts on a federation an outage run holds. Under it the
+launch is a step of the run that uses its tokens (O35), noted on the admission until its stop has ended, so the fault
+injector's restore can tell whether it still runs.
 """
 
 import asyncio
@@ -16,7 +18,7 @@ from fault_support import FakeServices, faults_table, injector_for
 from sandbox_support import FAST, add_sandbox
 
 from expcore.campaign.lease import LeasePool
-from expcore_onedata.admission import AdmissionRefused, FederationLock
+from expcore_onedata.admission import SANDBOX_STEP, AdmissionRefused, FederationLock
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
 from expcore_onedata.sandbox.provider import SandboxPlatform
@@ -185,3 +187,63 @@ def test_o11_a_cancelled_launch_whose_start_thread_outlives_its_wait_keeps_the_f
 
     asyncio.run(go())
     assert seen == [True] * 5
+
+
+def test_o35_a_sandbox_launch_is_a_token_step_of_its_run_until_its_stop_has_ended(platform, config):
+    """O35, O11: from its mint to the end of its stop (the slot's revocation included) the launch is noted on the
+    run's admission as a step that uses the run's tokens, so the injector's restore can tell that it still runs; once
+    the launch has ended, so has the step."""
+    built, host, _ = platform
+    lock = FederationLock(load_faults(config.file, config))
+    seen: dict[str, list] = {"start": [], "stop": []}
+    original = host.docker
+
+    def watched(*args, **kwargs):
+        phase = "stop" if args[0] in ("stop", "rm", "kill") else "start" if args[0] == "run" else None
+        if phase is not None:
+            seen[phase].append(admission[0].open_steps())
+        return original(*args, **kwargs)
+
+    host.docker = watched
+    admission: list = []
+
+    async def go():
+        async with lock.admitted(exclusive=False) as held:
+            admission.append(held)
+            assert held.open_steps() == ()
+            async with built.launch(TimedContext(), run_key="run-1", level="isolated", ceiling_s=CEILING_S):
+                seen["body"] = held.open_steps()
+            seen["after"] = held.open_steps()
+
+    asyncio.run(go())
+    assert seen["body"] == (SANDBOX_STEP,)
+    assert seen["start"]
+    assert set(seen["start"]) == {(SANDBOX_STEP,)}
+    assert seen["stop"]
+    assert set(seen["stop"]) == {(SANDBOX_STEP,)}
+    assert seen["after"] == ()
+
+
+def test_o35_a_sandbox_launch_whose_start_fails_ends_its_token_step(platform, config):
+    """O35: a launch that fails during its start ends its step as it leaves, so a restore after it is not refused for
+    a sandbox that is gone."""
+    built, host, _ = platform
+    lock = FederationLock(load_faults(config.file, config))
+    original = host.docker
+
+    def failing(*args, **kwargs):
+        if args[0] == "run":
+            raise RuntimeError("the daemon went away")
+        return original(*args, **kwargs)
+
+    host.docker = failing
+    after: list = []
+
+    async def go():
+        async with lock.admitted(exclusive=False) as held:
+            with pytest.raises(RuntimeError, match="the daemon went away"):
+                await launched(built, TimedContext())
+            after.append(held.open_steps())
+
+    asyncio.run(go())
+    assert after == [()]

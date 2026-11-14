@@ -93,6 +93,14 @@ class FaultDriver(Protocol):
 log = logging.getLogger(__name__)
 
 _WORD = re.compile(r"[A-Za-z_]{1,40}")  # how a settling ended, as a word: nothing else goes into a message
+RUN_NOT_STOPPED = "run_not_stopped"  # a restore the injector did not start: a step using the run's tokens still ran
+_NOT_STARTED = {  # how a restore that was never started ended, in words: nothing of the provider was checked
+    RUN_NOT_STOPPED: (
+        "the restore was not started, since a step of the run that uses its tokens (its tool server or its sandbox) "
+        "still ran, and a heal could outlast the token that step examines: stop both before FaultInjector.running's "
+        "exit, or declare [tokens] margin_s of at least heal_token_margin_s"
+    ),
+}
 _TRIED = re.compile(r"[A-Za-z_ ,()\[\]0-9]{1,2000}")  # the heal's actions: words and provider labels, nothing else
 
 _WHY = {  # how a settling failed, in words, where the bare word would not say it
@@ -153,7 +161,7 @@ class RestoreNotVerified(InfraError):
         self.how = how if _WORD.fullmatch(how) else "failed"
         self.identity_changed, self.serving, self.still_open = identity_changed, serving, still_open
         self.tried = tried if tried is not None and _TRIED.fullmatch(tried) else None
-        checked = (
+        checked = _NOT_STARTED.get(self.how) or (
             f"its identity {'changed' if identity_changed else 'did not change to a running one'} and it "
             f"{'served' if serving else 'did not serve'}"
         )
