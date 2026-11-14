@@ -788,6 +788,7 @@ def test_s16_a_smallest_effect_and_a_smallest_ratio_load_with_their_direction(tm
         ('smallest_effect = "0.1"', "", "a-vs-b", "smallest_effect", "finite number"),
         ('direction = "higher"', "", "a-vs-b", "direction", "without smallest_effect or smallest_ratio"),
         ('smallest_effect = 0.1\ndirection = "up"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
+        ('smallest_effect = 0.1\ndirection = "either"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
         ("", 'smallest_ratio = 0.5\ndirection = "higher"', "spend-per-win", "smallest_ratio", "below 1"),
     ],
 )

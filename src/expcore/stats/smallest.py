@@ -163,6 +163,11 @@ def rule(
                 "effect of interest is about, so declare the threshold beside it or leave it out",
             )
         return None
+    if direction is not None and direction not in DIRECTIONS:  # "either" is the rule's word for none, never declared
+        raise RuleError(
+            "direction",
+            f"must be 'higher' or 'lower', got {direction!r}; leave it out for a rule that holds in either direction",
+        )
     form = "ratio" if ratio else "difference"
     return Rule(form, declared, EITHER if direction is None else direction)  # Rule checks each value's type
 

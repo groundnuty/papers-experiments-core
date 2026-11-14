@@ -31,11 +31,14 @@ ARMS = FactorSchema(
     {"arm": ["a", "b", "c"]}, ["task", "arm", "model", "seed"], {f"cond-{a}": {"arm": a} for a in "abc"}
 )
 # Six clusters at alpha 0.05: the exact two-sided signed-rank test rejects only when all six differences share a sign
-# (p = 2/64 = 0.03125; one rank against them gives 4/64 = 0.0625). A study of six N(delta, sd^2) draws then rejects
-# with probability Phi(delta/sd)^6 + Phi(-delta/sd)^6, the second term below 1e-8 here, so power 0.8 needs
-# Phi(delta/sd) = 0.8^(1/6) = 0.963492, delta = 1.7927 sd: the minimum detectable effect of six clusters.
+# (p = 2/64 = 0.03125; rank 1 alone against them gives 4/64 = 0.0625, any other rank more). A study of six
+# N(delta, sd^2) draws then rejects with probability Phi(delta/sd)^6 + Phi(-delta/sd)^6, the second term below 1e-8
+# here and dropped, so power 0.8 needs Phi(delta/sd) = 0.8^(1/6) = 0.963492, delta = 1.7927 sd: the minimum
+# detectable effect of six clusters.
 MDE_PER_SD = 1.7927
-MDE_TOLERANCE = 0.08  # in SDs: about five Monte Carlo standard errors of 4000 simulated studies
+# In SDs: about five Monte Carlo standard errors of 20000 simulated studies (the slope of the power curve at the
+# target is 6 x (0.8 / 0.9635) x phi(1.7927) = 0.40 per SD, and sqrt(0.8 x 0.2 / 20000) / 0.40 = 0.007 SD)
+MDE_TOLERANCE = 0.035
 SD_OF_ONE_TO_SIX = math.sqrt(3.5)  # 1..6 deviate from 3.5 by 0.5, 1.5, 2.5 twice each: 17.5 / 5 = 3.5
 
 
@@ -70,6 +73,8 @@ def test_s16_a_difference_is_compared_on_the_outcomes_scale_and_a_ratio_as_its_n
         ({"smallest_effect": math.nan}, False, "smallest_effect", "finite number"),
         ({"smallest_ratio": math.inf}, True, "smallest_ratio", "finite number"),
         ({"smallest_effect": 0.1, "direction": "up"}, False, "direction", "'higher' or 'lower'"),
+        ({"smallest_effect": 0.1, "direction": "either"}, False, "direction", "'higher' or 'lower'"),  # none is either
+        ({"smallest_ratio": 2, "direction": "either"}, True, "direction", "'higher' or 'lower'"),
         ({"direction": "higher"}, False, "direction", "without smallest_effect or smallest_ratio"),
         ({"smallest_ratio": 0.5, "direction": "higher"}, True, "smallest_ratio", "below 1"),
     ],
@@ -184,7 +189,7 @@ seed = 7
 
 [power]
 seed = 3
-n_simulations = 4000
+n_simulations = 20000
 target_clusters = 6
 target_difference = 0.1
 sd_grid = [0.1]
