@@ -207,12 +207,11 @@ def beta_physical(client) -> int:
 
 
 @pytest.mark.parametrize(("path", "lag"), [("top.bin", 10.0), ("study/one.bin", 15.0), ("a/b/c/deep.bin", 25.0)])
-def test_o33_the_fakes_root_size_shows_a_placement_after_the_sources_lag_and_an_eviction_at_once(
-    client, fake, ticker, path, lag
-):
-    """O33: the fake's directory size follows the source's bound: bytes that land on a file L path parts below the
-    space root show in the root's physical size 10 + 5 x (L - 1) s later, and bytes that leave show at once; what the
-    test put in place before the first call is old and shows at once."""
+def test_o46_the_fakes_root_size_shows_a_placement_and_an_eviction_after_the_same_lag(client, fake, ticker, path, lag):
+    """O46: the fake's directory size follows the source's bound for a placement and the live slot's measure for an
+    eviction: bytes that land on a file L path parts below the space root, and bytes that leave it, show in the root's
+    physical size 10 + 5 x (L - 1) s later; what the test put in place before the first call is old and shows at
+    once."""
     held = len(FILES) * len(DATA)
     assert beta_physical(client) == held  # the setup's: old (this first call also ends the setup)
     landed = fake.add_file(path, DATA, holder=BETA_ID)
@@ -222,7 +221,10 @@ def test_o33_the_fakes_root_size_shows_a_placement_after_the_sources_lag_and_an_
     ticker.sleep(0.5)
     assert beta_physical(client) == held + len(DATA)
     del fake.blocks[(landed, BETA_ID)]
-    assert beta_physical(client) == held  # an eviction shows at once
+    ticker.sleep(lag - 0.5)
+    assert beta_physical(client) == held + len(DATA)  # the eviction has not shown yet
+    ticker.sleep(0.5)
+    assert beta_physical(client) == held
     fake.blocks[(landed, BETA_ID)] = [[0, len(DATA)]]
     ticker.sleep(lag - 0.5)
     assert beta_physical(client) == held  # a placement again: the lag counts from this one
@@ -230,12 +232,27 @@ def test_o33_the_fakes_root_size_shows_a_placement_after_the_sources_lag_and_an_
     assert beta_physical(client) == held + len(DATA)
 
 
-def test_o33_the_fakes_root_size_does_not_show_a_placement_that_was_evicted_within_the_lag(client, fake, ticker):
-    """O33: bytes that land and leave inside the lag never show in the directory's size, whatever time passes."""
+def test_o46_the_fakes_root_size_shows_an_eviction_of_an_old_replica_only_after_the_lag(client, fake, ticker):
+    """O46: a replica the setup put in place is old, and its eviction is a change like any other: the root's size
+    still shows it until the lag has passed, as the live slot saw a mirror's size drop 20 s after an eviction."""
+    held = len(FILES) * len(DATA)
+    assert beta_physical(client) == held
+    del fake.blocks[(fake.id_of(FILES[0]), BETA_ID)]
+    ticker.sleep(fake.occupancy_lag_s(2) - 0.5)
+    assert beta_physical(client) == held
+    ticker.sleep(0.5)
+    assert beta_physical(client) == held - len(DATA)
+
+
+def test_o46_the_fakes_root_size_settles_on_what_is_held_after_a_landing_evicted_within_the_lag(client, fake, ticker):
+    """O46: bytes that land and leave inside the lag are gone from the directory's size once the eviction's own lag has
+    passed, whatever time passes after it."""
     assert beta_physical(client) == len(FILES) * len(DATA)
     landed = fake.add_file("study/one.bin", DATA, holder=BETA_ID)
     ticker.sleep(5.0)
     del fake.blocks[(landed, BETA_ID)]
+    ticker.sleep(fake.occupancy_lag_s(2))
+    assert beta_physical(client) == len(FILES) * len(DATA)
     ticker.sleep(60.0)
     assert beta_physical(client) == len(FILES) * len(DATA)
 
