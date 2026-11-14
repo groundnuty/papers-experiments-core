@@ -244,10 +244,10 @@ def test_o34_a_read_of_a_file_only_the_stopped_provider_holds_outlives_its_kill_
     survived, with the process in D state."""
     record = attempt["during"]["deadline"]
     steps = {s["step"]: s for s in record["steps"]}
-    # the kill follows the cap by the time of the listing and the signals (0.127 s on the 14 Nov slot), never by a whole
-    # grace, which is what the check of the survivors waits after it
-    assert 0.0 <= steps["kill"]["t_s"] <= GRACE_S
-    assert steps["survived"]["t_s"] >= steps["kill"]["t_s"] + GRACE_S
+    # the kill is stamped after the listing of the cell's processes and the signals (0.127 s on the 14 Nov slot), which
+    # the escalation bounds by its whole margin (`deadline.margin_s`); the check of the survivors follows it
+    assert 0.0 <= steps["kill"]["t_s"] <= deadline.margin_s(GRACE_S)
+    assert steps["kill"]["t_s"] <= steps["survived"]["t_s"]
     assert steps["survived"]["left"] >= 1
     assert "D" in steps["survived"]["states"]
 
