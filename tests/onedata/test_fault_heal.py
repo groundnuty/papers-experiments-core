@@ -1235,6 +1235,37 @@ def test_o35_a_heal_whose_check_could_not_answer_still_names_the_reading_provide
         recovery.recover(heal=True)
     _, _, why = caught.value.detail.partition("was not cleared (")
     assert "restart the rtransfer link on the reading provider each failed pair names" in why
-    assert f"{CRASHED}->{READER}" in why  # the last answer, the restore's own check, source -> reader
-    assert f"{CRASHED}->{SECOND}" in why
+    assert f"{READER} reading from {CRASHED}" in why  # the last answer: the restore's own check
+    assert f"{SECOND} reading from {CRASHED}" in why
     assert services.checks > 1  # the heal did check, and could not read
+
+
+def test_o35_a_heal_whose_check_after_a_restart_could_not_answer_names_the_readers_its_latest_answer_found(tmp_path):
+    """O35: the heal's check after a reader's ping finds a second reader failing, and its check after the link restart
+    raises; the recovery's failure names both readers, from the latest check that answered, not only the one the
+    restore's own check found."""
+    services = HealServices()
+    services.stuck = {(READER, CRASHED)}
+    services.link_fixes = {READER: ()}
+
+    def after_the_ping_a_second_reader_fails_and_after_the_restart_no_check_answers():
+        last = services.actions[-1] if services.actions else None
+        if last == ("ping", READER):
+            services.stuck |= {(SECOND, CRASHED)}
+        elif last == ("restart_link", READER):
+            raise RuntimeError("the probe space cannot be read")
+
+    services.on_check = after_the_ping_a_second_reader_fails_and_after_the_restart_no_check_answers
+    injector_, services = injector(tmp_path, services, heal="link")
+    injector_.start(RUN)
+    injector_._unlock()  # the run's process ends with the injection open: the kernel drops its lock on the target
+    platform = tmp_path / "platform.toml"
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    clock = services.clock
+    recovery = Recovery(settings, services, clock=clock, sleep=clock.sleep, labels=SERVICE, wall=clock)
+    with pytest.raises(InfraError) as caught:
+        recovery.recover(heal=True)
+    assert ("restart_link", READER) in acted(services, "restart_link")
+    _, _, why = caught.value.detail.partition("was not cleared (")
+    assert f"{READER} reading from {CRASHED}" in why
+    assert f"{SECOND} reading from {CRASHED}" in why  # found only by the heal's check after the ping
