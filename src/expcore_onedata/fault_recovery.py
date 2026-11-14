@@ -85,9 +85,11 @@ _WORD = re.compile(r"[A-Za-z_]{1,40}")  # how a settling ended, as a word: nothi
 
 _WHY = {  # how a settling failed, in words, where the bare word would not say it
     "serves_unconfigured": "its service has no provider declared in [faults.services], so no read can show it serving",
-    "links_stuck": (
-        "it serves, but a link of it transferred no probe within the link check's bound (O35): restart the rtransfer "
-        "link on the local provider (rtransfer_config:restart_link()) or that provider's container alone"
+    "links_stuck": (  # the link check tests every ordered pair, so the stuck link need not be the restored provider's
+        "it serves, but the link check (O35) found a pair of providers that transferred no probe within its bound: "
+        "restart the rtransfer link on the reading provider each failed pair names (rtransfer_config:restart_link() in "
+        "its op-worker) or that provider's container alone (docker restart, never a compose down), one at a time, "
+        "re-checking every pair after each"
     ),
 }
 
@@ -194,9 +196,18 @@ class Recovery:
                 lock.close()
             step("recovered", done, target=target, how=how, identity_after_sha256=after, ready_after_s=ready_after_s)
             if not done:
-                why = _WHY.get(how, how)
+                why = self._why(how)
                 raise failure(f"an injection of {target} that an earlier run left open was not cleared ({why})", target)
         return sorted(set(held))
+
+    def _why(self, how: str) -> str:
+        """How a settling failed, in words. A stuck link adds what the link check found, which names each failed pair's
+        reading provider by position (`links_detail` is set by the settling that just ended with `links_stuck`, so it is
+        used for that word alone, never for another failure's message)."""
+        why = _WHY.get(how, how)
+        if how == "links_stuck" and self.links_detail:
+            why = f"{why}; the link check found: {self.links_detail}"
+        return why
 
     def settle(self, entry: Mapping[str, Any]) -> Settled:
         """Leave one injection's target up and serving: find it back, find it never went down, or bring it back with a
