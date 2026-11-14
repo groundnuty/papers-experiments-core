@@ -118,7 +118,9 @@ stuck, and fails the start the same way instead of being skipped as a live run's
 **Baseline (O11).** While an injection proceeds or is unsettled the federation is not in its baseline state, so no
 other run may be on it. An outage run holds the federation's lock exclusively for its whole run, inject and clear
 included (`expcore_onedata.admission`): the injector uses its run's exclusive admission, takes one itself when the run
-holds none, refuses a shared one, and keeps it until the restore is verified. Every other run holds it shared, so the
+holds none, refuses a shared one, and keeps it until the restore is verified. Its own wait that runs out while another
+run holds the federation is raised as it is, `federation_busy`, a hold that costs the run no attempt, never as
+`injector_failure`. Every other run holds it shared, so the
 two never overlap; a turnstile in front of the lock keeps a stream of shared holders from starving an outage run. An
 injector also refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
 settle, and the platform's standard health check (`PlatformHealth`), whenever platform.toml has a `[faults]` table,
@@ -179,6 +181,7 @@ from expcore_onedata.admission import (
     INJECTOR,
     Admission,
     AdmissionRefused,
+    FederationBusy,
     FederationLock,
     current_admission,
     require_same_federation,
@@ -380,6 +383,8 @@ class FaultInjector:
                 self._admission = self._federation.acquire(
                     exclusive=True, timeout_s=timeout_s, cancel=cancel, purpose=INJECTOR, target=self.target
                 )
+            except FederationBusy:  # another run holds the federation: a hold that costs no attempt, never a failure
+                raise
             except InfraError as error:
                 raise self._fail(error.detail) from None
 

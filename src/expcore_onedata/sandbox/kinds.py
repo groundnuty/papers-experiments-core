@@ -45,7 +45,10 @@ make every kind the layer raises known before its conditions are validated, and 
 that names one. The fault injector's two kinds are registered here too (`expcore_onedata.faults`):
 `provider_outage`, a provider of the federation that was unavailable, which a condition may declare with the target
 it takes down; and `injector_failure`, the injector's own failure to inject, clear or verify, which is not treatable,
-so a run whose fault was never verified is set aside and never scored as the outage (O10, O11, C01).
+so a run whose fault was never verified is set aside and never scored as the outage (O10, O11, C01). The federation's
+lock has one more (`expcore_onedata.admission`): `federation_busy`, a run's bounded wait for the federation that ran out
+while another run held it, an outage run through its restore and heal say. A hold like `ingest_held`: never treatable,
+it costs no attempt, so waits piled up behind a long heal never exhaust a run (O11).
 """
 
 from collections.abc import Iterable, Mapping
@@ -75,6 +78,15 @@ register_infra_kind(
 PROVIDER_OUTAGE = "provider_outage"
 register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
 register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
+
+FEDERATION_BUSY = "federation_busy"
+register_infra_kind(
+    FEDERATION_BUSY,
+    "a run's bounded wait for the federation ran out while another run legitimately held it (an outage run's restore "
+    "and heal, say): nothing was started or taken down, so the run costs no attempt and asks again",
+    treatable=False,
+    charged=False,
+)
 
 INGEST_FAILURE = "ingest_failure"
 register_infra_kind(
@@ -190,6 +202,7 @@ def collection_error(what: str, reason: str) -> InfraError:
 __all__ = [
     "CELL_UNKILLABLE",
     "DATA_GATE_INTEGRITY",
+    "FEDERATION_BUSY",
     "INGEST_FAILURE",
     "INJECTOR_FAILURE",
     "KIND_OF_CATEGORY",

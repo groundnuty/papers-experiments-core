@@ -1,0 +1,225 @@
+"""O11: a wait for the federation that runs out because another run legitimately holds it is a hold, never a failure.
+
+An outage run holds the federation exclusively for its whole attempt, its restore and heal included, which can last
+over an hour; every other run waits for it, bounded by `admission_timeout_s`. A wait that runs out says nothing about
+the waiting run, so it is `federation_busy`, a hold that costs no attempt (as `ingest_held` is): piled-up waits never
+exhaust `max_attempts`. The injector's own failures (`injector_failure`) are still charged.
+"""
+
+import contextlib
+import threading
+import time
+
+import pytest
+from campaign_support import make_schema
+from fault_support import LOCAL_TARGET, SERVICES, FakeServices, injector_for, write_faults
+from heal_support import TARGET, heal_injector, stale
+from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings_for
+
+from expcore.campaign.attempts import is_charged
+from expcore.campaign.factors import FactorSchema
+from expcore.errors import InfraError, is_treatable, uncharged_kinds
+from expcore_onedata.admission import FederationBusy, FederationLock, run_admission
+from expcore_onedata.config import load_platform
+from expcore_onedata.faults import INJECTOR_FAILURE, PROVIDER_OUTAGE, load_faults
+
+HOLD = "federation_busy"
+RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
+OTHER_RUN = {"run_key": "task=task-b|model=m1|seed=1", "attempt": 1}
+SMALL = {"tasks": ("task-a",), "seeds": (1,)}
+SCHEMA = make_schema()
+KEY = key_of(SCHEMA, "api-none")
+ONE = FactorSchema(SCHEMA.declared, SCHEMA.order, {"api-none": SCHEMA.conditions["api-none"]})  # a plan of one run
+ONE_KEY = key_of(ONE, "api-none")
+
+
+def platform_in(directory, **faults):
+    """platform.toml with `[faults]` in a directory of its own, beside the campaign's."""
+    directory.mkdir(parents=True, exist_ok=True)
+    return write_faults(directory, **faults)
+
+
+def federation_lock(platform):
+    return FederationLock(load_faults(platform, load_platform(platform, require_secrets=False)))
+
+
+def in_thread(work):
+    """Run `work` in a thread; return the thread and the list its result or exception lands in."""
+    landed: list = []
+
+    def run():
+        try:
+            landed.append(work())
+        except BaseException as error:
+            landed.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, landed
+
+
+def test_o11_a_wait_for_the_federation_that_runs_out_is_a_hold_that_costs_no_attempt(tmp_path):
+    """O11: a run that waits for the federation past its bound while another holds it did nothing and failed at
+    nothing: the wait ends as `federation_busy`, shared or exclusive, a hold that is never treatable and costs no
+    attempt; never `injector_failure`."""
+    lock = federation_lock(write_faults(tmp_path))
+    holder = lock.acquire(exclusive=True)
+    try:
+        for exclusive in (False, True):
+            with pytest.raises(FederationBusy) as caught:
+                lock.acquire(exclusive=exclusive, timeout_s=0.1)
+            assert caught.value.kind == HOLD
+            assert "past the bound of the wait" in caught.value.detail
+    finally:
+        holder.close()
+    assert HOLD in uncharged_kinds()
+    assert not is_charged(HOLD)
+    assert not is_treatable(HOLD)
+    assert is_charged(INJECTOR_FAILURE)  # the injector's own failure is charged as before
+
+
+def test_o11_an_injector_whose_own_wait_for_the_federation_runs_out_holds_and_takes_nothing_down(tmp_path):
+    """O11: an injector whose run holds no admission waits for the federation itself; while another outage run holds
+    it, that wait runs out as the hold `federation_busy`, not as `injector_failure`, and nothing is stopped or
+    journalled for its target."""
+    platform = write_faults(tmp_path, admission_timeout_s=0.2)
+    services = FakeServices()
+    first, second = injector_for(platform, services), injector_for(platform, services, target=LOCAL_TARGET)
+    first.start(RUN)
+    try:
+        with pytest.raises(InfraError) as caught:
+            second.start(OTHER_RUN)
+        assert caught.value.kind == HOLD
+        assert services.running(SERVICES["alpha"]) is True  # its own target was never touched
+        assert ("stop", SERVICES["alpha"]) not in services.calls
+        assert second.snapshot()["injections"] == []
+    finally:
+        assert first.finish()["ok"] is True
+
+
+def waits_for_the_federation(lock):
+    """An executor's behaviour that takes the federation inside its attempt (the in-call form of the admission) and
+    raises what its wait raises."""
+
+    async def behaviour(request):
+        async with lock.admitted(exclusive=False, timeout_s=0.1):
+            raise AssertionError("admitted while another run holds the federation")
+
+    return behaviour
+
+
+def test_o11_waits_for_the_federation_inside_attempts_cost_no_attempt_however_often(tmp_path):
+    """O11: an attempt whose wait for the federation runs out, four times, more than `max_attempts`, while another
+    run holds it, is set aside uncharged each time under the same attempt number, and the fifth runs: piled-up
+    time-outs behind an outage run's heal never exhaust a run."""
+    lock = federation_lock(platform_in(tmp_path / "platform"))
+    executor = FakeExecutor({KEY: [waits_for_the_federation(lock)] * 4})
+    holder = lock.acquire(exclusive=True)
+    try:
+        settings = settings_for(max_attempts=2)
+        with build(tmp_path / "campaign", executor=executor, plan=SMALL, settings=settings) as scheduler:
+            summary = scheduler.run()
+            assert attempts_of(scheduler.store, KEY) == [("infra_fail", 0, 1)] * 4 + [("done", 0, 1)]
+            assert scheduler.store.charged_attempts(KEY) == 0
+            kinds = {
+                row["infra_kind"]
+                for row in scheduler.store.q("SELECT infra_kind FROM attempts WHERE run_key=?", (KEY,))
+            }
+            assert kinds == {HOLD, None}
+            assert summary.statuses == {"done": 3}
+    finally:
+        holder.close()
+
+
+def fails_to_inject(platform):
+    """An executor's behaviour whose injector takes the federation itself and then fails to take its target down: the
+    injector's own failure."""
+
+    async def behaviour(request):
+        injector_for(platform, FakeServices(stop_noop=True)).start(RUN)
+        raise AssertionError("an injection that was never seen down was not refused")
+
+    return behaviour
+
+
+def test_o11_a_real_injector_failure_is_still_charged_and_exhausts_the_run(tmp_path):
+    """O11: only the wait is a hold: an injector that took the federation and then could not take its target down
+    fails as `injector_failure`, which is charged, so the run is exhausted at `max_attempts`."""
+    platform = platform_in(tmp_path / "platform")
+    executor = FakeExecutor({KEY: [fails_to_inject(platform)] * 4})
+    with build(
+        tmp_path / "campaign", executor=executor, plan=SMALL, settings=settings_for(max_attempts=2)
+    ) as scheduler:
+        summary = scheduler.run()
+        assert attempts_of(scheduler.store, KEY) == [("infra_fail", 1, 1), ("infra_fail", 1, 2)]
+        kinds = {
+            row["infra_kind"] for row in scheduler.store.q("SELECT infra_kind FROM attempts WHERE run_key=?", (KEY,))
+        }
+        assert kinds == {INJECTOR_FAILURE}
+        assert summary.statuses == {"done": 2, "infra_exhausted": 1}
+
+
+def test_o11_a_run_waiting_behind_an_outage_runs_heal_holds_uncharged_and_starts_once_the_heal_lets_go(tmp_path):
+    """O11, O35: an outage run holds the federation exclusively through its restore's heal. A baseline run of the
+    campaign, admitted shared by the platform's run admission, waits behind it; each wait that runs out is the hold
+    `federation_busy`, so it is left unstarted and asked again, never charged (`max_attempts` is 1, so one charge
+    would exhaust it). Once the heal ends and the outage run lets the federation go, the baseline run is admitted,
+    runs once and is done."""
+    federation = tmp_path / "federation"
+    injector, services = heal_injector(federation, stale(), heal="all_links", admission_timeout_s=0.2)
+    config = load_platform(federation / "platform.toml", require_secrets=False)
+    admit = run_admission(config)
+    refusals: list[str] = []
+    healing, asked_enough, released = threading.Event(), threading.Event(), []
+
+    @contextlib.contextmanager
+    def counted(kinds, targets, cancel, exclusive):
+        with contextlib.ExitStack() as stack:
+            try:
+                mode = stack.enter_context(admit(kinds, targets, cancel, exclusive))
+            except InfraError as refusal:
+                refusals.append(refusal.kind)
+                if len(refusals) >= 3:
+                    asked_enough.set()
+                raise
+            yield mode
+
+    def hold_the_heal(reader):
+        if not healing.is_set():  # the heal's first ping: the federation is held exclusively for the whole heal
+            healing.set()
+            asked_enough.wait(30)
+
+    services.on_ping = hold_the_heal
+
+    def outage_run():
+        with admit((PROVIDER_OUTAGE,), {PROVIDER_OUTAGE: TARGET}, threading.Event(), False):
+            injector.start(RUN)
+            verified = injector.clear()
+        released.append(time.monotonic())
+        return verified
+
+    thread, landed = in_thread(outage_run)
+    assert healing.wait(30)
+    started: list[float] = []
+
+    async def baseline(request):
+        started.append(time.monotonic())
+        return await executor._run(request, "finish")
+
+    executor = FakeExecutor({ONE_KEY: [baseline]})
+    settings = settings_for(max_attempts=1)
+    with build(
+        tmp_path / "campaign", schema=ONE, executor=executor, plan=SMALL, settings=settings, admission=counted
+    ) as scheduler:
+        summary = scheduler.run()
+        assert attempts_of(scheduler.store, ONE_KEY) == [("done", 0, 1)]
+        assert scheduler.store.charged_attempts(ONE_KEY) == 0
+        unstarted = [r["detail"] for r in scheduler.store.q("SELECT detail FROM events WHERE kind='run_unstarted'")]
+    thread.join(30)
+    assert landed == [True]  # the heal mended every pair and the restore was verified
+    assert len(refusals) >= 3
+    assert set(refusals) == {HOLD}
+    assert len(unstarted) == len(refusals)
+    assert all("no attempt used" in detail for detail in unstarted)
+    assert summary.statuses == {"done": 1}
+    assert started[0] >= released[0]  # it ran only once the outage run had let the federation go
