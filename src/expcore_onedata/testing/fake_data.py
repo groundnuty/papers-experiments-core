@@ -7,7 +7,7 @@ import itertools
 import json
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from email.utils import formatdate
 
@@ -200,7 +200,9 @@ class FakeData(FakeQos, FakeFederation):
                                                     `limit`, `token`), with `effQosInheritancePath`
 
     and, from Onezone, `GET /spaces/{space}` (the live name). Time is counted in calls, and where a delay is in
-    seconds it is seconds of the fake's own `clock`, never of the wall, so a test never waits.
+    seconds it is seconds of the fake's own `clock`, never of the wall, so a test never waits. A space besides the
+    study space has a tree of its own when it is added with `add_data_space`: every provider answers its root, and its
+    entries are made and read by id like the study space's.
 
     **QoS requirements** (#206) are the minimum the reset's QoS stages need, as the 25.0 build's source answers them
     (`expcore_onedata.resetqos` cites it): a requirement is added (`add_qos`, or the POST) and kept until removed; a
@@ -384,6 +386,19 @@ class FakeData(FakeQos, FakeFederation):
       a QoS requirement still covers on that provider: the job completes, the file keeps its blocks, and the record
       counts it in `filesProcessed` and not in `filesEvicted`, with `filesFailed` 0, as the platform does;
     - `onthefly_unit`: a range read through a provider lacking the bytes places at least this many from its offset;
+    - `links`: `(reading provider id, holding provider id)` to `"hang"` or `"fail"`, a link between two providers that
+      is stuck (#221): a range read through the reader of bytes it lacks, when every other provider holding them has
+      its link to the reader so marked, either hangs, `hang_hook` given the read's timeout (a `Ticker`'s `sleep`, so the
+      wait runs out on the test's clock) before it raises `httpx.ReadTimeout`, or answers `link_fail_answer` (500 by
+      default; how a provider answers a failed fetch was not measured). One working link to a holder serves the read.
+      Seen live: a stuck link left a read through the reader hanging past its bound with nothing logged, while every
+      other pair transferred; the hang is that, the failure an assumption;
+    - `joins_stuck_jobs`: True makes a read that hung a stuck fetch job of its reader (`stuck_jobs`, which a test
+      empties to model the synchronizer's restart): every later read of that file through that reader hangs too, even
+      once its link works, as op-worker's does (a later read of the same range joins the job, until its 1,800 s
+      restart); a read of another file is unaffected;
+    - `distribution_entries`: `(file id, provider id)` to what the block map holds for that provider instead of its
+      own entry, such as a malformed one;
     - `transfer_flip_after`: polls of a transfer before it ends; `transfer_visible_after`: polls before it is found at
       all, each answered `transfer_unseen_answer`; a fresh space root answers `root_enoent_answer` for
       `root_enoent_polls` reads;
@@ -391,6 +406,7 @@ class FakeData(FakeQos, FakeFederation):
       whose route contains the substring (to that provider, when named) fail with a connection reset;
     - `statuses`: a list of `[substring, count, status]` likewise answering with that HTTP status;
     - `fail_deletes`, `ignore_deletes`: every DELETE answers 500, or answers 204 and removes nothing;
+    - `fail_creates`: provider ids through which every creation of a file or directory answers 500;
     - `delete_delay_s` (also a constructor argument): seconds of `clock` a delete stays under way after it is answered
       (0: none); `land_deletes()` ends every one now (see "Pending deletes");
     - `lose_recreated` (also a constructor argument): True makes the landing of a directory's delete take the files of a
@@ -505,6 +521,7 @@ class FakeData(FakeQos, FakeFederation):
         self.page_size = 1000
         self.id_suffix = ""  # appended to every file id made from now on, for ids with characters like "="
         self.fail_deletes = False  # every DELETE answers 500
+        self.fail_creates: set[str] = set()  # provider ids through which every creation answers 500
         self.omit_blocks = False  # the block map's storage backends carry no "blocks" field
         self.omit_providers: set[str] = set()  # provider ids the block map leaves out (a partial answer)
         self.ignore_deletes = False  # every DELETE answers 204 and removes nothing
@@ -536,6 +553,17 @@ class FakeData(FakeQos, FakeFederation):
         self.qos_hidden_on: dict[str, set[str]] = {}  # requirement id -> provider ids that have not seen it yet
         self.qos_replicates_to: str | None = None  # a new requirement replicates its files into this provider id
         self.qos_land_after_s = 0.0  # seconds of `clock` before that replication's bytes land, with no transfer
+        self.space_roots: dict[str, str] = {self.SPACE_ID: ROOT_ID}  # space id -> its root's id (`add_data_space`)
+        # (reading provider id, holding provider id) -> "hang" or "fail": a link between two providers that is stuck
+        self.links: dict[tuple[str, str], str] = {}
+        self.hang_hook: Callable[[float], None] | None = None  # given the read's timeout before a stuck read times out
+        # With `joins_stuck_jobs`, a read that hung is a stuck fetch job of its reader: (reader id, file id) is kept
+        # here, and any later read of that file through that reader hangs too, whatever `links` says, until `clear`.
+        self.joins_stuck_jobs = False
+        self.stuck_jobs: set[tuple[str, str]] = set()
+        # (file id, provider id) -> what the block map holds for that provider instead of its entry (a malformed one)
+        self.distribution_entries: dict[tuple[str, str], object] = {}
+        self.link_fail_answer: Answer = (500, "internalServerError", None)  # a read whose only link failed
         self._init_qos_model()  # dbsync, status and replication of a requirement (`fake_qos.py`)
         self._qos_ids = itertools.count(1)
         self._ids = itertools.count(1)
@@ -980,11 +1008,13 @@ class FakeData(FakeQos, FakeFederation):
             if part == "/children" and method == "GET":
                 return self._list(node, query, provider)
             if part == "/children" and method == "POST":
+                if provider in self.fail_creates:
+                    return self._error(500, "internalServerError")
                 return self._make(node, query, provider)
             if part == "/content" and method == "PUT":
                 return self._put_content(request, node, provider)
             if part == "/content" and method == "GET":
-                return self._read(node, provider, request.headers.get("Range"))
+                return self._read(node, provider, request.headers.get("Range"), request)
             if part == "/distribution" and method == "GET":
                 return httpx.Response(200, json=self._distribution(node))
         if route == "/transfers" and method == "POST":
@@ -1109,7 +1139,20 @@ class FakeData(FakeQos, FakeFederation):
         token = str(start + limit) if start + limit < len(entries) else None
         return httpx.Response(200, json={"files": files, "inaccessiblePaths": [], "nextPageToken": token})
 
+    def add_data_space(self, space_id: str, name: str, supports: Iterable[str]) -> None:
+        """Add a space with a tree of its own: Onezone knows it and a token's scope shows it supported by these provider
+        ids (`add_space`), and every provider answers its root (`space_roots`). Its entries are made and read through
+        the data API, by id, as the study space's are; `add_file` and `id_of` stay the study space's. It stands for a
+        space no study code touches, such as the link check's probe space."""
+        self.add_space(space_id, name, list(supports))
+        root_id = f"root-{space_id}"
+        with self._lock:
+            self.nodes[root_id] = Node(root_id, "", "DIR", None)
+            self.space_roots[space_id] = root_id
+
     def _space_root(self, space: str) -> httpx.Response:
+        if space in self.space_roots and space != self.SPACE_ID:
+            return httpx.Response(200, json={"fileId": self.space_roots[space], "name": self.other_spaces[space]})
         if space != self.SPACE_ID:
             return self._error(404, "notFound")
         self._root_polls += 1
@@ -1212,7 +1255,7 @@ class FakeData(FakeQos, FakeFederation):
             self.blocks[(node.file_id, provider)] = _merge(held)
         return httpx.Response(204)
 
-    def _read(self, node: Node, provider: str, header: str | None) -> httpx.Response:
+    def _read(self, node: Node, provider: str, header: str | None, request: httpx.Request) -> httpx.Response:
         found = re.fullmatch(r"bytes=(\d+)-(\d+)", header or "")
         typed = {} if self.content_type is None else {"Content-Type": self.content_type}
         if found is None:
@@ -1221,6 +1264,17 @@ class FakeData(FakeQos, FakeFederation):
         if first > last:
             return self._error(416, "rangeNotSatisfiable")
         length = last - first + 1
+        if not self._holds(node.file_id, provider, first, length):
+            stuck = self._stuck_link(node.file_id, provider, first, length)
+            if stuck == "hang":
+                if self.joins_stuck_jobs:
+                    self.stuck_jobs.add((provider, node.file_id))
+                wait = (request.extensions.get("timeout") or {}).get("read")
+                if self.hang_hook is not None:
+                    self.hang_hook(float(wait) if wait is not None else 0.0)  # the wait runs out, then the read
+                raise httpx.ReadTimeout("the link to the provider holding the bytes is stuck", request=request)
+            if stuck == "fail":
+                return self._answer(self.link_fail_answer)
         if not self._holds(node.file_id, provider, first, length) and self.onthefly_places:
             placed = (
                 length
@@ -1234,6 +1288,18 @@ class FakeData(FakeQos, FakeFederation):
             content=bytes(node.content[first : last + 1]),
             headers={"Content-Range": f"bytes {first}-{last}/{len(node.content)}", **typed},
         )
+
+    def _stuck_link(self, file_id: str, reader: str, offset: int, length: int) -> str | None:
+        """How a read through `reader` that lacks these bytes fares by `links`: "hang" or "fail" when every other
+        provider holding them has its link to the reader so marked ("hang" if any does), None when one link works or
+        no other provider holds them."""
+        if (reader, file_id) in self.stuck_jobs:  # the fetch of this file through this reader is still outstanding
+            return "hang"
+        holders = [p for p in self.providers if p != reader and self._holds(file_id, p, offset, length)]
+        marks = [self.links.get((reader, holder)) for holder in holders]
+        if not marks or None in marks:
+            return None
+        return "hang" if "hang" in marks else "fail"
 
     def _holds(self, file_id: str, provider: str, offset: int, length: int) -> bool:
         return any(
@@ -1261,10 +1327,10 @@ class FakeData(FakeQos, FakeFederation):
             if not self.omit_blocks:
                 backend["blocks"] = [list(b) for b in held]
             if provider not in self.omit_providers:
-                per[provider] = {
-                    "virtualSize": len(node.content),
-                    "distributionPerStorageBackend": {"storage-1": backend},
-                }
+                per[provider] = self.distribution_entries.get(
+                    (node.file_id, provider),
+                    {"virtualSize": len(node.content), "distributionPerStorageBackend": {"storage-1": backend}},
+                )
         return {"type": node.kind, "distributionPerProvider": per}
 
     def _schedule(self, request: httpx.Request, via: str) -> httpx.Response:

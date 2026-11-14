@@ -8,8 +8,10 @@ declares it.
 
 - up: from nothing, make the root, the CA, the certificates and the secrets, start the zone, bootstrap it, start the
   providers, register and support, add the fixed users, write the baseline files (into every space but those the layout
-  declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform template). On a
-  federation that is already up it starts what is stopped and checks every step again, and leaves the files as they are.
+  declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform template). Last, it
+  runs the link check through that platform.toml (fedlinks.py, #221) and fails, naming the pair and the remedy, unless
+  every (local, source) pair transfers. On a federation that is already up it starts what is stopped and checks every
+  step again, the links included, and leaves the files as they are.
 - reset --clean: start whatever is stopped, check every step again, and bring every space's content back to the
   baseline, removing whatever was ingested; a space declared `baseline = false` is left empty. The ids of the
   providers, the spaces and the users stay, so platform.toml stays valid.
@@ -56,6 +58,7 @@ from feddocker import (
 )
 from fedfacts import baseline_left_behind, describe, root_parent, write_facts
 from fedlayout import NODE, ROOT_MARKER, Layout
+from fedlinks import check_after_up
 from fedpki import (
     ensure_secret,
     make_ca,
@@ -227,9 +230,11 @@ def up(layout: Layout) -> str:
             Content(boot).reset(TRANSFER_TIMEOUT_S)
             timer.mark("baseline")
         written = write_facts(layout, boot)
+        links = check_after_up(layout, dict(boot.ids.spaces))  # last: not ready until every pair transfers (#221)
+        timer.mark("links")
     finally:
         rest.close()
-    return timer.summary("up" if fresh else "up (already up: checked)") + f"\n{written}"
+    return timer.summary("up" if fresh else "up (already up: checked)") + f"\n{written}\n{links}"
 
 
 def require_up(layout: Layout) -> None:

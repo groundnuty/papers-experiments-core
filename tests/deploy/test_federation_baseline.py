@@ -129,17 +129,20 @@ def test_a_space_declared_baseline_false_loads_and_renders_the_same_compose_file
 
 
 def test_a_space_without_the_key_keeps_its_baseline_as_it_always_did(fed):
-    """The default layout and the example declare no key, so every space of both keeps its baseline files."""
+    """The default layout and the example declare the key for their probe space alone (#221), so every other space of
+    both keeps its baseline files."""
     from federation_support import EXAMPLE
 
     for path in (None, EXAMPLE):
         spec = fed.spec.load_spec(path)
-        assert all(space.baseline for space in spec.spaces)
+        assert [space.name for space in spec.spaces if not space.baseline] == [spec.probe_space]
         plan = fed.layout.baseline_plan(spec)
         assert set(plan) == {space.name for space in spec.spaces}
-        assert all(plan.values())
+        assert not plan[spec.probe_space]
         for name, files in plan.items():
-            assert files == fed.layout.baseline(name, spec.study_space)
+            if name != spec.probe_space:
+                assert files
+                assert files == fed.layout.baseline(name, spec.study_space)
 
 
 def test_the_plan_gives_a_baseline_off_space_no_file_and_every_other_space_its_files(fed, tmp_path):
