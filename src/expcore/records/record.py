@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.loop.outcomes import SET_ASIDE_OUTCOMES
+from expcore.records.injections import restore_refusal
 from expcore.records.redact import Redactor
 from expcore.records.schema import (
     CURRENT,
@@ -93,9 +94,11 @@ class RunRecord:
 
         An infrastructure outcome of a kind the attempt's condition declares as its treatment is a scored final
         attempt, so it is not set aside: the record carries the declared kinds and the flag, and the store agrees. An
-        attempt an instrument refused after the run is set aside whatever its outcome was (C31).
+        attempt an instrument refused after the run is set aside whatever its outcome was (C31), and so is one whose
+        fault injector's reading says its restore was not verified (O11): the record carries the failure itself, so no
+        re-scoring takes such a record, whether or not it holds a refusal of its own.
         """
-        if self.instrument_refusal is not None:
+        if self.instrument_refusal is not None or restore_refusal(self.instruments) is not None:
             return True
         return self.outcome["name"] in SET_ASIDE_OUTCOMES and not self.outcome["treatment"]
 

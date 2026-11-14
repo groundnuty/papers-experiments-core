@@ -32,6 +32,19 @@ user, shared with day-0, health and the live checks) revokes nothing.
 tool-server launcher records through, so that the slots' minting can record `token_expiry_beyond_request`
 (`users.py`). It has no default, because a silent no-op would lose the event.
 
+**The teardown has a deadline (O42).** The platform waits for `DockerSandbox.stop` at most `teardown_deadline_s`
+(`TEARDOWN_DEADLINE_S`, 600 s, unless the platform is built with another), and records how it ended in the sandbox's
+metadata under `teardown`: `outcome` `completed`, `failed` (it raised, which is the run's `InfraError("sandbox")` as
+before) or `cut`, with `deadline_s` and `elapsed_s`, and for the last two what the stop had left (`left`:
+`sandbox.teardown_left()`). A teardown still running at its deadline, wedged on a FUSE mount whose provider is gone
+say, is not waited for any more: the run is `InfraError("sandbox")`, which is infrastructure and never the agent's
+doing (unless its body had raised, which stands). A thread cannot be made to stop, so the teardown goes on in a daemon
+thread of its own, which never holds a normal exit of the process (a SIGTERM's stopper, `termination.py`, calls
+`stop()` too and waits for it behind the same lock, as it always waited for a teardown); the lease's probe keeps the
+key quarantined until the sandbox is shown gone. The slot's tokens are revoked after the cut as after any stop, though
+the stop is still running: the revocation checks no stop thread, only the mint and start threads, and a revoked token
+can only free what holds it.
+
 Waits. Start and teardown (the token mint, the image checks, the containers, the stop) are each inside
 `ctx.infrastructure_wait("sandbox_lifecycle")`. What the agent's code does in the sandbox and its reads of data are the
 agent's own time and are never waits (see `codetool.py`).
@@ -80,6 +93,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 WAIT_KIND = "sandbox_lifecycle"
+TEARDOWN_DEADLINE_S = 600.0  # how long the platform waits for a sandbox's stop, whatever it is doing (O42)
 CANCEL_WAIT_S = 120.0  # how long a cancelled launch waits for its start thread to notice and clean up, before it stops
 DATA_PATH_FACTOR = "data_path"  # the study's factor whose levels [sandbox.data_paths] maps
 
@@ -276,6 +290,13 @@ class SandboxPlatform:
     `token_expiry_beyond_request` through it (`users.SlotTokens`). `tool_condition` tells from a run's factors the
     tool-server condition it has, or None; `tool_server` starts that server (`toolserver.ToolServerLauncher`) when a
     run has one.
+
+    A lease-less platform (O38) is built with neither `slots` nor `journal`, for a run that takes no lease, a one-off
+    check of the data path say: it leases nothing, mints a data-path token as the fixed `[principals.data_path]` user,
+    and never uses a slot's users or tokens. The two come together or not at all (a ValueError names the one missing),
+    and everything that needs them (`lease_keys`, `condition_group`, `probe`, a tool-server condition, a `launch` with a
+    lease) is refused with a `ConfigError` that says so, before anything is minted or created. `lease_group` is None
+    for every run that needs no tool server. A platform built with them is unchanged.
     """
 
     def __init__(
@@ -284,9 +305,9 @@ class SandboxPlatform:
         issuer: TokenIssuer,
         host: HostOps,
         *,
-        slots: Slots,
-        journal: TokenJournal,
         events: EventSink,
+        slots: Slots | None = None,
+        journal: TokenJournal | None = None,
         tool_condition: Callable[[Mapping[str, Any]], str | None] = lambda factors: None,
         tool_server: ToolServerLauncher | None = None,
         registry: Registry = DEFAULT,
@@ -294,12 +315,28 @@ class SandboxPlatform:
         cancel_wait_s: float = CANCEL_WAIT_S,
         clock: Callable[[], float] = time.time,
         read_only_inputs: Mapping[str, Sequence[ReadOnlyInput]] | None = None,
+        teardown_deadline_s: float = TEARDOWN_DEADLINE_S,
     ) -> None:
+        if isinstance(teardown_deadline_s, bool) or not isinstance(teardown_deadline_s, int | float):
+            raise ValueError("teardown_deadline_s must be a number of seconds")
+        if not 0 < teardown_deadline_s < float("inf"):
+            raise ValueError("teardown_deadline_s must be a positive, finite number of seconds")
+        self._teardown_s = teardown_deadline_s
         if config.sandbox is None:
             raise ValueError(f"{config.file}: has no [sandbox] section")
+        if (slots is None) != (journal is None):
+            missing = "journal" if journal is None else "slots"
+            raise ValueError(
+                f"{config.file}: the platform was given one of `slots` and `journal` but not `{missing}`: slots mint "
+                "tokens whose expiry the journal records, so give both, or neither for a lease-less platform"
+            )
         self._config, self._s, self._issuer, self._host = config, config.sandbox, issuer, host
         self._slots, self._journal, self._clock = slots, journal, clock
-        self._tokens = SlotTokens(issuer, config, slots, journal, events=events, clock=clock)
+        self._tokens = (
+            SlotTokens(issuer, config, slots, journal, events=events, clock=clock)
+            if slots is not None and journal is not None
+            else None
+        )
         self._tool_condition, self._launcher = tool_condition, tool_server
         self._registry, self._options = registry, dict(sandbox_options or {})
         self._cancel_wait_s = cancel_wait_s
@@ -308,6 +345,16 @@ class SandboxPlatform:
         self._planes: weakref.WeakKeyDictionary[DockerSandbox, _ToolPlane] = weakref.WeakKeyDictionary()
         self._revocable: weakref.WeakKeyDictionary[DockerSandbox, _Revocable] = weakref.WeakKeyDictionary()
         self._serving: weakref.WeakSet[DockerSandbox] = weakref.WeakSet()  # sandboxes whose tool server runs
+
+    def _slots_needed(self, what: str) -> Slots:
+        """The platform's slots, or a ConfigError that says what is missing, for a lease-less platform (O38)."""
+        if self._slots is None:
+            raise ConfigError(
+                f"{self._config.file}: the platform was built without `slots` and `journal` (a lease-less platform), "
+                f"so it cannot {what}: build it with the slots of platform.toml (`users.load_slots`) and a "
+                "`TokenJournal` beside the leases"
+            )
+        return self._slots
 
     # ------------------------------------------------------------------------------------------------ the plugin's hooks
     def mode(self, factors: Mapping[str, Any]) -> DataPathMode:
@@ -323,15 +370,16 @@ class SandboxPlatform:
         condition = self._tool_condition(factors)
         if condition is not None:
             return self.condition_group(condition)
-        return GROUP if mode is not DataPathMode.NONE else None
+        return GROUP if mode is not DataPathMode.NONE and self._slots is not None else None
 
     def condition_group(self, condition: str) -> str:
         """The lease group of a tool-server condition: the slots whose tool-server user declares its rights. Raise
         ConfigError, naming the condition by its position and the rights, when it is not declared or no slot declares
-        its rights."""
+        its rights. A lease-less platform has no slots: ConfigError (`_slots_needed`)."""
+        slots = self._slots_needed("give a tool-server condition a lease group")
         rights = self._config.condition(condition).rights
         try:
-            return self._slots.group_for(rights)
+            return slots.group_for(rights)
         except ValueError:
             raise ConfigError(
                 f"{self._config.file}: [slots]: no slot's tool-server user declares the rights of [toolserver] "
@@ -340,8 +388,8 @@ class SandboxPlatform:
 
     def lease_keys(self, group: str) -> Sequence[str]:
         """The keys of a lease group: every slot of `[slots]` for `GROUP`, those of one set of tool-server rights for its
-        group; a group the slots do not declare is refused."""
-        return self._slots.keys_of(group)
+        group; a group the slots do not declare is refused. A lease-less platform has no slots: ConfigError."""
+        return self._slots_needed("name the keys of a lease group").keys_of(group)
 
     def sandbox_probe(self) -> SandboxProbe:
         """The probe that proves a key's sandbox gone: no container, network or mount of it is left."""
@@ -349,7 +397,9 @@ class SandboxPlatform:
 
     def probe(self) -> SlotProbe:
         """The `ResourceProbe` for the plugin: a key is free once its sandbox is proven gone and its tokens have ended,
-        by their expiry or by a revocation that has settled."""
+        by their expiry or by a revocation that has settled. A lease-less platform has no journal, and no key to free:
+        ConfigError, never a probe that frees nothing or everything."""
+        self._slots_needed("probe the keys of a pool")
         return SlotProbe(self._journal, sandbox_gone=self.sandbox_probe().resource_gone, clock=self._clock)
 
     @staticmethod
@@ -480,6 +530,10 @@ class SandboxPlatform:
         proved read-only from inside the agent, and recorded by its hash in the sandbox's metadata and, through
         `inputs_record` (`inputs.InputsRecord`), in the run's record itself (`sandbox.inputs`, O20).
 
+        A platform built without `slots` and `journal` (O38) takes no lease and starts no tool server: a `lease` or a
+        `condition` is a ConfigError, raised before anything is minted or created, and a data-path run mints as the
+        fixed `[principals.data_path]` user.
+
         A run with a lease has its tokens minted through its slot (`users.SlotTokens`): the data path's, and the tool
         server's when `condition` names the run's tool-server condition, which `tool_server` then starts the server
         with. A run with a tool server needs a lease; one without a lease (a live check) mints its data-path token as
@@ -516,6 +570,10 @@ class SandboxPlatform:
         it mints a token or enters a wait (O11). An injector's own admission, taken when its run holds none, is not
         the run's: the run must be admitted before it launches.
         """
+        if lease is not None:  # a lease-less platform has no slot for it (O38): refused before anything else
+            self._slots_needed("take a lease")
+        if condition is not None:
+            self._slots_needed("start a tool server, whose user is a slot's")
         require_admission(self._config)  # first: a refused run mints, journals and starts nothing (O11)
         mode = self._s.mode_of(level)
         if any(item not in self._declared for item in inputs):
@@ -634,20 +692,58 @@ class SandboxPlatform:
         await _wait_through_cancellation(started, self._cancel_wait_s)
 
     async def _stop(self, ctx: CallContext, sandbox: DockerSandbox, *, quiet: bool) -> None:
-        """Stop the sandbox, verified, and then, in the same wait and whatever the stop did, revoke its run's slot's
-        tokens when the launch registered them (`_revoke_now`)."""
+        """Stop the sandbox, verified, within the teardown's deadline, and then, in the same wait and whatever the stop
+        did, revoke its run's slot's tokens when the launch registered them (`_revoke_now`). How it ended is recorded in
+        the sandbox's metadata (`teardown`, O42): a stop that ends in time is `completed`, one that raised `failed`, and
+        one still running at the deadline `cut` with what it had left: it is not waited for any more, and the run is
+        `InfraError("sandbox")` unless `quiet` (the body's own error stands). A cancellation pending at the cut is kept."""
         async with ctx.infrastructure_wait(WAIT_KIND):
+            began = time.monotonic()
             try:
                 try:
-                    await _complete(asyncio.to_thread(sandbox.stop))
+                    await _complete(_in_daemon_thread(sandbox.stop), within=self._teardown_s)
                 except SandboxError as error:
+                    self._record_teardown(sandbox, "failed", began)
                     if not quiet:
                         raise InfraError("sandbox", f"the sandbox could not be torn down: {error}"[:600]) from None
                     log.error("the sandbox of an ended run could not be torn down: %s", error)
+                except TeardownCut as cut:
+                    left = sandbox.teardown_left()
+                    self._record_teardown(sandbox, "cut", began, left)
+                    message = (
+                        f"the sandbox's teardown was cut at its deadline of {self._teardown_s:g} s, still in "
+                        f"{left['step']} with {left['containers']} container(s), {left['mounts']} mount(s) and "
+                        f"{'a' if left['network'] else 'no'} network left, and goes on in its thread: the key stays "
+                        "quarantined until the sandbox is shown gone"
+                    )
+                    log.error("%s", message)
+                    if cut.cancelled:
+                        raise asyncio.CancelledError from None
+                    if not quiet:
+                        raise InfraError("sandbox", message) from None
+                except asyncio.CancelledError:  # the stop ended, with a cancellation waiting: nothing is left to report
+                    self._record_teardown(sandbox, "completed", began)
+                    raise
+                else:
+                    self._record_teardown(sandbox, "completed", began)
             finally:
                 revocable = self._revocable.pop(sandbox, None)
                 if revocable is not None:
                     await _complete(asyncio.to_thread(self._revoke_now, revocable, sandbox))
+
+    def _record_teardown(
+        self, sandbox: DockerSandbox, outcome: str, began: float, left: Mapping[str, Any] | None = None
+    ) -> None:
+        """Put how the sandbox's stop ended in its metadata (O42): `outcome`, the deadline, the seconds it took, and for
+        a stop that did not complete what it had left. It touches no host: a wedged one must not hold the record."""
+        record: dict[str, Any] = {
+            "outcome": outcome,
+            "deadline_s": self._teardown_s,
+            "elapsed_s": round(time.monotonic() - began, 3),
+        }
+        if left is not None:
+            record["left"] = dict(left)
+        sandbox.record(teardown=record)
 
     async def _revoke_unstarted(
         self,
@@ -718,14 +814,56 @@ async def _wait_through_cancellation(future: asyncio.Future[Any], seconds: float
     return future.done()
 
 
-async def _complete(work: Any) -> None:
-    """Run `work` (a coroutine) to its end even if this task is cancelled meanwhile, then raise the cancellation: a
-    teardown that is cut short leaves what it exists to remove. An error of the work is raised in preference."""
+class TeardownCut(Exception):
+    """A teardown still running at its deadline: nobody waits for it any more, and it goes on in its thread (O42).
+    `cancelled` is whether a cancellation of the waiting task was pending when it was cut."""
+
+    def __init__(self, deadline_s: float, *, cancelled: bool = False) -> None:
+        super().__init__(f"the teardown was cut at its deadline of {deadline_s:g} s")
+        self.cancelled = cancelled
+
+
+def _in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future[Any]:
+    """Run a blocking `fn` in a daemon thread of its own and return the future of its result (O42). A thread cannot be
+    stopped, and a teardown wedged on the host may never end: in a daemon thread it never holds the process's exit, as a
+    worker of the default executor, which is joined at exit, would. A result that comes after its loop has gone is
+    dropped."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def deliver(result: Any, error: BaseException | None) -> None:
+        if future.cancelled():
+            return
+        future.set_result(result) if error is None else future.set_exception(error)
+
+    def work() -> None:
+        try:
+            result, error = fn(), None
+        except BaseException as raised:  # delivered to whoever waits, as `asyncio.to_thread` delivers it
+            result, error = None, raised
+        with contextlib.suppress(RuntimeError):  # the loop closed: nobody is waiting for it
+            loop.call_soon_threadsafe(deliver, result, error)
+
+    threading.Thread(target=work, daemon=True, name="sandbox-stop").start()
+    return future
+
+
+async def _complete(work: Any, *, within: float | None = None) -> None:
+    """Run `work` (a coroutine or a future) to its end even if this task is cancelled meanwhile, then raise the
+    cancellation: a teardown that is cut short leaves what it exists to remove. An error of the work is raised in
+    preference. With `within`, the wait ends after that many seconds whatever the work is doing: `TeardownCut` is raised,
+    and the work is left to go on (O42)."""
     task = asyncio.ensure_future(work)
+    loop = asyncio.get_running_loop()
+    stop_at = None if within is None else loop.time() + within
     cancelled = False
     while not task.done():
+        remaining = None if stop_at is None else stop_at - loop.time()
+        if remaining is not None and remaining <= 0:
+            task.add_done_callback(lambda f: f.cancelled() or f.exception())  # its late failure is no one's to report
+            raise TeardownCut(within or 0.0, cancelled=cancelled)
         try:
-            await asyncio.wait({task})
+            await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError:
             cancelled = True
     task.result()

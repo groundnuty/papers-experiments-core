@@ -56,6 +56,22 @@ def contrast_notes(alpha: float, family: bool = True) -> list[str]:
     ]
 
 
+def equivalence_family_notes(alpha: float) -> list[str]:
+    """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces."""
+    return [
+        "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two",
+        "one-sided tests' p-values, for an effect above minus the margin and for one below the margin (for the",
+        "Wilcoxon cluster bootstrap, t-tests of the mean cluster difference on clusters - 1 degrees of freedom; n/a",
+        "with fewer than two clusters or no spread between them). Holm TOST p: Holm-adjusted over the family, for",
+        "reading; the decision compares each raw TOST p with its step's level. A member is `equivalent` only when Holm",
+        "rejects,",
+        f"so for these contrasts the conclusion rests on this table, not the {equivalence_header(alpha)} beside it,",
+        "which can lie inside the margin while the family's decision is no. Adjusted interval: the test's own interval",
+        "at 1 - 2 times the level Holm compared the member with (Interval level), inside the margin exactly when the",
+        "TOST p is at most that level; an untestable member has none and counts as p = 1.",
+    ]
+
+
 NO_CLAIM = (  # the summary line of a preregistration with no Holm family (S12)
     "the preregistration declares `exploratory_only = true`, so it makes no confirmatory claim: every contrast is "
     "exploratory, judged by its raw p-value at alpha with nothing adjusting for multiplicity, and none may be read as "
@@ -116,6 +132,29 @@ RATIO_BY_MODEL_NOTES = [  # after the ratio contrasts' table, only for a contras
     "Each model's Estimate is the mean log ratio of its own cells, with its ratio and interval from the same",
     "resamples of the values of the independent unit as the contrast's: a breakdown with no test of its own, outside",
     "the Holm family.",
+]
+
+ARM_LOST_HEADINGS = ["Treatment outcome None", "Outcome None", "Exhausted", "Unfinished", "Left out"]  # LOST_CAUSES
+
+ARM_RUNS_NOTES = [
+    "Each arm's own planned runs on the contrast's tasks (S14), whatever became of their partners: a pair lost to one",
+    "run's None is one run lost here, in the arm that lost it. Finished: the runs with an analysed attempt, the",
+    "population the contrast's outcome is defined over, and Finish rate their share of the planned runs (n/a for an",
+    "arm with none planned). Measured: the finished runs whose outcome is known. The other columns give the runs",
+    "lost by cause: the outcome None on a treatment attempt or on another run, or no analysed attempt (exhausted,",
+    "unfinished, or left out of a partial analysis). An arm that finished fewer of its runs is compared on fewer, and",
+    "perhaps other, runs than its partner.",
+]
+
+DESCRIPTIVE_NOTES = [
+    "Each one-arm estimate is descriptive: no test is made, it has no conclusion word, and it is in no Holm family.",
+    "A rate is the mean of its outcome over the arm's runs that have it, averaged per task and model, then per",
+    "cluster and model, then over each cluster's models and over the clusters, each with equal weight (a share for an",
+    "outcome of 0 or 1). A ratio of totals is the sum of the numerator over the sum of the denominator across every",
+    "run of the arm that has both. The interval resamples whole clusters at the preregistration's bootstrap; a",
+    "replicate whose drawn denominators sum to 0 has no ratio and is counted under Undefined replicates, and the",
+    "interval is n/a when fewer than half are defined. Finish rate is the share of the arm's planned runs that",
+    "finished.",
 ]
 
 CONDITION_NOTES = [

@@ -56,3 +56,38 @@ baseline = false
 
 # The study space itself declared baseline = false: the study ingests everything that is ever in it.
 STUDY_BASELINE_OFF = MINIMAL.replace('mirrors = ["elm"]', 'mirrors = ["elm"]\nbaseline = false', 1)
+
+STORAGE_IMPORT = DEPLOY / "layouts" / "storage-import.toml"
+
+# The same with a space whose owner holds it on an imported storage, read-only from a source a variable names: elm owns
+# it and oak mirrors it, so the mirror keeps a regular storage and the owner's support differs from the mirror's.
+WITH_IMPORT = (
+    MINIMAL
+    + """
+[spaces.fern-space]
+owner = "elm"
+mirrors = ["oak"]
+baseline = false
+import = { readonly = true, source_env = "EXPCORE_FED_IMPORT_FERN" }
+"""
+)
+
+# A writable import too: oak owns moss-space and holds a copy of its source in the root.
+WITH_WRITABLE_IMPORT = (
+    WITH_IMPORT
+    + """
+[spaces.moss-space]
+owner = "oak"
+baseline = false
+import = { readonly = false, source_env = "EXPCORE_FED_IMPORT_MOSS" }
+"""
+)
+
+
+def import_layout(fed, tmp_path: Path, text: str = WITH_WRITABLE_IMPORT):
+    """A layout over a root and a source directory of its own, both below a resolved temp directory (the source's path
+    may hold no symbolic link, and a temp directory may be one); return the layout and the source."""
+    base = tmp_path.resolve()
+    (base / "data").mkdir()
+    (base / "federation.toml").write_text(text, encoding="utf-8")
+    return fed.layout.Layout(base / "fed", spec=fed.spec.load_spec(base / "federation.toml")), base / "data"

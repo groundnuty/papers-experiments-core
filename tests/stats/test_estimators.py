@@ -230,6 +230,29 @@ def test_s06_the_registered_p_values_follow_the_method_parameter():
     assert estimators.p_values_function(WILCOXON, {"method": "approx"})(study) == pytest.approx([0.04311444678])
 
 
+def test_s15_the_wilcoxon_estimators_tost_is_the_t_tests_of_its_cluster_differences():
+    """S15: the two one-sided t-tests of the mean cluster difference, the estimate, by model with equal weight; its
+    interval is the dual one; its studies' form is row by row its p-value."""
+    data = paired([[0.1, 0.0], [-0.05, math.nan], [0.02, 0.04], [0.08, 0.0], [-0.01, 0.01], [0.04, 0.0]])
+    tost = estimators.tost_function(WILCOXON)
+    assert tost.p(data, settings(), 0.1) == kernel.tost_t(data.cluster_differences, 0.1)
+    assert tost.interval(data, settings(), 0.05) == kernel.tost_t_interval(data.cluster_differences, 0.05)
+    studies = np.vstack([data.cluster_differences, data.cluster_differences * 2])
+    assert tost.p_values(studies, 0.1, {}) == pytest.approx(
+        [tost.p(data, settings(), 0.1), kernel.tost_t(studies[1], 0.1)]
+    )
+    assert math.isnan(tost.p(PairedDifferences((), (), np.empty((0, 0))), settings(), 0.1))
+    assert math.isnan(tost.p(paired([[0.01]]), settings(), 0.1))  # one cluster: no evidence of equivalence
+
+
+def test_s15_an_estimator_registers_no_tost_p_unless_it_gives_one(scratch_registry):
+    """S15: an estimator without one cannot be in an equivalence family; the loader says so."""
+    estimators.register("no_tost")(lambda paired, settings: None)
+    assert estimators.tost_function("no_tost") is None
+    with pytest.raises(UnknownEstimator, match="unknown estimator 'bayes'"):
+        estimators.tost_function("bayes")
+
+
 def test_an_estimator_without_a_p_values_function_has_none_and_a_bad_parameter_is_refused(scratch_registry):
     """The hook is optional; asking for it checks the parameter table as the analysis does."""
     estimators.register("mean_only_hookless")(lambda paired, settings: None)

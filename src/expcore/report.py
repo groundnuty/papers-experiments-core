@@ -55,10 +55,13 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.report_notes import (
+    ARM_LOST_HEADINGS,
+    ARM_RUNS_NOTES,
     BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
     COUNT_DEFINITIONS,
     DEPLOYMENT_NOTES,
+    DESCRIPTIVE_NOTES,
     MDE_NOTES,
     MISSING_PAIRS,
     NO_CLAIM,
@@ -68,11 +71,13 @@ from expcore.report_notes import (
     RATIO_NOTES,
     UNKNOWN,
     contrast_notes,
+    equivalence_family_notes,
     equivalence_header,
     percent,
 )
 from expcore.report_shards import shard_lines
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
+from expcore.stats.armruns import LOST_CAUSES
 from expcore.stats.pairing import MISSING_CAUSES
 from expcore.stats.ratio import RATIO_CAUSES, RatioForm
 
@@ -258,7 +263,15 @@ def _exploratory_only(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *MDE_NOTES]
     if contrasts:
         lines += ["", *_pairs(contrasts, "### Pairs of the exploratory contrasts")]
-    return [*lines, "", *_ratios(contrasts), *_missing_pairs(contrasts), ""]
+    return [
+        *lines,
+        "",
+        *_ratios(contrasts),
+        *_missing_pairs(contrasts),
+        "",
+        *_arm_runs(contrasts),
+        *_descriptives(result, level),
+    ]
 
 
 def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
@@ -280,6 +293,7 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *MDE_NOTES]
     if family:
         lines += ["", *_pairs(family, "### Pairs of the family's contrasts")]
+    lines += _equivalence_family(result)
     lines += [
         "",
         "## Exploratory contrasts (outside the Holm family)",
@@ -291,7 +305,85 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *_pairs(exploratory, "### Pairs of the exploratory contrasts")]
     else:
         lines += ["None declared."]
-    return [*lines, "", *_ratios(result.contrasts), *_missing_pairs(result.contrasts), ""]
+    return [
+        *lines,
+        "",
+        *_ratios(result.contrasts),
+        *_missing_pairs(result.contrasts),
+        "",
+        *_arm_runs(result.contrasts),
+        *_descriptives(result, level),
+    ]
+
+
+def _finish_rate(value: float) -> str:
+    """A share of planned runs as a percentage; n/a for an arm with no planned run, never 0%."""
+    return _share(value) if math.isfinite(value) else UNKNOWN
+
+
+def _arm_runs(results: Sequence[ContrastResult]) -> list[str]:
+    """What became of each arm's own planned runs, per contrast (S14); nothing for a result that carries none."""
+    rows = [
+        [
+            r.name,
+            a.arm,
+            a.planned,
+            a.finished,
+            _finish_rate(a.finish_rate),
+            a.measured,
+            *(a.lost[c] for c in LOST_CAUSES),
+        ]
+        for r in results
+        for a in r.arm_runs
+    ]
+    if not rows:
+        return []
+    header = ["Contrast", "Arm", "Planned", "Finished", "Finish rate", "Measured", *ARM_LOST_HEADINGS]
+    return ["### Runs of each arm", "", *ARM_RUNS_NOTES, "", *_table(header, rows), ""]
+
+
+def _descriptives(result: AnalysisResult, level: float | None) -> list[str]:
+    """The one-arm estimates (S14), descriptive, with no test; nothing when none is declared."""
+    if not result.descriptives:
+        return []
+    interval = "Interval" if level is None else f"{percent(level)} interval"
+    header = ["Estimate", "Kind", "Arm", "Outcome", "Value", interval, "Clusters", "Runs used", "Finish rate"]
+    rows = [
+        [
+            d.name,
+            d.kind,
+            " + ".join(d.conditions),
+            d.outcome,
+            _num(d.estimate),
+            f"[{_num(d.ci_low)}, {_num(d.ci_high)}]",
+            d.n_clusters,
+            d.n_runs,
+            _finish_rate(d.runs.finish_rate),
+            d.n_undefined_replicates,
+        ]
+        for d in result.descriptives
+    ]
+    lines = ["## One-arm estimates (descriptive)", "", *DESCRIPTIVE_NOTES, ""]
+    return [*lines, *_table([*header, "Undefined replicates"], rows), ""]
+
+
+def _equivalence_family(result: AnalysisResult) -> list[str]:
+    """The equivalence family's members (S15): each one's TOST p-value, its Holm-adjusted one, and the interval at the
+    level Holm compared it with; nothing when the preregistration declares no equivalence family."""
+    members = [r for r in result.contrasts if r.in_equivalence_family]
+    if not members:
+        return []
+    rows = []
+    for r in members:
+        low, high = r.equivalence_interval_adjusted or (math.nan, math.nan)
+        level = UNKNOWN if r.equivalence_level is None else percent(r.equivalence_level)
+        interval = f"[{_num(low)}, {_num(high)}]"
+        rows.append(
+            [r.name, _margin(r), _p(r.tost_p), _p(r.tost_p_holm), level, interval, "yes" if r.equivalent else "no"]
+        )
+    header = ["Contrast", "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"]
+    heading = "### Equivalence family (Holm over two one-sided tests)"
+    return ["", heading, "", *_table(header, rows), "", *equivalence_family_notes(result.alpha)]
 
 
 def _pairs(results: Sequence[ContrastResult], heading: str) -> list[str]:
@@ -497,7 +589,12 @@ def summary_lines(result: AnalysisResult) -> list[str]:
         holm = _p(adjusted[r.name]) if member else EXPLORATORY
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
         scale = "" if r.ratio is None else " (ln ratio)"  # a log ratio printed bare reads as a difference (S13)
-        lines.append(f"{r.name}: estimate {_num(r.estimate)}{scale}, p {_p(r.p_value)}, Holm p {holm}, {word}")
+        tost = f", Holm TOST p {_p(r.tost_p_holm)}" if r.in_equivalence_family else ""  # the basis of `equivalent`
+        lines.append(f"{r.name}: estimate {_num(r.estimate)}{scale}, p {_p(r.p_value)}, Holm p {holm}, {word}{tost}")
+    for d in result.descriptives:  # no test and no word: a one-arm estimate is descriptive (S14)
+        kind, arm = d.kind.replace("_", " "), " + ".join(d.conditions)
+        interval = f"[{_num(d.ci_low)}, {_num(d.ci_high)}]"
+        lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
     return lines
 
 

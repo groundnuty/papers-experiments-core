@@ -6,13 +6,18 @@ declares it.
     uv run python deploy/compose-federation/federation.py [--layout PATH] down
     uv run python deploy/compose-federation/federation.py [--layout PATH] status | memory | describe | compose
 
-- up: from nothing, make the root, the CA, the certificates and the secrets, start the zone, bootstrap it, start the
-  providers, register and support, add the fixed users, write the baseline files (into every space but those the layout
-  declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform template). On a
-  federation that is already up it starts what is stopped and checks every step again, and leaves the files as they are.
+- up: from nothing, make the root, the CA, the certificates and the secrets (and a writable import's copy of its
+  dataset, fedimport.py), start the zone, bootstrap it, start the providers, register and support (an imported space on
+  its imported storage, and wait for its scan), add the fixed users, write the baseline files (into every space but
+  those the layout declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform
+  template). Last, it runs the link check through that platform.toml (fedlinks.py, #221) and fails, naming the pair and
+  the remedy, unless every ordered (reader, source) pair of providers sharing a space transfers. On a federation that
+  is already up it starts what is stopped and checks every step again, the links included, and leaves the files as
+  they are.
 - reset --clean: start whatever is stopped, check every step again, and bring every space's content back to the
   baseline, removing whatever was ingested; a space declared `baseline = false` is left empty. The ids of the
-  providers, the spaces and the users stay, so platform.toml stays valid.
+  providers, the spaces and the users stay, so platform.toml stays valid. A layout with an imported space is refused:
+  down, then up, brings it back to clean.
 - reset --replicas: start whatever is stopped, check every step again, keep every owner's data, and evict only what
   the mirrors hold, verified on the block maps (fedreplicas.py). For between runs. A bare `reset` is refused, naming
   both, so nobody wipes ingested datasets by accident.
@@ -32,6 +37,7 @@ pulled, and nothing is pruned.
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -55,7 +61,9 @@ from feddocker import (
     require_ports_free,
 )
 from fedfacts import baseline_left_behind, describe, root_parent, write_facts
+from fedimport import copy_imports, pending_copies, require_resettable
 from fedlayout import NODE, ROOT_MARKER, Layout
+from fedlinks import check_after_up
 from fedpki import (
     ensure_secret,
     make_ca,
@@ -72,6 +80,7 @@ from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
 SUPPORT_TIMEOUT_S = 600.0
+IMPORT_TIMEOUT_S = 1800.0  # in all, for every imported space's one scan to complete
 TRANSFER_TIMEOUT_S = 600.0
 GUI_CHECK_OFF = """[
     {oz_worker, [
@@ -142,6 +151,7 @@ def prepare(layout: Layout) -> None:
             f"the root holds files and is not marked as this federation's ({ROOT_MARKER} naming {spec.project}); "
             "refused"
         )
+    copies = pending_copies(layout, os.environ)  # every import's source is checked before the root is touched
     private_directory(layout.root)
     if not owned:
         layout.marker.write_text(spec.project + "\n", encoding="utf-8")
@@ -176,6 +186,7 @@ def prepare(layout: Layout) -> None:
             storage.mkdir()
             storage.chmod(0o777)
     work.rmdir()
+    copy_imports(layout, copies)
 
 
 # -- the commands ----------------------------------------------------------------------------------------------------
@@ -194,11 +205,14 @@ def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     boot.wait_providers(PROVIDER_TIMEOUT_S)
     timer.mark("providers")
     boot.ensure_spaces()
+    boot.ensure_import_storages()
     boot.ensure_support(SUPPORT_TIMEOUT_S)
     for space in spec.spaces:
         if spec.members(space.name):
             boot.ensure_members(space.name)
     timer.mark("spaces")
+    boot.wait_import(IMPORT_TIMEOUT_S)
+    timer.mark("import")
 
 
 def up(layout: Layout) -> str:
@@ -227,9 +241,11 @@ def up(layout: Layout) -> str:
             Content(boot).reset(TRANSFER_TIMEOUT_S)
             timer.mark("baseline")
         written = write_facts(layout, boot)
+        links = check_after_up(layout, dict(boot.ids.spaces))  # last: not ready until every pair transfers (#221)
+        timer.mark("links")
     finally:
         rest.close()
-    return timer.summary("up" if fresh else "up (already up: checked)") + f"\n{written}"
+    return timer.summary("up" if fresh else "up (already up: checked)") + f"\n{written}\n{links}"
 
 
 def require_up(layout: Layout) -> None:
@@ -240,7 +256,10 @@ def require_up(layout: Layout) -> None:
 
 
 def reset_clean(layout: Layout) -> str:
-    """Back to clean: every space emptied and its baseline written again, whatever a run or a study ingested."""
+    """Back to clean: every space emptied and its baseline written again, whatever a run or a study ingested.
+
+    Refused first, touching nothing, for a layout with an imported space (fedimport.require_resettable)."""
+    require_resettable(layout)
     timer = Timer()
     require_up(layout)
     rest = Rest(layout.ca_pem)
@@ -278,6 +297,8 @@ def down(layout: Layout) -> str:
 
     Compose runs only over a root that exists and carries the mark naming this project: with the root gone, a compose
     down under the project's name could only remove what another federation of that name left, its network included.
+    With the root gone, a volume labelled with the project still fails the call (an earlier down left it): the project
+    is down only when no container, network or volume of it remains.
     """
     timer = Timer()
     project = layout.spec.project
@@ -288,6 +309,16 @@ def down(layout: Layout) -> str:
             raise RuntimeError(
                 f"the root is missing while {len(containers)} container(s) and {len(networks)} network(s) of the "
                 f"project {project} name it; nothing stopped, since compose runs only over a marked root"
+            )
+        # A first `down` that removed the root and then found a volume it could not remove raised, and its retry finds
+        # no root: that is no federation that is down while the volume remains. Compose still runs only over a marked
+        # root, so the volumes are named and left to the operator.
+        volumes = project_volumes(project)
+        if volumes:
+            raise RuntimeError(
+                f"the root is gone but {len(volumes)} volume(s) labelled with the project {project} remain "
+                f"({', '.join(volumes)}); an earlier down left them, docker compose down --volumes cannot run without "
+                "the root, and nothing else removes them: remove them with docker volume rm"
             )
         return timer.summary("down (already down)")
     if not layout.owned:

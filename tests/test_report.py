@@ -7,7 +7,9 @@ import pytest
 
 from expcore.report import render_report, summary_lines
 from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision
+from expcore.stats.armruns import LOST_CAUSES, ArmRuns
 from expcore.stats.estimators import ModelEstimate
+from expcore.stats.onearm import DescriptiveResult
 from expcore.stats.ratio import RatioForm
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
@@ -814,3 +816,169 @@ def test_s13_a_report_whose_ratio_contrasts_pool_the_models_has_no_breakdown_by_
     report = render(analysis(ratio_contrast()))
     assert "## Ratio contrasts" in report
     assert "### Ratio contrasts by model" not in report
+
+
+# --- an equivalence family (S15) --------------------------------------------------------------------------------------
+
+
+def member(name, equivalent, tost, holm, level, interval):
+    """A member of the equivalence family as the analysis gives one."""
+    return contrast(
+        name,
+        "equivalent" if equivalent else "not_detected",
+        p_value=0.4,
+        significant=False,
+        equivalence_margin=0.2,
+        equivalence_interval=(-0.05, 0.06),
+        in_equivalence_family=True,
+        tost_p=tost,
+        tost_p_holm=holm,
+        equivalence_level=level,
+        equivalence_interval_adjusted=interval,
+    )
+
+
+def equivalence_analysis():
+    """Two members: one equivalent at the first step, one not, though its raw TOST p is below alpha."""
+    results = (
+        member("same-a", True, 0.002, 0.004, 0.95, (-0.08, 0.09)),
+        member("same-b", False, 0.04, 0.04, 0.9, (-0.1, 0.12)),
+    )
+    holm = tuple(HolmDecision(r.name, 0.4, 0.4, 0.05, False) for r in results)
+    eq = (HolmDecision("same-a", 0.002, 0.004, 0.025, True), HolmDecision("same-b", 0.04, 0.04, 0.05, True))
+    return AnalysisResult(results, holm, 0.05, dict(MANIFEST), equivalence_holm=eq)
+
+
+def test_s15_the_equivalence_family_has_a_table_with_each_members_tost_p_its_holm_p_and_its_adjusted_interval():
+    """S15: the decision a member's `equivalent` rests on, beside the interval at the level Holm compared it with."""
+    report = render(equivalence_analysis())
+    table = table_of(report, "### Equivalence family (Holm over two one-sided tests)")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Margin",
+        "TOST p",
+        "Holm TOST p",
+        "Interval level",
+        "Adjusted interval",
+        "Equivalent",
+    ]
+    assert table["same-a"][1:] == ["0.2", "0.0020", "0.0040", "95%", "[-0.08, 0.09]", "yes"]
+    assert table["same-b"][1:] == ["0.2", "0.0400", "0.0400", "90%", "[-0.1, 0.12]", "no"]
+    assert "not the 90% equivalence interval" in report.split("### Equivalence family", 1)[1]
+
+
+def test_s15_a_report_without_an_equivalence_family_has_no_such_section():
+    """S15: nothing declared, nothing shown."""
+    assert "Equivalence family" not in render(analysis(contrast("primary", "difference")))
+
+
+def test_s15_the_terminal_summary_gives_a_members_holm_tost_p():
+    """S15: the basis of `equivalent` for a member is never printed apart from it."""
+    lines = summary_lines(equivalence_analysis())
+    assert lines[0] == "same-a: estimate 0.25, p 0.4000, Holm p 0.4000, equivalent, Holm TOST p 0.0040"
+    assert summary_lines(analysis(contrast("primary", "difference")))[0].endswith(", difference")
+
+
+# --- each arm's runs, and the one-arm estimates -----------------------------------------------------------------------
+
+
+def arm(name, planned, measured, **lost):
+    """One arm's planned runs; the causes not given are 0, and the finished runs are the measured and the None ones."""
+    causes = {cause: lost.get(cause, 0) for cause in LOST_CAUSES}
+    finished = measured + causes["treatment_outcome_none"] + causes["outcome_none"]
+    return ArmRuns(name, planned, finished, measured, causes)
+
+
+def test_s14_each_contrast_shows_each_arms_finish_rate_and_its_runs_lost_by_cause():
+    """S14: beside the outcome defined over finished runs, how many of each arm's planned runs finished, and why the
+    others are missing, so a loss in one arm is not hidden in a count of pairs."""
+    runs = (arm("cond-a", 10, 6, outcome_none=1, exhausted=3), arm("cond-b", 10, 10))
+    report = render(analysis(contrast("primary", "difference", arm_runs=runs)))
+    table = table_of(report, "### Runs of each arm")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Arm",
+        "Planned",
+        "Finished",
+        "Finish rate",
+        "Measured",
+        "Treatment outcome None",
+        "Outcome None",
+        "Exhausted",
+        "Unfinished",
+        "Left out",
+    ]
+    section = report.split("### Runs of each arm", 1)[1].splitlines()
+    first, second = (line for line in section if line.startswith("| primary | cond-"))
+    assert first == "| primary | cond-a | 10 | 7 | 70% | 6 | 0 | 1 | 3 | 0 | 0 |"
+    assert second == "| primary | cond-b | 10 | 10 | 100% | 10 | 0 | 0 | 0 | 0 | 0 |"
+
+
+def test_s14_an_arm_with_no_planned_run_has_a_finish_rate_of_n_a():
+    """S14: 0 of 0 is not 0%."""
+    report = render(analysis(contrast("primary", "difference", arm_runs=(arm("cond-a", 0, 0), arm("cond-b", 0, 0)))))
+    assert "| primary | cond-a | 0 | 0 | n/a | 0 |" in report
+
+
+def described(name="waited-in-a", kind="rate", **changes):
+    """A one-arm estimate as the analysis gives one."""
+    base = {
+        "name": name,
+        "kind": kind,
+        "outcome": "waited",
+        "conditions": ("cond-a",),
+        "cluster": "group",
+        "estimate": 0.25,
+        "ci_low": 0.1,
+        "ci_high": 0.4,
+        "n_clusters": 12,
+        "n_runs": 40,
+        "n_undefined_replicates": 0,
+        "runs": arm("cond-a", 44, 40, outcome_none=1, unfinished=3),
+        "per_model": (),
+    }
+    return DescriptiveResult(**{**base, **changes})
+
+
+def test_s14_the_one_arm_estimates_have_a_section_of_their_own_that_says_they_are_descriptive():
+    """S14: each with its arm, estimate, interval, clusters, runs used, finish rate and undefined replicates; no p-value
+    and no conclusion, and the section says nothing adjusts or tests them."""
+    ratio = described(
+        "queries-per-placement",
+        "ratio_of_totals",
+        outcome="queries/placements",
+        conditions=("cond-a", "cond-b"),
+        n_undefined_replicates=7,
+    )
+    result = dataclasses.replace(analysis(contrast("primary", "difference")), descriptives=(described(), ratio))
+    report = render(result, interval_level=0.95)
+    section = report.split("## One-arm estimates (descriptive)", 1)[1]
+    table = table_of(report, "## One-arm estimates (descriptive)")
+    assert table["Estimate"] == [
+        "Estimate",
+        "Kind",
+        "Arm",
+        "Outcome",
+        "Value",
+        "95% interval",
+        "Clusters",
+        "Runs used",
+        "Finish rate",
+        "Undefined replicates",
+    ]
+    assert table["waited-in-a"][1:] == ["rate", "cond-a", "waited", "0.25", "[0.1, 0.4]", "12", "40", "93.18%", "0"]
+    assert table["queries-per-placement"][2] == "cond-a + cond-b"
+    assert table["queries-per-placement"][-1] == "7"
+    assert "no test" in section
+    assert "Holm" in section
+
+
+def test_s14_a_report_without_one_arm_estimates_has_no_such_section():
+    """S14: nothing declared, nothing shown."""
+    assert "One-arm estimates" not in render(analysis(contrast("primary", "difference")))
+
+
+def test_s14_the_terminal_summary_gives_each_one_arm_estimate_as_descriptive():
+    """S14: an estimate with no test is never printed as a contrast is."""
+    result = dataclasses.replace(analysis(contrast("primary", "difference")), descriptives=(described(),))
+    assert summary_lines(result)[-1] == "waited-in-a (descriptive, rate of waited in cond-a): 0.25 [0.1, 0.4]"

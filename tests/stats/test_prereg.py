@@ -7,9 +7,11 @@ import pytest
 
 from expcore.campaign.factors import FactorSchema
 from expcore.config.loading import ConfigError
+from expcore.stats import estimators
+from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import ContrastSpec
 from expcore.stats.power import PowerSettings
-from expcore.stats.prereg import BootstrapSettings, Preregistration, parse
+from expcore.stats.prereg import BootstrapSettings, Preregistration, name_digest, parse
 from expcore.stats.prereg import load as load_checked
 from expcore.stats.ratio import RatioForm
 
@@ -627,3 +629,128 @@ def test_a_cluster_written_as_an_array_is_refused_on_a_contrast_of_one_outcome(t
                   f'estimator = "wilcoxon_cluster_bootstrap"\ncluster = {written}')  # fmt: skip
     with pytest.raises(ConfigError, match=r"\[contrasts.a-vs-b\]: key 'cluster' .*one task attribute"):
         load(write(tmp_path, text))
+
+
+# --- an equivalence family: Holm over the two one-sided tests of its members (S15) -----------------------------------
+
+
+def with_margins(text=BASE):
+    """The base text with a margin on both contrasts."""
+    text = edited('cluster = "group"\n\n[contrasts.gate-effect]', 'cluster = "group"\nequivalence_margin = 0.1\n\n'
+                  "[contrasts.gate-effect]", text)  # fmt: skip
+    return text + "equivalence_margin = 0.2\n"
+
+
+def family_of(*names, text=None):
+    """A preregistration declaring an equivalence family of the given contrasts."""
+    text = with_margins() if text is None else text
+    listed = ", ".join(f'"{name}"' for name in names)
+    return edited('holm_family = ["a-vs-b", "gate-effect"]', f'holm_family = ["a-vs-b", "gate-effect"]\n'
+                  f"equivalence_family = [{listed}]", text)  # fmt: skip
+
+
+def test_s15_an_equivalence_family_loads_in_its_declared_order(tmp_path):
+    """S15: its members, as written; a preregistration without one has none."""
+    assert load(write(tmp_path, family_of("gate-effect", "a-vs-b"))).equivalence_family == ("gate-effect", "a-vs-b")
+    assert load(write(tmp_path)).equivalence_family == ()
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [
+        (("nope",), "names 'nope', which is not a declared contrast"),
+        (("a-vs-b", "a-vs-b"), "names a contrast twice"),
+        ((), "is empty"),
+    ],
+)
+def test_s15_an_equivalence_family_that_names_no_declared_contrast_once_is_refused(tmp_path, names, message):
+    """S15: each member a declared contrast, once."""
+    with pytest.raises(ConfigError, match=f"key 'equivalence_family' {message}"):
+        load(write(tmp_path, family_of(*names)))
+
+
+def test_s15_a_member_without_a_margin_is_refused(tmp_path):
+    """S15: equivalence is within a margin, so a member must declare one."""
+    with pytest.raises(ConfigError, match="names 'a-vs-b', which declares no equivalence_margin"):
+        load(write(tmp_path, family_of("a-vs-b", text=BASE + "equivalence_margin = 0.2\n")))
+
+
+def test_s15_a_member_outside_the_holm_family_is_refused(tmp_path):
+    """S15: an equivalence claim the family controls is confirmatory, so its contrast is not shown as exploratory."""
+    text = edited('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["a-vs-b"]', family_of("gate-effect"))
+    with pytest.raises(ConfigError, match="names 'gate-effect', which is not in holm_family"):
+        load(write(tmp_path, text))
+
+
+def test_s15_an_equivalence_family_beside_exploratory_only_is_refused(tmp_path):
+    """S15, S12: a preregistration that makes no confirmatory claim makes no confirmatory equivalence claim either."""
+    flag = 'exploratory_only = true\nequivalence_family = ["a-vs-b"]'
+    text = edited('holm_family = ["a-vs-b", "gate-effect"]', flag, with_margins())
+    with pytest.raises(ConfigError, match="key 'equivalence_family' is given with exploratory_only = true"):
+        load(write(tmp_path, text))
+
+
+def test_s15_a_member_whose_estimator_has_no_tost_p_is_refused(tmp_path, monkeypatch):
+    """S15: the family's decision is Holm over TOST p-values, which such an estimator cannot give."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    estimators.register("no_tost")(lambda paired, settings: None)
+    text = edited('estimator = "wilcoxon_cluster_bootstrap"', 'estimator = "no_tost"', family_of("a-vs-b"))
+    with pytest.raises(ConfigError, match="names 'a-vs-b', whose estimator 'no_tost' registers no TOST p-value"):
+        load(write(tmp_path, text))
+
+
+# --- one-arm estimates: [descriptives.<name>] ------------------------------------------------------------------------
+
+DESCRIPTIVES = """
+[descriptives.waited-in-a]
+conditions = ["cond-a"]
+outcome = "waited"
+cluster = "group"
+
+[descriptives.queries-per-placement]
+conditions = ["cond-a", "cond-b"]
+numerator = "queries"
+denominator = "placements"
+cluster = "group"
+"""
+
+
+def test_s14_one_arm_estimates_load_in_their_order_with_their_settings(tmp_path):
+    """S14: a rate and a ratio of totals, each over its conditions, seeded by its own name."""
+    prereg = load(write(tmp_path, BASE + DESCRIPTIVES))
+    assert list(prereg.descriptives) == ["waited-in-a", "queries-per-placement"]
+    assert prereg.descriptives["waited-in-a"] == DescriptiveSpec("waited-in-a", ("cond-a",), "group", outcome="waited")
+    ratio = prereg.descriptives["queries-per-placement"]
+    assert (ratio.conditions, ratio.numerator, ratio.denominator) == (("cond-a", "cond-b"), "queries", "placements")
+    settings = prereg.descriptive_settings(ratio)
+    assert (settings.replicates, settings.level) == (500, 0.9)
+    assert settings.seed == (20260101, name_digest("queries-per-placement"))
+    assert load(write(tmp_path)).descriptives == {}
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "message"),
+    [
+        ('conditions = ["cond-a"]', 'conditions = ["cond-z"]', "conditions", "unknown condition 'cond-z'"),
+        ('conditions = ["cond-a"]', "conditions = []", "conditions", "one condition or more"),
+        ('conditions = ["cond-a"]', 'conditions = ["cond-a", "cond-a"]', "conditions", "each condition once"),
+        ('outcome = "waited"', 'outcome = "waited"\nnumerator = "q"', "numerator", "not both"),
+        ('outcome = "waited"\n', "", "outcome", "an outcome, or a numerator and a denominator"),
+        ('denominator = "placements"', 'denominator = "queries"', "denominator", "two different outcomes"),
+        ('cluster = "group"\n\n[descriptives.q', 'groups = "group"\n\n[descriptives.q', "groups", "is not a known key"),
+    ],
+)
+def test_s14_a_one_arm_estimate_that_is_not_fully_declared_is_refused_naming_the_key(tmp_path, old, new, key, message):
+    """S14: every key is checked where it is written."""
+    with pytest.raises(ConfigError, match=rf"\[descriptives\.[a-z-]+\]: key '{key}' .*{message}|{message}"):
+        load(write(tmp_path, BASE + edited(old, new, DESCRIPTIVES)))
+
+
+def test_s14_a_one_arm_estimate_may_not_share_a_contrasts_name_or_join_the_holm_family(tmp_path):
+    """S14: it is descriptive, never a test, and its name seeds its draws apart from every contrast's."""
+    same = DESCRIPTIVES.replace("[descriptives.waited-in-a]", "[descriptives.a-vs-b]")
+    with pytest.raises(ConfigError, match=r"\[descriptives.a-vs-b\]: .*is also a contrast's name"):
+        load(write(tmp_path, BASE + same))
+    family = edited('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["a-vs-b", "waited-in-a"]')
+    with pytest.raises(ConfigError, match="names 'waited-in-a', which is not a declared contrast"):
+        load(write(tmp_path, family + DESCRIPTIVES))

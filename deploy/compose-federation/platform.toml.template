@@ -16,3 +16,4 @@ principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-to
 principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
 tls = { ca_file = "ca/federation-ca.pem" }
 placement = { holder = "pine" }
+link_check = { name = "link-probes", id = "@space_id.link-probes@", prefixes = ["link-"], providers = ["pine", "birch", "cedar"] }

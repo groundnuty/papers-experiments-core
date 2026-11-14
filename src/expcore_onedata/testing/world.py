@@ -231,6 +231,22 @@ def with_spaces(data: dict[str, Any], count: int = 2, **override: Any) -> None:
     ]
 
 
+PROBE_SPACE_ID, PROBE_SPACE_NAME = "sp-probe-0009", "probe-links"  # the link check's probe space, no study's
+
+
+def with_link_check(data: dict[str, Any], providers: list[str] | None = None, **override: Any) -> None:
+    """Edit a platform document: add a `[link_check]` table naming the probe space `PROBE_SPACE_NAME`, supported by
+    `providers` (`alpha` and `beta` by default), with `override` over its keys. The federation answers for the space
+    once `FakeData.add_data_space(PROBE_SPACE_ID, PROBE_SPACE_NAME, ...)` has added it."""
+    data["link_check"] = {
+        "name": PROBE_SPACE_NAME,
+        "id": PROBE_SPACE_ID,
+        "prefixes": ["probe-"],
+        "providers": providers or ["alpha", "beta"],
+        **override,
+    }
+
+
 def write_platform(directory: Path, edit: Callable[[dict[str, Any]], None] | None = None) -> Path:
     """Write `platform.toml` into a directory after letting `edit` change the default document; return its path.
 
@@ -293,6 +309,8 @@ __all__ = [
     "DATA_PATH_USER",
     "MANAGE",
     "NOW",
+    "PROBE_SPACE_ID",
+    "PROBE_SPACE_NAME",
     "SERVICE_USER",
     "SETTINGS",
     "SPACE_NAME",
@@ -305,6 +323,7 @@ __all__ = [
     "make_federation",
     "platform_document",
     "tool_plane_replicates",
+    "with_link_check",
     "with_placement",
     "write_platform",
     "write_with_placement",

@@ -10,6 +10,9 @@ written again, for a bounded number of rounds.
 
 A space declared `baseline = false` has no baseline files: it is brought back to empty, everything in it removed, and
 nothing is written into it. A study space with none has no replicated file either, so it gets no transfer record.
+
+An imported space is the exception to both: nothing is cleared, written or replicated in it, up's first write
+included, since what it holds is a dataset the platform found on a storage, not content this module made.
 """
 
 import time
@@ -199,9 +202,14 @@ class Content:
     def reset(self, timeout_s: float) -> dict[str, int]:
         """Bring every space's content back to its baseline; return how many entries each space lost. A study space
         with no mirror has nothing to replicate to, and one declared `baseline = false` has no file to replicate, so
-        neither has a transfer record."""
+        neither has a transfer record. An imported space is left exactly as it is, and loses nothing: its content is
+        the dataset, and a delete there unlinks the file from the import directory on a writable storage, or leaves
+        it there on a read-only one for a later scan to import again under a new id."""
         removed = {}
         for declared in self.spec.spaces:
+            if declared.imported is not None:
+                removed[declared.name] = 0
+                continue
             removed[declared.name], ids = self.settle(declared.name)
             if declared.name == self.spec.study_space and declared.mirrors and declared.baseline:
                 self.replicate(ids[REPLICATED_FILE], declared.mirrors[0], timeout_s)

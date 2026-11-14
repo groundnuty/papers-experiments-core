@@ -140,11 +140,24 @@ PValuesFunction = Callable[[np.ndarray, Mapping[str, Any]], np.ndarray]  # (stud
 
 
 @dataclass(frozen=True)
+class Tost:
+    """An estimator's two one-sided tests for equivalence within plus or minus a margin (S15), in three forms that
+    must agree: `p(paired, settings, margin)` its p-value; `interval(paired, settings, level)` its dual interval at
+    1 - 2 x level, inside the margin exactly when p <= level; `p_values(studies, margin, params)` its p-value of every
+    row of a (studies x clusters) array of cluster differences, by which the feasibility simulation judges a study."""
+
+    p: Callable[[PairedDifferences, EstimatorSettings, float], float]
+    interval: Callable[[PairedDifferences, EstimatorSettings, float], tuple[float, float]]
+    p_values: Callable[[np.ndarray, float, Mapping[str, Any]], np.ndarray]
+
+
+@dataclass(frozen=True)
 class _Entry:
     function: Estimator
     check_params: Callable[[Mapping[str, Any]], None]
     p_values: PValuesFunction | None = None
     form: str = "difference"
+    tost: Tost | None = None
 
 
 _REGISTRY: dict[str, _Entry] = {}
@@ -162,13 +175,15 @@ def register(
     check_params: Callable[[Mapping[str, Any]], None] | None = None,
     p_values: PValuesFunction | None = None,
     form: str = "difference",
+    tost: Tost | None = None,
 ):
     """Register the decorated function under `name`.
 
     `check_params` raises ParamError for a bad parameter table. `p_values`, when given, is the estimator's p-value
     for a whole (studies x clusters) array of cluster differences under a parameter table; row by row it must equal
     the p-value the estimator itself reports for those differences. `form` is the form of contrast it reads, one of
-    `FORMS`.
+    `FORMS`. `tost`, when given, is its two one-sided tests (`Tost`, S15); an estimator without one cannot be a
+    member of an equivalence family.
     """
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"estimator name {name!r} must be lower-case letters, digits and underscores")
@@ -178,7 +193,7 @@ def register(
     def decorate(function: Estimator) -> Estimator:
         if name in _REGISTRY:
             raise ValueError(f"estimator {name!r} is already registered")
-        _REGISTRY[name] = _Entry(function, check_params or _no_params, p_values, form)
+        _REGISTRY[name] = _Entry(function, check_params or _no_params, p_values, form, tost)
         return function
 
     return decorate
@@ -200,6 +215,12 @@ def form(name: str) -> str:
     """The form of contrast the estimator `name` reads, one of `FORMS`; raise UnknownEstimator for an unknown name."""
     get(name)
     return _REGISTRY[name].form
+
+
+def tost_function(name: str) -> Tost | None:
+    """The two one-sided tests the estimator `name` registered (S15), or None; raise UnknownEstimator."""
+    get(name)
+    return _REGISTRY[name].tost
 
 
 def check_params(name: str, params: Mapping[str, Any]) -> None:
@@ -261,7 +282,25 @@ def _wilcoxon_p_values(studies: np.ndarray, params: Mapping[str, Any]) -> np.nda
     return kernel.wilcoxon_p_studies(studies, merged["snap_decimals"], merged["method"])
 
 
-@register(WILCOXON, check_params=_check_wilcoxon_params, p_values=_wilcoxon_p_values)
+def _snap_decimals(params: Mapping[str, Any]) -> int:
+    """The snap grid of the kernel's parameters, checked."""
+    merged = {**_WILCOXON_DEFAULTS, **params}
+    _check_wilcoxon_params(merged)
+    return merged["snap_decimals"]
+
+
+_WILCOXON_TOST = Tost(  # two one-sided t-tests of the mean cluster difference, the estimate (S15)
+    p=lambda paired, settings, margin: kernel.tost_t(
+        paired.cluster_differences, margin, _snap_decimals(settings.params)
+    ),
+    interval=lambda paired, settings, level: kernel.tost_t_interval(
+        paired.cluster_differences, level, _snap_decimals(settings.params)
+    ),
+    p_values=lambda studies, margin, params: kernel.tost_t_studies(studies, margin, _snap_decimals(params)),
+)
+
+
+@register(WILCOXON, check_params=_check_wilcoxon_params, p_values=_wilcoxon_p_values, tost=_WILCOXON_TOST)
 def wilcoxon_cluster_bootstrap(paired: PairedDifferences, settings: EstimatorSettings) -> EstimatorResult:
     """Wilcoxon signed-rank test on the cluster differences, with a cluster-bootstrap percentile interval.
 

@@ -652,3 +652,56 @@ def test_an_estimation_unit_that_is_not_the_attribute_or_the_model_and_the_attri
     )
     with pytest.raises(ValueError, match=message):
         build(estimation_unit=unit)
+
+
+# --- what became of each arm's own planned runs -----------------------------------------------------------------------
+
+
+def test_s14_each_arm_counts_its_own_planned_runs_by_what_became_of_them():
+    """S14: one pair lost to A's None is one A run lost; B's exhausted run and A's unfinished one count in their arm."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows += both_arms("task-b", "model-a", 1, None, 0.5)
+    rows += treated("task-e", "model-a", 1, None, 0.4)
+    rows.append(make_row("task-c", "model-a", 1, 0.7, condition="cond-a"))
+    rows.append(make_row("task-d", "model-a", 1, 0.3, condition="cond-b"))
+    gone = [absent("task-c", "cond-b", "exhausted"), absent("task-d", "cond-a", "unfinished")]
+    first, second = pair_rows(rows, named(), absent=gone).arm_runs
+    assert (first.arm, first.planned, first.finished, first.measured) == ("cond-a", 5, 4, 2)
+    assert first.lost == {
+        "treatment_outcome_none": 1,
+        "outcome_none": 1,
+        "exhausted": 0,
+        "unfinished": 1,
+        "excluded": 0,
+    }
+    assert (second.arm, second.planned, second.finished, second.measured) == ("cond-b", 5, 4, 4)
+    assert second.lost["exhausted"] == 1
+
+
+def test_s14_a_run_on_a_task_the_other_arm_never_plans_is_outside_both_arms_counts():
+    """S14: a chain design's arm runs tasks the other does not; those runs are not the contrast's, lost or not."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows.append(make_row("task-z", "model-a", 1, None, condition="cond-a"))
+    first, second = pair_rows(rows, named(), absent=[absent("task-y", "cond-b", "unfinished")]).arm_runs
+    assert (first.planned, first.measured, second.planned, second.measured) == (1, 1, 1, 1)
+
+
+def test_s14_a_factor_contrasts_run_whose_other_factors_no_run_of_the_other_level_shares_is_outside_both_arms():
+    """S14: mode y's open run has no shut run to pair with, so it is no run of the contrast's pairs."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.9, condition="open-x", gate="open", mode="x"),
+        make_row("task-a", "model-a", 1, 0.5, condition="shut-x", gate="shut", mode="x"),
+        make_row("task-a", "model-a", 1, 0.8, condition="open-y", gate="open", mode="y"),
+    ]
+    first, second = pair_rows(rows, by_factor()).arm_runs
+    assert (first.planned, second.planned) == (1, 1)
+
+
+def test_s14_a_factor_contrasts_arms_are_its_levels():
+    """S14: the arms are named by the levels of the varying factor, each counting every run of its level."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.9, condition="open-x", gate="open"),
+        make_row("task-a", "model-a", 1, 0.5, condition="shut-x", gate="shut"),
+    ]
+    first, second = pair_rows(rows, by_factor()).arm_runs
+    assert (first.arm, first.planned, second.arm, second.planned) == ("open", 1, "shut", 1)

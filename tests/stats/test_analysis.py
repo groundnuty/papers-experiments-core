@@ -7,6 +7,7 @@ import tomllib
 
 import numpy as np
 import pytest
+from scipy import stats
 from stats_support import both_arms, make_row, ratio_arms, ratio_row, ratio_spec
 
 from expcore.campaign.factors import FactorSchema
@@ -19,6 +20,7 @@ from expcore.stats.analysis import (
     TreatmentOutcomesRefused,
     analyse,
     conclude,
+    equivalence_feasibility,
     pilot_power,
     power_study,
     run_contrast,
@@ -119,6 +121,23 @@ def test_the_pipeline_recovers_a_planted_effect_within_its_interval(prereg, plan
     null = result.contrast("mode-effect")
     assert abs(null.estimate) < 0.05
     assert null.p_value > 0.05
+
+
+def test_s14_the_analysis_carries_each_arms_runs_and_every_one_arm_estimate(planted):
+    """S14: a contrast's result names its two arms' planned runs; a one-arm estimate recovers its planted rate, and
+    stays outside the Holm family."""
+    _, rows = planted
+    text = TEXT + '\n[descriptives.rate-open-x]\nconditions = ["open-x"]\noutcome = "rate"\ncluster = "group"\n'
+    result = analyse(rows, parse(tomllib.loads(text), "inline", "a" * 64, SCHEMA))
+    [described] = result.descriptives
+    assert (described.name, described.kind, described.n_clusters) == ("rate-open-x", "rate", 30)
+    assert described.estimate == pytest.approx(RATE["open-x"], abs=0.06)
+    assert described.ci_low < described.estimate < described.ci_high
+    assert "rate-open-x" not in [d.name for d in result.holm]
+    contrast = result.contrast("open-vs-shut-at-x")
+    assert [arm.arm for arm in contrast.arm_runs] == ["open-x", "shut-x"]
+    assert all(arm.planned == arm.measured == contrast.n_pairs for arm in contrast.arm_runs)
+    assert analyse(rows, parse(tomllib.loads(TEXT), "inline", "a" * 64, SCHEMA)).descriptives == ()
 
 
 def test_holm_runs_over_the_declared_family_with_the_exact_levels(prereg, planted):
@@ -1397,3 +1416,205 @@ def test_s13_the_one_model_a_cell_key_leaves_keeps_its_estimate_whatever_its_nam
     assert (contrast.n_clusters, contrast.pairs_missing["zero_denominator"]) == (4, 4)
     assert [m.model for m in contrast.per_model] == ["pooled"]
     assert contrast.per_model[0].estimate == pytest.approx(contrast.estimate)
+
+
+# --- an equivalence family: Holm over the two one-sided tests (S15) ---------------------------------------------------
+
+EQUIVALENCE_TEXT = """\
+alpha = 0.05
+holm_family = ["a-vs-b", "x-vs-y"]
+equivalence_family = ["a-vs-b", "x-vs-y"]
+
+[bootstrap]
+replicates = 400
+seed = 17
+
+[contrasts.a-vs-b]
+conditions = ["cond-a", "cond-b"]
+outcome = "score"
+estimator = "ESTIMATOR"
+cluster = "group"
+equivalence_margin = 0.2
+
+[contrasts.x-vs-y]
+conditions = ["cond-x", "cond-y"]
+outcome = "score"
+estimator = "ESTIMATOR"
+cluster = "group"
+equivalence_margin = 0.2
+"""
+
+
+def equivalence_prereg(estimator="wilcoxon_cluster_bootstrap", family='["a-vs-b", "x-vs-y"]'):
+    """Two confirmatory contrasts with a margin of 0.2, in one equivalence family unless told otherwise."""
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", estimator)
+    text = text.replace('equivalence_family = ["a-vs-b", "x-vs-y"]', f"equivalence_family = {family}")
+    return parse(tomllib.loads(text), "inline", "e" * 64, ARMS)
+
+
+def near_zero_rows(arms=(("cond-a", "cond-b"), ("cond-x", "cond-y")), spread=0.01):
+    """Eight clusters per contrast whose differences lie within plus or minus `spread` of 0."""
+    rows = []
+    for a, b in arms:
+        for i in range(8):
+            difference = spread * (1 if i % 2 else -1) * (i + 1) / 8
+            rows.append(make_row(f"t{i}", "model-a", 1, 0.5 + difference, condition=a, cluster=f"c{i}"))
+            rows.append(make_row(f"t{i}", "model-a", 1, 0.5, condition=b, cluster=f"c{i}"))
+    return rows
+
+
+@pytest.fixture
+def planted_tost(monkeypatch):
+    """An estimator that is the Wilcoxon cluster bootstrap with a TOST p planted: the first cluster's difference."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    wilcoxon, real = estimators.get(estimators.WILCOXON), estimators.tost_function(estimators.WILCOXON)
+    planted = estimators.Tost(lambda paired, settings, margin: paired.matrix[0, 0], real.interval, real.p_values)
+    estimators.register("planted_tost", check_params=lambda params: None, tost=planted)(wilcoxon)
+
+
+def rows_with_tost(p_a, p_b):
+    """Rows whose first cluster's difference is the TOST p the planted estimator reports, the rest near 0."""
+    rows = near_zero_rows()
+    rows[0] = make_row("t0", "model-a", 1, 0.5 + p_a, condition="cond-a", cluster="c0")
+    rows[16] = make_row("t0", "model-a", 1, 0.5 + p_b, condition="cond-x", cluster="c0")
+    return rows
+
+
+def test_s15_holm_over_the_tost_p_values_decides_equivalent_not_each_interval_alone(planted_tost):
+    """S15: TOST p 0.04 for both is below alpha, and each 90% interval lies inside the margin, but Holm's first level
+    is 0.025, so neither is equivalent; each alone in a family of one would be."""
+    result = analyse(rows_with_tost(0.04, 0.04), equivalence_prereg("planted_tost"))
+    for name in ("a-vs-b", "x-vs-y"):
+        contrast = result.contrast(name)
+        assert contrast.in_equivalence_family
+        assert contrast.tost_p == pytest.approx(0.04)
+        lo, hi = contrast.equivalence_interval  # inside the margin at 1 - 2 alpha, which no longer decides
+        assert lo >= -0.2
+        assert hi <= 0.2
+        assert (contrast.equivalent, contrast.conclusion) == (False, "not_detected")
+    assert [d.name for d in result.equivalence_holm] == ["a-vs-b", "x-vs-y"]
+    assert [d.reject for d in result.equivalence_holm] == [False, False]
+    alone = analyse(rows_with_tost(0.04, 0.04), equivalence_prereg("planted_tost", family='["a-vs-b"]'))
+    assert (alone.contrast("a-vs-b").equivalent, alone.contrast("a-vs-b").conclusion) == (True, "equivalent")
+
+
+def test_s15_the_family_steps_down_and_reports_each_members_level_and_adjusted_interval(planted_tost):
+    """S15: 0.01 meets 0.025, then 0.04 meets 0.05; each interval is at 1 - 2 x its own level, 95% and 90%."""
+    result = analyse(rows_with_tost(0.01, 0.04), equivalence_prereg("planted_tost"))
+    first, second = result.contrast("a-vs-b"), result.contrast("x-vs-y")
+    assert (first.equivalent, second.equivalent) == (True, True)
+    assert first.equivalence_level == pytest.approx(1 - 2 * 0.025)
+    assert second.equivalence_level == pytest.approx(1 - 2 * 0.05)
+    assert first.tost_p_holm == pytest.approx(0.02)
+    assert second.tost_p_holm == pytest.approx(0.04)
+    prereg = equivalence_prereg("planted_tost")
+    for contrast, level in ((first, 0.025), (second, 0.05)):  # the t-tests' dual interval at its own Holm level
+        cells = pair_rows(rows_with_tost(0.01, 0.04), prereg.contrasts[contrast.name]).differences
+        assert contrast.equivalence_interval_adjusted == kernel.tost_t_interval(cells.cluster_differences, level)
+
+
+def test_s15_a_member_with_the_real_estimator_is_judged_by_the_t_tests_of_its_cluster_differences():
+    """S15: eight clusters within 0.01 of 0 and a margin of 0.2 give a TOST p far below alpha / 2: scipy's two
+    one-sided t-tests of the same differences."""
+    result = analyse(near_zero_rows(), equivalence_prereg())
+    contrast = result.contrast("a-vs-b")
+    differences = pair_rows(near_zero_rows(), equivalence_prereg().contrasts["a-vs-b"]).differences.cluster_differences
+    lower = stats.ttest_1samp(differences, -0.2, alternative="greater").pvalue
+    upper = stats.ttest_1samp(differences, 0.2, alternative="less").pvalue
+    assert contrast.tost_p == pytest.approx(max(lower, upper), rel=1e-9)
+    assert (contrast.equivalent, contrast.conclusion) == (True, "equivalent")
+
+
+def test_s15_a_member_with_one_cluster_is_never_equivalent():
+    """S15: one cluster inside the margin has no spread estimated, so no evidence: TOST p is NaN, as p = 1 in Holm."""
+    rows = [
+        make_row("t0", "model-a", 1, 0.51, condition="cond-a"),
+        make_row("t0", "model-a", 1, 0.5, condition="cond-b"),
+    ]
+    contrast = analyse(rows, equivalence_prereg()).contrast("a-vs-b")
+    assert math.isnan(contrast.tost_p)
+    assert (contrast.equivalent, contrast.conclusion) == (False, "not_detected")
+
+
+def test_s15_s02_an_untestable_member_keeps_its_place_in_the_equivalence_family():
+    """S15, S02: no pair, no TOST p; it counts as p = 1, so the other member is judged at alpha / 2, and it is never
+    equivalent."""
+    result = analyse(near_zero_rows(arms=(("cond-a", "cond-b"),)), equivalence_prereg())
+    dry = result.contrast("x-vs-y")
+    assert (dry.conclusion, dry.equivalent) == ("untestable", False)
+    assert math.isnan(dry.tost_p)
+    decisions = {d.name: d for d in result.equivalence_holm}
+    assert decisions["a-vs-b"].level == 0.05 / 2
+    assert decisions["x-vs-y"].reject is False
+
+
+FEASIBILITY_POWER = "\n[power]\nseed = 3\nn_simulations = 60\ntarget_clusters = 20\ntarget_difference = 0.1\n"
+
+
+def feasibility_prereg(sd_grid="[0.05, 2.0]"):
+    """The equivalence family above, with power settings whose SD grid has a reachable and an unreachable spread."""
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", "wilcoxon_cluster_bootstrap").replace(
+        "replicates = 400", "replicates = 100"
+    )
+    text = text.replace("[contrasts.a-vs-b]", FEASIBILITY_POWER + f"sd_grid = {sd_grid}\n\n[contrasts.a-vs-b]")
+    return parse(tomllib.loads(text), "inline", "e" * 64, ARMS)
+
+
+def test_s15_the_feasibility_of_each_members_claim_at_the_declared_spreads_and_the_family_level():
+    """S15: per member and declared SD, the chance of concluding equivalent at a true 0 and at half the margin, at
+    alpha over the family size, with the target clusters; reachable when the chance at 0 meets the target power."""
+    result = equivalence_feasibility(feasibility_prereg())
+    rows = [row for row in result.rows if row["contrast"] == "a-vs-b"]
+    assert [(row["sd"], row["delta"]) for row in rows] == [(0.05, 0.0), (0.05, 0.1), (2.0, 0.0), (2.0, 0.1)]
+    assert {(row["n_clusters"], row["margin"], row["alpha"]) for row in rows} == {(20, 0.2, 0.05 / 2)}
+    tight, _, wide, _ = rows
+    assert (tight["probability"], tight["reachable"]) == (1.0, True)
+    assert (wide["probability"], wide["reachable"]) == (0.0, False)
+    assert {row["contrast"] for row in result.rows} == {"a-vs-b", "x-vs-y"}
+    assert result.manifest["preregistration_sha256"] == "e" * 64  # P04
+    assert equivalence_feasibility(feasibility_prereg()) == result  # seeded by the file
+
+
+def test_s15_the_feasibility_from_pilot_rows_uses_each_contrasts_own_spread():
+    """S15: with pilot rows, the SD is each member's between-cluster SD of its paired differences."""
+    result = equivalence_feasibility(feasibility_prereg(), near_zero_rows())
+    sds = {row["contrast"]: row["sd"] for row in result.rows}
+    expected = power.pilot_cluster_sd(
+        pair_rows(near_zero_rows(), feasibility_prereg().contrasts["a-vs-b"]).differences.cluster_differences
+    )
+    assert sds["a-vs-b"] == pytest.approx(expected)
+    assert all(row["reachable"] for row in result.rows if row["delta"] == 0.0)
+
+
+def test_s15_the_feasibility_refuses_what_it_cannot_run():
+    """S15: no power settings, or no equivalence family, is an error naming the preregistration; a margin outside a
+    family is judged by the interval rule, which this does not simulate."""
+    with pytest.raises(ValueError, match=r"inline: has no \[power\] section"):
+        equivalence_feasibility(equivalence_prereg())
+    with pytest.raises(ValueError, match="inline: declares no equivalence_family"):
+        equivalence_feasibility(parse(tomllib.loads(TEXT), "inline", "a" * 64, SCHEMA))
+
+
+def test_s15_the_feasibility_judges_a_member_by_its_estimators_own_tost(monkeypatch):
+    """S15: an estimator whose TOST never concludes equivalence is never reachable, whatever the spread."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    wilcoxon, real = estimators.get(estimators.WILCOXON), estimators.tost_function(estimators.WILCOXON)
+    never = estimators.Tost(real.p, real.interval, lambda studies, margin, params: np.ones(studies.shape[0]))
+    estimators.register("never_equivalent", check_params=lambda params: None, tost=never)(wilcoxon)
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", "never_equivalent").replace(
+        "[contrasts.a-vs-b]", FEASIBILITY_POWER + "sd_grid = [0.01]\n\n[contrasts.a-vs-b]"
+    )
+    result = equivalence_feasibility(parse(tomllib.loads(text), "inline", "e" * 64, ARMS))
+    assert {(row["probability"], row["reachable"]) for row in result.rows} == {(0.0, False)}
+
+
+def test_s15_a_margin_outside_the_equivalence_family_keeps_the_interval_rule():
+    """S15: a contrast with a margin that no family names is judged by its 1 - 2 alpha interval, as before."""
+    text = EQUIVALENCE_TEXT.replace("ESTIMATOR", "wilcoxon_cluster_bootstrap").replace(
+        'equivalence_family = ["a-vs-b", "x-vs-y"]\n', ""
+    )
+    result = analyse(near_zero_rows(), parse(tomllib.loads(text), "inline", "e" * 64, ARMS))
+    contrast = result.contrast("a-vs-b")
+    assert (contrast.in_equivalence_family, contrast.tost_p, contrast.equivalence_level) == (False, None, None)
+    assert (contrast.equivalent, contrast.conclusion) == (True, "equivalent")
+    assert result.equivalence_holm == ()
