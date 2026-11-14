@@ -223,6 +223,17 @@ SHARD_TIME_NOTES = [
     "with no analysed run.",
 ]
 
+RESET_SETTINGS_NOTES = [
+    "The platform reports settings that are in no fingerprint, because they change how it does its work (how a reset",
+    "finds what it removes, how long it waits) and not what an agent sees, so a campaign resumes under any of",
+    "them. The campaign's store records them at its first start, and every later start compares them with the record.",
+    "Each row below is a start at which a setting was not what the record held, with its value before and after",
+    "(`absent`: the platform did not report the key on that side); the runs that started after that start ran under",
+    "the value after. A start of a store that had no record, made before the settings were recorded, leaves the",
+    "settings of the runs before it unknown.",
+]
+RESET_SETTINGS_UNCHANGED = "No change in them was recorded at any start."
+
 BUDGET_HOLD_NOTES = [
     "Attempts set aside by a budget hold: attempts that ended because a request the token cap could not account for",
     "(a resend after a failure that may have been billed, or a request after a reply without usage) needed a top-up",

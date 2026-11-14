@@ -302,6 +302,75 @@ def test_set_aside_and_treatment_counts_are_listed_per_condition_and_kind():
     assert "| cond-a | none |" not in report  # a condition with a row of its own needs no row of zeros
 
 
+SETTINGS_HEADING = "### Platform settings outside the fingerprint"
+SCAN = {"at": "2026-03-01T11:00:00Z", "key": "placement.qos_scan", "old": "listing", "new": "summaries"}
+
+
+def settings_export(changes=(), unknown=()):
+    return export(reset_settings={"changes": list(changes), "unknown_before": list(unknown)})
+
+
+def settings_section(report: str) -> str:
+    """The text of the settings section: from its heading to the next one."""
+    return report.split(SETTINGS_HEADING, 1)[1].split("\n### ", 1)[0]
+
+
+def test_c35_a_changed_platform_setting_is_in_the_infrastructure_notes_with_both_values_and_when():
+    """C35: each start that found a setting changed is a row with the key, the value before and the value after, as the
+    store holds them; a setting that was not reported on one side reads `absent`, never None or empty; the section is
+    among the infrastructure notes, before the budget holds."""
+    changes = [SCAN, {"at": "2026-03-02T09:00:00Z", "key": "placement.concurrency", "old": 16}]
+    report = render(analysis(contrast("primary", "difference")), settings_export(changes))
+    assert (
+        report.index("### Infrastructure failures") < report.index(SETTINGS_HEADING) < report.index("### Budget holds")
+    )
+    rows = table_of(report, SETTINGS_HEADING)
+    assert rows["Recorded"] == ["Recorded", "Key", "Before", "After"]
+    assert rows["2026-03-01T11:00:00Z"] == ["2026-03-01T11:00:00Z", "placement.qos_scan", '"listing"', '"summaries"']
+    assert rows["2026-03-02T09:00:00Z"] == ["2026-03-02T09:00:00Z", "placement.concurrency", "16", "absent"]
+    assert "No change" not in settings_section(report)
+
+
+def test_c35_a_store_whose_earlier_settings_are_unknown_says_so_and_names_the_start_that_recorded_them():
+    """C35: the start of a store made before the settings were recorded says that the runs before it ran under
+    settings that are unknown, and never that nothing changed."""
+    report = render(
+        analysis(contrast("primary", "difference")), settings_export(unknown=[{"at": "2026-03-05T08:00:00Z"}])
+    )
+    section = settings_section(report)
+    assert "2026-03-05T08:00:00Z" in section
+    assert "unknown" in section
+    assert "No change" not in section
+
+
+def test_c35_settings_that_never_changed_are_reported_as_such_in_one_line_and_never_as_a_table():
+    """C35: the key is present when the store recorded settings, and says that no start found them changed."""
+    section = settings_section(render(analysis(contrast("primary", "difference")), settings_export()))
+    assert "No change in them was recorded at any start." in section
+    assert "|" not in section
+
+
+def test_c35_the_changes_of_a_merged_batch_name_their_shard():
+    """C35: the joined export's changes and unknown starts carry the shard that saw them, and the table has a shard
+    column only then."""
+    data = settings_export([{**SCAN, "shard": 2}], [{"at": "2026-03-05T08:00:00Z", "shard": 1}])
+    report = render(analysis(contrast("primary", "difference")), data)
+    rows = table_of(report, SETTINGS_HEADING)
+    assert rows["Shard"] == ["Shard", "Recorded", "Key", "Before", "After"]
+    assert rows["2"] == ["2", "2026-03-01T11:00:00Z", "placement.qos_scan", '"listing"', '"summaries"']
+    assert "shard 1" in settings_section(report)
+
+
+def test_c35_an_export_without_the_key_gives_the_report_it_always_gave():
+    """C35: a campaign whose platform supplies no settings has no section, and nothing else in its report moves."""
+    result = analysis(contrast("primary", "difference"))
+    plain = render(result)
+    assert SETTINGS_HEADING not in plain
+    with_section = render(result, settings_export([SCAN]))
+    before, rest = with_section.split(SETTINGS_HEADING)
+    assert before + "### Budget holds" + rest.split("### Budget holds", 1)[1] == plain
+
+
 def test_c23_each_condition_shows_its_planned_runs_how_each_ended_and_its_attempts_set_aside():
     """C23: planned is analysed + exhausted + unfinished + left out, per condition, so an exhausted run is seen under
     its own condition and not only in the header; set-aside attempts are summed over the condition's kinds."""

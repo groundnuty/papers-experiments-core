@@ -46,7 +46,7 @@ import math
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +93,17 @@ class PlacementSettings:
     # Last, so a caller that passes the settings positionally keeps the order it had before #196 (O25): every field
     # added later goes at the end of the class.
     fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
+
+    def reset_settings(self) -> dict[str, Any]:
+        """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
+
+        Every field after its default, as `placement.<name>`: numbers and text only. They are in no fingerprint, since
+        they change how placement and the reset work and not what an agent sees, so a campaign resumed after one
+        changed (or after a default changed under a file that never declared it) says so. The data provider's name is
+        left out, since the record travels with the export and the replication package, which name no provider. The
+        map is not here either: it says what is placed and where, not how, and it is no setting.
+        """
+        return {f"placement.{item.name}": getattr(self, item.name) for item in fields(self) if item.name != "holder"}
 
 
 @dataclass(frozen=True)

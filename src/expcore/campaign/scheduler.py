@@ -125,9 +125,11 @@ class Scheduler:
         crash_hook: Callable[[str, str], None] = lambda point, run_key: None,
         on_hold: Callable[[str], None] | None = None,
         shard: ShardStart | None = None,
+        reset_settings: Mapping[str, Any] | None = None,
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
         self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
+        self.reset_settings = reset_settings  # the platform's settings in no fingerprint, recorded and compared (C35)
         self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
@@ -207,6 +209,7 @@ class Scheduler:
             max_attempts=cfg.max_attempts,
             allow_growth=cfg.allow_growth,
             shard=self.shard,
+            reset_settings=self.reset_settings,
         )
         store = self.store
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)

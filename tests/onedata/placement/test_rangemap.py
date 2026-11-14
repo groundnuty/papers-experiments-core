@@ -201,3 +201,34 @@ def test_o25_a_positional_construction_from_before_the_connection_threshold_stil
 def test_o25_the_threshold_for_a_new_connection_can_be_set(tmp_path):
     """O25: `[placement] fresh_connection_bytes` is the smallest content write sent on a connection of its own."""
     assert load(tmp_path, fresh_connection_bytes=4 << 20).settings.fresh_connection_bytes == 4 << 20
+
+
+def test_c35_the_settings_a_resume_compares_are_every_effective_value_of_the_table_but_the_providers_name(tmp_path):
+    """C35: `PlacementSettings.reset_settings()` is what the platform gives the core to record and compare at a resume:
+    each field after its default, under `placement.<name>`, numbers and text only. The data provider's name is left
+    out, since the record is shipped with a replication package, and so is the map."""
+    from expcore.campaign.reset_settings import canonical
+
+    placement = load(tmp_path, ROWS, qos_scan="summaries", concurrency=4)
+    watched = placement.settings.reset_settings()
+    fields = {field.name for field in dataclasses.fields(PlacementSettings)} - {"holder"}
+    assert set(watched) == {f"placement.{name}" for name in fields}
+    assert watched["placement.qos_scan"] == "summaries"
+    assert watched["placement.concurrency"] == 4
+    assert watched["placement.qos_fulfil_timeout_s"] == 120.0  # not declared: its default, the effective value
+    assert all(isinstance(value, str | int | float) for value in watched.values())
+    text = canonical(watched)
+    assert "alpha" not in text
+    assert "study/data.bin" not in text
+    assert "beta" not in text
+
+
+def test_c35_a_default_that_changes_under_a_file_that_does_not_declare_it_shows_in_the_settings(tmp_path):
+    """C35: the record is of the effective value, so a file that never declared `qos_scan` differs from one that
+    declares `summaries` (the default before #258), and a resume that finds the other says so."""
+    declared = load(tmp_path, qos_scan="summaries").settings.reset_settings()
+    (tmp_path / "bare").mkdir()
+    bare = load(tmp_path / "bare").settings.reset_settings()
+    assert declared["placement.qos_scan"] == "summaries"
+    assert bare["placement.qos_scan"] == "listing"
+    assert {key for key in bare if bare[key] != declared[key]} == {"placement.qos_scan"}

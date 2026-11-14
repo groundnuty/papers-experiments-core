@@ -29,6 +29,7 @@ from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
 from expcore.campaign.healthgate import HealthCheck
 from expcore.campaign.lease import ResourceProbe
+from expcore.campaign.reset_settings import checked as checked_settings
 from expcore.config.loading import ConfigError, Section
 from expcore.config.models import ModelTable, not_built_by_core
 from expcore.plugin import ToolSpec
@@ -82,6 +83,12 @@ class StudyPlugin:
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
       listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
       fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+    - `reset_settings`: the platform's settings that change how it does its work and not what an agent sees, and so are
+      in no fingerprint, after its defaults (the Onedata layer's `PlacementSettings.reset_settings()`): a flat mapping
+      of names to text, numbers, booleans or None, without a secret or a name that identifies a machine, since it
+      travels with the export. The core records it at the first start and compares it at every resume; a resume
+      under other values is never refused, and says which keys changed, with their old and new values, in the log,
+      in an event of the store and in the report (`campaign.reset_settings`, C35). Empty: nothing is recorded.
     - `backend_factory`: builds the backend of every model, for admission and for each run, in place of the core's
       `default_backend_factory`; None keeps the core's. A model whose backend the core does not build
       (`config.models.BACKENDS`) needs one, and the factory decides which models it serves: it hands the others to
@@ -109,6 +116,7 @@ class StudyPlugin:
     platform: Mapping[str, Any] = field(default_factory=dict)
     backend_factory: BackendFactory | None = None
     environment_identity: Callable[[], Mapping[str, str]] | None = None
+    reset_settings: Mapping[str, Any] = field(default_factory=dict)  # last, so positional callers keep their order
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
@@ -319,6 +327,13 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    if not isinstance(plugin.reset_settings, Mapping):
+        kind = type(plugin.reset_settings).__name__
+        raise ConfigError(f"{file}: the plugin's reset_settings must be a mapping of plain data, not a {kind}")
+    try:
+        checked_settings(plugin.reset_settings)
+    except ValueError as error:
+        raise ConfigError(f"{file}: the plugin's reset_settings: {error}") from None
     if plugin.environment_identity is not None and not callable(plugin.environment_identity):
         kind = type(plugin.environment_identity).__name__
         raise ConfigError(
