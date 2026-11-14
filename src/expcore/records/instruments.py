@@ -28,7 +28,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from expcore.errors import FirstTurnRefusal, InfraError, is_treatable
+from expcore.errors import FirstTurnRefusal, InfraError, is_treatable, uncharged_kinds
 from expcore.loop.outcomes import DETAIL_LIMIT
 from expcore.loop.timer import AgentTimer
 from expcore.plugin import FIRST_TURN_LABEL, Instrument
@@ -118,7 +118,10 @@ def first_turn_instruments(instruments: Sequence[Instrument], timer: AgentTimer)
 
 
 def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
-    """Run the checks in order and return the first refusal as the record keeps it, or None when every one passed."""
+    """Run the checks in order and return the first refusal as the record keeps it, or None when every one passed.
+    A hold (a kind that costs no attempt, `expcore.errors.uncharged_kinds`: an instrument whose start was held back)
+    wins over a refusal before it, so the checks after a charged refusal still run until one holds."""
+    first = None
     for instrument in instruments:
         check = _method(instrument, "check")
         if check is None:
@@ -127,8 +130,12 @@ def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
             check()
         except InfraError as error:
             _require_untreatable(instrument, error, "after the run")
-            return {"namespace": instrument.namespace, "infra_kind": error.kind, "detail": error.detail[:DETAIL_LIMIT]}
-    return None
+            detail = error.detail[:DETAIL_LIMIT]
+            refusal = {"namespace": instrument.namespace, "infra_kind": error.kind, "detail": detail}
+            if error.kind in uncharged_kinds():
+                return refusal
+            first = first or refusal
+    return first
 
 
 def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord:
@@ -138,8 +145,9 @@ def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> 
     injector's snapshot decides whether a declared target was held down in this attempt (record version 3).
 
     Then each instrument that has `check` is asked, in order, once every snapshot is in; the first to refuse stops the
-    rest, and its refusal is in the returned record (`RunRecord.instrument_refusal`), snapshots and all, so the attempt
-    keeps its record. A check runs even when its instrument's `finish` failed: unknown is not a pass, and the check
+    rest, unless its kind is charged and a later one holds (a kind that costs no attempt, C33), which then wins, and
+    the refusal is in the returned record (`RunRecord.instrument_refusal`), snapshots and all, so the attempt keeps
+    its record. A check runs even when its instrument's `finish` failed: unknown is not a pass, and the check
     decides. The executor calls this after the sandbox's collection and before its teardown, so a check can still read
     what the run left. A check that raises a kind a condition may declare, or anything but a refusal, raises here.
     """
