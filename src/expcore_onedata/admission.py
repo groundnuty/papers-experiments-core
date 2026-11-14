@@ -76,6 +76,8 @@ FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes 
 OUTAGE_RUN, INJECTOR, RECOVERY = "outage_run", "injector", "recovery"  # why the federation is held exclusively
 EXCLUSIVE_RUN = "exclusive_run"  # a run whose condition declares `exclusive = true`: a matched control, no fault
 _ADMISSION: ContextVar["Admission | None"] = ContextVar("expcore_onedata_admission", default=None)
+# locks kept for the life of the process: a drain that could be neither recorded nor waited out (`_release`)
+_STRANDED: list[HeldLock] = []
 
 
 class AdmissionRefused(ConfigError):
@@ -168,16 +170,20 @@ class Admission:
     def _release(self) -> None:
         """Let the lock go, its holder record first, so no record outlives a lock let go this way. An armed drain is
         written to the federation's drain record first (`fault_drain`), so that no admission is granted inside it; when
-        it cannot be written the drain is waited out here, the lock held. However it ends, the lock is let go, since a
-        process that has been interrupted is about to drop it anyway."""
+        it cannot be written the drain is waited out here, the lock held. When that fails too (an interrupt of the wait,
+        or anything else) the lock is not let go: it is kept for as long as this process lives (`_STRANDED`), with its
+        holder record, and the failure is raised. The federation then stays closed until the process ends, which is the
+        kernel's to settle, instead of opening inside the drain."""
         try:
             if self.drain is not None and self.held:
                 self.drain.close_out()
-        finally:
-            if self.journal is not None and self.record is not None and self.held:
-                with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
-                    self.journal.clear_holder(self.record["token"])
-            self.lock.close()
+        except BaseException:
+            _STRANDED.append(self.lock)  # a held lock is closed by its finalizer once nothing refers to it
+            raise
+        if self.journal is not None and self.record is not None and self.held:
+            with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
+                self.journal.clear_holder(self.record["token"])
+        self.lock.close()
 
 
 async def _close_off_the_loop(admission: Admission) -> None:

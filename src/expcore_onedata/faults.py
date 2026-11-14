@@ -708,20 +708,18 @@ class FaultInjector:
         no recovery ends with the federation open inside the drain (`fault_drain`)."""
         self._require_sanction()
         began = self._clock()
+        if self._settings.session_drain_s > 0 and self._exclusive_admission() is None and self._recovery.entries():
+            # with no admission to keep the federation closed behind the restore, it is closed before anything is
+            # restored, or another process could be admitted between the journal's clear and the record (a record that
+            # cannot be written fails as `injector_failure`, with nothing restored)
+            self._federation.hold_for(self._settings.session_drain_s)
         try:
             return self._recovery.recover(self._step, heal=heal)
         finally:
             if self._recovery.restored and self._settings.session_drain_s > 0:
-                self._owe_drain(began)
-
-    def _owe_drain(self, began: float) -> None:
-        """A recovery that began at `began` restored a provider: owe its drain on the admission held, or, with none,
-        close the federation for what is left of it (a record that cannot be written fails as `injector_failure`)."""
-        admission = self._exclusive_admission()
-        if admission is not None and admission.drain is not None:
-            admission.drain.owe(began, clock=self._clock, sleep=self._sleep)
-            return
-        self._federation.hold_for(max(0.0, self._settings.session_drain_s - (self._clock() - began)))
+                admission = self._exclusive_admission()
+                if admission is not None and admission.drain is not None:
+                    admission.drain.owe(began, clock=self._clock, sleep=self._sleep)
 
     def _drain(self, how: str, began: float) -> None:
         """After a verified restore of a provider that went down: arm the drain of the exclusive admission that holds the

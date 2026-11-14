@@ -158,12 +158,9 @@ class FaultGate:
                 return Health(
                     False, f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
                 )
-            began = self._clock()
-            try:
-                self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
-            finally:  # it holds no admission, so the federation is closed for the drain it owes by the record itself
-                if self._recovery.restored and self._drain_s > 0:
-                    self._lock.hold_for(max(0.0, self._drain_s - (self._clock() - began)))
+            if self._drain_s > 0:  # it holds no admission: the federation is closed for the drain by the record, first
+                self._lock.hold_for(self._drain_s)
+            self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
             done = f"what it left open is recovered, and the federation closed for its drain; {done}"
         return Health(
             False, f"the federation's lock is stuck{at}: {_named(record)} is gone, yet the lock stays held; {done}"

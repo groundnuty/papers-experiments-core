@@ -13,6 +13,8 @@ import fcntl
 import json
 import multiprocessing
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -29,11 +31,18 @@ from fault_support import (
 
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
-from expcore_onedata.admission import FEDERATION_LOCK, OUTAGE_RUN, FederationBusy, FederationLock, run_admission
+from expcore_onedata.admission import (
+    _STRANDED,
+    FEDERATION_LOCK,
+    OUTAGE_RUN,
+    FederationBusy,
+    FederationLock,
+    run_admission,
+)
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_drain import GATE, MOUNT, SessionDrain
 from expcore_onedata.fault_gate import FaultGate
-from expcore_onedata.fault_journal import DRAIN, JOURNAL, InjectionJournal
+from expcore_onedata.fault_journal import DRAIN, HOLDER, JOURNAL, InjectionJournal, boot_id
 from expcore_onedata.faults import load_faults
 from expcore_onedata.testing import write_platform
 
@@ -690,3 +699,142 @@ def test_o11_a_recovery_that_restored_nothing_closes_nothing(tmp_path):
     injector = injector_for(platform, FakeServices(), clock=clock, wall=clock)
     assert injector.recover() == []
     assert not (settings_of(platform).journal / DRAIN).exists()
+
+
+def test_o11_a_recovery_with_no_admission_closes_the_federation_before_it_restores_anything(tmp_path):
+    """O11: with no admission held, nothing keeps the federation closed behind a restore, so the record is written
+    before the provider is restarted and the injection cleared: no process is admitted in a gap between them."""
+    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    clock = FakeClock()
+    settings = settings_of(platform)
+    lock = FederationLock(settings, wall=clock)
+    services = FakeServices(path=state)
+    seen: list[float] = []
+    services.on_serves = lambda service: seen.append(lock.drain_left())  # every reading is before the journal's clear
+    injector = injector_for(platform, services, clock=clock, wall=clock)
+    assert injector.recover() == []
+    assert seen
+    assert all(left == pytest.approx(DRAIN_S, abs=2.0) for left in seen)
+    assert open_injections(tmp_path) == []
+
+
+def test_o11_a_recovery_with_no_admission_that_cannot_record_the_drain_restores_nothing(tmp_path, monkeypatch):
+    """O11: when the record cannot be written the recovery fails as the injector's own failure before it restarts
+    anything: the provider is left for a recovery that can close the federation behind it."""
+    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    clock = FakeClock()
+    services = FakeServices(path=state)
+    injector = injector_for(platform, services, clock=clock, wall=clock)
+
+    def broken(self, until):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(InjectionJournal, "raise_drain", broken)
+    with pytest.raises(InfraError, match="could not be recorded"):
+        injector.recover()
+    assert [call for call in services.calls if call[0] == "start"] == []
+    assert len(open_injections(tmp_path)) == 1
+
+
+def stuck_federation(settings):
+    """The lock held through a descriptor no admission knows of, and a holder record naming a process that is gone."""
+    settings.journal.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(settings.journal / FEDERATION_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    record = {
+        "token": "a" * 32,
+        "pid": gone.pid,
+        "boot_id": boot_id(),
+        "purpose": OUTAGE_RUN,
+        "target": OUTAGE_TARGET,
+        "since_utc": "2026-01-01T00:00:00+00:00",
+    }
+    (settings.journal / HOLDER).write_text(json.dumps(record), encoding="utf-8")
+    return descriptor
+
+
+def test_o11_the_gates_recovery_of_a_stuck_holders_injection_closes_the_federation_before_it_restores(tmp_path):
+    """O11: a holder that is gone while the lock stays held left an injection open: the health gate recovers it with no
+    admission, so it writes the drain record first, then restores."""
+    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.2)
+    settings = settings_of(platform)
+    clock = FakeClock()
+    lock = FederationLock(settings, wall=clock)
+    services = FakeServices(path=state)
+    seen: list[float] = []
+    services.on_serves = lambda service: seen.append(lock.drain_left())
+    descriptor = stuck_federation(settings)
+    try:
+        health = FaultGate(settings, services, clock=clock, sleep=clock.sleep, wall=clock)()
+    finally:
+        os.close(descriptor)
+    assert health.ok is False
+    assert "stuck" in health.detail
+    assert open_injections(tmp_path) == []  # recovered
+    assert seen
+    assert all(left == pytest.approx(DRAIN_S, abs=2.0) for left in seen)
+
+
+# --- what the last review found --------------------------------------------------------------------------------
+
+
+def test_o11_a_second_recovery_owes_its_own_drain_on_top_of_the_first():
+    """O11: the first recovery restored provider A at 100 and failed on B; the retry at 200 restored B: the drain is
+    owed from the later start, 520, not from the first, 420."""
+    drain, _, _ = drained()
+    drain.owe(100.0)
+    drain.owe(200.0)
+    assert drain.plan().until == 200.0 + DRAIN_S
+    drain.owe(150.0)  # an earlier start noted late never lowers it
+    assert drain.plan().until == 200.0 + DRAIN_S
+
+
+def test_o11_a_pause_between_the_two_clocks_never_publishes_an_earlier_deadline(tmp_path):
+    """O11: the wall clock is read just after the monotonic one, so a process paused between them (here the wall clock's
+    own read takes 30 s) publishes a deadline that is 30 s later than the plan's, never earlier."""
+    journal = InjectionJournal(tmp_path / "journal")
+    clock = FakeClock()  # now = 100
+
+    def wall():
+        value = clock.now + 1000.0
+        clock.now += 30.0  # the process is descheduled right after it has read the wall clock
+        return value
+
+    drain = SessionDrain(DRAIN_S, clock=clock, sleep=clock.sleep, journal=journal, wall=wall)
+    drain.begin(GATE).ended(GATE, at=100.0)
+    drain.arm(restore_started=100.0)
+    record = drain.publish()
+    assert record["published"] >= 1000.0 + 100.0 + DRAIN_S  # the plan's end on the wall clock, or later
+
+
+def test_o11_an_admission_whose_drain_can_be_neither_recorded_nor_waited_out_is_never_let_go(tmp_path, monkeypatch):
+    """O11: the record cannot be written, and the wait in its place is interrupted: the lock is kept, with its holder
+    record, for as long as the process lives, instead of opening the federation inside the drain."""
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    settings = settings_of(platform)
+
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    def broken(self, until):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(InjectionJournal, "raise_drain", broken)
+    lock = FederationLock(settings, clock=clock, sleep=interrupted, wall=clock)
+    admission = lock.acquire(exclusive=True, purpose=OUTAGE_RUN, target=OUTAGE_TARGET)
+    admission.drain.arm(restore_started=clock.now)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            admission.close()
+        assert lock.try_acquire(exclusive=False) is None
+        assert lock.try_acquire(exclusive=True) is None
+        assert InjectionJournal(settings.journal).read_holder() is not None
+    finally:
+        for held in _STRANDED:
+            held.close()
+        _STRANDED.clear()
+    taken = lock.try_acquire(exclusive=True)  # only the process's end would have let it go
+    assert taken is not None
+    taken.close()

@@ -157,7 +157,9 @@ class SessionDrain:
             self._set(clock, sleep)
             self._armed = True
             if restore_started is not None:
-                self._restore_started = restore_started
+                self._restore_started = (
+                    restore_started if self._restore_started is None else max(self._restore_started, restore_started)
+                )
 
     def owe(
         self,
@@ -168,11 +170,12 @@ class SessionDrain:
     ) -> None:
         """A recovery restored a provider that an earlier run left down, from `since` on `clock`: that run's sessions
         are unknown, whatever this admission's own sandbox says of its own, so the drain is never over before `since`
-        plus `drain_s`. The sandbox's reports cannot remove what is owed."""
+        plus `drain_s`. The sandbox's reports cannot remove what is owed, and a second recovery owes its own drain on
+        top of the first's: the latest start counts."""
         with self._lock:
             self._set(clock, sleep)
             self._armed = True
-            self._owed = since if self._owed is None else min(self._owed, since)
+            self._owed = since if self._owed is None else max(self._owed, since)
 
     def _set(self, clock: Callable[[], float] | None, sleep: Callable[[float], None] | None) -> None:
         if clock is not None:
@@ -263,7 +266,9 @@ class SessionDrain:
         record: dict[str, Any] = {**plan.record(), "armed": self.armed, "waited_s": 0.0, "published": None}
         if not record["armed"] or plan.until is None or self._journal is None:
             return record
-        until_wall = self._wall() + (plan.until - self.clock())
+        # the monotonic reading first: a pause before the wall clock's makes the deadline later, never earlier
+        now = self.clock()
+        until_wall = self._wall() + (plan.until - now)
         self._journal.raise_drain(until_wall)
         record["published"] = until_wall
         self.last = record
@@ -276,6 +281,6 @@ class SessionDrain:
             return self.wait()
         try:
             return self.publish()
-        except OSError as error:
+        except (OSError, ValueError) as error:  # the record cannot be written, or an existing one cannot be read
             log.error("the drain could not be recorded (%s): the admission waits it out", type(error).__name__)
             return self.wait()
