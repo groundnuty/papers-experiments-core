@@ -910,7 +910,10 @@ An instrument that must finish first, one that stamps the end of the run before 
 
 What stays in list order: the snapshots in the record, so its `instruments` keep the list's key order, though what an instrument reads can differ with the order of the calls; `at_first_turn`, which is one moment, not a nest; and `check`, which runs once every `finish` has run. The first listed instrument that refuses is the one the record keeps, so a refusal of the injector or the ingest, the cause, wins over a refusal of a probe listed after it. A `finish` that raises is recorded as failed and the instruments listed before it still finish.
 
-The fault injector's `running` clears the provider when its block exits. Call `finish_instruments` inside the block for the probes to read before the restore; called after the block, it runs after the restore the block's exit made, whatever the order. A restore that was not verified at the exit is tried again by the injector's `finish`, and for that retry the order decides again.
+Whether readers should finish before or after a restore depends on what the restore does, and the two Onedata instruments differ:
+
+- **A progressive ingest's restore makes transfers:** it completes each file and replicates it again to the providers its `replicas` declare. Readers that must record the state the agent left are listed after the ingest, so they finish before its restore, as in the block above.
+- **A fault injector's restore makes none:** starting a provider's container again moves no data and leaves the local provider's block maps as the agent left them. While the owner is down, a transfer listing also misses the owner's tree. So in a fault condition, readers can finish after the restore, and reading then gives them the whole listing. The injector's `running` clears the provider when its block exits, so a `finish_instruments` called after the block finishes every instrument after that restore, whatever the order. Call it inside the block only if a reader must read with the provider still down. A restore that was not verified at the exit is tried again by the injector's `finish`, and for that retry the order decides again.
 
 ### An instrument that refuses an attempt
 
