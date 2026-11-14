@@ -326,3 +326,31 @@ def test_c27_the_fifth_fixture_pins_whether_the_attempt_was_held_to_the_reservat
         assert "reserved_capped" not in held.totals
         assert "reply_cap_unheld" not in held.totals
         assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_l17_the_sixth_fixture_pins_a_declared_tool_call_bound_and_each_started_call_elapsed_time():
+    """L17 and R03: the sixth merge point added `agent_config.tool_call_bound_s`, which a study that declares no bound
+    leaves out, and the optional `elapsed_s` of a tool call that started. Its fixture, written by the code of that merge
+    on the record tests' fake clock, declares a bound of 60 s and holds a call that took 10 s, a call that outlasted the
+    bound and failed as `knowledge` infrastructure, and a call answered as skipped, which has no elapsed time. It
+    validates and replays to its own bytes (the parametrized tests above); the five fixtures before it hold neither
+    field, and a record without them gains nothing."""
+    sixth = [p for p in FIXTURES if p.name.startswith("06-")]
+    assert [p.name for p in sixth] == ["06-tool-call-bound.json"]
+    record = load_record(sixth[0])
+    assert record.agent_config["tool_call_bound_s"] == 60.0
+    assert list(record.agent_config)[-2:] == ["tool_call_bound_s", "terminal_tools"]
+    assert [(c["status"], c.get("elapsed_s")) for c in record.tool_calls] == [
+        ("ok", 10.0),
+        ("failed", 60.0),
+        ("skipped", None),
+    ]
+    assert "elapsed_s" not in record.tool_calls[2]
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "knowledge")
+    assert "within 60 s" in record.outcome["detail"]
+    assert replay_record(record).dumps().encode("utf-8") == sixth[0].read_bytes()
+    for earlier in FIXTURES[:5]:
+        held = load_record(earlier)
+        assert "tool_call_bound_s" not in held.agent_config
+        assert all("elapsed_s" not in call for call in held.tool_calls)
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()

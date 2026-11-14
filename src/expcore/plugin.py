@@ -142,7 +142,8 @@ class ToolProvider(Protocol):
         ...
 
     async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
-        """Run one call. `timeout_s` is the agent's time left: the call has no other limit (L05). `ctx` marks waits."""
+        """Run one call. `timeout_s` is the agent's time left, or the study's declared per-call bound when that is
+        shorter (L05, L17): the call has no other limit. `ctx` marks waits."""
         ...
 
 
