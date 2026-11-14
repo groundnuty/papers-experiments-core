@@ -6,16 +6,18 @@ declares it.
     uv run python deploy/compose-federation/federation.py [--layout PATH] down
     uv run python deploy/compose-federation/federation.py [--layout PATH] status | memory | describe | compose
 
-- up: from nothing, make the root, the CA, the certificates and the secrets, start the zone, bootstrap it, start the
-  providers, register and support, add the fixed users, write the baseline files (into every space but those the layout
-  declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform template). Last, it
-  runs the link check through that platform.toml (fedlinks.py, #221) and fails, naming the pair and the remedy, unless
-  every ordered (reader, source) pair of providers sharing a space transfers. On a federation that is already up it
-  starts what is stopped and checks every
-  step again, the links included, and leaves the files as they are.
+- up: from nothing, make the root, the CA, the certificates and the secrets (and a writable import's copy of its
+  dataset, fedimport.py), start the zone, bootstrap it, start the providers, register and support (an imported space on
+  its imported storage, and wait for its scan), add the fixed users, write the baseline files (into every space but
+  those the layout declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform
+  template). Last, it runs the link check through that platform.toml (fedlinks.py, #221) and fails, naming the pair and
+  the remedy, unless every ordered (reader, source) pair of providers sharing a space transfers. On a federation that
+  is already up it starts what is stopped and checks every step again, the links included, and leaves the files as
+  they are.
 - reset --clean: start whatever is stopped, check every step again, and bring every space's content back to the
   baseline, removing whatever was ingested; a space declared `baseline = false` is left empty. The ids of the
-  providers, the spaces and the users stay, so platform.toml stays valid.
+  providers, the spaces and the users stay, so platform.toml stays valid. A layout with an imported space is refused:
+  down, then up, brings it back to clean.
 - reset --replicas: start whatever is stopped, check every step again, keep every owner's data, and evict only what
   the mirrors hold, verified on the block maps (fedreplicas.py). For between runs. A bare `reset` is refused, naming
   both, so nobody wipes ingested datasets by accident.
@@ -35,6 +37,7 @@ pulled, and nothing is pruned.
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -58,6 +61,7 @@ from feddocker import (
     require_ports_free,
 )
 from fedfacts import baseline_left_behind, describe, root_parent, write_facts
+from fedimport import copy_imports, pending_copies, require_resettable
 from fedlayout import NODE, ROOT_MARKER, Layout
 from fedlinks import check_after_up
 from fedpki import (
@@ -76,6 +80,7 @@ from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
 SUPPORT_TIMEOUT_S = 600.0
+IMPORT_TIMEOUT_S = 1800.0  # in all, for every imported space's one scan to complete
 TRANSFER_TIMEOUT_S = 600.0
 GUI_CHECK_OFF = """[
     {oz_worker, [
@@ -146,6 +151,7 @@ def prepare(layout: Layout) -> None:
             f"the root holds files and is not marked as this federation's ({ROOT_MARKER} naming {spec.project}); "
             "refused"
         )
+    copies = pending_copies(layout, os.environ)  # every import's source is checked before the root is touched
     private_directory(layout.root)
     if not owned:
         layout.marker.write_text(spec.project + "\n", encoding="utf-8")
@@ -180,6 +186,7 @@ def prepare(layout: Layout) -> None:
             storage.mkdir()
             storage.chmod(0o777)
     work.rmdir()
+    copy_imports(layout, copies)
 
 
 # -- the commands ----------------------------------------------------------------------------------------------------
@@ -198,11 +205,14 @@ def bring_up(layout: Layout, boot: Bootstrap, timer: Timer) -> None:
     boot.wait_providers(PROVIDER_TIMEOUT_S)
     timer.mark("providers")
     boot.ensure_spaces()
+    boot.ensure_import_storages()
     boot.ensure_support(SUPPORT_TIMEOUT_S)
     for space in spec.spaces:
         if spec.members(space.name):
             boot.ensure_members(space.name)
     timer.mark("spaces")
+    boot.wait_import(IMPORT_TIMEOUT_S)
+    timer.mark("import")
 
 
 def up(layout: Layout) -> str:
@@ -246,7 +256,10 @@ def require_up(layout: Layout) -> None:
 
 
 def reset_clean(layout: Layout) -> str:
-    """Back to clean: every space emptied and its baseline written again, whatever a run or a study ingested."""
+    """Back to clean: every space emptied and its baseline written again, whatever a run or a study ingested.
+
+    Refused first, touching nothing, for a layout with an imported space (fedimport.require_resettable)."""
+    require_resettable(layout)
     timer = Timer()
     require_up(layout)
     rest = Rest(layout.ca_pem)

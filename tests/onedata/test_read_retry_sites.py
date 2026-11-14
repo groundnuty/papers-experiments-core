@@ -60,6 +60,8 @@ PLUMBING = {
     ("resetqos.py", "_listing_page", "client.get"): ["p.retry"],
     ("resetqos.py", "_requirement_entry", "client.get"): ["p.retry"],
     ("resetqos.py", "read_pairs", "provisioner.blocks"): ["p.retry"],
+    # the check of a space provisioned by storage import (O41): its block maps are read by the harness, as a baseline's
+    ("storageimport.py", "SpaceCheck._check_blocks.whole", "provisioner.blocks"): ["self._p.retry"],
     ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["provisioner.retry"],
     # the placement's block-map reads outside a poll: a stall there ends the placement
     ("ranges.py", "_held", "provisioner.blocks"): ["provisioner.retry"],
@@ -150,6 +152,9 @@ ONE_ATTEMPT_SITES = {
 CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient.get", "self._send(GET)"): ["retry"],
     ("client.py", "OnezoneClient.get_dated", "self._request(GET)"): ["retry"],
+    # the Onepanel reads of an imported space (O41): a plain GET under the caller's policy, and the forced scan's gate
+    ("client.py", "OnezoneClient.panel_get", "self._send(GET)"): ["retry"],
+    ("client.py", "OnezoneClient.force_scan", "self._space_name"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient._send", "self._request(<method>)"): ["retry"],
     ("client.py", "_exchange", "http.send"): ["<transport>"],  # every request, a retry's one-shot client's included
     ("client.py", "OnezoneClient.mutate", "self._send(<method>)"): ["<none>"],  # a write: never retried
@@ -251,6 +256,11 @@ HELPER_USERS = {
     },
     "resetqos.py": {"provisioner.children"},
     "resetremove.py": {"provisioner.mutate"},
+    "storageimport.py": {  # the check of a space provisioned by storage import (O41): plumbing, as a baseline's
+        "provisioner.root",
+        "provisioner.children",
+        "provisioner.read_file",
+    },
 }
 
 # Calls that have a provisioner helper's name and are the method of another object (module, function, receiver).

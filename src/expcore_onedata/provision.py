@@ -29,6 +29,10 @@ configured name or lies outside the prefixes. On top of that gate:
 - **Teardown removes only what the change log says this provisioner created** (O09). A file is deleted by its logged id;
   a directory only when nothing but logged, already deleted entries was in it; anything else is reported as left, and
   the report's `ok` is False. Nothing outside the log is touched, and no token or user is revoked.
+- **A space held on a read-only imported storage is never written** (O41, `[space] import`): every request that would
+  create, write or delete a file or a directory there, through any provider, and a replication onto the data
+  provider, is refused before it is sent (`read_only`). Reads, replications onto other providers and evictions from
+  them go on as in any space; `storageimport.py` verifies such a space against its dataset's manifest.
 - **The waits are bounded** (O07, `consistency.py`) and happen before or after a run, never in the agent's time.
 - **A plumbing read that timed out is tried again, boundedly and in the log** (O29, `readretry.py`): the listings, the
   size and attribute reads, `read_file`'s metadata read, the visibility wait, the polls of a transfer's record that end
@@ -292,11 +296,31 @@ class Provisioner:
         """The client every request of this provisioner goes through."""
         return self._client
 
+    @property
+    def read_only(self) -> bool:
+        """Whether the space's data provider holds it on a read-only imported storage (`[space] import`, O41)."""
+        return self._entry.imported is not None and self._entry.imported.readonly
+
+    def _refuse_read_only(self, what: str) -> None:
+        """Refuse, before anything is sent, a request a read-only imported storage cannot take (O41)."""
+        if self.read_only:
+            raise Refused(
+                f"{self._where}the space is held on a read-only imported storage, so {what} is refused; nothing was sent"
+            )
+
     def mutate(self, method: str, path: str, **options: Any) -> Any:
         """Send a mutation through the client's gate, bound to this provisioner's space: one whose target lies in any
         other declared space is refused before it is sent, even under a shared prefix (O09). The gate's own reads, which
         find the target's space, are tried again when they time out, under this provisioner's policy (O29); the mutation
-        is sent once."""
+        is sent once.
+
+        In a space held on a read-only imported storage every change of a file's content or of the tree
+        (`/data/...`), through any provider, is refused unsent (O41): op-worker answers a creation or a write there
+        EROFS, a delete there removes the file from the space and leaves it on the storage, and a write through another
+        provider takes the data provider's blocks from it for good, since nothing can be replicated back onto a
+        read-only storage (op-worker f118ed9, `test_distributed/readonly_storage_test_SUITE.erl`)."""
+        if path.startswith("/data/"):
+            self._refuse_read_only(f"a {method} of a file or directory")
         return self._client.mutate(method, path, space=self._entry.space, gate_retry=self._retry, **options)
 
     @property
@@ -976,6 +1000,8 @@ class Provisioner:
         it and return the transfer's id. Its end is a report, never placement (O01): a caller confirms by the block
         map."""
         field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
+        if kind == "replication" and provider == self._settings.holder:
+            self._refuse_read_only("a replication onto the data provider")  # op-worker answers it EROFS
         self._verified()
         self.await_visible(provider, [file_id])
         answer = self.mutate(
