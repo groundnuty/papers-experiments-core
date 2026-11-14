@@ -84,9 +84,9 @@ as much as for a read. Every 3xx, on every path (`_request` through `_checked`, 
 through `_streamed`), is a `PlatformError` that names the status and whether a `Location` came, never its value
 (`_refuse_redirect`). It is raised after the answer is released, as an answer, not a transport failure, so no retry
 policy of the client repeats it: the GET retry takes only a timeout, which raises, and a probe retries only `transport`.
-The layer's own polls and bounded waits (`consistency.converge`, the visibility and absence waits, the reset's) count a
-failed read of any status as a poll that did not match, as a 403 or a 500 is, so they poll a 3xx again until their own
-bound, and end as not converged: never as a pass.
+The layer's polls that count a failed read as one that did not match (`consistency.converge`, `converge_each`, and
+what is built on them) treat a 3xx as they do a 403 or a 500: they read again until their own bound and end as not
+converged, never as a pass; a wait that waits out only absence (`wait_visible`, `space_root`) raises it at once.
 
 What none of this reaches is an HTTP client the caller injected whose hooks, authentication flow or transport keep a
 reference of their own to an answer or a request, and a cycle inside httpx or httpcore that no answer the client holds
