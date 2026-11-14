@@ -972,23 +972,30 @@ cluster = "group"
 
 ```python
 @dataclass(frozen=True)
-class ArmRuns:                   # ContrastResult.arm_runs (arm A, arm B) and DescriptiveResult.runs
-    arm: str                     # a condition, a factor's level, or a one-arm estimate's conditions joined by " + "
-    planned: int                 # = finished + exhausted + unfinished + excluded
-    finished: int                # analysed: = measured + treatment_outcome_none + outcome_none
-    measured: int                # finished, with the outcome known
-    lost: Mapping[str, int]      # LOST_CAUSES in order, zeros included
-    finish_rate: float           # a property: finished / planned, NaN for none planned
+class ArmRuns:  # ContrastResult.arm_runs (arm A, arm B) and DescriptiveResult.runs
+    arm: str  # a condition, a factor's level, or a one-arm estimate's conditions joined by " + "
+    planned: int  # = finished + exhausted + unfinished + excluded
+    finished: int  # analysed: = measured + treatment_outcome_none + outcome_none
+    measured: int  # finished, with the outcome known
+    lost: Mapping[str, int]  # LOST_CAUSES in order, zeros included
+    finish_rate: float  # a property: finished / planned, NaN for none planned
+
 
 @dataclass(frozen=True)
-class DescriptiveResult:         # AnalysisResult.descriptives, in declared order
-    name: str; kind: str         # "rate" or "ratio_of_totals"
-    outcome: str; conditions: tuple[str, ...]; cluster: str
-    estimate: float; ci_low: float; ci_high: float    # NaN where nothing can be computed, never 0
-    n_clusters: int; n_runs: int                      # the clusters and runs that entered the estimate
+class DescriptiveResult:  # AnalysisResult.descriptives, in declared order
+    name: str
+    kind: str  # "rate" or "ratio_of_totals"
+    outcome: str
+    conditions: tuple[str, ...]
+    cluster: str
+    estimate: float
+    ci_low: float
+    ci_high: float  # NaN where nothing can be computed, never 0
+    n_clusters: int
+    n_runs: int  # the clusters and runs that entered the estimate
     n_undefined_replicates: int  # a ratio's replicates whose drawn denominators sum to 0
     runs: ArmRuns
-    per_model: tuple[ModelEstimate, ...]              # each model's estimate and interval, from the same draws
+    per_model: tuple[ModelEstimate, ...]  # each model's estimate and interval, from the same draws
 ```
 
 **A rate.** The mean of the outcome over the arm's runs that have it, in the stages a contrast's differences take: the runs of a (task, model), every seed and condition of the arm together; the tasks of a (cluster, model); the models of a cluster; and the clusters, each step with equal weight. For an outcome of 0 or 1 it is a share. The interval is the percentile interval of the kernel's cluster bootstrap (clusters drawn with replacement, one draw for every model, S04) at the preregistration's replicates and level and a seed from the estimate's name, so it draws the same resamples whichever others run; each model's comes from the same draws (S05). A percentile interval is never wider than the data: clusters all at one value give that point, so a share of 0 or 1 over few clusters has a zero-width interval.
