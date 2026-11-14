@@ -834,6 +834,41 @@ assert all(len(modes) == 1 for modes in held.values())  # each condition ran und
 assert held == dict.fromkeys(held, {"none"})  # the example study has no run admission
 ```
 
+### Tools outside a campaign: hold the federation shared
+
+A smoke driver, a warm-up or a `verify` is no campaign attempt, so it holds no run admission, and on a platform with `[faults]` nothing keeps an outage from taking a provider down or bringing it back while the tool reads and writes through it. Take the federation's shared admission around everything such a tool does on it, the same one a campaign attempt takes, so an outage run waits for the tool and the tool waits for an outage run. Give the reason, in your own words: it goes into the record of who held the federation, `shared-holds.jsonl` beside the fault journal, with the process (boot id, pid and start time) and the start and end, and nowhere else.
+
+```python
+import tempfile
+from pathlib import Path
+
+from expcore_onedata.config import load_platform
+from expcore_onedata.testing import write_platform
+from expcore_onedata.tool_admission import shared_admission
+
+
+def faults_document(document):
+    document["faults"] = {
+        "sanctioned": True,
+        "journal": "fault-journal",
+        "compose_file": "compose.yaml",
+        "project": "stack-a",
+        "services": {"alpha": "store-one", "beta": "store-two"},
+    }
+
+
+smoke_platform = write_platform(Path(tempfile.mkdtemp()), faults_document)
+smoke_config = load_platform(smoke_platform, require_secrets=False)  # a real run keeps its secrets
+with shared_admission(smoke_config, reason="smoke: warm-up of the first space", timeout_s=60) as admission:
+    assert not admission.exclusive  # held shared: no outage can start until this block ends
+    # start the sandbox and the tool server here, read, write: both accept this admission as a run's
+```
+
+- It waits for an outage run in progress, at most `timeout_s` (`[faults] admission_timeout_s` when you pass none; `0` tries once), then raises `FederationBusy`.
+- It refuses, naming why, while an injection is open or the fault journal cannot be read, so a tool never starts on a federation with a provider down. Pass `ingest_journals=[...]`, the journals of the preallocated ingests, and it also refuses while a baseline is not whole or a live run is resetting it.
+- It releases when the block ends, on an exception too, and the kernel drops it with a tool that dies. Everything the tool does on the federation belongs inside the block: a thread or a subprocess that outlives it is not held back from an outage, and a worker that must outlive it takes `retain_admission()` first and gives it up when it ends.
+- A warm-up that a smoke driver calls inside its own block takes none of its own: it uses the driver's. A driver in an event loop uses `shared_admission_async`. On a platform without `[faults]` it yields `None`.
+
 ### Testing a study's instruments and scorers
 
 A study's own instruments (the ones that induce a state, the probes), its scorers and its plugin can be tested against the platform without a live federation. `expcore_onedata.testing`, installed with the platform layer, holds the fakes the core's own tests use: an in-process Onezone with every provider's data API (`FakeData`), a default `platform.toml` that matches it, and a clock that moves only when something sleeps (`Ticker`). Each fake's docstring says what it models and what it does not, and [`interfaces.md`](interfaces.md#the-platform-layers-testing-module) lists the names. Nothing at runtime imports the module and it imports no pytest, so a fixture is your own thin wrapper around it.
