@@ -71,7 +71,13 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
-from expcore_onedata.admission import SANDBOX_STEP, require_admission, retain_admission, token_step
+from expcore_onedata.admission import (
+    SANDBOX_STEP,
+    begin_token_step,
+    require_admission,
+    retain_admission,
+    token_step,
+)
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
@@ -166,6 +172,21 @@ class _Share:
                 return
             self._state = "ended"
         self._give_up()
+
+
+def _counted(ended: Callable[[], None]) -> Callable[[], None]:
+    """`ended` (a mint or start thread's end, `_StartThreads.began`), which also ends a count of the run's sandbox step
+    taken now (`admission.begin_token_step`): such a thread uses the run's tokens and may outlive a cancelled launch,
+    so the step stays counted until it has ended (O35). Once only, however often it is called."""
+    step_ended = begin_token_step(SANDBOX_STEP)
+
+    def both() -> None:
+        try:
+            ended()
+        finally:
+            step_ended()
+
+    return both
 
 
 class _StartThreads:
@@ -617,7 +638,7 @@ class SandboxPlatform:
         revoking = lease if mode is not DataPathMode.NONE or condition is not None else None  # its slot's, at the end
         try:
             async with ctx.infrastructure_wait(WAIT_KIND):
-                minted = self._threads.began(lease.key if lease is not None else None)  # before the thread exists
+                minted = _counted(self._threads.began(lease.key if lease is not None else None))  # before the thread
                 minting = asyncio.ensure_future(
                     asyncio.to_thread(self._mint_tracked, mode, lease, ceiling_s, condition, minted)
                 )
@@ -626,7 +647,7 @@ class SandboxPlatform:
                 sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
                 if revoking is not None:  # from here the sandbox's stop revokes them (`_stop`)
                     self._revocable[sandbox] = _Revocable(revoking, tokens)
-                ended = self._threads.began(lease.key if lease is not None else None)
+                ended = _counted(self._threads.began(lease.key if lease is not None else None))
                 share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end

@@ -36,7 +36,9 @@ go, and a shared admission clears any record left behind, since no exclusive hol
 **The run's token steps (O35).** An admission also counts the steps of its run that use the run's tokens and have
 begun but not ended (`token_step`, `Admission.open_steps`): the tool server's launch (`TOOL_SERVER_STEP`), up to the
 end of its stop's re-verification of the plane, which examines its token, and the sandbox's (`SANDBOX_STEP`), from its
-mint up to the end of its stop. Both launches note their own. The fault injector reads them at the start of a restore
+mint up to the end of its stop. Both launches note their own, and each worker thread of theirs that uses a token
+(the tool server's checks, the sandbox's mint and start) is counted until the thread itself has ended, which a
+cancellation of the launch does not hasten. The fault injector reads them at the start of a restore
 or of its start's recovery, either of which may heal for up to `heal_timeout_s`: a step still running then could find
 its token expired after the heal (`expcore_onedata.faults`, "The token's window"). A copy of the context (a worker
 thread, a task) sees the same admission, and so the same count.
@@ -213,13 +215,20 @@ def retain_admission() -> Callable[[], None]:
     return admission.retain() if admission is not None else (lambda: None)
 
 
+def begin_token_step(name: str) -> Callable[[], None]:
+    """Count a step of the run that uses its tokens on the running context's admission (`Admission.begin_step`), and
+    return the call that ends the count, once; nothing is counted without an admission, as on a platform without
+    `[faults]`, which has no injector to read it. A worker thread a cancellation cannot stop takes a count of its own
+    before it is dispatched and ends it as it ends, so the step outlives a launch that left without it."""
+    admission = current_admission()
+    return admission.begin_step(name) if admission is not None else (lambda: None)
+
+
 @contextlib.contextmanager
 def token_step(name: str) -> Iterator[None]:
-    """For the body of a `with`, a step of the run that uses its tokens, counted on the running context's admission
-    from its start to its end however the body ends (`Admission.begin_step`); nothing is counted without an admission,
-    as on a platform without `[faults]`, which has no injector to read it."""
-    admission = current_admission()
-    end = admission.begin_step(name) if admission is not None else (lambda: None)
+    """For the body of a `with`, a step of the run that uses its tokens, counted from its start to its end however the
+    body ends (`begin_token_step`)."""
+    end = begin_token_step(name)
     try:
         yield
     finally:

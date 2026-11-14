@@ -247,3 +247,42 @@ def test_o35_a_sandbox_launch_whose_start_fails_ends_its_token_step(platform, co
 
     asyncio.run(go())
     assert after == [()]
+
+
+def test_o35_a_cancelled_launch_counts_its_sandbox_step_until_its_start_thread_ends(config, issuer, slots, tmp_path):
+    """O35: a launch cancelled mid-start stops waiting for its start thread after its bound and leaves, but the thread
+    goes on with the run's data-path token, so the sandbox's step stays counted on the run's admission until the
+    thread has ended."""
+    built, host, _ = build_platform(config, issuer, slots, tmp_path, cancel_wait_s=0.05)
+    lock = FederationLock(load_faults(config.file, config))
+    pool = LeasePool(tmp_path / "leases", built.lease_keys, built.probe(), clock=lambda: 0.0, sleep=lambda s: None)
+    lease = pool.acquire(GROUP, run_key="run-1")
+    entered, release = threading.Event(), threading.Event()
+    original = host.docker
+
+    def slow(*args, **kwargs):
+        if args[0] == "run" and "--init" in args:  # the agent's `docker run`, inside the start thread
+            entered.set()
+            assert release.wait(20), "the test never released the start thread"
+        return original(*args, **kwargs)
+
+    host.docker = slow
+    seen: list = []
+
+    async def go():
+        async with lock.admitted(exclusive=False) as held:
+            task = asyncio.ensure_future(launched(built, TimedContext(), level="via-gate", lease=lease))
+            assert await asyncio.to_thread(entered.wait, 20)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task  # gave up waiting for the thread after its bound
+            seen.append(held.open_steps())
+            release.set()
+            deadline = time.monotonic() + 20
+            while held.open_steps():
+                assert time.monotonic() < deadline, "the start thread never ended its count"
+                await asyncio.sleep(0.01)
+            seen.append(held.open_steps())
+
+    asyncio.run(go())
+    assert seen == [(SANDBOX_STEP,), ()]

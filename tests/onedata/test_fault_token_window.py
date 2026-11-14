@@ -15,6 +15,8 @@ import asyncio
 import contextlib
 import shutil
 import sys
+import threading
+import time
 
 import pytest
 from campaign_support import LATER, NOW, keys_under, make_manifest, make_schema, open_store
@@ -31,6 +33,7 @@ from expcore.records.build import RunIdentity
 from expcore.records.injections import restore_refusal
 from expcore.records.instruments import finish_instruments
 from expcore.tools.manifest import FrozenManifest, live_manifest
+from expcore_onedata import toolserver
 from expcore_onedata.admission import SANDBOX_STEP, TOOL_SERVER_STEP, FederationLock, token_step
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
@@ -394,3 +397,46 @@ def test_o35_in_the_documented_order_the_starts_recovery_heals_before_any_token_
     assert "heal_withheld" not in steps
     assert record.instruments["fault_injector"]["restore_verified"] is True
     assert stored(store, key, record) == ("done", 0, None)
+
+
+@pytest.mark.parametrize("check", ["_prepare", "_recheck"])
+def test_o35_a_cancelled_tool_server_launch_counts_its_step_until_its_check_thread_ends(
+    tmp_path, fake, frozen_manifests, monkeypatch, check
+):
+    """O35: a cancellation does not stop the worker thread that examines the run's token, before the start or at the
+    stop, so the tool server's step stays counted on the run's admission until that thread has ended, though the
+    launch has already left: no restore heals while the token is still being examined."""
+    outage = Outage(tmp_path / "federation", fake, frozen_manifests)
+    entered, release = threading.Event(), threading.Event()
+    real = getattr(toolserver, check)
+
+    def held(*args):
+        entered.set()
+        assert release.wait(20), "the test never released the check"
+        return real(*args)
+
+    monkeypatch.setattr(toolserver, check, held)
+    seen: list = []
+
+    async def go(admission):
+        async def launched():
+            async with outage.tool_server():
+                await asyncio.sleep(0)
+
+        task = asyncio.ensure_future(launched())
+        assert await asyncio.to_thread(entered.wait, 20)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        seen.append(admission.open_steps())  # the launch has left; its check's thread still runs
+        release.set()
+        deadline = time.monotonic() + 20
+        while admission.open_steps():
+            assert time.monotonic() < deadline, "the check's thread never ended its count"
+            await asyncio.sleep(0.01)
+        seen.append(admission.open_steps())
+
+    lock = FederationLock(load_faults(outage.platform, outage.config))
+    with lock.held(exclusive=True, timeout_s=5) as admission:
+        asyncio.run(go(admission))
+    assert seen == [(TOOL_SERVER_STEP,), ()]
