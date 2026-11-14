@@ -1,9 +1,15 @@
 """The scale study: a campaign the size of a main study's, made of stubs, for the rehearsal of #154 at N = 21 and 27.
 
 `make_scale_study` writes a stamped study of four stub models, two arms (`plain`, `guided`), `TASKS` tasks and `SEEDS`
-seeds (150 pairs of task and seed per model), with `[shards] per_model` when a layout is given; its plugin is
-`scale_study_plugin.py`. Every copy made with the same arguments is the same campaign, so they share one fingerprint
-wherever they lie.
+seeds, with `[shards] per_model` when a layout is given; its plugin is `scale_study_plugin.py`. Every copy made with
+the same arguments is the same campaign, so they share one fingerprint wherever they lie.
+
+**The size.** A main study has about 150 pairs of task and seed per model; `EXPCORE_SCALE_TASKS=75` gives them
+(1200 runs per campaign; the rehearsal then takes over ten minutes on a shared host). The default, 12 tasks, gives 24
+pairs per model (192 runs per campaign, 3 or 4 pairs per shard at N = 27), so that the rehearsal takes minutes, most of
+them the start of its 49 driver processes and the package's scan of every byte it holds. What the shard path does with
+a pair does not depend on how many a shard holds; the partition and the shares at 150 pairs per model are tested
+without running (`tests/campaign/test_shard_budget.py`).
 
 A `Host` is one driver's machine: its own copy of the study (so its own store and `out/`), the shard it runs, and what
 its environment adds (the faults its platform plants). `in_pool` runs jobs at most `PARALLEL` at once: the host is
@@ -13,25 +19,24 @@ of the core so that its process reports its peak memory and its wall time.
 
 import concurrent.futures
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from fractions import Fraction
 from pathlib import Path
 
 from study_support import EXAMPLE, HEAD
 
-from expcore.campaign.shard import ModelShards
-from expcore.campaign.shard_budget import planned_runs, reservation_usd
+from expcore.campaign.shard_budget import reservation_usd
 from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
 
 SUPPORT = Path(__file__).resolve().parent
 CRASH = SUPPORT / "study_crash.py"
-TASKS = 75
+TASKS = int(os.environ.get("EXPCORE_SCALE_TASKS", "12"))
 SEEDS = (1, 2)
 MODELS = ("alpha-stub", "beta-stub", "gamma-stub", "delta-stub")
 PRICES = {"alpha-stub": (1.0, 2.0), "beta-stub": (0.5, 1.5), "gamma-stub": (3.0, 6.0), "delta-stub": (0.25, 1.0)}
@@ -78,7 +83,9 @@ def _models_toml() -> str:
     return "\n".join(lines)
 
 
-def _campaign_toml(per_model: Mapping[str, int] | None, max_usd: float, workers: int) -> str:
+def _campaign_toml(
+    per_model: Mapping[str, int] | None, max_usd: float, per_model_usd: Mapping[str, float], workers: int
+) -> str:
     lines = [
         "order_seed = 20261114",
         f"seeds = {json.dumps(list(SEEDS))}",
@@ -108,6 +115,8 @@ def _campaign_toml(per_model: Mapping[str, int] | None, max_usd: float, workers:
         f"max_usd = {max_usd!r}",
         "",
     ]
+    if per_model_usd:
+        lines += ["[budget.per_model_usd]", *(f"{model} = {usd!r}" for model, usd in per_model_usd.items()), ""]
     if per_model is not None:
         counts = ", ".join(f"{model} = {count}" for model, count in per_model.items())
         lines += ["[shards]", f"per_model = {{ {counts} }}", ""]
@@ -173,16 +182,18 @@ def make_scale_study(
     *,
     per_model: Mapping[str, int] | None = None,
     max_usd: float = 1000.0,
+    per_model_usd: Mapping[str, float] | None = None,
     workers: int = 1,
     tasks: int = TASKS,
 ) -> Path:
-    """Write a stamped copy of the scale study under `base/name` and return its root."""
+    """Write a stamped copy of the scale study under `base/name` and return its root: `per_model` is its `[shards]`
+    layout, `max_usd` and `per_model_usd` its budget."""
     root = base / name
     root.mkdir(parents=True)
     files = {
         "study.toml": _study_toml(task_names(tasks)),
         "models.toml": _models_toml(),
-        "campaign.toml": _campaign_toml(per_model, max_usd, workers),
+        "campaign.toml": _campaign_toml(per_model, max_usd, per_model_usd or {}, workers),
         "preregistration.toml": PREREGISTRATION,
         "package.toml": PACKAGE,
         "README.md": "# Scale study\n\nFour stub models, two arms, many tasks: the rehearsal of a sharded campaign.\n",
@@ -195,14 +206,10 @@ def make_scale_study(
     return root
 
 
-def reserved_total_usd(root: Path) -> Fraction:
-    """What the budget gate reserves for every run of a sharded study's plan together: each shard's planned runs times
-    one run's reservation of its model, summed (what `max_usd` is split in proportion to)."""
+def run_reservation_usd(root: Path, model: str) -> float:
+    """What the budget gate reserves for one run of `model` in the study at `root`."""
     study = load_study(root)
-    layout: ModelShards = study.campaign.shards
-    limits = study.campaign.agent.limits
-    reserve = {model: Fraction(reservation_usd(study.models.resolve(model), limits)) for model in MODELS}
-    return sum(runs * reserve[layout.at(index)[0]] for index, runs in planned_runs(study.manifest, layout).items())
+    return reservation_usd(study.models.resolve(model), study.campaign.agent.limits)
 
 
 # --- hosts, processes and the pool ----------------------------------------------------------------------------------
@@ -285,6 +292,27 @@ def finish_batch(env: Mapping[str, str], root: Path) -> dict[str, Done]:
         if done[name].code != 0:
             break
     return done
+
+
+PACKAGE_BUILD = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from package_support import stand_in_vendor\n"
+    "from expcore.package.build import build_package\n"
+    "from expcore.provenance.hashfile import render_hash_file\n"
+    "root, dist = Path(sys.argv[2]), Path(sys.argv[3])\n"
+    "dist.mkdir(parents=True)\n"
+    "hashes = dist / 'private.sha256'\n"
+    "hashes.write_text(render_hash_file(['zarnothwick']), encoding='utf-8')  # an invented private name\n"
+    "print(build_package(root, dist / 'archive', hashes=hashes, vendor=stand_in_vendor))\n"
+)
+
+
+def build_package_apart(env: Mapping[str, str], root: Path, dist: Path) -> Done:
+    """Build the study's replication package into `dist/archive` in a process of its own, with stand-in wheels; it
+    prints the archive's path. The build is refused unless the package passes its own check."""
+    return run_process([sys.executable, "-c", PACKAGE_BUILD, str(SUPPORT), str(root), str(dist)], env)
 
 
 def in_pool[T](jobs: Mapping[str, Callable[[], T]]) -> dict[str, T]:

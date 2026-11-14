@@ -1,6 +1,7 @@
-"""The rehearsal of #154 at a main study's scale: 4 models, 150 pairs of task and seed per model, 2 arms, sharded by
-model (`expcore-shard/3`) into N = 27 and N = 21, every shard a driver process of its own with its own study copy,
-store and `out/`, as hosts would run them.
+"""The rehearsal of #154 at a main study's shard counts: 4 models, 2 arms, 2 seeds, sharded by model
+(`expcore-shard/3`) into N = 27 and N = 21, every shard a driver process of its own with its own study copy, store and
+`out/`, as hosts would run them. The plan has 30 pairs of task and seed per model, or a main study's 150 with
+`EXPCORE_SCALE_TASKS=75` (`shard_scale_support`, "The size").
 
 **Campaign A, N = 27, clean: the determinism claim.** The same plan, fakes and seeds are run once by one unsharded
 driver of the same campaign.toml and once as 27 shards merged. `scores.json` and `analysis.json` are the same bytes;
@@ -8,27 +9,28 @@ the export and the report are the same but for the fields documented to belong t
 (`SHARD_ONLY`, `PER_DRIVER` below, and the report's `## Shards` section and median dispatch position).
 
 **Campaign B, N = 21, with the faults a fleet of hosts meets:** a host killed mid-run and the shard resumed; a host
-whose runs cost more, so that its share of the budget runs out; a host whose infrastructure fails attempts; and, at
-the merge, a shard's output given twice, a shard missing and a shard of campaign A. The merge accepts what the hosts
-did and refuses the planted inconsistencies; check, analyze, report and package work on the merged batch, and every
-run it analysed scores as one driver's run of it does.
+whose runs cost more, so that its share of its model's ceiling runs out; a host whose infrastructure fails attempts;
+and, at the merge, a shard's output given twice, a shard missing and a shard of campaign A. The shards are moved off
+the paths they ran under before they are merged, as outputs gathered from 21 hosts are. The merge accepts what the
+hosts did and refuses the planted inconsistencies; check, analyze, report and package work on the merged batch, and
+every run it analysed scores as one driver's run of it does.
 
 The host is shared, so at most three processes run at once (`shard_scale_support.PARALLEL`); the rehearsal takes some
-minutes, most of it in the start of 50 driver processes.
+minutes, most of it in the start of 49 driver processes.
 """
 
 import json
+import re
 import shutil
 import sqlite3
 import sys
 import tarfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from fractions import Fraction
 from pathlib import Path
 
 import pytest
-from package_support import stand_in_vendor
 from shard_rehearsal_support import apart_from_where_and_when, without_dispatch_positions
 from shard_scale_support import (
     LAYOUT_21,
@@ -38,12 +40,13 @@ from shard_scale_support import (
     UNIT_CAP,
     Done,
     Host,
+    build_package_apart,
     finish_batch,
     in_pool,
     make_scale_study,
     measured,
-    reserved_total_usd,
     run_process,
+    run_reservation_usd,
 )
 from shard_support import MERGED_ONLY, keys_of_shard, without_shard_section
 from study_support import clean_environment
@@ -60,8 +63,6 @@ from expcore.campaign.shard import (
     micro_usd,
 )
 from expcore.campaign.shard_budget import reservation_usd
-from expcore.package.build import build_package
-from expcore.provenance.hashfile import render_hash_file
 from expcore.study.config import load_study
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
@@ -69,8 +70,8 @@ __all__ = ["clean_environment"]  # a fixture the tests below use, imported from 
 A_COUNT, B_COUNT = sum(LAYOUT_27.values()), sum(LAYOUT_21.values())
 PLANNED = len(MODELS) * TASKS * 2 * 2  # models x tasks x arms x seeds
 KILLED, HEAVY, FAILING = 3, 9, 14  # B's faulty hosts: shard 3 serves alpha-stub, 9 beta-stub, 14 gamma-stub
-KILL_AT = 10  # the attempt of the killed host's process that dies, after its 'running' row and before its marker
-B_BUDGET = Fraction(1, 5)  # B's max_usd as a part of what its whole plan reserves: ample for a run of normal cost
+KILL_AT = 4  # the attempt of the killed host's process that dies, after its 'running' row and before its marker
+HEAVY_CEILING = 1.5  # each beta-stub shard's part of that model's ceiling, in runs' reservations: ample at normal cost
 SHARD_ONLY = ("shard", *MERGED_ONLY, "wall_s", "turn_latency_s")  # what a merged export adds (C29)
 PER_DRIVER = ("dispatch_seq", "started_at", "lease_wait_s")  # where and when a driver dispatched an attempt
 PINNED = (META_SHARD, META_STARTED, META_ENVIRONMENT, META_SHARES)
@@ -91,6 +92,8 @@ class Rehearsal:
     runs: dict[str, Done] = field(default_factory=dict)
     finished: dict[str, dict[str, Done]] = field(default_factory=dict)
     killed: dict[str, dict[str, str]] = field(default_factory=dict)
+    refusals: dict[str, tuple[Path, Done]] = field(default_factory=dict)  # each refused merge's target and outcome
+    package: Done | None = None
 
 
 def meta(root: Path) -> dict[str, str]:
@@ -124,6 +127,16 @@ def shard_rows(root: Path) -> list[list[str]]:
     return [[cell.strip() for cell in line.strip().strip("|").split("|")] for line in lines]
 
 
+def gathered(where: Path, hosts: dict[int, Host]) -> dict[int, Host]:
+    """Move every host's copy of the study to `where`, as its `out/` is gathered from its machine onto the one that
+    merges: the stores keep the paths each attempt ran under, which no longer exist."""
+    where.mkdir()
+    return {
+        i: Host(Path(shutil.move(host.root, where / host.root.name)), host.shard, host.faults)
+        for i, host in hosts.items()
+    }
+
+
 def merge_and_finish(env: dict[str, str], target: Path, hosts: dict[int, Host]) -> dict[str, Done]:
     """Merge the shards' outputs into `target`'s out/, then check, analyze and report it; each step measured."""
     merged = measured(env, "merge", str(target / "out"), *(str(host.out) for host in hosts.values()))
@@ -140,9 +153,10 @@ def rehearsal(tmp_path_factory, clean_environment) -> Rehearsal:
         for i in range(1, A_COUNT + 1)
     }
     probe = make_scale_study(base, "b-probe", per_model=LAYOUT_21)
-    b_max = float(round(reserved_total_usd(probe) * B_BUDGET, 6))
+    ceiling = {"beta-stub": HEAVY_CEILING * LAYOUT_21["beta-stub"] * run_reservation_usd(probe, "beta-stub")}
     b_roots = {
-        i: make_scale_study(base, f"b-host-{i}", per_model=LAYOUT_21, max_usd=b_max) for i in range(1, B_COUNT + 1)
+        i: make_scale_study(base, f"b-host-{i}", per_model=LAYOUT_21, per_model_usd=ceiling)
+        for i in range(1, B_COUNT + 1)
     }
     infra_keys = keys_of_shard(b_roots[FAILING], FAILING, B_COUNT)[::4]
     faults = {HEAVY: {"SCALE_HEAVY": "1"}, FAILING: {"SCALE_INFRA_RUNS": json.dumps(infra_keys)}}
@@ -153,7 +167,7 @@ def rehearsal(tmp_path_factory, clean_environment) -> Rehearsal:
         a_shards,
         make_scale_study(base, "a-merged", per_model=LAYOUT_27, workers=4),
         b_shards,
-        make_scale_study(base, "b-merged", per_model=LAYOUT_21, max_usd=b_max),
+        make_scale_study(base, "b-merged", per_model=LAYOUT_21, per_model_usd=ceiling),
         infra_keys,
     )
 
@@ -171,16 +185,52 @@ def rehearsal(tmp_path_factory, clean_environment) -> Rehearsal:
     began = time.monotonic()
     found.runs |= in_pool(jobs)
     ran = time.monotonic()
-    found.finished = in_pool(
+    found.b_shards = gathered(base / "gathered", b_shards)
+
+    def b_merged_and_packaged() -> dict[str, Done]:
+        steps = merge_and_finish(env, found.b_merged, found.b_shards)
+        if all(done.code == 0 for done in steps.values()) and len(steps) == 4:
+            found.package = build_package_apart(env, found.b_merged, base / "package")
+        return steps
+
+    refusals = {name: refused_merge(env, base / "refused", name, outs) for name, outs in planted(found).items()}
+    finished = in_pool(
         {
-            "a unsharded": lambda: finish_batch(env, a_ref.root),
+            "b merged": b_merged_and_packaged,
             "a merged": lambda: merge_and_finish(env, found.a_merged, a_shards),
-            "b merged": lambda: merge_and_finish(env, found.b_merged, b_shards),
+            "a unsharded": lambda: finish_batch(env, a_ref.root),
+            **{f"refused {name}": job for name, job in refusals.items()},
         }
     )
+    found.refusals = {name: finished.pop(f"refused {name}") for name in refusals}
+    found.finished = finished
     steps = ", ".join(f"{name} {step} {done.measured}" for (name, step), done in _steps(found) if done.code == 0)
     print(f"drivers {ran - began:.0f} s, merged and finished {time.monotonic() - ran:.0f} s; KiB, s: {steps}")
     return found
+
+
+def planted(found: Rehearsal) -> dict[str, list[Path]]:
+    """The inconsistent sets of shard outputs the merge must refuse, by name: shard 5's output given a second time (a
+    copy, as a second host's), shard 12 missing, and A's shard 1 in place of B's."""
+    copy = found.base / "copy-of-5"
+    shutil.copytree(found.b_shards[DUPLICATED].out, copy / "out")
+    outs = [host.out for host in found.b_shards.values()]
+    return {
+        "twice": [*outs, copy / "out"],
+        "missing": [host.out for i, host in found.b_shards.items() if i != MISSING],
+        "foreign": [found.a_shards[1].out, *(host.out for i, host in found.b_shards.items() if i != 1)],
+    }
+
+
+def refused_merge(env: dict[str, str], base: Path, name: str, outs: list[Path]) -> Callable[[], tuple[Path, Done]]:
+    """A job: merge `outs` into a new study copy of B, returning the copy and how the merge ended."""
+
+    def job() -> tuple[Path, Done]:
+        target = make_scale_study(base, name, per_model=LAYOUT_21)
+        command = [sys.executable, "-m", "expcore", "merge", str(target / "out"), *(str(out) for out in outs)]
+        return target, run_process(command, env, timeout=600)
+
+    return job
 
 
 # --- every process ended as planned ---------------------------------------------------------------------------------
@@ -335,26 +385,31 @@ def test_c28_a_shard_killed_mid_run_resumes_as_itself_and_keeps_every_pinned_fac
     assert json.loads(after[META_SHARD])["index"] == KILLED
 
 
-def test_the_killed_attempt_is_interrupted_and_its_run_ends_in_a_later_attempt_of_the_same_shard(rehearsal):
-    """The attempt the kill caught is interrupted, its run is run again to the end on the same host, and the merged
-    export keeps the interrupted attempt in `discarded_usage` and the run under shard 3."""
+def test_c04_the_killed_attempt_is_interrupted_and_its_run_ends_on_the_same_host_under_the_same_number(rehearsal):
+    """C04: the attempt the kill caught is interrupted and uncharged, its run is run again to the end on the same
+    host under the same attempt number, and the merged export keeps the interrupted attempt in `discarded_usage` and
+    the run under shard 3."""
     root = rehearsal.b_shards[KILLED].root
-    interrupted = rows(root, "SELECT run_key, attempt FROM attempts WHERE state = 'interrupted'")
+    interrupted = rows(root, "SELECT run_key, attempt, charged FROM attempts WHERE state = 'interrupted'")
     assert len(interrupted) == 1
-    key = interrupted[0][0]
-    assert rows(root, "SELECT status FROM runs WHERE run_key = ?", key) == [("done",)]
+    key, number, charged = interrupted[0]
+    assert charged == 0
+    assert rows(root, "SELECT attempt, state FROM attempts WHERE run_key = ? ORDER BY id", key) == [
+        (number, "interrupted"),
+        (number, "done"),
+    ]
     assert {status for (status,) in rows(root, "SELECT status FROM runs")} == {"done"}
     export = read(rehearsal.b_merged, "export.json")
     entry = next(e for e in export["analysed_attempts"] if e["run_key"] == key)
-    assert entry["shard"] == KILLED
-    assert entry["attempt"] > interrupted[0][1]
+    assert (entry["shard"], entry["attempt"]) == (KILLED, number)
     lost = [row for row in export["discarded_usage"] if row["state"] == "interrupted"]
     assert [(row["model"], row["attempts"]) for row in lost] == [("alpha-stub", 1)]
 
 
 def test_c32_a_shard_whose_budget_share_runs_out_holds_its_remaining_runs_and_no_sibling_does(rehearsal):
-    """C32: the host whose runs cost more meets its own share of `max_usd` and ends with runs held, as the gate
-    reserves a run's bound before it starts; every other shard, on the same split, runs all its runs."""
+    """C32: the host whose runs cost more meets its own part of its model's `per_model_usd` ceiling (one and a half
+    runs' reservations) and ends with runs held, as the gate reserves a run's bound before it starts; every other shard,
+    the other beta-stub shards on the same split among them, runs all its runs."""
     statuses = {
         i: dict(rows(host.root, "SELECT status, COUNT(*) FROM runs GROUP BY status"))
         for i, host in rehearsal.b_shards.items()
@@ -409,50 +464,63 @@ def test_every_run_the_faulted_campaign_analysed_scores_as_one_drivers_run_of_it
     assert {key: many[key] for key in many} == {key: one[key] for key in many}
 
 
+def test_c29_shards_gathered_from_their_hosts_merge_though_their_stores_name_paths_that_are_gone(rehearsal):
+    """C29: B's shards were moved off the paths they ran under before the merge, as outputs gathered from 21 hosts are:
+    each store still names those paths, none of which exists, and the merged batch's snapshots name none of them."""
+    for index, host in rehearsal.b_shards.items():
+        ran_under = {Path(run_dir) for (run_dir,) in rows(host.root, "SELECT run_dir FROM attempts")}
+        assert ran_under, index
+        assert all(path.is_absolute() and not path.exists() for path in ran_under), index
+        snapshot = sqlite3.connect(rehearsal.b_merged / "out" / "shards" / str(index) / "campaign-snapshot.sqlite")
+        try:
+            kept = [run_dir for (run_dir,) in snapshot.execute("SELECT run_dir FROM attempts")]
+        finally:
+            snapshot.close()
+        assert kept
+        assert all(re.fullmatch(r"[0-9a-f]{64}/try\d+", run_dir) for run_dir in kept), index
+
+
 # --- B: the merge refuses what is not one campaign ------------------------------------------------------------------
 
 
-def refused(rehearsal: Rehearsal, env: dict[str, str], name: str, outs: list[Path], fragments: tuple[str, ...]) -> None:
-    """Merge `outs` into a new study copy of B and expect a refusal holding every fragment, with nothing written."""
-    target = make_scale_study(rehearsal.base / "refused", name, per_model=LAYOUT_21)
-    command = [sys.executable, "-m", "expcore", "merge", str(target / "out"), *(str(out) for out in outs)]
-    done = run_process(command, env, timeout=600)
+def refused(rehearsal: Rehearsal, name: str, fragment: str) -> None:
+    """The planted merge `name` was refused with a message holding `fragment`, and wrote nothing."""
+    target, done = rehearsal.refusals[name]
     assert done.code == 1, done.errors[-800:]
-    for fragment in fragments:
-        assert fragment in done.errors, f"{fragment!r} is not in: {done.errors[-800:]}"
+    assert fragment in done.errors, f"{fragment!r} is not in: {done.errors[-800:]}"
     assert not (target / "out").exists()
+    assert not list(target.glob(".out.merge-*")), "a refused merge left its staging directory"
 
 
-def test_c29_a_shards_output_given_twice_is_refused_naming_the_shard(rehearsal, clean_environment):
+def test_c29_a_shards_output_given_twice_is_refused_naming_the_shard(rehearsal):
     """C29: the out/ of shard 5, copied as a second host's, is the same shard twice."""
-    copy = rehearsal.base / "refused" / "copy-of-5"
-    shutil.copytree(rehearsal.b_shards[DUPLICATED].out, copy / "out")
-    outs = [host.out for host in rehearsal.b_shards.values()] + [copy / "out"]
-    fragment = f"shard {DUPLICATED} (shard-{DUPLICATED}) and shard {DUPLICATED} (shard-{DUPLICATED}) are both shard"
-    refused(rehearsal, clean_environment, "twice", outs, (fragment,))
+    n = DUPLICATED
+    refused(rehearsal, "twice", f"shard {n} (shard-{n}) and shard {n} (shard-{n}) are both shard {n} of {B_COUNT}")
 
 
-def test_c29_a_missing_shard_of_21_is_refused_naming_it(rehearsal, clean_environment):
-    outs = [host.out for i, host in rehearsal.b_shards.items() if i != MISSING]
-    refused(rehearsal, clean_environment, "missing", outs, (f"shard {MISSING} of {B_COUNT} is missing",))
+def test_c29_a_missing_shard_of_21_is_refused_naming_it(rehearsal):
+    refused(rehearsal, "missing", f"shard {MISSING} of {B_COUNT} is missing")
 
 
-def test_c29_a_shard_of_another_campaign_is_refused_naming_it(rehearsal, clean_environment):
-    """C29: shard 1 of A (27 shards) in place of B's shard 1: another split of the plan."""
-    outs = [rehearsal.a_shards[1].out] + [host.out for i, host in rehearsal.b_shards.items() if i != 1]
-    refused(rehearsal, clean_environment, "foreign", outs, (f"split into {A_COUNT} shards", f"into {B_COUNT}"))
+def test_c29_a_shard_of_another_campaign_is_refused_naming_the_other_split(rehearsal):
+    """C29: shard 1 of A (27 shards) in place of B's shard 1: the first shard given is the one the others are compared
+    with, so the message names B's shard 2 against it."""
+    refused(
+        rehearsal,
+        "foreign",
+        f"shard 2 (shard-2): its campaign was split into {B_COUNT} shards, but shard 1 (shard-1)'s into {A_COUNT}",
+    )
 
 
 # --- B: the package -------------------------------------------------------------------------------------------------
 
 
-def test_c29_the_package_of_the_faulted_merged_batch_passes_its_own_check(rehearsal, tmp_path):
+def test_c29_the_package_of_the_faulted_merged_batch_passes_its_own_check(rehearsal):
     """C29: the replication package of B's merged batch (21 snapshots, an interrupted attempt, held runs, set-aside
     attempts) is built, which it is only when its own check regenerates every output byte for byte."""
-    hashes = tmp_path / "private.sha256"
-    hashes.write_text(render_hash_file(["zarnothwick"]), encoding="utf-8")  # an invented private name
-    archive = build_package(rehearsal.b_merged, tmp_path / "dist", hashes=hashes, vendor=stand_in_vendor)
-    with tarfile.open(archive) as members:
+    assert rehearsal.package is not None, "B's merged batch was not finished, so it was not packaged"
+    assert rehearsal.package.code == 0, rehearsal.package.errors[-1500:]
+    with tarfile.open(rehearsal.package.out.strip().splitlines()[-1]) as members:
         names = set(members.getnames())
     root = "scale-study-package"
     assert {f"{root}/out/{MERGE_FILE}", f"{root}/out/analysis.json"} <= names
