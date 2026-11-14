@@ -233,6 +233,41 @@ alpha = study.models.resolve("alpha-stub")
 assert round(bound_usd(alpha, study.campaign.agent.limits), 6) == 0.056384  # (20,000 + 8,192) x 2, per million
 ```
 
+### An abandoned request
+
+When a run gives up a request in flight, the record cannot say what it cost. Its `route.abandoned_request` holds the bound the adapter took when it built that request: `prompt_bound_tokens`, `prompt_bound_by` (`bytes`, or `window` where the byte assumption cannot be used: the first request, a reply that left a count out, a conversation in which a reply reported more than its bound), and the `reply_max_tokens` it carried. A cost scorer that charges an abandoned run for that request prices it with `abandoned_request_bound`, in place of the window and the reply maximum, and reports which basis it used. The budget gate does not read it, and the reservation above is unchanged. Pass `reply_capped` from the record's own totals, which say whether the attempt was held to its reply maximum; a record with neither field was not.
+
+For the tiered model above, a run that had sent 100,000 tokens when its next request was given up has a bound of 100,500 tokens, and the prompt cannot reach the upper tier. The request is at most that prompt and a reply of 8,000 tokens at the lower tier's dearest rates, $0.0414, where the window's bound, which reaches the upper tier, is $0.145:
+
+```python
+from expcore.campaign.abandoned_bound import abandoned_request_bound, held_to_reply_maximum
+
+entry = {
+    "reason": "read_timeout",
+    "usage": "unknown",
+    "prompt_bound_tokens": 100_500,
+    "prompt_bound_by": "bytes",
+    "reply_max_tokens": 8000,
+    "window_tokens": 200_000,
+    "bound_checked": 3,
+    "bound_exceeded": 0,
+    "bound_unreported": 0,
+    "bound_overlapped": 0,
+}
+totals = {"reserved_capped": True, "reply_cap_unheld": False}  # as the record's totals say
+tight = abandoned_request_bound(model, limits, entry, reply_capped=held_to_reply_maximum(totals))
+assert (tight.request_bound_tokens, tight.prompt_by, tight.reply_by) == (108_500, "bytes", "reply_maximum")
+assert round(tight.request_bound_usd, 8) == 0.04140625  # 100,500 x 0.3125 + 8,000 x 1.25, per million
+assert (tight.tripwire_checked, tight.tripwire_fired_before) == (3, False)  # what the tight bound rests on
+loose = abandoned_request_bound(model, limits, {"reason": "read_timeout", "usage": "unknown"}, reply_capped=True)
+assert (loose.prompt_by, round(loose.request_bound_usd, 6)) == ("window", 0.145)  # an older record: `overshoot_usd`
+assert (loose.tripwire_checked, loose.tripwire_fired_before) == (None, None)  # not recorded, which is not a clean run
+```
+
+The basis says what its bound rests on: `tripwire_checked`, the requests of that model in that run that were bounded by bytes and tested against the reply that came back, and `tripwire_exceeded`, `tripwire_unreported` and `tripwire_overlapped`, the replies that reported a prompt above their bound, the replies that left a count out and the requests built while another was in flight, each kept as its own count. `tripwire_fired_before` is true when any of the three is above zero. Report them beside the cost: a tight bound with `tripwire_checked` of 3 and nothing fired rests on three tests, and one with 0 rests on none. The counts are None for a record that lacks them, never 0.
+
+The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows (checked by digest, with the window as the answer when it fails). Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `tripwire_exceeded` (the entry's `bound_exceeded`) before trusting an entry. A backend of your own that does not record the bound keeps the window's.
+
 ### The federation's certificate
 
 On the Onedata platform four clients talk to the federation: the platform layer's REST client, the data gate that carries the agent's REST data path, oneclient in the mount sidecar, and the MCP tool server. All four take their certificate check from one `[tls]` table of `platform.toml`, so no two can check differently. Without the table, every client verifies the federation's certificate against its own default CAs, which is right for a federation with a publicly trusted certificate. A federation whose certificate no default trusts, such as a self-signed one, takes one of two modes:
@@ -692,7 +727,7 @@ assert counts == Counter()  # the example study runs without the platform
 
 ### Fault injection: compare like isolation with like
 
-On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
+On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A restore that is not verified is never scored either: the injector's reading in the record says `restore_verified: false` (with `how`, `identity_changed` and `serving`), and the campaign sets such an attempt aside as `injector_failure` and runs it again, whatever its outcome was and whatever the post-run health check decided, even when the executor kept its record (`FaultInjector.running` returns for it, and `session` raises). A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
 
 ```python
 import expcore_onedata.sandbox.kinds  # what [study] platforms imports before study.toml's conditions are validated
@@ -1003,6 +1038,62 @@ ingest.check()  # what finish_instruments asks after the snapshots: nothing to r
 assert [s["step"] for s in snapshot["steps"] if s["step"] != "planned"] == ["written", "confirmed", "not_due"]
 assert [e["event"] for e in snapshot["ids"]] == ["restored", "removed", "created", "restored"]
 assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]  # whole again, from the staged copy
+
+del os.environ[ADMIN_ENV]
+shutil.rmtree(workdir)
+```
+
+**A file that is there but still being written.** When the agent must not tell from the namespace that anything is missing, set `mode = "preallocated"` under `[ingest]` and give each file a `prefix`, the bytes written at the start. Every planned file must then be `"complete"`: at the start the instrument makes it again at its final size with only the prefix written, so a listing and a `stat` show the file as in your baseline, while the rest reads as zeros (through REST and the mount alike) until its parts arrive. Only the block map tells the gap from written zeros. The parts' times count from the agent's first model turn, not from the instrument's start, so the setup before the loop does not eat into the agent's window: call `first_turn_instruments` in your executor just before the loop starts, as for any instrument with a first-turn hook ([An instrument that refuses an attempt](#an-instrument-that-refuses-an-attempt)); a run whose first turn never came is refused. After the run the instrument completes each file in place from its staged copy and never removes it, so the files every other condition reads stay in the dataset. Each start makes the files again, so their ids change every run: the snapshot's `id_map` maps each file's old id to its new one, the id the run's reads and the reset use, so a map you key by file id (as a data gate's rows are) follows it; `ids` and `start.files` give the same with each file's label. `start_s` is the start's seconds, which run before the first turn and so outside the agent's time.
+
+The removal takes every replica of a file with it. If another provider holds a file whole between runs, a mirror that an outage condition reads through, list it in the file's `replicas`: the reset then replicates the completed file there and checks that provider's block map, so the next run, whatever its condition, finds the mirror as in your baseline. The start refuses, before it removes anything, when a declared provider does not hold the file whole, when one you did not declare holds any of it (evict it, or declare it), or when any planned file's staged copy is damaged or missing.
+
+A start or a reset that fails part-way leaves files sparse or missing, so the instrument writes the baseline's state into its journal, and the start's own recovery marks it whole again only when it verifies every file. Otherwise every later start is refused before it sends anything, and the platform's health check closes the gate if you give it the journals: `PlatformHealth(config, client, issuer, ingest_journals=[journal])`, one per plan's journal. Bring the baseline back with `ProgressiveIngest(own, plan, journal=journal).recover()`, over the plan the failed run used (another plan is refused), when no run is on the space: it restores every file and its replicas, verified, and reopens both. A run whose process died leaves the same state, and the health check finds it by the dead process's id.
+
+The block runs a preallocated plan of one file in three parts against the fakes. The run ends after the first part, and the finish completes the day.
+
+```python
+ticker = Ticker()
+fake = make_federation(clock=ticker.clock)
+fake.add_provider(BETA_ID, "beta.test")
+fake.add_file("records/day-13.csv", DAY)  # the dataset's last day, held whole by its owner
+
+workdir = Path(tempfile.mkdtemp())
+os.environ[ADMIN_ENV] = fake.admin_token
+platform = write_platform(workdir, both_providers)
+config = load_platform(platform)
+client = OnezoneClient(config, http=fake.client_http())
+own = Provisioner(
+    client,
+    config,
+    load_placement(platform, config).settings,
+    provider_ids=resolve_provider_ids(config),
+    log=workdir / "ingest-changes.jsonl",
+    clock=ticker.clock,
+    sleep=ticker.sleep,
+)
+(workdir / "staged").mkdir()
+(workdir / "staged" / "day-13.csv").write_bytes(DAY)
+(workdir / "ingest.toml").write_text(
+    '[ingest]\nstaging = "staged"\nmode = "preallocated"\n\n[[ingest.files]]\nlabel = "day-13"\n'
+    'path = "records/day-13.csv"\nsource = "day-13.csv"\nat_s = 60\nbaseline = "complete"\nprefix = 150\n'
+    "parts = 3\nover_s = 60\n",
+    encoding="utf-8",
+)
+plan = load_ingest_plan(workdir / "ingest.toml", config)
+ingest = ProgressiveIngest(own, plan, journal=workdir / "ingest-journal.jsonl", max_wait_s=0.001)
+
+ingest.start({})  # the day is at its full size with its first 150 bytes written: the namespace is the baseline's
+assert len(fake.nodes[fake.id_of("records/day-13.csv")].content) == len(DAY)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 150]]
+ingest.at_first_turn({"clock_s": 0.0})  # what first_turn_instruments calls just before the loop: the schedule's zero
+ticker.sleep(60)
+while ingest.progress < 1:
+    time.sleep(0.001)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 300]]  # the prefix and the first part, nothing beyond
+snapshot = ingest.finish()  # the run ended before the rest: the day is completed in place, never removed
+ingest.check()
+assert (snapshot["anchor"], snapshot["files"]["day-13"]["state"]) == ("first_turn", "partial")
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]
 
 del os.environ[ADMIN_ENV]
 shutil.rmtree(workdir)
