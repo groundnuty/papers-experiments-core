@@ -64,7 +64,7 @@ def test_o35_every_pair_is_checked_and_recorded_with_its_seconds_and_bytes(fake,
     report = run(config, client, ticker)
     assert report.ok, report.detail
     assert len(report.pairs) == 6
-    assert [(p.local, p.source) for p in report.pairs[:2]] == [
+    assert [(p.reader, p.source) for p in report.pairs[:2]] == [
         ("providers[0]", "providers[1]"),
         ("providers[0]", "providers[2]"),
     ]
@@ -83,7 +83,7 @@ def test_o35_every_pair_is_checked_and_recorded_with_its_seconds_and_bytes(fake,
     record = json.loads(json.dumps(report.to_json()))
     assert record["version"] == 1
     assert record["ok"] is True
-    assert [(p["local"], p["source"], p["bytes"]) for p in record["pairs"][:2]] == [
+    assert [(p["reader"], p["source"], p["bytes"]) for p in record["pairs"][:2]] == [
         ("providers[0]", "providers[1]", size),
         ("providers[0]", "providers[2]", size),
     ]
