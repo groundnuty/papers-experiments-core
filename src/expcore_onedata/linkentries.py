@@ -18,9 +18,10 @@ Any other name is `other`, near misses (a wrong number of digits, upper case, `-
 **The current probe of a pair is the highest generation among its files not retired**, a file being retired when a
 marker of its stem holds the digest of its file id (the id, never the name: a name written again is a new file). Every
 other probe of the pair, a lower generation or a retired one, is superseded, and a pair whose every probe is retired
-has no current one. This is the choice `linkprobe.ProbeFiles.provision` makes, for every generation it reads:
-`linkprobe.generation_of` stops at nine digits, so a probe of a billionth generation or later (a billion failed fetches
-of one pair) is the check's own file here and one `provision` does not look at.
+has no current one. This is the choice `linkprobe.ProbeFiles.provision` makes, and it reads a generation as
+`linkprobe.generation_of` does, which stops at nine digits. A probe named with ten or more (the writer has no bound, but
+a billion failed fetches of one pair is out of reach) is the check's own file and never `current`, since `provision`
+does not look at it; it is `superseded`, with every other probe that is not current.
 """
 
 import re
@@ -28,11 +29,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from expcore_onedata.linkprobe import PROBE_PREFIX, RETIRED_PREFIX, _digest
+from expcore_onedata.linkprobe import _GENERATION, PROBE_PREFIX, RETIRED_PREFIX, _digest
 from expcore_onedata.provision import Entry
 
 _STEM = r"(?P<stem>[0-9a-f]{16})"
-_PROBE = re.compile(rf"{re.escape(PROBE_PREFIX)}{_STEM}(?:-g(?P<generation>[1-9][0-9]*))?")
+_PROBE = re.compile(rf"{re.escape(PROBE_PREFIX)}{_STEM}(?P<suffix>-g[1-9][0-9]*)?")
 _MARKER = re.compile(rf"{re.escape(RETIRED_PREFIX)}{_STEM}-(?P<file>[0-9a-f]{{16}})")
 
 
@@ -73,6 +74,15 @@ def is_link_check_entry(name: str) -> bool:
     return _PROBE.fullmatch(name) is not None or _MARKER.fullmatch(name) is not None
 
 
+def _readable_generation(suffix: str | None) -> int | None:
+    """The generation a probe name's `-g<N>` suffix gives as `linkprobe.generation_of` reads it (no suffix is generation
+    0), or None for one it does not read: the writer's names past nine digits. No integer is made of those."""
+    if suffix is None:
+        return 0
+    found = _GENERATION.fullmatch(suffix)
+    return int(found.group(1)) if found else None
+
+
 def _listed(listing: Mapping[str, Entry] | Iterable[Entry | tuple[str, str]]) -> list[ListedFile]:
     """The listing's entries as name and file id, a pair given twice once. Refuse an item that is neither an `Entry` nor
     a `(name, file_id)` pair of strings, an entry with no file id, and a name given two file ids."""
@@ -104,8 +114,8 @@ def link_check_entries(listing: Mapping[str, Entry] | Iterable[Entry | tuple[str
     retired: dict[str, set[str]] = {}
     for file in files:
         if (probe := _PROBE.fullmatch(file.name)) is not None:
-            generation = int(probe["generation"] or 0)
-            probes.setdefault(probe["stem"], []).append((generation, file))
+            if (generation := _readable_generation(probe["suffix"])) is not None:
+                probes.setdefault(probe["stem"], []).append((generation, file))
         elif (mark := _MARKER.fullmatch(file.name)) is not None:
             retired.setdefault(mark["stem"], set()).add(mark["file"])
     current = []

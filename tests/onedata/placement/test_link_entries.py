@@ -181,16 +181,26 @@ def test_o48_a_probe_name_is_read_with_the_generation_linkprobe_reads(generation
     assert [c.generation for c in found.current] == [generation]
 
 
-def test_o48_the_successor_the_check_writes_past_the_generations_it_reads_is_still_its_own():
+def test_o48_a_generation_past_the_nine_digits_the_check_reads_is_its_own_and_never_current():
     """O48: `probe_name` has no upper bound, so the name `retire` writes after generation 999999999 is the check's own,
-    though `generation_of` reads no more than nine digits."""
+    but `generation_of` reads no more than nine digits and `provision` never selects it, so it is not current."""
     last = probe_name(KEY, 999_999_999)
     successor = probe_name(KEY, 1_000_000_000)
     assert generation_of(successor, KEY) is None
+    assert is_link_check_entry(successor)
     found = link_check_entries([(last, "file-a"), (successor, "file-b")])
-    assert [(c.generation, c.file_id) for c in found.current] == [(1_000_000_000, "file-b")]
-    assert found.superseded == (ListedFile(last, "file-a"),)
+    assert [(c.generation, c.file_id) for c in found.current] == [(999_999_999, "file-a")]
+    assert found.superseded == (ListedFile(successor, "file-b"),)
     assert found.other == ()
+
+
+def test_o48_a_generation_of_thousands_of_digits_is_classified_without_making_an_integer_of_it():
+    """O48: a name with a generation past Python's integer conversion limit has the check's shape and raises nothing."""
+    name = f"{probe_name(KEY)}-g{'1' * 5000}"
+    assert is_link_check_entry(name)
+    found = link_check_entries([(name, "file-a"), probe(2, "file-b")])
+    assert [c.file_id for c in found.current] == ["file-b"]
+    assert found.superseded == (ListedFile(name, "file-a"),)
 
 
 def test_o48_an_empty_listing_has_nothing():
