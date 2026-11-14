@@ -20,9 +20,9 @@ Once armed, the federation admits no run before the drain has ended: the plan's 
 journal's drain record (`InjectionJournal.raise_drain`, `federation.drain`), which only ever moves later; and every
 admission, shared or exclusive, checks that record once it holds the lock (`FederationLock.acquire` waits for it,
 `try_acquire` refuses). So the drain is kept by the federation itself and not by the process that began it: an
-interrupt, a restore that holds no admission and a recovery in another process cannot reopen it. An injector that
-holds the federation by an admission of its own also waits the drain out in `clear`, so its snapshot records the wait
-(`SessionDrain.wait`). When the record cannot be written, the release waits in process, the lock held, instead of going
+interrupt, a restore that holds no admission (it takes the federation for the restore) and a recovery in another
+process cannot reopen it. An injector that holds the federation by an admission of its own also waits the drain out in
+`clear`, so its snapshot records the wait (`SessionDrain.wait`). When the record cannot be written, the release waits in process, the lock held, instead of going
 (`close_out`). An admission nothing armed (every shared admission, an exclusive control, an outage run whose provider
 never went down) writes nothing and is let go at once.
 

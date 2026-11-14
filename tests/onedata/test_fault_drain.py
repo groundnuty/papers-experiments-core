@@ -43,6 +43,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.fault_drain import GATE, MOUNT, SessionDrain
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import DRAIN, HOLDER, JOURNAL, InjectionJournal, boot_id
+from expcore_onedata.fault_recovery import Recovery
 from expcore_onedata.faults import load_faults
 from expcore_onedata.testing import write_platform
 
@@ -701,37 +702,42 @@ def test_o11_a_recovery_that_restored_nothing_closes_nothing(tmp_path):
     assert not (settings_of(platform).journal / DRAIN).exists()
 
 
-def test_o11_a_recovery_with_no_admission_closes_the_federation_before_it_restores_anything(tmp_path):
-    """O11: with no admission held, nothing keeps the federation closed behind a restore, so the record is written
-    before the provider is restarted and the injection cleared: no process is admitted in a gap between them."""
+def test_o11_a_recovery_with_no_admission_takes_the_federation_for_the_restore_and_leaves_it_closed(tmp_path):
+    """O11: with no admission held, `FaultInjector.recover()` takes the federation exclusively for the restore, so no
+    process is admitted in any gap around it (the lock, not a record written beside it, is what keeps it closed), and
+    lets it go into the drain."""
     platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
     clock = FakeClock()
     settings = settings_of(platform)
     lock = FederationLock(settings, wall=clock)
     services = FakeServices(path=state)
-    seen: list[float] = []
-    services.on_serves = lambda service: seen.append(lock.drain_left())  # every reading is before the journal's clear
+    seen: list[bool] = []
+    services.on_serves = lambda service: seen.append(lock.try_acquire(exclusive=False) is None)
     injector = injector_for(platform, services, clock=clock, wall=clock)
     assert injector.recover() == []
     assert seen
-    assert all(left == pytest.approx(DRAIN_S, abs=2.0) for left in seen)
+    assert all(seen)  # held against every other admission at each reading, before the journal's clear
     assert open_injections(tmp_path) == []
+    assert lock.drain_left() == pytest.approx(DRAIN_S, abs=2.0)
+    assert lock.try_acquire(exclusive=False) is None
 
 
-def test_o11_a_recovery_with_no_admission_that_cannot_record_the_drain_restores_nothing(tmp_path, monkeypatch):
-    """O11: when the record cannot be written the recovery fails as the injector's own failure before it restarts
-    anything: the provider is left for a recovery that can close the federation behind it."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+def test_o11_a_recovery_with_no_admission_that_cannot_get_the_federation_restores_nothing(tmp_path):
+    """O11: another process holds the federation: the recovery waits inside `admission_timeout_s`, fails as the
+    injector's own failure, and restarts nothing, since a restore that nothing keeps the federation closed behind is
+    not made."""
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5, admission_timeout_s=0.2
+    )
     clock = FakeClock()
     services = FakeServices(path=state)
     injector = injector_for(platform, services, clock=clock, wall=clock)
-
-    def broken(self, until):
-        raise OSError("the disk is full")
-
-    monkeypatch.setattr(InjectionJournal, "raise_drain", broken)
-    with pytest.raises(InfraError, match="could not be recorded"):
-        injector.recover()
+    held = FederationLock(settings_of(platform)).acquire(exclusive=False)
+    try:
+        with pytest.raises(InfraError):
+            injector.recover()
+    finally:
+        held.close()
     assert [call for call in services.calls if call[0] == "start"] == []
     assert len(open_injections(tmp_path)) == 1
 
@@ -881,9 +887,9 @@ def test_o11_a_recovery_under_an_admission_owes_its_drain_before_it_restores_and
     assert lock.drain_left() == pytest.approx(DRAIN_S, abs=2.0)
 
 
-def test_o11_a_later_clear_without_the_original_admission_closes_the_federation_before_it_restores(tmp_path):
-    """O11: the first clear fails readiness and the run's admission is let go; the retry, which holds none, writes the
-    drain record before it journals the injection cleared, and does not return `True` without one."""
+def test_o11_a_later_clear_without_the_original_admission_takes_the_federation_for_its_restore(tmp_path):
+    """O11: the first clear fails readiness and the run's admission is let go; the retry, which holds none, takes the
+    federation exclusively for its restore, so nothing is admitted while it restores, and lets it go into the drain."""
     platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
     settings = settings_of(platform)
     lock = FederationLock(settings, clock=clock, sleep=clock.sleep, wall=clock)
@@ -895,13 +901,15 @@ def test_o11_a_later_clear_without_the_original_admission_closes_the_federation_
     clock.now += DRAIN_S + 1  # the first clear's drain, published as the admission went, is over
     assert lock.drain_left() == 0.0
     services.knobs["never_serves"] = False
-    seen: list[float] = []
-    services.on_serves = lambda service: seen.append(lock.drain_left())
+    seen: list[bool] = []
+    services.on_serves = lambda service: seen.append(lock.try_acquire(exclusive=False) is None)
+    began = clock.now
     assert injector.clear() is True
     assert seen
-    assert all(left == pytest.approx(DRAIN_S, abs=2.0) for left in seen)  # closed before the journal's clear
-    assert lock.drain_left() > 0
+    assert all(seen)  # held against every other admission until the journal's clear and after it
     assert open_injections(tmp_path) == []
+    assert clock.now - began >= DRAIN_S - 5  # it holds no sandbox of its own: it waits the drain out before it lets go
+    assert step(injector, "drain")["deferred"] is False
 
 
 def test_o11_an_unverified_restore_under_a_runs_admission_still_closes_the_federation_when_it_ends(tmp_path):
@@ -930,3 +938,60 @@ def test_o11_a_provider_the_stop_never_took_down_closes_nothing_under_a_runs_adm
     taken = lock.try_acquire(exclusive=True)
     assert taken is not None
     taken.close()
+
+
+def test_o11_a_drain_that_cannot_be_recorded_after_a_recovery_is_waited_out_holding_the_federation(
+    tmp_path, monkeypatch
+):
+    """O11: the recovery's own admission cannot write the drain record when it lets go: it waits the drain out in
+    process, the lock held, before the federation goes."""
+    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    clock = FakeClock()
+    injector = injector_for(platform, FakeServices(path=state), clock=clock, wall=clock)
+
+    def broken(self, until):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(InjectionJournal, "raise_drain", broken)
+    began = clock.now
+    assert injector.recover() == []
+    assert open_injections(tmp_path) == []
+    assert clock.now - began >= DRAIN_S - 5  # the drain, waited out in the injector's sleeps
+    taken = FederationLock(settings_of(platform)).try_acquire(exclusive=True)
+    assert taken is not None  # and only then let go
+    taken.close()
+
+
+def test_o11_a_share_of_an_admission_that_is_let_go_is_not_kept(tmp_path):
+    """O11: `try_retain` keeps a held admission for a worker and is None when there is nothing to keep (the owner has
+    let it go), and the plain `retain` then holds nothing: a restore must not take such an admission for held."""
+    _, _, _, lock = fake_federation(tmp_path)
+    admission = lock.acquire(exclusive=True, purpose=OUTAGE_RUN, target=OUTAGE_TARGET)
+    give_up = admission.try_retain()
+    assert give_up is not None
+    assert admission.shares.count == 2
+    admission.close()  # the owner leaves: the retained share keeps the lock
+    assert admission.held
+    give_up()
+    assert not admission.held
+    assert admission.try_retain() is None
+    assert admission.retain()() is None
+
+
+def test_o11_a_recovery_tells_what_it_has_read_before_it_settles_any_of_it(tmp_path):
+    """O11: `Recovery.recover(before=...)` is called once with the open injections it has just read, before it
+    restarts any provider, so what is done before a restore is done for exactly what is restored; and not at all when
+    nothing is open."""
+    platform, state = crashed(tmp_path, poll_s=0.01, ready_timeout_s=5)
+    services, clock = FakeServices(path=state), FakeClock()
+    recovery = Recovery(settings_of(platform), services, clock=clock, sleep=clock.sleep)
+    told: list[tuple[list[str], list[tuple[str, str]]]] = []
+    recovery.recover(
+        before=lambda entries: told.append(
+            ([entry["target"] for entry in entries], [call for call in services.calls if call[0] == "start"])
+        )
+    )
+    assert told == [([OUTAGE_TARGET], [])]  # told of the one open injection, with nothing yet restarted
+    again: list[object] = []
+    recovery.recover(before=again.append)
+    assert again == []

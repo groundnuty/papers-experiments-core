@@ -130,12 +130,13 @@ class Admission:
     def held(self) -> bool:
         return self.lock.held
 
-    def retain(self) -> Callable[[], None]:
+    def try_retain(self) -> Callable[[], None] | None:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
-        counts). A share of an admission no longer held is nothing to give up."""
+        counts), or None when there is no share to take: the admission is no longer held, or its last share is already
+        given up and its release is under way, so it cannot be kept for the worker."""
         with self.shares.lock:
             if not self.held or self.shares.count == 0:
-                return lambda: None
+                return None
             self.shares.count += 1
         given_up = threading.Event()
 
@@ -145,6 +146,10 @@ class Admission:
                 self._give_up()
 
         return give_up
+
+    def retain(self) -> Callable[[], None]:
+        """`try_retain`, with nothing to give up when there was no share to take."""
+        return self.try_retain() or (lambda: None)
 
     def _give_up(self) -> None:
         with self.shares.lock:

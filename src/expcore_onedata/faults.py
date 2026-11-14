@@ -657,12 +657,22 @@ class FaultInjector:
     def _clear(self) -> bool:
         if self._pending is None:
             return True
+        with self._restoring() as (admission, own, refused):
+            if refused is not None:  # the federation could not be taken for the restore: nothing was restored
+                self._step("cleared", False, how="federation_unavailable")
+                return False
+            return self._settle_pending(admission, own)
+
+    def _settle_pending(self, admission: Admission | None, own: bool) -> bool:
+        """Settle the pending injection under `admission`, which the restore keeps held: the drain is armed before the
+        provider is brought back, and an injector that holds the federation by an admission of its own waits it out
+        before it lets go (`_drain`)."""
+        assert self._pending is not None
         entry, digest = self._pending
         injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
         began = self._clock()  # the restore's start, from which an unknown end of the run's sessions is drained in full
-        drain, fresh = None, False
+        drain, fresh = self._arm(admission, began)  # before the provider is brought back
         try:
-            drain, fresh = self._close_behind(began, owed=False)  # before the provider is brought back
             done, how, after, ready_after_s = self._recovery.settle(
                 {
                     "id": entry,
@@ -692,7 +702,7 @@ class FaultInjector:
             ready_after_s=ready_after_s,
         )
         if done:
-            self._drain(how, began)  # before the federation goes back to the other runs
+            self._drain(admission, own, how, began)  # before the federation goes back to the other runs
             self._pending, self._stop_unknown = None, False
             self._unlock()
             self._release_admission()
@@ -708,54 +718,79 @@ class FaultInjector:
     def _recover(self, *, heal: bool = False) -> list[str]:
         """Recovery, healing a stuck link only when `heal`: the caller holds the federation exclusively (`_start`). A
         provider it restored went down in a run this injector knows nothing of, so its sessions are unknown whatever the
-        current run's sandbox says: the exclusive admission held owes the full drain from the start of the recovery
-        (`SessionDrain.owe`), and with no admission held the federation is closed for it at once (`hold_for`), so that
-        no recovery ends with the federation open inside the drain (`fault_drain`)."""
+        current run's sandbox says: the exclusive admission it restores under owes the full drain from the start of the
+        recovery (`SessionDrain.owe`), decided against the injections the recovery has just read and before it settles
+        one (`fault_drain`)."""
         self._require_sanction()
-        give_up = retain_admission()  # the admission that protects the restore stays held until the recovery has ended
-        try:
-            if self._recovery.entries():  # something is open: whatever the recovery brings back is owed its drain
-                self._close_behind(self._clock(), owed=True)
-            return self._recovery.recover(self._step, heal=heal)
-        finally:
-            give_up()
+        with self._restoring() as (admission, _, refused):
+            if refused is not None:
+                raise refused
+            drain = None if admission is None else admission.drain
+            owe = (lambda entries: drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)) if drain else None
+            return self._recovery.recover(self._step, heal=heal, before=owe)
 
-    def _close_behind(self, began: float, *, owed: bool) -> tuple["SessionDrain | None", bool]:
-        """Before a restore that may bring back a provider that went down, close the federation behind it, so that no
-        interrupt, no cancellation and no other process can find the provider restored, the journal cleared and the
-        federation open (`fault_drain`). With an exclusive admission held, its drain is armed (`arm`, for this injector's
-        own injection) or owed (`owe`, for a recovery of an earlier run's: that run's sessions are unknown); the
-        admission's release publishes it. With none held, the drain record is written now (`hold_for`). A record that
-        cannot be written fails as `injector_failure`, with nothing restored. Return the drain armed, and whether this
-        call armed it (for a restore that finds nothing to restore, `SessionDrain.disarm`)."""
+    @contextlib.contextmanager
+    def _restoring(self) -> Iterator[tuple[Admission | None, bool, InfraError | None]]:
+        """The exclusive admission a restore runs under, for the restore's whole duration, so that nothing is admitted
+        while it restores and the drain it arms is published when it ends (`fault_drain`). Yield `(admission, own,
+        refused)`:
+
+        - the exclusive admission already held, a share of it kept for the restore (`Admission.try_retain`: a cancelled
+          owner cannot let the lock go under it; one whose last share is already given up is not held for this purpose);
+        - else an exclusive admission this injector takes for the restore and gives up when it ends (`own` true: no
+          sandbox of the run is under it), which waits for the federation inside `[faults] admission_timeout_s`; one it
+          cannot get is `refused`, an InfraError of kind `injector_failure`, and nothing is restored;
+        - with `session_drain_s` 0, nothing: there is no drain to keep.
+        """
         if self._settings.session_drain_s <= 0:
-            return None, False
-        admission = self._exclusive_admission()
+            yield None, False, None
+            return
+        held = self._exclusive_admission()
+        give_up = held.try_retain() if held is not None else None
+        if held is not None and give_up is not None:
+            try:
+                yield held, held is self._admission, None
+            finally:
+                give_up()
+            return
+        try:
+            taken = self._federation.acquire(
+                exclusive=True,
+                timeout_s=self._settings.admission_timeout_s,
+                cancel=self._cancel,
+                purpose=INJECTOR,
+                target=self.target,
+            )
+        except InfraError as error:
+            yield None, False, self._fail(error.detail)
+            return
+        try:
+            yield taken, True, None
+        finally:
+            taken.close()
+
+    def _arm(self, admission: Admission | None, began: float) -> tuple[SessionDrain | None, bool]:
+        """Before a restore of a provider that may have gone down: arm the drain of the admission it runs under. Return
+        the drain, and whether this call armed it (for a restore that finds nothing to restore, `SessionDrain.disarm`)."""
         if admission is None or admission.drain is None:
-            self._federation.hold_for(self._settings.session_drain_s)
             return None, False
         drain = admission.drain
         fresh = not drain.armed
-        if owed:
-            drain.owe(began, clock=self._clock, sleep=self._sleep)
-        else:
-            drain.arm(began, clock=self._clock, sleep=self._sleep)
+        drain.arm(began, clock=self._clock, sleep=self._sleep)
         return drain, fresh
 
-    def _drain(self, how: str, began: float) -> None:
-        """After a verified restore of a provider that went down: arm the drain of the exclusive admission that holds the
-        federation (`fault_drain`), and record a `drain` step. An injector that holds the federation by an admission of
-        its own waits the drain out here, before it lets go: it has no sandbox of its own run. A run's admission is
-        waited out when the run ends, with the sandbox's mount and gate ends known; the restore comes before them, so
-        the step records the plan as it stands (`deferred`), with the mount unknown if it is still up."""
+    def _drain(self, admission: Admission | None, own: bool, how: str, began: float) -> None:
+        """After a verified restore of a provider that went down, record a `drain` step. An injector that holds the
+        federation by an admission of its own (`own`) waits the drain out here, before it lets go: it has no sandbox of
+        its own run. A run's admission is waited out when the run ends, with the sandbox's mount and gate ends known; the
+        restore comes before them, so the step records the plan as it stands (`deferred`), with the mount unknown if it
+        is still up."""
         if how not in RESTORED or self._settings.session_drain_s <= 0:
             return
-        admission = self._exclusive_admission()
         if admission is None or admission.drain is None:
             self._step("drain", False, why="no exclusive admission holds the federation: nothing keeps it closed")
             return
         admission.drain.arm(began, clock=self._clock, sleep=self._sleep)
-        own = admission is self._admission
         record = admission.drain.wait() if own else {**admission.drain.plan().record(), "waited_s": 0.0}
 
         def since_start(moment: float | None) -> float | None:

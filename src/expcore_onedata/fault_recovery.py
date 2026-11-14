@@ -207,18 +207,29 @@ class Recovery(LinkSettling):
         except OSError as error:  # an OS error's text holds the journal's path: only its type is told (O12)
             raise failure(f"the injection journal cannot be read ({type(error).__name__})", target) from None
 
-    def recover(self, on_step: Callable[..., None] | None = None, *, heal: bool = False) -> list[str]:
+    def recover(
+        self,
+        on_step: Callable[..., None] | None = None,
+        *,
+        heal: bool = False,
+        before: Callable[[list[dict[str, Any]]], None] | None = None,
+    ) -> list[str]:
         """Settle every open injection whose target's lock is free; raise InfraError of kind `injector_failure` when one
         cannot be settled or its lock is stuck. Return the targets of those live injectors hold, sorted. `heal` lets a
         stuck link be healed, which only a caller holding the federation exclusively may ask for.
 
         `on_step("recovered", ok, target=..., how=..., ...)` is told of every injection it settled or failed to, with
         the seconds the restored service took to serve (`ready_after_s`) and the gate's and the heal's records.
+        `before(entries)` is called once with the open injections it has just read, when there are any, and before it
+        settles one: whatever must be done before something is restored is done for exactly what it will settle.
         """
         step = on_step or (lambda *args, **kwargs: None)
         held: list[str] = []
         # a heal's container restart of a reader first: while it is down, the injection it healed cannot pass its gate
-        for entry in sorted(self.entries(), key=lambda entry: entry.get("heal") is not True):
+        open_entries = self.entries()
+        if before is not None and open_entries:
+            before(open_entries)
+        for entry in sorted(open_entries, key=lambda entry: entry.get("heal") is not True):
             target = entry["target"]
             lock = self.journal.try_lock(target)
             if lock is None:
