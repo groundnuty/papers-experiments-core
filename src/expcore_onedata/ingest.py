@@ -18,7 +18,9 @@ else: every write goes through the provisioner, so through the mutation gate bou
   manipulation, not a failure), restores the baseline and returns the snapshot. **`restore`** is the same, for an
   executor's `finally` when `finish` was not reached; calling it again is harmless. Each file is restored on its own,
   so one that fails leaves no other missing. Both block, so an executor on an event loop calls them through
-  `asyncio.to_thread`, as it calls `finish_instruments`.
+  `asyncio.to_thread`, as it calls `finish_instruments`. The restore changes the files the run left, and
+  `finish_instruments` finishes the last listed instrument first (C31): list the ingest before the probes that read
+  those files, which then read them before the restore.
 - **`check`**, the post-run check that `finish_instruments` calls once every snapshot is in (C31), raises
   `InfraError("ingest_failure")`, a kind no condition may declare, naming the step, when the start, an arrival, the
   stop or the restore failed: the core records the refusal and sets the attempt aside as charged infrastructure, run
