@@ -29,6 +29,7 @@ clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that wid
 concurrency = 16                # the most requests a bulk operation has in flight at once (eviction, block maps, reset)
 qos_scan = "listing"            # how the reset finds QoS requirements: "listing" or "summaries" (a read per leaf, O33)
 qos_fulfil_timeout_s = 120      # the longest the reset waits for a run's QoS requirement to be fulfilled before deleting it
+reset_concurrency = 4           # the spaces a reset of several spaces works on at once (`resetspaces.py`)
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -93,6 +94,7 @@ class PlacementSettings:
     # Last, so a caller that passes the settings positionally keeps the order it had before #196 (O25): every field
     # added later goes at the end of the class.
     fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
+    reset_concurrency: int = 4  # the spaces a reset of several works on at once (`resetspaces.py`)
 
 
 @dataclass(frozen=True)
@@ -256,6 +258,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "concurrency",
             "qos_scan",
             "qos_fulfil_timeout_s",
+            "reset_concurrency",
         )
     )
     holder = table.string("holder")
@@ -283,6 +286,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         concurrency=_number(table, "concurrency", 16, minimum=1, integer=True),
         qos_scan=qos_scan,
         qos_fulfil_timeout_s=_number(table, "qos_fulfil_timeout_s", 120.0, minimum=0),
+        reset_concurrency=_number(table, "reset_concurrency", 4, minimum=1, integer=True),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))

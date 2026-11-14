@@ -26,9 +26,12 @@ read and every check is made on each provider that supports the space, since eac
    gate (bound to this space, its record's `spaceId` resolved); a cancel answered 400 is a job that has ended, never
    one the gate refused unsent. Each must then report an ended state on that provider, and the listings must show
    nothing waiting or ongoing on every provider in `transfer_settle_polls` observations in a row, `transfer_settle_s`
-   apart (the listing's lag, O07), within twice that many observations. `cancelled` counts the distinct jobs the stage
-   sent a cancel to, from its own actions, so a job it cancelled while still scheduled, which the history cannot see,
-   is never invisible.
+   apart (the listing's lag, O07), within twice that many observations; **a space whose every observation showed
+   nothing, so that nothing was cancelled, settles on two**, one `transfer_settle_s` apart, by when a job scheduled
+   before the first is listed: the reset runs between runs, under the run's exclusive admission, so nothing else
+   schedules one meanwhile (`resetspaces.py` has the argument, and the record says `fast`). `cancelled` counts the
+   distinct jobs the stage sent a cancel to, from its own actions, so a job it cancelled while still scheduled, which
+   the history cannot see, is never invisible.
 3. **eviction**: the files the caller names leave each provider named (`eviction.py`): a directory in one transfer, a
    set of files in parallel under `[placement] concurrency`, each scheduled again while its block map still shows bytes
    after the transfers ended (an eviction on 25.0 can complete having evicted nothing), up to `EVICTION_ATTEMPTS`.
@@ -131,13 +134,13 @@ reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, w
 a provider that does not answer is a failure, not an empty listing. Every message and every record key names the space
 and each provider by its position, never a label, a name or a path.
 
-The waits happen between runs, never in an agent's time (`consistency.guard`).
+The waits happen between runs, never in an agent's time (`consistency.guard`). **Several spaces** reset as one
+through `resetspaces.SpacesReset`: the same stages for each, the waits they share taken once, and the spaces' own work
+at once; `run` is that driver with this space alone.
 """
 
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from functools import partial
-from math import isfinite
 from typing import Any
 
 from expcore_onedata import consistency, resetheld, resetqos, resetremove
@@ -166,7 +169,7 @@ LISTED_MAX = 100_000
 # Waits the occupancy stage takes in all, beginning again when a transfer ended or ran during the last one, before it
 # fails: a reading after such a wait may not show that transfer's change (O46).
 OCCUPANCY_ROUNDS = 3
-_FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, Unreadable, KeyError)
+FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, Unreadable, KeyError)  # a stage's, recorded
 NOT_IN_SPACE = "a path the plan names is not in the space"  # a KeyError's own text holds a path's part (O12)
 
 
@@ -203,6 +206,21 @@ class SpaceReset:
             raise ValueError("a listing's bound is at least one id")
         self._listed_max, self._now = listed_max, now
 
+    @property
+    def provisioner(self) -> Provisioner:
+        """The provisioner of the space this reset is bound to."""
+        return self._p
+
+    @property
+    def providers(self) -> tuple[str, ...]:
+        """The providers whose listings the reset reads."""
+        return tuple(self._providers)
+
+    @property
+    def now(self) -> Callable[[], float]:
+        """This host's epoch clock, the one the history's `since` is on."""
+        return self._now
+
     def _label(self, provider: str) -> str:
         return self._p.client.provider_label(provider)
 
@@ -217,7 +235,8 @@ class SpaceReset:
         qos_rights: bool | None = None,
     ) -> dict[str, Any]:
         """Check the plan, verify the space, run the stages in order and return the record; raise ResetFailed at the
-        first stage that fails.
+        first stage that fails. It is `resetspaces.SpacesReset` with this space alone, so its stages, and the
+        transfer settle's fast path, are that driver's.
 
         `evict` maps a provider to the space-relative paths of what must leave it: a directory leaves in one
         transfer, files together. `allowed` maps a provider to the physical bytes of the space it may still hold at the
@@ -234,73 +253,10 @@ class SpaceReset:
         `False` only when you know that no run since the last verified reset had the right to manage QoS, and then
         only a reset that removed no requirement skips it. `Condition.manages_qos` describes one condition: combine it
         over every run since the last verified reset (O33)."""
-        if since is not None and (isinstance(since, bool) or not isinstance(since, int | float) or not isfinite(since)):
-            raise ValueError("the history's since is a finite number of epoch seconds")
-        if isinstance(qos_baseline, str) or not all(isinstance(q, str) for q in qos_baseline):
-            raise ValueError("the QoS baseline is a collection of requirement ids")
-        if qos_rights is not None and not isinstance(qos_rights, bool):
-            raise ValueError("qos_rights is True, False, or None for a caller that does not say")
-        history_since = float(self._now() if since is None else since)
-        # what one stage hands a later one: the files a removed requirement applied to, why the quiet check runs (None:
-        # it is skipped), the depth of the deepest file of the space, the (file, provider) pairs the eviction emptied
-        # (collected as it lists them), the instant the eviction stage ended and the ended listings' first pages then
-        # (later, at the occupancy stage's accepted reading), the maps the settle ended on, the occupancy
-        run: dict[str, Any] = {
-            "affected": {},
-            "why": resetheld.quiet_reason(0, qos_rights),
-            "deepest": 0,
-            "evicted": set(),
-            "evicted_at": None,
-            "ended_head": {},
-            "own": set(),  # the ids of the jobs the reset sent or cancelled, all ended before the occupancy's wait
-            "settled": {},
-            "occupancy": {},
-            "qos_rights": qos_rights,
-        }
-        plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (evict or {}).items()}
-        bounds = dict(allowed or {})
-        for provider in [*plan, *bounds]:
-            self._p.check_eviction(provider)
-        if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in bounds.values()):
-            raise ProvisionError(f"{self._p.where}an allowed holding is a whole number of bytes, zero or more")
-        self._p.verify_space()
-        steps: dict[str, Callable[[], dict[str, Any]]] = {
-            "qos": lambda: self._qos(qos_baseline, run),
-            "qos_settle": lambda: self._qos_settle(run),
-            "transfers": lambda: self._transfers(run),
-            "eviction": lambda: self._evict(plan, run),
-            "occupancy": lambda: self._occupancy(bounds, run),
-            "quiet": lambda: self._quiet(run),
-            "history": lambda: self._history(history_since),
-        }
-        record: dict[str, Any] = {
-            "space": self._p.space.position,
-            "ok": False,
-            "stages": {},
-            "seconds": None,
-            "reads_retried": 0,
-        }
-        began, retried = self._p.clock(), self._p.reads_retried
-        for stage in STAGES:
-            started = self._p.clock()
-            try:
-                facts = steps[stage]()
-            except _FAILURES as error:
-                detail = NOT_IN_SPACE if isinstance(error, KeyError) else str(error)
-                seconds = round(self._p.clock() - started, 3)
-                record["stages"][stage] = {"ok": False, "seconds": seconds, **getattr(error, "facts", {})}
-                record["stages"][stage]["error"] = detail
-                record["seconds"] = round(self._p.clock() - began, 3)
-                record["reads_retried"] = self._p.reads_retried - retried
-                raise ResetFailed(
-                    f"{self._p.where}the reset failed at its {stage} stage ({type(error).__name__}): {detail}; "
-                    "the next run must not start",
-                    stage,
-                    record,
-                ) from None
-            record["stages"][stage] = {"ok": True, "seconds": round(self._p.clock() - started, 3), **facts}
-        record.update(ok=True, seconds=round(self._p.clock() - began, 3), reads_retried=self._p.reads_retried - retried)
-        return record
+        from expcore_onedata.resetspaces import ResetPlan, SpacesReset  # the driver builds on this module
+
+        plan = ResetPlan(evict, allowed, since=since, qos_baseline=qos_baseline, qos_rights=qos_rights)
+        return SpacesReset([self], concurrency=1).run_one(plan)
 
     # -- 1. QoS requirements, and 1a. their files settled (`resetqos.py`) -------------------
     def qos_requirements(self) -> frozenset[str]:
@@ -320,24 +276,35 @@ class SpaceReset:
         facts, run["settled"] = resetqos.settle(self._p, run["affected"], self._providers)
         return facts
 
-    def _quiet(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Read, at one instant, the block maps of the eviction plan's files and of the files a removed requirement
-        applied to, against what the eviction and the settle left; wait; read the occupancy and set it against the
-        occupancy stage's. It proves that no replica of the plan's files, and no occupancy growth, had landed by that
-        instant, and not that nothing lands after it. A transfer that ran or ended since the occupancy stage's wait
-        began fails it (O46): an eviction there can hide a growth in the second reading, and a job the occupancy
-        stage's own look at the listings missed, listed late, made its figure wrong. The listings are looked at
-        `transfer_settle_s` after the reading, by when a job that ended before it is listed (O07). Skipped, and
-        recorded so, for a caller that knows no run could have set a requirement, when none was removed."""
-        why, evicted = run["why"], run["evicted"]
-        if why is None:
-            return {"ran": False, "why": None, "qos_rights": run["qos_rights"], "files": 0, "waited_s": 0.0}
-        sizes = partial(physical_sizes, self._p, self._providers, retry=self._p.retry)  # read after the wait
+    # The quiet stage, in the steps `resetspaces` takes for every space, with one wait between each (`_quiet_*`).
+    def _quiet_skipped(self, run: dict[str, Any]) -> dict[str, Any] | None:
+        """The stage's record when it is skipped, for a caller that knows no run could have set a requirement, when
+        none was removed; None when it runs."""
+        if run["why"] is not None:
+            return None
+        return {"ran": False, "why": None, "qos_rights": run["qos_rights"], "files": 0, "waited_s": 0.0}
+
+    def _quiet_maps(self, run: dict[str, Any]) -> float:
+        """Read, at one instant T, the block maps of the eviction plan's files and of the files a removed requirement
+        applied to, against what the eviction and the settle left; return the instant the occupancy may be read at:
+        T and `resetqos.quiet_wait_s` for the deepest file a late replication could reach. It proves that no replica of
+        the plan's files, and no occupancy growth, had landed by T, and not that nothing lands after it."""
         depth = resetheld.quiet_depth(run["affected"], run["deepest"], run["qos_rights"])
-        expected = resetheld.expected_maps(run["settled"], evicted)
-        facts = resetqos.quiet(self._p, expected, sizes, run["occupancy"], depth=depth)
-        settle = self._p.settings.transfer_settle_s
-        self._p.sleep(settle)  # a job that ended by the reading is listed by now (O07)
+        facts = resetqos.quiet_maps(self._p, resetheld.expected_maps(run["settled"], run["evicted"]))
+        wait = resetqos.quiet_wait_s(depth)
+        run["quiet"] = {**facts, "waited_s": wait}
+        return self._p.clock() + wait
+
+    def _quiet_sizes(self, run: dict[str, Any]) -> None:
+        """After the wait, read the occupancy and set it against the occupancy stage's."""
+        sizes = physical_sizes(self._p, self._providers, retry=self._p.retry)
+        run["quiet"].update(resetqos.quiet_grown(self._p, sizes, run["occupancy"]))
+
+    def _quiet_look(self, run: dict[str, Any], after_s: float) -> dict[str, Any]:
+        """Look at the listings `after_s` (at least `transfer_settle_s`) after the reading, by when a job that ended
+        before it is listed (O07): a transfer that ran or ended since the occupancy stage's wait began fails the stage
+        (O46), since an eviction there can hide a growth in the reading, and a job the occupancy stage's own look
+        missed, listed late, made its figure wrong. Return the stage's record."""
         moved = self._moved(run["ended_head"], self._ended_heads(), run["own"])
         if moved:
             raise ProvisionError(
@@ -346,12 +313,12 @@ class SpaceReset:
             )
         return {
             "ran": True,
-            "why": why,
+            "why": run["why"],
             "qos_rights": run["qos_rights"],
-            "held_files": len({file_id for file_id, _ in evicted}),
+            "held_files": len({file_id for file_id, _ in run["evicted"]}),
             "held_source": resetheld.SOURCE,
-            **facts,
-            "listings_after_s": settle,
+            **run["quiet"],
+            "listings_after_s": after_s,
         }
 
     # -- 2. running transfers ---------------------------------------------------------
@@ -429,33 +396,19 @@ class SpaceReset:
                 f"{self._label(provider)}: {what}",
             )
 
-    def _transfers(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Cancel every job that has not ended, on every provider that lists it, until `transfer_settle_polls`
-        observations in a row show none, within twice that many. `cancelled` counts the distinct jobs the reset sent a
-        cancel to (one answered 400, a job that had just ended, included): the history's `ended` cannot hold one it
-        cancelled while still scheduled, which is given no finish time. Their ids join the reset's own
-        (`run["own"]`, O46)."""
-        settings = self._p.settings
-        cancelled: set[tuple[str, str]] = set()
-        clean = observations = 0
-        while True:
-            observations += 1
-            active = self._active()
-            fresh = [pair for pair in dict.fromkeys(active) if pair not in cancelled]
-            for provider, tid in fresh:
-                self._cancel(provider, tid)
-                cancelled.add((provider, tid))
-            self._wait_ended(fresh, "a cancelled transfer")
-            clean = 0 if active else clean + 1
-            if clean >= settings.transfer_settle_polls:
-                run["own"].update(tid for _, tid in cancelled)
-                return {"cancelled": len({tid for _, tid in cancelled}), "observations": observations}
-            if observations >= 2 * settings.transfer_settle_polls:
-                raise ProvisionError(
-                    f"the listings had not shown no transfer waiting or ongoing {settings.transfer_settle_polls} times "
-                    f"in a row after {observations} observations"
-                )
-            self._p.sleep(settings.transfer_settle_s)
+    def _observe(self, cancelled: set[tuple[str, str]]) -> bool:
+        """One observation of the transfers stage: cancel every job a provider lists as waiting or ongoing that the
+        stage has not cancelled yet, on that provider, and wait until each reports an ended state there; return whether
+        any job was listed. `cancelled` gathers the `(provider, transfer id)` pairs the stage sent a cancel to (one
+        answered 400, a job that had just ended, included), mutated on purpose: the driver counts the observations of
+        every space and decides when each has settled (`resetspaces.py`)."""
+        active = self._active()
+        fresh = [pair for pair in dict.fromkeys(active) if pair not in cancelled]
+        for provider, tid in fresh:
+            self._cancel(provider, tid)
+            cancelled.add((provider, tid))
+        self._wait_ended(fresh, "a cancelled transfer")
+        return bool(active)
 
     def _require_quiet(self) -> None:
         """Require the listings of every provider to show no transfer waiting or ongoing, observing again after the
@@ -524,52 +477,66 @@ class SpaceReset:
         return {"providers": out}
 
     # -- 4. occupancy -----------------------------------------------------------------
-    def _occupancy(self, allowed: Mapping[str, int], run: dict[str, Any]) -> dict[str, Any]:
-        """Wait until every eviction's and every ended transfer's change can show in the space root's physical size:
-        `resetqos.occupancy_wait_s` for the deepest regular file of the space, from the eviction stage's end (O46).
-        Then, with no transfer running, read each provider's physical size of the space, and keep the reading only when
-        no transfer ran or ended since the wait began (the ended listings' first pages, and the waiting and ongoing
-        listings, read after it): a job no stage sent may have, after the instant the wait counts from. Otherwise wait
-        again from when none runs, up to `OCCUPANCY_ROUNDS` waits in all. A listing shows a job up to
-        `transfer_settle_s` late (O07): when the quiet stage is skipped, the listings are looked at that long after the
-        reading, so the reading is kept only when it holds every job's change; when it runs, they are looked at at once,
-        and the quiet stage's own look, that long after its reading, against the same first pages, covers the rest and
-        fails the reset. Refuse a provider other than the data provider that holds more than it is allowed; keep the
-        sizes for the quiet re-check, which would otherwise hold the occupancy to a figure still showing evicted
-        bytes."""
-        depth = max(run["deepest"], 1)
-        settle = self._p.settings.transfer_settle_s if run["why"] is None else 0.0
-        anchor, before, waited, rounds = run["evicted_at"], run["ended_head"], 0.0, 0
-        while True:
-            rounds += 1
-            wait = max(0.0, anchor + resetqos.occupancy_wait_s(depth) - self._p.clock())
-            if wait > 0:
-                self._p.sleep(wait)
-                waited += wait
-            self._require_quiet()
-            sizes = physical_sizes(self._p, self._providers, retry=self._p.retry)
-            if settle > 0:
-                self._p.sleep(settle)  # a job that ended by the reading is listed by now (O07)
-            if not self._moved(before, self._ended_heads(), run["own"]):
-                break
-            if rounds == OCCUPANCY_ROUNDS:
-                raise ProvisionError(
-                    f"transfers kept ending or running during the occupancy stage's wait, {OCCUPANCY_ROUNDS} waits in "
-                    "all: no reading of the occupancy is shown to hold their changes"
-                )
-            self._require_quiet()  # a job ran or ended since the wait began: let it end, then wait from then
-            before, anchor = self._ended_heads(), self._p.clock()
-        run["occupancy"], run["ended_head"] = sizes, before  # the quiet stage looks for jobs since this wait began
+    # The occupancy stage, in the steps `resetspaces` takes for every space, with one wait between each
+    # (`_occupancy_*`). Its state is `run["occupancy_wait"]`: the instant the wait counts from, the first pages of the
+    # ended listings it holds the next look to, the seconds waited, the rounds and the last reading.
+    def _occupancy_due(self, run: dict[str, Any]) -> float:
+        """Begin a round and return the instant the occupancy may be read at: `resetqos.occupancy_wait_s` for the
+        deepest regular file of the space from the instant the wait counts from, the eviction stage's end in the
+        first round, by when every eviction's and every ended transfer's change can show in the space root's physical
+        size (O46)."""
+        state = run.setdefault(
+            "occupancy_wait", {"anchor": run["evicted_at"], "before": run["ended_head"], "waited": 0.0, "rounds": 0}
+        )
+        state["rounds"] += 1
+        return state["anchor"] + resetqos.occupancy_wait_s(max(run["deepest"], 1))
+
+    def _occupancy_read(self, run: dict[str, Any], waited: float) -> float:
+        """After a wait of `waited` seconds, with no transfer running, read each provider's physical size of the space.
+        Return how long after the reading the listings must be looked at, since a listing shows a job up to
+        `transfer_settle_s` late (O07): that long when the quiet stage is skipped, so a reading is kept only when it
+        holds every job's change; 0 when it runs, since the quiet stage's own look, that long after its reading and
+        against the same first pages, covers the rest and fails the reset."""
+        state = run["occupancy_wait"]
+        state["waited"] += waited
+        self._require_quiet()
+        state["sizes"] = physical_sizes(self._p, self._providers, retry=self._p.retry)
+        return self._p.settings.transfer_settle_s if run["why"] is None else 0.0
+
+    def _occupancy_look(self, run: dict[str, Any]) -> bool:
+        """Keep the reading (True) when no transfer ran or ended since the wait began: the ended listings' first
+        pages, and the waiting and ongoing listings, read now. Otherwise a job no stage sent changed the space after
+        the instant the wait counts from, and its change may not show: let it end, count the next wait from then, and
+        return False, up to `OCCUPANCY_ROUNDS` waits in all, then fail."""
+        state = run["occupancy_wait"]
+        if not self._moved(state["before"], self._ended_heads(), run["own"]):
+            return True
+        if state["rounds"] == OCCUPANCY_ROUNDS:
+            raise ProvisionError(
+                f"transfers kept ending or running during the occupancy stage's wait, {OCCUPANCY_ROUNDS} waits in "
+                "all: no reading of the occupancy is shown to hold their changes"
+            )
+        self._require_quiet()  # a job ran or ended since the wait began: let it end, then wait from then
+        state["before"], state["anchor"] = self._ended_heads(), self._p.clock()
+        return False
+
+    def _occupancy_kept(self, allowed: Mapping[str, int], run: dict[str, Any], after_s: float) -> dict[str, Any]:
+        """The reading kept: refuse a provider other than the data provider that holds more than it is allowed; keep
+        the sizes for the quiet re-check, which would otherwise hold the occupancy to a figure still showing evicted
+        bytes; return the stage's record, `after_s` being how long after the reading the listings were looked at."""
+        state = run["occupancy_wait"]
+        sizes = state["sizes"]
+        run["occupancy"], run["ended_head"] = sizes, state["before"]  # the quiet stage looks for jobs since this wait
         over = [p for p, held in sizes.items() if p != self._p.settings.holder and held > allowed.get(p, 0)]
         if over:
             where = ", ".join(self._label(p) for p in over)
             raise ProvisionError(f"{where} hold(s) bytes of the space beyond what the reset allows")
         return {
             "physical_bytes": {self._label(p): held for p, held in sizes.items()},
-            "waited_s": round(waited, 3),
-            "depth": depth,
-            "rounds": rounds,
-            "listings_after_s": settle,
+            "waited_s": round(state["waited"], 3),
+            "depth": max(run["deepest"], 1),
+            "rounds": state["rounds"],
+            "listings_after_s": after_s,
         }
 
     # -- 5. ended-transfer history ------------------------------------------------------

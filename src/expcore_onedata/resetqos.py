@@ -105,7 +105,7 @@ directory statistics off answers no physical size at all, and the occupancy stag
 """
 
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -394,24 +394,16 @@ def _held(maps: Maps, key: Pair) -> int:
     return held_bytes(list(maps.get(key, ())))
 
 
-def quiet(
-    p: Provisioner,
-    expected: Maps,
-    occupancy: Callable[[], Mapping[str, int]],
-    before: Mapping[str, int],
-    *,
-    depth: int,
-) -> dict[str, Any]:
-    """Read the block map of each (file, provider) pair of `expected`, wait `quiet_wait_s(depth)` from T, the instant
-    the last was read, and read the occupancy. Raise ProvisionError when a map holds more than `expected` says it should
-    (nothing, for a pair the eviction emptied; what the settle saw, for a file a removed requirement applied to), or
-    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`). The
-    occupancy is read whatever `expected` holds, none included: a replication on a file nothing here names shows in no
-    block map read, and only the occupancy shows it.
+def quiet_maps(p: Provisioner, expected: Maps) -> dict[str, Any]:
+    """The quiet stage's first read, at T: the block map of each (file, provider) pair of `expected`. Raise
+    ProvisionError when a map holds more than `expected` says it should (nothing, for a pair the eviction emptied; what
+    the settle saw, for a file a removed requirement applied to). The occupancy is read after it (`quiet_grown`)
+    whatever `expected` holds, none included: a replication on a file nothing here names shows in no block map read,
+    and only the occupancy shows it.
 
-    What this proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The occupancy
-    read at T + the lag + a margin shows every placement that landed by T. A landing after T is not proved absent: it
-    may not show in the occupancy yet, and no map is read again."""
+    What the two prove, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The
+    occupancy read at T + `quiet_wait_s` or later shows every placement that landed by T. A landing after T is not
+    proved absent: it may not show in the occupancy yet, and no map is read again."""
     maps = read_pairs(p, expected)
     more = grown(expected, maps)
     if more:
@@ -420,16 +412,17 @@ def quiet(
             f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to "
             f"hold more than the eviction or the settle left them, on {where}: a replica had landed by the quiet stage"
         )
-    wait = quiet_wait_s(depth)
-    p.sleep(wait)
-    sizes = occupancy()
+    return {"files": len({file_id for file_id, _ in expected}), "block_maps": len(maps)}
+
+
+def quiet_grown(p: Provisioner, sizes: Mapping[str, int], before: Mapping[str, int]) -> dict[str, Any]:
+    """The quiet stage's second read, the occupancy `sizes` read at least `quiet_wait_s` after T: raise ProvisionError
+    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`)."""
     over = [q for q, size in sizes.items() if q != p.settings.holder and size > before.get(q, 0)]
     if over:
         where = ", ".join(p.client.provider_label(q) for q in over)
         raise ProvisionError(f"{where} hold(s) more of the space after the quiet wait than at the occupancy stage")
-    physical = {p.client.provider_label(q): n for q, n in sizes.items()}
-    files = {file_id for file_id, _ in expected}
-    return {"files": len(files), "block_maps": len(maps), "waited_s": wait, "physical_bytes": physical}
+    return {"physical_bytes": {p.client.provider_label(q): n for q, n in sizes.items()}}
 
 
 __all__ = [
@@ -442,7 +435,8 @@ __all__ = [
     "occupancy_lag_s",
     "occupancy_wait_s",
     "plain_id",
-    "quiet",
+    "quiet_grown",
+    "quiet_maps",
     "quiet_wait_s",
     "requirements_of",
     "scan",
