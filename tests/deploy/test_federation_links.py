@@ -144,7 +144,7 @@ def test_without_a_template_up_checks_nothing_and_says_why(fed, fedlinks, tmp_pa
 def test_pairs_and_no_link_check_refuse_up(fed, fedlinks, tmp_path, monkeypatch):
     """O35: Pairs and no link check refuse up."""
     layout = layout_with(fed, tmp_path, monkeypatch, lambda d: two_providers(d, link_check=False), probe=False)
-    with pytest.raises(RuntimeError, match=r"1 provider pair\(s\) and no \[link_check\]"):
+    with pytest.raises(RuntimeError, match=r"2 provider pair\(s\) and no \[link_check\]"):
         fedlinks.check_after_up(layout, {})
 
 
