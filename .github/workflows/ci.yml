@@ -16,9 +16,12 @@ on:
 permissions:
   contents: read
 
-# A newer run on the same ref supersedes an older one that is still going.
+# A newer run for the same pull request supersedes an older one that is still going: each pull request run checks the
+# whole range from its base to its head, so the newer run covers everything the older one did. A push to main and a
+# manual dispatch each get a group of their own and are never cancelled: a push run checks only the commits since the
+# previous push, so a cancelled one (or one replaced while pending) would leave its commits unchecked for good.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 env:
