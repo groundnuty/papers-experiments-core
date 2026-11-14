@@ -56,14 +56,29 @@ class LinkSettling:
     _labels: dict[str, str]
     _healed: set[str]
     _deadline: float | None
+    _quiet_until: float | None
     journal: InjectionJournal
     links_detail: str | None
     restore_record: dict[str, Any]
     settle: Callable[..., Any]
     wait: Callable[..., Observation | None]
 
+    def hold(self, seconds: float) -> None:
+        """Mark that nothing may read through the links for `seconds` from now: a heal sends it before and after every
+        restart, so a later gate read or link check of this recovery, even one after an interrupted heal, waits until
+        the settle could have ended (`_await_quiet`)."""
+        self._quiet_until = self._clock() + seconds
+
+    def _await_quiet(self) -> None:
+        """Wait out what is left of the latest held settle, before any gate read or link check."""
+        until = self._quiet_until
+        if until is not None and self._clock() < until:
+            self._sleep(until - self._clock())
+
     def _gate(self, service: str, gate_probe: str | None, timeout_s: float | None = None) -> dict[str, Any]:
-        """The session gate for a provider's service, polled within `gate_timeout_s`, or `timeout_s` when shorter."""
+        """The session gate for a provider's service, polled within `gate_timeout_s`, or `timeout_s` when shorter;
+        never before a held settle has ended."""
+        self._await_quiet()
         bound = self._settings.gate_timeout_s if timeout_s is None else timeout_s
         return await_sessions(self._driver, service, gate_probe, bound, self._settings.poll_s, self._clock, self._sleep)
 
@@ -131,6 +146,7 @@ class LinkSettling:
             gate=lambda reader, timeout_s: self._gate(reader, gate_probe, timeout_s),
             transfers=self._active_transfers,
             restart_container=restart,
+            hold=self.hold,
             clock=self._clock,
             sleep=self._sleep,
         ).run()
@@ -147,7 +163,9 @@ class LinkSettling:
         return None if read is None else read()
 
     def _matrix(self, service: str) -> LinkMatrix:
-        """A fresh link check of every pair, as a matrix; one that cannot be read raises."""
+        """A fresh link check of every pair, as a matrix, never before a held settle has ended; one that cannot be
+        read raises."""
+        self._await_quiet()
         read = getattr(self._driver, "link_matrix", None)
         matrix = read(service) if read is not None else None
         if not isinstance(matrix, LinkMatrix):
@@ -157,7 +175,9 @@ class LinkSettling:
     def _stuck_links(self, service: str) -> tuple[str | None, LinkMatrix | None]:
         """The link check of every ordered pair after a restore, when the driver has one: as a matrix
         (`ComposeDriver.link_matrix`), or as a detail alone (`restored_links`); None when each passed, else why not,
-        with the matrix when there is one. A check that raises fails closed, with no matrix to heal from."""
+        with the matrix when there is one. A check that raises fails closed, with no matrix to heal from. Never before
+        a held settle has ended."""
+        self._await_quiet()
         try:
             read = getattr(self._driver, "link_matrix", None)
             matrix = read(service) if read is not None else None

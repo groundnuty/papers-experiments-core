@@ -987,3 +987,26 @@ def test_o35_a_heals_container_restart_ends_its_waits_at_its_budget_with_the_sta
     assert acted(services, "stop", "start") == [("stop", READER), ("start", READER)]
     (open_,) = recovery.entries()
     assert open_["target"] == READER
+
+
+def test_o35_an_interrupted_heal_leaves_no_read_before_its_settle_could_end(tmp_path):
+    """O35: a heal interrupted right after a link restart was sent (an interrupt, an exit) skips its settle, so the
+    restart is held before it is sent: the next clear of the same injector reads no gate and checks no pair until that
+    settle could have ended."""
+    services = stale()
+    original = services.restart_link
+
+    def interrupted(service):
+        original(service)
+        raise KeyboardInterrupt
+
+    services.restart_link = interrupted
+    injector_, services = injector(tmp_path, services, heal="link_then_container")
+    injector_.start(RUN)
+    with pytest.raises(KeyboardInterrupt):
+        injector_.clear()
+    stopped, checks = services.clock.now, len(services.checked_at)
+    injector_.clear()
+    later = services.checked_at[checks:]
+    assert later
+    assert min(later) >= stopped + 30  # the settle, at least, before any check

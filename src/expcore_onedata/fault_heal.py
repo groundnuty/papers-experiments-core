@@ -28,8 +28,9 @@ or at the settle's end.
    (an active transfer fails it closed), then the session gate of the restored provider, then every ordered pair,
    with fresh probes.
 
-The settle is enforced after every restart that was sent, in both modes: an interrupted sequence, an unverified
-container restart and a step that raised all get it before the heal returns.
+The settle is enforced after every restart that was sent, in both modes, an interrupted sequence and an unverified
+container restart included. Each restart is held before it is sent (`hold`, `Recovery.hold`), so a heal interrupted
+mid-step leaves the settle held, and the next gate read or link check of that recovery waits until it could have ended.
 
 If a pair still fails, the **container fallback**: the readers of the stuck pairs, one at a time in label order, each
 container restarted by the injector's own stop and start (`Recovery.restart_container`: journalled as an injection of
@@ -124,6 +125,7 @@ class LinkHeal:
         gate: Callable[[str, float], dict[str, Any]],
         transfers: Callable[[], int | None],
         restart_container: Callable[[str, str, float], dict[str, Any]],
+        hold: Callable[[float], None],
         clock: Callable[[], float],
         sleep: Callable[[float], None],
         utc: Callable[[], str] = _utc,
@@ -134,6 +136,7 @@ class LinkHeal:
         self._all_links_cost, self._container_cost = all_links_s, container_s
         self._margin_s = 3 * command_s  # past a container restart's budget: a start in flight and one reading
         self._matrix, self._gate, self._transfers, self._restart = matrix, gate, transfers, restart_container
+        self._hold = hold  # marks that nothing may read through the links for that many seconds from now
         self._clock, self._sleep, self._utc = clock, sleep, utc
         self._actions: list[dict[str, Any]] = []
         self._skipped: list[dict[str, str]] = []
@@ -195,14 +198,22 @@ class LinkHeal:
         self._record(label, "ping", "pong" if pong else "no_pong", start)
         return pong
 
-    def _restart_link(self, label: str, service: str) -> str:
-        """One link restart, recorded by its result word; never issued twice to a provider in a restore."""
+    def _sent(self, label: str, service: str) -> str:
+        """Send one link restart, the settle held first, so that even a restart interrupted mid-command leaves no read
+        before its settle could end (`hold`), and again from its return; never issued twice to a provider."""
         self._linked.add(label)
-        start = self._utc()
+        self._hold(self._restart_cost)  # its lookup, its RPC and the settle: the longest it could need
         try:
             result = str(self._driver.restart_link(service))
         except DriverError:
             result = "not_run"
+        self._hold(self._settle_s)
+        return result
+
+    def _restart_link(self, label: str, service: str) -> str:
+        """One link restart of the all-links sequence, recorded by its result word."""
+        start = self._utc()
+        result = self._sent(label, service)
         self._record(label, "restart_link", result, start)
         return result
 
@@ -253,20 +264,14 @@ class LinkHeal:
         if not self._fits(cost):
             return "links_stuck", before, f"heal_timeout_s leaves no time for the {action} on {label}"
         start, extra = self._utc(), {}
-        try:
-            if action == "restart_link":
-                self._linked.add(label)
-                try:
-                    result = str(self._driver.restart_link(service))
-                except DriverError:
-                    result = "not_run"
-            else:  # its waits end by what its reserve leaves after the margin and the settle: never past the bound
-                budget = max(0.0, self._left() - self._margin_s - self._settle_s)
-                done = self._restart(label, service, budget)
-                result, extra = str(done.get("how")), {"serves_after_s": done.get("serves_after_s")}
-        except Exception:
-            self._settle()  # whatever broke after the restart was sent, nothing reads through it before the settle
-            raise
+        if action == "restart_link":
+            result = self._sent(label, service)
+        else:  # its waits end by what its reserve leaves after the margin and the settle: never past the bound
+            budget = max(0.0, self._left() - self._margin_s - self._settle_s)
+            self._hold(self._container_cost)  # held before the stop: an interrupted restart still leaves no read early
+            done = self._restart(label, service, budget)
+            self._hold(self._settle_s)
+            result, extra = str(done.get("how")), {"serves_after_s": done.get("serves_after_s")}
         settled = self._settle()  # enforced after every restart sent, a failed or unverified one included
         if action != "restart_link" and done.get("ok") is not True:
             self._record(label, action, result, start, settle_s=settled, **extra)
@@ -302,15 +307,11 @@ class LinkHeal:
         if not self._fits(self._all_links_cost - pinged):
             return "links_stuck", before, "heal_timeout_s leaves no time for the all-links restarts"
         opened, interrupted = self._utc(), None
-        try:
-            for index, label in enumerate(labels):  # one after another, nothing fetched in between
-                if index and not self._no_transfers("between", wait=False):  # a transfer could dial a restarted link
-                    interrupted = f"a transfer became active during the all-links sequence, before {label}'s restart"
-                    break
-                self._restart_link(label, self._services[label])
-        except Exception:
-            self._settle()  # whatever broke after a restart was sent, nothing reads through it before the settle
-            raise
+        for index, label in enumerate(labels):  # one after another, nothing fetched in between
+            if index and not self._no_transfers("between", wait=False):  # a transfer could dial a restarted link
+                interrupted = f"a transfer became active during the all-links sequence, before {label}'s restart"
+                break
+            self._restart_link(label, self._services[label])
         settled = self._settle()  # enforced once any restart was sent, an interrupted sequence included
         self._window = {"start_utc": opened, "end_utc": self._utc(), "settle_s": settled}
         if interrupted is not None:

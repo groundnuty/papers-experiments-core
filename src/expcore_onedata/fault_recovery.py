@@ -189,6 +189,7 @@ class Recovery(LinkSettling):
         self.restore_record: dict[str, Any] = {}  # the latest settling's gate reading and heal record (O35)
         self._labels = dict(labels or {})
         self._deadline: float | None = None  # while a heal's container restart runs: the clock time it must end by
+        self._quiet_until: float | None = None  # the end of the latest settle a heal held: no gate read or check before
         self._healed: set[str] = set()  # the injections this recovery healed once already: never twice
 
     def entries(self, target: str | None = None) -> list[dict[str, Any]]:
