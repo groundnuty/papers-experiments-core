@@ -547,7 +547,44 @@ A run can write a file beside its record that the analysis reads, a compressed l
 
 `check` then hashes every file of a declared name in the batch into its inputs, never replays one, and pairs each with the one record in its directory: the attempt directory, which holds one record. It refuses, naming the file, a record that names a side file by its hash with no such file beside it, a side file whose bytes do not have the hash its own record names (two side files swapped included), a side file in a directory with no record, left from an earlier campaign or attempt, a side file beside a record that names no hash for it, and a hash that is not 64 lower-case hexadecimal digits. A record with neither the hash nor the file is fine: that run made no side file. The side files are looked for in the batch the check parses, wherever `--study` puts the study. The check records the declaration under `side_files`, and `analyze` and `report` refuse a check made under another, refuse a side file changed, removed or added since the check, and pair each side file with its record again. The declaration is in `study.toml`, whose hash is in the campaign fingerprint, so a campaign resumed under another declaration is refused.
 
-An attempt killed between writing its side file and writing its record leaves a side file with no record, which `check` refuses until you remove it.
+Place each side file with the helper, `stage_side_file` and `StagedSideFile.commit` of `expcore.replay.side_file_placement`, never by writing it to its final name yourself. It collects the file from the sandbox's `/work` through `sandbox.collect`, so the copy keeps the sandbox's guarantees (never a link or a special file of the agent's making), writes it into `request.run_dir` under a temporary dot-name, and returns its SHA-256 for the record. You put that hash in the record's `hash_field`, write the record, and only then `commit`, which renames the file to its declared name and refuses to while the record on disk does not name it. It refuses a name `study.toml` does not declare and a file over the cap, before it writes anything, and returns `None` when the run made no file, so the record then holds no hash:
+
+```python
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+from expcore.records.record import record_filename
+from expcore.replay.side_file_placement import stage_side_file
+from expcore.replay.side_files import SideFile
+
+declared = [SideFile("extent_ranges.json.gz", "instruments.extent.side_sha256")]  # what `study.side_files` holds
+
+
+class StandInSandbox:
+    """What `DockerSandbox.collect(dest, outputs=[...])` does: the named files of /work arrive in `dest/work/`."""
+
+    def collect(self, dest_dir, outputs=()):
+        for name in outputs:
+            Path(dest_dir, "work", name).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest_dir, "work", name).write_bytes(b"the ranges the run read")
+        return {"outputs": dict.fromkeys(outputs, True)}
+
+
+run_dir = Path(tempfile.mkdtemp()) / "try1"  # `request.run_dir` of an attempt
+request = SimpleNamespace(run_dir=run_dir, identity=SimpleNamespace(run_key="task=lake|seed=1", attempt=1))
+staged = stage_side_file(StandInSandbox(), request, declared, "extent_ranges.json.gz")  # 1: the temporary file
+assert staged is not None and sorted(p.name for p in run_dir.iterdir()) == [".extent_ranges.json.gz.tmp-1"]
+snapshot = {"ok": True, "side_sha256": staged.sha256}  # the instrument's reading, which the record holds
+record_file = run_dir / record_filename("task=lake|seed=1", 1)
+# 2: the record, which names the hash (stands for `record.write(request.run_dir)`)
+record_file.write_text(json.dumps({"instruments": {"extent": snapshot}}))
+staged.commit()  # 3: the rename, refused until the record names the hash
+assert {p.name for p in run_dir.iterdir()} == {record_file.name, "extent_ranges.json.gz"}
+```
+
+The order is what lets a kill be recovered, and `check` does the recovery: it never refuses a state the study did not cause, and never accepts a wrong file. An attempt killed after the temporary file and before its record leaves a dot-name that `check` never reads and then removes, since no record names it (once it holds the campaign's lock, so that it cannot remove the file of an attempt that is still running). One killed after the record and before the rename leaves a record whose hash has no file beside it, which would be a refusal, so `check` first renames the temporary file, when its SHA-256 is the one that one record names (and nothing lies at the declared name), and then pairs it like any other side file. One killed after the rename is complete. The rule, including what a `check --partial` leaves alone and what a running campaign's check can still refuse, is in [`interfaces.md`](interfaces.md#placing-a-side-file-beside-its-record).
 
 A side file may hold at most 64 MiB (`expcore.replay.side_files.MAX_SIDE_FILE_BYTES`), since the analysis reads each one whole into memory to hand it to the scorers ([section 5](#5-score-and-analyse)). `check` fails a larger one at stage `side_file`, and `analyze` refuses one that grew past the cap after the check, having read no more than one byte beyond it. Keep a larger log compressed, or split it into side files of their own names.
 

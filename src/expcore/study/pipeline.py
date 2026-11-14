@@ -43,6 +43,7 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 """
 
 import collections
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -60,6 +61,7 @@ from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
+from expcore.campaign.lock import CampaignLocked, DispatchLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
@@ -95,6 +97,7 @@ from expcore.replay.check import (
     write_check,
 )
 from expcore.replay.native import has_native_parser
+from expcore.replay.side_file_placement import settle_side_files
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
@@ -424,12 +427,36 @@ def _check_batch_of(
         running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
     except SnapshotError as error:
         raise Refused(str(error)) from None
+    _settle_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
     )
     check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
     write_check(directory, check)
     return check
+
+
+def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
+    """Finish or remove what a kill left of the placement of a declared side file in the batch (R15), and say so.
+
+    A temporary file no record names is removed only while this process holds the lock of the campaign the batch
+    belongs to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with
+    no dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released.
+    A lock that cannot be taken (a campaign runs, or the file system refuses `flock`), or a batch that is not the
+    study's own, leaves such a file where it is; a rename that a record names is finished either way. A study that
+    declares no side file is not touched at all.
+    """
+    if not study.side_files:
+        return
+    lock = DispatchLock(out_dir(study))
+    if Path(batch).resolve().is_relative_to(out_dir(study).resolve()):
+        with contextlib.suppress(CampaignLocked):  # a dispatcher is alive: only what the records name is finished
+            lock.acquire()
+    try:
+        for settled in settle_side_files(batch, study.side_files, remove_unnamed=lock.held):
+            print(f"check: {settled}", file=sys.stderr)
+    finally:
+        lock.release()
 
 
 def _check_merged(
