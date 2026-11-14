@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from shard_rehearsal_support import apart_from_where_and_when, without_dispatch_positions
+from shard_rehearsal_support import ORDER_FIELDS, SHARD_FIELDS, apart_from_where_and_when, without_dispatch_positions
 from shard_scale_support import (
     LAYOUT_21,
     LAYOUT_27,
@@ -48,7 +48,7 @@ from shard_scale_support import (
     run_process,
     run_reservation_usd,
 )
-from shard_support import MERGED_ONLY, keys_of_shard, without_shard_section
+from shard_support import MERGE_TIMES, MERGED_ONLY, keys_of_shard, without_shard_section
 from study_support import clean_environment
 
 from expcore.campaign.resume import FINGERPRINT_KEY
@@ -336,6 +336,8 @@ def test_c29_the_merged_export_differs_from_one_drivers_only_in_the_documented_s
     """C29: the merged export is the unsharded one but for what a merge adds (`SHARD_ONLY`: each run's shard tag, the
     shards' own retries, merge.json's list, each analysed attempt's wall time and turn latencies) and what is a
     driver's own order (`PER_DRIVER`); its run set is the same runs, at the same attempts, ending the same way."""
+    assert set(SHARD_ONLY) == {*SHARD_FIELDS, *MERGE_TIMES}  # what the comparison below leaves out, and nothing more
+    assert set(PER_DRIVER) == set(ORDER_FIELDS)
     one, many = read(rehearsal.a_ref.root, "export.json"), read(rehearsal.a_merged, "export.json")
     assert list(many) == [*one, *MERGED_ONLY]
     assert apart_from_where_and_when(many) == apart_from_where_and_when(one)
@@ -365,9 +367,10 @@ def test_c29_the_merged_batch_names_27_shards_by_label_with_every_run_once(rehea
 
 
 def test_the_merge_of_27_batches_holds_no_more_memory_than_one_drivers_check_and_analysis(rehearsal):
-    """The merge reads one shard's store at a time and replays its records as `check` does, so its peak memory is the
-    check's, not 27 stores at once; the merged analysis holds every snapshot, as one driver's holds its one store, and
-    peaks within a quarter more than one driver's."""
+    """A tripwire, not a measurement: the merge reads one shard's store at a time and replays its records as `check`
+    does, so its peak memory stays the check's, not 27 stores at once; the merged analysis holds every snapshot, as
+    one driver's holds its one store, and peaks within a quarter more than one driver's. At the default size both are
+    near the processes' import baseline; at 1200 runs (`EXPCORE_SCALE_TASKS=75`) the margin means something."""
     merged, alone = rehearsal.finished["a merged"], rehearsal.finished["a unsharded"]
     peak = {name: done.measured[0] for name, done in merged.items()}
     assert peak["merge"] <= 1.25 * alone["check"].measured[0], peak
