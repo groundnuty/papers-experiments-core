@@ -21,7 +21,7 @@ other probe of the pair, a lower generation or a retired one, is superseded, and
 has no current one. This is the choice `linkprobe.ProbeFiles.provision` makes, and it reads a generation as
 `linkprobe.generation_of` does, which stops at nine digits. A probe named with ten or more (the writer has no bound, but
 a billion failed fetches of one pair is out of reach) is the check's own file and never `current`, since `provision`
-does not look at it; it is `superseded`, with every other probe that is not current.
+does not look at it, and no `purge` deletes it; it is `superseded`, with every other probe that is not current.
 """
 
 import re
