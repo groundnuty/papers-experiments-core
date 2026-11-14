@@ -342,6 +342,7 @@ class FaultInjector:
         unsettled = self._recover(heal=self._holds_exclusive())  # under the exclusive admission just taken
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
             raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
+        self._wait_owed()  # a recovery's drain is satisfied before this run takes anything down
         self._await_drain()  # the record is read after the journal was: see `_await_drain`
         self._lock = self._journal.try_lock(self.target)
         if self._lock is None:
@@ -370,6 +371,18 @@ class FaultInjector:
             raise self._fail(f"{self.target} could not be taken down, seen down and journalled ({why})") from None
         self._injection["injected"] = True
         self._step("injected", True, identity_before_sha256=digest)
+
+    def _wait_owed(self) -> None:
+        """When this start's recovery restored a provider an earlier run left down, wait out the drain it owes before
+        the start goes on: that run's sessions may still hold on-demand jobs on the local provider, and this run's reads
+        must not meet them. Recorded as a `recovery_drain` step. The wait is the admission's own plan (`SessionDrain.wait`),
+        so it counts what the recovery already took."""
+        admission = self._exclusive_admission()
+        drain = None if admission is None else admission.drain
+        if drain is None or not drain.owing:
+            return
+        record = drain.wait()
+        self._step("recovery_drain", True, drain_s=record["drain_s"], waited_s=round(record["waited_s"], 3))
 
     def _await_drain(self) -> None:
         """Wait, inside `admission_timeout_s` and until cancelled, for the federation's drain record to pass. It is read

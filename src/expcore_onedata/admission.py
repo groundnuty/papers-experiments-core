@@ -385,7 +385,7 @@ class FederationLock:
         )
         token = _ADMISSION.set(admission)
         try:
-            if not exclusive:
+            if not exclusive or purpose == EXCLUSIVE_RUN:  # an outage run settles the journal itself, under its lock
                 self._require_settled()
             # the record is read again after the journal was: a restore that cleared an injection without this lock (the
             # health gate's, of a stuck holder's) wrote its record first, so an admission that finds the journal

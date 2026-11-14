@@ -187,6 +187,12 @@ class SessionDrain:
             self._armed = True
             self._owed = since if self._owed is None else max(self._owed, since)
 
+    @property
+    def owing(self) -> bool:
+        """Whether a recovery has noted sessions of an earlier run that this drain owes the full wait for (`owe`)."""
+        with self._lock:
+            return self._owed is not None
+
     def _set(self, clock: Callable[[], float] | None, sleep: Callable[[float], None] | None) -> None:
         if clock is not None:
             self.clock = clock

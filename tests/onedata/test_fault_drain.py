@@ -33,6 +33,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore_onedata.admission import (
     _STRANDED,
+    EXCLUSIVE_RUN,
     FEDERATION_LOCK,
     OUTAGE_RUN,
     FederationBusy,
@@ -677,7 +678,12 @@ def test_o11_a_start_that_recovers_a_crashed_runs_injection_owes_its_drain_whate
         plan = admission.drain.plan()
         assert plan.basis == "restore_start"
         assert plan.until == pytest.approx(began + DRAIN_S, abs=2.0)
-    assert lock.drain_left() > DRAIN_S - 10
+        # the start did not return before the drain its own recovery owes was over, so this run takes nothing down
+        # while the earlier run's sessions may still hold jobs
+        assert clock.now - began >= DRAIN_S - 5
+        owed = step(injector, "recovery_drain")
+        assert owed["ok"] is True
+        assert owed["waited_s"] == pytest.approx(DRAIN_S, abs=5.0)
 
 
 def test_o11_a_recovery_that_holds_no_admission_still_closes_the_federation_for_the_drain(tmp_path):
@@ -1071,3 +1077,29 @@ def test_o11_the_gates_recovery_after_the_holder_went_runs_under_the_lock_it_tak
     assert seen
     assert all(seen)  # under the lock it took: nothing was admitted while it restored
     assert lock.drain_left() == pytest.approx(DRAIN_S, abs=2.0)  # and the federation went into the drain
+
+
+def test_o11_an_exclusive_control_settles_the_journal_before_it_reads_the_record_again(tmp_path, monkeypatch):
+    """O11: a control with no fault holds the federation exclusively and has no injector to settle the journal for it:
+    like a shared run it refuses an unsettled one, and reads the record again after it, so a restore that cleared the
+    journal without the lock (the health gate's, of a stuck holder's) and wrote its record first cannot be raced."""
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, admission_timeout_s=0.3)
+    lock = FederationLock(settings_of(platform))
+    original = FederationLock._require_settled
+
+    def after_the_restore_wrote_its_record(self):
+        self.hold_for(30)
+        original(self)
+
+    monkeypatch.setattr(FederationLock, "_require_settled", after_the_restore_wrote_its_record)
+    with pytest.raises(FederationBusy), lock.held(exclusive=True, timeout_s=0.3, purpose=EXCLUSIVE_RUN):
+        pytest.fail("admitted inside the drain")
+
+
+def test_o11_an_exclusive_control_is_refused_while_an_injection_is_unsettled(tmp_path):
+    """O11: an injection a crashed run left open means the federation is not in its baseline state: a control that
+    holds it exclusively is refused, as a shared run is, naming the target by its label."""
+    platform, _ = crashed(tmp_path, poll_s=0.01, ready_timeout_s=5)
+    lock = FederationLock(settings_of(platform))
+    with pytest.raises(InfraError, match="unsettled"), lock.held(exclusive=True, timeout_s=1, purpose=EXCLUSIVE_RUN):
+        pytest.fail("admitted on a federation with an injection open")
