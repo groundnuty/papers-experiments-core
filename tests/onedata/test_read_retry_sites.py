@@ -53,7 +53,7 @@ PLUMBING = {
     # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): the counter, and every file's block
     # map at each provider that can hold the space's bytes
     ("reset.py", "SpaceReset._holdings", "holdings"): ["self._p.retry"],
-    ("occupancy.py", "read_files", "provisioner.blocks"): ["p.retry"],
+    ("occupancy.py", "_held", "provisioner.blocks"): ["p.retry"],
     # the reset's QoS stages (O33): the scans, each requirement's record, and the settle's and the quiet stage's
     # block maps, whose failure fails the stage (a read that fails is no poll that did not match)
     ("resetqos.py", "_summary", "client.get"): ["p.retry"],

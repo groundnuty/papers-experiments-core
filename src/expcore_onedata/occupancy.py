@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from expcore_onedata import consistency
+from expcore_onedata.client import PlatformError
 from expcore_onedata.placement import held_bytes, merged
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
@@ -146,7 +147,7 @@ def _files_at(regular: Mapping[str, Collection[str]], provider: str) -> list[str
 def read_files(p: Provisioner, wanted: Mapping[str, Sequence[str]], label: Label) -> dict[str, dict[str, int]]:
     """The bytes each file's block map holds at each provider, read there, `concurrency` at a time; raise
     ProvisionError, closed and with the figures, past `READS_MAX` reads or `READ_BOUND_S`."""
-    pairs = [(file_id, provider) for provider, ids in wanted.items() for file_id in ids]
+    pairs = [(file_id, provider, i) for provider, ids in wanted.items() for i, file_id in enumerate(ids)]
     where = ", ".join(f"{label(q)}: {len(ids)} file(s)" for q, ids in wanted.items())
     if len(pairs) > READS_MAX:
         raise ProvisionError(
@@ -162,12 +163,24 @@ def read_files(p: Provisioner, wanted: Mapping[str, Sequence[str]], label: Label
                 f"its bound ({where}); the directory statistics alone are no verdict"
             )
         chunk = pairs[start : start + step]
-        sizes = consistency.bounded_map(
-            lambda key: held_bytes(merged(p.blocks(key[0], key[1], retry=p.retry))), chunk, p.settings.concurrency
-        )
-        for (file_id, provider), size in zip(chunk, sizes, strict=True):
+        sizes = consistency.bounded_map(lambda key: _held(p, key, label), chunk, p.settings.concurrency)
+        for (file_id, provider, _), size in zip(chunk, sizes, strict=True):
             held[provider][file_id] = size
     return held
+
+
+def _held(p: Provisioner, key: tuple[str, str, int], label: Label) -> int:
+    """The bytes one file's block map holds at one provider, read there. A map that cannot be read, an error or a
+    missing provider in the answer included, is unknown and raises, naming the provider and the file's position: it
+    never counts as 0."""
+    file_id, provider, index = key
+    try:
+        return held_bytes(merged(p.blocks(file_id, provider, retry=p.retry)))
+    except PlatformError as error:
+        raise Unreadable(
+            f"the block map of files[{index}] at {label(provider)} is unknown ({error}): the occupancy's per-file "
+            "reading has no verdict, and the directory statistics alone are none"
+        ) from None
 
 
 def holdings(

@@ -194,3 +194,47 @@ def test_o46_the_file_reads_are_bounded_and_fail_closed_with_the_figures(
     with pytest.raises(ResetFailed, match=r"occupancy stage") as caught:
         SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=False)
     assert f"needs {len(FILES)} block-map read(s), past its budget of {len(FILES) - 1}" in str(caught.value)
+
+
+ERROR_BACKEND = {"success": True, "distributionPerStorageBackend": {"storage-1": {"success": False, "error": {}}}}
+NULL_BACKEND = {"success": True, "distributionPerStorageBackend": {"storage-1": {"blocks": None, "physicalSize": None}}}
+
+
+@pytest.mark.parametrize("shape", ["error", "null", "missing"])
+def test_o46_a_block_map_that_is_unknown_never_counts_as_0(
+    client, config, platform_file, ticker, tmp_path, fake, shape
+):
+    """O46, O08: a file's distribution that answers beta's storage as failed, with no size, gives its blocks and size
+    as null, or leaves beta out says nothing of what beta holds there (data_distribution_translator.erl): the reset
+    fails at its occupancy stage, naming the file's position and the provider, and never passes beta as holding 0."""
+    for path in FILES:
+        fake.blocks.pop((fake.id_of(path), BETA_ID))
+    if shape == "missing":
+        fake.omit_providers = {BETA_ID}
+    else:
+        fake.distribution_entries[(fake.id_of(FILES[2]), BETA_ID)] = ERROR_BACKEND if shape == "error" else NULL_BACKEND
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"occupancy stage") as caught:
+        SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
+    position = "files[0]" if shape == "missing" else "files[2]"
+    assert f"the block map of {position} at providers[1] is unknown" in str(caught.value)
+
+
+def test_o46_a_counter_that_is_null_is_unknown_never_0(client, config, platform_file, ticker, tmp_path, fake):
+    """O46, O08: the space root's distribution can answer a provider's physical size as null; that is unknown, and the
+    reset fails at its occupancy stage rather than read it as 0, though every file's map was read."""
+    for path in FILES:
+        fake.blocks.pop((fake.id_of(path), BETA_ID))
+    original = fake._distribution
+
+    def null_root(node):
+        answer = original(node)
+        if node.file_id == ROOT_ID:
+            backends = answer["distributionPerProvider"][BETA_ID]["distributionPerStorageBackend"]
+            backends["storage-1"]["physicalSize"] = None
+        return answer
+
+    fake._distribution = null_root
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"occupancy stage.*physical size of the space is unknown"):
+        SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)

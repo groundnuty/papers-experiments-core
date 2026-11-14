@@ -44,7 +44,10 @@ read and every check is made on each provider that supports the space, since eac
    space root's physical size as late as a placement's (the 14 Nov live slot saw a drop 20.03 s after an eviction at
    depth 3 was scheduled), and every eviction and every transfer, the reset's and an earlier run's, had ended by that
    instant, with none running. Then, with no transfer running on any provider (the listings are read again), the
-   space root's distribution gives each provider's physical size, the bytes its storage holds of the space; never the
+   occupancy is read (`occupancy.py`): every regular file's block map at each provider that can hold the space's bytes,
+   read there and summed, which is the verdict, and the space root's distribution beside it, its per-provider
+   physical size, a directory-statistics counter that is wrong in both directions and never the sole verdict (it
+   stayed 1 MiB high for good after an eviction, and read 0 for 9.534 s while a placement was held); never the
    logical figures, which lag. The reading is kept only when no transfer ran or ended since the wait began: the first
    page of each provider's ended listing, newest first by finish time, read at the eviction stage's end and again
    after the reading, holds no new job, and no transfer is waiting or ongoing. Otherwise a job no stage sent changed
@@ -54,17 +57,21 @@ read and every check is made on each provider that supports the space, since eac
    when the quiet stage is skipped, else the quiet stage's, after its own reading and against the same first pages,
    which fails the reset on a job either look missed. The reset's own jobs, the evictions it sent and the jobs it
    cancelled, all seen to end before the wait, never count as new, however late they are listed. A provider other
-   than the data provider that holds more than the caller allows (nothing by default) fails the reset, so a reset
-   without an eviction plan still shows that only the owner holds data. Read before the evictions could show, the
-   figure held evicted bytes: a reset that allows nothing failed after a good eviction, and the quiet stage, held to
-   that figure, passed a growth up to their size. The record gives `waited_s` (every wait together), `depth`, `rounds`
-   and `listings_after_s`.
+   than the data provider whose files hold more than the caller allows (nothing by default) fails the reset, so a
+   reset without an eviction plan still shows that only the owner holds data; the message states the bytes held, the
+   figure allowed and the counter, per provider, and the files by position. The counter skips a provider's files only
+   for one the caller declares never holds the space's bytes (`never_holds`), while it reads 0, and each disagreement
+   with the files is an event. Read before the evictions could show, the figure held evicted bytes: a reset that
+   allows nothing failed after a good eviction, and the quiet stage, held to that figure, passed a growth up to their
+   size. The record gives `physical_bytes` (the counter), `files_bytes`, `files_read`, `events`, `waited_s` (every
+   wait together), `depth`, `rounds` and `listings_after_s`.
    **quiet**: the block maps of the eviction plan's own files (the files the reset evicts from a provider other than
    the data provider, each on the providers it evicted it from) and of the files a removed requirement applied to are
    read at one instant T, and none may hold more than the eviction (nothing, where it verified them empty) or the
    settle (what it saw) left. The stage then waits `resetqos.quiet_wait_s` from T, the occupancy's longest lag for the
    deepest file a late replication could reach, from the source, plus a margin, and reads the occupancy, which no
-   provider other than the data provider may have grown over the occupancy stage's. **What it proves, exactly: no
+   provider other than the data provider may have grown over the occupancy stage's, by its files' block maps summed,
+   never by the counter (O46). **What it proves, exactly: no
    replica of the plan's files, and no occupancy growth, had landed by T.** The occupancy read at T + the lag + the
    margin shows every placement that landed by T, whichever file it is on, so it alone catches a replication that lands
    before T on a file that is not in the plan, since no block map of the rest of the space is read. **It does not prove
@@ -83,10 +90,11 @@ read and every check is made on each provider that supports the space, since eac
    (`requirements`, `rights` or `default`, `resetheld.py`), `held_files` and `held_source` (`"eviction plan"`),
    `files`, `block_maps`, `listings_after_s` and the stage's seconds. It costs the wait, 20 s for files one directory
    below the root and 5 s more per further level (the depth of the deepest file of the space, as the QoS scan saw
-   it), `transfer_settle_s` for the late look, and one block-map read per evicted (file, provider) pair of the plan
-   and per (file, provider) of a removed requirement's files, once: bounded by the plan, never by the size of the
-   space. The occupancy stage's wait comes on top, on every reset: the same lag and margin, for the deepest regular
-   file of the space.
+   it), `transfer_settle_s` for the late look, one block-map read at T per evicted (file, provider) pair of the plan
+   and per (file, provider) of a removed requirement's files, once, bounded by the plan, and the occupancy's reading,
+   one block-map read per regular file at each provider that can hold the space's bytes, which follows the size of
+   the space (O46). The occupancy stage's wait and reading come on top, on every reset: the same lag and margin, for
+   the deepest regular file of the space.
 5. **history**: ended transfers cannot be removed. The 25.0 REST description offers, for a transfer, only `GET` and
    `DELETE /transfers/{tid}`, a cancel that answers 400 for a job that has ended, and `POST .../rerun`; the space's
    listing (`GET /spaces/{sid}/transfers`) only reads. So the next agent sees every ended transfer, the reset's own
@@ -541,16 +549,17 @@ class SpaceReset:
     def _occupancy(self, allowed: Mapping[str, int], run: dict[str, Any]) -> dict[str, Any]:
         """Wait until every eviction's and every ended transfer's change can show in the space root's physical size:
         `resetqos.occupancy_wait_s` for the deepest regular file of the space, from the eviction stage's end (O46).
-        Then, with no transfer running, read each provider's physical size of the space, and keep the reading only when
+        Then, with no transfer running, read the occupancy (`_holdings`: each file's block map at each provider that
+        can hold the space's bytes, and the counter beside them), and keep the reading only when
         no transfer ran or ended since the wait began (the ended listings' first pages, and the waiting and ongoing
         listings, read after it): a job no stage sent may have, after the instant the wait counts from. Otherwise wait
         again from when none runs, up to `OCCUPANCY_ROUNDS` waits in all. A listing shows a job up to
         `transfer_settle_s` late (O07): when the quiet stage is skipped, the listings are looked at that long after the
         reading, so the reading is kept only when it holds every job's change; when it runs, they are looked at at once,
         and the quiet stage's own look, that long after its reading, against the same first pages, covers the rest and
-        fails the reset. Refuse a provider other than the data provider that holds more than it is allowed; keep the
-        sizes for the quiet re-check, which would otherwise hold the occupancy to a figure still showing evicted
-        bytes."""
+        fails the reset. Refuse a provider other than the data provider whose files hold more than it is allowed,
+        stating the figures (`occupancy.judge`, O46); keep the reading for the quiet re-check, which would otherwise
+        hold the occupancy to a figure still showing evicted bytes."""
         depth = max(run["deepest"], 1)
         settle = self._p.settings.transfer_settle_s if run["why"] is None else 0.0
         anchor, before, waited, rounds = run["evicted_at"], run["ended_head"], 0.0, 0
