@@ -150,6 +150,36 @@ assert relay.accepted_fingerprints == ("fp-northern-deploy", "fp-southern-deploy
 assert study.models.resolve("alpha-stub").accepted_fingerprints == ()  # checked against a baseline, as before
 ```
 
+### Bounding one tool call
+
+A tool call's only bound in the loop is the agent's time left. A tool server that hangs mid-run therefore waits out the whole cap, and the run is scored as the agent's time cap. If your conditions differ in how many tools they call, such hangs fall on them unevenly and bias the comparison. `[agent] tool_call_bound_s` in `campaign.toml` declares a bound on one call, in seconds: positive and finite, and optional.
+
+- Each call runs under the shorter of the bound and the agent's time left. A call that outlasts the bound first ends as infrastructure of kind `knowledge` (the tool server did not answer, the message naming the tool and the bound): the attempt is set aside, like any other infrastructure ending, and the agent is not charged. A call that outlasts the time left first is the agent's time cap as before, unless the bound had already passed when the loop cut it: that call hung first, and is `knowledge` infrastructure too.
+- Pick the bound well above the slowest call that is not a hang, and below the time cap, or it never decides anything. A bound at or above the time cap leaves every call as it was, though it still changes the caps in the fingerprint.
+- It is a bound on wall time, and it reaches the provider as its `timeout_s`. `McpToolProvider` honours it; a function you wrote as a tool must bound itself with the `timeout_s` it is handed, or only the time left will cut it.
+- Each call's record has `elapsed_s`, the seconds it took, so you can count hangs and what they cost per condition. A condition that declares `knowledge` as its treatment kind scores such an attempt as a treatment outcome, since the failure is of that kind.
+- Declare it before the campaign starts. The bound is one of the campaign's caps, which are in its fingerprint, and `campaign.toml`'s hash is in it too, so a store that started without the key is not resumed with it: start a new store. A study that never declares it keeps its fingerprint, its configuration and its behaviour.
+
+```python
+import shutil
+from pathlib import Path
+
+from expcore.campaign.config import load_campaign
+
+assert study.campaign.agent.tool_call_bound_s is None  # the example declares none
+assert "tool_call_bound_s" not in study.campaign.caps()["agent"]  # so its caps are what they were
+
+bounded = Path("bounded-study")
+shutil.copytree("my-study", bounded)
+toml = bounded / "campaign.toml"
+toml.write_text(toml.read_text().replace("[agent]\n", "[agent]\ntool_call_bound_s = 300\n", 1))
+declared = load_campaign(toml)
+assert declared.agent.tool_call_bound_s == 300.0
+assert declared.caps()["agent"]["tool_call_bound_s"] == 300.0
+assert declared.caps() != study.campaign.caps()  # another fingerprint: a store without the bound is not resumed with it
+shutil.rmtree(bounded)
+```
+
 ### Prices and the budget
 
 A model's price is `[models.<key>.price]` in `models.toml`, in US dollars per million tokens: `input_per_mtok` and `output_per_mtok`, and optionally `cache_write_per_mtok` and `cache_read_per_mtok`, which are the input price when left out. A model the study hosts itself says `free = true` instead. With a budget, every planned model that is not free also declares its endpoint's context window, `context_tokens`, for the reason given below. `run` refuses to start or resume the campaign without it, naming `models.toml` and the model's key; checking, analysing, reporting and a package's check of a finished study do not need it.
@@ -727,7 +757,7 @@ assert counts == Counter()  # the example study runs without the platform
 
 ### Fault injection: compare like isolation with like
 
-On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
+On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A restore that is not verified is never scored either: the injector's reading in the record says `restore_verified: false` (with `how`, `identity_changed` and `serving`), and the campaign sets such an attempt aside as `injector_failure` and runs it again, whatever its outcome was and whatever the post-run health check decided, even when the executor kept its record (`FaultInjector.running` returns for it, and `session` raises). A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
 
 ```python
 import expcore_onedata.sandbox.kinds  # what [study] platforms imports before study.toml's conditions are validated

@@ -19,8 +19,8 @@ The order is fixed, and each step is decided by what a kill at that point must l
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
    under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26);
-6. the post-run health check, an instrument's refusal and the served-identity check, which can turn the result into
-   infrastructure (C11, C31, C16);
+6. the post-run health check, an instrument's refusal (or a fault injector's reading in the record that its restore was
+   not verified, O11) and the served-identity check, which can turn the result into infrastructure (C11, C31, C16);
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
    harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
    lose the stop or the failure it caused; the lease ends after it. A result committed from its marker at the next
@@ -73,6 +73,7 @@ from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
 from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
+from expcore.records.injections import restore_refusal
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
 # A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
@@ -403,8 +404,15 @@ class AttemptRunner:
 
         An attempt the store would not score, one set aside by the health check, an outage, or its own infrastructure
         failure or defect, keeps its outcome and the refusal is noted.
+
+        A record whose fault injector's reading says the restore was not verified (`restore_verified` not true) is
+        refused the same way, as `injector_failure` (`post_check_unverified` in a process that has not registered it),
+        whether or not an instrument's own check refused it: the record carries the failure itself (O11), because the
+        executor that holds it inside `FaultInjector.running` keeps its record when the restore fails. It takes
+        precedence over a refusal of the record's own, so the kind is the injector's. The health check decides before,
+        and nothing after this step can score what it set aside.
         """
-        p, refusal = self.p, record.instrument_refusal
+        p, refusal = self.p, restore_refusal(record.instruments) or record.instrument_refusal
         if refusal is None:
             return result
         who = f"instrument {refusal['namespace']!r} refused the attempt"
