@@ -51,6 +51,7 @@ from typing import Any
 from expcore_onedata import consistency
 from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.ingestbase import FAILURES, Baseline, plain
+from expcore_onedata.ingesthealth import OPEN, Marks, Unreadable, recovery_refusal, start_refusal
 from expcore_onedata.ingestplan import PlannedFile, Step
 from expcore_onedata.placement import Range, merged, provider_blocks, uncovered
 from expcore_onedata.provision import Entry, NotPlaced, ProvisionError
@@ -59,6 +60,10 @@ from expcore_onedata.streamed import Digest
 
 PREALLOCATE = "preallocate"  # the start's journalled intent to make a removed file again
 REMOVE_LOST = "remove_lost"  # the restore's journalled intent to remove the empty file a lost creation left
+
+
+class BaselineNotWhole(ProvisionError):
+    """A start, or a recovery, refused by the baseline's mark in the journal, with nothing read or sent."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,8 @@ class SparseBaseline(Baseline):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.written: dict[str, int] = {}  # label -> the end of what the ingest has written and confirmed
+        self.marks = Marks(self._journal, self._p.space.position, self.journal)
+        self.at: dict[str, str] | None = None  # the file and the step the start state is at, for a failure's mark
         if any(self.holder in planned.replicas for planned in self._plan.files):
             raise ValueError("a planned file's replicas name the data provider, which holds the file itself")
 
@@ -173,6 +180,37 @@ class SparseBaseline(Baseline):
         if end and self._p.read_file(file_id, size=planned.size, stop=end) != Digest(end, sha256):
             raise ProvisionError(f"{self._p.where}{planned.label}: the bytes written do not have the plan's hash")
 
+    # -- the baseline's marks (`ingesthealth.py`) ---------------------------------------------------------------------
+    def _last_mark(self) -> dict[str, Any] | None:
+        try:
+            return self.marks.last()
+        except Unreadable as error:
+            raise ProvisionError(f"{self._p.where}{error}") from None
+
+    def admit_start(self) -> None:
+        """Refuse a start on a baseline whose last mark is not `whole`; check every staged copy; then mark the baseline
+        open, pushed to disk before the start's restore or its first removal changes anything."""
+        refusal = start_refusal(self._last_mark())
+        if refusal is not None:
+            raise BaselineNotWhole(f"{self._p.where}{refusal}")
+        self.check_sources()
+        self.marks.mark(OPEN, "start")
+
+    def admit_recovery(self) -> None:
+        """Refuse a recovery while another process that still runs holds the baseline open: a run in progress."""
+        refusal = recovery_refusal(self._last_mark())
+        if refusal is not None:
+            raise BaselineNotWhole(f"{self._p.where}{refusal}")
+
+    def mark_failed(self, phase: str, error: str, text: str) -> None:
+        """Mark the baseline unhealthy: what failed and in which phase, with the file and step the start state was at
+        for a start."""
+        at = self.at if phase == "start" else None
+        self.marks.mark("unhealthy", phase, error=error, detail=text, **(at or {}))
+
+    def _step(self, label: str, step: str) -> None:
+        self.at = {"file": label, "step": step}
+
     # -- the start state -----------------------------------------------------------------------------------------------
     def _preallocate(self, planned: PlannedFile, old: str) -> str:
         """Make the file again at its final size, its id recorded as soon as it exists, a failed extension's too. The
@@ -218,18 +256,24 @@ class SparseBaseline(Baseline):
         declared replicas (`check_holdings`)."""
         entries = {planned.label: self._p.resolve(planned.path) for planned in self._plan.files}
         for planned in self._plan.files:
+            self._step(planned.label, "holdings")
             self.check_holdings(planned, entries[planned.label].file_id)
         states = {}
         for planned in self._plan.files:
             found = entries[planned.label]
+            self._step(planned.label, "removal")
             self.remove(planned, found, "start")
+            self._step(planned.label, "creation")  # the creation and the extension, `Provisioner.preallocate`
             file_id = self._preallocate(planned, found.file_id)
+            self._step(planned.label, "prefix")
             if planned.prefix:
                 self._p.write_range(file_id, planned.source, 0, planned.prefix)
             self._check_prefix(file_id, planned, planned.prefix, planned.prefix_sha256)
+            self._step(planned.label, "confirmation")
             confirmed = self.confirm_state(file_id, planned, planned.prefix)
             self.written[planned.label] = planned.prefix
             states[planned.label] = {"baseline_id": found.file_id, "file_id": file_id, **confirmed}
+        self.at = None
         return states
 
     # -- the parts -----------------------------------------------------------------------------------------------------
@@ -375,4 +419,4 @@ class SparseBaseline(Baseline):
         return "rewritten"
 
 
-__all__ = ["Layout", "SparseBaseline", "written_ranges"]
+__all__ = ["BaselineNotWhole", "Layout", "SparseBaseline", "written_ranges"]

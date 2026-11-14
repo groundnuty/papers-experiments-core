@@ -277,10 +277,11 @@ def test_o44_a_creation_whose_answer_was_lost_is_taken_back_and_the_file_written
     again.stop()
 
 
-def test_o44_a_lost_creation_whose_removal_failed_is_removed_by_the_next_start(make, fake, provisioner, tmp_path):
-    """O44: the answer of the new file's creation was lost and the recovery's delete of the empty file failed too, so
-    the attempt is set aside with the empty file in place; its removal's intent is journalled, so the next start
-    removes it, writes the day back whole and sets the start state."""
+def test_o44_a_lost_creation_whose_removal_failed_is_removed_by_the_recovery(make, fake, provisioner, tmp_path):
+    """O44: the answer of the new file's creation was lost and the start's own recovery could not delete the empty
+    file, so the attempt is set aside with the empty file in place and the baseline marked unhealthy: the next start is
+    refused. Its removal's intent is journalled, so the recovery removes it (nothing while the staged copy is damaged),
+    writes the day back whole, and the start after it sets the start state."""
     real = provisioner.mutate
     lost = []
 
@@ -298,18 +299,22 @@ def test_o44_a_lost_creation_whose_removal_failed_is_removed_by_the_next_start(m
     assert (fake.id_of(DAY_PATH), len(node(fake).content)) == (lost[0], 0)
     del provisioner.mutate
     fake.fail_deletes = False
+    with pytest.raises(InfraError, match="not whole"):
+        make(ROW).start({})
     damaged = make(ROW)
     (tmp_path / "staged" / "day-13.csv").write_bytes(DAY[:-1] + b"?")  # the empty file stays, nothing is deleted
     deletes = sum(1 for c in fake.provider_calls if c[1] == "DELETE")
     with pytest.raises(InfraError):
-        damaged.start({})
+        damaged.recover()
     assert fake.id_of(DAY_PATH) == lost[0]
     assert sum(1 for c in fake.provider_calls if c[1] == "DELETE") == deletes
-    again = make(ROW)  # the staged copy written whole again
-    again.start({})
-    assert again.finish()["start"]["restore"]["day-13"]["action"] == "created"
+    recovered = make(ROW).recover()  # the staged copy written whole again
+    assert recovered["files"]["day-13"]["action"] == "created"
     assert lost[0] not in {fake.id_of(DAY_PATH)}
     assert bytes(node(fake).content) == DAY
+    again = make(ROW)
+    again.start({})
+    assert fake.held(DAY_PATH, ALPHA_ID) == [[0, PREFIX]]
 
 
 def test_o44_a_part_out_of_order_is_refused_before_anything_is_written(provisioner, config, fake, tmp_path):
@@ -375,31 +380,37 @@ def test_o44_the_reset_completes_the_file_in_place_and_removes_nothing(make, fak
     ingest.check()
 
 
-def test_o44_a_crash_mid_run_ends_with_the_complete_file_after_the_next_start(make, fake, ticker):
-    """O44: a run's process dies after the first part, its reset never run; the next start completes the file the
-    ingest made in place (no DELETE before the start state), then sets the start state again."""
+def test_o44_a_crash_mid_run_ends_with_the_complete_file_after_the_recovery(make, fake, ticker):
+    """O44: a run's instrument is dropped after the first part, its reset never run, so its baseline stays open: the
+    next start is refused with nothing sent. The recovery completes the file the ingest made in place, with no DELETE,
+    and the start after it sets the start state again."""
     crashed = make(ROW)
     crashed.start({})
     t0 = first_turn(crashed, ticker)
     run_to(crashed, ticker, t0, 30, 1)
-    crashed.stop()  # the process died: no finish, no restore
+    crashed.stop()  # the instrument was dropped: no finish, no restore
     left = fake.id_of(DAY_PATH)
     calls = len(fake.provider_calls)
+    with pytest.raises(InfraError, match="held open"):
+        make(ROW).start({})
+    assert [c for c in fake.provider_calls[calls:] if c[1] in ("POST", "PUT", "DELETE")] == []
+    recovered = make(ROW).recover()
+    assert recovered["files"]["day-13"] == {"ok": True, "action": "completed", "file_id": left}
+    assert [c for c in fake.provider_calls[calls:] if c[1] == "PUT"]  # the rest was written, in place
+    assert [c for c in fake.provider_calls[calls:] if c[1] == "DELETE"] == []
+    assert bytes(node(fake).content) == DAY
     again = make(ROW)
     again.start({})
-    first_delete = next(n for n, c in enumerate(fake.provider_calls[calls:]) if c[1] == "DELETE")
-    completing = [c for c in fake.provider_calls[calls : calls + first_delete] if c[1] == "PUT"]
-    assert completing  # the rest was written before the start state's removal
-    snapshot = again.finish()
-    assert snapshot["start"]["restore"]["day-13"] == {"ok": True, "action": "completed", "file_id": left}
-    assert bytes(node(fake).content) == DAY
+    assert fake.held(DAY_PATH, ALPHA_ID) == [[0, PREFIX]]
 
 
-def test_o44_a_crash_between_the_removal_and_the_new_file_ends_complete_after_the_next_start(make, fake, ticker):
+def test_o44_a_crash_between_the_removal_and_the_new_file_ends_complete_after_the_recovery(
+    make, fake, ticker, tmp_path
+):
     """O44: the start removed the complete day and could not make it again (creations refused); its own recovery
-    cannot either, so the attempt is set aside with the day missing. The next start finds the name empty, waits until
-    every provider answers the old id absent, writes the day back whole from its staged copy, then sets the start
-    state."""
+    cannot either, so the attempt is set aside with the day missing and the baseline marked unhealthy: the next start
+    is refused. The recovery finds the name empty, waits until every provider answers the old id absent, writes the
+    day back whole from its staged copy, and the start after it sets the start state."""
     old = fake.id_of(DAY_PATH)
     fake.fail_creates.add(ALPHA_ID)
     failed = make(ROW)
@@ -407,23 +418,30 @@ def test_o44_a_crash_between_the_removal_and_the_new_file_ends_complete_after_th
         failed.start({})
     assert not fake.exists(DAY_PATH)
     fake.fail_creates.clear()
+    with pytest.raises(InfraError, match="not whole"):
+        make(ROW).start({})
+    assert not fake.exists(DAY_PATH)
+    recovered = make(ROW).recover()
+    assert recovered["files"]["day-13"]["action"] == "created"
+    journal = [json.loads(line) for line in (tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
+    restored = next(e for e in journal if e.get("entry") == "id" and e["phase"] == "recover")
+    assert (restored["event"], restored["old_id"]) == ("restored", old)
+    assert recovered["id_map"] == {old: fake.id_of(DAY_PATH)}
+    assert bytes(node(fake).content) == DAY
     again = make(ROW)
     again.start({})
     first_turn(again, ticker)
-    snapshot = again.finish()  # the run ends before the first part
-    assert snapshot["start"]["restore"]["day-13"]["action"] == "created"
-    restored = next(e for e in snapshot["ids"] if e["event"] == "restored")
-    assert restored["old_id"] == old
-    assert bytes(node(fake).content) == DAY
+    again.finish()  # the run ends before the first part
     again.check()
 
 
-def test_o44_a_crash_after_the_new_file_was_made_and_before_its_extension_ends_complete_after_the_next_start(
+def test_o44_a_crash_after_the_new_file_was_made_and_before_its_extension_ends_complete_after_the_recovery(
     make, fake, ticker, tmp_path
 ):
     """O44: the new file was made, then every write of content failed (its extension first), so the start and its
-    own recovery fail with the file left at size 0; its id was recorded as soon as it existed. The next start finds
-    the ingest's file short, writes it whole at its offsets in place, and then sets the start state."""
+    own recovery fail with the file left at size 0, the baseline marked unhealthy; its id was recorded as soon as it
+    existed. The next start is refused; the recovery finds the ingest's file short and writes it whole at its offsets
+    in place, and the start after it sets the start state."""
     fake.writes_before_reset = 0  # the extension is the start's first write of content
     failed = make(ROW)
     with pytest.raises(InfraError):
@@ -434,12 +452,14 @@ def test_o44_a_crash_after_the_new_file_was_made_and_before_its_extension_ends_c
     made = [e for e in journal if e.get("entry") == "id" and e["event"] == "created"]
     assert [(e["new_id"], e["action"]) for e in made] == [(short, "preallocated")]
     fake.writes_before_reset = None
+    with pytest.raises(InfraError, match="not whole"):
+        make(ROW).start({})
+    assert make(ROW).recover()["files"]["day-13"] == {"ok": True, "action": "completed", "file_id": short}
+    assert bytes(node(fake).content) == DAY
     again = make(ROW)
     again.start({})
     first_turn(again, ticker)
-    snapshot = again.finish()
-    assert snapshot["start"]["restore"]["day-13"] == {"ok": True, "action": "completed", "file_id": short}
-    assert bytes(node(fake).content) == DAY
+    again.finish()
     again.check()
 
 

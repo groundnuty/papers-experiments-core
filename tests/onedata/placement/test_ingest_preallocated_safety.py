@@ -3,11 +3,17 @@ reset restoring each file whole at its path and the mirror's replica of it, the 
 mid-start or mid-reset marking the federation unhealthy until a verified recovery."""
 
 import json
+import subprocess
+import sys
 
 import pytest
 
 from expcore.errors import InfraError
+from expcore_onedata import ingesthealth
+from expcore_onedata.client import PlatformError
+from expcore_onedata.fault_journal import boot_id
 from expcore_onedata.ingest import ProgressiveIngest
+from expcore_onedata.ingesthealth import baseline_health, last_marks
 from expcore_onedata.ingestplan import load_ingest_plan
 from expcore_onedata.sandbox.kinds import INGEST_FAILURE
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, with_placement, write_platform
@@ -219,3 +225,199 @@ def test_o44_the_snapshot_maps_each_recreated_files_old_id_to_its_new_one_and_ti
     assert all(snapshot["files"][label]["restored_id"] == new[label] for label in old)
     assert snapshot["start_s"] == snapshot["start"]["seconds"] == round(took, 3)
     assert snapshot["start_s"] > 0
+
+
+# -- 4. a failure mid-start or mid-reset marks the federation unhealthy until a verified recovery ---------------------
+
+
+class Died(BaseException):
+    """The run's process dies here: nothing after it runs, neither the start's own recovery nor the finish."""
+
+
+STEPS = ("delete", "create", "extend", "prefix")
+
+
+def is_step(step, method, path, options):
+    """Whether a change the provisioner sends is the call of the step: the start state's removal, the new file's
+    creation, its extension (the empty write at the final size), its prefix, or the reset's first write of content."""
+    if step == "delete":
+        return method == "DELETE"
+    if step == "create":
+        return method == "POST" and path.endswith("/children") and options["params"]["type"] == "REG"
+    if method != "PUT" or not path.endswith("/content"):
+        return False
+    offset, body = int(options["params"]["offset"]), options.get("content", b"")
+    return {"extend": offset == len(DAY) and not body, "prefix": offset == 0 and bool(body)}.get(step, bool(body))
+
+
+class Fault:
+    """The provisioner's changes, with one step made to fail once its call has reached the platform: the process dies
+    there (`dies`), the answer is lost once (`once`), or the answer is lost and every later change fails until the
+    test brings the provider back (`down`)."""
+
+    def __init__(self, provisioner):
+        self._real, self._provisioner = provisioner.mutate, provisioner
+        self.step = self.how = None
+        self.down = False
+        provisioner.mutate = self
+
+    def arm(self, step, how):
+        self.step, self.how = step, how
+
+    def __call__(self, method, path, **options):
+        if self.down:
+            raise PlatformError("providers[0]: a change failed (ConnectError)", transport=True)
+        answer = self._real(method, path, **options)
+        if self.step is not None and is_step(self.step, method, path, options):
+            self.step = None
+            if self.how == "dies":
+                raise Died
+            self.down = self.how == "down"
+            raise PlatformError("providers[0]: the answer was lost (ReadTimeout)", transport=True)
+        return answer
+
+    def remove(self):
+        del self._provisioner.mutate
+
+
+@pytest.fixture
+def dead_holder():
+    """A holder whose process is gone: a child that has exited and been reaped, in this boot."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return {"pid": child.pid, "boot_id": boot_id()}
+
+
+def mark_of(tmp_path):
+    return last_marks(tmp_path / "journal.jsonl")["spaces[0]"]
+
+
+def assert_recovered(make, fake, tmp_path):
+    """No start passes the marked baseline; the recovery brings the day back whole at the data provider and on the
+    mirror, verified, and marks it whole; the health check passes again, and so does the next start."""
+    since = len(fake.provider_calls)
+    refused = make(MIRRORED)
+    with pytest.raises(InfraError, match="not whole") as error:
+        refused.start({})
+    assert error.value.kind == INGEST_FAILURE
+    refused.finish()  # its reset brings nothing back: it changed nothing, and a refused start never recovers
+    assert changes(fake, since) == []
+    assert baseline_health([tmp_path / "journal.jsonl"]).ok is False
+    recovered = make(MIRRORED).recover()
+    assert recovered["ok"]
+    assert recovered["files"]["day-13"]["ok"]
+    assert content(fake, DAY_PATH) == DAY
+    assert (fake.held(DAY_PATH, ALPHA_ID), fake.held(DAY_PATH, BETA_ID)) == ([[0, len(DAY)]], [[0, len(DAY)]])
+    assert (mark_of(tmp_path)["state"], mark_of(tmp_path)["phase"]) == ("whole", "recover")
+    assert baseline_health([tmp_path / "journal.jsonl"]).ok
+    again = make(MIRRORED)
+    again.start({})
+    assert fake.held(DAY_PATH, ALPHA_ID) == [[0, PREFIX]]
+
+
+@pytest.mark.parametrize("step", [*STEPS, "reset"])
+def test_o44_a_run_that_dies_at_any_step_leaves_its_baseline_open_and_every_start_refused_until_a_recovery(
+    make, mirrored, provisioner, tmp_path, monkeypatch, dead_holder, step
+):
+    """O44: the run's process dies after the start state's removal, after the new file's creation, after its extension,
+    after its prefix, or in the middle of the reset, so the day is missing, empty, unwritten, a prefix or partly
+    completed, and its mirror holds nothing of it. The journal's mark, written before the first change, stays open
+    with a holder that is gone: the health check fails, and every start is refused with nothing sent, until the
+    recovery brings it back whole, the mirror's replica included."""
+    fault = Fault(provisioner)
+    ingest = make(MIRRORED)
+    with monkeypatch.context() as patch:
+        patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+        if step == "reset":
+            ingest.start({})
+            ingest.at_first_turn({"clock_s": 0.0})
+        fault.arm(step, "dies")
+        with pytest.raises(Died):
+            ingest.finish() if step == "reset" else ingest.start({})
+    assert not mirrored.exists(DAY_PATH) or content(mirrored, DAY_PATH) != DAY  # the baseline is not whole
+    assert mark_of(tmp_path)["state"] == "open"
+    health = baseline_health([tmp_path / "journal.jsonl"])
+    assert not health.ok
+    assert "stopped during its" in health.detail
+    assert_recovered(make, mirrored, tmp_path)
+    fault.remove()
+
+
+@pytest.mark.parametrize("step", [*STEPS, "reset"])
+def test_o44_a_failure_at_any_step_whose_recovery_fails_too_marks_the_baseline_unhealthy_until_a_recovery(
+    make, mirrored, provisioner, tmp_path, step
+):
+    """O44: a step's answer is lost and the provider then refuses every change, so neither the start's own recovery
+    nor the finish can bring the day back; the journal marks the baseline unhealthy, naming the phase and, in the start,
+    the file and its step, the health check fails, and every later start is refused with nothing sent until the
+    recovery, once the provider is back, verifies the day whole at its owner and on its mirror."""
+    fault = Fault(provisioner)
+    ingest = make(MIRRORED)
+    if step == "reset":
+        ingest.start({})
+        ingest.at_first_turn({"clock_s": 0.0})
+        fault.arm(step, "down")
+    else:
+        fault.arm(step, "down")
+        with pytest.raises(InfraError):
+            ingest.start({})
+    snapshot = ingest.finish()  # the executor's finally: the provider is still down
+    assert snapshot["restore"]["ok"] is False
+    mark = mark_of(tmp_path)
+    assert (mark["state"], mark["phase"]) == ("unhealthy", "restore")
+    marks = [
+        json.loads(line)
+        for line in (tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("entry") == "baseline"
+    ]
+    if step != "reset":
+        failed = next(m for m in marks if m["state"] == "unhealthy")
+        assert (failed["phase"], failed["file"]) == ("start", "day-13")
+    health = baseline_health([tmp_path / "journal.jsonl"])
+    assert not health.ok
+    assert "failed" in health.detail
+    fault.down = False
+    assert_recovered(make, mirrored, tmp_path)
+    fault.remove()
+
+
+def test_o44_a_failed_start_whose_own_recovery_verifies_the_baseline_leaves_it_whole_for_the_next_start(
+    make, fake, provisioner, tmp_path
+):
+    """O44: the prefix's answer is lost once; the start fails and marks the baseline unhealthy before its own recovery,
+    which completes the day in place, verified, and marks it whole, as a fault injector's verified clear settles an
+    injection: the health check passes and the next start sets the start state."""
+    fault = Fault(provisioner)
+    fault.arm("prefix", "once")
+    with pytest.raises(InfraError):
+        make(ROW).start({})
+    states = [
+        (m["state"], m["phase"])
+        for m in map(json.loads, (tmp_path / "journal.jsonl").read_text(encoding="utf-8").splitlines())
+        if m.get("entry") == "baseline"
+    ]
+    assert states == [("open", "start"), ("unhealthy", "start"), ("whole", "start")]
+    assert content(fake, DAY_PATH) == DAY
+    assert baseline_health([tmp_path / "journal.jsonl"]).ok
+    again = make(ROW)
+    again.start({})
+    assert fake.held(DAY_PATH, ALPHA_ID) == [[0, PREFIX]]
+    fault.remove()
+
+
+def test_o44_a_recovery_is_refused_while_another_live_process_holds_the_baseline(make, fake, tmp_path, monkeypatch):
+    """O44: the open mark's holder is another process that still runs, a run in progress: the recovery would write
+    into its files, so it is refused with nothing sent, and the health check reads the run as in progress."""
+    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(ingesthealth, "holder", lambda: {"pid": alive.pid, "boot_id": boot_id()})
+            make(ROW).start({})
+        since = len(fake.provider_calls)
+        with pytest.raises(InfraError, match="another process"):
+            make(ROW).recover()
+        assert changes(fake, since) == []
+        assert baseline_health([tmp_path / "journal.jsonl"]).ok
+    finally:
+        alive.kill()
+        alive.wait()

@@ -60,6 +60,7 @@ from typing import Any
 
 from expcore.errors import InfraError
 from expcore_onedata.ingestbase import FAILURES, Baseline, RestoreFailed, detail
+from expcore_onedata.ingesthealth import OPEN, WHOLE
 from expcore_onedata.ingestplan import PREALLOCATED, IngestPlan, Step
 from expcore_onedata.ingestsparse import SparseBaseline
 from expcore_onedata.provision import Provisioner, ProvisionError
@@ -106,6 +107,8 @@ class ProgressiveIngest:
         self._p, self._plan = provisioner, plan
         self._sparse = plan.mode == PREALLOCATED
         self._base = (SparseBaseline if self._sparse else Baseline)(provisioner, plan, Path(journal), now)
+        self._marks = self._base if isinstance(self._base, SparseBaseline) else None  # the preallocated mode's marks
+        self._opened = False  # this instrument marked the baseline open: its start began to change it (O44)
         self._steps = plan.steps()
         self._max_wait_s = max_wait_s
         self._join_timeout_s = provisioner.settings.transfer_timeout_s if join_timeout_s is None else join_timeout_s
@@ -146,8 +149,12 @@ class ProgressiveIngest:
             self._readings.append({**base, **fields})
 
     def _failed(self, phase: str, error: BaseException, began: float) -> dict[str, Any]:
+        """Journal a failure, and in the preallocated mode, once this instrument began to change the baseline, mark the
+        baseline unhealthy, before any recovery is tried; return the failure's record."""
         text = detail(error)
         self._base.journal(entry="failure", phase=phase, error=type(error).__name__, detail=text)
+        if self._marks is not None and self._opened:
+            self._marks.mark_failed(phase, type(error).__name__, text)
         return {
             "ok": False,
             "seconds": round(self._p.clock() - began, 3),
@@ -167,8 +174,9 @@ class ProgressiveIngest:
         try:
             self._p.verify_space()
             self._base.read_journal()
-            if self._sparse:  # every staged copy, before the restore or the start state removes anything
-                self._base.check_sources()
+            if self._marks is not None:  # a baseline not whole refuses; every staged copy is checked; then it is open
+                self._marks.admit_start()
+                self._opened = True
             restored = self._base.restore_all("start")  # each file on its own, its staged source checked first
             self._base.check_directories()
             for planned in self._plan.files:
@@ -183,6 +191,8 @@ class ProgressiveIngest:
             raise self._start_refused(error) from None
         self._start = {"ok": True, "seconds": round(self._p.clock() - began, 3), "restore": restored}
         self._start.update({} if states is None else {"files": states})
+        if self._marks is not None:
+            self._marks.marks.mark(OPEN, "run")
         self._ready = self._p.clock()
         for step in self._steps:
             self._reading("planned", step, bytes=step.stop, sha256=step.sha256)
@@ -229,13 +239,20 @@ class ProgressiveIngest:
         text = f"{self._p.where}the progressive ingest could not set its start state: {detail(error)}"
         return InfraError(INGEST_FAILURE, text[:600])
 
-    def _recover(self) -> dict[str, Any]:
-        """After a failed start, restore the baseline as far as it goes; the result is recorded, never raised."""
+    def _recover(self) -> dict[str, Any] | None:
+        """After a failed start, restore the baseline as far as it goes; the result is recorded, never raised. In the
+        preallocated mode a start refused before it changed anything recovers nothing (None), and a recovery that
+        verifies every file marks the baseline whole, as a verified clear settles an injection."""
+        if self._marks is not None and not self._opened:
+            return None
         try:
-            return {"ok": True, "files": self._base.restore_all("start")}
+            files = self._base.restore_all("start")
         except FAILURES as error:
             files = error.files if isinstance(error, RestoreFailed) else None
             return {"ok": False, "error": type(error).__name__, "detail": detail(error), "files": files}
+        if self._marks is not None:
+            self._marks.marks.mark(WHOLE, "start")
+        return {"ok": True, "files": files}
 
     # -- the schedule --------------------------------------------------------------------------------------------------
     def _drive(self) -> None:
@@ -336,8 +353,14 @@ class ProgressiveIngest:
         if self._restore is not None and self._restore["ok"]:
             return self._restore
         if not self.stop():
-            self._restore = {"ok": False, "error": "Timeout", "detail": "a part was still being written; not restored"}
+            text = "a part was still being written; not restored"
+            self._restore = {"ok": False, "error": "Timeout", "detail": text}
+            if self._marks is not None and self._opened:
+                self._marks.mark_failed("restore", "Timeout", text)
             raise InfraError(INGEST_FAILURE, f"{self._p.where}the progressive ingest could not stop its schedule")
+        if self._marks is not None and not self._opened:  # it changed nothing; a marked baseline needs `recover`
+            self._restore = {"ok": True, "seconds": 0.0, "files": {}, "untouched": True}
+            return self._restore
         began = self._p.clock()
         try:
             self._p.verify_space()
@@ -353,7 +376,40 @@ class ProgressiveIngest:
                 f"{self._p.where}the progressive ingest could not restore the baseline: {detail(error)}"[:600],
             ) from None
         self._restore = {"ok": True, "seconds": round(self._p.clock() - began, 3), "files": self._restored(files)}
+        if self._marks is not None:
+            self._marks.marks.mark(WHOLE, "restore")
         return self._restore
+
+    def recover(self) -> dict[str, Any]:
+        """Bring the baseline back after a run left it not whole, on an instrument that has not started: every planned
+        file restored and verified, the mirror's replicas included, and in the preallocated mode the baseline marked
+        whole, so the health check passes and starts are admitted again (`ingesthealth.py`). Return the record (each
+        file's result, and `id_map` for a file it wrote back under a new id), or
+        raise `InfraError("ingest_failure")`, the baseline marked unhealthy, when it cannot be shown back. Refused
+        while another process that still runs holds the baseline open: run it with no run on the plan's space."""
+        if self._started:
+            raise RuntimeError("recover() is for an instrument that has not started: make a new one")
+        began, marking = self._p.clock(), False
+        try:
+            self._p.verify_space()
+            self._base.read_journal()
+            if self._marks is not None:
+                self._marks.admit_recovery()
+                marking = True  # from here a failure marks the baseline unhealthy
+            files = self._base.restore_all("recover")
+        except FAILURES as error:
+            self._failed("recover", error, began)
+            if self._marks is not None and marking:
+                self._marks.mark_failed("recover", type(error).__name__, detail(error))
+            raise InfraError(
+                INGEST_FAILURE,
+                f"{self._p.where}the progressive ingest could not recover the baseline: {detail(error)}"[:600],
+            ) from None
+        if self._marks is not None:
+            self._marks.marks.mark(WHOLE, "recover")
+        with self._base.lock:
+            changed = id_map(list(self._base.ids))  # a name written back has a new id, which a study's map follows
+        return {"ok": True, "seconds": round(self._p.clock() - began, 3), "files": files, "id_map": changed}
 
     def _restored(self, files: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         """Note the id each restored file ends with; return the restore's results."""
