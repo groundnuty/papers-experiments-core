@@ -147,6 +147,62 @@ def test_o39_a_tool_whose_required_arguments_cannot_be_filled_is_unmeasured_not_
     assert tool_arguments(None, known) == {}
 
 
+# The property names and required lists of the pinned tool server's seven tools, as the manifest of the 14 Nov live run
+# froze them (onedata-mcp 8c9b10c): the argument names are the server's, so this checks the test fills each of them.
+PINNED_TOOLS = {
+    "get_transfer": (["transfer_id"], ["transfer_id"]),
+    "list_space_transfers": (["limit", "page_token", "space_id", "state"], ["space_id"]),
+    "get_qos_requirement": (["qos_id"], ["qos_id"]),
+    "get_file_qos_summary": (["file_id_or_path"], ["file_id_or_path"]),
+    "get_file_distribution": (["file_id_or_path"], ["file_id_or_path"]),
+    "schedule_file_replication": (["file_id_or_path", "target_provider_id"], ["file_id_or_path", "target_provider_id"]),
+    "add_file_qos_requirement": (["expression", "file_id_or_path", "replicas_num"], ["file_id_or_path", "expression"]),
+}
+TEST_VALUES = {
+    "file": "file-0001",
+    "requirement": "requirement-0001",
+    "transfer": "transfer-0001",
+    "replicas": 1,
+    "expression": "anyStorage",
+    "space": "space-0001",
+    "state": "ended",
+    "provider": "provider-0001",
+}
+
+
+@pytest.mark.parametrize("tool", sorted(PINNED_TOOLS))
+def test_o39_every_required_argument_of_the_pinned_servers_tools_is_filled(tool):
+    """O39: the 14 Nov live run failed `get_qos_requirement` because its `qos_id` named no kind the test knew. Each
+    of the seven tools' required arguments, by the names the pinned server gives them, is filled by the kind the
+    name says, so none is left unmeasured."""
+    properties, required = PINNED_TOOLS[tool]
+    schema = {"properties": {name: {"type": "string"} for name in properties}, "required": required}
+    arguments = tool_arguments(schema, TEST_VALUES)
+    assert isinstance(arguments, dict), arguments
+    assert set(required) <= set(arguments)
+
+
+def test_o39_a_qos_id_is_the_requirement_and_the_other_qos_names_keep_their_kind():
+    """O39: a name holding `qos` is a requirement's id, but the kind a more specific word names wins: the expression and
+    the replicas of a QoS requirement, and the file it is on, stay what they are."""
+    schema = {
+        "properties": {
+            "qos_id": {"type": "string"},
+            "qos_expression": {"type": "string"},
+            "qos_replicas_num": {"type": "integer"},
+            "file_qos_id": {"type": "string"},
+            "file_id": {"type": "string"},
+        }
+    }
+    assert tool_arguments(schema, TEST_VALUES) == {
+        "qos_id": "requirement-0001",
+        "qos_expression": "anyStorage",
+        "qos_replicas_num": 1,
+        "file_qos_id": "requirement-0001",
+        "file_id": "file-0001",
+    }
+
+
 @pytest.mark.parametrize(
     ("status", "code", "errno", "is_refusal"),
     [
@@ -154,16 +210,26 @@ def test_o39_a_tool_whose_required_arguments_cannot_be_filled_is_unmeasured_not_
         (401, "tokenCaveatUnverified", None, True),
         (403, "forbidden", None, True),
         (400, "posix", "eacces", True),
+        (400, "posix", "eperm", True),
+        (400, "posix", "EPERM", True),
         (400, "posix", "enoent", False),
+        (400, "posix", "eio", False),
+        (400, "posix", None, False),
+        (400, None, "eperm", False),
+        (400, "badValueToken", "eperm", False),
         (400, "badValueToken", None, False),
         (404, "notFound", None, False),
+        (404, "posix", "eperm", False),
         (500, "internalServerError", None, False),
+        (500, "posix", "eperm", False),
         (None, None, None, False),
     ],
 )
 def test_o39_only_a_refusal_counts_as_a_refused_write(status, code, errno, is_refusal):
     """O39: a write of a read-only condition passes the live test only when Onedata refused it: 401, 403, or 400 posix
-    eacces. A write that failed for another reason, a missing file, a bad value, a server error or no answer at all,
-    is not a refusal, so it cannot make the test pass."""
+    with errno eacces (a token caveat's refusal) or eperm (a user without the privilege: the 14 Nov live run's answer
+    to a data write by the read-only condition's token). A write that failed for another reason, a missing file, a
+    bad value, a server error or no answer at all, is not a refusal, so it cannot make the test pass; nor is another
+    status or error id that carries the same errno."""
     error = PlatformError("x", status=status, code=code, errno=errno, transport=status is None)
     assert refused(error) is is_refusal

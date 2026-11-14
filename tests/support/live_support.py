@@ -134,7 +134,9 @@ VIEW_TOOLS = (
 WRITE_TOOLS = ("schedule_file_replication", "add_file_qos_requirement")
 # What an argument is, from a word its name holds, tried in this order, so that a name holding two words is the more
 # specific one's: a state before a transfer (`transfer_state`), a transfer or a requirement before a file, and a
-# provider before a count of replicas (Onedata names a replication's target `replicatingProviderId`).
+# provider before a count of replicas (Onedata names a replication's target `replicatingProviderId`). `qos` is a
+# requirement's id (the pinned server's `get_qos_requirement` takes `qos_id`), tried after the words that name what a
+# QoS requirement holds (its expression, its replicas) and before the file it is on.
 ARGUMENT_KINDS = (
     ("state", "state"),
     ("transfer", "transfer"),
@@ -142,6 +144,7 @@ ARGUMENT_KINDS = (
     ("expression", "expression"),
     ("provider", "provider"),
     ("replica", "replicas"),
+    ("qos", "requirement"),
     ("file", "file"),
     ("space", "space"),
 )
@@ -176,7 +179,11 @@ def tool_arguments(schema: Mapping[str, Any] | None, values: Mapping[str, Any]) 
 
 
 def refused(error: PlatformError) -> bool:
-    """Whether a platform error is the refusal of a request, as Onedata 25.0 answers one: 401, 403, or 400 `posix`
-    `eacces` (`.claude/rules/onedata-25.md`). Any other answer, another 400 or a 404 among them, is not one, so a
-    write that fails for another reason is never taken for a refused one."""
-    return error.status in (401, 403) or (error.status, error.code, error.errno) == (400, "posix", "eacces")
+    """Whether a platform error is the refusal of a request, as Onedata 25.0 answers one: 401, 403, or 400 `posix` with
+    the errno `eacces` (a token caveat's refusal, `.claude/rules/onedata-25.md`) or `eperm` (a user without the
+    privilege: the answer the 14 Nov live run got to every data write of the read-only condition's token, whose user
+    holds no `space_write_data`, and the 12 Nov progressive-ingest run to a user without write rights). Any other
+    answer, another 400 or a 404 among them, is not one, so a write that fails for another reason is never taken for a
+    refused one. The errno is compared as POSIX names it, whatever its case."""
+    posix = (error.status, error.code) == (400, "posix")
+    return error.status in (401, 403) or (posix and (error.errno or "").lower() in ("eacces", "eperm"))

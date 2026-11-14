@@ -19,14 +19,20 @@ condition's own token, minted and launched as a run's is (`ToolServerLauncher.la
   fail-open warning in its log;
 - the write tools answer an error and change nothing (`schedule_file_replication`, `add_file_qos_requirement`), read
   back with the admin credential;
-- the same token sent straight to the provider is refused (`live_support.refused`: 401, 403 or 400 posix eacces) a
-  replication, an eviction, a rerun and a cancel of a transfer, a QoS requirement added and one removed, a file
-  created and a file's content written, and none of them happened. The file writes are the refusals the old token
-  got from its `data.readonly` caveat; this one gets them from its user, who holds no `space_write_data`;
+- the same token sent straight to the provider is refused (`live_support.refused`: 401, 403, or 400 posix with errno
+  eacces or eperm) a replication, an eviction, a rerun and a cancel of a transfer, a QoS requirement added and one
+  removed, a file created and a file's content written, and none of them happened. The file writes are refused as the
+  old token's were by its `data.readonly` caveat, but this one is refused by its user, who holds no
+  `space_write_data`, and Onedata answers that 400 posix eperm (14 Nov live run), not eacces. The cancel is of a
+  64 MiB replication scheduled just before, sent to the provider that runs it, which shows it from the first moment
+  (the agent's local provider shows a transfer another provider scheduled only once it has synchronised: the 14 Nov
+  run's 404 on a one-second job), after the admin credential has read its state there;
 - with `EXPCORE_LIVE_OUTSIDE_SPACE`, a space the condition's user is no member of and the agent's local provider
   supports: its root, its transfer listing and an ended transfer of it, each first shown served to the admin
   credential through that provider (or the test fails, so a space that is not there cannot pass it), are not served
-  to the token, through the tools and straight.
+  to the token, through the tools and straight. The test creates nothing there: the mutation gate refuses a write
+  outside the declared space (O09), so an ended transfer of that space must exist before the run, and the transfer
+  check skips, saying so, when the space lists none. The 14 Nov run's space had none.
 
 The tools' names are this test's choice, their arguments are filled from each tool's own input schema
 (`live_support.tool_arguments`), and nothing here changes a tool.
@@ -56,7 +62,7 @@ from live_support import (  # noqa: E402 -- only once the module is known to run
 )
 
 from expcore_onedata import consistency  # noqa: E402
-from expcore_onedata.client import AUTH_HEADER, PlatformError  # noqa: E402
+from expcore_onedata.client import AUTH_HEADER, PlatformError, answered_absent  # noqa: E402
 from expcore_onedata.toolserver import ToolServerLauncher  # noqa: E402
 
 CEILING_S = 300.0
@@ -64,6 +70,7 @@ OUTSIDE_SPACE = os.environ.get("EXPCORE_LIVE_OUTSIDE_SPACE")  # a space id the c
 FAIL_OPEN = "Could not examine Oneprovider token via Onezone"  # the pinned server's warning when its examination fails
 STATES = ("waiting", "ongoing", "ended")
 CONTENT = bytes(range(256)) * 4
+RUNNING_BYTES = 64 * 1024 * 1024  # a replication to cancel that is still under way when the cancel arrives
 
 
 class Context:
@@ -111,9 +118,10 @@ def requirements_of(plane, file_id):
     }
 
 
-def nothing_new(plane, file_id):
-    """What the admin sees of the space's transfers and the file's requirements, to compare before and after."""
-    return space_transfers(plane), requirements_of(plane, file_id)
+def nothing_new(plane, file_id, ignore=()):
+    """What the admin sees of the space's transfers (but those in `ignore`: ones the test itself scheduled, which a
+    provider may show later than another) and the file's requirements, to compare before and after."""
+    return space_transfers(plane) - set(ignore), requirements_of(plane, file_id)
 
 
 @pytest.fixture(scope="module")
@@ -207,12 +215,12 @@ def values_of(plane, **override):
     }
 
 
-def as_token(plane, method, path, *, zone=False, headers=None, **options):
-    """Send one request straight to the agent's local provider, the one the tool server talks to (or to Onezone with
-    `zone`), as the condition's token, never through the mutation gate, whose credential is the admin's; return the
-    PlatformError it raised, or None when it was accepted."""
+def as_token(plane, method, path, *, zone=False, provider=None, headers=None, **options):
+    """Send one request straight to the agent's local provider, the one the tool server talks to (or to `provider`, or
+    to Onezone with `zone`), as the condition's token, never through the mutation gate, whose credential is the
+    admin's; return the PlatformError it raised, or None when it was accepted."""
     client, token = plane["client"], plane["token"].reveal()
-    where = None if zone else plane["config"].support.local
+    where = None if zone else provider or plane["config"].support.local
     try:
         client._send(method, path, provider=where, headers={AUTH_HEADER: token, **(headers or {})}, **options)
     except PlatformError as error:
@@ -221,7 +229,8 @@ def as_token(plane, method, path, *, zone=False, headers=None, **options):
 
 
 def require_refused(error, what):
-    """A write: refused as Onedata refuses one (`live_support.refused`), never failed for another reason."""
+    """A write: refused as Onedata refuses one (`live_support.refused`: 401, 403, or 400 posix eacces or eperm), never
+    failed for another reason."""
     assert error is not None, f"{what}: accepted with the read-only condition's token"
     assert refused(error), f"{what}: failed, but not as a refusal ({error.status}, {error.code}, {error.errno})"
 
@@ -257,15 +266,30 @@ def test_o39_a_read_only_conditions_write_tools_answer_an_error_and_change_nothi
     assert nothing_new(plane, file_id) == before
 
 
+def transfer_state_as_admin(plane, tid, provider):
+    """The state of a transfer as `provider` shows it to the admin credential, read until the provider shows it
+    (`answered_absent`: it has not synchronised the transfer yet), for 60 s at most, after which the test fails."""
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            return consistency.transfer_state(plane["client"].get(f"/transfers/{tid}", provider=provider))
+        except PlatformError as error:
+            if not answered_absent(error) or time.monotonic() > deadline:
+                raise
+        time.sleep(1)
+
+
 def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straight_at_the_provider(plane):
     """O39: sent straight to the provider, without the tool server, the token is refused a replication, an eviction,
     a QoS requirement, the removal of the admin's requirement, a rerun of the ended transfer and the cancel of a
-    running one, and none of them happened."""
+    replication that is running (its state read with the admin credential just before), and none of them happened:
+    the cancel never took effect either, the replication running to its end."""
     client, holder, provisioner, file_id = plane["client"], plane["holder"], plane["provisioner"], plane["files"][0]
-    running = provisioner.schedule_transfer("replication", plane["files"][1], plane["receiver"])
-    time.sleep(3)  # every provider shows the running transfer before the listing is taken
+    receiver = plane["receiver"]
+    big = provisioner.put_file(f"{plane['directory']}/running.bin", bytes(RUNNING_BYTES))
     before = nothing_new(plane, file_id)
-    receiver_id, holder_id = provisioner.provider_id(plane["receiver"]), provisioner.provider_id(holder)
+    running = provisioner.schedule_transfer("replication", big, receiver)
+    receiver_id, holder_id = provisioner.provider_id(receiver), provisioner.provider_id(holder)
     replication = {"type": "replication", "replicatingProviderId": receiver_id, "dataSourceType": "file"}
     eviction = {"type": "eviction", "evictingProviderId": holder_id, "dataSourceType": "file"}
     qos = {"fileId": file_id, "expression": "anyStorage", "replicasNum": 1}
@@ -275,21 +299,28 @@ def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straigh
         "a QoS requirement": as_token(plane, "POST", "/qos_requirements", json=qos),
         "a requirement's removal": as_token(plane, "DELETE", f"/qos_requirements/{plane['qid']}"),
         "a rerun": as_token(plane, "POST", f"/transfers/{plane['tid']}/rerun"),
-        "a cancel": as_token(plane, "DELETE", f"/transfers/{running}"),
     }
+    # The cancel goes to the provider that runs the replication, which shows it from the start, and only after the
+    # admin credential has read it there: a 404 is then a real answer about the token, never a transfer not shown yet.
+    state = transfer_state_as_admin(plane, running, receiver)
+    attempts[f"a cancel of a replication that was {state}"] = as_token(
+        plane, "DELETE", f"/transfers/{running}", provider=receiver
+    )
     for what, error in attempts.items():
         require_refused(error, what)
     time.sleep(3)
-    assert nothing_new(plane, file_id) == before
+    assert nothing_new(plane, file_id, ignore={running}) == before
     assert plane["qid"] in requirements_of(plane, file_id)
-    state = consistency.transfer_state(client.get(f"/transfers/{running}", provider=plane["receiver"]))
-    assert state != "cancelled", "the running transfer was cancelled"
+    done = consistency.wait_transfers(client, receiver, [running], timeout_s=300, poll_s=2)
+    assert not done.timed_out, "the replication the cancel was sent to did not end"
+    final = consistency.transfer_state(done.records[running])
+    assert final != "cancelled", f"the replication was cancelled with the read-only condition's token ({state} before)"
 
 
 def test_o39_the_read_only_token_is_refused_a_file_and_a_write_of_content(plane):
-    """O39: with no `data.readonly` caveat, the user's lack of `space_write_data` is what refuses a data write: a file
-    created in the scratch directory and a write of a file's content are both refused, the file is not there and the
-    content is what it was."""
+    """O39: with no `data.readonly` caveat, the user's lack of `space_write_data` is what refuses a data write, as 400
+    posix eperm (the 14 Nov live run; the caveat's refusal was eacces): a file created in the scratch directory and a
+    write of a file's content are both refused, the file is not there and the content is what it was."""
     provisioner, file_id = plane["provisioner"], plane["files"][1]
     directory_id = provisioner.resolve(plane["directory"]).file_id
     before = provisioner.read_file(file_id)
@@ -345,11 +376,16 @@ def test_o39_a_read_only_condition_sees_nothing_of_a_space_it_does_not_hold(plan
 def test_o39_a_read_only_condition_cannot_view_a_transfer_of_a_space_it_does_not_hold(plane):
     """O39: a transfer of another space, which the local provider lists and serves to the admin credential, is not
     served to the condition, through `get_transfer` or straight. Skipped, saying so, when the space has no ended
-    transfer to view."""
+    transfer to view: the test cannot make one, since the mutation gate refuses a write outside the declared space
+    (O09), so one must have been scheduled there before the run (a replication or an eviction in that space, with the
+    admin credential), or the space named must be one that already has one."""
     path = f"/spaces/{OUTSIDE_SPACE}/transfers"
     found = next(iter(served_to_the_admin(plane, path, {"state": "ended"}).get("transfers") or []), None)
     if found is None:
-        pytest.skip("the outside space lists no ended transfer to view")
+        pytest.skip(
+            "the outside space lists no ended transfer to view, and this test may not write there (O09): schedule "
+            "one in that space before the run, or name a space that has one"
+        )
     served_to_the_admin(plane, f"/transfers/{found}")
     (viewed,) = call_tools(plane, [("get_transfer", values_of(plane, transfer=found))])
     assert viewed.is_error, "the tool showed a transfer of a space the condition does not hold"

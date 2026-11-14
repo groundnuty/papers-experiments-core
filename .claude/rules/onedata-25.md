@@ -12,7 +12,7 @@ The images are a 25.0 development build (op-worker `f118ed9`), not the released 
 
 Behaviours measured live on 25.0 (dated facts in `deploy/compose-federation/day0/`), which the platform layer must handle:
 - A deleted or not-yet-visible entry answers 400 with error id `posix`/`enoent`, not 404. Treat exactly that id, or 404, as absent; any other 400 fails closed.
-- A write with a read-only token answers 400 `posix`/`eacces`: a refusal, like 401 and 403.
+- A write with a read-only token answers 400 `posix`/`eacces`: a refusal, like 401 and 403. A data write by a user who lacks `space_write_data`, with a token that has no data-access caveat, answers 400 `posix`/`eperm`: also a refusal, from the user's rights and not the token (14 Nov live run of O39: a file created, content written at offset 0, an empty write past the end, a directory created and a delete; the 12 Nov progressive-ingest run saw the same answer for a user without write rights).
 - An upload without a `Content-Type` answers 415; send `application/octet-stream`.
 - `GET /data/{id}?attribute=path` is refused: find a file's space by walking `parent_id` to the space root.
 - A new file is invisible on another provider for about 6 s: wait, bounded, before reading or transferring through that provider.
