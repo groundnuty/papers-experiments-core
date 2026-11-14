@@ -1,0 +1,36 @@
+# ONEPROVIDER_CONFIG, filled by configure.sh (one provider per node, the node's own network and names).
+# The registration token is not in here: onepanel reads it from tokenFile (0600, inside the rootfs).
+cluster:
+  domainName: "@NODE_DOMAIN@"
+  nodes:
+    n0:
+      hostname: "@NODE_SHORT@"
+  managers:
+    mainNode: "n0"
+    nodes: ["n0"]
+  workers:
+    nodes: ["n0"]
+  databases:
+    serverQuota: 256
+    bucketQuota: 256
+    nodes: ["n0"]
+  # Fails verification (edom) when not root, but the deployment completes; finish.sh then adds a posix
+  # storage owned by the job user.
+  storages:
+    posix-local:
+      type: "posix"
+      mountPoint: "/volumes/posix"
+      readonly: false
+oneprovider:
+  register: true
+  name: "@PROVIDER_NAME@"
+  domain: "@NODE_FQDN@"
+  tokenProvisionMethod: "fromFile"
+  tokenFile: "/root/.hpcop/registration-token"
+  adminEmail: "@ADMIN_EMAIL@"
+  geoLatitude: 0.0
+  geoLongitude: 0.0
+  letsEncryptEnabled: false
+  subdomainDelegation: false
+onezone:
+  domainName: "@ZONE_FQDN@"
