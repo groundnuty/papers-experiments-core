@@ -105,6 +105,23 @@ def test_a_two_space_platform_runs_every_check_and_writes_a_report(platform, fak
     assert not [n for n in fake.nodes.values() if n.name.startswith("day0-")]  # each space's scratch is gone
 
 
+def test_o41_the_round_trip_is_unknown_in_a_read_only_imported_space_and_sends_it_nothing(fake, ticker, tmp_path):
+    """O41, O08: a read-only imported space takes no scratch file, so the round trip cannot run there: it is unknown
+    in that space, saying why, with nothing sent to it, and still runs in the other space."""
+    directory = tmp_path / "target"
+    directory.mkdir()
+
+    def edit(data):
+        two_spaces(data)
+        data["spaces"][1]["import"] = {"readonly": True}
+
+    entry = one_check(write_platform(directory, edit), fake, ticker, tmp_path, "round_trip")
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("pass", "unknown")
+    assert "read-only imported storage" in spaces["spaces[1]"]["summary"]
+    assert entry.ok is None
+
+
 def test_a_support_difference_in_the_second_space_fails_the_run_and_names_that_space(platform, fake, ticker, tmp_path):
     """The federation reports the second space without beta, which platform.toml declares: the run fails, the report is
     written, and the failure names the second space by its position alone."""

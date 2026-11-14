@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fedspec import Spec, load_spec
+from fedspec import Import, Spec, load_spec
 
 ROOT_MARKER = ".expcore-fed-root"  # written by up into a root it made or found empty; holds the project name
 NESTED_DEPTH = 8  # how many levels below a root up and down look for another federation's marked root
@@ -26,6 +26,15 @@ IMAGES = (  # pinned by the deployment: a layout cannot name another
     "docker.onedata.org/oneprovider:ID-765309c84f",
 )
 NODE = "node1"  # each service's one cluster node
+REGULAR_STORAGE = "posix"  # the name of every provider's batch-mode storage (fedcompose.provider_config): its own disk
+IMPORT_MOUNT = "/volumes/import"  # where an owner's service sees its imported spaces' directories, one below it each
+
+
+def import_storage_name(space: str) -> str:
+    """The name of the imported storage that holds a space: one storage per imported space, so each has its own
+    directory and its own scan."""
+    return f"import-{space}"
+
 
 CONTENT_FILE = "hello.txt"  # a small file at the study space's root: the content test reads it
 REPLICATED_FILE = "replicated.bin"  # replicated from the owner to the first mirror, so a transfer record exists
@@ -217,3 +226,45 @@ class Layout:
 
     def storage(self, service: str) -> Path:
         return self.root / service / "storage"
+
+    def imported(self, space: str) -> Import:
+        """A space's import declaration; refused for a space that has none."""
+        declared = self.spec.space(space).imported
+        if declared is None:
+            raise ValueError(f"{space} is not an imported space: spaces.{space} has no import")
+        return declared
+
+    def import_dir(self, space: str) -> Path:
+        """Where a writable import's copy of its source lies: in the owner's directory of the root, so down removes
+        it with the root. A read-only import has no copy: its source is mounted as it is."""
+        self.imported(space)
+        return self.root / self.spec.space(space).owner / "import" / space
+
+    def import_source(self, space: str, environ: Mapping[str, str]) -> Path:
+        """The host directory of an imported space's dataset, from the variable its layout names.
+
+        The layout never holds a path, so the variable is the only way to one, and what it names is checked before
+        anything reads, copies or mounts it: an absolute path of an existing directory with no `..` step and no
+        symbolic link on the way, which is not the root, inside it, or holding it (down empties the root, and the
+        copy or the mount would meet it). A refusal names the variable and never says what it holds."""
+        name = self.imported(space).source_env
+        value = environ.get(name)
+        if value is None:
+            raise ValueError(f"{name} is not set; it must name the directory of the dataset of {space}")
+        if not value or not os.path.isabs(value):
+            raise ValueError(f"{name} must be an absolute path of the directory of the dataset of {space}")
+        source = Path(value)  # drops a trailing separator and `.` steps, keeps `..`
+        if ".." in source.parts:
+            raise ValueError(f"{name} may not hold a '..' step: a link before it would change where it leads")
+        for step in (*reversed(source.parents), source):
+            if step.is_symlink():
+                raise ValueError(f"{name} may not pass through a symbolic link")
+        if not source.is_dir():
+            raise ValueError(f"{name} must be an existing directory")
+        if source == self.root:
+            raise ValueError(f"{name} is the root of the federation, which down empties")
+        if self.root in source.parents:
+            raise ValueError(f"{name} lies inside the root of the federation, which down empties")
+        if source in self.root.parents:
+            raise ValueError(f"{name} holds the root of the federation, which down empties")
+        return source

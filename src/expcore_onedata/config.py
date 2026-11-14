@@ -19,6 +19,7 @@ id = "..."                      # the id Onezone reports for the provider; repor
 name = "..."
 id = "..."
 prefixes = ["..."]              # a mutation may only name a space whose name starts with one of these (O09)
+import = { readonly = true }    # optional: the data provider holds the space on an imported storage (spaces.py, O41)
 
 [support]
 providers = ["<name>", ...]     # the declared supporting set; health fails on any difference (O04)
@@ -70,7 +71,10 @@ manifest = "path.json"          # the frozen manifest the client checks the serv
 Two more tables are accepted here and read by the modules that use them, each validated against this file's providers:
 `[placement]` (the data provider, the bounds of placement and the declared range map; `rangemap.load_placement`) and
 `[slots.<name>]` (the leased platform users, one per token plane; `users.load_slots`). `[faults]` (the sanction, journal
-and services of the fault injector; `faults.load_faults`) is read the same way.
+and services of the fault injector; `faults.load_faults`) is read the same way. `[link_check]` (the probe space of the
+pre-campaign link check, never a study space, and its bounds; `linksettings.load_link_check`, O35) is read when the
+file is loaded, into `link_check`, and kept out of the fingerprint: it says what is checked before a campaign, not what
+a run measures.
 
 **Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and its
 fingerprint is unchanged. With several spaces, `space` and `support` refuse (there is no one space to give), and each
@@ -93,6 +97,7 @@ from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
+from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
 from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
@@ -213,6 +218,12 @@ class PlatformConfig:
     sha256: str = ""  # of the file as loaded: a record names the configuration by this, never by a value in it
     tls: TlsSettings = field(default_factory=TlsSettings)  # every client's one certificate check (`[tls]`)
     spaces_table: bool = False  # the spaces came from [[spaces]], one entry or several, not from [space]/[support]
+    link_check: LinkCheckSettings | None = None  # the pre-campaign link check's probe space and bounds (O35)
+
+    @property
+    def probe_space(self) -> Space | None:
+        """The link check's probe space, which only a request bound to it reaches (`OnezoneClient.mutate`), or None."""
+        return None if self.link_check is None else self.link_check.space
 
     def space_named(self, label: str | None = None) -> StudySpace:
         """Return the space a label names, or, with none, the only one; refuse, naming no label, when there is none
@@ -267,7 +278,8 @@ class PlatformConfig:
         It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
         whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
         (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
-        The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was.
+        The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
+        declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly`.
 
         With a `[sandbox]`, it also holds every level of the data path with its kind and a REST level's listing mode
         (O21), so a resume after a level changed its data path or its listing is refused. A declared
@@ -284,6 +296,8 @@ class PlatformConfig:
         out: dict[str, Any] = {"tls": self.tls.record()}
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
+        elif self.spaces[0].imported is not None:  # the one-space form's: only when declared, so the old one stands
+            out["storage_import"] = {"readonly": self.spaces[0].imported.readonly}
         if self.sandbox is not None:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:
@@ -540,6 +554,7 @@ def load_platform(
             "placement",  # read by rangemap.load_placement
             "slots",  # read by users.load_slots
             "faults",  # read by faults.load_faults
+            "link_check",  # read by linksettings.load_link_check, below
         )
     )
     zone = root.section("zone")
@@ -575,4 +590,5 @@ def load_platform(
         else None,
         sha256=digest,
         tls=tls,
+        link_check=load_link_check(root, providers, spaces),
     )

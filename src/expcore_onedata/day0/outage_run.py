@@ -122,14 +122,12 @@ class Run(AfterRestore):
             self.gaps.append(f"the tool server lacks {len(missing)} of the knowledge tools, so they were not measured")
 
     async def execute(self) -> None:
-        """Prepare and baseline, take the target down, measure, restore it, then check the restore and read again."""
-        try:
-            await asyncio.to_thread(self.prepare)
-            await self.agent_baseline()
-        except (ProvisionError, PlatformError, consistency.WaitTimeout, KeyError, Unprepared) as error:
-            reason = str(error) if isinstance(error, Unprepared) else type(error).__name__
-            self.gaps.append(f"nothing was taken down: the scenario could not be set up or proved ({reason})")
-            return
+        """Recover what an earlier run left open, prepare and baseline, take the target down, measure, restore it, then
+        check the restore and read again.
+
+        The injector comes first, and its recovery before anything is prepared (#178): an earlier process that died
+        with the data provider stopped leaves a provider every read and write of the preparation fails against, so
+        preparing first would return before the recovery ran and leave the provider down, with no restore recorded."""
         ctx = self.ctx
         assert ctx.fault_settings is not None
         assert ctx.fault_driver is not None
@@ -139,6 +137,20 @@ class Run(AfterRestore):
             driver=ctx.fault_driver, clock=ctx.clock, sleep=ctx.sleep,
         )  # fmt: skip
         outage = Outage(injector, self.directory, InjectionJournal(ctx.fault_settings.journal))
+        left = await outage.recover()
+        if left:  # a provider may still be down: nothing is prepared, and no later space is run (`outage.py`)
+            self.facts["restore"] = outage.left_open_facts(left)
+            await self.after_restore(False)
+            return
+        if settled := outage.recovered():
+            self.facts["earlier_injection"] = {"recovered": settled}
+        try:
+            await asyncio.to_thread(self.prepare)
+            await self.agent_baseline()
+        except (ProvisionError, PlatformError, consistency.WaitTimeout, KeyError, Unprepared) as error:
+            reason = str(error) if isinstance(error, Unprepared) else type(error).__name__
+            self.gaps.append(f"nothing was taken down: the scenario could not be set up or proved ({reason})")
+            return
         went_down = False
         try:
             async with outage.down() as down:  # the injector's `running`: never its start in a bare thread (#27)

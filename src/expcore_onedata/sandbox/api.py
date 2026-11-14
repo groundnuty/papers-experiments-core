@@ -111,7 +111,15 @@ class ExecResult:
     """What the agent's code did: its output, its exit code, how long it ran, and, when it was killed, why.
 
     `status` is `RAN`, or `NOT_STARTED` for a cell that too little time was left to start: it ran nothing, so it has no
-    timeout and no kill, and what the time running out means is the loop's own rule."""
+    timeout and no kill, and what the time running out means is the loop's own rule.
+
+    `timed_out` says that a bound of the sandbox's own ended the cell, with `record=False` as with a cell of the
+    agent's, and `bound` says which (`bounds.CELL_TIMER`, `CONTAINER_TIMEOUT` or `HOST_CALL`); it is None exactly when
+    `timed_out` is False. An exit 137 or 124 from the container's `timeout` at its limit reads as the bound's, and one a
+    cell gave itself (`os.kill(os.getpid(), 9)`) before that limit as its own exit, not a timeout (`bounds`, O39).
+
+    `output_cut` is what the sandbox cut of the cell's output, which it keeps up to a cap per stream: for each stream it
+    cut, the bytes the cell wrote (`produced`) and the bytes kept (`kept`); None when nothing was cut (O43)."""
 
     stdout: str
     stderr: str
@@ -121,6 +129,9 @@ class ExecResult:
     kill: dict[str, Any] | None = None  # the cause of a kill or timeout, from the kernel's counters (killcause.py)
     status: str = RAN
     gate_refusals: tuple[str, ...] = ()  # the data gate's own refusals during the cell (gatelog.refusals)
+    bound: str | None = None  # the sandbox's bound that ended the cell, when `timed_out` (bounds.py)
+    # the streams of the cell the sandbox cut (O43): `{"stdout": {"produced": n, "kept": m}, ...}`, only those it cut
+    output_cut: dict[str, dict[str, int]] | None = None
 
 
 @runtime_checkable

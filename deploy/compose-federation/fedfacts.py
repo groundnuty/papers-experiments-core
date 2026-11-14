@@ -1,8 +1,10 @@
 """What up writes into the root for an integrator, and what the day-0 report records of a deployment.
 
 facts.json holds the addresses, ids and names a platform.toml needs, the declared layout's name, digest and memory
-limits, and the root's allowed parent; never a secret, since credentials are named by their files. platform.toml is
-rendered from the layout's template with those facts. `describe` gives the deployment's table for the day-0 report.
+limits, the root's allowed parent and how each imported space is held (its mode, the name of the variable that gave its
+source, its storage and its scan, never the source's path); never a secret, since credentials are named by their
+files. platform.toml is rendered from the layout's template with those facts. `describe` gives the deployment's table
+for the day-0 report.
 """
 
 import json
@@ -10,10 +12,10 @@ import os
 import re
 from pathlib import Path
 
-from fedboot import Bootstrap
+from fedboot import Bootstrap, Ids
 from feddocker import gib
-from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout
-from fedspec import Spec
+from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout, import_storage_name
+from fedspec import Space, Spec
 
 PLACEHOLDER = re.compile(r"@([a-z_]+(?:\.[a-z0-9_-]+)?)@")
 
@@ -52,6 +54,19 @@ def baseline_left_behind(layout: Layout) -> list[str]:
     return [s.name for s in layout.spec.spaces if not s.baseline and had_files.get(s.name, False)]
 
 
+def import_facts(space: Space, ids: Ids) -> dict | None:
+    """How a space is imported, or None: its mode, the name of the variable that gave its source, its storage's name and
+    the scan the wait read for it (None before one was read). Never the source's path: it is the host's own."""
+    if space.imported is None:
+        return None
+    return {
+        "readonly": space.imported.readonly,
+        "source_env": space.imported.source_env,
+        "storage": import_storage_name(space.name),
+        "scan": ids.scans.get(space.name),
+    }
+
+
 def facts_of(boot: Bootstrap) -> dict:
     """What an integrator needs to write platform.toml: addresses, ids, names and where the credentials are.
 
@@ -77,6 +92,7 @@ def facts_of(boot: Bootstrap) -> dict:
                 "supported_by": list(s.supporters),
                 "agent_visible": s.agent_visible,
                 "baseline": s.baseline,
+                "import": import_facts(s, ids),
             }
             for s in spec.spaces
         },
@@ -144,6 +160,14 @@ def write_private(path: Path, text: str) -> None:
         handle.write(text)
 
 
+def import_note(space: Space) -> str:
+    """The clause a space's row of the day-0 table gets when it is imported: its mode and the variable, not its path."""
+    if space.imported is None:
+        return ""
+    mode = "read-only" if space.imported.readonly else "writable"
+    return f"; imported ({mode}) from ${space.imported.source_env}"
+
+
 def describe(layout: Layout) -> str:
     """The declared layout and the root, as the rows of the day-0 report's table of the deployment."""
     spec = layout.spec
@@ -161,7 +185,8 @@ def describe(layout: Layout) -> str:
                 f"owner `{s.owner}`, mirrors {', '.join(f'`{m}`' for m in s.mirrors) or 'none'}, "
                 f"support {gib(s.support_bytes)} each"
                 + ("" if s.agent_visible else "; day-0 only, no agent user")
-                + ("" if s.baseline else "; no baseline files"),
+                + ("" if s.baseline else "; no baseline files")
+                + import_note(s),
             )
             for s in spec.spaces
         ),

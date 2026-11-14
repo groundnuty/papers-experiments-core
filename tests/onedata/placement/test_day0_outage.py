@@ -297,6 +297,19 @@ def test_o28_the_answers_of_each_path_are_recorded_with_status_latency_and_outco
     assert entry.facts["during"]["knowledge"]["get_file_distribution"]["replicated"]["outcome"] == "served"
 
 
+def test_o35_a_rest_read_records_the_statuses_and_bytes_of_the_answers_it_was_given(context):
+    """O37: a REST read of the outage check says what the platform answered, never only that it served: the count of
+    its answers by status (a ranged read is answered 206, a range at a time) and the body bytes they held; a read that
+    got no answer says so with no counts."""
+    entry = outage_check(context)
+    rest = entry.facts["during"]["rest"]
+    served = rest["replicated"]["answers"]
+    assert set(served["statuses"]) == {"206"}
+    assert served["statuses"]["206"] > 1
+    assert served["body_bytes"] == outage_run.FILE_BYTES
+    assert rest["owner_only"]["answers"] == {"statuses": {}, "body_bytes": 0}
+
+
 def test_o28_a_read_the_platform_refuses_records_its_status_and_error_id(context, world):
     """O28: a read the platform refuses records its status and error id."""
     world.reads_while_down = "refuse"
@@ -866,6 +879,58 @@ def test_o28_the_mount_is_read_through_a_real_sandbox_in_mount_mode_all_up_and_d
     assert ("read", "owner_only") in agent.mount_ops
 
 
+def wrong_replicated_after_restore(agent, services, answers):
+    """Make the mount's read of the replicated file answer as `answers` says each time it is read after the restore:
+    `answers(row, tries)` returns the row for the `tries`-th such read, given the correct one."""
+    mount_op, tries = agent.mount_op, []
+
+    def op(request, deadline_s):
+        row = mount_op(request, deadline_s)
+        if request["op"] == "read" and request["key"] == "replicated" and services.generation[SERVICE] > 1:
+            tries.append(1)
+            return answers(row, len(tries))
+        return row
+
+    agent.mount_op = op  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize("wrong", ["differs", "an_error"])
+def test_o28_a_replicated_mount_read_that_is_wrong_after_the_restore_fails_the_check(context, agent, services, wrong):
+    """O28 (#178): after the restore the mount's two files are read again and each must return what was written. A
+    replicated file that returns other bytes, or fails with an errno, fails the check, with the file that went wrong
+    named in its facts; the owner-only file read through the same cell is no excuse."""
+
+    def answers(row, tries):
+        if wrong == "differs":
+            return {**row, "sha256": "0" * 64}
+        return {"key": row["key"], "seconds": 0.01, "blocked": False, "error": "EIO", "errno": 5, "kind": "OSError"}
+
+    wrong_replicated_after_restore(agent, services, answers)
+    entry = outage_check(context)
+    assert entry.ok is False
+    after = entry.facts["after"]
+    assert after["mount_owner_only"]["outcome"] == "served"
+    assert after["mount_replicated"]["outcome"] == ("differs" if wrong == "differs" else "refused")
+    assert "after the restore 1 read(s) did not return what was written" in entry.summary
+    assert entry.facts["restore"]["verified"] is True  # the provider is back: it is the read that is wrong
+
+
+def test_o28_a_replicated_mount_read_that_is_wrong_once_after_the_restore_and_then_served_passes(
+    context, agent, services
+):
+    """O28 (#178): a provider slow to take up its peers is read again until the file is served or the settle timeout,
+    for the replicated file as for the owner-only one: one wrong answer and then the right bytes pass, with the
+    attempts recorded."""
+    wrong_replicated_after_restore(
+        agent, services, lambda row, tries: {**row, "sha256": "0" * 64} if tries == 1 else row
+    )
+    entry = outage_check(context)
+    assert entry.ok is True, entry.summary
+    after = entry.facts["after"]
+    assert (after["mount_replicated"]["outcome"], after["mount_replicated"]["attempts"]) == ("served", 2)
+    assert after["mount_owner_only"]["outcome"] == "served"
+
+
 def test_o28_a_mount_read_that_times_out_at_the_bound_is_blocked_with_its_errno(context, agent):
     """O28: a mount's ETIMEDOUT, which Python reports as TimeoutError, after the read waited its bound got no answer:
     it is `blocked`, never a refusal, and the cell keeps the errno's name and number and the exception's class (the
@@ -1240,6 +1305,71 @@ def test_o28_a_journal_that_cannot_be_read_after_a_failed_start_is_not_shown_to_
     assert spaces["spaces[0]"]["restore"]["left_open"] == [{"target": None, "how": "journal_unreadable"}]
     assert "the injection journal" in spaces["spaces[0]"]["summary"]
     assert services.verbs() == []
+
+
+def watch_prepare(monkeypatch, services, world):
+    """Record, as each space's `Run.prepare` begins, the stops and starts so far and the hosts that are down."""
+    seen = []
+    original = outage_run.Run.prepare
+
+    def prepare(self):
+        seen.append((services.verbs(), set(world.down)))
+        original(self)
+
+    monkeypatch.setattr(outage_run.Run, "prepare", prepare)
+    return seen
+
+
+def test_o28_a_provider_an_earlier_run_left_stopped_is_restored_before_anything_is_prepared(two_spaces, monkeypatch):
+    """O28 (#178): an earlier process died with the data provider stopped and its injection open in the journal. The
+    injector's recovery of it runs before the check prepares anything, since preparing reads and writes through that
+    provider: it is restarted, with its restore recorded as a fact, and the run then prepares and goes on as usual."""
+    ctx, services, world, _ = two_spaces
+    services.stop(SERVICE)  # what the earlier process did before it died
+    leave_open(ctx, services, "stopping", "injected")
+    services.calls.clear()
+    seen = watch_prepare(monkeypatch, services, world)
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert seen[0] == (["start"], set())  # restarted, and the host answering again, when the first space prepared
+    assert entry.ok is True, entry.summary
+    recovered = entry.facts["spaces"]["spaces[0]"]["earlier_injection"]["recovered"]
+    assert [(row["target"], row["how"]) for row in recovered] == [("providers[0]", "restored")]
+    assert "earlier_injection" not in entry.facts["spaces"]["spaces[1]"]  # nothing of it left for the second space
+    assert services.verbs() == ["start", "stop", "start", "stop", "start"]  # the recovery's, then each space's own
+    assert InjectionJournal(ctx.fault_settings.journal).open_entries() == []
+    assert world.down == set()
+
+
+def test_o28_an_injection_left_open_that_cannot_be_settled_stops_the_run_before_anything_is_prepared(
+    two_spaces, monkeypatch
+):
+    """O28 (#178): when the recovery of an earlier run's injection fails, the check prepares nothing: the provider may
+    still be down, and preparing against it would only fail and hide that."""
+    ctx, services, world, _ = two_spaces
+    leave_open(ctx, services, "stopping")
+    seen = watch_prepare(monkeypatch, services, world)
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert seen == []
+    assert entry.facts["spaces"]["spaces[0]"]["restore"]["how"] == "earlier_injection_open"
+    assert entry.ok is False
+
+
+def test_o28_a_recovery_that_raises_something_unforeseen_fails_closed_naming_only_its_type(two_spaces, monkeypatch):
+    """O28 (#178): whatever the recovery of an earlier run's injection raises, the check does not crash and does not
+    go on: it prepares nothing, fails, halts the spaces after it, and names the exception's class, never its text."""
+    ctx, services, world, _ = two_spaces
+
+    def broken(self):
+        raise OSError("/home/someone/journal.lock: no space left")
+
+    monkeypatch.setattr("expcore_onedata.faults.FaultInjector.recover", broken)
+    seen = watch_prepare(monkeypatch, services, world)
+    entry = run_checks(ctx, ["provider_outage"])[0]
+    assert seen == []
+    spaces = entry.facts["spaces"]
+    assert (spaces["spaces[0]"]["result"], spaces["spaces[1]"]["result"]) == ("fail", "unknown")
+    assert spaces["spaces[0]"]["restore"]["left_open"] == [{"target": None, "how": "OSError"}]
+    assert "someone" not in json.dumps(entry.facts)
 
 
 def test_o28_a_start_that_fails_before_anything_is_journalled_or_stopped_leaves_the_spaces_after_it_to_run(two_spaces):
