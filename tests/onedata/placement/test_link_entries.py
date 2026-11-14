@@ -120,7 +120,6 @@ def test_o48_each_pair_has_its_own_current_probe():
         PROBE_PREFIX + STEM.upper(),
         f"{probe_name(KEY)}-g0",  # generation 0 has no suffix
         f"{probe_name(KEY)}-g01",
-        f"{probe_name(KEY)}-g1234567890",  # ten digits: past the generations generation_of reads
         f"{probe_name(KEY)}-g{chr(0x661)}",  # an Arabic-Indic digit one
         f"{probe_name(KEY)}-g",
         f"{probe_name(KEY)}-G1",
@@ -158,7 +157,15 @@ def test_o48_the_near_misses_are_not_all_the_same_digit_case():
 
 @pytest.mark.parametrize(
     "name",
-    [probe_name(KEY), probe_name(KEY, 1), probe_name(KEY, 7), probe_name(KEY, 123456789), retired_name(KEY, "file-a")],
+    [
+        probe_name(KEY),
+        probe_name(KEY, 1),
+        probe_name(KEY, 7),
+        probe_name(KEY, 123456789),
+        probe_name(KEY, 10**9),
+        probe_name(KEY, 10**40 + 7),
+        retired_name(KEY, "file-a"),
+    ],
 )
 def test_o48_both_name_shapes_the_link_check_writes_are_its_own(name):
     """O48: every name `probe_name` and `retired_name` make is the check's own."""
@@ -172,6 +179,18 @@ def test_o48_a_probe_name_is_read_with_the_generation_linkprobe_reads(generation
     assert generation_of(name, KEY) == generation
     found = link_check_entries([(name, "file-a")])
     assert [c.generation for c in found.current] == [generation]
+
+
+def test_o48_the_successor_the_check_writes_past_the_generations_it_reads_is_still_its_own():
+    """O48: `probe_name` has no upper bound, so the name `retire` writes after generation 999999999 is the check's own,
+    though `generation_of` reads no more than nine digits."""
+    last = probe_name(KEY, 999_999_999)
+    successor = probe_name(KEY, 1_000_000_000)
+    assert generation_of(successor, KEY) is None
+    found = link_check_entries([(last, "file-a"), (successor, "file-b")])
+    assert [(c.generation, c.file_id) for c in found.current] == [(1_000_000_000, "file-b")]
+    assert found.superseded == (ListedFile(last, "file-a"),)
+    assert found.other == ()
 
 
 def test_o48_an_empty_listing_has_nothing():

@@ -7,8 +7,9 @@ reads that from a listing's names and file ids alone, with no provider id and no
 
 **The two name shapes**, matched whole, in lower-case hex and with no other text before, after or between:
 
-- a probe, `expcore-link-probe-<16 hex>`, and `-g<N>` after it for generation N from 1 to 999,999,999 (no `-g0`, no
-  leading zero), the 16 hex digits being the SHA-256 of the pair's key, the pair's **stem**;
+- a probe, `expcore-link-probe-<16 hex>`, and `-g<N>` after it for generation N from 1, with no leading zero and no
+  upper bound, since `probe_name` has none and the check writes whatever generation comes next (no `-g0`). The 16 hex
+  digits, the SHA-256 of the pair's key, are the pair's **stem**;
 - a retirement marker, `expcore-link-retired-<16 hex>-<16 hex>`: the pair's stem, then the SHA-256 of the retired file
   id.
 
@@ -17,7 +18,9 @@ Any other name is `other`, near misses (a wrong number of digits, upper case, `-
 **The current probe of a pair is the highest generation among its files not retired**, a file being retired when a
 marker of its stem holds the digest of its file id (the id, never the name: a name written again is a new file). Every
 other probe of the pair, a lower generation or a retired one, is superseded, and a pair whose every probe is retired
-has no current one. This is the choice `linkprobe.ProbeFiles.provision` makes.
+has no current one. This is the choice `linkprobe.ProbeFiles.provision` makes, for every generation it reads:
+`linkprobe.generation_of` stops at nine digits, so a probe of a billionth generation or later (a billion failed fetches
+of one pair) is the check's own file here and one `provision` does not look at.
 """
 
 import re
@@ -29,7 +32,7 @@ from expcore_onedata.linkprobe import PROBE_PREFIX, RETIRED_PREFIX, _digest
 from expcore_onedata.provision import Entry
 
 _STEM = r"(?P<stem>[0-9a-f]{16})"
-_PROBE = re.compile(rf"{re.escape(PROBE_PREFIX)}{_STEM}(?:-g(?P<generation>[1-9][0-9]{{0,8}}))?")
+_PROBE = re.compile(rf"{re.escape(PROBE_PREFIX)}{_STEM}(?:-g(?P<generation>[1-9][0-9]*))?")
 _MARKER = re.compile(rf"{re.escape(RETIRED_PREFIX)}{_STEM}-(?P<file>[0-9a-f]{{16}})")
 
 
