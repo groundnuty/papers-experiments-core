@@ -11,7 +11,7 @@ never from an exit code. Their categories map to the core's vocabulary of infras
   `unattributed_kill`, retried within the attempt limit.
 
 Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). The platform's own kinds are registered here,
-when this module is first imported. Five are the sandbox's and the ingest's, and none is treatable:
+when this module is first imported. Six are the sandbox's and the ingest's, and none is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
   its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
@@ -39,6 +39,10 @@ when this module is first imported. Five are the sandbox's and the ingest's, and
   (`deadline.py`, O34). The harness could not bound the cell, and the run's mount or sandbox is gone: the run says
   nothing about the agent or the manipulation, so it is set aside, and no condition may declare it, an outage's
   included. A cell killed cleanly at its deadline is the agent's own time limit, never this kind.
+- `io_mode_integrity`: the mount run's effective oneclient I/O mode, as oneclient's own start lines and detection
+  lines show it (`iomode`, O48), was not the mode the run declared, or the log could not say. The run ran in another
+  mode, or in none that can be shown, so it says nothing about the manipulation: set aside and never scored as the
+  declared mode, and no condition may declare it.
 
 This is the one module of the platform layer that registers kinds, so a study names it alone in `[study] platforms` to
 make every kind the layer raises known before its conditions are validated, and `check` imports it alone for a record
@@ -101,6 +105,14 @@ register_infra_kind(
     "a process of the agent's code outlived its kill at the cell's deadline (a read waiting in the kernel on the FUSE "
     "mount), so the sandbox aborted the mount or stopped: the harness could not bound the cell, and the run says "
     "nothing about the agent or the manipulation",
+    treatable=False,
+)
+
+IO_MODE_INTEGRITY = "io_mode_integrity"
+register_infra_kind(
+    IO_MODE_INTEGRITY,
+    "a mount run's effective oneclient I/O mode, read from oneclient's own start lines, was not the declared one, or "
+    "its log could not say: a run that did not run in the mode it declares says nothing about the manipulation",
     treatable=False,
 )
 
@@ -192,6 +204,7 @@ __all__ = [
     "DATA_GATE_INTEGRITY",
     "INGEST_FAILURE",
     "INJECTOR_FAILURE",
+    "IO_MODE_INTEGRITY",
     "KIND_OF_CATEGORY",
     "OUTPUT_COLLECTION",
     "PROVIDER_OUTAGE",

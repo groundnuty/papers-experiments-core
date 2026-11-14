@@ -64,6 +64,7 @@ from expcore_onedata.sandbox import (
     gatepolicy,
     hostops,
     inputs,
+    iomode,
     kinds,
     netpool,
     reap,
@@ -794,6 +795,30 @@ class DockerSandbox:
                 f"the sidecar's oneclient logged {', '.join(lines)}: a read did not go to the storage",
             )
 
+    def _note_io_mode(self) -> None:
+        """At collection, read the mount's effective I/O mode from oneclient's own log and keep it with the declared one
+        (`mount.effective`, O48): a log that cannot be read is an unknown reading, never an error of the collection,
+        since the instrument's check is what refuses the run."""
+        try:
+            text = self._read_sidecar_log()
+        except (OSError, SandboxError) as error:
+            log.error("the sidecar's oneclient log could not be read for the I/O mode: %s", describe_error(error))
+            text = None
+        reading = iomode.judge(self.s.mount.io_mode, text)
+        with self._meta_lock:  # `metadata()` may be reading it from another thread
+            self._meta["mount"]["effective"] = reading
+
+    def mount_io_mode(self) -> dict[str, Any]:
+        """The mount's I/O mode for the run's record (O48, `iomode`): `{"mount": False}` without a mount; with one, the
+        reading the collection took of oneclient's log, `declared`, `effective`, `agree` and what shows them. Before the
+        collection there is none, so the reading is unknown (`iomode.NOT_COLLECTED`), never the declared mode."""
+        if self.spec.mode is not DataPathMode.MOUNT:
+            return {"mount": False}
+        with self._meta_lock:
+            taken = self._meta["mount"].get("effective")
+        reading = taken or iomode.judge(self.s.mount.io_mode, None, why_unread=iomode.NOT_COLLECTED)
+        return {"mount": True, **json.loads(json.dumps(reading))}
+
     def _read_sidecar_log(self) -> str | None:
         """The sidecar's oneclient INFO log, read as root in the sidecar, or None when it could not be read."""
         found = self.host.docker(
@@ -1216,6 +1241,8 @@ class DockerSandbox:
         except SandboxError as failed:  # the copy command, the disk or the copy failed: the harness's own failure
             raise kinds.collection_error("the run's outputs", str(failed)) from None
         self._inputs_unchanged()
+        if self.spec.mode is DataPathMode.MOUNT:
+            self._note_io_mode()  # while the sidecar runs, and before the direct check below, which may refuse
         if self.spec.mode is DataPathMode.MOUNT and self.s.mount.io_mode == DIRECT:
             self._direct_io_held()  # while the sidecar runs: its log is read in it
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs

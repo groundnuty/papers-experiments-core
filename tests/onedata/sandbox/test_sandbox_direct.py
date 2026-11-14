@@ -244,3 +244,37 @@ def test_o40_a_read_only_input_from_a_storage_directory_is_refused(direct, tmp_p
         start(direct, inputs=(ReadOnlyInput(source, "/opt/invented"),))
     assert "storage" in str(caught.value)
     assert str(storage) not in str(caught.value)
+
+
+def test_o48_a_direct_run_records_both_modes_agreeing_through_the_instrument(direct, tmp_path):
+    """O48: a direct mount's collection reads the log once more and keeps the reading with the metadata; the instrument
+    records declared direct against effective direct, and its check passes."""
+    from expcore_onedata.sandbox.iomode import MountIoMode
+
+    sbx = start(direct)
+    instrument = MountIoMode(sbx)
+    sbx.collect(tmp_path / "evidence")
+    assert instrument.finish() == {
+        "version": 1, "mount": True, "declared": "direct", "effective": "direct", "agree": True,
+        "forced_direct": "1", "forced_proxy": "0", "lines": [], "problems": [],
+    }  # fmt: skip
+    instrument.check()
+    written = json.loads((tmp_path / "evidence" / "metadata.json").read_text())
+    assert written["mount"]["effective"]["effective"] == "direct"
+    sbx.stop()
+
+
+def test_o48_a_direct_run_whose_collection_is_refused_for_a_fallback_still_keeps_the_mixed_reading(direct, tmp_path):
+    """O48 and O40: the collection of a direct run that fell back to the provider fails as `output_collection`, and the
+    reading it took before that says the run was mixed, with the line's name, so the evidence is not lost with the
+    refusal."""
+    from expcore.errors import InfraError
+
+    sbx = start(direct)
+    direct.direct.log += FALLBACK
+    with pytest.raises(InfraError):
+        sbx.collect(tmp_path / "evidence")
+    reading = sbx.mount_io_mode()
+    assert (reading["declared"], reading["effective"], reading["agree"]) == ("direct", "mixed", False)
+    assert reading["lines"] == ["proxy_fallback"]
+    sbx.stop()
