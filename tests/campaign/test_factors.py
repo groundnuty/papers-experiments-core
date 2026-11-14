@@ -521,8 +521,8 @@ def test_c34_a_schema_cut_to_the_kind_names_alone_loses_the_target_and_is_refuse
     assert FactorSchema(base.declared, base.order, base.conditions, treatment=kept).digest == schema.digest
 
 
-def test_c35_a_schema_rebuilt_from_its_parts_is_the_schema_and_holds_every_rule_again(registry):
-    """C35: `rebuilt` runs the constructor over the schema's own parts, so a schema is checked again against the
+def test_c37_a_schema_rebuilt_from_its_parts_is_the_schema_and_holds_every_rule_again(registry):
+    """C37: `rebuilt` runs the constructor over the schema's own parts, so a schema is checked again against the
     vocabulary in scope now and against the rules of the constructor, and a valid one is the schema it was: the same
     digest, the same targets, the same tasks and exclusive conditions. One whose parts were edited after it was built
     is refused as a schema built that way would be."""
@@ -548,8 +548,8 @@ def test_c35_a_schema_rebuilt_from_its_parts_is_the_schema_and_holds_every_rule_
         schema.rebuilt()
 
 
-def test_c35_a_schema_whose_conditions_were_swapped_after_it_was_built_is_refused_not_rebuilt_around():
-    """C35: a run key resolves to its condition by a lookup built with the schema. Swapping the levels of two conditions
+def test_c37_a_schema_whose_conditions_were_swapped_after_it_was_built_is_refused_not_rebuilt_around():
+    """C37: a run key resolves to its condition by a lookup built with the schema. Swapping the levels of two conditions
     afterwards leaves a lookup that gives each key the other's treatment kinds, which a rebuild that only checked the
     parts would accept; the schema is refused, naming the file and the schema."""
     schema = make_schema()
@@ -573,8 +573,8 @@ def test_c35_a_schema_whose_conditions_were_swapped_after_it_was_built_is_refuse
         ("exclusive", "its exclusive conditions"),
     ],
 )
-def test_c35_a_schema_with_a_condition_deleted_from_one_of_its_parts_is_refused_not_given_the_default(deleted, label):
-    """C35: a rebuild gives a condition missing from a part the default the constructor gives, which would equal the
+def test_c37_a_schema_with_a_condition_deleted_from_one_of_its_parts_is_refused_not_given_the_default(deleted, label):
+    """C37: a rebuild gives a condition missing from a part the default the constructor gives, which would equal the
     digest, while the schema's own accessors would raise KeyError for that condition's run keys at run time; the
     schema is refused naming the part that differs."""
     schema = chain_schema()
@@ -584,8 +584,8 @@ def test_c35_a_schema_with_a_condition_deleted_from_one_of_its_parts_is_refused_
         schema.rebuilt()
 
 
-def test_c35_a_schema_edited_after_its_digest_was_taken_is_refused():
-    """C35: the digest is taken once and is what the campaign fingerprint holds, so a schema edited after it was taken
+def test_c37_a_schema_edited_after_its_digest_was_taken_is_refused():
+    """C37: the digest is taken once and is what the campaign fingerprint holds, so a schema edited after it was taken
     no longer is what its digest says, and is refused."""
     schema = make_schema()
     assert schema.digest == schema.rebuilt().digest  # taken, and unchanged by a rebuild
