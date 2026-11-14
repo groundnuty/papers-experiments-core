@@ -46,6 +46,21 @@ def digest(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def unhealed_detail(record: Mapping[str, Any], before: str | None) -> str:
+    """Why a heal left the links stuck, for the restore's failure: the heal's own why (else the check's detail before
+    it), then each pair the heal's last check found failing, named by its reading provider, the one whose link the
+    remedy restarts, and its source, by label (O35, O12)."""
+    why = str(record.get("why") or before)
+    after = record.get("after")
+    pairs = after.get("pairs") if isinstance(after, Mapping) else None
+    failing = [
+        f"{pair['reader']} reading from {pair['source']}"
+        for pair in pairs or ()
+        if isinstance(pair, Mapping) and pair.get("ok") is not True
+    ]
+    return f"{why}; failing after the heal, by reading provider: {', '.join(failing)}" if failing else why
+
+
 class LinkSettling:
     """The link half of `Recovery` (see the module docstring); `Recovery` provides every attribute it reads."""
 
@@ -171,7 +186,7 @@ class LinkSettling:
         for child in children:  # a restarted reader is restored only with every pair passing
             line = {"event": "cleared", "how": "restored"} if result.healed else {"event": "clear_failed"}
             self.journal.append({**line, "id": child, **({} if result.healed else {"how": result.how})})
-        self.links_detail = None if result.healed else str(result.record.get("why") or self.links_detail)
+        self.links_detail = None if result.healed else unhealed_detail(result.record, self.links_detail)
         return result.how
 
     def _active_transfers(self) -> int | None:

@@ -1175,3 +1175,38 @@ def test_o35_a_settle_one_recovery_held_holds_every_other_recoverys_reads(tmp_pa
     assert clock.now >= began + 30
     (reread,) = other.entries()
     assert reread["settle_until"] == began + 30
+
+
+@pytest.mark.parametrize("heal", ["off", "link"])
+def test_o35_a_links_stuck_recovery_names_the_reading_provider_of_each_failed_pair(tmp_path, heal):
+    """O35: a run left beta's outage open, and after the restore two pairs fail, each read by a different provider
+    from the crashed source. Whether no heal is declared or a heal ran and mended neither, the recovery's `links_stuck`
+    failure says to restart the reading provider's link and names the reader of each failed pair, never the restored
+    provider, the source or the platform's local provider as the one to restart."""
+    services = HealServices()
+    services.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
+    services.link_fixes = {READER: (), SECOND: ()}
+    injector_, services = injector(tmp_path, services, heal=heal)
+    injector_.start(RUN)
+    injector_._unlock()  # the run's process ends with the injection open: the kernel drops its lock on the target
+    platform = tmp_path / "platform.toml"
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    clock = services.clock
+    recovery = Recovery(settings, services, clock=clock, sleep=clock.sleep, labels=SERVICE, wall=clock)
+    with pytest.raises(InfraError) as caught:
+        recovery.recover(heal=True)
+    head, _, why = caught.value.detail.partition("was not cleared (")
+    assert RESTORED in head  # the injection the message is about
+    assert "restart the rtransfer link on the reading provider each failed pair names" in why
+    if heal == "link":
+        assert acted(services, "restart_link") == [("restart_link", READER), ("restart_link", SECOND)]
+        assert "a pair still fails after every step the bounds allow" in why
+        assert f"{READER} reading from {CRASHED}" in why
+        assert f"{SECOND} reading from {CRASHED}" in why
+    else:
+        assert acted(services, "restart_link") == []
+        assert f"{CRASHED}->{READER}" in why  # the check's own detail, source -> reader
+        assert f"{CRASHED}->{SECOND}" in why
+    assert f"{RESTORED} reading" not in why
+    assert f"{CRASHED} reading" not in why
+    assert "on the local provider" not in why
