@@ -91,6 +91,18 @@ def test_r03_a_cut_at_the_ceiling_replays_as_infrastructure_of_the_ceiling_kind(
     assert replayed.totals["infra_wait_by_kind"] == record.totals["infra_wait_by_kind"] != {}
 
 
+def test_l16_a_call_whose_own_expiry_was_judged_as_the_loops_cut_replays_as_that_cut():
+    """L16: the expiry of a tool call's bound at the agent's time left is recorded as the cut it stands for, with the
+    watch reading a cut takes, so the replay (which holds the call until that reading) ends the same way."""
+    record = SCENARIOS["tool_expiry_cut"][0]()
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("time_cap", None)
+    assert record.tool_calls[0]["status"] == "cut"
+    assert "watch" in [label for label, _ in record.clock]
+    replayed = replay_record(record)
+    assert replayed.outcome == record.outcome
+    assert replayed.clock == record.clock
+
+
 def test_r03_a_cleanup_that_timed_out_is_served_from_the_label_of_the_reading_that_ended_it():
     """R03: the replay's cleanup waiter answers as the record says, so a call given up on replays as given up on."""
     record = SCENARIOS["cleanup_timeout"][0]()

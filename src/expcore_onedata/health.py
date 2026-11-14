@@ -56,6 +56,11 @@ transfers the check made. `monotonic` and `sleep` are its clock and its pauses, 
 probes and evicts them, so a caller that must change nothing, day-0's read-only `health` check alone, builds this with
 `links=False`; a campaign's health gate never does.
 
+**So is every preallocated ingest's baseline (O44, `ingesthealth.py`), when the study names the ingests' journals**
+(`ingest_journals`): before anything else, with no request to the federation, the check fails while a space's baseline
+is marked unhealthy, or open by a run that is gone, so no run is admitted until `ProgressiveIngest.recover` verifies it
+whole. A study whose conditions use a preallocated ingest passes every journal they write to.
+
 **While `[tls] insecure_tls` is on, every reading warns** that no client of the federation checks its certificate, a
 setting for disposable test federations only (`tls.py`). The warning is appended to the detail, so the campaign's
 health record and day-0's report carry it; it does not change the verdict.
@@ -64,7 +69,8 @@ health record and day-0's report carry it; it does not change the verdict.
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from pathlib import Path
 
 from expcore.campaign.healthgate import Health, HealthCheck
 from expcore.config.loading import ConfigError
@@ -76,6 +82,7 @@ from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import compose_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
+from expcore_onedata.ingesthealth import baseline_health
 from expcore_onedata.linkcheck import LinkReport, check_links
 from expcore_onedata.linksettings import LinkCheckSettings
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
@@ -174,6 +181,7 @@ class PlatformHealth:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         links: bool = True,
+        ingest_journals: Iterable[Path | str] = (),
     ) -> None:
         if config.principals.service is None:
             raise ConfigError(f"{config.file}: [principals]: key 'service' is required for the health check")
@@ -188,6 +196,7 @@ class PlatformHealth:
         self._links_passed = False  # whether any link check of this campaign passed
         self._links_lock = threading.Lock()
         self._with_links = links
+        self._ingest_journals = tuple(Path(journal) for journal in ingest_journals)  # read at every call (O44)
         # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
         # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
         self._gate = PreCampaignHealth(self._regular, self._measure)
@@ -250,13 +259,15 @@ class PlatformHealth:
             return token
 
     def __call__(self) -> Health:
-        """Return the platform's health: with `[faults]`, the fault gate holding the federation around the rest; the
-        content type kept from the first call; then the space. Never raise.
+        """Return the platform's health: the ingests' baselines; with `[faults]`, the fault gate holding the federation
+        around the rest; the content type kept from the first call; then the space. Never raise.
 
         While `[tls] insecure_tls` is on, every reading, healthy, failed or deferred, ends with a warning that no client
         of the federation checks its certificate (`tls.WARNING`); the verdict, a deferral included, is unchanged."""
         try:
-            verdict = self._faults() if self._faults is not None else self._gate()
+            verdict = baseline_health(self._ingest_journals)  # first, and asking the federation nothing
+            if verdict.ok:
+                verdict = self._faults() if self._faults is not None else self._gate()
         except Exception as error:
             verdict = Health(False, f"health check raised {type(error).__name__}")
         return self._warned(verdict)
