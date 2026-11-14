@@ -1,7 +1,10 @@
 name: ci
 
+# A push to a branch with an open pull request would otherwise run twice, once as a push and once as a pull request.
+# Pushes are built for main only; every other change is built by its pull request, whatever branch it is based on.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -12,6 +15,14 @@ on:
 
 permissions:
   contents: read
+
+# A newer run for the same pull request supersedes an older one that is still going: each pull request run checks the
+# whole range from its base to its head, so the newer run covers everything the older one did. A push to main and a
+# manual dispatch each get a group of their own and are never cancelled: a push run checks only the commits since the
+# previous push, so a cancelled one (or one replaced while pending) would leave its commits unchecked for good.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   # Pinned to the uv that made uv.lock, so CI does not look up "latest" on every run.
