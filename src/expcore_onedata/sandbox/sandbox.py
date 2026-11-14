@@ -82,6 +82,7 @@ from expcore_onedata.sandbox.api import (
     SandboxSpec,
     StartRefused,
 )
+from expcore_onedata.sandbox.cells import OUTPUT_CAP_BYTES as CELL_OUTPUT_CAP_BYTES
 from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     GATE_CA_PATH,
@@ -147,7 +148,9 @@ class DockerSandbox:
         sleep: Callable[[float], None] = time.sleep,
         config_sha256: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        output_cap_bytes: int = CELL_OUTPUT_CAP_BYTES,
     ) -> None:
+        self._output_cap = output_cap_bytes  # what is kept of each of a cell's output streams (O43)
         self.host, self.s, self.spec, self.registry = host, settings, spec, registry
         self.waits, self._sample_period, self._sleep = waits or TD.WAITS, sample_period_s, sleep
         self._clock = clock  # what a cell's deadline counts its graces and its margin by (O34), with `sleep`
@@ -165,6 +168,11 @@ class DockerSandbox:
         self._steps_running = 0  # harness steps under way: no mark meanwhile
         self._containers: list[str] = []
         self._net: str | None = None
+        # how far a stop under way has got, for `teardown_left` (O42): the phase it is in, and what it has shown gone
+        self._teardown_step: str | None = None
+        self._removed: set[str] = set()
+        self._net_removed = False
+        self._unmounted: set[Path] = set()
         self._watched: dict[str, dict[str, Any]] = {}
         self._meta: dict[str, Any] = {
             "run_key": spec.run_key,
@@ -367,7 +375,7 @@ class DockerSandbox:
         escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock)
         self._cells = CellRunner(
             self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation,
-            stop=self._stop_at_deadline, meta_lock=self._meta_lock,
+            stop=self._stop_at_deadline, meta_lock=self._meta_lock, output_cap_bytes=self._output_cap,
         )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
@@ -1059,6 +1067,7 @@ class DockerSandbox:
                 "timed_out": res.timed_out,
                 "bound": res.bound,
                 "gate_refusals": list(res.gate_refusals),
+                **({"output_cut": res.output_cut} if res.output_cut else {}),  # only a step that was cut (O43)
                 "earlyoom_kills": self._cells.step_earlyoom(),
             }
         )
@@ -1356,13 +1365,31 @@ class DockerSandbox:
         with TERM.sigterm_deferred(), self._stop_lock:
             self._stop_locked(force)
 
-    def _step(self, errors: list[str], fn: Callable[..., Any], *a: Any) -> None:
-        """Every step runs whatever an earlier one raised (a timeout, a daemon error); a failure is recorded."""
+    def teardown_left(self) -> dict[str, Any]:
+        """What a stop under way has not yet shown removed, for the record of one that was cut at its deadline (O42): the
+        phase it is in (`step`), how many of the sandbox's containers it has not removed, whether its network is not,
+        and how many of its mounts are not unmounted. Counts and a phase name, never a name of the configuration; read
+        from what the stop has noted, so it asks the host nothing and cannot wait on it. What a step did not show
+        removed counts as left: `containers` counts every container the start registered that the stop has not yet
+        shown removed, as of its last look (a one-shot `--rm` that went by itself is counted until the stop has looked
+        for it, and one a start still in flight creates after the stop looked is not)."""
+        return {
+            "step": self._teardown_step,
+            "containers": sum(1 for c in self._containers if c not in self._removed),
+            "network": self._net is not None and not self._net_removed,
+            "mounts": len([m for m in self._mounts if m not in self._unmounted]),
+        }
+
+    def _step(self, errors: list[str], fn: Callable[..., Any], *a: Any) -> bool:
+        """Every step runs whatever an earlier one raised (a timeout, a daemon error); a failure is recorded. Whether
+        the step succeeded."""
         try:
             fn(*a)
         except Exception as e:
             log.error("teardown step %s failed: %s", getattr(fn, "__name__", "step"), describe_error(e))
             errors.append(f"a teardown step failed ({type(e).__name__})")
+            return False
+        return True
 
     def _step_token_files(self, errors: list[str]) -> None:
         """The teardown's first step, `_remove_token_files`, with its own message kept in the error the teardown raises:
@@ -1391,11 +1418,13 @@ class DockerSandbox:
         try:
             # first, on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05), and a
             # step below that raises or hangs must find none left on disk
+            self._teardown_step = "token files"
             self._step_token_files(errors)
             held: set[str] = set()
             if self.names.sidecar in self._containers:
                 # a oneclient sidecar was started (or tried), also after a failed start: the readers stop, the FUSE
                 # mount goes, then the sidecar, then the agent; no container is killed with the mount live (O15)
+                self._teardown_step = "fuse teardown"
                 log_path = self.s.work_root / TD.TEARDOWN_LOG_DIR / f"{self.sid}.jsonl"
                 agent = self.names.agent if self.names.agent in self._containers else None
                 res = TD.ordered_fuse_teardown(
@@ -1408,12 +1437,14 @@ class DockerSandbox:
                     agent_sleep=self._init_sleep,
                 )
                 self.teardown_log = res.log
+                self._removed.update(res.removed)
                 errors.extend(res.errors)
                 if not res.fuse_safe:
                     held = {self.names.agent, self.names.sidecar}
+            self._teardown_step = "containers"
             for c in reversed(self._containers):
-                if c not in held:
-                    self._step(errors, hostops.remove_container, self.host, c)
+                if c not in held and self._step(errors, hostops.remove_container, self.host, c):
+                    self._removed.add(c)
             if held:  # the network and the mounts cannot go while those two live: all of it is left for a retry
                 errors.append("the sidecar and the agent are left running with a FUSE mount that could not be released")
             else:
@@ -1444,11 +1475,13 @@ class DockerSandbox:
         return any(m["mountpoint"].startswith(under) or hostops.mount_identity(m) in ours for m in table)
 
     def _remove_the_rest(self, errors: list[str]) -> None:
-        if self._net:
-            self._step(errors, hostops.remove_network, self.host, self._net)  # a leaked network keeps its subnet
+        self._teardown_step = "network and mounts"
+        if self._net:  # a leaked network keeps its subnet
+            self._net_removed = self._step(errors, hostops.remove_network, self.host, self._net)
         unmount_errors: list[str] = []
         for m in reversed(self._mounts):
-            self._step(unmount_errors, self.host.unmount, m)
+            if self._step(unmount_errors, self.host.unmount, m):
+                self._unmounted.add(m)  # a set: a stop tried again asks again, and counts each mount once
         errors.extend(unmount_errors)
         if self.keep_evidence:
             with self._meta_lock:  # `metadata()` may be reading it from another thread
@@ -1457,6 +1490,7 @@ class DockerSandbox:
                     "directory_id": self.sid.rsplit("-", 1)[-1],
                     "relocated": False,
                 }
+        self._teardown_step = "run directory"
         if self._mounts_may_be_live(unmount_errors):
             # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
