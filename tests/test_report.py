@@ -11,6 +11,7 @@ from expcore.stats.armruns import LOST_CAUSES, ArmRuns
 from expcore.stats.estimators import ModelEstimate
 from expcore.stats.onearm import DescriptiveResult
 from expcore.stats.ratio import RatioForm
+from expcore.stats.smallest import SmallestEffect
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
 MANIFEST = {"preregistration_sha256": "e" * 64, "factor_schema_sha256": "f" * 64}
@@ -982,3 +983,114 @@ def test_s14_the_terminal_summary_gives_each_one_arm_estimate_as_descriptive():
     """S14: an estimate with no test is never printed as a contrast is."""
     result = dataclasses.replace(analysis(contrast("primary", "difference")), descriptives=(described(),))
     assert summary_lines(result)[-1] == "waited-in-a (descriptive, rate of waited in cond-a): 0.25 [0.1, 0.4]"
+
+
+# --- a smallest effect of interest (S16) -----------------------------------------------------------------------------
+
+
+def smallest(form="difference", declared=0.1, direction="higher", decision="meets", **changes) -> SmallestEffect:
+    """A contrast's judged smallest effect; a ratio's threshold is the natural log of its declared ratio."""
+    threshold = abs(math.log(declared)) if form == "ratio" else declared
+    base = {"interval": "includes", "detectable": True, "minimum_detectable_ratio": None}
+    return SmallestEffect(form, declared, threshold, direction, decision, **{**base, **changes})
+
+
+SMALLEST = "## Smallest effects of interest"
+
+
+def test_s16_each_declaring_contrast_has_a_row_with_its_estimate_and_interval_against_its_smallest_effect():
+    """S16: the threshold as declared, the direction, the signed estimate and interval, the decision, where the
+    interval lies against it, the minimum detectable effect and whether the design detects the smallest effect."""
+    declared = contrast("primary", "difference", minimum_detectable_effect=0.2, smallest_effect=smallest())
+    report = render(analysis(declared, contrast("other", "difference")), interval_level=0.95)
+    table = table_of(report, SMALLEST)
+    assert table["Contrast"] == [
+        "Contrast",
+        "Smallest effect",
+        "Direction",
+        "Estimate",
+        "95% interval",
+        "Decision",
+        "Interval against it",
+        "Min. detectable effect",
+        "Detects it",
+    ]
+    assert table["primary"][1:] == ["0.1", "higher", "+0.25", "[0.1, 0.4]", "meets", "includes it", "0.2", "yes"]
+    assert "other" not in table  # it declares none
+
+
+@pytest.mark.parametrize(
+    ("relation", "cell"),
+    [("beyond", "excludes it: beyond it"), ("short_of", "excludes it: short of it"), (None, "n/a")],
+)
+def test_s16_the_interval_excludes_the_smallest_effect_beyond_or_short_of_it_or_includes_it(relation, cell):
+    """S16: the relation in words, and n/a for an undefined interval."""
+    declared = contrast("primary", "difference", smallest_effect=smallest(interval=relation))
+    assert table_of(render(analysis(declared)), SMALLEST)["primary"][6] == cell
+
+
+def test_s16_a_ratio_contrasts_smallest_ratio_is_shown_as_declared_with_its_log_beside_every_number_as_a_ratio():
+    """S16: the ratio 2 is compared as ln 2 = 0.6931, the scale of the estimate, the interval and the MDE."""
+    rule = smallest("ratio", 2.0, minimum_detectable_ratio=math.exp(0.5))
+    judged = ratio_contrast(minimum_detectable_effect=0.5, smallest_effect=rule)
+    cells = table_of(render(analysis(judged)), SMALLEST)["spend-per-win"]
+    assert cells[1:4] == ["ratio 2 (ln 0.6931)", "higher", "+0.6931 (ratio 2)"]
+    assert cells[4] == "[0.4055, 1.099] (ratio [1.5, 3])"
+    assert cells[7:] == ["0.5 (ratio 1.649)", "yes"]
+
+
+def test_s16_a_rule_with_no_direction_reads_meets_either_direction_and_the_estimates_sign_is_written():
+    """S16 (the issue): never a bare "meets" for a two-sided rule; the sign says which way the difference went."""
+    rule = smallest(direction="either", decision="meets_either_direction")
+    judged = contrast("primary", "difference", estimate=-0.25, smallest_effect=rule)
+    cells = table_of(render(analysis(judged)), SMALLEST)["primary"]
+    assert cells[2:4] == ["either", "-0.25"]
+    assert cells[5] == "meets (either direction)"
+
+
+def test_s16_an_exploratory_contrasts_decision_is_labelled_exploratory():
+    """S16: as its conclusion is, so an exploratory "meets" never reads as confirmatory."""
+    judged = contrast("side", "difference", in_family=False, exploratory=True, smallest_effect=smallest())
+    assert table_of(render(analysis(judged)), SMALLEST)["side"][5] == "meets (exploratory)"
+
+
+@pytest.mark.parametrize(
+    ("mde", "detects", "cells"),
+    [(None, None, ["-", "-"]), (math.nan, None, ["n/a", "n/a"]), (0.3, False, ["0.3", "no"])],
+)
+def test_s16_whether_the_design_detects_it_is_no_only_when_known_and_unknown_otherwise(mde, detects, cells):
+    """S16: `-` without power settings, n/a where the figure cannot be found, `no` only for a larger figure."""
+    rule = smallest(detectable=detects)
+    judged = contrast("primary", "difference", minimum_detectable_effect=mde, smallest_effect=rule)
+    assert table_of(render(analysis(judged)), SMALLEST)["primary"][7:] == cells
+
+
+def test_s16_the_notes_say_a_margin_and_a_smallest_effect_are_two_declarations():
+    """S16: a contrast may declare both; the report says how they differ and derives neither from the other."""
+    judged = contrast("primary", "difference", equivalence_margin=0.05, smallest_effect=smallest())
+    section = render(analysis(judged)).split(SMALLEST)[1]
+    assert "two declarations" in section
+    assert "opposite_direction" in section  # every decision word is explained
+
+
+def test_s16_the_terminal_summary_gives_the_decision_beside_the_signed_estimate():
+    """S16 (the issue): the sign of the estimate is always shown beside the verdict."""
+    rule = smallest(decision="opposite_direction")
+    line = summary_lines(analysis(contrast("primary", "difference", estimate=-0.25, smallest_effect=rule)))[0]
+    assert line.endswith("; smallest effect 0.1 (higher): opposite_direction, estimate -0.25")
+
+
+def test_s16_a_report_with_no_smallest_effect_has_no_section_and_no_summary_text_of_one():
+    """S16: nothing declared, nothing shown, with a family or without one."""
+    plain = analysis(contrast("primary", "difference"), ratio_contrast())
+    assert "mallest effect" not in render(plain)
+    assert all("smallest" not in line for line in summary_lines(plain))
+    assert "mallest effect" not in render(exploratory_only("first", "second"))
+
+
+def test_s16_an_exploratory_only_report_shows_its_smallest_effects_too():
+    """S16: a pilot may declare one to see whether its design could detect it."""
+    pilot = exploratory_only("first")
+    judged = dataclasses.replace(pilot.contrasts[0], smallest_effect=smallest(decision="not_significant"))
+    report = render(dataclasses.replace(pilot, contrasts=(judged,)))
+    assert table_of(report, SMALLEST)["first"][5] == "not_significant (exploratory)"

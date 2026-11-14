@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from expcore.stats import ratio
+from expcore.stats import ratio, smallest
 from expcore.stats.armruns import ArmRuns, count_arm
 from expcore.stats.estimators import PairedDifferences
 from expcore.stats.ratio import RatioForm
@@ -90,6 +90,8 @@ class ContrastSpec:
     cell one value is computed in, nested in a cluster: `("model", cluster)` for a contrast of one outcome, which
     averages each model's pairs apart; for a ratio contrast `(cluster,)`, its sums pooling the models of a cluster
     (the default), or `("model", cluster)`, its sums per model's cell, the cluster's value their equal-weight mean.
+    `smallest_effect` (a contrast of one outcome, on its outcome's scale) or `smallest_ratio` (a ratio contrast, a
+    ratio compared as its natural log), with an optional `direction`, is its smallest effect of interest (S16).
     """
 
     name: str
@@ -104,12 +106,21 @@ class ContrastSpec:
     max_unscored_treatment: int = 0
     ratio: RatioForm | None = None
     estimation_unit: tuple[str, ...] | None = None  # None is the form's default
+    # the smallest effect of interest (S16, `expcore.stats.smallest`): a difference for a contrast of one outcome, a
+    # ratio for a ratio contrast, and the direction of the claim beside either
+    smallest_effect: float | None = None
+    smallest_ratio: float | None = None
+    direction: str | None = None
 
     def __post_init__(self) -> None:
         """Require exactly one form, with two different arms, a positive finite margin and a known treatment word; a
         ratio contrast's outcome is its form's label; the estimation unit is the model's cell of the cluster or, for
-        a ratio contrast, the cluster alone."""
+        a ratio contrast, the cluster alone; a smallest effect of the contrast's own form (S16)."""
         self._check_estimation_unit()
+        try:  # built to be checked: a spec made past the loader is refused here, as the loader refuses the file
+            _ = self.smallest_rule
+        except smallest.RuleError as error:
+            raise ValueError(f"contrast {self.name!r}: {error}") from None
         if self.ratio is not None:
             if not isinstance(self.ratio, RatioForm):
                 raise ValueError(f"contrast {self.name!r}: ratio must be a RatioForm, got {type(self.ratio).__name__}")
@@ -159,6 +170,16 @@ class ContrastSpec:
                     f"cluster alone or the model's cell of it; got {unit!r}"
                 )
         object.__setattr__(self, "estimation_unit", unit)
+
+    @property
+    def smallest_rule(self) -> smallest.Rule | None:
+        """The preregistered smallest effect of interest, or None when the contrast declares none (S16)."""
+        return smallest.rule(
+            smallest_effect=self.smallest_effect,
+            smallest_ratio=self.smallest_ratio,
+            direction=self.direction,
+            ratio=self.ratio is not None,
+        )
 
     @property
     def by_model(self) -> bool:

@@ -84,6 +84,28 @@ MDE_NOTES = [
     "`-` for an untestable contrast, which has none.",
 ]
 
+SMALLEST_NOTES = [  # after the smallest effects' table, only in a report with one (S16)
+    "Smallest effect: as preregistered, on the scale of the contrast's estimate; a ratio contrast's is a ratio,",
+    "compared as its natural log (in brackets), the scale of its estimate, interval and minimum detectable effect.",
+    "Direction: the sign the preregistration claims for A - B (`higher`, `lower`), or `either` when it declares",
+    "none. Decision: `meets` (significant, and the estimate at or beyond the smallest effect on the claimed side),",
+    "`meets (either direction)` (the same with no direction declared: the estimate's sign says which way),",
+    "`opposite_direction` (significant, with the estimate on the other side of zero from the claim, whatever its",
+    "size), `falls_short` (significant, and the estimate short of it), `not_significant`, `untestable` (no pair).",
+    "Significant is Holm's decision for a member of the family and the raw p-value at alpha for an exploratory",
+    "contrast, as for its conclusion.",
+    "Interval against it: where the interval lies against the smallest effect on the claimed side (either side",
+    "without a direction): it includes it, or excludes it, every value beyond it or every value short of it.",
+    "Detects it: `yes` when the minimum detectable effect is at most the smallest effect, so the test reaches the",
+    "preregistered power at a true effect of that size; `no` when it is larger; n/a when it cannot be found, `-`",
+    "without power settings. A member's minimum detectable effect is at alpha over the family size, so a `yes` is",
+    "conservative. At a true effect of exactly the smallest effect, the estimate reaches it only about half the",
+    "time, so `meets` is not reached at the preregistered power even when the design detects it.",
+    "An equivalence margin is another declaration: it bounds the differences the study calls negligible and",
+    "decides `equivalent` and `trivial_difference`, while the smallest effect is what a difference must reach to",
+    "count. A contrast that declares both holds two declarations, and neither is derived from the other.",
+]
+
 MISSING_PAIRS = [
     "## Missing pairs by cause",
     "",
