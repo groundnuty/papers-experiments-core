@@ -1010,3 +1010,22 @@ def test_o35_an_interrupted_heal_leaves_no_read_before_its_settle_could_end(tmp_
     later = services.checked_at[checks:]
     assert later
     assert min(later) >= stopped + 30  # the settle, at least, before any check
+
+
+def test_o35_a_restart_that_raises_settles_before_the_failure_unwinds(tmp_path):
+    """O35: a link restart that raises (not a driver error) may have been sent: its settle runs before the failure
+    leaves the heal, while the injector still holds the federation, so no other recovery (the health check's, which
+    knows nothing of the hold) can read through the link early."""
+    services = stale()
+
+    def broken(service):
+        services._note("restart_link", LABEL[service])
+        raise RuntimeError("the command broke after it was sent")
+
+    services.restart_link = broken
+    injector_, services = injector(tmp_path, services, heal="link_then_container")
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    sent_at = next(at for verb, _, at in services.at if verb == "restart_link")
+    assert services.clock.now >= sent_at + 30  # the settle ran before the clear returned
+    assert not [checked for checked in services.checked_at if sent_at < checked < sent_at + 30]

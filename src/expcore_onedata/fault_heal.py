@@ -207,6 +207,11 @@ class LinkHeal:
             result = str(self._driver.restart_link(service))
         except DriverError:
             result = "not_run"
+        except Exception:
+            # sent, perhaps: the settle runs here, under the admission still held, before anything unwinds and another
+            # recovery (the health check's, which knows nothing of the hold) may read through the link
+            self._settle()
+            raise
         self._hold(self._settle_s)
         return result
 
@@ -269,7 +274,11 @@ class LinkHeal:
         else:  # its waits end by what its reserve leaves after the margin and the settle: never past the bound
             budget = max(0.0, self._left() - self._margin_s - self._settle_s)
             self._hold(self._container_cost)  # held before the stop: an interrupted restart still leaves no read early
-            done = self._restart(label, service, budget)
+            try:
+                done = self._restart(label, service, budget)
+            except Exception:
+                self._settle()  # as for a link restart: settled here, before the admission unwinds (`_sent`)
+                raise
             self._hold(self._settle_s)
             result, extra = str(done.get("how")), {"serves_after_s": done.get("serves_after_s")}
         settled = self._settle()  # enforced after every restart sent, a failed or unverified one included
