@@ -159,9 +159,9 @@ CLIENT_INTERNAL = {
     # a revocation's confirmation: a failed read writes no revoked line, so the slot stays held (fail closed)
     ("client.py", "OnezoneClient.own_temporary_generation", "self._send(GET)"): ["ONE_ATTEMPT"],
     ("client.py", "OnezoneClient.read_content", "self._target"): ["gate", "gate"],  # bounded by the deadline left
-    ("client.py", "OnezoneClient._stream_range", "http.stream"): ["<streamed>"],
     ("client.py", "OnezoneClient.content_answer", "self._target"): ["_ONE_ATTEMPT"],  # the pre-campaign measurement
-    ("client.py", "OnezoneClient.content_answer", "http.stream"): ["<streamed>"],
+    # a streamed range and a content head both stream through `_streamed`, which releases the answer (O47)
+    ("client.py", "_streamed", "http.stream"): ["<streamed>"],
     ("client.py", "OnezoneClient.space_name", "self._space_name"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_id", "self._file_space_id"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_name", "self._space_name"): ["reads"],

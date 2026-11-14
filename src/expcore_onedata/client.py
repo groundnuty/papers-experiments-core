@@ -68,6 +68,15 @@ A failure raises `PlatformError` with the status and Onedata's error id only. Th
 header, and names a provider by its position (`providers[1]`), so neither a token nor a federation name reaches a log
 or a record through it.
 
+**Bodies are freed when their exchange is used (#259, O47).** httpx binds every answer to a stream that points back at
+it, a reference cycle that holds the answer, its request and both bodies until the cyclic collector runs; a batch of
+large uploads or reads would grow by everything it moved. So every answer is released the moment it is read (`_release`:
+closed, its stream replaced by an empty one), on every path that sends or receives a body (`_request`, `_stream_range`,
+`content_answer`), and no error holds the httpx error or the answer that caused it: a transport failure is raised after
+its handler has ended, so the `PlatformError` has no `__context__`. The client keeps no answer, request or body. The net
+under that is `collect_after_bytes`: after that many bytes of bodies sent and received, a full collection runs before
+the next exchange (`collectbudget.py`); it is a fallback, not the fix.
+
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
 client test in a source sends it and reads the answer as this layer does. `[L1]` is the live contract tests
@@ -207,7 +216,8 @@ import socket
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,6 +225,7 @@ import httpx
 
 from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
+from expcore_onedata.collectbudget import COLLECT_AFTER_BYTES, CollectBudget
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
 from expcore_onedata.readretry import ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
@@ -376,6 +387,34 @@ def _build_http(config: PlatformConfig, timeout_s: float) -> httpx.Client:
     return httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
 
 
+_NO_BODY = httpx.ByteStream(b"")  # holds nothing and points at nothing: what a released answer's stream is made
+
+
+def _release(response: httpx.Response) -> httpx.Response:
+    """Close an answer and cut the reference cycle httpx builds around it, so that its body, and its request's, are
+    freed when the last name for the answer goes, not at the next full collection (#259, O47).
+
+    httpx replaces an answer's stream with one that holds the answer (`BoundSyncStream`, which stamps `elapsed` when the
+    stream closes), and the answer holds the stream: a cycle of the answer, its request, both bodies and, over a real
+    connection, httpcore's pool objects for it. Once the answer is closed and read, the stream has nothing left to do,
+    so it is swapped for an empty one. What the answer holds of its own (`status_code`, `headers`, `content`, `json()`)
+    is untouched, and a stream that was not read stays unread: it cannot be read after a close either way."""
+    response.close()
+    response.stream = _NO_BODY
+    return response
+
+
+@contextmanager
+def _streamed(http: httpx.Client, url: str, *, headers: Mapping[str, str], timeout: float) -> Iterator[httpx.Response]:
+    """Stream a GET as `http.stream` does, and release the answer however the block ends, an error in it included, so
+    that an answer never read to its end is freed as soon as one that was (#259, O47)."""
+    with http.stream("GET", url, headers=headers, timeout=timeout) as response:
+        try:
+            yield response
+        finally:
+            _release(response)
+
+
 class PlatformError(RuntimeError):
     """A request failed or was answered with something unreadable; the message holds no URL, body or header.
 
@@ -439,6 +478,19 @@ def _answered(label: str, method: str, status: int, code: str | None, errno: str
     """The message of an error answer: the label, the method, the status, and the error id with its errno."""
     shown = f"{code}: {errno}" if code and errno else code
     return f"{label}: {method} answered {status}" + (f" ({shown})" if shown else "")
+
+
+def _checked(response: httpx.Response, method: str, label: str) -> httpx.Response:
+    """Return an answer whose status is below 400, and raise the PlatformError of one that is not."""
+    if response.status_code >= 400:
+        code, errno = _error_fields(response)
+        raise PlatformError(
+            _answered(label, method, response.status_code, code, errno),
+            status=response.status_code,
+            code=code,
+            errno=errno,
+        )
+    return response
 
 
 def answered_absent(error: PlatformError) -> bool:
@@ -560,14 +612,21 @@ class OnezoneClient:
         environ: Mapping[str, str] | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         kept_links: int = MAX_KEPT_LINKS,
+        collect_after_bytes: int | None = COLLECT_AFTER_BYTES,
     ) -> None:
         """Build the client; the admin credential comes from `admin_token` or else from the configured source.
 
         The client it builds checks certificates as the platform's `[tls]` says (`tls.py`): its own default CAs, the
         configured CA bundle alone, or not at all. An injected `http` is the caller's, with its own TLS. `kept_links`
-        bounds the parent links the gate keeps (`MAX_KEPT_LINKS` by default)."""
+        bounds the parent links the gate keeps (`MAX_KEPT_LINKS` by default).
+
+        Every answer is released as soon as it is used, so a body is freed with its exchange (#259, O47).
+        `collect_after_bytes` is the fallback under that: once the bodies sent and received since the last collection
+        reach it, a full collection runs before the next exchange (`COLLECT_AFTER_BYTES`, 128 MiB, by default; None for
+        a caller that collects itself). A positive whole number of bytes, or ValueError."""
         if kept_links < 1:
             raise ValueError("the client keeps at least one parent link")
+        self._budget = CollectBudget(collect_after_bytes)
         self._config = config
         self._http = http if http is not None else _build_http(config, timeout_s)
         self._owns_http = http is None
@@ -656,6 +715,7 @@ class OnezoneClient:
         base, label = self._base(provider)
         url = base + _check_path(path)
         wait = timeout_s if timeout_s is not None else self._timeout_s
+        self._budget.before_exchange()  # a collection owed for earlier exchanges runs now, none of this one's alive
 
         def send(timeout: float, trace: Trace | None, new_connection: bool) -> httpx.Response:
             options: dict[str, Any] = {
@@ -668,40 +728,49 @@ class OnezoneClient:
             }
             if new_connection and self._owns_http:  # a connection of its own, never one of the pool's idle ones
                 with _build_http(self._config, self._timeout_s) as one_shot:
-                    return one_shot.request(method, url, **options)
-            return self._http.request(method, url, **options)
+                    return _release(one_shot.request(method, url, **options))
+            return _release(self._http.request(method, url, **options))
 
         try:
-            if method == "GET" and retry.attempts > 1:
-                response = run_attempts(
-                    send,
-                    retry=retry,
-                    label=label,
-                    timeout_s=wait,
-                    timeouts=RETRIED_TIMEOUTS,
-                    deadline_s=deadline_s,
-                    served=self._served_before,
-                )
-            elif method == "PUT" and content is not None:
-                response = self._send_content(send, label, len(content), wait, fresh)
-            else:
-                response = send(wait, None, fresh)
+            response = self._dispatch(send, method, label, content, wait, retry, deadline_s, fresh)
         except Exhausted as spent:
-            raise PlatformError(
-                f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts",
-                transport=True,
-            ) from None
+            failed = f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts"
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: {method} failed ({type(error).__name__})", transport=True) from None
-        if response.status_code >= 400:
-            code, errno = _error_fields(response)
-            raise PlatformError(
-                _answered(label, method, response.status_code, code, errno),
-                status=response.status_code,
-                code=code,
-                errno=errno,
+            failed = f"{label}: {method} failed ({type(error).__name__})"
+        else:
+            self._budget.spent(len(content or b"") + len(response.content))
+            return _checked(response, method, label)
+        # Raised here, with the handlers over: an error raised inside one has the httpx error as its context, and that
+        # holds the request, its body and the frames the failure passed through, for as long as the error lives (#259).
+        self._budget.spent(len(content or b""))
+        raise PlatformError(failed, transport=True)
+
+    def _dispatch(
+        self,
+        send: Callable[[float, Trace | None, bool], httpx.Response],
+        method: str,
+        label: str,
+        content: bytes | None,
+        wait: float,
+        retry: ReadRetry,
+        deadline_s: float | None,
+        fresh: bool,
+    ) -> httpx.Response:
+        """Send one request as its kind asks: a GET under a policy of more than one attempt is retried when it timed
+        out, a write of content is sent once and logged with how its connection began, and any other is sent once."""
+        if method == "GET" and retry.attempts > 1:
+            return run_attempts(
+                send,
+                retry=retry,
+                label=label,
+                timeout_s=wait,
+                timeouts=RETRIED_TIMEOUTS,
+                deadline_s=deadline_s,
+                served=self._served_before,
             )
-        return response
+        if method == "PUT" and content is not None:
+            return self._send_content(send, label, len(content), wait, fresh)
+        return send(wait, None, fresh)
 
     def _send_content(
         self,
@@ -775,7 +844,8 @@ class OnezoneClient:
         try:
             return response.json()
         except ValueError:
-            raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
+            pass  # the decoder's error holds the whole text it could not read, so it is no context of ours (#259)
+        raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON")
 
     def get_dated(
         self,
@@ -1320,9 +1390,10 @@ class OnezoneClient:
         first, length, total = span
         last = first + length - 1
         got = 0
+        self._budget.before_exchange()
         try:
-            with self._http.stream(
-                "GET", url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
+            with _streamed(
+                self._http, url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
             ) as response:
                 status = response.status_code
                 if status >= 400:
@@ -1337,13 +1408,17 @@ class OnezoneClient:
                     raise PlatformError(f"{label}: a streamed read's range was answered with another range or size")
                 for piece in response.iter_bytes():
                     got += len(piece)
+                    self._budget.spent(len(piece))
                     if got > length:
                         raise PlatformError(f"{label}: a streamed read's range carried more bytes than it asked for")
                     consume(piece)
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
-        if got != length:
-            raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
+            failed = f"{label}: GET failed ({type(error).__name__})"
+        else:
+            if got != length:
+                raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
+            return
+        raise PlatformError(failed, transport=True)  # with the handler over, so the httpx error is no context (#259)
 
     def content_answer(
         self, path: str, *, provider: str, first_byte: bool, timeout_s: float | None = None
@@ -1362,19 +1437,25 @@ class OnezoneClient:
         base, label = self._base(provider)
         self._require_in_scope(self._target("GET", path, provider, None, _ONE_ATTEMPT), None)
         headers = {**self._admin, **({"Range": "bytes=0-0"} if first_byte else {})}
+        self._budget.before_exchange()
         try:
-            with self._http.stream(
-                "GET", base + path, headers=headers, timeout=timeout_s if timeout_s is not None else self._timeout_s
+            with _streamed(
+                self._http,
+                base + path,
+                headers=headers,
+                timeout=timeout_s if timeout_s is not None else self._timeout_s,
             ) as response:
                 status, content_type = response.status_code, response.headers.get("Content-Type")
                 code, errno = (None, None)
                 if status >= 400 and response.read() is not None:
                     code, errno = _error_fields(response)
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
-        if status >= 400:
-            raise PlatformError(_answered(label, "GET", status, code, errno), status=status, code=code, errno=errno)
-        return status, content_type
+            failed = f"{label}: GET failed ({type(error).__name__})"
+        else:
+            if status >= 400:
+                raise PlatformError(_answered(label, "GET", status, code, errno), status=status, code=code, errno=errno)
+            return status, content_type
+        raise PlatformError(failed, transport=True)  # with the handler over, so the httpx error is no context (#259)
 
     def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:
         """Mint a temporary access token for a user, as that user, with exactly these caveats; return the value.
