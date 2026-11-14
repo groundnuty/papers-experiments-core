@@ -52,5 +52,5 @@ def check_after_up(layout: Layout, space_ids: dict[str, str]) -> str:
     (layout.root / REPORT).write_text(json.dumps(report.to_json(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not report.ok:
         raise RuntimeError(f"the link check failed, so the federation is not ready: {report.detail}")
-    rows = (f"{p.source} -> {p.local} {p.seconds:.2f} s {p.bytes} B" for p in report.pairs)
+    rows = (f"{p.source} -> {p.reader} {p.seconds:.2f} s {p.bytes} B" for p in report.pairs)
     return f"link check: every pair transferred ({'; '.join(rows)}); {REPORT} written"

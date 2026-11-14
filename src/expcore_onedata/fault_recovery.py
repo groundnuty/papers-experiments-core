@@ -99,10 +99,11 @@ _TRIED = re.compile(r"[A-Za-z_ ,()\[\]0-9]{1,2000}")  # the heal's actions: word
 
 _WHY = {  # how a settling failed, in words, where the bare word would not say it
     "serves_unconfigured": "its service has no provider declared in [faults.services], so no read can show it serving",
-    "links_stuck": (
-        "it serves, but a provider link transferred no probe within the link check's bound (O35), and no heal of "
-        "[faults] mended it: restart the rtransfer link of the stuck pair's reader (rtransfer_config:restart_link()), "
-        "or that reader's container alone"
+    "links_stuck": (  # the link check tests every ordered pair, so the stuck link need not be the restored provider's
+        "it serves, but the link check (O35) found a pair of providers that transferred no probe within its bound, "
+        "and no heal of [faults] mended it: restart the rtransfer link on the reading provider each failed pair names "
+        "(rtransfer_config:restart_link() in its op-worker) or that provider's container alone (docker restart, never "
+        "a compose down), one at a time, re-checking every pair after each"
     ),
     "sessions_not_ready": (
         "it serves, but its peers did not show their sessions to it ready within gate_timeout_s (O35), so its links "
@@ -253,9 +254,20 @@ class Recovery(LinkSettling):
                 **record,
             )
             if not done:
-                why = _WHY.get(how, how)
+                why = self._why(how)
                 raise failure(f"an injection of {target} that an earlier run left open was not cleared ({why})", target)
         return sorted(set(held))
+
+    def _why(self, how: str) -> str:
+        """How a settling failed, in words. A stuck link adds what the link check found, which names each failed pair's
+        reading provider by position (`links_detail` is set by the settling that just ended with `links_stuck`, so it is
+        used for that word alone, never for another failure's message): the check's own detail, or, after a heal that
+        left a pair failing, why the heal ended and each pair its last check found failing, by reader
+        (`LinkSettling._heal`)."""
+        why = _WHY.get(how, how)
+        if how == "links_stuck" and self.links_detail:
+            why = f"{why}; the link check found: {self.links_detail}"
+        return why
 
     def settle(
         self, entry: Mapping[str, Any], *, heal: bool = False, links: bool = True, clear: bool = True
