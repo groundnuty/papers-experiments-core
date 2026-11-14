@@ -27,51 +27,47 @@ another (below).
 
 **Each pair**:
 
-1. *Prepare.* The probe is found through the source, or written there; its bytes are read back through the source,
-   which holds it (no transfer), and written again when they differ. Then, within `visible_timeout_s`, the reading
-   provider must see it at its size and its block map, read through the reading provider, must show the source holding
-   it whole and **no other provider holding any of it**. The whole block map is read, every provider the answer lists,
-   not the providers of `[link_check]` alone, since a provider that is not one of them could serve the reading
-   provider's read while the link under test is stuck. The pairs are prepared at most `WORKERS` at once. A listed
-   provider that holds part of it is evicted, confirmed
-   on its own block map within `evict_timeout_s`, when it is one of `[link_check].providers` (the client's gate admits
-   an eviction through those and no others). One that is not, declared in platform.toml or not, fails the pair,
-   named, and so does one whose holding cannot be read (a block map entry that does not parse is unknown, never
-   empty): the check waits for it to read within `visible_timeout_s` and then fails, naming it. A provider the map
-   does not list, or lists with no block, holds nothing. So the source alone holds the probe, and the local provider
-   has nowhere else to get it.
-2. *Fetch.* One REST range read of the whole probe through the reading provider (`OnezoneClient.read_content`, bound
-   to the probe space, so a file of any other space is refused before anything is sent), with `timeout_s` as its
-   deadline
-   and as the longest wait for an answer. It passes only when it ends in time with the probe's bytes. A read that
-   times out, or that the local provider answers with an error, is the pair's failure: "no transfer from providers[j]
-   to providers[i] within N s", with the remedy. The fetches run at once, at most `WORKERS` together, so they take
-   about one bound however many pairs there are. A fetch is never tried again in the same check, and **never of the
-   same file in a later one**: a provider waits on its rtransfer synchronizer with no timeout (op-worker f118ed9,
-   `gen_server2:call(..., infinity)`) and a later read of the same file range joins the same outstanding job until
-   the synchronizer restarts it after 1,800 s, so a second read of that file would only wait on the same stuck job,
-   even once the link works again. A failed probe is therefore **retired** (`linkprobe.ProbeFiles.retire`), and **a
-   file id whose fetch ever failed is never read again**, whatever the file's name or generation and whether it still
-   exists. The retirement is recorded first, as a marker file in the probe space (`expcore-link-retired-`, digests of
-   the pair's key and of the retired file's id) written through the reading provider, which the next check lists the
-   same way: no probe file a marker names is chosen. Then the next generation of the probe is written through the
-   source, a new name and a new file id, and the failed file and the source's other probe files are deleted (a file
-   with a stuck job may be deleted). The next check reads the new file, so a recovered link passes at once. When no
-   probe file is left that a marker does not retire and a fresh one cannot be written, the pair fails closed, "no fresh
-   probe for <source> to <local>: creation failed", and no retired file is read in its place. The deletions are
-   best-effort: a retired file that stays is deleted by a later check of the pair that passes, and stays excluded
-   until then; a marker is deleted once the source no longer lists its file, so the record is bounded by the retired
-   files that remain. Only when the marker cannot be written and the failed file is not deleted is it not excluded
-   for good: the failure says so, with a new file or without, and a later check may read it once more, retiring it
-   again if it fails. The probe space is the
+1. *Prepare.* The probe is found through the source, or written there; its bytes are read back through the source, which
+   holds it (no transfer), and written again when they differ. Then, within `visible_timeout_s`, the reading provider
+   must see it at its size and its block map, read through the reading provider, must show the source holding it whole
+   and **no other provider holding any of it**. The whole block map is read, every provider the answer lists, not the
+   providers of `[link_check]` alone, since a provider that is not one of them could serve the reading provider's read
+   while the link under test is stuck. The pairs are prepared at most `WORKERS` at once. A listed provider that holds
+   part of it is evicted, confirmed on its own block map within `evict_timeout_s`, when it is one of
+   `[link_check].providers` (the client's gate admits an eviction through those and no others). One that is not,
+   declared in platform.toml or not, fails the pair, named, and so does one whose holding cannot be read (a block map
+   entry that does not parse is unknown, never empty): the check waits for it to read within `visible_timeout_s` and
+   then fails, naming it. A provider the map does not list, or lists with no block, holds nothing. So the source alone
+   holds the probe, and the reading provider has nowhere else to get it.
+2. *Fetch.* One REST range read of the whole probe through the reading provider (`OnezoneClient.read_content`, bound to
+   the probe space, so a file of any other space is refused before anything is sent), with `timeout_s` as its deadline
+   and as the longest wait for an answer. It passes only when it ends in time with the probe's bytes. A read that times
+   out, or that the reading provider answers with an error, is the pair's failure: "no transfer from providers[j] to
+   providers[i] within N s", with the remedy. The fetches run at once, at most `WORKERS` together, so they take about
+   one bound however many pairs there are. A fetch is never tried again in the same check, and **never of the same file
+   in a later one**: a provider waits on its rtransfer synchronizer with no timeout (op-worker f118ed9,
+   `gen_server2:call(..., infinity)`) and a later read of the same file range joins the same outstanding job until the
+   synchronizer restarts it after 1,800 s, so a second read of that file would only wait on the same stuck job, even
+   once the link works again. A failed probe is therefore **retired** (`linkprobe.ProbeFiles.retire`), and **a file id
+   whose fetch ever failed is never read again**, whatever the file's name or generation and whether it still exists.
+   The retirement is recorded first, as a marker file in the probe space (`expcore-link-retired-`, digests of the pair's
+   key and of the retired file's id) written through the reading provider, which the next check lists the same way: no
+   probe file a marker names is chosen. Then the next generation of the probe is written through the source, a new name
+   and a new file id, and the failed file and the source's other probe files are deleted (a file with a stuck job may be
+   deleted). The next check reads the new file, so a recovered link passes at once. When no probe file is left that a
+   marker does not retire and a fresh one cannot be written, the pair fails closed, "no fresh probe for <source> to
+   <local>: creation failed", and no retired file is read in its place. The deletions are best-effort: a retired file
+   that stays is deleted by a later check of the pair that passes, and stays excluded until then; a marker is deleted
+   once the source no longer lists its file, so the record is bounded by the retired files that remain. Only when the
+   marker cannot be written and the failed file is not deleted is it not excluded for good: the failure says so, with a
+   new file or without, and a later check may read it once more, retiring it again if it fails. The probe space is the
    check's alone, so no other reader has the file open.
-3. *Evict afterwards*, only when every pair passed: each probe is evicted from its reading provider once, the
-   eviction waited for and that provider's block map read. On Onedata 25.0 an eviction scheduled right after a fetch
-   completes having
-   evicted nothing (the same eviction about 30 s later works), so one that did not take is recorded, never retried and
-   never a failure: the link was shown to work, and the next check's step 1 evicts the probe and confirms the local
-   block map empty before it reads. When a pair fails the check answers at once, retiring its probe and evicting
-   nothing.
+3. *Evict afterwards*, only when every pair passed: each probe is evicted from its reading provider once, the eviction
+   waited for and that provider's block map read. On Onedata 25.0 an eviction scheduled right after a fetch completes
+   having evicted nothing (the same eviction about 30 s later works), so one that did not take is recorded, never
+   retried and never a failure: the link was shown to work, and the next check's step 1 evicts the probe and confirms
+   the local block map empty before it reads. When a pair fails the check answers at once, retiring its probe and
+   evicting nothing.
 
 **The remedy** of a stuck link is named with its failure: restart the reading provider's rtransfer link
 (`rtransfer_config:restart_link()` in its op-worker), or restart that provider's container alone (`docker restart`,
@@ -98,8 +94,8 @@ health gate: the run whose check found it is an infrastructure outcome, never sc
 (the core's gate holds all dispatch, not one rights group's) until a check passes again. Periodic rather than per run:
 each check costs a few seconds of eviction and block-map polls on 25.0, which every run would pay. A fault injector's
 restore runs it for every ordered pair, not the restored provider's alone, and the restore fails while a pair does not
-pass (`fault_serves.ServingProbe.links`): on the live slot the stuck pair was one of two other providers, whose link
-broke while a third was down. `deploy/compose-federation`'s `up` runs it last and does not report the federation ready
+pass (`fault_serves.ServingProbe.links`): on the live slot a mirror's link to the local provider broke while a third
+provider was down. `deploy/compose-federation`'s `up` runs it last and does not report the federation ready
 until it passes.
 
 **Its time.** The first check after the probe space was emptied writes the probes and waits for the reading providers
@@ -136,7 +132,7 @@ from expcore_onedata.placement import Range, file_fully_placed, held_bytes, prov
 from expcore_onedata.readretry import ONE_ATTEMPT
 
 VERSION = 1  # of the record
-WORKERS = 8  # fetches at once
+WORKERS = 8  # pairs prepared, fetched and evicted at once (a test sets it to 1: its fake clock is every thread's)
 POLL_S = 2.0  # between reads of a block map or a transfer's record
 EVICTION_PAUSE_S = 10.0  # before an eviction that took nothing is scheduled again
 REMEDY = (
@@ -494,12 +490,13 @@ def check_links(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.time,
-    workers: int = WORKERS,
+    workers: int | None = None,
 ) -> LinkReport:
     """Check every ordered (reader, source) pair's link with a bounded fetch of its probe; never pass what was not
     shown.
 
-    `clock` and `sleep` bound and pace the waits (a test's `Ticker`), `now` dates the window on the host's epoch clock.
+    `clock` and `sleep` bound and pace the waits (a test's `Ticker`), `now` dates the window on the host's epoch clock,
+    and `workers` (`WORKERS` by default) is how many pairs are prepared, fetched and evicted at once.
     A failure of the platform is the failing pair's; any other exception is a defect and propagates."""
     pairs = link_pairs(config.spaces, list(config.providers))
     started = now()
@@ -513,7 +510,7 @@ def check_links(
             "space to test their links with, so none was tested"
         )
         return LinkReport(False, detail, (), started, now())
-    results = _Check(config, client, settings, clock, sleep).run(pairs, workers)
+    results = _Check(config, client, settings, clock, sleep).run(pairs, WORKERS if workers is None else workers)
     failed = [result for result in results if not result.ok]
     if failed:
         detail = "a provider link is stuck or untested: " + "; ".join(str(result.reason) for result in failed)

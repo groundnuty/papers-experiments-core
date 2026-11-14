@@ -21,6 +21,7 @@ from link_support import (
     three_providers,
 )
 
+from expcore_onedata import consistency, linkcheck
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_serves import provider_serves
@@ -39,6 +40,14 @@ ORDERED = [
     ("gamma", "beta"),
 ]  # (the reading provider, the source), in the order platform.toml declares the providers
 STORES = {**SERVICES, "gamma": "store-three"}  # the Compose service of each provider a restore can concern
+
+
+@pytest.fixture(autouse=True)
+def one_pair_at_a_time(monkeypatch):
+    """The fake federation's clock is the test's `Ticker`, which every thread shares: a wait one pair makes (a hang's, a
+    poll's) would run out another pair's deadline. The pairs run one at a time here, and
+    `test_o35_the_pairs_are_prepared_fetched_and_evicted_at_most_workers_at_once` shows the check's concurrency."""
+    monkeypatch.setattr(linkcheck, "WORKERS", 1)
 
 
 @pytest.fixture
@@ -142,14 +151,30 @@ def test_o35_a_stuck_link_is_found_when_another_reader_fetched_the_same_source_f
     assert own not in reads_through(fake, ALPHA_ID)
 
 
-def test_o35_a_check_with_more_pairs_than_workers_prepares_and_fetches_them_at_once(fake, config, client, ticker):
-    """O35: the pairs are prepared as well as fetched at most `workers` at once, so a check of every ordered pair takes
-    about as long as one of the local provider's pairs did, and its results keep the declared order."""
+def test_o35_the_pairs_are_prepared_fetched_and_evicted_at_most_workers_at_once(
+    fake, config, client, ticker, monkeypatch
+):
+    """O35: with every ordered pair the check's time must not grow by a whole preparation per pair, so the preparation
+    of the pairs, their fetches and the evictions of the readers' probes are each handed to `workers` (the given
+    number, `WORKERS` by default). The calls are recorded and run one at a time here (the fake's clock is shared)."""
+    handed, original = [], consistency.bounded_map
+
+    def recording(call, keys, workers):
+        if workers > 1:  # the check's own, not those of the waits it makes, which run one at a time
+            handed.append((len(keys), workers))
+        return original(call, keys, 1)
+
+    monkeypatch.setattr(consistency, "bounded_map", recording)
     report = check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, now=ticker.clock, workers=4)
     assert report.ok, report.detail
+    assert handed == [(6, 4), (6, 4), (3, 4)]  # the six pairs prepared, the six fetched, the three readers' evictions
     assert [(p.local, p.source) for p in report.pairs] == [
         (f"providers[{list(PROVIDERS).index(r)}]", f"providers[{list(PROVIDERS).index(s)}]") for r, s in ORDERED
     ]
+    handed.clear()
+    monkeypatch.setattr(linkcheck, "WORKERS", 7)
+    assert check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, now=ticker.clock).ok
+    assert handed == [(6, 7), (6, 7), (3, 7)]  # the default is the module's `WORKERS`, read at the call
 
 
 def test_o35_the_retirement_of_one_pairs_probe_leaves_every_other_pairs_files_and_markers_alone(

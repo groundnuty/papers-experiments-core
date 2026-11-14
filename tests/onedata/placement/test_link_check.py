@@ -25,6 +25,7 @@ from link_support import (
 )
 
 from expcore.config.loading import ConfigError
+from expcore_onedata import linkcheck
 from expcore_onedata.client import OnezoneClient, OutOfScope
 from expcore_onedata.config import load_platform
 from expcore_onedata.health import PlatformHealth
@@ -32,6 +33,14 @@ from expcore_onedata.linkcheck import PROBE_PREFIX, probe_content, probe_name
 from expcore_onedata.testing import SPACE_NAME, with_placement, write_platform
 from expcore_onedata.testing.world import PROBE_SPACE_ID, PROBE_SPACE_NAME
 from expcore_onedata.tokens import TokenIssuer
+
+
+@pytest.fixture(autouse=True)
+def one_pair_at_a_time(monkeypatch):
+    """The fake federation's clock is the test's `Ticker`, which every thread shares: a wait one pair makes (a hang's, a
+    poll's) would run out another pair's deadline. The pairs run one at a time here; test_link_check_pairs.py shows that
+    the check hands its pairs to `workers`."""
+    monkeypatch.setattr(linkcheck, "WORKERS", 1)
 
 
 @pytest.fixture
