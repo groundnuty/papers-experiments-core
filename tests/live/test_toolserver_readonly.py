@@ -2,6 +2,7 @@
 
     EXPCORE_LIVE_PLATFORM=/path/to/platform.toml EXPCORE_LIVE_MUTATE=1 uv run pytest tests/live
     EXPCORE_LIVE_OUTSIDE_SPACE=<space id> ...   # also the views of a space the condition does not hold
+    EXPCORE_LIVE_RUNNING_MIB=<MiB> ...          # the size of the replication whose cancel is tried (default 128)
 
 Skipped unless both variables are set. The platform file needs: `[toolserver]` with the real tool server (the pinned
 onedata-mcp server), a condition that declares no write right whose allow-list holds the five view tools and the two
@@ -24,9 +25,11 @@ condition's own token, minted and launched as a run's is (`ToolServerLauncher.la
   removed, a file created and a file's content written, and none of them happened. The file writes are refused as the
   old token's were by its `data.readonly` caveat, but this one is refused by its user, who holds no
   `space_write_data`, and Onedata answers that 400 posix eperm (14 Nov live run), not eacces. The cancel is of a
-  64 MiB replication scheduled just before, sent to the provider that runs it, which shows it from the first moment
-  (the agent's local provider shows a transfer another provider scheduled only once it has synchronised: the 14 Nov
-  run's 404 on a one-second job), after the admin credential has read its state there;
+  replication of a 128 MiB file (`EXPCORE_LIVE_RUNNING_MIB`) sent at once, to the provider that runs it, which shows it
+  from the first moment (the agent's local provider shows a transfer another provider scheduled only once it has
+  synchronised: the 14 Nov run's 404 on a one-second job). The admin credential reads the transfer there just before
+  and just after the cancel, and the test fails unless it was still active at both, so the cancel was sent to a
+  running transfer and a refusal of it is about the token, never about a transfer that had ended;
 - with `EXPCORE_LIVE_OUTSIDE_SPACE`, a space the condition's user is no member of and the agent's local provider
   supports: its root, its transfer listing and an ended transfer of it, each first shown served to the admin
   credential through that provider (or the test fails, so a space that is not there cannot pass it), are not served
@@ -70,7 +73,9 @@ OUTSIDE_SPACE = os.environ.get("EXPCORE_LIVE_OUTSIDE_SPACE")  # a space id the c
 FAIL_OPEN = "Could not examine Oneprovider token via Onezone"  # the pinned server's warning when its examination fails
 STATES = ("waiting", "ongoing", "ended")
 CONTENT = bytes(range(256)) * 4
-RUNNING_BYTES = 64 * 1024 * 1024  # a replication to cancel that is still under way when the cancel arrives
+# The size of the replication the cancel is sent to, which must still be under way when it arrives (the test checks
+# that, before and after, and fails when it does not hold: raise this then).
+RUNNING_BYTES = int(os.environ.get("EXPCORE_LIVE_RUNNING_MIB", "128")) * 1024 * 1024
 
 
 class Context:
@@ -279,16 +284,34 @@ def transfer_state_as_admin(plane, tid, provider):
         time.sleep(1)
 
 
+def require_active(state, when):
+    """A transfer the cancel is about must be one that is running: a state that is ended, or that names none of the
+    known fields, shows nothing of cancelling a running transfer, so the test fails and says what to change."""
+    assert state not in (*consistency.ENDED_STATES, "unknown"), (
+        f"the replication was {state} {when} the cancel, so the cancel was not tried on a running transfer: "
+        "raise EXPCORE_LIVE_RUNNING_MIB"
+    )
+
+
 def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straight_at_the_provider(plane):
-    """O39: sent straight to the provider, without the tool server, the token is refused a replication, an eviction,
-    a QoS requirement, the removal of the admin's requirement, a rerun of the ended transfer and the cancel of a
-    replication that is running (its state read with the admin credential just before), and none of them happened:
-    the cancel never took effect either, the replication running to its end."""
+    """O39: sent straight to the provider, without the tool server, the token is refused the cancel of a replication
+    that is running (read active with the admin credential just before and just after, so the cancel reached it
+    running), a replication, an eviction, a QoS requirement, the removal of the admin's requirement and a rerun of the
+    ended transfer, and none of them happened: the replication ran to its end, never cancelled."""
     client, holder, provisioner, file_id = plane["client"], plane["holder"], plane["provisioner"], plane["files"][0]
     receiver = plane["receiver"]
     big = provisioner.put_file(f"{plane['directory']}/running.bin", bytes(RUNNING_BYTES))
     before = nothing_new(plane, file_id)
     running = provisioner.schedule_transfer("replication", big, receiver)
+    # The cancel goes first, at once, to the provider that runs the replication, which shows it from the start, once
+    # the admin credential has read it there: a 404 is then a real answer about the token, never a transfer not shown
+    # yet, and the replication is not given time to end.
+    state_before = transfer_state_as_admin(plane, running, receiver)
+    require_active(state_before, "before")
+    cancel = as_token(plane, "DELETE", f"/transfers/{running}", provider=receiver)
+    state_after = transfer_state_as_admin(plane, running, receiver)
+    require_refused(cancel, f"a cancel of a replication that was {state_before}")
+    require_active(state_after, "after")
     receiver_id, holder_id = provisioner.provider_id(receiver), provisioner.provider_id(holder)
     replication = {"type": "replication", "replicatingProviderId": receiver_id, "dataSourceType": "file"}
     eviction = {"type": "eviction", "evictingProviderId": holder_id, "dataSourceType": "file"}
@@ -300,12 +323,6 @@ def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straigh
         "a requirement's removal": as_token(plane, "DELETE", f"/qos_requirements/{plane['qid']}"),
         "a rerun": as_token(plane, "POST", f"/transfers/{plane['tid']}/rerun"),
     }
-    # The cancel goes to the provider that runs the replication, which shows it from the start, and only after the
-    # admin credential has read it there: a 404 is then a real answer about the token, never a transfer not shown yet.
-    state = transfer_state_as_admin(plane, running, receiver)
-    attempts[f"a cancel of a replication that was {state}"] = as_token(
-        plane, "DELETE", f"/transfers/{running}", provider=receiver
-    )
     for what, error in attempts.items():
         require_refused(error, what)
     time.sleep(3)
@@ -314,7 +331,7 @@ def test_o39_the_read_only_token_is_refused_every_transfer_and_qos_write_straigh
     done = consistency.wait_transfers(client, receiver, [running], timeout_s=300, poll_s=2)
     assert not done.timed_out, "the replication the cancel was sent to did not end"
     final = consistency.transfer_state(done.records[running])
-    assert final != "cancelled", f"the replication was cancelled with the read-only condition's token ({state} before)"
+    assert final != "cancelled", f"the replication was cancelled with the read-only condition's token ({final})"
 
 
 def test_o39_the_read_only_token_is_refused_a_file_and_a_write_of_content(plane):
