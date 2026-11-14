@@ -342,6 +342,7 @@ class FaultInjector:
         unsettled = self._recover(heal=self._holds_exclusive())  # under the exclusive admission just taken
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
             raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
+        self._await_drain()  # the record is read after the journal was: see `_await_drain`
         self._lock = self._journal.try_lock(self.target)
         if self._lock is None:
             raise self._fail(f"{self.target} is held by another run's fault injector")
@@ -369,6 +370,22 @@ class FaultInjector:
             raise self._fail(f"{self.target} could not be taken down, seen down and journalled ({why})") from None
         self._injection["injected"] = True
         self._step("injected", True, identity_before_sha256=digest)
+
+    def _await_drain(self) -> None:
+        """Wait, inside `admission_timeout_s` and until cancelled, for the federation's drain record to pass. It is read
+        after the journal was (`_recover` read it): a restore that cleared an injection without holding this admission
+        (the health gate's recovery of a stuck holder's injection) wrote its record before it cleared, so a start that
+        finds the journal settled finds the record too, whatever it read before. A start that cannot wait it out fails
+        as `injector_failure`, with nothing taken down."""
+        deadline = self._clock() + self._settings.admission_timeout_s
+        while (left := self._federation.drain_left()) > 0:
+            if self._cancel.is_set():
+                raise self._fail("the wait for the federation was cancelled")
+            if self._clock() >= deadline:
+                raise self._fail(
+                    "the federation stayed closed past the bound of the wait: an outage run's sessions drain"
+                )
+            self._sleep(min(left, 0.5))
 
     def _journal_stop_unknown(self, entry: str) -> None:
         """Journal that the stop command raised, so that a later process settling the injection waits for the target

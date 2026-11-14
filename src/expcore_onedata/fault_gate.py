@@ -159,9 +159,19 @@ class FaultGate:
                 return Health(
                     False, f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
                 )
-            if self._drain_s > 0:  # it holds no admission: the federation is closed for the drain by the record, first
-                self._lock.hold_for(self._drain_s)
-            self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
+            # the holder may have gone, and the lock with it, since the wait ran out: then the recovery runs under it
+            exclusive = self._lock.try_acquire(exclusive=True, purpose=RECOVERY)
+            try:
+                if exclusive is not None and exclusive.drain is not None:
+                    exclusive.drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)
+                elif exclusive is None and self._drain_s > 0:
+                    # still held, by a holder that is gone: nobody else is admitted while it is, and the record is
+                    # written first, so an admission that finds the journal settled after it finds the record
+                    self._lock.hold_for(self._drain_s)
+                self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
+            finally:
+                if exclusive is not None:
+                    exclusive.close()
             done = f"what it left open is recovered, and the federation closed for its drain; {done}"
         return Health(
             False, f"the federation's lock is stuck{at}: {_named(record)} is gone, yet the lock stays held; {done}"

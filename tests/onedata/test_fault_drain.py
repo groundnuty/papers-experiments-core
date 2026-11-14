@@ -44,7 +44,7 @@ from expcore_onedata.fault_drain import GATE, MOUNT, SessionDrain
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import DRAIN, HOLDER, JOURNAL, InjectionJournal, boot_id
 from expcore_onedata.fault_recovery import Recovery
-from expcore_onedata.faults import load_faults
+from expcore_onedata.faults import FaultInjector, load_faults
 from expcore_onedata.testing import write_platform
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -995,3 +995,79 @@ def test_o11_a_recovery_tells_what_it_has_read_before_it_settles_any_of_it(tmp_p
     again: list[object] = []
     recovery.recover(before=again.append)
     assert again == []
+
+
+# --- the record is read after the journal, wherever a restore had no lock ----------------------------------------
+
+
+def test_o11_an_admission_that_read_the_record_before_a_lockless_restore_wrote_it_is_not_admitted_inside_it(
+    tmp_path, monkeypatch
+):
+    """O11: a restore that holds no lock (the health gate's, of a stuck holder's injection) writes the drain record
+    before it clears the journal. An admission that read the record before that and the journal after it must read the
+    record again, or it would pass `_require_settled` and start inside the drain."""
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, admission_timeout_s=0.3)
+    settings = settings_of(platform)
+    lock = FederationLock(settings)
+    original = FederationLock._require_settled
+
+    def after_the_restore_wrote_its_record(self):
+        self.hold_for(30)  # written between this admission's two readings, as the restore's record is
+        original(self)
+
+    monkeypatch.setattr(FederationLock, "_require_settled", after_the_restore_wrote_its_record)
+    with pytest.raises(FederationBusy), lock.held(exclusive=False, timeout_s=0.3):
+        pytest.fail("admitted inside the drain")
+    descriptor = os.open(settings.journal / FEDERATION_LOCK, os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the lock it took was let go
+    finally:
+        os.close(descriptor)
+
+
+def test_o11_a_start_that_finds_the_journal_settled_waits_for_a_record_written_before_that(tmp_path, monkeypatch):
+    """O11: the injector's start reads the journal (`_recover`), then the record: one written by a restore that cleared
+    the journal in between holds the start back, and it takes nothing down when it cannot wait it out."""
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, admission_timeout_s=5), FakeClock()
+    services = FakeServices()
+    injector = injector_for(platform, services, clock=clock, wall=clock)
+    original = FaultInjector._recover
+
+    def then_a_record(self, **kwargs):
+        result = original(self, **kwargs)
+        self._federation.hold_for(30)
+        return result
+
+    monkeypatch.setattr(FaultInjector, "_recover", then_a_record)
+    with pytest.raises(InfraError, match="stayed closed"):
+        injector.start(RUN)
+    assert [call for call in services.calls if call[0] == "stop"] == []
+    assert open_injections(tmp_path) == []
+
+
+def test_o11_the_gates_recovery_after_the_holder_went_runs_under_the_lock_it_takes(tmp_path, monkeypatch):
+    """O11: the gate's wait ran out against a lock a holder that is gone left held, and by the time it reads the
+    holder the lock is free: the recovery then runs under an exclusive admission of its own, and the federation is
+    closed for the drain by that admission's release."""
+    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.2)
+    settings = settings_of(platform)
+    clock = FakeClock()
+    lock = FederationLock(settings, wall=clock)
+    services = FakeServices(path=state)
+    seen: list[bool] = []
+    services.on_serves = lambda service: seen.append(lock.try_acquire(exclusive=False) is None)
+    descriptor = stuck_federation(settings)
+    original = InjectionJournal.read_holder
+
+    def holder_then_the_lock_goes(self):
+        record = original(self)
+        os.close(descriptor)  # the process that held it exits just after the record is read
+        return record
+
+    monkeypatch.setattr(InjectionJournal, "read_holder", holder_then_the_lock_goes)
+    health = FaultGate(settings, services, clock=clock, sleep=clock.sleep, wall=clock)()
+    assert health.ok is False
+    assert open_injections(tmp_path) == []  # recovered
+    assert seen
+    assert all(seen)  # under the lock it took: nothing was admitted while it restored
+    assert lock.drain_left() == pytest.approx(DRAIN_S, abs=2.0)  # and the federation went into the drain

@@ -258,9 +258,9 @@ class FederationLock:
         except OSError as error:  # its text holds the journal's path: only its type is told (O12)
             raise failure(f"the federation's drain could not be recorded ({type(error).__name__})") from None
 
-    def _await_drain(self, main: HeldLock, deadline: float | None, cancel: threading.Event | None) -> None:
-        """With the lock just taken: wait until the drain record has passed, polling, inside the same bound and under
-        the same cancellation as the wait for the lock; let the lock go and raise when it cannot be waited out."""
+    def _await_drain(self, release: Callable[[], None], deadline: float | None, cancel: threading.Event | None) -> None:
+        """With the lock held: wait until the drain record has passed, polling, inside the same bound and under the
+        same cancellation as the wait for the lock; call `release` and raise when it cannot be waited out."""
         try:
             while True:
                 left = self.drain_left()
@@ -276,7 +276,7 @@ class FederationLock:
                 pause = min(left, 0.5)
                 time.sleep(pause if deadline is None else min(pause, max(0.0, deadline - time.monotonic())))
         except BaseException:
-            main.close()
+            release()
             raise
 
     def _try(self, name: str, mode: int) -> HeldLock | None:
@@ -364,7 +364,7 @@ class FederationLock:
             main = self._wait(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, deadline, cancel)
         finally:
             intent.close()  # whoever waits behind it may now queue for the main lock
-        self._await_drain(main, deadline, cancel)
+        self._await_drain(main.close, deadline, cancel)
         return self._admit(main, exclusive, purpose, target)
 
     @contextlib.contextmanager
@@ -387,6 +387,10 @@ class FederationLock:
         try:
             if not exclusive:
                 self._require_settled()
+            # the record is read again after the journal was: a restore that cleared an injection without this lock (the
+            # health gate's, of a stuck holder's) wrote its record first, so an admission that finds the journal
+            # settled finds the record too, whatever it read before
+            self._await_drain(lambda: None, None if timeout_s is None else time.monotonic() + timeout_s, cancel)
             yield admission
         finally:
             _ADMISSION.reset(token)
@@ -424,6 +428,8 @@ class FederationLock:
         try:
             if not exclusive:
                 self._require_settled()
+            deadline = None if timeout_s is None else time.monotonic() + timeout_s
+            await asyncio.to_thread(self._await_drain, lambda: None, deadline, cancel)  # as `held`: after the journal
             yield admission
         finally:
             _ADMISSION.reset(token)
