@@ -46,7 +46,9 @@ and refused otherwise, but for an empty file at a path whose journal ends with t
 creation whose answer was lost, or whose change-log line a crash cut, which holds nothing, so it is removed and the
 file written back whole. A name removed by a crashed start is written back from the staged source once every provider
 answers the old id absent. The completed file is then replicated to each provider its `replicas` name, verified by that
-provider's block map.
+provider's block map. The mirror runs that replication from its own dbsync copy of the owner's map, which lags the
+reset's write while the block map read through the mirror already shows the owner whole, so a replication that
+completed short is scheduled again within the settle bound (`Provisioner.replicate_file`), each try recorded.
 
 **The baseline's marks** (`ingesthealth.py`): the start marks the baseline open before it changes anything, a failure
 after that marks it unhealthy, and a restore that verifies every file marks it whole. A start is held back
@@ -340,24 +342,30 @@ class SparseBaseline(Baseline):
         done = self._restore_whole(planned, phase)
         if not planned.replicas:
             return done
-        return {**done, "replicas": self._restore_replicas(planned, done["file_id"])}
+        actions, replications = self._restore_replicas(planned, done["file_id"])
+        return {**done, "replicas": actions, **({"replications": replications} if replications else {})}
 
-    def _restore_replicas(self, planned: PlannedFile, file_id: str) -> dict[str, str]:
+    def _restore_replicas(self, planned: PlannedFile, file_id: str) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
         """Replicate the completed file to each provider its replicas declare that does not hold it whole, and verify
-        each by that provider's own block map on consecutive polls; return `held` or `replicated` by position."""
-        done = {}
+        each by that provider's own block map on consecutive polls; return `held` or `replicated` by position, and for
+        each provider replicated to the tries it took, their transfer ids and the seconds until its map covered the
+        file. The mirror runs the replication from its own lagging copy of the owner's map, so one scheduled right
+        after the reset's write can complete short and is scheduled again (`Provisioner.replicate_file`)."""
+        done, replications = {}, {}
         for provider in planned.replicas:
             whole = {plain(file_id): [(0, planned.size)]}
+            label = self._p.client.provider_label(provider)
             self._p.await_visible(provider, [file_id])  # `visible_on` may leave the mirror out of the restore's wait
             if uncovered(self._p.blocks(file_id, provider, retry=self._p.retry), whole[file_id]):
-                self._p.replicate_file(file_id, planned.size, provider)  # NotPlaced unless the map then covers it
+                record = self._p.replicate_file(file_id, planned.size, provider)  # NotPlaced unless the map covers it
+                replications[label] = {key: record[key] for key in ("tries", "transfer_ids", "converged_s")}
                 action = "replicated"
             elif self._p.confirm_placed(provider, whole).placed:
                 action = "held"
             else:
                 raise NotPlaced(f"{self._p.where}{planned.label}: a replica's block map does not stay whole")
-            done[self._p.client.provider_label(provider)] = action
-        return done
+            done[label] = action
+        return done, replications
 
     def _restore_whole(self, planned: PlannedFile, phase: str) -> dict[str, Any]:
         """Bring one file back whole at its path without removing it, verified; return what was done and its id. A
