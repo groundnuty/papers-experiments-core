@@ -258,6 +258,54 @@ def test_b03_a_cancelled_request_is_recorded_as_abandoned_at_the_deadline(sleeps
     assert pump.abandoned == {"reason": "deadline", "usage": "unknown"}
 
 
+def test_b19_a_read_timeout_carries_what_the_caller_knows_of_the_request_in_flight(make_timeout, sleeps, jitter, sdk):
+    """B19: the abandoned entry holds the caller's account of the request in flight, from when it was given up."""
+    pump = retrier(sleeps, jitter, in_flight=lambda: {"prompt_bound_tokens": 5_000, "prompt_bound_by": "bytes"})
+    with pytest.raises(RequestAbandoned):
+        run(pump, Script(make_timeout(read=True, sdk=sdk)))
+    assert pump.abandoned == {
+        "reason": "read_timeout",
+        "usage": "unknown",
+        "prompt_bound_tokens": 5_000,
+        "prompt_bound_by": "bytes",
+    }
+
+
+def test_b19_a_cancelled_request_carries_the_account_as_it_stood_when_it_was_cancelled(sleeps, jitter):
+    """B19: the account is read at the moment of the cancel, so a request built afterwards cannot change an entry."""
+    account = {"prompt_bound_tokens": 1}
+
+    async def send():
+        raise asyncio.CancelledError
+
+    pump = retrier(sleeps, jitter, in_flight=lambda: dict(account))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(pump.call(send))
+    account["prompt_bound_tokens"] = 2
+    assert pump.abandoned == {"reason": "deadline", "usage": "unknown", "prompt_bound_tokens": 1}
+
+
+def test_b19_the_callers_account_cannot_replace_the_reason_or_the_unknown_usage(make_timeout, sleeps, jitter, sdk):
+    """B19: `reason` and `usage` are the retrier's own words; an account that names them is overridden."""
+    pump = retrier(sleeps, jitter, in_flight=lambda: {"reason": "mine", "usage": "known", "extra": 1})
+    with pytest.raises(RequestAbandoned):
+        run(pump, Script(make_timeout(read=True, sdk=sdk)))
+    assert pump.abandoned == {"reason": "read_timeout", "usage": "unknown", "extra": 1}
+
+
+def test_b19_a_cancel_while_waiting_to_resend_abandons_nothing_because_no_request_is_in_flight(make_error, jitter):
+    """B19: the bound belongs to the send in flight. A cancel in the wait before a resend has none, and the failed send
+    before it was charged as a top-up when it failed (C26), so no entry is made and none is bounded."""
+
+    async def cancelled_sleep(seconds):
+        raise asyncio.CancelledError
+
+    pump = Retrier(POLICY, sleep=cancelled_sleep, rng=jitter(0.0), in_flight=lambda: {"prompt_bound_tokens": 5})
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(pump.call(Script(make_error(503))))
+    assert pump.abandoned is None
+
+
 @pytest.mark.parametrize("status", [401, 403])
 def test_b09_a_rejected_key_is_not_retried_and_the_sdk_text_is_not_kept(make_error, sleeps, jitter, status, sdk):
     """B09: 401 and 403 end as key_rejected after one request; the SDK message, which may echo a key, is dropped."""
