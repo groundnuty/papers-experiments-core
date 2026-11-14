@@ -27,6 +27,12 @@ its raw p-value at alpha, and every table or report that shows its conclusion sh
 preregistration with `exploratory_only = true` has no family, so every contrast is exploratory, Holm decides nothing,
 and the result says that no confirmatory claim is made (S12).
 
+A preregistration may declare several named Holm families in place of the one flat family (S16, `[holm_families]`).
+Each is adjusted on its own at alpha, so a member's level, adjusted p-value and decision are its own family's; its
+minimum detectable effect is judged at alpha over its own family's size; and an equivalence claim is adjusted with the
+other equivalence claims of its own Holm family only. One flat `holm_family` is one family, whose result is the one it
+was before families were named.
+
 A treatment attempt (a run that ended in an infrastructure failure its condition declares as its treatment) is scored
 as its condition's outcome, so a scorer that returns None for it takes its pair out of every contrast on that outcome,
 and the manipulation silently leaves the comparison it was kept for (S10). Each result counts those pairs, with every
@@ -168,11 +174,38 @@ class HolmDecision:
 
 
 @dataclasses.dataclass(frozen=True)
+class HolmStep:
+    """One step of a family's step-down (S16): the `step`-th smallest p-value of a family of m, compared with alpha /
+    (m - step + 1), with its adjusted p-value and the verdict."""
+
+    step: int  # 1 for the smallest p-value; an untestable member counts as p = 1, ties keep the declared order
+    name: str
+    p_value: float
+    p_holm: float
+    level: float
+    reject: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class HolmFamily:
+    """One named Holm family of the preregistration (S16), adjusted on its own at alpha."""
+
+    name: str
+    members: tuple[str, ...]  # in declared order
+    steps: tuple[HolmStep, ...]  # in the order Holm takes them, from the smallest p-value
+    equivalence: tuple[HolmDecision, ...] = ()  # Holm over its members' TOST p-values, those of the equivalence family
+
+
+@dataclasses.dataclass(frozen=True)
 class AnalysisResult:
     """Every declared contrast, the decisions over the family, and the manifest entries of the preregistration.
 
     `exploratory_only` is the preregistration's statement that it makes no confirmatory claim (S12): there is no Holm
     decision, and every contrast is exploratory.
+
+    With several named families (S16), `holm` holds every member's decision as its own family made it, the families
+    in declared order, and `holm_families` each family's members and steps; with one flat `holm_family` there is no
+    named family and `holm_families` is empty.
     """
 
     contrasts: tuple[ContrastResult, ...]
@@ -182,6 +215,7 @@ class AnalysisResult:
     exploratory_only: bool = False
     equivalence_holm: tuple[HolmDecision, ...] = ()  # Holm over the equivalence family's TOST p-values (S15)
     descriptives: tuple[DescriptiveResult, ...] = ()  # the one-arm estimates, in declared order (S14)
+    holm_families: tuple[HolmFamily, ...] = ()  # the named families, in declared order (S16)
 
     def contrast(self, name: str) -> ContrastResult:
         """Return the result of the contrast with this name."""
@@ -248,8 +282,8 @@ def _minimum_detectable_effect(
 
     Rejection in the simulation is decided by the p-value function and the parameters the contrast's estimator
     analyses with (a preregistered Wilcoxon `method`, for one), so the effect found is one the analysis itself can
-    reject (S06, S09). The level is alpha divided by the size of the Holm family for a member and alpha for any other
-    contrast.
+    reject (S06, S09). The level is alpha divided by the size of its own Holm family for a member (of the one flat
+    family, or of the named family it is in, S16) and alpha for any other contrast.
 
     That level is conservative for a member. Holm's step-down levels are alpha / m, alpha / (m - 1), ..., alpha, and
     alpha / m is the first and hardest of them, so this figure overstates the effect needed for every member except
@@ -266,7 +300,8 @@ def _minimum_detectable_effect(
     p_values = estimators.p_values_function(spec.estimator, prereg.estimator_settings(spec).params)
     if p_values is None:
         return math.nan
-    level = prereg.alpha / len(prereg.holm_family) if in_family else prereg.alpha
+    family = prereg.family_of(spec.name)
+    level = prereg.alpha / len(family[1]) if in_family and family is not None else prereg.alpha
     rng = np.random.default_rng([prereg.power.seed, name_digest(spec.name)])
 
     return power.minimum_detectable_effect(sd, len(differences.clusters), level, prereg.power, rng, p_values)
@@ -285,7 +320,7 @@ def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pa
                 f'{prereg.source}: confirmatory contrast {spec.name!r} declares treatment_outcomes = "excluded", which '
                 f"leaves it no pair: all {removed} are treatment attempts, so nothing is estimated and its conclusion "
                 'would read as no effect detected. Declare treatment_outcomes = "scored" and score them, or take the '
-                "contrast out of holm_family"
+                f"contrast out of {prereg.family_key}"
             )
         return
     lost = pairing.missing["treatment_outcome_none"]
@@ -325,7 +360,7 @@ def _refuse_unmeasured_failures(spec: ContrastSpec, prereg: Preregistration, pai
         f"{spec.ratio.numerator!r} is None while its denominator {spec.ratio.denominator!r} is 0, so its ratio would "
         f"count the {spec.ratio.numerator!r} of the runs with a nonzero {spec.ratio.denominator!r} and leave out "
         f"that of the others. Make the scorer return {spec.ratio.numerator!r} for every run, a failed run's included, "
-        "or take the contrast out of holm_family"
+        f"or take the contrast out of {prereg.family_key}"
     )
 
 
@@ -433,24 +468,46 @@ def _run_contrast(
     return result, pairing
 
 
-def _equivalence_family(
-    results: tuple[ContrastResult, ...], pairings: Mapping[str, Pairing], prereg: Preregistration
-) -> tuple[tuple[ContrastResult, ...], tuple[HolmDecision, ...]]:
-    """Holm over the equivalence family's TOST p-values (S15): each member is equivalent only when Holm rejects its
-    two one-sided nulls, and carries the interval at 1 - 2 x the level Holm compared it with. An untestable member's
-    NaN counts as p = 1, so the family keeps its size and it is never equivalent (S02)."""
-    if not prereg.equivalence_family:
-        return results, ()
-    by_name = {result.name: result for result in results}
-    names = prereg.equivalence_family
-    p_values = [by_name[name].tost_p for name in names]
-    outcome = kernel.holm(p_values, prereg.alpha)
-    decisions = tuple(
+def _holm_decisions(names: Sequence[str], p_values: Sequence[float | None], alpha: float) -> tuple[HolmDecision, ...]:
+    """Holm over one family, each member's decision in the order the names are given."""
+    outcome = kernel.holm(p_values, alpha)
+    return tuple(
         HolmDecision(name, p, adjusted, level, reject)
         for name, p, adjusted, level, reject in zip(
             names, p_values, outcome.adjusted, outcome.levels, outcome.reject, strict=True
         )
     )
+
+
+def equivalence_groups(prereg: Preregistration) -> tuple[tuple[str | None, tuple[str, ...]], ...]:
+    """The equivalence family split by Holm family (S15, S16): for each Holm family that holds any, its members of
+    the equivalence family, in the equivalence family's declared order. Each group is adjusted on its own, so an
+    equivalence claim is adjusted with the other claims of its own Holm family only; with one flat family there is
+    one group, the whole equivalence family."""
+    groups = []
+    for name, members in prereg.families():
+        group = tuple(member for member in prereg.equivalence_family if member in members)
+        if group:
+            groups.append((name, group))
+    return tuple(groups)
+
+
+def _equivalence_family(
+    results: tuple[ContrastResult, ...], pairings: Mapping[str, Pairing], prereg: Preregistration
+) -> tuple[tuple[ContrastResult, ...], tuple[HolmDecision, ...]]:
+    """Holm over the equivalence family's TOST p-values (S15), within each Holm family (S16): each member is
+    equivalent only when Holm rejects its two one-sided nulls, and carries the interval at 1 - 2 x the level Holm
+    compared it with. An untestable member's NaN counts as p = 1, so its group keeps its size and it is never
+    equivalent (S02). The decisions are returned in the equivalence family's declared order."""
+    if not prereg.equivalence_family:
+        return results, ()
+    by_name = {result.name: result for result in results}
+    by_member = {
+        decision.name: decision
+        for _, group in equivalence_groups(prereg)
+        for decision in _holm_decisions(group, [by_name[name].tost_p for name in group], prereg.alpha)
+    }
+    decisions = tuple(by_member[name] for name in prereg.equivalence_family)
     decided = {}
     for d in decisions:
         r, spec = by_name[d.name], prereg.contrasts[d.name]
@@ -468,9 +525,37 @@ def _equivalence_family(
     return tuple(decided.get(r.name, r) for r in results), decisions
 
 
+def _steps(decisions: Sequence[HolmDecision]) -> tuple[HolmStep, ...]:
+    """A family's decisions in the order Holm takes them. Its levels are alpha / m, alpha / (m - 1), ..., alpha, one
+    per step and each larger than the last, so the order of the levels is the order of the steps."""
+    ordered = sorted(decisions, key=lambda d: d.level)
+    return tuple(HolmStep(i, d.name, d.p_value, d.p_holm, d.level, d.reject) for i, d in enumerate(ordered, start=1))
+
+
+def _family_results(
+    prereg: Preregistration,
+    families: Sequence[tuple[str | None, tuple[HolmDecision, ...]]],
+    equivalence: Sequence[HolmDecision],
+) -> tuple[HolmFamily, ...]:
+    """Each named family with its members, its steps and its members' equivalence decisions, in the equivalence
+    family's order (S16); none for the one flat family, whose output is the one it was before families were named."""
+    if not prereg.holm_families:
+        return ()
+    return tuple(
+        HolmFamily(
+            str(name),
+            tuple(d.name for d in decisions),
+            _steps(decisions),
+            tuple(e for e in equivalence if e.name in {d.name for d in decisions}),
+        )
+        for name, decisions in families
+    )
+
+
 def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[AbsentRun] = ()) -> AnalysisResult:
-    """Run every declared contrast, then Holm over the declared family at the preregistered alpha, and Holm over the
-    equivalence family's TOST p-values when one is declared (S15).
+    """Run every declared contrast, then Holm over each declared family at the preregistered alpha (one flat family,
+    or each named family on its own, S16), and Holm over the equivalence family's TOST p-values when one is declared,
+    within each Holm family (S15).
 
     `absent` are the planned runs with no analysed attempt (exhausted, unfinished, left out), from the export.
     """
@@ -478,14 +563,11 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
     runs = {spec.name: _run_contrast(rows, spec, prereg, absent=absent) for spec in prereg.contrasts.values()}
     results = tuple(result for result, _ in runs.values())
     by_name = {result.name: result for result in results}
-    p_values = [by_name[name].p_value for name in prereg.holm_family]
-    outcome = kernel.holm(p_values, prereg.alpha)
-    decisions = tuple(
-        HolmDecision(name, p, adjusted, level, reject)
-        for name, p, adjusted, level, reject in zip(
-            prereg.holm_family, p_values, outcome.adjusted, outcome.levels, outcome.reject, strict=True
-        )
-    )
+    families = [
+        (name, _holm_decisions(members, [by_name[member].p_value for member in members], prereg.alpha))
+        for name, members in prereg.families()
+    ]
+    decisions = tuple(decision for _, family in families for decision in family)
     rejected = {d.name: d.reject for d in decisions}  # an untestable member's NaN p never rejects
     decided = tuple(
         dataclasses.replace(
@@ -510,6 +592,7 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
         prereg.exploratory_only,
         equivalence_holm=equivalence,
         descriptives=described,
+        holm_families=_family_results(prereg, families, equivalence),
     )
 
 
@@ -523,14 +606,16 @@ class PowerResult:
 
 def power_study(prereg: Preregistration, simulate: bool = True) -> PowerResult:
     """The power table of the preregistration's [power] settings, at alpha and at alpha divided by the family size;
-    at alpha only when the preregistration has no family (S12).
+    at alpha only when the preregistration has no family (S12). With several named families (S16) the size is the
+    largest family's, the hardest first step any family has, so the figure is conservative for the others.
 
     It reads nothing but the preregistration and runs scipy's test directly (see power), so it checks the design
     without touching the pipeline.
     """
     if prereg.power is None:
         raise ValueError(f"{prereg.source}: has no [power] section, so there is no power study to run")
-    rows = power.power_table(prereg.power, prereg.alpha, len(prereg.holm_family), simulate=simulate)
+    largest = max((len(members) for _, members in prereg.families()), default=0)
+    rows = power.power_table(prereg.power, prereg.alpha, largest, simulate=simulate)
     return PowerResult(tuple(rows), prereg.manifest())
 
 
@@ -563,7 +648,8 @@ def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None 
     (`Tost.p_values`, with the estimator's preregistered parameters), the test the analysis decides it by, at the
     [power] section's target clusters, simulations and seed (with a digest of the contrast's name). The SD is each of
     the [power] sd_grid's, declared; or, given pilot rows, the contrast's own between-cluster SD of its paired
-    differences, estimated. The level is alpha divided by the family's size, Holm's first and hardest step, so the
+    differences, estimated. The level is alpha divided by the number of equivalence claims in the member's own Holm
+    family (the whole equivalence family under one flat family, S16), Holm's first and hardest step there, so the
     figure is conservative for every member but the one with the smallest p-value. A claim is `reachable` when its
     chance at 0 meets the target power; a preregistration should state an equivalence hypothesis only if it is, and
     say so if it is not. Only members are simulated: a contrast whose margin no family names is judged by the 1 - 2
@@ -576,11 +662,12 @@ def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None 
         raise ValueError(f"{prereg.source}: declares no equivalence_family, so no equivalence claim is decided by TOST")
     pilot = list(rows) if rows is not None else None
     settings = prereg.power
+    claims = {member: len(group) for _, group in equivalence_groups(prereg) for member in group}
     table = []
     for name in family:
         spec = prereg.contrasts[name]
         margin = float(spec.equivalence_margin or 0.0)
-        alpha = prereg.alpha / len(family)
+        alpha = prereg.alpha / claims[name]
         tost = estimators.tost_function(spec.estimator)
         if tost is None:  # the loader refuses such a member
             raise ValueError(f"{prereg.source}: contrast {name!r} has an estimator with no TOST")
