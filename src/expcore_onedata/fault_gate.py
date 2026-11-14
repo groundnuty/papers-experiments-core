@@ -107,12 +107,13 @@ class FaultGate:
             if self._recovery.entries() and self._may_recover:
                 exclusive = self._lock.try_acquire(exclusive=True, purpose=RECOVERY)
                 if exclusive is not None:  # no run is on the federation: settle what is left
-                    began = self._clock()
                     try:
+                        if self._drain_s > 0 and exclusive.drain is not None:
+                            # before anything is restored: a provider it brings back went down in a run it knows nothing
+                            # of, and the release below publishes the drain whatever interrupts the recovery
+                            exclusive.drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)
                         self._recovery.recover()
-                    finally:  # a provider it brought back went down in a run it knows nothing of: drain in full
-                        if self._recovery.restored and self._drain_s > 0 and exclusive.drain is not None:
-                            exclusive.drain.owe(began, clock=self._clock, sleep=self._sleep)
+                    finally:
                         exclusive.close()
             try:
                 shared = self._lock.acquire(exclusive=False, timeout_s=self._wait_s)

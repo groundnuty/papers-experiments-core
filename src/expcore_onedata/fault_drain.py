@@ -10,10 +10,11 @@ when its HTTP request process dies (seconds after the client closes the socket, 
 file and `restart_link` cancel nothing; only a container restart does. (Source-read of op-worker f118ed9, not measured.)
 
 **What.** `SessionDrain` is carried by an exclusive `Admission` (`expcore_onedata.admission`). The fault injector
-arms it once a provider it took down is verified restored (`FaultInjector.clear`), and `owe` arms it for a provider
-that a recovery brought back after an earlier run. Once armed, the federation admits no run before the drain has
-ended: the plan's `until` is `[faults] session_drain_s` (320 s by default) after the later of the run's mount
-disconnecting and its REST gate stopping.
+arms it before it restores a provider it took down (`FaultInjector.clear`; `disarm` takes it back when the provider
+never went down), and `owe` arms it before a recovery brings back a provider an earlier run left down. Both come
+before the restore, so nothing between the journal's clear and the restore's report can leave the federation open.
+Once armed, the federation admits no run before the drain has ended: the plan's `until` is `[faults] session_drain_s`
+(320 s by default) after the later of the run's mount disconnecting and its REST gate stopping.
 
 **How it is kept.** When an armed admission is let go, `SessionDrain.publish` writes `until`, on the wall clock, to the
 journal's drain record (`InjectionJournal.raise_drain`, `federation.drain`), which only ever moves later; and every
@@ -160,6 +161,14 @@ class SessionDrain:
                 self._restore_started = (
                     restore_started if self._restore_started is None else max(self._restore_started, restore_started)
                 )
+
+    def disarm(self) -> None:
+        """Take back an arming made before a restore that then found nothing to restore (the provider never went down).
+        Nothing owed to an earlier run is ever taken back."""
+        with self._lock:
+            if self._owed is None:
+                self._armed = False
+                self._restore_started = None
 
     def owe(
         self,

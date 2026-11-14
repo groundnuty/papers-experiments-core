@@ -838,3 +838,95 @@ def test_o11_an_admission_whose_drain_can_be_neither_recorded_nor_waited_out_is_
     taken = lock.try_acquire(exclusive=True)  # only the process's end would have let it go
     assert taken is not None
     taken.close()
+
+
+# --- the drain is closed behind a restore before the restore, not after it ----------------------------------------
+
+
+def test_o11_an_interrupt_during_the_gates_recovery_still_closes_the_federation(tmp_path):
+    """O11: the gate's recovery arms its drain before it restores anything, so an interrupt after the provider is back
+    and the journal cleared, before the recovery could report it, cannot leave the federation open: the admission's
+    release publishes the drain whatever ended the recovery."""
+    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    clock = FakeClock()
+    services = FakeServices(path=state)
+
+    def interrupted(service):
+        raise KeyboardInterrupt
+
+    services.on_serves = interrupted
+    gate = FaultGate(settings_of(platform), services, clock=clock, sleep=clock.sleep, wall=clock)
+    with pytest.raises(KeyboardInterrupt):
+        gate()
+    assert FederationLock(settings_of(platform), wall=clock).drain_left() == pytest.approx(DRAIN_S, abs=2.0)
+
+
+def test_o11_a_recovery_under_an_admission_owes_its_drain_before_it_restores_and_holds_the_admission(tmp_path):
+    """O11: `FaultInjector.recover()` under an exclusive admission owes the drain on it before the provider is
+    restarted, and keeps a share of the admission until it has ended, so a cancelled owner cannot let the lock go
+    under it."""
+    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    clock = FakeClock()
+    settings = settings_of(platform)
+    lock = FederationLock(settings, clock=clock, sleep=clock.sleep, wall=clock)
+    services = FakeServices(path=state)
+    injector = injector_for(platform, services, clock=clock, wall=clock)
+    seen: list[tuple[bool, int]] = []
+    with lock.held(exclusive=True, target=OUTAGE_TARGET, purpose=OUTAGE_RUN) as admission:
+        services.on_serves = lambda service: seen.append((admission.drain.armed, admission.shares.count))
+        assert injector.recover() == []
+        assert admission.shares.count == 1  # the share it took is given up
+    assert seen
+    assert all(armed and count >= 2 for armed, count in seen)  # armed, and the recovery held its own share
+    assert lock.drain_left() == pytest.approx(DRAIN_S, abs=2.0)
+
+
+def test_o11_a_later_clear_without_the_original_admission_closes_the_federation_before_it_restores(tmp_path):
+    """O11: the first clear fails readiness and the run's admission is let go; the retry, which holds none, writes the
+    drain record before it journals the injection cleared, and does not return `True` without one."""
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    settings = settings_of(platform)
+    lock = FederationLock(settings, clock=clock, sleep=clock.sleep, wall=clock)
+    services = FakeServices(never_serves=True)
+    injector = injector_for(platform, services, clock=clock, wall=clock)
+    with lock.held(exclusive=True, target=OUTAGE_TARGET, purpose=OUTAGE_RUN):
+        injector.start(RUN)
+        assert injector.clear() is False  # not serving: the injection stays open
+    clock.now += DRAIN_S + 1  # the first clear's drain, published as the admission went, is over
+    assert lock.drain_left() == 0.0
+    services.knobs["never_serves"] = False
+    seen: list[float] = []
+    services.on_serves = lambda service: seen.append(lock.drain_left())
+    assert injector.clear() is True
+    assert seen
+    assert all(left == pytest.approx(DRAIN_S, abs=2.0) for left in seen)  # closed before the journal's clear
+    assert lock.drain_left() > 0
+    assert open_injections(tmp_path) == []
+
+
+def test_o11_an_unverified_restore_under_a_runs_admission_still_closes_the_federation_when_it_ends(tmp_path):
+    """O11: the provider went down and was restarted but never served: the injection stays open and the run's admission,
+    armed before the restore, closes the federation for the drain behind it."""
+    platform, _, clock, lock = fake_federation(tmp_path)
+    injector = injector_for(platform, FakeServices(never_serves=True), clock=clock, wall=clock)
+    with lock.held(exclusive=True, target=OUTAGE_TARGET, purpose=OUTAGE_RUN) as admission:
+        admission.drain.begin(GATE).ended(GATE, at=clock.now)
+        injector.start(RUN)
+        assert injector.clear() is False
+    assert lock.drain_left() > 0
+    assert lock.try_acquire(exclusive=False) is None
+
+
+def test_o11_a_provider_the_stop_never_took_down_closes_nothing_under_a_runs_admission(tmp_path):
+    """O11: an outage run whose provider never went down arms nothing that survives its restore: no record is written
+    when its admission ends, and the next run is admitted at once."""
+    platform, settings, clock, lock = fake_federation(tmp_path)
+    injector = injector_for(platform, FakeServices(stop_noop=True), clock=clock, wall=clock)
+    with lock.held(exclusive=True, target=OUTAGE_TARGET, purpose=OUTAGE_RUN) as admission:
+        with pytest.raises(InfraError, match="could not be taken down"):
+            injector.start(RUN)
+        assert not admission.drain.armed
+    assert not (settings.journal / DRAIN).exists()
+    taken = lock.try_acquire(exclusive=True)
+    assert taken is not None
+    taken.close()

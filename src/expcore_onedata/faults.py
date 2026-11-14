@@ -195,6 +195,7 @@ from expcore_onedata.admission import (
 )
 from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
 from expcore_onedata.fault_recovery import RESTORED, FaultDriver, Recovery, RestoreNotVerified, digest
 from expcore_onedata.fault_serves import provider_serves
@@ -659,7 +660,9 @@ class FaultInjector:
         entry, digest = self._pending
         injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
         began = self._clock()  # the restore's start, from which an unknown end of the run's sessions is drained in full
+        drain, fresh = None, False
         try:
+            drain, fresh = self._close_behind(began, owed=False)  # before the provider is brought back
             done, how, after, ready_after_s = self._recovery.settle(
                 {
                     "id": entry,
@@ -674,6 +677,8 @@ class FaultInjector:
             )
         except Exception as error:  # never lose the reading: a clear that failed stays pending and open
             done, how, after, ready_after_s = False, type(error).__name__, None, None
+        if drain is not None and fresh and done and how == "never_down":
+            drain.disarm()  # the provider never went down: nothing was left to drain
         verified = done and how in ("restored", "found_restored")
         timed = {} if ready_after_s is None else {"ready_after_s": ready_after_s}
         self._injection = {**injection, "cleared": done, "verified": verified, **timed}
@@ -707,19 +712,35 @@ class FaultInjector:
         (`SessionDrain.owe`), and with no admission held the federation is closed for it at once (`hold_for`), so that
         no recovery ends with the federation open inside the drain (`fault_drain`)."""
         self._require_sanction()
-        began = self._clock()
-        if self._settings.session_drain_s > 0 and self._exclusive_admission() is None and self._recovery.entries():
-            # with no admission to keep the federation closed behind the restore, it is closed before anything is
-            # restored, or another process could be admitted between the journal's clear and the record (a record that
-            # cannot be written fails as `injector_failure`, with nothing restored)
-            self._federation.hold_for(self._settings.session_drain_s)
+        give_up = retain_admission()  # the admission that protects the restore stays held until the recovery has ended
         try:
+            if self._recovery.entries():  # something is open: whatever the recovery brings back is owed its drain
+                self._close_behind(self._clock(), owed=True)
             return self._recovery.recover(self._step, heal=heal)
         finally:
-            if self._recovery.restored and self._settings.session_drain_s > 0:
-                admission = self._exclusive_admission()
-                if admission is not None and admission.drain is not None:
-                    admission.drain.owe(began, clock=self._clock, sleep=self._sleep)
+            give_up()
+
+    def _close_behind(self, began: float, *, owed: bool) -> tuple["SessionDrain | None", bool]:
+        """Before a restore that may bring back a provider that went down, close the federation behind it, so that no
+        interrupt, no cancellation and no other process can find the provider restored, the journal cleared and the
+        federation open (`fault_drain`). With an exclusive admission held, its drain is armed (`arm`, for this injector's
+        own injection) or owed (`owe`, for a recovery of an earlier run's: that run's sessions are unknown); the
+        admission's release publishes it. With none held, the drain record is written now (`hold_for`). A record that
+        cannot be written fails as `injector_failure`, with nothing restored. Return the drain armed, and whether this
+        call armed it (for a restore that finds nothing to restore, `SessionDrain.disarm`)."""
+        if self._settings.session_drain_s <= 0:
+            return None, False
+        admission = self._exclusive_admission()
+        if admission is None or admission.drain is None:
+            self._federation.hold_for(self._settings.session_drain_s)
+            return None, False
+        drain = admission.drain
+        fresh = not drain.armed
+        if owed:
+            drain.owe(began, clock=self._clock, sleep=self._sleep)
+        else:
+            drain.arm(began, clock=self._clock, sleep=self._sleep)
+        return drain, fresh
 
     def _drain(self, how: str, began: float) -> None:
         """After a verified restore of a provider that went down: arm the drain of the exclusive admission that holds the

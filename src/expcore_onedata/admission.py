@@ -26,7 +26,7 @@ then lets the turnstile go. An outage run waiting for the main lock holds the tu
 queue behind it, and it gets in once the runs that were on the federation at its arrival have finished.
 
 **The session drain (`expcore_onedata.fault_drain`).** An exclusive admission carries a `SessionDrain`. The fault
-injector arms it once a provider it took down is verified restored, and from then the federation admits nobody before
+injector arms it before it restores a provider it took down, and from then the federation admits nobody before
 `[faults] session_drain_s` has passed since the later of the run's mount disconnecting and its REST gate stopping (the
 sandbox reports both to it): a read of a file only the stopped provider holds leaves an on-demand sync job that a later
 read of the same file would join and hang on. The last release of an armed admission (`Admission._release`) writes that
