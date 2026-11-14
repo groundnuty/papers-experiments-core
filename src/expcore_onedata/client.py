@@ -78,10 +78,13 @@ send, a redirect it cannot parse or a hook that raises, is found in the frames t
 (`_release_stranded`). No error holds the httpx error or the answer that caused it: a transport failure is raised after
 its handler has ended, so the `PlatformError` has no `__context__`. The client keeps no answer, request or body, and
 follows no redirect, whatever the HTTP client it was given does: httpx follows one inside its send, and takes the
-`X-Auth-Token` header along to another host (it drops `Authorization` alone); a 3xx answer is the answer. The net under
-all of that is `collect_after_bytes`: once that many bytes of bodies, sent and received, failed exchanges' included,
-have been counted since the last collection, a full collection runs before the next exchange (`collectbudget.py`); it
-is a fallback, not the fix.
+`X-Auth-Token` header along to another host (it drops `Authorization` alone); a 3xx answer is the answer.
+
+What none of this reaches is an HTTP client the caller injected whose hooks, authentication flow or transport keep a
+reference of their own to an answer or a request, and a cycle inside httpx or httpcore that no answer the client holds
+reaches. The net under all of it is `collect_after_bytes`: once that many bytes of bodies, sent and received, failed
+exchanges' included, have been counted since the last collection, a full collection runs before the next exchange
+(`collectbudget.py`); it is a fallback, not the fix.
 
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
@@ -437,7 +440,9 @@ def _release_stranded(error: BaseException, request: httpx.Request) -> int:
     The first frame of the failure's traceback is the caller's own, and is not read: its locals hold the failure
     itself, and before Python 3.13 reading them copies them into a cache the frame keeps, a cycle of the frame, the
     failure and its traceback that holds the request and the body written. The frames below it are cleared at the end,
-    which drops the copies reading them made and whatever else they held."""
+    which drops the copies reading them made and whatever else they held. Clearing every one of them, not only those
+    that held an answer, is deliberate: they are finished, and what they held of the request and its body is not
+    wanted. A close that fails on top of the failure being reported adds nothing to it, and is let go."""
     first = error.__traceback__
     below = None if first is None else first.tb_next
     delivered: dict[int, int] = {}  # by the answer's identity: the same answer is a local of more than one frame
