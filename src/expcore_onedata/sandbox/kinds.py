@@ -48,6 +48,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from expcore.errors import InfraError, register_infra_kind
+from expcore.records.injections import INJECTOR_FAILURE  # the core names it: it sets an attempt aside as this kind
 from expcore_onedata.sandbox import infradeath, killcause
 
 DATA_GATE_INTEGRITY = "data_gate_integrity"
@@ -68,7 +69,6 @@ register_infra_kind(
     treatable=False,
 )
 PROVIDER_OUTAGE = "provider_outage"
-INJECTOR_FAILURE = "injector_failure"
 register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
 register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
 

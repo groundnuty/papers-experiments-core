@@ -128,7 +128,8 @@ def health_detail(tmp_path, fake, edit=None):
 
     config = load_platform(write_platform(tmp_path, edit))
     client = OnezoneClient(config, http=fake.client_http())
-    return PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW)().detail
+    health = PlatformHealth(config, client, TokenIssuer(client, config, clock=lambda: NOW), clock=lambda: NOW)
+    return health.space().detail  # the space check's: with two providers the composed check probes links first (O35)
 
 
 def test_o12_a_health_detail_names_declared_providers_by_position_and_others_by_their_reported_id(tmp_path, fake):

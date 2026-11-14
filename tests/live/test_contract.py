@@ -723,19 +723,19 @@ def copy_prefix(source, dest, size):
 
 
 @MUTATE
-def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_back_by_its_hash(
+def test_a_large_file_resumes_by_offset_writes_refuses_a_shorter_one_and_reads_back_by_its_hash(
     config, client, tmp_path
 ):
-    """O25: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
-    nothing, a shorter file over the longer target is written again from a write without an offset (which must
-    truncate it), and the streamed read gives each file's SHA-256. Everything is under a fresh scratch directory and
-    torn down; skipped without a [placement] table."""
+    """O25, O44: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
+    nothing, a shorter file over the longer target is refused with nothing written (only a write without an offset,
+    which truncates and is never sent, could shorten it), and the streamed read gives each file's SHA-256.
+    Everything is under a fresh scratch directory and torn down; skipped without a [placement] table."""
     # covers: PUT /data/{id}/content
     import dataclasses
     import secrets
 
     from expcore.config.loading import ConfigError
-    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+    from expcore_onedata.provision import Provisioner, ProvisionError, resolve_provider_ids
     from expcore_onedata.rangemap import load_placement
 
     try:
@@ -752,17 +752,18 @@ def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_
     prefix_sha = copy_prefix(whole, prefix, cut)
     path = f"expcore-live-{secrets.token_hex(6)}/large.bin"
     try:
-        assert provisioner.upload(path, prefix).action == "created"
+        created = provisioner.upload(path, prefix)
+        assert (created.action, created.digest.sha256) == ("created", prefix_sha)
         resumed = provisioner.upload(path, whole)
         assert (resumed.action, resumed.sent_bytes) == ("resumed", LARGE_FILE_BYTES - cut)
         assert (resumed.digest.size, resumed.digest.sha256) == (LARGE_FILE_BYTES, whole_sha)
         assert provisioner.upload(path, whole).action == "skipped"
-        restarted = provisioner.upload(path, prefix)  # the target is longer, so only a truncating write fits it
-        assert (restarted.action, restarted.digest.sha256) == ("restarted", prefix_sha)
+        with pytest.raises(ProvisionError, match="longer"):  # only a truncating write could fit it, never sent
+            provisioner.upload(path, prefix)
         back = tmp_path / "back.bin"
-        found = provisioner.read_file(restarted.file_id, dest=back)
-        assert (found.size, found.sha256) == (cut, prefix_sha)
-        assert back.stat().st_size == cut
+        found = provisioner.read_file(resumed.file_id, dest=back)
+        assert (found.size, found.sha256) == (LARGE_FILE_BYTES, whole_sha)
+        assert back.stat().st_size == LARGE_FILE_BYTES
     finally:
         report = provisioner.teardown()
     assert report.ok, report.left
