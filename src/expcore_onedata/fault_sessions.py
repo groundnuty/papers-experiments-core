@@ -73,7 +73,7 @@ def await_sessions(
     polls = max(1, math.ceil(timeout_s / poll_s)) + 1
     for poll in range(polls):
         if poll:
-            sleep(poll_s)
+            sleep(max(0.0, min(poll_s, timeout_s - (clock() - started))))  # no pause past the bound
         try:
             detail = read(service, gate_probe)
         except GateUnarmed as error:

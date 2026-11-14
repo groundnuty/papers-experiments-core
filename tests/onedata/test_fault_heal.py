@@ -921,13 +921,14 @@ def test_o35_a_clear_keeps_the_runs_admission_held_when_the_run_lets_it_go_midwa
     other.close()
 
 
-def test_o35_a_heals_container_restart_ends_its_waits_at_its_budget_with_the_start_sent(tmp_path):
-    """O35: the heal gives a reader's container restart what is left of its bound; its waits end there, the start is
-    sent all the same, so the reader is never left stopped, and a restart cut short is unverified with its entry open
-    for recovery."""
+@pytest.mark.parametrize("poll_s", [1, 1000])
+def test_o35_a_heals_container_restart_ends_its_waits_at_its_budget_with_the_start_sent(tmp_path, poll_s):
+    """O35: the heal gives a reader's container restart what is left of its bound; its waits end there, no pause
+    between two readings crosses it however long `poll_s` is, the start is sent all the same, so the reader is never
+    left stopped, and a restart cut short is unverified with its entry open for recovery."""
     services = HealServices()
     services.never_serving = {READER}
-    platform = write_platform(tmp_path, lambda data: four_providers(data, ready_timeout_s=60))
+    platform = write_platform(tmp_path, lambda data: four_providers(data, ready_timeout_s=60, poll_s=poll_s))
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     clock = FakeClock()
     services.clock = clock

@@ -322,7 +322,7 @@ class Recovery(LinkSettling):
         started = self._clock()
         for poll in range(polls):
             if poll:
-                self._sleep(poll_s)
+                self._sleep(self._until_deadline(poll_s))
             try:
                 served = self._driver.serves(service) is True
             except DriverError:
@@ -337,6 +337,13 @@ class Recovery(LinkSettling):
         """Whether a heal's container restart has used the time its heal gave it (`restart_container`); its waits and
         start attempts end then, and the restart is unverified, journalled open for recovery."""
         return self._deadline is not None and self._clock() >= self._deadline
+
+    def _until_deadline(self, seconds: float) -> float:
+        """A pause of `seconds`, cut so that it ends by the deadline of a heal's container restart when one is set: no
+        pause carries the restart past the time its heal gave it."""
+        if self._deadline is None:
+            return seconds
+        return max(0.0, min(seconds, self._deadline - self._clock()))
 
     def _await_down(self, service: str, before: str) -> tuple[Observation | None, bool]:
         """After a stop of unknown outcome: read the service until it shows not running, or running with another
@@ -363,7 +370,7 @@ class Recovery(LinkSettling):
             if attempt and self._past_deadline():
                 break
             if attempt:
-                self._sleep(self._settings.poll_s)
+                self._sleep(self._until_deadline(self._settings.poll_s))
             try:
                 self._driver.start(service)
             except DriverError:
@@ -395,7 +402,7 @@ class Recovery(LinkSettling):
         self.last, self.unreadable = None, 0
         for poll in range(polls):
             if poll:
-                self._sleep(self._settings.poll_s)
+                self._sleep(self._until_deadline(self._settings.poll_s))
             try:
                 self.last = self._driver.observe(service)
             except DriverError:
