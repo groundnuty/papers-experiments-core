@@ -135,6 +135,12 @@ class ToolProvider(Protocol):
     this way may offer `abandoned_threads() -> int`; the loop result records the count.
 
     Every wait on infrastructure is wrapped in `ctx.infrastructure_wait(kind)` (see `CallContext`).
+
+    A provider whose tools are a tool server's (an MCP server) sets a true `tool_server` attribute, which is optional
+    and not part of the protocol, so a test double need not have it. It is how the loop knows which calls the study's
+    declared per-call bound is for (`[agent] tool_server_call_bound_s`, L17): a hang of a tool server is not the
+    agent's time. A provider without it (a code tool, a function provider) serves in-process tools, which are never
+    handed the bound and never judged by it.
     """
 
     def tools(self) -> Sequence[ToolSpec]:
@@ -142,8 +148,9 @@ class ToolProvider(Protocol):
         ...
 
     async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
-        """Run one call. `timeout_s` is the agent's time left, or the study's declared per-call bound when that is
-        shorter (L05, L17): the call has no other limit. `ctx` marks waits."""
+        """Run one call. `timeout_s` is the agent's time left (L05), or, for a provider that is a tool server and a
+        study that declares a per-call bound, that bound when it is shorter (L17): the call has no other limit. `ctx`
+        marks waits."""
         ...
 
 

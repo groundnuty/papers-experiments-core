@@ -7,6 +7,7 @@ import pytest
 from replay_scenarios import SCENARIOS
 
 from expcore.records.record import RunRecord, decode
+from expcore.records.seal import seal
 from expcore.replay.clock import ReplayClock
 from expcore.replay.divergence import Halt, ReplayDivergence
 from expcore.replay.replay import replay_record
@@ -108,7 +109,7 @@ def test_l17_a_call_that_outlasts_the_declared_bound_replays_as_the_knowledge_fa
     it; the replay raises the recorded failure the same way and reads the clock as the run did. The second call of the
     reply is answered as skipped, with no elapsed time."""
     record = SCENARIOS["tool_bound_expiry"][0]()
-    assert record.agent_config["tool_call_bound_s"] == 60
+    assert record.agent_config["tool_server_call_bound_s"] == 60
     assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "knowledge")
     assert "within 60 s" in record.outcome["detail"]
     started, skipped = record.tool_calls
@@ -124,7 +125,7 @@ def test_l17_a_call_whose_time_left_is_shorter_than_the_declared_bound_replays_a
     loop's cut, a time cap with the call recorded as cut and the watch reading that cut it, and the replay ends the same
     way."""
     record = SCENARIOS["tool_bound_past_the_time_left"][0]()
-    assert record.agent_config["tool_call_bound_s"] == 500
+    assert record.agent_config["tool_server_call_bound_s"] == 500
     assert (record.outcome["name"], record.outcome["infra_kind"]) == ("time_cap", None)
     assert record.tool_calls[0]["status"] == "cut"
     assert record.tool_calls[0]["elapsed_s"] == 300
@@ -147,11 +148,43 @@ def test_l17_a_call_cut_after_the_declared_bound_passed_replays_as_the_same_know
     assert replay_record(record).dumps() == record.dumps()
 
 
+def test_l17_a_code_cell_cut_after_the_declared_bound_replays_as_the_agents_time_cap():
+    """L17: the same hold under the same bound, by a tool that is no tool server: the loop's cut at the time left is the
+    agent's time cap, the call is `cut` without a judgement by the bound, and the record says the bound reached no tool.
+    The replay, which is told by the record which tools are tool servers, ends the same way."""
+    record = SCENARIOS["tool_bound_code_cell_cut"][0]()
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("time_cap", None)
+    call = record.tool_calls[0]
+    assert (call["status"], call["elapsed_s"], call["detail"]) == ("cut", 61, "")
+    assert "outlasted the bound" not in call["text"]
+    assert record.agent_config["tool_server_tools"] == []
+    assert replay_record(record).dumps() == record.dumps()
+
+
+def test_l17_the_replay_takes_the_tool_servers_from_the_record_and_a_list_edited_to_say_otherwise_diverges():
+    """L17: the tools a declared bound reached are part of the configuration the record pins, and the replay's loop
+    judges a cut call by them. A record whose list was edited and sealed again no longer reaches the ending it
+    recorded: the call is the agent's time cap, with the text of a cut call, where the record says it was a hang of the
+    tool, which is where the replay first differs."""
+    data = record_of("tool_bound_cut")
+    assert data["agent_config"]["tool_server_tools"] == ["echo"]
+    data["agent_config"]["tool_server_tools"] = []
+    seal(data)
+    diverges(data, "tool_calls[0].text")
+
+
+def test_l17_a_changed_list_of_tool_servers_is_a_divergence_of_the_configuration_hash():
+    """L17: the list is in `agent_config`, which the record's digest pins: an edit alone fails before the loop runs."""
+    data = record_of("tool_bound_cut")
+    data["agent_config"]["tool_server_tools"] = []
+    diverges(data, "agent_config_sha256")
+
+
 def test_l17_a_changed_declared_bound_is_a_divergence_of_the_configuration():
     """L17: the bound is part of the configuration the record pins, so replaying a record whose bound was edited fails
     before the loop runs, at the hash of the configuration."""
     data = record_of("tool_bound_expiry")
-    data["agent_config"]["tool_call_bound_s"] = 30
+    data["agent_config"]["tool_server_call_bound_s"] = 30
     diverges(data, "agent_config_sha256")
 
 
