@@ -2,6 +2,7 @@
 spinning; a mark no live attempt owns is unhealthy at once, until a recovery (O45). Through the real scheduler, its
 store and the ingest's health check, over the fake federation."""
 
+import asyncio
 import gc
 import itertools
 import json
@@ -112,10 +113,11 @@ def held_by(make, monkeypatch, process):
 
 def ingest_run(make, executor, *, drop=None):
     """The study's executor: start the ingest, take the first turn and finish it, then run the loop; `drop(n)` says
-    whether the n-th attempt drops its instrument instead, with no finish and no reset."""
+    whether the n-th attempt drops its instrument instead, with no finish and no reset. The instrument's blocking
+    calls go through `asyncio.to_thread`, as an executor on an event loop makes them, inside the attempt's context."""
     calls = []
 
-    async def run(request):
+    def instrument(request):
         calls.append(request)
         ingest = make()
         ingest.start({"run_key": request.run_key, "attempt": request.identity.attempt})
@@ -125,9 +127,18 @@ def ingest_run(make, executor, *, drop=None):
         else:
             ingest.finish()
             ingest.check()
+
+    async def run(request):
+        await asyncio.to_thread(instrument, request)
         return await executor._run(request, "finish")
 
     return run
+
+
+def reset(holder):
+    """The other run ends: its first turn came, and its finish resets the baseline whole."""
+    holder.at_first_turn({"clock_s": 0.0})
+    holder.finish()
 
 
 def until(predicate, timeout_s=20.0):
@@ -170,8 +181,7 @@ def test_o45_a_held_start_costs_the_run_no_attempt_however_often_and_runs_once_t
     async def run(request):
         attempts.append(request)
         if len(attempts) == 4:  # the other run ends: its reset marks the baseline whole
-            holder.at_first_turn({"clock_s": 0.0})
-            holder.finish()
+            await asyncio.to_thread(reset, holder)
         return await started(request)
 
     executor.default = run
