@@ -777,7 +777,8 @@ class FaultInjector:
           owner cannot let the lock go under it; one whose last share is already given up is not held for this purpose);
         - else an exclusive admission this injector takes for the restore and gives up when it ends (`own` true: no
           sandbox of the run is under it), which waits for the federation inside `[faults] admission_timeout_s`; one it
-          cannot get is `refused`, an InfraError of kind `injector_failure`, and nothing is restored;
+          cannot get is `refused`, and nothing is restored: the hold `federation_busy` (`FederationBusy`) when the wait
+          ran out, else an InfraError of kind `injector_failure`;
         - with `session_drain_s` 0, nothing: there is no drain to keep.
 
         Declared limits. A restore that holds no admission waits for the federation (and for a drain still standing)
@@ -804,6 +805,9 @@ class FaultInjector:
                 purpose=INJECTOR,
                 target=self.target,
             )
+        except FederationBusy as busy:  # another run holds the federation, or it drains: a hold, never a failure (O11)
+            yield None, False, busy
+            return
         except InfraError as error:
             yield None, False, self._fail(error.detail)
             return

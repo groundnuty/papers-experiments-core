@@ -148,6 +148,7 @@ class FaultGate:
                 f"the federation is closed for {draining:.0f} s more while an outage run's sessions drain: "
                 "the check waits for it",
                 deferred=True,
+                charge=False,  # nor once it outlasts the gate's bound: the drain says nothing about the waiting run
             )
         record = self._journal.read_holder()
         if record is None or holder_alive(record) is not False:
