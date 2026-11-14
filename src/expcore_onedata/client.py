@@ -70,12 +70,15 @@ or a record through it.
 
 **Bodies are freed when their exchange is used (#259, O47).** httpx binds every answer to a stream that points back at
 it, a reference cycle that holds the answer, its request and both bodies until the cyclic collector runs; a batch of
-large uploads or reads would grow by everything it moved. So every answer is released the moment it is read (`_release`:
-closed, its stream replaced by an empty one), on every path that sends or receives a body (`_request`, `_stream_range`,
-`content_answer`), and no error holds the httpx error or the answer that caused it: a transport failure is raised after
-its handler has ended, so the `PlatformError` has no `__context__`. The client keeps no answer, request or body. The net
-under that is `collect_after_bytes`: after that many bytes of bodies sent and received, a full collection runs before
-the next exchange (`collectbudget.py`); it is a fallback, not the fix.
+large uploads or reads would grow by everything it moved. So every answer is released the moment it is read
+(`_release`: closed, its stream replaced by an empty one, the answers of followed redirects too), however the read ends
+(`_exchange` reads a request's answer in the open, since `httpx.Client.request` leaves one whose body failed to read in
+its cycle), on every path that sends or receives a body (`_request`, `_stream_range`, `content_answer`), and no error
+holds the httpx error or the answer that caused it: a transport failure is raised after its handler has ended, so the
+`PlatformError` has no `__context__`. The client keeps no answer, request or body. The net under that is
+`collect_after_bytes`: once that many bytes of bodies, sent and received, failed exchanges' included, have been counted
+since the last collection, a full collection runs before the next exchange (`collectbudget.py`); it is a fallback, not
+the fix.
 
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
@@ -391,28 +394,71 @@ _NO_BODY = httpx.ByteStream(b"")  # holds nothing and points at nothing: what a 
 
 
 def _release(response: httpx.Response) -> httpx.Response:
-    """Close an answer and cut the reference cycle httpx builds around it, so that its body, and its request's, are
-    freed when the last name for the answer goes, not at the next full collection (#259, O47).
+    """Close an answer, and each answer it followed a redirect from, and cut the reference cycle httpx builds around
+    each, so that its body, and its request's, are freed when the last name for it goes, not at the next full
+    collection (#259, O47).
 
     httpx replaces an answer's stream with one that holds the answer (`BoundSyncStream`, which stamps `elapsed` when the
     stream closes), and the answer holds the stream: a cycle of the answer, its request, both bodies and, over a real
-    connection, httpcore's pool objects for it. Once the answer is closed and read, the stream has nothing left to do,
-    so it is swapped for an empty one. What the answer holds of its own (`status_code`, `headers`, `content`, `json()`)
-    is untouched, and a stream that was not read stays unread: it cannot be read after a close either way."""
-    response.close()
-    response.stream = _NO_BODY
+    connection, httpcore's pool objects for it. Once an answer is closed the stream has nothing left to do, so it is
+    swapped for an empty one, even when the close itself failed. What the answer holds of its own (`status_code`,
+    `headers`, `content`, `json()`, `num_bytes_downloaded`) is untouched, and a stream that was not read stays unread:
+    it cannot be read after a close either way."""
+    answers = [response, *response.history]
+    try:
+        for answer in answers:
+            answer.close()
+    finally:
+        for answer in answers:
+            answer.stream = _NO_BODY
+    return response
+
+
+def _received(response: httpx.Response) -> int:
+    """The bytes of an answer's body that came: what the transport delivered as it was read, or, for an answer a mock
+    transport made whole before any read, what it holds."""
+    if response.num_bytes_downloaded:
+        return response.num_bytes_downloaded
+    try:
+        return len(response.content)
+    except httpx.ResponseNotRead:
+        return 0
+
+
+def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, **options: Any) -> httpx.Response:
+    """Send one request on `http`, read its answer whole and release it however the read ends, and count the bytes of
+    the bodies it moved, the failed ones' too, for the fallback collection (#259, O47).
+
+    `http.request` raises from inside when an answer's body fails to read, before the caller has the answer to release,
+    and leaves it in its cycle with the request and the body sent. So the request is built and sent here, streamed, and
+    its body read in the open."""
+    request = http.build_request(method, url, **options)
+    sent = int(request.headers.get("Content-Length") or 0)
+    try:
+        response = http.send(request, stream=True)
+    except BaseException:
+        budget.spent(sent)
+        raise
+    try:
+        response.read()
+    finally:
+        _release(response)
+        budget.spent(sent + _received(response))
     return response
 
 
 @contextmanager
-def _streamed(http: httpx.Client, url: str, *, headers: Mapping[str, str], timeout: float) -> Iterator[httpx.Response]:
-    """Stream a GET as `http.stream` does, and release the answer however the block ends, an error in it included, so
-    that an answer never read to its end is freed as soon as one that was (#259, O47)."""
+def _streamed(
+    http: httpx.Client, budget: CollectBudget, url: str, *, headers: Mapping[str, str], timeout: float
+) -> Iterator[httpx.Response]:
+    """Stream a GET as `http.stream` does, release the answer however the block ends, an error in it included, so that
+    an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47)."""
     with http.stream("GET", url, headers=headers, timeout=timeout) as response:
         try:
             yield response
         finally:
             _release(response)
+            budget.spent(_received(response))
 
 
 class PlatformError(RuntimeError):
@@ -728,8 +774,8 @@ class OnezoneClient:
             }
             if new_connection and self._owns_http:  # a connection of its own, never one of the pool's idle ones
                 with _build_http(self._config, self._timeout_s) as one_shot:
-                    return _release(one_shot.request(method, url, **options))
-            return _release(self._http.request(method, url, **options))
+                    return _exchange(one_shot, self._budget, method, url, **options)
+            return _exchange(self._http, self._budget, method, url, **options)
 
         try:
             response = self._dispatch(send, method, label, content, wait, retry, deadline_s, fresh)
@@ -738,11 +784,9 @@ class OnezoneClient:
         except httpx.HTTPError as error:
             failed = f"{label}: {method} failed ({type(error).__name__})"
         else:
-            self._budget.spent(len(content or b"") + len(response.content))
             return _checked(response, method, label)
         # Raised here, with the handlers over: an error raised inside one has the httpx error as its context, and that
         # holds the request, its body and the frames the failure passed through, for as long as the error lives (#259).
-        self._budget.spent(len(content or b""))
         raise PlatformError(failed, transport=True)
 
     def _dispatch(
@@ -1393,7 +1437,7 @@ class OnezoneClient:
         self._budget.before_exchange()
         try:
             with _streamed(
-                self._http, url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
+                self._http, self._budget, url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
             ) as response:
                 status = response.status_code
                 if status >= 400:
@@ -1408,7 +1452,6 @@ class OnezoneClient:
                     raise PlatformError(f"{label}: a streamed read's range was answered with another range or size")
                 for piece in response.iter_bytes():
                     got += len(piece)
-                    self._budget.spent(len(piece))
                     if got > length:
                         raise PlatformError(f"{label}: a streamed read's range carried more bytes than it asked for")
                     consume(piece)
@@ -1441,6 +1484,7 @@ class OnezoneClient:
         try:
             with _streamed(
                 self._http,
+                self._budget,
                 base + path,
                 headers=headers,
                 timeout=timeout_s if timeout_s is not None else self._timeout_s,

@@ -40,15 +40,22 @@ def collector_off():
             gc.enable()
 
 
-def watched_client(config, fake, seen, **options):
-    """A client whose federation is the fake, and `seen` a weak reference to every request and every answer it makes."""
+def answering_client(config, answer, seen, *, follow_redirects=False, **options):
+    """A client whose federation answers every request with `answer(request)`, and `seen` a weak reference to every
+    request and every answer it makes."""
 
     def handler(request):
-        response = fake.respond(request)
+        response = answer(request)
         seen.extend((weakref.ref(request), weakref.ref(response)))
         return response
 
-    return OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(handler)), **options)
+    http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=follow_redirects)
+    return OnezoneClient(config, http=http, **options)
+
+
+def watched_client(config, fake, seen, **options):
+    """A client whose federation is the fake, and `seen` a weak reference to every request and every answer it makes."""
+    return answering_client(config, fake.respond, seen, **options)
 
 
 @pytest.fixture
@@ -97,7 +104,7 @@ def seed(fake):
 
 def stored(fake):
     """The bytes the fake holds as files: the platform's own storage, which no client of it can free."""
-    return sum(sys.getsizeof(node.content) for node in fake.nodes.values())
+    return 0 if fake is None else sum(sys.getsizeof(node.content) for node in fake.nodes.values())
 
 
 def alive(seen):
@@ -250,6 +257,59 @@ def test_o47_an_answer_that_is_not_json_has_no_decoder_error_holding_its_text_as
     assert (failed.value.__cause__, failed.value.__context__) == (None, None)
 
 
+class Cut(httpx.SyncByteStream):
+    """An answer's body that is cut after its first MiB: the headers came, and the rest of the body never did."""
+
+    def __iter__(self):
+        yield bytes(MIB)
+        raise httpx.ReadError("the connection was cut")
+
+
+def fails(call):
+    """Run `call`, which must raise a PlatformError; return whether it was a transport failure, and let the error go."""
+    try:
+        call()
+    except PlatformError as error:
+        return error.transport
+    raise AssertionError("the call did not fail")
+
+
+def test_o47_an_answer_whose_body_fails_to_read_is_released_with_the_request_it_answered(config, seen):
+    """O47: the headers came and the body was cut. httpx raises from inside its own send before the caller has the
+    answer, so the cycle it leaves holds the four MiB of the write that was answered. With the collector off, three such
+    writes leave no request or answer alive and no byte allocated, the errors dropped."""
+    client = answering_client(config, lambda request: httpx.Response(200, stream=Cut()), seen)
+
+    def writes():
+        for _ in range(3):
+            assert fails(lambda: client._request("PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE)))
+
+    held, lingering = measured(None, seen, writes)
+    assert lingering == 0
+    assert held < SLACK
+
+
+def test_o47_the_answers_of_the_redirects_a_client_followed_are_released_too(config, seen):
+    """O47: a client the caller made follows redirects, and the answer of each is its own cycle with the request, which
+    carries the body of a write sent again; the intermediate answers are released with the last."""
+
+    def answer(request):
+        if request.url.path.endswith("/spaces"):
+            return httpx.Response(307, headers={"Location": request.url.path + "/again"})
+        return httpx.Response(204)
+
+    client = answering_client(config, answer, seen, follow_redirects=True)
+
+    def writes():
+        for _ in range(3):
+            client._request("PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE))
+
+    held, lingering = measured(None, seen, writes)
+    assert len(seen) == 12  # three writes, each sent twice
+    assert lingering == 0
+    assert held < SLACK
+
+
 # -- what the fakes keep ---------------------------------------------------------------------------------------------
 
 
@@ -357,6 +417,26 @@ def test_o47_the_bytes_of_a_streamed_read_count_toward_the_budget(config, fake, 
         f"/data/{file_id}/content", provider="alpha", size=4 * MIB, chunk_bytes=MIB, deadline_s=60
     )
     assert found.size == 4 * MIB
+    assert collections == [2]
+
+
+def test_o47_the_bytes_of_a_json_body_count_toward_the_budget(config, seen, collections):
+    """O47: a request's body is counted whatever it is made of: three requests of a MiB of JSON are three MiB sent, and
+    the third finds two spent."""
+    client = answering_client(config, lambda request: httpx.Response(204), seen, collect_after_bytes=2 * MIB)
+    for _ in range(3):
+        client._request("POST", "/spaces", provider=None, headers={}, json={"filler": "x" * MIB})
+    assert collections == [2]
+
+
+def test_o47_the_bytes_received_before_a_read_failed_count_toward_the_budget(config, seen, collections):
+    """O47: an exchange that failed moved its bytes too: three answers cut after a MiB each are three MiB received,
+    and the third finds two spent."""
+    client = answering_client(
+        config, lambda request: httpx.Response(200, stream=Cut()), seen, collect_after_bytes=2 * MIB
+    )
+    for _ in range(3):
+        assert fails(lambda: client.get("/spaces/s"))
     assert collections == [2]
 
 

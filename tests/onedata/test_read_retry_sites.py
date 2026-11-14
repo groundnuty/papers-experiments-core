@@ -151,7 +151,7 @@ CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient.get", "self._send(GET)"): ["retry"],
     ("client.py", "OnezoneClient.get_dated", "self._request(GET)"): ["retry"],
     ("client.py", "OnezoneClient._send", "self._request(<method>)"): ["retry"],
-    ("client.py", "OnezoneClient._request.send", "http.request"): ["<transport>", "<transport>"],
+    ("client.py", "_exchange", "http.send"): ["<transport>"],  # every request, a retry's one-shot client's included
     ("client.py", "OnezoneClient.mutate", "self._send(<method>)"): ["<none>"],  # a write: never retried
     ("client.py", "OnezoneClient.mutate", "self._target"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient.read_range", "self._target"): ["_GateReads(gate_retry)"],

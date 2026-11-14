@@ -5,11 +5,12 @@ cycle httpx builds around it (`client._release`), so a body is freed the moment 
 under that fix and not the fix: a cycle that arises some other way (a caller's own, a library's) still holds its bytes
 until a full collection, so after a fixed number of bytes sent and received the client asks for one.
 
-The count is of the bytes of bodies sent and received since the client last collected. When it has reached the budget,
-the collection runs at the start of the NEXT exchange, never in the one that spent the budget: that one's own request
-and answer are still alive when it ends, and a collection run then would leave them alive. At most one full collection
-runs per budget of bytes moved, so its cost is bounded by the transfer it follows, and a client with no budget never
-collects.
+The count is of the bytes of bodies sent and received since the client last collected, those of an exchange that
+failed included. When it has reached the budget, the collection runs at the start of the NEXT exchange, never in the
+one that spent the budget: that one's own request and answer are still alive when it ends, and a collection run then
+would leave them alive. A client's exchanges are counted only once their answer is released, so a collection that
+another thread starts as one ends finds no cycle of it. At most one full collection runs per budget of bytes moved, so
+its cost is bounded by the transfer it follows, and a client with no budget never collects.
 """
 
 from __future__ import annotations
