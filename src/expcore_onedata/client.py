@@ -71,11 +71,14 @@ or a record through it.
 **Bodies are freed when their exchange is used (#259, O47).** httpx binds every answer to a stream that points back at
 it, a reference cycle that holds the answer, its request and both bodies until the cyclic collector runs; a batch of
 large uploads or reads would grow by everything it moved. So every answer is released the moment it is read
-(`_release`: closed, its stream replaced by an empty one, the answers of followed redirects too), however the read ends
-(`_exchange` reads a request's answer in the open, since `httpx.Client.request` leaves one whose body failed to read in
-its cycle), on every path that sends or receives a body (`_request`, `_stream_range`, `content_answer`), and no error
+(`_release`: closed, its stream replaced by an empty one), however the read ends (`_exchange` reads a request's answer
+in the open, since `httpx.Client.request` leaves one whose body failed to read in its cycle), on every path that sends
+or receives a body (`_request`, `_stream_range`, `content_answer`), and no error
 holds the httpx error or the answer that caused it: a transport failure is raised after its handler has ended, so the
-`PlatformError` has no `__context__`. The client keeps no answer, request or body. The net under that is
+`PlatformError` has no `__context__`. The client keeps no answer, request or body, and follows no redirect, whatever
+the HTTP client it was given does: httpx follows one inside its send, out of reach of the release when it fails
+halfway, and takes the `X-Auth-Token` header along to another host (it drops `Authorization` alone); a 3xx answer is
+the answer. The net under that is
 `collect_after_bytes`: once that many bytes of bodies, sent and received, failed exchanges' included, have been counted
 since the last collection, a full collection runs before the next exchange (`collectbudget.py`); it is a fallback, not
 the fix.
@@ -394,23 +397,20 @@ _NO_BODY = httpx.ByteStream(b"")  # holds nothing and points at nothing: what a 
 
 
 def _release(response: httpx.Response) -> httpx.Response:
-    """Close an answer, and each answer it followed a redirect from, and cut the reference cycle httpx builds around
-    each, so that its body, and its request's, are freed when the last name for it goes, not at the next full
-    collection (#259, O47).
+    """Close an answer and cut the reference cycle httpx builds around it, so that its body, and its request's, are
+    freed when the last name for it goes, not at the next full collection (#259, O47).
 
     httpx replaces an answer's stream with one that holds the answer (`BoundSyncStream`, which stamps `elapsed` when the
     stream closes), and the answer holds the stream: a cycle of the answer, its request, both bodies and, over a real
     connection, httpcore's pool objects for it. Once an answer is closed the stream has nothing left to do, so it is
     swapped for an empty one, even when the close itself failed. What the answer holds of its own (`status_code`,
     `headers`, `content`, `json()`, `num_bytes_downloaded`) is untouched, and a stream that was not read stays unread:
-    it cannot be read after a close either way."""
-    answers = [response, *response.history]
+    it cannot be read after a close either way. A redirect is never followed (`_exchange`, `_streamed`), so an answer
+    has no earlier one to release."""
     try:
-        for answer in answers:
-            answer.close()
+        response.close()
     finally:
-        for answer in answers:
-            answer.stream = _NO_BODY
+        response.stream = _NO_BODY
     return response
 
 
@@ -431,19 +431,23 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
 
     `http.request` raises from inside when an answer's body fails to read, before the caller has the answer to release,
     and leaves it in its cycle with the request and the body sent. So the request is built and sent here, streamed, and
-    its body read in the open."""
+    its body read in the open. A redirect is never followed, whatever the client was built to do: httpx follows one
+    inside `send`, and a redirect that failed halfway leaves its answers in their cycles out of reach, and a request of
+    the layer goes where its configuration says and nowhere else, with the credential header it carries (O09)."""
     request = http.build_request(method, url, **options)
     sent = int(request.headers.get("Content-Length") or 0)
     try:
-        response = http.send(request, stream=True)
+        response = http.send(request, stream=True, follow_redirects=False)
     except BaseException:
         budget.spent(sent)
         raise
     try:
         response.read()
     finally:
-        _release(response)
-        budget.spent(sent + _received(response))
+        try:
+            _release(response)
+        finally:
+            budget.spent(sent + _received(response))
     return response
 
 
@@ -453,12 +457,14 @@ def _streamed(
 ) -> Iterator[httpx.Response]:
     """Stream a GET as `http.stream` does, release the answer however the block ends, an error in it included, so that
     an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47)."""
-    with http.stream("GET", url, headers=headers, timeout=timeout) as response:
+    with http.stream("GET", url, headers=headers, timeout=timeout, follow_redirects=False) as response:
         try:
             yield response
         finally:
-            _release(response)
-            budget.spent(_received(response))
+            try:
+                _release(response)
+            finally:
+                budget.spent(_received(response))
 
 
 class PlatformError(RuntimeError):

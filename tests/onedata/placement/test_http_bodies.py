@@ -289,24 +289,25 @@ def test_o47_an_answer_whose_body_fails_to_read_is_released_with_the_request_it_
     assert held < SLACK
 
 
-def test_o47_the_answers_of_the_redirects_a_client_followed_are_released_too(config, seen):
-    """O47: a client the caller made follows redirects, and the answer of each is its own cycle with the request, which
-    carries the body of a write sent again; the intermediate answers are released with the last."""
-
-    def answer(request):
-        if request.url.path.endswith("/spaces"):
-            return httpx.Response(307, headers={"Location": request.url.path + "/again"})
-        return httpx.Response(204)
-
-    client = answering_client(config, answer, seen, follow_redirects=True)
+def test_o47_a_redirect_is_never_followed_whatever_the_client_it_was_given_does(config, seen):
+    """O47: a client the caller made follows redirects, but a request of the layer does not: httpx follows one inside
+    its send, where a redirect that failed halfway leaves its answers in their cycles with the body of a write, and a
+    request that is sent on to another host takes the credential header with it (httpx drops `Authorization` alone). The
+    redirect is the answer, and nothing is sent a second time."""
+    moved = {"Location": "https://elsewhere.test/api/v3/onezone/spaces"}
+    client = answering_client(config, lambda request: httpx.Response(307, headers=moved), seen, follow_redirects=True)
+    statuses = []
 
     def writes():
         for _ in range(3):
-            client._request("PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE))
+            statuses.append(
+                client._request("PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE)).status_code
+            )
 
     held, lingering = measured(None, seen, writes)
-    assert len(seen) == 12  # three writes, each sent twice
+    assert statuses == [307] * 3
     assert lingering == 0
+    assert len(seen) == 6  # three writes, each sent once
     assert held < SLACK
 
 
@@ -437,6 +438,38 @@ def test_o47_the_bytes_received_before_a_read_failed_count_toward_the_budget(con
     )
     for _ in range(3):
         assert fails(lambda: client.get("/spaces/s"))
+    assert collections == [2]
+
+
+class BadClose(httpx.SyncByteStream):
+    """An answer's body of two MiB whose close fails: the connection is gone when the client lets go of it."""
+
+    def __iter__(self):
+        yield bytes(2 * MIB)
+
+    def close(self):
+        raise httpx.ReadError("the connection was gone at the close")
+
+
+def test_o47_the_bytes_of_an_answer_whose_close_failed_still_count_toward_the_budget(config, fake, seen, collections):
+    """O47: an answer refused for carrying more than it was asked for is closed before it was read to its end, and its
+    close fails; the bytes it delivered are counted all the same, so the failure is no way past the budget: three such
+    answers of two MiB are six, and the third range finds four spent of three."""
+    file_id = fake.add_file("study/part.bin", bytes(MIB))
+    content_range = {"Content-Range": f"bytes 0-{MIB - 1}/{MIB}"}
+
+    def answer(request):
+        if request.url.path.endswith("/content"):
+            return httpx.Response(206, headers=content_range, stream=BadClose())
+        return fake.respond(request)
+
+    client = answering_client(config, answer, seen, collect_after_bytes=3 * MIB)
+    for _ in range(3):
+        assert fails(
+            lambda: client.read_content(
+                f"/data/{file_id}/content", provider="alpha", size=MIB, chunk_bytes=MIB, deadline_s=60
+            )
+        )
     assert collections == [2]
 
 
