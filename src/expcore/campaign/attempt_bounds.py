@@ -52,6 +52,11 @@ billed, and every request after a reply that left a count out. Each top-up is th
 the request past the cap (`request_bound_usd`), charged when it is reserved and never refunded, since what that send
 cost is unknown. An attempt costs what is said above plus its top-ups, so a run's true cost is never more than its
 reservation and its top-ups together.
+
+**An abandoned request** (the loop gave up a request in flight) is inside that reservation, and a study that charges it
+separately, as a cost scorer does, has a tighter bound than the window in the record (B19): the adapters record a bound
+on its prompt, and `expcore.campaign.abandoned_bound.abandoned_request_bound` prices it. It is recorded only, and the
+budget gate does not read it.
 """
 
 import json

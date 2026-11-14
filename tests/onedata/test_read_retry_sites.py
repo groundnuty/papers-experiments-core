@@ -29,7 +29,7 @@ PLUMBING = {
     ("provision.py", "Provisioner.read_file", "client.get"): ["self._retry"],  # the metadata read, with the deadline
     ("provision.py", "Provisioner.await_visible", "client.get"): ["self._retry"],
     ("provision.py", "Provisioner.await_visible", "consistency.wait_visible"): ["self._retry"],
-    ("provision.py", "Provisioner.replicate", "consistency.wait_transfers"): ["self._retry"],
+    ("provision.py", "Provisioner.replicate_file", "consistency.wait_transfers"): ["self._retry"],
     ("provision.py", "Provisioner.evict", "consistency.wait_transfers"): ["self._retry"],
     # the mutation gate's reads, and the gate of a range read and of a streamed read: the request itself is sent once
     ("provision.py", "Provisioner.mutate", "client.mutate"): ["self._retry"],
@@ -38,6 +38,11 @@ PLUMBING = {
     ("provision.py", "Provisioner.fetch", "client.read_range"): ["self._retry"],
     ("ingestbase.py", "Baseline._times", "client.get"): ["self._p.retry"],
     ("ingestbase.py", "Baseline.confirm", "consistency.wait_visible"): ["self._p.retry"],
+    # the preallocated ingest (O44): its visibility wait, the block map before a part and the one its reset completes
+    ("ingestsparse.py", "SparseBaseline.confirm_state", "consistency.wait_visible"): ["self._p.retry"],
+    ("ingestsparse.py", "SparseBaseline._complete", "provisioner.blocks"): ["self._p.retry"],
+    ("ingestsparse.py", "SparseBaseline.check_holdings", "provisioner.blocks"): ["self._p.retry"],  # before a removal
+    ("ingestsparse.py", "SparseBaseline._restore_replicas", "provisioner.blocks"): ["self._p.retry"],
     ("reset.py", "SpaceReset._page", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._dated_page", "client.get_dated"): ["self._p.retry"],  # the history's, with its Date
     ("reset.py", "SpaceReset._zone_clock", "client.get_dated"): [
@@ -77,6 +82,7 @@ CALLER_CHOOSES = {
     ("provision.py", "Provisioner._list_pages", "client.get"): ["reads"],  # `children` decides, below
     ("provision.py", "Provisioner.blocks", "client.get"): ["retry"],  # one attempt unless the caller says: place_ranges
     ("provision.py", "Provisioner.holds", "provisioner.blocks"): ["retry"],
+    ("ingestsparse.py", "SparseBaseline.layout", "client.get"): ["retry"],  # a poll's one attempt, or the part's check
 }
 
 # Plumbing unless it is an instrument's read: `children` and `root` say so by their own arguments.
@@ -94,7 +100,20 @@ ONE_ATTEMPT_SITES = {
     ("precampaign.py", "_child", "client.get"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "client.content_answer"): ["<one attempt>", "<one attempt>"],
-    ("fault_serves.py", "provider_serves.probe", "client.get"): ["ONE_ATTEMPT"],
+    ("fault_serves.py", "ServingProbe.__call__", "client.get"): ["ONE_ATTEMPT"],
+    # the link check (O35): its fetch is the measurement, and every read and write of setting its probe up is part of
+    # the health gate's check, one attempt like the content-type check's
+    ("linkcheck.py", "_Check._empty_on", "client.get"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._evict", "consistency.wait_transfers"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._holdings", "client.get"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check._schedule_eviction", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkcheck.py", "_Check.prepare", "consistency.wait_visible"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._create", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._children", "client.get"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._root", "consistency.space_root"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles._write", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles.delete", "client.mutate"): ["ONE_ATTEMPT"],
+    ("linkprobe.py", "ProbeFiles.digest", "client.read_content"): ["ONE_ATTEMPT"],
     # the placement probes: the transfer records they record, the transfer log, the block map
     ("probes.py", "PlatformProbes._transfer_records", "client.get"): ["ONE_ATTEMPT"],
     ("probes.py", "PlatformProbes._read_maps", "provisioner.blocks"): ["<default>"],
@@ -132,7 +151,7 @@ CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient.get", "self._send(GET)"): ["retry"],
     ("client.py", "OnezoneClient.get_dated", "self._request(GET)"): ["retry"],
     ("client.py", "OnezoneClient._send", "self._request(<method>)"): ["retry"],
-    ("client.py", "OnezoneClient._request.send", "http.request"): ["<transport>", "<transport>"],
+    ("client.py", "_exchange", "http.send"): ["<transport>"],  # every request, a retry's one-shot client's included
     ("client.py", "OnezoneClient.mutate", "self._send(<method>)"): ["<none>"],  # a write: never retried
     ("client.py", "OnezoneClient.mutate", "self._target"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient.read_range", "self._target"): ["_GateReads(gate_retry)"],
@@ -140,9 +159,9 @@ CLIENT_INTERNAL = {
     # a revocation's confirmation: a failed read writes no revoked line, so the slot stays held (fail closed)
     ("client.py", "OnezoneClient.own_temporary_generation", "self._send(GET)"): ["ONE_ATTEMPT"],
     ("client.py", "OnezoneClient.read_content", "self._target"): ["gate", "gate"],  # bounded by the deadline left
-    ("client.py", "OnezoneClient._stream_range", "http.stream"): ["<streamed>"],
     ("client.py", "OnezoneClient.content_answer", "self._target"): ["_ONE_ATTEMPT"],  # the pre-campaign measurement
-    ("client.py", "OnezoneClient.content_answer", "http.stream"): ["<streamed>"],
+    # a streamed range and a content head both go through `_streamed`, which sends once and releases the answer (O47)
+    ("client.py", "_streamed", "http.send"): ["<transport>"],
     ("client.py", "OnezoneClient.space_name", "self._space_name"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_id", "self._file_space_id"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_name", "self._space_name"): ["reads"],
@@ -189,6 +208,13 @@ HELPER_USERS = {
         "provisioner.replicate",
     },
     "ingest.py": {"provisioner.verify_space"},
+    "ingestsparse.py": {
+        "provisioner.resolve",
+        "provisioner.read_file",
+        "provisioner.mutate",
+        "provisioner.replicate_file",  # the reset's replica of a completed file
+        "provisioner.await_visible",  # the mirror sees the completed file before its block map is read
+    },
     "ingestbase.py": {
         "provisioner.resolve",
         "provisioner.mutate",
@@ -208,6 +234,7 @@ HELPER_USERS = {
         "provisioner.await_visible",
         "provisioner.fetch",
         "provisioner.schedule_transfer",
+        "provisioner.replicate_file",  # `replicate` by path, through the one by id
     },
     "ranges.py": {
         "provisioner.verify_space",
@@ -242,6 +269,8 @@ MEASURING_MODULES = {
     "probes.py",
     "transferlog.py",
     "precampaign.py",
+    "linkcheck.py",
+    "linkprobe.py",
     "fault_serves.py",
     "tokens.py",
     "tokenscope.py",

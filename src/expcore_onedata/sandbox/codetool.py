@@ -20,6 +20,18 @@ raises `InfraError` of kind `sandbox` or `unattributed_kill` and ends the attemp
 gate refused an answer for its own integrity raises `InfraError` of kind `data_gate_integrity`, which no condition can
 treat (O05, C01). A cell a process of which outlived its kill at the cell's deadline raises `InfraError` of kind
 `cell_unkillable`, before anything else, which no condition can treat either (O34).
+
+What is kept of a cell's output is capped per stream by the sandbox (`cells.OUTPUT_CAP_BYTES`, O43). When it cut
+one, the text this tool returns ends with a notice that says how much of each cut stream was written and how much kept,
+and the call's `source_truncated` is True, as for any source's own limit (L07, apart from the loop's own cap); the
+numbers are on the cell's record too (`output_cut`).
+
+The loop's cap (`output_cap_chars`, L06) then applies to that whole text, the notice included, and the order is fixed:
+the sandbox cuts first, this tool adds its notice, and the loop cuts last, from the end of the text, with its own notice
+counted inside the cap. A cap that the text and the notice fit leaves the notice as the last line. A smaller cap cuts
+it off with the tail, and the model sees the loop's notice instead. A cap just below the text, by a few characters
+(the loop's notice takes room from the cap too), cuts the notice in the middle, and a cap too short for the loop's
+notice cuts the text plain. The record keeps the whole text and both flags either way.
 """
 
 import asyncio
@@ -72,9 +84,20 @@ class CodeExecutionProvider:
             raise failure
         return self._output(result)
 
+    @classmethod
+    def _output(cls, result: ExecResult) -> ToolOutput:
+        """The text the model sees for a finished cell, or for one too little time was left to start; a notice ends it
+        when the sandbox cut the cell's output (O43)."""
+        shown = cls._shown(result)
+        if not result.output_cut:
+            return shown
+        return ToolOutput(
+            f"{shown.text}\n{_cut_notice(result.output_cut)}", shown.is_error, shown.error_class, source_truncated=True
+        )
+
     @staticmethod
-    def _output(result: ExecResult) -> ToolOutput:
-        """The text the model sees for a finished cell, or for one too little time was left to start."""
+    def _shown(result: ExecResult) -> ToolOutput:
+        """The output of a finished cell as it would be shown if nothing had been cut."""
         if result.status == NOT_STARTED:  # it ran nothing: no timeout, no exit; the loop's time rule decides the rest
             return ToolOutput(
                 "the code was not started: too little of the time was left", is_error=True, error_class="not_started"
@@ -97,6 +120,15 @@ class CodeExecutionProvider:
                 error_class="exit_status",
             )
         return ToolOutput(_with(result.stdout, result.stderr) if result.stderr.strip() else result.stdout)
+
+
+def _cut_notice(cut: dict[str, dict[str, int]]) -> str:
+    """The line that tells the model what the sandbox cut of a cell's output: each cut stream, stdout first."""
+    parts = [
+        f"the first {counts['kept']} of the {counts['produced']} bytes of {stream} were kept"
+        for stream, counts in sorted(cut.items(), reverse=True)
+    ]
+    return f"[output cut by the sandbox: {'; '.join(parts)}]"
 
 
 def _with(output: str, note: str) -> str:

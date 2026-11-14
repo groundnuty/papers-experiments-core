@@ -33,21 +33,22 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
         assert outcome not in done.stdout, done.stdout[-800:]
 
 
-def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_reads_and_the_clock_are_unconfirmed():
+def test_o09_only_the_resets_calls_the_tool_server_user_reads_and_the_clock_are_unconfirmed():
     """O09, O11: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did,
     the gate's walk by `parent_id` among them, the reset's eviction of a directory and a transfer record's `spaceId`,
     and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
     asks for it; the client's docstring records what refuted it. What is left unconfirmed are the reset's calls no live
-    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal), the write of content
-    without an offset, which truncates the file and which a restarted upload relies on (O25), and the two reads that
+    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal) and the two reads that
     bound a writing tool-server user (#177): its Onezone admin privileges, named by Onezone's REST description alone,
     and the clusters its token acts in, the current user's read sent as the token, named by that description and the
     route of oz-worker. And, since a job's times are stamped on the platform's global clock, Onezone's reading of it
     that the transfer log and the reset's history place their window by (#207), a public call named by oz-worker's
     source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it. And the three calls of a
     run's revocation at its end (C19): a user's read of its generation of temporary tokens, its own revocation of them,
-    and the verification that answers a revoked token `tokenRevoked`, all named by oz-worker's source alone. And the
-    four Onepanel calls that check a space held on an imported storage (O41), named by onepanel's source alone."""
+    and the verification that answers a revoked token `tokenRevoked`, all named by oz-worker's source alone. The write
+    of content without an offset, which truncates the file, left the list when the client began to refuse it (O44):
+    nothing sends it, so nothing relies on it. And the four Onepanel calls that check a space held on an imported
+    storage (O41), named by onepanel's source alone."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
@@ -55,7 +56,6 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
         ("GET", "/provider/storages/{id}"),
         ("GET", "/provider/spaces/{space}/storage-import/auto/info"),
         ("POST", "/provider/spaces/{space}/storage-import/auto/force-start"),
-        ("PUT", "/data/{id}/content"),
         ("DELETE", "/transfers/{id}"),
         ("GET", "/data/{id}/qos/summary"),
         ("GET", "/qos_requirements/{qid}"),
@@ -75,7 +75,6 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
             "fileId",
             "requirements",
             "400",
-            "truncates",
             "oz_view_privileges",
             "clusters",
             "timeMillis",

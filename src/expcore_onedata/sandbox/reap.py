@@ -51,7 +51,7 @@ def sid_pattern(key: str) -> re.Pattern[str]:
     return re.compile(re.escape(re.sub(r"[^A-Za-z0-9_.-]", "_", key)[:48]) + r"-[0-9a-f]{8}")
 
 
-def _named(x: Path) -> dict[str, str]:
+def named_directory(x: Path) -> dict[str, str]:
     """A sandbox directory as a log or a record names it (O12): its name holds the lease key or run key and its path the
     work root, both configured values, so by the id that ends its name and the SHA-256 of the name, to match on."""
     return {"id": x.name.rsplit("-", 1)[-1], "sha256": hashlib.sha256(x.name.encode("utf-8", "replace")).hexdigest()}
@@ -113,7 +113,7 @@ def reap_dirs(
     for x in dirs:
         ps = host.docker("ps", "-a", "-q", "--filter", f"label={dir_label}={x}", check=False)
         if ps.returncode != 0:  # a docker that did not answer lists no containers: that is not "none left"
-            named = _named(x)
+            named = named_directory(x)
             log.error(
                 "reap: docker ps failed (%s), so directory %s (sha256 %s) is not shown clear of containers",
                 ps.returncode,
@@ -133,7 +133,7 @@ def _reap_one(host: HostOps, log_dir: Path, x: Path, outputs: Sequence[str], max
         kept = collect(host, x, keep, outputs, max_bytes=max_bytes)
         sizes = {f.name: f.stat().st_blocks * 512 for f in x.iterdir() if f.is_file() and not f.is_symlink()}
         with open(Path(log_dir) / REAPED, "a") as f:
-            record = {"t": time.time(), "dir": _named(x), "kept": kept, "allocated_bytes": sizes}
+            record = {"t": time.time(), "dir": named_directory(x), "kept": kept, "allocated_bytes": sizes}
             mounts = [str(m.relative_to(x)) for m in mounts_under(host, x)]  # by their place in it, never the path
             f.write(json.dumps(record | {"mounts": mounts}) + "\n")
             f.flush()
@@ -199,7 +199,7 @@ def reap_token_files(
                 continue
             _sudo(host, "rm", "-f", str(path), timeout_s=20.0)
             if os.path.lexists(path):  # verified, not assumed
-                named = _named(run_dir)
+                named = named_directory(run_dir)
                 log.error(
                     "reap: a token file of directory %s (sha256 %s) could not be removed", named["id"], named["sha256"]
                 )

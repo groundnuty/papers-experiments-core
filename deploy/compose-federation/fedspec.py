@@ -7,11 +7,14 @@ The layout is a TOML file. Without --layout it is `federation.toml` beside this 
 this directory always had: one Onezone and three Oneproviders. A space's owner is the provider its data is written
 through and kept on; its mirrors are other providers that support it and may hold replicas, which the per-run reset
 evicts. A space declared `baseline = false` is made, supported and given its members like any other, but up writes
-none of the core's baseline files into it and `reset --clean` leaves it empty. A space with an `import` table is held
-by its owner on an imported POSIX storage (Onedata's storage import) whose directory is a dataset the layout does not
-hold: the table names the environment variable that gives its path, never the path, since a layout is public. Every
-key is checked when the file is read, and a refusal names the file and the key. The two images stay pinned by the
-deployment itself (fedlayout.IMAGES): a layout cannot name another.
+none of the core's baseline files into it and `reset --clean` leaves it empty. `probe_space` names the space the link
+check writes its probes into (#221): one declared `agent_visible = false`, supported by every provider of a space the
+agent may reach, in a layout with a `platform_template`; `reset --replicas` leaves it alone, since each probe is held by
+the provider that wrote it, owner or not. A space with an `import` table is held by its owner on an imported POSIX
+storage (Onedata's storage import) whose directory is a dataset the layout does not hold: the table names the
+environment variable that gives its path, never the path, since a layout is public. Every key is checked when the file
+is read, and a refusal names the file and the key. The two images stay pinned by the deployment itself
+(fedlayout.IMAGES): a layout cannot name another.
 """
 
 import hashlib
@@ -52,6 +55,7 @@ TOP_KEYS = {
     "memory_limit",
     "support_bytes",
     "platform_template",
+    "probe_space",
     "zone",
     "providers",
     "spaces",
@@ -157,6 +161,7 @@ class Spec:
     study_space: str
     principals: tuple[Principal, ...]
     platform_template: Path | None = None
+    probe_space: str | None = None  # the link check's probe space (#221): agent_visible = false, never reset per run
 
     @property
     def services(self) -> tuple[Service, ...]:
@@ -374,6 +379,7 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         principals.append(Principal(name, tuple(rights), member_of, agent))
 
     template = checked_template(read, path, top["platform_template"]) if "platform_template" in top else None
+    probe = checked_probe_space(read, top, spaces, template) if "probe_space" in top else None
     return Spec(
         source=path.name,
         digest=digest,
@@ -385,4 +391,29 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         study_space=study,
         principals=tuple(principals),
         platform_template=template,
+        probe_space=probe,
     )
+
+
+def checked_probe_space(read: _Reader, top: Mapping[str, Any], spaces: list[Space], template: Path | None) -> str:
+    """The link check's probe space (#221): a declared space no agent may reach, supported by every provider that
+    supports a space the agent may reach (each a possible local provider or source), in a layout whose platform template
+    up runs the check through. Each refusal names the key, and the space or the provider."""
+    name = read.name(top["probe_space"], "probe_space", {s.name for s in spaces}, "space")
+    probe = next(s for s in spaces if s.name == name)
+    if probe.agent_visible:
+        raise read.fail(
+            f"spaces.{name}.agent_visible",
+            "must be false for the probe space: its probe files must be where no agent can see them",
+        )
+    for space in (s for s in spaces if s.agent_visible):
+        for provider in space.supporters:
+            if provider not in probe.supporters:
+                raise read.fail(
+                    "probe_space",
+                    f"{name} is not supported by {provider}, which supports {space.name}, so a pair of {provider} "
+                    "cannot be tested: the probe space must be supported by it",
+                )
+    if template is None:
+        raise read.fail("probe_space", "needs a platform_template: up runs the link check through its platform.toml")
+    return name

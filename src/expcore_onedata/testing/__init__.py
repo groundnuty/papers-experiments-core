@@ -7,7 +7,9 @@ and the standard library, never pytest or anything of a test tree, so a helper t
 study's own thin wrapper around a name here. `docs/interfaces.md` lists the public names with what each models and
 what it does not; the study guide shows them in use ("Testing a study's instruments and scorers").
 
-- `MockOnedata`, `Request`: the provider REST surface the fsspec client uses, over a real local HTTP socket.
+- `MockOnedata`, `Request`, `BODY_KEPT_BYTES`: the provider REST surface the fsspec client uses, over a real local HTTP
+  socket, and the record of a request every fake keeps (a body past `BODY_KEPT_BYTES` is kept as its `size` and
+  `sha256`, never whole).
 - `FakeFederation`: an in-process Onezone (tokens, privileges, the scope of the study space).
 - `FakeData`, `Node`, `Transfer`, `PROVIDER`, `ROOT_ID`, `ERRORS_25_0`, `ERRORS_LEGACY`: Onezone plus every provider's
   data API: files, per-provider block maps, per-reader visibility delays, pending deletes, transfers, and Onedata
@@ -22,7 +24,7 @@ what it does not; the study guide shows them in use ("Testing a study's instrume
 
 from expcore_onedata.testing.fake_data import ERRORS_25_0, ERRORS_LEGACY, PROVIDER, ROOT_ID, FakeData, Node, Transfer
 from expcore_onedata.testing.fake_federation import FakeFederation
-from expcore_onedata.testing.fake_onedata import MockOnedata, Request
+from expcore_onedata.testing.fake_onedata import BODY_KEPT_BYTES, MockOnedata, Request
 from expcore_onedata.testing.world import (
     ADMIN_ENV,
     ALPHA_ID,
@@ -56,6 +58,7 @@ __all__ = [
     "ALPHA_ID",
     "BASELINE",
     "BETA_ID",
+    "BODY_KEPT_BYTES",
     "CEILING_S",
     "CREDENTIALS_DIR",
     "DATA",

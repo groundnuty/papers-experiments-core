@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from expcore_onedata.sandbox import bounds as BD
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
@@ -48,6 +49,9 @@ QUIESCE_ROUNDS = (
 HOST_CALL_MARGIN_S = 30.0  # what the docker client may take beyond the cell's own limit before it is given up on
 KILL_S = 20.0  # a `kill` of the agent's processes through the host's privilege
 SETTLE_SLACK_S = 30.0  # beyond a deadline's margin, what its commands' own timeouts may overrun it by
+OUTPUT_CAP_BYTES = (
+    1 << 20
+)  # what is kept of each of a cell's stdout and stderr: the first bytes, the rest read and dropped
 
 
 def docker_failed(rc: int, err: str) -> bool:
@@ -57,6 +61,14 @@ def docker_failed(rc: int, err: str) -> bool:
     if rc == 0 or not any(m in err for m in ("Error response from daemon", "OCI runtime", "docker: ", "timeout: ")):
         return False
     return rc in (125, 126) or "is not running" in err or "No such container" in err
+
+
+def _output_cut(done: Any, gave_up: bool) -> dict[str, dict[str, int]] | None:
+    """The streams of a finished `docker exec` that were cut to the output cap (O43), by what each wrote and what was
+    kept; None when none was. The stderr of a call that was given up on is the harness's own words, not the cell's."""
+    streams = {"stdout": done.stdout_count, "stderr": None if gave_up else done.stderr_count}
+    cut = {name: count.record() for name, count in streams.items() if count is not None and count.cut}
+    return cut or None
 
 
 class CellTimer:
@@ -173,7 +185,9 @@ class CellRunner:
         escalation: DL.Escalation | None = None,
         stop: Callable[[], dict[str, Any]] | None = None,
         meta_lock: threading.RLock | None = None,
+        output_cap_bytes: int = OUTPUT_CAP_BYTES,
     ) -> None:
+        self._output_cap = output_cap_bytes  # the most kept of a cell's stdout, and of its stderr (O43)
         self._host, self._obs, self._names, self._s = host, observer, names, settings
         self._meta, self._registry, self.roles, self._started = meta, registry, roles, started_epoch
         # past the kill at a cell's deadline: by default the grace alone, with nothing to abort and no stop
@@ -393,8 +407,10 @@ class CellRunner:
         timer records that it fired and kills every process of the agent's container, a detached worker included; the
         container and the run's evidence stay. `timeout` inside the container is only a backstop, `CAP_MARGIN_S` later,
         should that kill not land. A time limit is that record and nothing else: never the elapsed time, nor 137 (O17).
-        A cell left less than a second once it is prepared is not started at all (`NOT_STARTED`): no timer ran, so none
-        fired, and it is no timeout; the loop's own time rule says what the run's time running out means.
+        With `record=False` no timer runs, and the backstop is the only bound: a cell it killed after the whole of its
+        limit (exit 137 or 124) is `timed_out` with `bound` naming it, and one that exited so sooner is its own (O39,
+        `bounds`). A cell left less than a second once it is prepared is not started at all (`NOT_STARTED`): no timer
+        ran, so none fired, and it is no timeout; the loop's own time rule says what the run's time running out means.
         """
         if not timeout_s >= 1:
             raise ValueError("timeout_s must be at least 1 second (GNU timeout treats 0 as no limit)")
@@ -403,7 +419,8 @@ class CellRunner:
         before = (self._events_seen or self._obs.memory_facts(agent)["events"]) if record else None
         up0 = self._obs.uptime() if record else None
         remaining = timeout_s - (time.monotonic() - entered)
-        limit = f"{max(remaining, 1.0) + CAP_MARGIN_S:.3f}"  # the backstop; the harness's timer below comes first
+        limit_s = max(remaining, 1.0) + CAP_MARGIN_S  # the backstop; the harness's timer below comes first
+        limit = f"{limit_s:.3f}"
         argv = [
             "exec",
             "-i",
@@ -432,15 +449,23 @@ class CellRunner:
                 with self.meta_lock:
                     self._running = timer  # what `settle` enforces when the run's body ends while it runs
                 timer.start()
-            done = self._host.docker(*argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False)
+            done = self._host.docker(
+                *argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False, output_cap=self._output_cap
+            )
             (fired, deadline), timer_ended = self._end(timer, cell), True  # its outcome waited for at most `decide_s`
             rc, out, err = done.returncode, done.stdout, done.stderr
             if rc == TIMED_OUT and err.startswith("timed out after"):
                 gave_up, err = True, "docker exec did not return"
             used = time.monotonic() - entered
-            res = ExecResult(out, err, rc, time.monotonic() - t0, timed_out=gave_up or fired)
+            res = ExecResult(
+                out, err, rc, time.monotonic() - t0, timed_out=gave_up or fired, output_cut=_output_cut(done, gave_up)
+            )
+            bound = BD.named(fired=fired, gave_up=gave_up, exit_code=rc, ran_s=res.duration_s, limit_s=limit_s)
             if record:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, deadline, wall0)
+                res.bound = bound if res.timed_out else None
+            else:  # no timer ran: only the container's own bound, or the host's giving up, can have ended it (O39)
+                res.timed_out, res.bound = bound is not None, bound
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
             if not timer_ended:  # one wait for the outcome, bounded, whichever way the cell ended
                 self._end(timer, cell)
@@ -509,6 +534,10 @@ class CellRunner:
         if res.kill:  # from what caused it, not from an exit code that a memory kill shares
             res.timed_out = entry["timed_out"] = gave_up or res.kill["reason"] in ("time_limit", KC.KILL_SURVIVED)
         entry["timed_out"] = res.timed_out
+        if res.output_cut:  # what the agent was told was cut (the code tool's notice) is on the run's record (O43)
+            entry["output_cut"] = res.output_cut
+            with self.meta_lock:
+                self._meta.setdefault("cell_output_cuts", []).append({"cell": entry["cell"], **res.output_cut})
         if res.timed_out and not escalated:  # now, and not only from the timer: a worker that closed the pipes must
             self.quiesce("time cap")  # not run on (after an escalation the deadline has done all a kill can)
         self.cells.append(entry)

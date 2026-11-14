@@ -5,6 +5,15 @@
 loop calls an instrument for you. Both run outside the agent's time. The record gets one entry per instrument under its
 namespace, `RunRecord.instruments[namespace]`, and a scorer reads that entry and nothing else (R13).
 
+**Order (C31).** Instruments nest like setup and teardown. `start_instruments` starts them in list order and
+`finish_instruments` finishes them in the reverse of it, so an instrument listed after another starts after it and
+finishes before it, and the first listed finishes last. A fault injector or a progressive ingest, whose `finish`
+restores what it changed, is listed before the probes that read the state the run left, which then read it before the
+restore. Only the calls are reversed: the record keeps its instruments in list order, and a failed `finish` does not
+stop the others. The first-turn hook and the post-run checks are not part of the nest. The first-turn hook is one
+moment, and a check is a verdict taken once every snapshot is in: both run in list order, so the instrument listed
+first is the first to refuse.
+
 A finish that raises, or returns something that is not a JSON object, is recorded as `{"ok": False, "error": <class>}`
 and never dropped or guessed (O08): the attempt keeps its record, and a scorer that needs the snapshot sees it failed.
 Two instruments with one namespace, or a namespace that is not lower-case letters, digits and underscores, are
@@ -28,7 +37,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from expcore.errors import FirstTurnRefusal, InfraError, is_treatable
+from expcore.errors import FirstTurnRefusal, InfraError, is_treatable, uncharged_kinds
 from expcore.loop.outcomes import DETAIL_LIMIT
 from expcore.loop.timer import AgentTimer
 from expcore.plugin import FIRST_TURN_LABEL, Instrument
@@ -90,7 +99,10 @@ def _refusal(instrument: Instrument, error: InfraError, when: str) -> FirstTurnR
 
 
 def first_turn_instruments(instruments: Sequence[Instrument], timer: AgentTimer) -> None:
-    """Let each instrument that has `at_first_turn` read the state at the agent's first turn, in order.
+    """Let each instrument that has `at_first_turn` read the state at the agent's first turn, in list order.
+
+    It is one moment, not a nest, so it is not reversed like the finishes: the instrument listed first is the first to
+    read, and the first to refuse.
 
     The executor calls this after its last step of its own and just before `record_run`, so before the loop starts the
     agent's clock and before the first request is sent; the timer is the request's, not yet started. One reading of
@@ -118,7 +130,14 @@ def first_turn_instruments(instruments: Sequence[Instrument], timer: AgentTimer)
 
 
 def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
-    """Run the checks in order and return the first refusal as the record keeps it, or None when every one passed."""
+    """Run the checks in list order and return the first refusal as the record keeps it, or None when every one passed.
+
+    List order, not the finishes' reverse: the instrument listed first is the outermost, the manipulation or the
+    restore, and its refusal is the cause of what the ones listed after it read, so it is the one the record keeps.
+    A hold (a kind that costs no attempt, `expcore.errors.uncharged_kinds`: an instrument whose start was held back)
+    wins over a refusal before it, so the checks after a charged refusal still run until one holds.
+    """
+    first = None
     for instrument in instruments:
         check = _method(instrument, "check")
         if check is None:
@@ -127,31 +146,44 @@ def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
             check()
         except InfraError as error:
             _require_untreatable(instrument, error, "after the run")
-            return {"namespace": instrument.namespace, "infra_kind": error.kind, "detail": error.detail[:DETAIL_LIMIT]}
-    return None
+            detail = error.detail[:DETAIL_LIMIT]
+            refusal = {"namespace": instrument.namespace, "infra_kind": error.kind, "detail": detail}
+            if error.kind in uncharged_kinds():
+                return refusal
+            first = first or refusal
+    return first
 
 
 def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord:
     """Return the record with each instrument's snapshot under its namespace; a failed one is recorded as failed.
 
+    The instruments finish in the reverse of their list order: the last listed first, the first listed last (C31).
+    A `finish` that raises is recorded as failed and the instruments listed before it still finish. The record gets
+    the snapshots in list order, so the keys of `instruments` keep the order the list gives them. What an instrument
+    reads can differ with the order of the calls, which is the point of the order.
+
     Each snapshot is added through `RunRecord.with_instrument`, which derives the treatment flag again: a fault
     injector's snapshot decides whether a declared target was held down in this attempt (record version 3).
 
-    Then each instrument that has `check` is asked, in order, once every snapshot is in; the first to refuse stops the
-    rest, and its refusal is in the returned record (`RunRecord.instrument_refusal`), snapshots and all, so the attempt
-    keeps its record. A check runs even when its instrument's `finish` failed: unknown is not a pass, and the check
-    decides. The executor calls this after the sandbox's collection and before its teardown, so a check can still read
-    what the run left. A check that raises a kind a condition may declare, or anything but a refusal, raises here.
+    Then each instrument that has `check` is asked, in list order, once every snapshot is in. A refusal of a hold kind
+    (one that costs no attempt, C33) stops the rest and is the record's refusal; a charged refusal does not stop them,
+    and is the record's refusal, the first one listed, only when no later check holds. The refusal is in the returned
+    record (`RunRecord.instrument_refusal`), snapshots and all, so the attempt keeps its record. A check runs even when
+    its instrument's `finish` failed: unknown is not a pass, and the check decides. The executor calls this after the
+    sandbox's collection and before its teardown, so a check can still read what the run left. A check that raises a
+    kind a condition may declare, or anything but a refusal, raises here.
     """
     check_instruments(instruments)
-    for instrument in instruments:
+    snapshots: dict[str, dict[str, Any]] = {}
+    for instrument in reversed(instruments):  # the last listed finishes first: setup and teardown nest
         try:
             data = instrument.finish()
             if not isinstance(data, Mapping):
                 raise TypeError("an instrument's snapshot must be a JSON object")
-            snapshot: dict[str, Any] = json.loads(canonical(dict(data)))
+            snapshots[instrument.namespace] = json.loads(canonical(dict(data)))
         except Exception as error:  # a failing instrument must not cost the attempt its record
-            snapshot = {"ok": False, "error": type(error).__name__}
-        record = record.with_instrument(instrument.namespace, snapshot)
+            snapshots[instrument.namespace] = {"ok": False, "error": type(error).__name__}
+    for instrument in instruments:  # the record keeps the list's order, whatever order the instruments finished in
+        record = record.with_instrument(instrument.namespace, snapshots[instrument.namespace])
     refusal = _refused_by(instruments)
     return record if refusal is None else record.with_instrument_refusal(refusal)

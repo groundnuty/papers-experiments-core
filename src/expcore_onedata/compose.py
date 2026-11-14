@@ -147,3 +147,9 @@ class ComposeDriver:
         if not seen.running or seen.health not in (None, "healthy"):
             return False
         return self._probe(service) is True
+
+    def restored_links(self, service: str) -> str | None:
+        """The link check of every pair the provider behind a restored service is in (O35): None when each passed, or
+        when the probe checks no link, else why one did not. The recovery asks it once the service serves."""
+        links = getattr(self._probe, "links", None)
+        return None if links is None else links(service)
