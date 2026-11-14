@@ -37,12 +37,22 @@ waited, counted from the verified identity change, are returned (`ready_after_s`
 that refuses the service (`ConfigError`: no provider is declared for it, which no wait changes) is not serving, at once:
 the settling ends `serves_unconfigured`, unverified and open, and the failure says why.
 
+**A served provider passes the session gate before its links are checked (O35).** Its peers' sessions toward it may
+still be renewing on their backoff, and a fetch from it through such a peer can crash that peer's link: the all-pairs
+check would then strand the very pairs it tests. So once it serves, `settle` polls the driver's session gate
+(`ComposeDriver.sessions_ready`, `expcore_onedata.fault_sessions`) every `poll_s` for at most `gate_timeout_s`, with
+the probe file the injection journalled, and fails closed (`sessions_not_ready`) when it does not pass; only then is
+every ordered pair checked. A pair that does not pass is `links_stuck`, and, when the caller holds the federation
+exclusively (`heal=True`: the injector, between runs) and `[faults] heal` is not `"off"`, the heal runs
+(`expcore_onedata.fault_heal`): a restore it mends is verified, with the heal in `restore_record`, and one it cannot is
+not, with its word (`links_stuck`, `heal_broke_pair`, `sessions_not_ready`, `heal_restart_failed`). The gate's reading
+and the heal's record of the latest settling are `restore_record`, for the injector's snapshot.
+
 `recover` settles every open injection whose target's lock it can take (its holder is gone),
 reports a lock held while its journalled holder is gone as stuck, and returns the targets live injectors hold.
 """
 
 import contextlib
-import hashlib
 import logging
 import math
 import re
@@ -54,6 +64,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.fault_journal import InjectionJournal, holder_alive
+from expcore_onedata.fault_restore import LinkSettling, digest
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE  # the platform layer's one module of kinds registers it
 
@@ -82,13 +93,21 @@ class FaultDriver(Protocol):
 log = logging.getLogger(__name__)
 
 _WORD = re.compile(r"[A-Za-z_]{1,40}")  # how a settling ended, as a word: nothing else goes into a message
+_TRIED = re.compile(r"[A-Za-z_ ,()\[\]0-9]{1,2000}")  # the heal's actions: words and provider labels, nothing else
 
 _WHY = {  # how a settling failed, in words, where the bare word would not say it
     "serves_unconfigured": "its service has no provider declared in [faults.services], so no read can show it serving",
     "links_stuck": (
-        "it serves, but a link of it transferred no probe within the link check's bound (O35): restart the rtransfer "
-        "link on the local provider (rtransfer_config:restart_link()) or that provider's container alone"
+        "it serves, but a provider link transferred no probe within the link check's bound (O35), and no heal of "
+        "[faults] mended it: restart the rtransfer link of the stuck pair's reader (rtransfer_config:restart_link()), "
+        "or that reader's container alone"
     ),
+    "sessions_not_ready": (
+        "it serves, but its peers did not show their sessions to it ready within gate_timeout_s (O35), so its links "
+        "were not checked"
+    ),
+    "heal_broke_pair": "an action of the link heal broke a provider pair that passed before it (O35)",
+    "heal_restart_failed": "the link heal restarted a reader's container, and that restore was not verified (O35)",
 }
 
 
@@ -100,11 +119,6 @@ class Settled(NamedTuple):
     how: str
     after: str | None = None
     ready_after_s: float | None = None
-
-
-def digest(identity: str) -> str:
-    """The SHA-256 of an identity, the only form in which one is journalled or recorded."""
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def failure(detail: str, target: str | None = None) -> InfraError:
@@ -126,10 +140,18 @@ class RestoreNotVerified(InfraError):
     """
 
     def __init__(
-        self, target: str, how: str, *, identity_changed: bool, serving: bool, still_open: bool = True
+        self,
+        target: str,
+        how: str,
+        *,
+        identity_changed: bool,
+        serving: bool,
+        still_open: bool = True,
+        tried: str | None = None,
     ) -> None:
         self.how = how if _WORD.fullmatch(how) else "failed"
         self.identity_changed, self.serving, self.still_open = identity_changed, serving, still_open
+        self.tried = tried if tried is not None and _TRIED.fullmatch(tried) else None
         checked = (
             f"its identity {'changed' if identity_changed else 'did not change to a running one'} and it "
             f"{'served' if serving else 'did not serve'}"
@@ -140,11 +162,12 @@ class RestoreNotVerified(InfraError):
             if still_open
             else "the injection is closed in the journal"
         )
-        detail = f"the restore of {target} is not verified ({self.how}): {checked}; {left}"
+        healed = "" if self.tried is None else f"; the link heal tried {self.tried}"
+        detail = f"the restore of {target} is not verified ({self.how}): {checked}{healed}; {left}"
         super().__init__(INJECTOR_FAILURE, detail, target=target)
 
 
-class Recovery:
+class Recovery(LinkSettling):
     """Settle journalled injections through a driver, with the bounds of `[faults]`."""
 
     def __init__(
@@ -154,12 +177,17 @@ class Recovery:
         *,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        labels: Mapping[str, str] | None = None,
     ) -> None:
+        """`labels` maps each provider's label to its service, which the heal needs to act on a reader by its label."""
         self._settings, self._driver, self._clock, self._sleep = settings, driver, clock, sleep
         self.journal = InjectionJournal(settings.journal)
         self.last: Observation | None = None  # the latest reading `wait` took
         self.unreadable = 0  # the readings of the latest `wait` that failed and counted as no answer
         self.links_detail: str | None = None  # why the latest restore's link check failed (O35), names labels only
+        self.restore_record: dict[str, Any] = {}  # the latest settling's gate reading and heal record (O35)
+        self._labels = dict(labels or {})
+        self._healed: set[str] = set()  # the injections this recovery healed once already: never twice
 
     def entries(self, target: str | None = None) -> list[dict[str, Any]]:
         """The journal's open injections; raise InfraError of kind `injector_failure` when it cannot be read."""
@@ -170,12 +198,13 @@ class Recovery:
         except OSError as error:  # an OS error's text holds the journal's path: only its type is told (O12)
             raise failure(f"the injection journal cannot be read ({type(error).__name__})", target) from None
 
-    def recover(self, on_step: Callable[..., None] | None = None) -> list[str]:
+    def recover(self, on_step: Callable[..., None] | None = None, *, heal: bool = False) -> list[str]:
         """Settle every open injection whose target's lock is free; raise InfraError of kind `injector_failure` when one
-        cannot be settled or its lock is stuck. Return the targets of those live injectors hold, sorted.
+        cannot be settled or its lock is stuck. Return the targets of those live injectors hold, sorted. `heal` lets a
+        stuck link be healed, which only a caller holding the federation exclusively may ask for.
 
         `on_step("recovered", ok, target=..., how=..., ...)` is told of every injection it settled or failed to, with
-        the seconds the restored service took to serve (`ready_after_s`).
+        the seconds the restored service took to serve (`ready_after_s`) and the gate's and the heal's records.
         """
         step = on_step or (lambda *args, **kwargs: None)
         held: list[str] = []
@@ -189,22 +218,35 @@ class Recovery:
                 held.append(target)  # a live injector holds the target down on purpose
                 continue
             try:
-                done, how, after, ready_after_s = self.settle(entry)
+                done, how, after, ready_after_s = self.settle(entry, heal=heal)
             finally:
                 lock.close()
-            step("recovered", done, target=target, how=how, identity_after_sha256=after, ready_after_s=ready_after_s)
+            record = dict(self.restore_record)
+            step(
+                "recovered",
+                done,
+                target=target,
+                how=how,
+                identity_after_sha256=after,
+                ready_after_s=ready_after_s,
+                **record,
+            )
             if not done:
                 why = _WHY.get(how, how)
                 raise failure(f"an injection of {target} that an earlier run left open was not cleared ({why})", target)
         return sorted(set(held))
 
-    def settle(self, entry: Mapping[str, Any]) -> Settled:
+    def settle(self, entry: Mapping[str, Any], *, heal: bool = False, links: bool = True) -> Settled:
         """Leave one injection's target up and serving: find it back, find it never went down, or bring it back with a
-        changed identity, and, once it was restored, wait for it to serve; journal it cleared when it is, and its clear
-        failed when it is not, or when settling raised. Return whether it is, how, the new identity's digest if any and
-        the seconds the wait for it to serve took."""
+        changed identity, and, once it was restored, wait for it to serve, pass the session gate and show every link
+        transferring (healing a stuck one when `heal` and `[faults] heal` allow); journal it cleared when it is, and its
+        clear failed when it is not, or when settling raised. Return whether it is, how, the new identity's digest if
+        any and the seconds the wait for it to serve took. `links=False` (a reader's container restart inside a heal,
+        which gates and checks itself) stops at serving."""
+        if links:
+            self.restore_record = {}
         try:
-            settled = self._settle(entry)
+            settled = self._settle(entry, heal=heal, links=links)
         except Exception as error:
             self._clear_failed(entry, type(error).__name__)
             raise
@@ -216,7 +258,7 @@ class Recovery:
         with contextlib.suppress(OSError):  # the journal may be what failed: the injection stays open all the same
             self.journal.append({"event": "clear_failed", "id": entry["id"], "how": how})
 
-    def _settle(self, entry: Mapping[str, Any]) -> Settled:
+    def _settle(self, entry: Mapping[str, Any], *, heal: bool, links: bool) -> Settled:
         before, injected = entry["identity_sha256"], entry["injected"]
         asked, unrecorded = bool(entry.get("stop_unknown")), bool(entry.get("stop_unrecorded"))
         seen: Observation | None
@@ -257,23 +299,11 @@ class Recovery:
                 return Settled(False, "serves_unconfigured", after)
             if ready_after_s is None:
                 return Settled(False, "not_serving", after)  # fail closed: the injection stays open, the identity known
-            self.links_detail = self._stuck_links(entry["service"])
-            if self.links_detail is not None:  # it serves, and a link of it does not transfer: not restored yet (O35)
-                log.warning("a restored provider's link check failed: %s", self.links_detail)
-                return Settled(False, "links_stuck", after, ready_after_s)
+            stuck = self._links_settled(entry, heal) if links else None
+            if stuck is not None:  # it serves, and its peers or a link do not: not restored yet (O35)
+                return Settled(False, stuck, after, ready_after_s)
         self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
         return Settled(True, how, after, ready_after_s)
-
-    def _stuck_links(self, service: str) -> str | None:
-        """The link check of the pairs a restored service's provider is in, when the driver has one
-        (`ComposeDriver.restored_links`): None when each passed, else why not. A check that raises fails closed."""
-        check = getattr(self._driver, "restored_links", None)
-        if check is None:
-            return None
-        try:
-            return check(service)
-        except Exception as error:  # a check that cannot answer is a failed one, never a pass
-            return f"the link check raised {type(error).__name__}"
 
     def _await_serving(self, service: str) -> float | None:
         """Ask the driver whether the service serves, now and then every `poll_s`, until it does or `ready_timeout_s`

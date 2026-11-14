@@ -18,6 +18,9 @@ service entry, its position, never by a provider's or a service's name. The serv
     clear_attempts = 3               # optional: how many times a restore is tried
     admission_timeout_s = 3600       # optional: the longest a run waits for the federation's lock
     health_wait_s = 30               # optional: the longest the health check waits for it; below health_timeout_s
+    gate_timeout_s = 240             # optional: the longest a restored provider's peers may take to reach it; see below
+    heal = "off"                     # optional: "off", "link" or "link_then_container"; see below
+    heal_timeout_s = 900             # optional: the longest the heal of a stuck link may take, all its actions together
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
@@ -37,6 +40,17 @@ after its start, so the default, `DEFAULT_READY_TIMEOUT_S`, is 180 s. The wait i
 change and ends when the provider answers an authenticated REST read and its container, if it has a health check, is
 healthy (`expcore_onedata.fault_serves`, `expcore_onedata.compose`). A provider that does not serve within it leaves the
 injection open and the federation's exclusive admission held, as a failed restore does.
+
+`gate_timeout_s` bounds the session gate a restore passes once its provider serves and before its links are checked
+(`expcore_onedata.fault_sessions`): Onezone shows every provider of the probe space online, and a probe file made before
+the injection, its block map read through each peer, has no error entry for the restored provider. Its default, 240 s,
+is the 180 s cap of a peer's session renewal backoff (op-worker f118ed9) and a margin.
+
+`heal` says what the restore does when a link is stuck after it (`links_stuck`, O35): `"off"` (the default) fails the
+restore closed, as before; `"link"` restarts the rtransfer link of each stuck pair's reader, one at a time, and checks
+again; `"link_then_container"` also restarts a reader's container when its link restart did not mend its pairs
+(`expcore_onedata.fault_heal`). A container restart is itself an outage of that provider, so declare it knowingly.
+`heal_timeout_s` bounds the heal: no action starts that its own wait and the gate's would carry past it.
 """
 
 import hashlib
@@ -60,6 +74,9 @@ STOP_GRACE_S = 120.0  # the federation's `stop_grace_period` for a provider (dep
 SETTLE_MARGIN_S = 60.0  # what the default settle timeout adds to it, for the daemon's kill and the readings' lag
 DEFAULT_SETTLE_TIMEOUT_S = STOP_GRACE_S + SETTLE_MARGIN_S
 DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48 to 52 s after their restart (measured)
+DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
+DEFAULT_HEAL_TIMEOUT_S = 900.0
+HEAL_MODES = ("off", "link", "link_then_container")
 _KEYS = (
     "sanctioned",
     "journal",
@@ -74,6 +91,9 @@ _KEYS = (
     "clear_attempts",
     "admission_timeout_s",
     "health_wait_s",
+    "gate_timeout_s",
+    "heal",
+    "heal_timeout_s",
     "services",
 )
 
@@ -97,6 +117,9 @@ class FaultSettings:
     clear_attempts: int = 3
     admission_timeout_s: float = 3600.0
     health_wait_s: float = 30.0
+    gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
+    heal: str = "off"
+    heal_timeout_s: float = DEFAULT_HEAL_TIMEOUT_S
     config_sha256: str = ""  # the digest of the platform.toml it was read from: part of the federation's identity
 
 
@@ -135,6 +158,9 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         if service in named:  # one container is one target: the probe maps a service back to exactly one provider
             raise services.fail(None, f"entry {index} names the same service as entry {named[service]}")
         named[service] = index
+    heal = table.data.get("heal", "off")
+    if heal not in HEAL_MODES:
+        raise table.fail("heal", "must be one of " + ", ".join(f'"{mode}"' for mode in HEAL_MODES))
     words = {}
     for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
         words[key] = tuple(table.strings(key)) or default
@@ -154,6 +180,9 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
         admission_timeout_s=_number(table, "admission_timeout_s", 3600.0, 0),
         health_wait_s=_number(table, "health_wait_s", 30.0, 0),
+        gate_timeout_s=_number(table, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S, 0),
+        heal=heal,
+        heal_timeout_s=_number(table, "heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S, 0),
         config_sha256=config.sha256,
     )
 

@@ -49,6 +49,13 @@ verified identity change to the first reading that showed it serving (0 for a pr
 the stop never took down is not waited for. The recovery of a crashed run's injection, by `start`, `recover` or the
 fault gate, waits the same way, and its `recovered` reading carries `ready_after_s` too.
 
+**The links after a restore (O35).** A provider that serves is not yet a federation whose links transfer: an outage
+can leave a pair between two other providers stuck. Before it stops anything, `start` makes the session gate's probe
+file and journals it with the injection (`fault_sessions`); the restore then passes the session gate (`gate_timeout_s`,
+else `sessions_not_ready`) and checks every ordered pair (`links_stuck`), and with `[faults] heal` declared heals a stuck
+pair's readers, bounded and failing closed (`fault_heal`). Only the injector's own clear and start heal, under its
+exclusive admission; the snapshot gains the `gate` and `heal` steps.
+
 **A stop of unknown outcome (O11).** When the stop command raises, typically at its timeout (`command_timeout_s`), the
 CLI is killed but the Docker daemon goes on stopping the container for up to the provider's `stop_grace_period`; the
 federation's is 120 s, the default command timeout. The injection is then journalled `stop_unknown`, and the clear
@@ -244,16 +251,19 @@ class FaultInjector:
             raise FaultRefused(f"{settings.file}: [faults.services]: no service is declared for {target}")
         self.target, self._service, self._driver = target, service, driver
         self._clock, self._sleep = clock, sleep
-        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep)
+        labels = {config.provider_label(name): service for name, service in settings.services.items()}
+        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep, labels=labels)
         self._journal = self._recovery.journal
+        self._gate_probe: str | None = None  # the open injection's session gate probe file (`fault_sessions`)
         self._lock: HeldLock | None = None
         self._federation = FederationLock(settings)
         self._admission: Admission | None = None  # the exclusive admission it took itself, when its run held none
         self._cancel = threading.Event()  # set when `running` is cancelled: an admission still awaited is given up
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
         rounds = settings.clear_attempts + 2
+        heal_s = settings.heal_timeout_s if settings.heal != "off" else 0.0
         self.cancel_wait_s = (settings.settle_timeout_s + settings.command_timeout_s) * rounds + (
-            2 * settings.ready_timeout_s  # a start may wait for a recovered provider and for its own clear's
+            2 * (settings.ready_timeout_s + settings.gate_timeout_s + heal_s)  # a recovered provider's, and its own
         )  # about a start's longest
         self._pending: tuple[str, str] | None = None  # the open injection's journal id and identity digest
         self._run: dict[str, Any] | None = None
@@ -310,7 +320,7 @@ class FaultInjector:
         self._run = {"run_key": run_key, "attempt": attempt}
         self._admit()
         self._step("sanctioned", True)
-        unsettled = self._recover()
+        unsettled = self._recover(heal=True)  # under the exclusive admission just taken
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
             raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
         self._lock = self._journal.try_lock(self.target)
@@ -380,12 +390,14 @@ class FaultInjector:
             before = self._driver.observe(self._service)
             if not before.running or before.identity is None:
                 raise self._fail(f"{self.target} is not running before the injection, so no restore could be confirmed")
+            self._gate_probe = self._arm_gate()
             before_sha256, entry = digest(before.identity), uuid.uuid4().hex
             line = {
                 "target": self.target,
                 "service": self._service,
                 "identity_sha256": before_sha256,
                 "holder": holder(),
+                **({} if self._gate_probe is None else {"gate_probe": self._gate_probe}),
             }
             self._journal.append({"event": "injecting", "id": entry, **line})
         except InfraError:
@@ -398,6 +410,30 @@ class FaultInjector:
             self._unlock()
             raise self._fail(f"{self.target} could not be read and journalled ({type(error).__name__})") from None
         return before_sha256, entry
+
+    def _arm_gate(self) -> str | None:
+        """The session gate's probe file, made and seen by every provider of the probe space before anything stops
+        (`fault_sessions`), so a restore's gate reads a file its provider knew; None when the driver has no gate. A
+        probe that cannot be made fails the start with nothing stopped (its error's type only, O12)."""
+        arm = getattr(self._driver, "arm_gate", None)
+        if arm is None:
+            return None
+        try:
+            return arm(self._service)
+        except Exception as error:
+            why = type(error).__name__
+            raise self._fail(
+                f"the session gate's probe could not be made before {self.target}'s outage ({why})"
+            ) from None
+
+    def _record_links(self, record: Mapping[str, Any]) -> None:
+        """The session gate's reading and the heal's record of the latest restore, as steps of the snapshot (O35)."""
+        gate = record.get("gate")
+        if isinstance(gate, Mapping):
+            self._step("gate", gate.get("ok") is True, **{k: v for k, v in gate.items() if k != "ok"})
+        heal = record.get("heal")
+        if isinstance(heal, Mapping):
+            self._step("heal", heal.get("ok") is True, **{k: v for k, v in heal.items() if k != "ok"})
 
     @contextlib.asynccontextmanager
     async def running(
@@ -503,12 +539,14 @@ class FaultInjector:
             return None
         cleared = [step for step in self._steps if step["step"] == "cleared"]
         verified = [step for step in self._steps if step["step"] == "verified"]
+        healed = [step for step in self._steps if step["step"] == "heal"]
         return RestoreNotVerified(
             self.target,
             str(cleared[-1]["how"]) if cleared else "not_cleared",
             identity_changed=bool(verified and verified[-1]["identity_changed"]),
             serving=bool(verified and verified[-1]["ready_after_s"] is not None),
             still_open=open_,
+            tried=str(healed[-1]["tried"]) if healed else None,
         )
 
     def _raise_unrestored(self, error: BaseException) -> None:
@@ -579,17 +617,21 @@ class FaultInjector:
             done, how, after, ready_after_s = self._recovery.settle(
                 {
                     "id": entry,
+                    "target": self.target,
                     "service": self._service,
                     "identity_sha256": digest,
                     "injected": self._went_down,
                     "stop_unknown": self._stop_unknown,
-                }
+                    "gate_probe": self._gate_probe,
+                },
+                heal=True,  # the injector holds the federation exclusively until its restore is verified
             )
         except Exception as error:  # never lose the reading: a clear that failed stays pending and open
             done, how, after, ready_after_s = False, type(error).__name__, None, None
         verified = done and how in ("restored", "found_restored")
         timed = {} if ready_after_s is None else {"ready_after_s": ready_after_s}
         self._injection = {**injection, "cleared": done, "verified": verified, **timed}
+        self._record_links(self._recovery.restore_record)
         self._step("cleared", done, how=how)
         self._step(
             "verified",
@@ -611,9 +653,10 @@ class FaultInjector:
         with self._mutex:
             return self._recover()
 
-    def _recover(self) -> list[str]:
+    def _recover(self, *, heal: bool = False) -> list[str]:
+        """Recovery, healing a stuck link only when `heal`: the caller holds the federation exclusively (`_start`)."""
         self._require_sanction()
-        return self._recovery.recover(self._step)
+        return self._recovery.recover(self._step, heal=heal)
 
     def _unlock(self) -> None:
         if self._lock is not None:
