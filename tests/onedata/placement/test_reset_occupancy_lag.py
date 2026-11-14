@@ -8,9 +8,9 @@ import pytest
 from qos_world import FILES, WAIT_S, federation, provisioner_with, two_providers
 
 from expcore_onedata import resetqos
-from expcore_onedata.reset import ResetFailed, SpaceReset
+from expcore_onedata.reset import OCCUPANCY_ROUNDS, ResetFailed, SpaceReset
 from expcore_onedata.testing import BETA_ID, DATA, write_platform
-from expcore_onedata.testing.fake_data import ROOT_ID
+from expcore_onedata.testing.fake_data import ROOT_ID, Transfer
 
 HELD = len(FILES) * len(DATA)  # what beta holds of the space at the start: every file of `study`
 
@@ -48,6 +48,43 @@ def land_after_the_occupancy_stage(fake, file_id):
 def arm(client) -> None:
     """End the fake's setup with one provider call, so that what changes after it is dated and lags."""
     client.get(f"/data/{ROOT_ID}/distribution", provider="alpha")
+
+
+def land_at_t(monkeypatch, fake, file_id) -> None:
+    """Make `file_id`'s bytes land on beta as the quiet stage reads its block maps, at T."""
+    original = resetqos.read_pairs
+
+    def landing(p, pairs):
+        fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
+        return original(p, pairs)
+
+    monkeypatch.setattr(resetqos, "read_pairs", landing)
+
+
+def outside_job(fake, ticker, kind, file_id, *, number=1) -> None:
+    """A job no stage of the reset sent, which ends now on beta: an eviction removes beta's blocks of the file, a
+    replication places them; the listings show it ended, with its finish time."""
+    if kind == "eviction":
+        del fake.blocks[(file_id, BETA_ID)]
+    else:
+        fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
+    now = int(ticker.now)
+    fake.transfers[f"tid-outside-{number}"] = Transfer(
+        kind, file_id, BETA_ID, ended=True, scheduled=now, started=now, finished=now
+    )
+
+
+def during_the_occupancy_wait(ticker, act):
+    """A sleep that runs `act` once, at the end of the occupancy stage's first wait (`occupancy_wait_s(2)`)."""
+    done: list[bool] = []
+
+    def sleep(seconds):
+        ticker.sleep(seconds)
+        if seconds == resetqos.occupancy_wait_s(2) and not done:
+            done.append(True)
+            act()
+
+    return sleep
 
 
 def root_reads(fake, ticker) -> list[float]:
@@ -164,6 +201,80 @@ def test_o45_the_listings_are_read_after_the_wait_and_before_the_occupancy(
     wait = max(i for i, event in enumerate(events[:first]) if event[0] == "sleep")
     assert events[wait] == ("sleep", resetqos.occupancy_wait_s(2))
     assert ("listing",) in events[wait:first]
+
+
+def test_o45_an_eviction_that_ends_during_the_occupancy_wait_makes_the_stage_wait_again(
+    client, config, platform_file, ticker, tmp_path, fake, monkeypatch
+):
+    """O45: a job no stage sent can end during the wait, after the instant it counts from. Here an eviction of a file
+    beta may keep ends as the wait ends; read then, the figure still held its bytes, and a landing at T, no larger,
+    passed the quiet stage. The ended listing's first page shows a job the stage had not seen, so the stage waits again
+    from when none runs, reads a figure without the evicted bytes, and the landing fails the quiet stage."""
+    kept, late = fake.add_file("other/kept.bin", DATA), fake.add_file("other/late.bin", DATA)
+    fake.blocks[(kept, BETA_ID)] = [[0, len(DATA)]]
+    land_at_t(monkeypatch, fake, late)
+    sleep = during_the_occupancy_wait(ticker, lambda: outside_job(fake, ticker, "eviction", kept))
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
+    with pytest.raises(ResetFailed, match=r"quiet stage.*more of the space after the quiet wait") as caught:
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, {"beta": len(DATA)}, qos_rights=True)
+    occupancy = caught.value.record["stages"]["occupancy"]
+    assert (occupancy["rounds"], occupancy["physical_bytes"]["providers[1]"]) == (2, 0)
+    assert occupancy["waited_s"] == 2 * resetqos.occupancy_wait_s(2)
+
+
+def test_o45_a_replication_that_ends_during_the_occupancy_wait_is_in_the_figure(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O45: the same for a placement, with the quiet check skipped: a replication into beta ends as the wait ends;
+    read then, the occupancy showed beta holding nothing and the reset passed. The stage waits again, and beta holds
+    bytes beyond what the reset allows."""
+    for path in FILES:
+        fake.blocks.pop((fake.id_of(path), BETA_ID))  # the setup's: beta holds nothing of the space
+    late = fake.add_file("other/late.bin", DATA)
+    sleep = during_the_occupancy_wait(ticker, lambda: outside_job(fake, ticker, "replication", late))
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
+    with pytest.raises(ResetFailed, match=r"occupancy stage.*beyond what the reset allows"):
+        SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
+
+
+def test_o45_an_eviction_that_ends_during_the_quiet_stage_fails_it(
+    client, config, platform_file, ticker, tmp_path, fake, monkeypatch
+):
+    """O45: after the occupancy stage's figure, an eviction that ends before the quiet stage's read can hide a growth
+    no larger than it there. Here one ends at T, beside a landing of the same size, and the read shows no more than the
+    figure: the stage fails, since a transfer ran or ended in its window, and certifies nothing."""
+    kept, late = fake.add_file("other/kept.bin", DATA), fake.add_file("other/late.bin", DATA)
+    fake.blocks[(kept, BETA_ID)] = [[0, len(DATA)]]
+    original = resetqos.read_pairs
+
+    def at_t(p, pairs):
+        outside_job(fake, ticker, "eviction", kept)
+        fake.blocks[(late, BETA_ID)] = [[0, len(DATA)]]
+        return original(p, pairs)
+
+    monkeypatch.setattr(resetqos, "read_pairs", at_t)
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
+    with pytest.raises(ResetFailed, match=r"quiet stage.*ran or ended.*certifies nothing") as caught:
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, {"beta": len(DATA)}, qos_rights=True)
+    assert caught.value.record["stages"]["occupancy"]["physical_bytes"]["providers[1]"] == len(DATA)
+
+
+def test_o45_transfers_that_keep_ending_during_the_occupancy_wait_fail_the_stage_at_its_bound(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O45: a job ending in every wait leaves no reading that shows them all; after `OCCUPANCY_ROUNDS` waits the stage
+    fails, closed, rather than read a figure that may miss one."""
+    late = fake.add_file("other/late.bin", DATA)
+    jobs = iter(range(1, 100))
+
+    def sleep(seconds):
+        ticker.sleep(seconds)
+        if seconds == resetqos.occupancy_wait_s(2):
+            outside_job(fake, ticker, "replication", late, number=next(jobs))
+
+    provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)
+    with pytest.raises(ResetFailed, match=rf"occupancy stage.*kept ending or running.*{OCCUPANCY_ROUNDS}"):
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, {"beta": len(DATA)}, qos_rights=False)
 
 
 @pytest.mark.parametrize(("depth", "wait"), [(1, 15.0), (2, 20.0), (3, 25.0), (4, 30.0)])

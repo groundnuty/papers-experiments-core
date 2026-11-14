@@ -151,10 +151,13 @@ def test_o33_a_landing_after_t_is_not_certified_by_the_quiet_stage(
     show in the occupancy 15 s later, which nothing reads, so the stage passes and beta holds them afterwards. A
     replication still running at T can do this, whichever scan found its requirement."""
     file_id = fake.add_file("other/late.bin", DATA)
+    waits: list[float] = []
 
     def sleep(seconds):
         ticker.sleep(seconds)
-        if seconds == WAIT_S:  # the replication lands as the wait ends, after T
+        if seconds == WAIT_S:
+            waits.append(seconds)
+        if len(waits) == 2 and seconds == WAIT_S:  # the quiet wait, after the occupancy stage's (O45): after T
             fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
 
     provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path, sleep=sleep)

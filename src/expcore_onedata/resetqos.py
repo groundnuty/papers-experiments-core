@@ -88,9 +88,11 @@ scheduling instead, the measured 20.03 s is past the bound alone and within the 
 
 So two reads of the occupancy wait. The occupancy stage waits `occupancy_wait_s` from the eviction stage's end, the
 lag for the deepest regular file of the space plus `QUIET_MARGIN_S`: every eviction and every transfer had ended by
-then, the reset's and an earlier run's, at any depth, so its figure shows them all, and the quiet stage holds the
-occupancy to a figure that no longer counts bytes already evicted. Read sooner, that figure still held them, and the
-quiet stage passed a growth up to their size: a false certification. The quiet wait is the same lag for the deepest
+then, the reset's and an earlier run's, at any depth, and the stage keeps a reading only when the transfer listings
+show none ran or ended since (`reset.py`, waiting again otherwise), so its figure shows them all, and the quiet stage
+holds the occupancy to a figure that no longer counts bytes already evicted. Read sooner, that figure still held
+them, and the quiet stage passed a growth up to their size: a false certification. The quiet wait is the same lag for
+the deepest
 file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest regular file of the space, as the scan saw it,
 since a replication nothing names could reach any file, or the deepest affected file when the caller knows the run
 could set no requirement. So the occupancy is read when every placement that landed by T shows in it. A space with
