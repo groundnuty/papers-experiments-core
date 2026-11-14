@@ -62,7 +62,14 @@ def _detail(exc: BaseException) -> str:
 
 
 class McpToolProvider:
-    """A tool provider over one MCP server session. Use it as an async context manager around the run."""
+    """A tool provider over one MCP server session. Use it as an async context manager around the run.
+
+    It is the one provider of the core that is a tool server (`tool_server`), so the study's declared per-call bound
+    (`[agent] tool_server_call_bound_s`, L17) reaches its calls and no others: a hang of the server is `knowledge`
+    infrastructure, and not the agent's time.
+    """
+
+    tool_server = True  # the loop hands its calls the declared per-call bound and judges their expiry by it (L17)
 
     def __init__(
         self,
@@ -134,13 +141,14 @@ class McpToolProvider:
     ) -> ToolOutput:
         """Call a tool. The call ends within `timeout_s`, and that bound is its only limit (L05, L16).
 
-        Inside the loop `timeout_s` is the agent's time left, or the study's declared per-call bound when that is
-        shorter (L17), so the bound is never longer than the loop's own. At the time left the loop cuts the call at
-        the same moment and judges this expiry as that cut (`Watcher`), so the run ends the same way whichever the
-        event loop runs first; at the declared bound the expiry is the call's own failure, as `knowledge`
-        infrastructure, and not the agent's time. Outside the loop (a pre-run check, a health probe) the bound is the
-        only one there is: a server that is up and never answers raises `CallTimedOut`, which is `InfraError` of kind
-        `knowledge` and names the tool and the bound. The call is abandoned and the session stays usable.
+        Inside the loop `timeout_s` is the agent's time left, or the study's declared per-call bound
+        (`tool_server_call_bound_s`) when that is shorter (L17), so the bound is never longer than the loop's own. At
+        the time left the loop cuts the call at the same moment and judges this expiry as that cut (`Watcher`), so the
+        run ends the same way whichever the event loop runs first; at the declared bound the expiry is the call's own
+        failure, as `knowledge` infrastructure, and not the agent's time. Outside the loop (a pre-run check, a health
+        probe) the bound is the only one there is: a server that is up and never answers raises `CallTimedOut`, which
+        is `InfraError` of kind `knowledge` and names the tool and the bound. The call is abandoned and the session
+        stays usable.
 
         The round trip to the server is the tool's own time and is charged to the agent: the client marks no wait on
         infrastructure, since the core cannot tell which part of a server's time a study counts as one.

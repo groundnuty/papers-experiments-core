@@ -11,7 +11,7 @@ import math
 from fault_support import FakeClock, FakeServices, faults_table, injector_for
 
 from expcore_onedata.fault_heal import LinkMatrix, PairState
-from expcore_onedata.fault_settings import DEFAULT_HEAL_TIMEOUT_S, TOKEN_MARGIN_BASE_S
+from expcore_onedata.fault_settings import DEFAULT_HEAL_TIMEOUT_S, DEFAULT_SESSION_DRAIN_S, TOKEN_MARGIN_BASE_S
 from expcore_onedata.testing import write_platform
 
 NAMES = ("alpha", "beta", "gamma", "delta")
@@ -141,12 +141,19 @@ class HealServices(FakeServices):
 
 def four_providers(data, **faults):
     """Four providers, each with a service; short commands and settles, so a declared heal fits its default bound, and
-    a token margin that outlives two heals of its bound, which a declared heal needs at load."""
+    a token margin that outlives two heals of its bound and a session drain, which a declared heal needs at load."""
     for name, index in (("gamma", 3), ("delta", 4)):
         data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
     data["faults"] = faults_table(**{"services": dict(STORES), "command_timeout_s": 10, "heal_settle_s": 30, **faults})
-    heal_timeout_s = data["faults"].get("heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S)
-    data["tokens"] = {**data.get("tokens", {}), "margin_s": math.ceil(TOKEN_MARGIN_BASE_S + 2 * heal_timeout_s)}
+    data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
+
+
+def heal_margin_s(faults) -> int:
+    """The `[tokens] margin_s` a declared heal of this `[faults]` table needs at load (`heal_token_margin_s`): the base,
+    two heals of its bound and its session drain."""
+    heal_timeout_s = faults.get("heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S)
+    drain_s = faults.get("session_drain_s", DEFAULT_SESSION_DRAIN_S)
+    return math.ceil(TOKEN_MARGIN_BASE_S + 2 * heal_timeout_s + drain_s)
 
 
 def heal_injector(tmp_path, services=None, **faults):

@@ -127,10 +127,12 @@ class LinkHeal:
         restart_container: Callable[[str, str, float], dict[str, Any]],
         hold: Callable[[float], None],
         clock: Callable[[], float],
+        container_fallback: bool = True,
         sleep: Callable[[float], None],
         utc: Callable[[], str] = _utc,
     ) -> None:
         self._mode, self._driver, self._services, self._restored = mode, driver, dict(services), restored
+        self._fallback = container_fallback  # whether all_links may restart a stuck reader's container
         self._bound_s, self._gate_s, self._poll_s, self._settle_s = bound_s, gate_s, poll_s, settle_s
         self._link_cost, self._restart_cost = link_s, link_s - 2 * command_s  # what is left once a ping is done
         self._all_links_cost, self._container_cost = all_links_s, container_s
@@ -360,7 +362,8 @@ class LinkHeal:
             elif self._mode == "link":
                 return "links_stuck", current, f"{label} answered no pong, so its link cannot be restarted"
         still = label in current.stuck_readers() and label not in current.sources()
-        if still and self._mode != "link" and label not in self._restarted:
+        containers = self._mode == "link_then_container" or (self._mode == "all_links" and self._fallback)
+        if still and containers and label not in self._restarted:
             self._restarted.add(label)  # one container restart per provider per restore, or none
             if label == self._restored:
                 self._skipped.append({"provider": label, "why": "the restored provider's container is not restarted"})
@@ -403,6 +406,11 @@ class LinkHeal:
             stop, current, why = self._all_links(before)
             if stop is not None:
                 return self._end(stop, current, before, why)
+            if not self._fallback:  # links only: a pair the link restarts did not mend is the operator's to decide
+                if current.ok:
+                    return self._end("healed", current, before)
+                why = "a pair still fails after every link was restarted, and no container may be (fallback off)"
+                return self._end("links_stuck", current, before, why)
         ended = self._readers(current, before)
         if isinstance(ended, HealResult):
             return ended

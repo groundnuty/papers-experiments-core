@@ -490,6 +490,22 @@ def test_o11_an_exclusive_control_holds_the_federation_exclusively_and_never_ove
     assert marks["control", "in"] >= marks["baseline", "out"]  # the control waited for the run already on it
 
 
+def test_c34_an_outage_run_with_no_declared_target_is_refused_before_it_takes_the_federation(tmp_path):
+    """C34: an outage run's admission names its target in the holder record; a run that arrives with the kind and no
+    target is refused, so the federation is never held exclusively for an outage that names no provider."""
+    platform, _ = federation(tmp_path)
+    config = load_platform(platform, require_secrets=False)
+    _, schema = matched_design(tmp_path)
+    admit = run_admission(config, schema)
+    with (
+        pytest.raises(AdmissionRefused, match=r"provider_outage.*no target"),
+        admit(("provider_outage",), {}, threading.Event(), False),
+    ):
+        raise AssertionError("the run must not be admitted")
+    with admit(("provider_outage",), {"provider_outage": OUTAGE_TARGET}, threading.Event(), False) as mode:
+        assert mode == "exclusive"
+
+
 def test_o11_an_exclusive_condition_on_a_platform_without_faults_is_refused_naming_the_file_and_key(tmp_path):
     """O11: without `[faults]` there is no federation lock to hold, so a condition that declares `exclusive = true` is
     refused, naming the study file and the key."""

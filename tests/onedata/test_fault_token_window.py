@@ -31,7 +31,13 @@ from expcore.tools.manifest import FrozenManifest, live_manifest
 from expcore_onedata.admission import FederationLock
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.fault_settings import DEFAULT_HEAL_TIMEOUT_S, TOKEN_MARGIN_BASE_S, load_faults
+from expcore_onedata.fault_settings import (
+    DEFAULT_HEAL_TIMEOUT_S,
+    DEFAULT_SESSION_DRAIN_S,
+    TOKEN_MARGIN_BASE_S,
+    heal_token_margin_s,
+    load_faults,
+)
 from expcore_onedata.faults import PROVIDER_OUTAGE
 from expcore_onedata.testing import CEILING_S, TOOL_SERVER_ARGS, write_platform
 from expcore_onedata.testing import NOW as WALL_START
@@ -39,7 +45,8 @@ from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
 from expcore_onedata.tokens import TokenIssuer, tool_server_spec
 from expcore_onedata.toolserver import ENV_TOOLS, ToolServerLauncher
 
-LEAST_MARGIN_S = int(TOKEN_MARGIN_BASE_S + 2 * DEFAULT_HEAL_TIMEOUT_S)  # 900 + 2 x 4,200 = 9,300 s
+# 900 + 2 x 4,200 + 320 = 9,620 s
+LEAST_MARGIN_S = int(TOKEN_MARGIN_BASE_S + 2 * DEFAULT_HEAL_TIMEOUT_S + DEFAULT_SESSION_DRAIN_S)
 
 
 def platform_with(tmp_path, margin_s, **faults):
@@ -54,18 +61,28 @@ def settings_of(platform):
     return load_faults(platform, load_platform(platform, require_secrets=False))
 
 
-def test_o35_a_declared_heal_is_refused_at_load_unless_the_token_margin_outlives_two_heals(tmp_path):
+def test_o35_a_declared_heal_is_refused_at_load_unless_the_token_margin_outlives_two_heals_and_a_drain(tmp_path):
     """O35, O06: the tool server's teardown examines the run's token after the restore, so a declared heal needs a
-    token margin of the base (900 s) plus two heals of `heal_timeout_s` (4,200 s each): 9,300 s. Less is refused at
-    load, naming both keys and both numbers; that much loads; a heal that is off asks nothing of the margin."""
-    assert (TOKEN_MARGIN_BASE_S, LEAST_MARGIN_S) == (900, 9300)
+    token margin of the base (900 s) plus two heals of `heal_timeout_s` (4,200 s each) and one session drain of
+    `session_drain_s` (320 s): 9,620 s. Less is refused at load, naming the keys and the numbers; that much loads; a
+    heal that is off asks nothing of the margin."""
+    assert (TOKEN_MARGIN_BASE_S, LEAST_MARGIN_S) == (900, 9620)
+    drained = {"session_drain_s": DEFAULT_SESSION_DRAIN_S}  # the fixture's [faults] declares no drain: this one does
     for margin in (900, LEAST_MARGIN_S - 1):
-        with pytest.raises(ConfigError, match=rf"heal.*\[tokens\] margin_s.*at least 9300 s.*{margin} s.*4200"):
-            settings_of(platform_with(tmp_path, margin, heal="all_links"))
-    assert settings_of(platform_with(tmp_path, LEAST_MARGIN_S, heal="all_links")).heal == "all_links"
-    shorter = 2 * 1000 + TOKEN_MARGIN_BASE_S  # a shorter declared heal needs a shorter margin
-    assert settings_of(platform_with(tmp_path, shorter, heal="all_links", heal_timeout_s=1000)).heal_timeout_s == 1000
+        with pytest.raises(
+            ConfigError, match=rf"heal.*\[tokens\] margin_s.*at least 9620 s.*{margin} s.*4200.*session_drain_s.*320"
+        ):
+            settings_of(platform_with(tmp_path, margin, heal="all_links", **drained))
+    assert settings_of(platform_with(tmp_path, LEAST_MARGIN_S, heal="all_links", **drained)).heal == "all_links"
+    shorter = int(2 * 1000 + TOKEN_MARGIN_BASE_S + DEFAULT_SESSION_DRAIN_S)  # a shorter heal needs a shorter one
+    shorter_heal = {"heal": "all_links", "heal_timeout_s": 1000, **drained}
+    assert settings_of(platform_with(tmp_path, shorter, **shorter_heal)).heal_timeout_s == 1000
     assert settings_of(platform_with(tmp_path, 900)).heal == "off"
+    shortest = 2 * 1000 + TOKEN_MARGIN_BASE_S  # without the drain it declares, a margin is too short
+    with pytest.raises(ConfigError, match=r"session_drain_s \(320 s\)"):
+        settings_of(platform_with(tmp_path, shortest, **shorter_heal))
+    drainless = settings_of(platform_with(tmp_path, shortest, heal="all_links", heal_timeout_s=1000, session_drain_s=0))
+    assert drainless.session_drain_s == 0
 
 
 @pytest.fixture(scope="module")
@@ -198,13 +215,14 @@ def test_o35_the_tool_servers_teardown_after_the_restore_reads_the_run_token_so_
 def test_o35_with_the_margin_load_demands_a_run_whose_heals_take_their_whole_bounds_completes_and_records(
     tmp_path, fake, frozen_manifests, outage_condition
 ):
-    """O35, O06: the coordinator's order with the margin the load check demands (9,300 s): a heal of its whole
+    """O35, O06: the coordinator's order with the margin the load check demands (`heal_token_margin_s`; the fixture
+    declares no session drain, so 9,300 s): a heal of its whole
     `heal_timeout_s` while the run starts (the recovery of an injection an earlier run left), the agent's loop at its
     whole ceiling, then the restore's heal of its whole bound: the tool server's stop still finds the token valid, the
     record carries the verified restore, and the store keeps the attempt done and uncharged, never infrastructure."""
     schema, store, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
-    assert outage.config.tokens.margin_s == LEAST_MARGIN_S
+    assert outage.config.tokens.margin_s == heal_token_margin_s(settings_of(outage.platform))
     outage.services.on_stop = lambda service: outage.wall.__setitem__(0, outage.wall[0] + DEFAULT_HEAL_TIMEOUT_S)
     outage.heal_s = DEFAULT_HEAL_TIMEOUT_S
     record = outage.run(schema, key)

@@ -6,6 +6,7 @@ the waiting run, so it is `federation_busy`, a hold that costs no attempt (as `i
 exhaust `max_attempts`. The injector's own failures (`injector_failure`) are still charged.
 """
 
+import asyncio
 import contextlib
 import threading
 import time
@@ -23,7 +24,7 @@ from expcore.errors import InfraError, is_treatable, uncharged_kinds
 from expcore_onedata.admission import OUTAGE_RUN, FederationBusy, FederationLock, run_admission
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
-from expcore_onedata.faults import INJECTOR_FAILURE, PROVIDER_OUTAGE, load_faults
+from expcore_onedata.faults import INJECTOR_FAILURE, PROVIDER_OUTAGE, FaultInjector, load_faults
 
 BUSY = "federation_busy"
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -97,6 +98,64 @@ def test_o11_an_injector_whose_own_wait_for_the_federation_runs_out_holds_and_ta
         assert second.snapshot()["injections"] == []
     finally:
         assert first.finish()["ok"] is True
+
+
+def test_o11_a_wait_for_the_federation_that_runs_out_inside_the_session_drain_is_federation_busy(tmp_path):
+    """O11: after an outage run the federation admits nobody while its sessions drain, and a run's bounded wait that
+    runs out inside the drain did nothing and failed at nothing, as one behind a holder of the lock: it is the hold
+    `federation_busy`, never `injector_failure`, whichever way it waits (`acquire`, shared or exclusive, `held`,
+    `admitted`, and an injector's own wait at its start, which takes nothing down)."""
+    platform = write_faults(tmp_path, session_drain_s=30, admission_timeout_s=0.2)
+    lock = federation_lock(platform)
+    lock.hold_for(30)  # what an outage run's release leaves: the federation closed for its drain
+    caught = []
+    for exclusive in (False, True):
+        with pytest.raises(FederationBusy) as acquired:
+            lock.acquire(exclusive=exclusive, timeout_s=0.1)
+        caught.append(acquired.value)
+    with pytest.raises(FederationBusy) as held, lock.held(exclusive=False, timeout_s=0.1):
+        pytest.fail("admitted inside the drain")
+    caught.append(held.value)
+
+    async def in_call():
+        async with lock.admitted(exclusive=False, timeout_s=0.1):
+            pytest.fail("admitted inside the drain")
+
+    with pytest.raises(FederationBusy) as admitted:
+        asyncio.run(in_call())
+    caught.append(admitted.value)
+    services = FakeServices()
+    with pytest.raises(InfraError) as started:
+        injector_for(platform, services).start(RUN)
+    caught.append(started.value)
+    assert [error.kind for error in caught] == [BUSY] * 5
+    assert all("sessions drain" in error.detail for error in caught), [error.detail for error in caught]
+    assert [call for call in services.calls if call[0] == "stop"] == []
+    assert not is_charged(BUSY)
+
+
+def test_o11_an_injector_start_that_cannot_wait_out_a_drain_recorded_after_its_journal_read_is_federation_busy(
+    tmp_path, monkeypatch
+):
+    """O11: the injector's start reads the drain record again after the journal, and a record written in between (a
+    lockless restore's) holds it back; a start whose wait for it runs out is the hold `federation_busy`, as a wait for
+    the lock is, never `injector_failure`, and it takes nothing down."""
+    platform = write_faults(tmp_path, session_drain_s=30, admission_timeout_s=0.2)
+    services = FakeServices()
+    injector = injector_for(platform, services)
+    original = FaultInjector._recover
+
+    def then_a_record(self, **kwargs):
+        result = original(self, **kwargs)
+        self._federation.hold_for(30)  # a restore that held no lock wrote its record after this start read the journal
+        return result
+
+    monkeypatch.setattr(FaultInjector, "_recover", then_a_record)
+    with pytest.raises(InfraError) as caught:
+        injector.start(RUN)
+    assert caught.value.kind == BUSY
+    assert "sessions drain" in caught.value.detail
+    assert [call for call in services.calls if call[0] == "stop"] == []
 
 
 def waits_for_the_federation(lock):

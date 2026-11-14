@@ -51,6 +51,15 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     estimator = "wilcoxon_cluster_bootstrap"
     cluster = "group"
 
+    [contrasts.cost-per-success]   # a ratio contrast (S13): an estimator of the ratio form, two outcomes, a zero rule
+    conditions = ["cond-a", "cond-b"]
+    estimator = "ratio"
+    numerator = "tokens"       # in place of `outcome`
+    denominator = "success"
+    zero_denominator = "exclude"   # or "continuity", with `continuity_correction = 0.5` (required with it, only with it)
+    cluster = "group"              # the independent unit, as for every contrast
+    estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group, the group their mean (S13)
+
     [descriptives.waited-in-a] # optional, S14: a one-arm estimate, descriptive, never in the Holm family
     conditions = ["cond-a"]    # one condition or a set of them, pooled
     outcome = "waited"         # a rate or share; or `numerator` and `denominator` for a ratio of totals
@@ -73,8 +82,9 @@ from expcore.config.loading import ConfigError, Section
 from expcore.stats import estimators
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
 from expcore.stats.onearm import DescriptiveSpec
-from expcore.stats.pairing import TREATMENT_OUTCOMES, ContrastSpec
+from expcore.stats.pairing import MODEL_KEY, TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
+from expcore.stats.ratio import ZERO_RULES, RatioForm
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
@@ -91,6 +101,8 @@ _TOP_KEYS = (
     "descriptives",
 )
 _DESCRIPTIVE_KEYS = ("conditions", "cluster", "outcome", "numerator", "denominator")
+# a ratio contrast's keys (S13)
+_RATIO_KEYS = ("numerator", "denominator", "zero_denominator", "continuity_correction", "estimation_unit")
 _CONTRAST_KEYS = (
     "conditions",
     "factor",
@@ -101,6 +113,7 @@ _CONTRAST_KEYS = (
     "equivalence_margin",
     "treatment_outcomes",
     "max_unscored_treatment",
+    *_RATIO_KEYS,
 )
 
 
@@ -488,20 +501,115 @@ def _max_unscored(section: Section, treatment: str | None) -> int:
     return value
 
 
+def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
+    """Read a ratio contrast's numerator, denominator and zero rule (S13); refuse them beside an estimator of one
+    outcome, and an outcome beside an estimator of the ratio form."""
+    if estimators.form(estimator) != "ratio":
+        for key in _RATIO_KEYS:
+            if key in section.data:
+                raise section.fail(
+                    key, f"belongs to a ratio contrast, and estimator {estimator!r} reads one outcome, its `outcome`"
+                )
+        return None
+    if "outcome" in section.data:
+        raise section.fail(
+            "outcome", f"is not read by estimator {estimator!r}, a ratio: name its numerator and denominator instead"
+        )
+    numerator, denominator = section.string("numerator"), section.string("denominator")
+    if numerator == denominator:
+        raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+    rule = section.data.get("zero_denominator")
+    if rule is None:
+        raise section.fail(
+            "zero_denominator",
+            f"is required: a ratio contrast declares what a cluster with a zero sum does, one of "
+            f"{', '.join(map(repr, ZERO_RULES))}",
+        )
+    if rule not in ZERO_RULES:
+        raise section.fail("zero_denominator", f"must be one of {', '.join(map(repr, ZERO_RULES))}, got {rule!r}")
+    correction = None
+    if rule == "continuity":
+        correction = _number(section, "continuity_correction")
+        if correction <= 0:
+            raise section.fail("continuity_correction", f"must be a positive number, got {correction}")
+    elif "continuity_correction" in section.data:
+        raise section.fail("continuity_correction", 'is only for zero_denominator = "continuity"')
+    return RatioForm(numerator, denominator, rule, correction)
+
+
+def _cluster(section: Section) -> str:
+    """Read `cluster`: one task attribute, the independent unit of the contrast. An array is refused, and one that
+    names the model is refused for the reason that matters: the cells of a cluster are not independent (S13)."""
+    value = section.data.get("cluster")
+    if not isinstance(value, list):
+        return section.string("cluster")
+    named = [field for field in value if isinstance(field, str) and field != MODEL_KEY]
+    attribute = named[0] if len(named) == 1 else "<attribute>"
+    reason = (
+        f". The (model, {attribute}) cells of one {attribute} share its response to the treatment, so they are not "
+        "independent of one another, and a test or a bootstrap over them would claim an n the data do not have. A "
+        f'ratio contrast estimated per model\'s cell declares cluster = "{attribute}" with '
+        f'estimation_unit = ["model", "{attribute}"], and is tested over the values of {attribute}; a contrast of one '
+        "outcome already estimates per model's cell and averages the models"
+        if MODEL_KEY in value
+        else ""
+    )
+    raise section.fail(
+        "cluster",
+        "must name one task attribute, the independent unit whose values the test, the bootstrap and the minimum "
+        f"detectable effect count; got an array, {value!r}{reason}",
+    )
+
+
+def _estimation_unit(section: Section, cluster: str, ratio: bool) -> tuple[str, ...] | None:
+    """Read a ratio contrast's `estimation_unit` (S13): the cluster alone, its models pooled in the sums (the default),
+    or "model" beside it, the sums per model's cell; held as (cluster,) or ("model", cluster). None when it is not
+    declared, which is the form's default; the key beside an estimator of one outcome is refused with the ratio keys."""
+    if not ratio or "estimation_unit" not in section.data:
+        return None
+    value = section.data["estimation_unit"]
+    if isinstance(value, str):
+        fields: tuple[str, ...] = (value,)
+    elif isinstance(value, list):
+        fields = section.strings("estimation_unit")
+    else:
+        raise section.fail(
+            "estimation_unit", f'must be an array of the cluster and, beside it, "model", got a {type(value).__name__}'
+        )
+    if len(set(fields)) != len(fields):
+        raise section.fail("estimation_unit", f"names a field twice: {list(fields)}")
+    if set(fields) == {cluster}:
+        return (cluster,)
+    if set(fields) == {MODEL_KEY, cluster}:
+        return (MODEL_KEY, cluster)
+    raise section.fail(
+        "estimation_unit",
+        f'must be ["{cluster}"] or ["model", "{cluster}"]: the cell a ratio\'s sums run over nests in the contrast\'s '
+        f"cluster {cluster!r}, the independent unit, alone (its models pooled) or as each model's cell of it; got "
+        f"{list(fields)}",
+    )
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
     section.reject_unknown(_CONTRAST_KEYS)
-    outcome, estimator, cluster = section.string("outcome"), section.string("estimator"), section.string("cluster")
+    estimator = section.string("estimator")
     try:
         estimators.get(estimator)
     except UnknownEstimator as error:
         raise section.fail("estimator", str(error)) from None
+    form = _ratio_form(section, estimator)
+    cluster = _cluster(section)
+    unit = _estimation_unit(section, cluster, form is not None)
+    outcome = section.string("outcome") if form is None else form.label
     treatment = _treatment_outcomes(section)
     declared = {
         "equivalence_margin": _margin(section, alpha),
         "treatment_outcomes": treatment,
         "max_unscored_treatment": _max_unscored(section, treatment),
+        "ratio": form,
+        "estimation_unit": unit,
     }
     if "conditions" in table:
         for extra in ("factor", "levels"):

@@ -39,11 +39,17 @@ whole bound showed it running with its identity. Beside the journal,
 whoever holds the federation exclusively keeps a holder record (`federation.holder`, written whole and fsynced by
 `write_holder`; `expcore_onedata.admission`): its pid and boot id, its purpose, the target's label and the time it took
 the lock.
+
+A third file, `federation.drain`, holds the wall-clock time before which no run is admitted: an outage run's sessions
+may still be draining on the local provider (`expcore_onedata.fault_drain`). `raise_drain` only ever moves it later,
+whole and fsynced under the journal-wide lock, and `read_drain` reads it; every admission checks it after it holds the
+lock (`expcore_onedata.admission`), so the wait outlives the process that began it, a crash and an interrupt included.
 """
 
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import weakref
@@ -57,6 +63,7 @@ from expcore.errors import TARGET_LABEL
 JOURNAL = "injections.jsonl"
 JOURNAL_LOCK = "journal.lock"
 HOLDER = "federation.holder"  # who holds the federation exclusively: written by the holder, read when a wait runs out
+DRAIN = "federation.drain"  # the wall-clock time before which no admission is granted (`raise_drain`, `read_drain`)
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 _HELD: dict[int, weakref.finalize] = {}  # the lock descriptors this process holds, with the finalizer of each
 
@@ -246,6 +253,9 @@ class InjectionJournal:
                 entries[key]["healing"] = line.get("healing") is True
                 if line.get("healing") is True:  # a link heal ran for it (O35): no process heals it again
                     entries[key]["healed"] = True
+                held = line.get("settle_until")  # a heal's settle (O35): no process reads through the links before it
+                if isinstance(held, int | float) and not isinstance(held, bool):
+                    entries[key]["settle_until"] = max(held, entries[key].get("settle_until", held))
             elif event == "cleared":
                 entries.pop(key, None)
             else:
@@ -321,6 +331,45 @@ class InjectionJournal:
             record["stuck_since"] = since
             self._replace_holder(record)
         return record
+
+    # --- the federation's drain record ----------------------------------------------------------------------------
+
+    def raise_drain(self, until: float) -> None:
+        """Make sure no admission is granted before `until`, on the wall clock: the record is written whole and
+        fsynced, renamed over the old one and the rename made durable, under the journal-wide lock, and only when
+        `until` is later than what it holds, so no writer can move it earlier."""
+        make_directories(self.directory)
+        with self._section():
+            held = self._drain_unlocked()
+            if held is not None and held >= until:
+                return
+            draft = self.directory / f"{DRAIN}.draft"  # one writer at a time: the section is held
+            with open(draft, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"until": until}))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(draft, self.directory / DRAIN)
+            _fsync_directory(self.directory)
+
+    def read_drain(self) -> float | None:
+        """The wall-clock time before which no admission is granted, or None when no record exists. A record that is not
+        one (not JSON, no finite number `until`) raises ValueError: an admission cannot tell it is safe to grant."""
+        if not (self.directory / DRAIN).exists():
+            return None
+        with self._section(fcntl.LOCK_SH):
+            return self._drain_unlocked()
+
+    def _drain_unlocked(self) -> float | None:
+        try:
+            record = json.loads((self.directory / DRAIN).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except ValueError:
+            raise ValueError("the federation's drain record is not JSON") from None
+        until = record.get("until") if isinstance(record, dict) else None
+        if isinstance(until, bool) or not isinstance(until, int | float) or not math.isfinite(until):
+            raise ValueError("the federation's drain record holds no finite time")
+        return float(until)
 
     def try_lock(self, target: str) -> HeldLock | None:
         """Take the target's exclusive lock without waiting; return it, or None when another holds it."""
