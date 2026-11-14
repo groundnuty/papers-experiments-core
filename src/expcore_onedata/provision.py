@@ -21,7 +21,8 @@ configured name or lies outside the prefixes. On top of that gate:
 - **A listing ends only on its last-page marker** (O26, `next_page_token`): a page without one is refused.
 - **Placement is what the block map says** (O01). A replication job that reports `completed` is a report; `replicate`
   returns only when `GET /data/{id}/distribution` on the receiving provider covers the whole file on consecutive polls,
-  and raises `NotPlaced` with the shortfall otherwise. An eviction is confirmed the same way, by the block map showing
+  and raises `NotPlaced` with the shortfall otherwise. A replication that completed short, as one scheduled while the
+  target's copy of the source's map lags does, is scheduled again, bounded by the settle bound (`replicate_file`). An eviction is confirmed the same way, by the block map showing
   the provider holding nothing of the file.
 - **The data provider's own copy is never evicted** (O09): a request to evict from the provider `[placement] holder`
   names is refused before anything is sent, by name and by id.
@@ -75,6 +76,17 @@ SHORT_FILES_SHOWN = 50
 EVICTION_ATTEMPTS = 5
 EVICTION_RETRY_PAUSE_S = 10.0
 EVICTION_CHECK_S = 10.0
+# A replication runs on its target from the target's own copy of the other providers' file locations, which dbsync
+# brings it, while the block map read through any provider gathers each provider's map from that provider (op-worker
+# f118ed9: replica_synchronizer.erl:1368-1372 and replica_finder.erl:48-89, against data_distribution.erl:183-199 and
+# provider_reg_distribution.erl:31-38). One scheduled before that copy holds the source's last write fetches only what
+# the copy shows and reports `completed`, and no REST call shows the lag
+# (`deploy/compose-federation/day0/2026-11-14-federation-facts-replication-lag.md`). So while the target's own block
+# map is short `REPLICATION_CHECK_S` after a replication ended, it is scheduled again after a pause on the order of
+# dbsync's delay (about 8 s, 15 s more on a gap), at most `REPLICATION_ATTEMPTS` in all, within the settle bound.
+REPLICATION_ATTEMPTS = 5
+REPLICATION_RETRY_PAUSES_S = (5.0, 10.0, 15.0, 15.0)  # before the second try, the third, the fourth and the fifth
+REPLICATION_CHECK_S = 10.0
 
 Listings = dict[tuple[str, str], dict[str, "Entry"]]  # (provider, directory id) -> its entries, for one operation
 
@@ -905,13 +917,17 @@ class Provisioner:
         reads it under `retry`."""
         return sum(held_bytes(self.blocks(fid, provider, retry=retry)) for fid in file_ids)
 
-    def confirm_placed(self, provider: str, wanted: Mapping[str, list[Range]]) -> Confirmation:
-        """Wait, within the bound, for the block map to show every wanted range on `provider` on consecutive polls."""
+    def confirm_placed(
+        self, provider: str, wanted: Mapping[str, list[Range]], *, timeout_s: float | None = None
+    ) -> Confirmation:
+        """Wait, within the bound, for the block map to show every wanted range on `provider` on consecutive polls.
+
+        The bound is `timeout_s`, the settings' `settle_timeout_s` unless given."""
         began = self._clock()
         result = consistency.converge(
             lambda: self.placement_report(provider, wanted),
             lambda report: report.fully_placed,
-            timeout_s=self._settings.settle_timeout_s,
+            timeout_s=self._settings.settle_timeout_s if timeout_s is None else timeout_s,
             poll_s=self._settings.poll_s,
             consecutive=self._settings.consecutive_polls,
             clock=self._clock,
@@ -977,35 +993,62 @@ class Provisioner:
 
     def replicate_file(self, file_id: str, size: int, to_provider: str) -> dict[str, Any]:
         """`replicate` for a file named by its id, whose size the caller knows: a progressive ingest's reset replicates
-        the file it completed, and never a file another entry now has at its path (O44)."""
+        the file it completed, and never a file another entry now has at its path (O44).
+
+        A replication that ended short is scheduled again (the target's copy of the source's map can lag,
+        `REPLICATION_ATTEMPTS`): while the target's own block map does not cover the file `REPLICATION_CHECK_S` after
+        a job ended, another is scheduled after the next of `REPLICATION_RETRY_PAUSES_S`, at most `REPLICATION_ATTEMPTS`
+        in all, and the last is waited on for what is left of `settle_timeout_s`, counted from the first job's end,
+        which bounds the checks, the pauses and every later job's wait; then `NotPlaced` refuses it. Every job's id is
+        in the change log and in the record, with the tries (`tries`) and the seconds from the first job's end until the
+        map covered the file (`converged_s`)."""
         self._verified()
         if size < 1:
             raise ProvisionError(f"{self._where}an empty file has nothing to place")
         wanted = {file_id: [(0, size)]}
-        began = self._clock()
-        tid = self.schedule_transfer("replication", file_id, to_provider)
-        done = consistency.require_ended(
-            consistency.wait_transfers(
-                self._client,
-                to_provider,
-                [tid],
-                timeout_s=self._settings.transfer_timeout_s,
-                poll_s=self._settings.poll_s,
-                clock=self._clock,
-                sleep=self._sleep,
-                retry=self._retry,
-            ),
-            "replication",
-        )
-        confirmation = self.confirm_placed(to_provider, wanted)
+        began, settings = self._clock(), self._settings
+        ids: list[str] = []
+        states: dict[str, int] = {}
+        first_end: float | None = None
+        for attempt in range(1, REPLICATION_ATTEMPTS + 1):
+            left = None if first_end is None else first_end + settings.settle_timeout_s - self._clock()
+            ids.append(self.schedule_transfer("replication", file_id, to_provider))
+            done = consistency.require_ended(
+                consistency.wait_transfers(
+                    self._client,
+                    to_provider,
+                    [ids[-1]],
+                    timeout_s=settings.transfer_timeout_s if left is None else min(settings.transfer_timeout_s, left),
+                    poll_s=settings.poll_s,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                    retry=self._retry,
+                ),
+                "replication",
+            )
+            for state, count in done.states().items():
+                states[state] = states.get(state, 0) + count
+            first_end = self._clock() if first_end is None else first_end
+            left = first_end + settings.settle_timeout_s - self._clock()
+            pause = REPLICATION_RETRY_PAUSES_S[attempt - 1] if attempt < REPLICATION_ATTEMPTS else 0.0
+            last = attempt == REPLICATION_ATTEMPTS or left <= REPLICATION_CHECK_S + pause  # no room for another try
+            confirmation = self.confirm_placed(
+                to_provider, wanted, timeout_s=max(left, 0.0) if last else REPLICATION_CHECK_S
+            )
+            if confirmation.placed or last:
+                break
+            self._sleep(pause)  # completed, and the target's own map is short: its copy may lag; schedule it again
         if not confirmation.placed:
             raise NotPlaced(
-                f"{self._where}the transfer reported {done.states()} but the block map does not cover the file "
-                f"({confirmation.report.bytes_short} B short)",
+                f"{self._where}the transfers reported {states} over {len(ids)} tries but the block map does not cover "
+                f"the file ({confirmation.report.bytes_short} B short)",
                 confirmation.report,
             )
         return {
-            "transfer_states": done.states(),
+            "transfer_states": states,
+            "tries": len(ids),
+            "transfer_ids": ids,
+            "converged_s": round(self._clock() - first_end, 3),
             "placement": confirmation.report.to_json(),
             "seconds": round(self._clock() - began, 3),
         }
