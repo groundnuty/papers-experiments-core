@@ -30,11 +30,18 @@ The fault half of the platform's health check, which reads the holder record thi
 gate's `RECOVERY`) first writes a holder record beside the lock, whole and fsynced (`fault_journal.HOLDER`): its pid and
 boot id, its purpose, the target's label and the time it took the lock; it removes the record before it lets the lock
 go, and a shared admission clears any record left behind, since no exclusive holder can then exist.
+
+A tool outside a campaign (a smoke driver, a warm-up) holds the shared admission too, through
+`expcore_onedata.tool_admission.shared_admission`, so no outage can overlap it. Whoever takes the lock exclusively
+knows that no such tool holds it, and ends the record of any a dead one left open (`expcore_onedata.shared_holds`); a
+wait for it that runs out says that tools outside a campaign hold the federation. An admission's `endings` are what
+runs, last first, when the last share lets the lock go.
 """
 
 import asyncio
 import contextlib
 import fcntl
+import logging
 import os
 import threading
 import time
@@ -55,6 +62,9 @@ from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, ma
 from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
+from expcore_onedata.shared_holds import SharedHolds
+
+log = logging.getLogger(__name__)
 
 FEDERATION_LOCK = "federation.lock"
 FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock
@@ -99,7 +109,9 @@ class Admission:
     the holder record it wrote beside the lock (`record`), which it removes before it lets the lock go.
 
     The owner's `close` gives up its share; the lock goes when the last share is given up, so a worker the owner
-    handed a share (`retain`) keeps the federation held until it ends, even after the owner has left."""
+    handed a share (`retain`) keeps the federation held until it ends, even after the owner has left. `endings` are
+    what to call, last first, just before the lock goes: a tool outside a campaign ends its record of the hold there
+    (`expcore_onedata.tool_admission`), so the record ends with the lock, never before a worker that still holds it."""
 
     exclusive: bool
     lock: HeldLock
@@ -107,6 +119,7 @@ class Admission:
     journal: InjectionJournal | None = None
     record: Mapping[str, Any] | None = None
     shares: _Shares = field(default_factory=_Shares, compare=False, repr=False)
+    endings: list[Callable[[], None]] = field(default_factory=list, compare=False, repr=False)
 
     @property
     def held(self) -> bool:
@@ -151,6 +164,11 @@ class Admission:
 
     def _release(self) -> None:
         """Let the lock go, its holder record first, so no record outlives a lock let go this way."""
+        for ending in reversed(self.endings):
+            try:
+                ending()
+            except Exception:  # the lock goes all the same: the record of a hold only says who held it
+                log.exception("the end of a hold could not be recorded")
         if self.journal is not None and self.record is not None and self.held:
             with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
                 self.journal.clear_holder(self.record["token"])
@@ -219,7 +237,17 @@ class FederationLock:
         except BaseException:
             main.close()
             raise
+        self._settle_tools()
         return Admission(True, main, self.federation, journal, record)
+
+    def _settle_tools(self) -> None:
+        """Under the exclusive lock, no tool outside a campaign holds the federation shared: end the record of any that
+        a dead one left open (`SharedHolds.settle`). It only says who held, so a record that cannot be read or written
+        is told of and never keeps an outage run out."""
+        try:
+            SharedHolds(self.directory).settle(proven=True)
+        except (OSError, ValueError):
+            log.warning("the record of the tools' holds could not be settled", exc_info=True)
 
     def try_acquire(self, *, exclusive: bool, purpose: str = OUTAGE_RUN, target: str | None = None) -> Admission | None:
         """Pass the turnstile and take the lock without waiting; None when either is held against it. `purpose` and
@@ -246,12 +274,26 @@ class FederationLock:
         `cancel` is set; raise InfraError of kind `injector_failure` when it could not be had (`FederationBusy` when
         the wait ran out). `purpose` and `target` go into the holder record of an exclusive admission."""
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
         try:
-            main = self._wait(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, deadline, cancel)
-        finally:
-            intent.close()  # whoever waits behind it may now queue for the main lock
+            intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
+            try:
+                main = self._wait(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, deadline, cancel)
+            finally:
+                intent.close()  # whoever waits behind it may now queue for the main lock
+        except FederationBusy as busy:
+            if exclusive:
+                raise self._explained(busy) from None
+            raise
         return self._admit(main, exclusive, purpose, target)
+
+    def _explained(self, busy: FederationBusy) -> FederationBusy:
+        """An exclusive wait that ran out, with the tools outside a campaign that hold the federation shared named,
+        when any do (their reasons are their own text and stay in the record)."""
+        try:
+            tools = SharedHolds(self.directory).waiting_on()
+        except (OSError, ValueError):
+            return busy  # the record only explains the wait
+        return FederationBusy(INJECTOR_FAILURE, f"{busy.detail}; {tools}") if tools else busy
 
     @contextlib.contextmanager
     def held(
