@@ -4,9 +4,11 @@
 #   changes: see git history of this file from its import commit
 """An MCP stdio client that serves a server's tools to the agent loop, as a tool provider.
 
-One server session per run: spawn, initialize, list the tools, then call them across turns. Four rules:
+One server session per run: spawn, initialize, list the tools, then call them across turns. Five rules:
 
 - The start is bounded by a timeout. A server that does not answer in time is broken (L14).
+- A call is bounded by its `timeout_s`, inside the loop and outside it. A server that is up and does not answer in time
+  is infrastructure of kind `knowledge`, naming the tool and the bound (L16).
 - The server's tools must equal the frozen manifest of the condition, and the allow-list the caller gave the
   server's launcher must name tools the server has. An extra or a missing tool fails the start. The client never
   filters the list itself: the server enforces the allow-list (L13).
@@ -25,7 +27,7 @@ from mcp import ClientSession, MCPError, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR
 
-from expcore.errors import InfraError
+from expcore.errors import CallTimedOut, InfraError
 from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolSpec
 from expcore.tools.manifest import FrozenManifest, ManifestError, canonical, list_all_tools, mismatches
 
@@ -130,15 +132,26 @@ class McpToolProvider:
     async def execute(
         self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext = NO_WAITS
     ) -> ToolOutput:
-        """Call a tool. The run's own time bound (the loop's) is the call's only limit (L05).
+        """Call a tool. The call ends within `timeout_s`, and that bound is its only limit (L05, L16).
+
+        Inside the loop `timeout_s` is the agent's time left, or the study's declared per-call bound when that is
+        shorter (L17), so the bound is never longer than the loop's own. At the time left the loop cuts the call at
+        the same moment and judges this expiry as that cut (`Watcher`), so the run ends the same way whichever the
+        event loop runs first; at the declared bound the expiry is the call's own failure, as `knowledge`
+        infrastructure, and not the agent's time. Outside the loop (a pre-run check, a health probe) the bound is the
+        only one there is: a server that is up and never answers raises `CallTimedOut`, which is `InfraError` of kind
+        `knowledge` and names the tool and the bound. The call is abandoned and the session stays usable.
 
         The round trip to the server is the tool's own time and is charged to the agent: the client marks no wait on
         infrastructure, since the core cannot tell which part of a server's time a study counts as one.
         """
         if self._session is None:
             raise RuntimeError("the tool provider is not started; use it as an async context manager")
+        if not timeout_s > 0:  # also refuses NaN
+            raise ValueError(f"the call's timeout must be positive, got {timeout_s!r}")
         try:
-            result = await self._session.call_tool(name, arguments)
+            async with asyncio.timeout(timeout_s) as bound:
+                result = await self._session.call_tool(name, arguments)
         except MCPError as exc:
             # Server-side failures only are infrastructure: the connection closed under us (the server crashed or is
             # unreachable) or the server reports an internal error. Every other protocol error (invalid params,
@@ -147,6 +160,10 @@ class McpToolProvider:
                 raise InfraError("knowledge", f"MCPError {exc.code}: {exc.message}"[:DETAIL_LIMIT]) from exc
             return ToolOutput(f"{exc.code}: {exc.message}", is_error=True, error_class="MCPError")
         except Exception as exc:
+            if (
+                isinstance(exc, TimeoutError) and bound.expired()
+            ):  # the bound's own expiry, not a timeout the SDK raised
+                raise CallTimedOut(name, timeout_s) from None
             if _is_transport_error(exc):
                 raise InfraError("knowledge", _detail(exc)) from exc
             raise

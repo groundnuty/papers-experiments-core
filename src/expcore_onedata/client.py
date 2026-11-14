@@ -137,8 +137,13 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
   `application/octet-stream` for both, is confirmed by [L1]. `read_content` is a run of range reads, each streamed and
   hashed as it comes (O25).
-- A write of content without the `offset` query, which truncates the file first and which a restarted upload relies
-  on: only the provider's API description states it, and no source sends it; see `UNVERIFIED_ENDPOINTS`.
+- A write of content always names its `offset`: without one the provider truncates the file to 0 first (op-worker
+  f118ed9, file_content_rest_handler.erl:224-228), so `mutate` refuses it unsent
+  (`TruncatingWrite`, O44). An empty body at an offset past the file's end extends its size to that offset and writes
+  no block: measured on the Compose federation (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A
+  file at its final size with only a prefix written": a 204, the size read back, the block map the prefix alone), and
+  traced in op-worker f118ed9 (file_upload_utils.erl:136-150, read_write_req.erl:58-86, replica_updater.erl:187-192,
+  fslogic_blocks.erl:125-126, which drops the zero-size block). A preallocated ingest relies on it (#107).
 - `file_space_id`: `GET /data/{id}` with the query `attribute=parent_id`, answered `{"parent_id": <id>}`, and
   `{"parent_id": null}` for a space's root. Confirmed by [L1] (a file two levels down, its directory and the root, on
   each of the three providers), which also refuted the `path` attribute the gate read before: [S9], the earlier
@@ -167,9 +172,10 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   named only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET
   /data/{id}/qos/summary` (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}`
   (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only), `DELETE
-  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"`, the
-  recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`; answer
-  `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`). A cancel's and a
+  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"` (the
+  default), the recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`;
+  answer `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`) and sent by one
+  live run, the 14 Nov 2026 slot, which showed that it takes `include_directories`. A cancel's and a
   removal's space is read from the
   record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
   requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
@@ -186,9 +192,9 @@ or the range read is refused as not sent (`ScopeUnread`).
 A token ends with the lifetime it was minted with, which derives from the attempt's whole-time ceiling (O06), unless
 its user revokes it first: the one revocation this client sends is a slot user's own, of all its temporary tokens, at
 the end of a run that held the slot (C19). `UNVERIFIED_ENDPOINTS` lists what neither a source nor [L1] confirms: only
-the reset's QoS calls and its cancel, the truncation by a write of content without an offset, the reads of a user's
-Onezone admin privileges and of the clusters a token's user is a member of, Onezone's reading of the global clock, and
-the three calls of a run's revocation, since [L1] confirmed every other call and detail the layer relies on.
+the reset's QoS calls and its cancel, the reads of a user's Onezone admin privileges and of the clusters a token's user
+is a member of, Onezone's reading of the global clock, and the three calls of a run's revocation, since [L1] confirmed
+every other call and detail the layer relies on.
 Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
 """
@@ -212,7 +218,7 @@ from expcore.records.redact import register_secret
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
 from expcore_onedata.readretry import ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
-from expcore_onedata.streamed import Digest, media_type
+from expcore_onedata.streamed import Digest, ReadOutcome, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
@@ -239,17 +245,10 @@ PUBLIC_READS: tuple[str, ...] = (ZONE_TIME_PATH,)
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a writing
-# tool-server user's Onezone admin privileges and of the clusters its token's user is a member of, and Onezone's
-# reading of the global clock, which the transfer log and the reset's history place their window by.
+# live run has made yet, the reads of a writing tool-server user's Onezone admin privileges and of the clusters its
+# token's user is a member of, and Onezone's reading of the global clock, which the transfer log and the reset's
+# history place their window by.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
-    (
-        "PUT",
-        "/data/{id}/content",
-        "a provider call: a write without the offset query truncates the file to the bytes it sends, which a "
-        "restarted upload relies on; named only by the provider's API description (25.0), and every source sends an "
-        "offset [S8]",
-    ),
     (
         "DELETE",
         "/transfers/{id}",
@@ -277,9 +276,10 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "GET",
         "/data/{id}/files",
-        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, with "
-        "include_directories, which the provider's API description omits, and effQosInheritancePath; read from the "
-        "source of the federation's build (resetqos.py), never sent by a live run, and not the default until it is",
+        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, the default, "
+        "with include_directories, which the provider's API description omits, and effQosInheritancePath; read from "
+        "the source of the federation's build (resetqos.py), and sent by one live run (14 Nov 2026), which showed "
+        "it takes include_directories",
     ),
     (
         "GET",
@@ -410,6 +410,11 @@ class OutOfScope(NotSent):
     """A mutation's target is no study space, or a path leaves the API; the mutation was not sent."""
 
 
+class TruncatingWrite(OutOfScope):
+    """A write of content without a whole `offset` of 0 or more, which truncates the file to 0 before it writes
+    (op-worker f118ed9, file_content_rest_handler.erl:224-228); refused before anything is read or sent (O44)."""
+
+
 class ScopeUnread(NotSent):
     """A read the gate makes to find a request's target space failed, so the request was not sent (fail closed).
 
@@ -463,6 +468,20 @@ def _check_path(path: str) -> str:
     if not path.startswith("/") or path.startswith("//") or "://" in path or ".." in path.split("/") or "\\" in path:
         raise OutOfScope("the request path is not a plain path of the API")
     return path
+
+
+def _refuse_truncation(method: str, path: str, params: Mapping[str, Any] | None) -> None:
+    """Refuse a write of content (a PUT to a path that ends in `/content`) unless it names a whole offset of 0 or more:
+    without one, the provider truncates the file to 0 first, which would drop the blocks of a file that is still
+    arriving and of any baseline file (O44). An empty body at an offset is a write too, and is sent."""
+    if method != "PUT" or not path.rstrip("/").endswith("/content"):
+        return
+    offset = (params or {}).get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise TruncatingWrite(
+            "a write of content needs a whole offset of 0 or more: without one the provider truncates the file to 0 "
+            "first, so it is never sent"
+        )
 
 
 def _target_space_id(path: str) -> str:
@@ -863,11 +882,17 @@ class OnezoneClient:
         provider's `GET /spaces/{id}`, read once per space and provider and kept once it was answered. An absence
         (`answered_absent`) is a space the provider does not hold, left out and asked again next time; when the
         provider holds none of them, the target resolves to no space (OutOfScope). Any other failure, or an answer
-        without a plain id, raises PlatformError and keeps nothing of that space."""
+        without a plain id, raises PlatformError and keeps nothing of that space. The link check's probe space
+        (`[link_check]`, O35) is asked too, of a provider that supports it, so a probe file resolves to it; only a
+        request bound to it passes the gate there (`_require_in_scope`)."""
         roots: dict[str, str] = {}
         declared = self._config.spaces
         supported = [entry for entry in declared if provider in entry.support.providers] or declared
-        for space_id in dict.fromkeys(entry.space.id for entry in supported):
+        ids = [entry.space.id for entry in supported]
+        probe = self._config.link_check
+        if probe is not None and provider in probe.providers:
+            ids.append(probe.space.id)
+        for space_id in dict.fromkeys(ids):
             root = self._space_root(provider, space_id, reads)
             if root is not None:
                 roots[root] = space_id
@@ -1092,10 +1117,14 @@ class OnezoneClient:
     def _require_in_scope(self, target: tuple[str, str], space: Space | None) -> None:
         """Refuse a target space whose name starts with no declared space's prefix (every `[[spaces]]` entry's), and,
         for a request bound to one space (`space`), a target that is not that space: another id, another name, or a
-        name outside its own prefixes, whatever the other spaces' prefixes allow."""
+        name outside its own prefixes, whatever the other spaces' prefixes allow. A request bound to the link check's
+        probe space (`PlatformConfig.probe_space`, O35) passes on that space alone; no other request reaches it, since
+        its prefixes are not among the study's."""
         space_id, name = target
         if space is not None and (space_id != space.id or name != space.name or not name.startswith(space.prefixes)):
             raise OutOfScope("the target lies in another space than the one the request is bound to; nothing was sent")
+        if space is not None and space == self._config.probe_space:
+            return
         if not name.startswith(self._config.prefixes):
             raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
 
@@ -1143,6 +1172,7 @@ class OnezoneClient:
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
+        _refuse_truncation(method, path, params)
         media = UPLOAD_CONTENT_TYPE if content_type is None else media_type(content_type)
         self._base(provider)  # an undeclared provider is refused before anything is read
         self._require_in_scope(self._target(method, path, provider, json, _GateReads(gate_retry)), space)
@@ -1171,6 +1201,7 @@ class OnezoneClient:
         timeout_s: float | None = None,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        answers: Callable[[ReadOutcome], None] | None = None,
     ) -> bytes:
         """Read `length` bytes from `offset` of a file's content through a declared provider; return the bytes.
 
@@ -1178,8 +1209,13 @@ class OnezoneClient:
         that provider grows (on-the-fly replication). It changes state, so it passes the same gate as a mutation: the
         path must be `/data/{id}/content`, and the file's space must have a name that starts with a configured prefix,
         or nothing is sent; with `space`, that space alone, as for `mutate`. The answer must be a 206 whose
-        `Content-Range` starts at `offset` and matches the body, and the body must be `length` bytes unless the range
-        ends at the end of the file; anything else is refused. [S8]
+        `Content-Range` starts at `offset`, ends inside the file it names and matches the body, and the body must be
+        `length` bytes unless the range ends at the end of the file; anything else is refused, a 200 (the whole file,
+        whatever it holds) and an empty answer included. [S8]
+
+        `answers`, when given, is called once with what the platform answered (`ReadOutcome`: its status, its
+        `Content-Range` as sent and the bytes of its body) after the answer is accepted, so a range clipped at the end
+        of the file shows as its shorter range; a refused answer reports nothing (O37).
 
         `gate_retry` is the policy of the gate's reads alone, as for `mutate`; the range read itself is one request,
         since it may have made the provider fetch bytes.
@@ -1197,18 +1233,23 @@ class OnezoneClient:
             "GET", path, provider=provider, headers=headers, timeout_s=timeout_s, retry=ONE_ATTEMPT
         )
         label = self._base(provider)[1]
-        found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+        sent = response.headers.get("Content-Range")
+        found = _CONTENT_RANGE.fullmatch(sent or "")
         if response.status_code != 206 or found is None:
             raise PlatformError(f"{label}: a range read was not answered with a 206 and a Content-Range")
         first, last, total = (int(found.group(i)) for i in (1, 2, 3))
         body = response.content
         if (
             first != offset
+            or last < first
+            or last >= total
             or last - first + 1 != len(body)
             or len(body) > length
             or (len(body) < length and last + 1 != total)
         ):
             raise PlatformError(f"{label}: a range read was answered with another range than the one asked for")
+        if answers is not None:
+            answers(ReadOutcome(response.status_code, sent, len(body)))
         return body
 
     def read_content(
@@ -1224,9 +1265,12 @@ class OnezoneClient:
         clock: Callable[[], float] = time.monotonic,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        answers: Callable[[ReadOutcome], None] | None = None,
+        stop: int | None = None,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
-        size and the SHA-256 of what was read (O25).
+        size and the SHA-256 of what was read (O25). With `stop`, only the first `stop` bytes are read, each answer
+        still checked against the file's `size`: the prefix of a file at its final size (O44).
 
         Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
         delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of
@@ -1245,12 +1289,20 @@ class OnezoneClient:
         each is given what remains of the deadline when that read begins: its retries and pauses stay within it, so
         they never carry the gate past the deadline, and a read that begins after it was passed is made once. A range
         is streamed once, whatever the policy.
+
+        `answers`, when given, is called once per range, in order, after that range was read whole and found to be
+        exactly the range asked for, with what the platform answered (`ReadOutcome`: 206, the `Content-Range` as sent,
+        the bytes of the body); a range that is refused, or cut short, reports nothing, so a failed read has reported
+        the ranges that came before it and no more (O37).
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
             raise OutOfScope("a content read is of /data/{id}/content only")
         if size < 0 or chunk_bytes < 1 or not deadline_s > 0:
             raise OutOfScope("a streamed read needs its bounds: a size of zero or more, a positive chunk and deadline")
+        end = size if stop is None else stop
+        if not 0 <= end <= size:
+            raise OutOfScope("a streamed read's stop lies within the file's size")
         path = _check_path(path)
         base, label = self._base(provider)
         hasher, began = hashlib.sha256(), clock()
@@ -1266,22 +1318,29 @@ class OnezoneClient:
             if clock() - began > deadline_s:
                 raise PlatformError(late)
 
-        if size == 0:
+        if end == 0:
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
-        for first in range(0, size, chunk_bytes):
+        for first in range(0, end, chunk_bytes):
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
             remaining = deadline_s - (clock() - began)
             if remaining <= 0:
                 raise PlatformError(late)
             wait = min(timeout_s if timeout_s is not None else self._timeout_s, remaining)
-            self._stream_range(base + path, label, (first, min(chunk_bytes, size - first), size), wait, consume)
-        return Digest(size, hasher.hexdigest())
+            self._stream_range(base + path, label, (first, min(chunk_bytes, end - first), size), wait, consume, answers)
+        return Digest(end, hasher.hexdigest())
 
     def _stream_range(
-        self, url: str, label: str, span: tuple[int, int, int], wait: float, consume: Callable[[bytes], None]
+        self,
+        url: str,
+        label: str,
+        span: tuple[int, int, int],
+        wait: float,
+        consume: Callable[[bytes], None],
+        answers: Callable[[ReadOutcome], None] | None = None,
     ) -> None:
         """Stream one range, `span` = (first byte, length, the file's size), to `consume` piece by piece; refuse an
-        answer that is not exactly that range of a file of that size."""
+        answer that is not exactly that range of a file of that size. Once it is whole, `answers` is told what the
+        platform answered."""
         first, length, total = span
         last = first + length - 1
         got = 0
@@ -1295,7 +1354,8 @@ class OnezoneClient:
                     raise PlatformError(
                         _answered(label, "GET", status, code, errno), status=status, code=code, errno=errno
                     )
-                found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+                sent = response.headers.get("Content-Range")
+                found = _CONTENT_RANGE.fullmatch(sent or "")
                 if status != 206 or found is None:
                     raise PlatformError(f"{label}: a streamed read's range was not answered with a 206 and a range")
                 if tuple(int(found.group(i)) for i in (1, 2, 3)) != (first, last, total):
@@ -1309,6 +1369,8 @@ class OnezoneClient:
             raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
         if got != length:
             raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
+        if answers is not None:
+            answers(ReadOutcome(status, sent, got))
 
     def content_answer(
         self, path: str, *, provider: str, first_byte: bool, timeout_s: float | None = None

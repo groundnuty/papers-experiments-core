@@ -12,7 +12,9 @@ from expcore_onedata.client import (
     OutOfScope,
     PlatformError,
     ScopeUnread,
+    TruncatingWrite,
 )
+from expcore_onedata.streamed import ReadOutcome
 from expcore_onedata.testing import DATA, PROVIDER, ROOT_ID, SPACE_NAME
 from expcore_onedata.testing.fake_federation import ZONE
 
@@ -500,6 +502,48 @@ def test_a_range_read_refuses_an_answer_that_is_not_the_range_asked_for(config, 
         read(client)
 
 
+def test_o35_a_range_read_reports_the_status_and_the_range_it_was_answered_with(config):
+    """O37: the bytes are returned as before, and `answers` is told, once, what the platform answered: its status, its
+    Content-Range as sent, and the bytes of the body."""
+    client, _ = scripted(config, ranged(206, b"abcde", "bytes 10-14/100"))
+    got = []
+    assert read(client, answers=got.append) == b"abcde"
+    assert got == [ReadOutcome(206, "bytes 10-14/100", 5)]
+
+
+def test_o35_a_range_clipped_at_the_end_of_the_file_reports_the_range_it_got_and_its_shorter_body(config):
+    """O37: a range that runs past the end is answered with its clipped range and fewer bytes than asked for; the
+    outcome says so, so a reader tells a clipped answer from a whole one without the request."""
+    client, _ = scripted(config, ranged(206, b"abc", "bytes 10-12/13"))
+    got = []
+    assert read(client, answers=got.append) == b"abc"
+    assert got == [ReadOutcome(206, "bytes 10-12/13", 3)]
+    assert got[0].to_json() == {"status": 206, "content_range": "bytes 10-12/13", "body_bytes": 3}
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "content_range"),
+    [
+        (200, b"abcde", None),  # the whole file, not a range
+        (200, b"abcde", "bytes 10-14/100"),  # a 200 is never a range read, whatever it says
+        (206, b"abcde", None),  # no Content-Range
+        (206, b"abcde", "bytes 10-14/12"),  # a range that ends past the end of the file it names
+        (206, b"", "bytes 10-9/10"),  # an empty body at the end of the file: no byte of the range asked for
+        (206, b"abcde", "bytes 10-14/*"),  # a file of no known size
+    ],
+)
+def test_o35_an_answer_that_is_not_the_range_asked_for_is_refused_and_never_reported_as_it(
+    config, status, body, content_range
+):
+    """O37: a refused answer reports nothing to `answers`, so no consumer takes a whole file, a range that does not
+    fit its file or an empty answer for the bytes asked for."""
+    client, _ = scripted(config, ranged(status, body, content_range))
+    got = []
+    with pytest.raises(PlatformError):
+        read(client, answers=got.append)
+    assert got == []
+
+
 def test_the_range_header_is_sent_to_the_named_provider_with_the_admin_credential(config):
     client, seen = scripted(config, ranged(206, b"abcde", "bytes 10-14/100"))
     read(client)
@@ -515,6 +559,42 @@ def test_mutate_sends_query_parameters_and_a_raw_body(config, seeded, client):
     sent = [r for r in seeded.requests if r.method == "PUT"]
     assert sent[0].query == {"offset": "7"}
     assert sent[0].body == b"\x00\x01"
+
+
+@pytest.mark.parametrize(
+    ("params", "path"),
+    [
+        (None, "/data/{id}/content"),
+        ({}, "/data/{id}/content"),
+        ({"limit": 1}, "/data/{id}/content"),
+        ({"offset": None}, "/data/{id}/content"),
+        ({"offset": -1}, "/data/{id}/content"),
+        ({"offset": True}, "/data/{id}/content"),
+        ({"offset": 1.0}, "/data/{id}/content"),
+        ({"offset": "0"}, "/data/{id}/content"),
+        (None, "/data/{id}/content/"),
+    ],
+)
+def test_o44_a_content_write_without_an_offset_is_refused_before_anything_is_read_or_sent(
+    config, seeded, client, params, path
+):
+    """O44: a write of content without the `offset` query truncates the file to 0 first (op-worker f118ed9,
+    file_content_rest_handler.erl:224-228), so the client refuses it, a whole offset of 0 or more being the only kind
+    it sends: nothing is read for its gate and nothing is sent, and the file keeps its bytes."""
+    file_id = seeded.id_of(PATH)
+    with pytest.raises(TruncatingWrite, match="offset"):
+        client.mutate("PUT", path.format(id=file_id), provider="alpha", params=params, content=b"x")
+    assert seeded.provider_calls == []
+    assert bytes(seeded.nodes[file_id].content) == DATA
+
+
+def test_o44_a_content_write_at_an_offset_and_an_empty_one_are_sent(config, seeded, client):
+    """O44: an offset of 0 or more passes, an empty body too (the write that extends a file's size, #107)."""
+    file_id = seeded.id_of(PATH)
+    client.mutate("PUT", f"/data/{file_id}/content", provider="alpha", params={"offset": 0}, content=b"y")
+    client.mutate("PUT", f"/data/{file_id}/content", provider="alpha", params={"offset": 8192}, content=b"")
+    assert [r.query for r in seeded.requests if r.method == "PUT"] == [{"offset": "0"}, {"offset": "8192"}]
+    assert len(seeded.nodes[file_id].content) == 8192
 
 
 def test_o09_a_raw_body_is_sent_as_an_octet_stream_and_nothing_else_is_marked_so(config):

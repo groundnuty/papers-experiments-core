@@ -14,7 +14,7 @@ import pytest
 
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, answered_absent
 from expcore_onedata.provision import ProvisionError
-from expcore_onedata.streamed import OCTET_STREAM, Digest
+from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome
 from expcore_onedata.testing import BETA_ID, DATA, PROVIDER, SETTINGS
 from expcore_onedata.testing.fake_federation import ZONE
 
@@ -223,7 +223,7 @@ def test_o25_an_upload_without_a_stop_of_a_local_file_that_grows_meanwhile_fails
     source = local_file(tmp_path, BULKY)
     real = type(provisioner)._write_chunks
 
-    def appending_after_the_first_block(self, file_id, blocks, media, *, truncate=False):
+    def appending_after_the_first_block(self, file_id, blocks, media):
         def blocks_then_append():
             for number, block in enumerate(blocks):
                 yield block
@@ -231,7 +231,7 @@ def test_o25_an_upload_without_a_stop_of_a_local_file_that_grows_meanwhile_fails
                     with open(source, "ab") as handle:
                         handle.write(b"appended" * CHUNK)
 
-        return real(self, file_id, blocks_then_append(), media, truncate=truncate)
+        return real(self, file_id, blocks_then_append(), media)
 
     monkeypatch.setattr(type(provisioner), "_write_chunks", appending_after_the_first_block)
     with pytest.raises(ProvisionError, match="changed size"):
@@ -246,33 +246,37 @@ def test_o25_a_stop_outside_the_local_file_is_refused_before_anything_is_sent(pr
     assert changes(fake) == []
 
 
-def test_o25_a_target_this_provisioner_made_that_differs_is_written_again_from_a_truncating_first_write(
+def test_o44_a_target_this_provisioner_made_that_differs_and_is_no_longer_is_written_again_at_explicit_offsets(
     provisioner, fake, tmp_path
 ):
-    """O25: a target that holds more bytes than the local file, or as many but other ones, is no prefix. The first
-    write goes without an offset, which truncates the file (the API's rule), and the rest follow at their offsets."""
-    made = provisioner.upload(TARGET, local_file(tmp_path, BULKY + b"tail"))
+    """O25, O44: a target as long as the local file but with other bytes, or shorter with bytes that are no prefix, is
+    written again from its first byte, every write at its offset: no write goes without one, which would truncate."""
+    made = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
 
-    def restarted():
+    def restarted(content):
         done = len(writes(fake))
-        result = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
+        result = provisioner.upload(TARGET, local_file(tmp_path, content))
         assert (result.action, result.file_id) == ("restarted", made.file_id)
-        first, *rest = writes(fake)[done:]
-        assert "offset" not in first.query
-        assert [int(r.query["offset"]) for r in rest] == list(range(CHUNK, len(BULKY), CHUNK))
-        assert stored(fake, made.file_id) == BULKY
+        assert [int(r.query["offset"]) for r in writes(fake)[done:]] == list(range(0, len(content), CHUNK))
+        assert stored(fake, made.file_id) == content
 
-    restarted()  # the target was longer
     fake.nodes[made.file_id].content[100] ^= 0xFF  # one byte of the target changed behind the upload
-    restarted()
+    restarted(BULKY)
+    restarted(b"other" + BULKY + b"tail")  # the target is shorter and no prefix of it
+    assert all("offset" in r.query for r in writes(fake))
 
 
-def test_o25_an_empty_file_over_a_longer_target_truncates_it(provisioner, fake, tmp_path):
-    """O25: an empty local file has no chunk to send, so the truncating write goes with an empty body."""
-    made = provisioner.upload(TARGET, local_file(tmp_path, DATA))
-    result = provisioner.upload(TARGET, local_file(tmp_path, b"", name="empty.bin"))
-    assert (result.action, result.digest) == ("restarted", digest(b""))
-    assert stored(fake, made.file_id) == b""
+@pytest.mark.parametrize("local", [BULKY[:-1], b""])
+def test_o44_a_target_longer_than_the_local_file_is_refused_and_nothing_is_written(provisioner, fake, tmp_path, local):
+    """O44: only a write without an offset could shorten a file (to 0, then the bytes it sends), and none is sent, so
+    an upload over a longer target the provisioner made is refused before anything is written, an empty local file
+    included; the target keeps its bytes. The caller removes the file first."""
+    made = provisioner.upload(TARGET, local_file(tmp_path, BULKY))
+    done = len(writes(fake))
+    with pytest.raises(ProvisionError, match="longer"):
+        provisioner.upload(TARGET, local_file(tmp_path, local, name="shorter.bin"))
+    assert writes(fake)[done:] == []
+    assert stored(fake, made.file_id) == BULKY
 
 
 def test_o25_a_differing_file_this_provisioner_did_not_create_is_refused_and_nothing_is_sent(
@@ -486,6 +490,55 @@ def test_o25_a_range_answered_with_other_bytes_than_asked_for_is_refused(config,
     client = answering(config, lambda request: httpx.Response(status, content=body, headers=headers))
     with pytest.raises(PlatformError):
         client.read_content("/data/fid/content", provider="alpha", size=8, chunk_bytes=4, deadline_s=5)
+
+
+def test_o35_a_streamed_read_reports_each_range_it_was_answered_with(config):
+    """O37: `answers` is told once per range, in order, with the status, the Content-Range as sent and the body's
+    bytes of that range; the digest is what it was."""
+    content = bytes(range(8))
+
+    def ranges(request):
+        first, last = (int(x) for x in request.headers["Range"].removeprefix("bytes=").split("-"))
+        return httpx.Response(
+            206, content=content[first : last + 1], headers={"Content-Range": f"bytes {first}-{last}/8"}
+        )
+
+    got = []
+    found = answering(config, ranges).read_content(
+        "/data/fid/content", provider="alpha", size=8, chunk_bytes=4, deadline_s=5, answers=got.append
+    )
+    assert found == digest(content)
+    assert got == [ReadOutcome(206, "bytes 0-3/8", 4), ReadOutcome(206, "bytes 4-7/8", 4)]
+
+
+def test_o35_a_streamed_read_whose_second_range_is_refused_has_reported_only_the_first(config):
+    """O37: a range answered with the whole file is refused and never reported; the range before it, accepted, was."""
+    content = bytes(range(8))
+
+    def answer(request):
+        if request.headers["Range"] == "bytes=0-3":
+            return httpx.Response(206, content=content[:4], headers={"Content-Range": "bytes 0-3/8"})
+        return httpx.Response(200, content=content)
+
+    got = []
+    with pytest.raises(PlatformError):
+        answering(config, answer).read_content(
+            "/data/fid/content", provider="alpha", size=8, chunk_bytes=4, deadline_s=5, answers=got.append
+        )
+    assert got == [ReadOutcome(206, "bytes 0-3/8", 4)]
+
+
+def test_o35_the_provisioners_reads_pass_the_answers_on(provisioner, seeded):
+    """O37: `read_file` and `fetch` take `answers` and hand it to the client's reads, so a study that reads through the
+    provisioner sees each answer's status and range too."""
+    file_id = seeded.id_of(SEEDED)
+    got = []
+    assert provisioner.fetch("alpha", file_id, 10, 20, answers=got.append) == DATA[10:30]
+    assert got == [ReadOutcome(206, f"bytes 10-29/{len(DATA)}", 20)]
+    got.clear()
+    assert provisioner.read_file(file_id, answers=got.append) == digest(DATA)
+    assert {o.status for o in got} == {206}
+    assert sum(o.body_bytes for o in got) == len(DATA)
 
 
 def test_o25_a_read_that_passes_its_deadline_stops(config):

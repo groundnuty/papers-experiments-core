@@ -15,6 +15,7 @@ the kill past the grace period has the mount aborted under it, or the sandbox st
 is published from the timer's thread under `meta_lock`, before the sandbox's stop, which runs after it. Every wait for
 that outcome, the cell's own included, lasts at most the margin and `SETTLE_SLACK_S`: an outcome not decided by then,
 like an escalation that raised and whose quiesce did not show the cell gone, is `survived_kill`, never a clean kill.
+The first end published stands: an outcome decided later is kept among the cell's deadlines, never made the run's end.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from expcore_onedata.sandbox import bounds as BD
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
@@ -306,12 +308,16 @@ class CellRunner:
 
     def _publish(self, cell: int, record: dict[str, Any]) -> Callable[[], None] | None:
         """Publish a deadline's record under the metadata's lock, under `cell_deadlines` and, for an escalated outcome,
-        as `ended`; the sandbox's stop it orders, for the timer to run once the outcome is decided."""
+        as `ended` unless the run's end is published already; the sandbox's stop it orders, for the timer to run once
+        the outcome is decided."""
         outcome = record["outcome"]
         with self.meta_lock:
             self._deadline = record
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})  # shares the record's steps
-            if outcome in DL.ESCALATED:  # the run is over from now, whatever the cell's record makes of it after
+            # the run is over from now, whatever the cell's record makes of it after. An end already published stands:
+            # a bounded wait that gave up on this outcome ended the run as `survived_kill` (`_end`, `settle`), and the
+            # cell and its attempt were classified by it, so a late outcome is kept above and never replaces it (#226)
+            if outcome in DL.ESCALATED and self.ended is None:
                 self.ended = record
         if outcome in DL.ESCALATED:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
@@ -388,8 +394,10 @@ class CellRunner:
         timer records that it fired and kills every process of the agent's container, a detached worker included; the
         container and the run's evidence stay. `timeout` inside the container is only a backstop, `CAP_MARGIN_S` later,
         should that kill not land. A time limit is that record and nothing else: never the elapsed time, nor 137 (O17).
-        A cell left less than a second once it is prepared is not started at all (`NOT_STARTED`): no timer ran, so none
-        fired, and it is no timeout; the loop's own time rule says what the run's time running out means.
+        With `record=False` no timer runs, and the backstop is the only bound: a cell it killed after the whole of its
+        limit (exit 137 or 124) is `timed_out` with `bound` naming it, and one that exited so sooner is its own (O39,
+        `bounds`). A cell left less than a second once it is prepared is not started at all (`NOT_STARTED`): no timer
+        ran, so none fired, and it is no timeout; the loop's own time rule says what the run's time running out means.
         """
         if not timeout_s >= 1:
             raise ValueError("timeout_s must be at least 1 second (GNU timeout treats 0 as no limit)")
@@ -398,7 +406,8 @@ class CellRunner:
         before = (self._events_seen or self._obs.memory_facts(agent)["events"]) if record else None
         up0 = self._obs.uptime() if record else None
         remaining = timeout_s - (time.monotonic() - entered)
-        limit = f"{max(remaining, 1.0) + CAP_MARGIN_S:.3f}"  # the backstop; the harness's timer below comes first
+        limit_s = max(remaining, 1.0) + CAP_MARGIN_S  # the backstop; the harness's timer below comes first
+        limit = f"{limit_s:.3f}"
         argv = [
             "exec",
             "-i",
@@ -434,8 +443,12 @@ class CellRunner:
                 gave_up, err = True, "docker exec did not return"
             used = time.monotonic() - entered
             res = ExecResult(out, err, rc, time.monotonic() - t0, timed_out=gave_up or fired)
+            bound = BD.named(fired=fired, gave_up=gave_up, exit_code=rc, ran_s=res.duration_s, limit_s=limit_s)
             if record:
                 self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, deadline, wall0)
+                res.bound = bound if res.timed_out else None
+            else:  # no timer ran: only the container's own bound, or the host's giving up, can have ended it (O39)
+                res.timed_out, res.bound = bound is not None, bound
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
             if not timer_ended:  # one wait for the outcome, bounded, whichever way the cell ended
                 self._end(timer, cell)

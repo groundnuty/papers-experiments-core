@@ -9,12 +9,12 @@ Sources are op-worker `f118ed9` (paths below are its own) and ctool `8ae7baf` (`
 (`src/modules/qos/qos_traverse.erl:298-305,332-338`), so the transfer listing cannot show one either. `[placement]
 qos_scan` chooses how the reset finds them:
 
-- `summaries` (the default): on every provider, the space is walked, each directory listed once, and the summary of
+- `summaries`: on every provider, the space is walked, each directory listed once, and the summary of
   the root and of every leaf is read; a leaf's summary holds the requirements on it and on every ancestor
   (`file_middleware_get_handler.erl:493-500`), so together they hold every requirement. One read per leaf per
   provider: about 52,000 reads for a large tree (#209).
-- `listing`: on **every provider that supports the space**, one recursive listing of the space root, `GET
-  /data/{root}/files` with `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`,
+- `listing` (the default): on **every provider that supports the space**, one recursive listing of the space root,
+  `GET /data/{root}/files` with `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`,
   `include_directories=true` and `limit`, its pages followed by `token` until `nextPageToken` is null
   (`basic_file_operations_rest_routes.erl:59-70`; the parameters, query or JSON body,
   `file_middleware_get_handler.erl:124-138`, `rest_handler.erl:313-325`; the answer, `files`, `inaccessiblePaths` and
@@ -32,12 +32,17 @@ qos_scan` chooses how the reset finds them:
   read on each provider that marks it. For N supporting providers the scan makes, besides each provider's read of the
   space root, N x ceil(E / `LISTING_PAGE`) page reads for E entries, one summary per entry per provider that marks it
   (a handful), and one record per requirement; the record gives `listings`, `listing_pages`, `summaries` and `records`.
-  **A fact it rests on is not verified live:** that the listing takes `include_directories` (the code does,
-  `file_middleware_get_handler.erl:131,404`; the REST description omits it). The gated live tests in
-  `tests/live/test_contract.py` (O33) check it, and also that a requirement added through one provider is found
-  through another once dbsync settles (each provider's QoS view is built from the synced requirement documents,
-  `src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`), which the reset itself no longer
-  needs to find a requirement; until the first has passed on the federation, `summaries` stays the default.
+  **The live facts** (the combined live slot of 14 Nov 2026, the 25.0 development build, op-worker `f118ed9`,
+  `deploy/compose-federation/day0/2026-11-14-federation-facts-slot.md`): **the recursive listing took
+  `include_directories`** (the code does, `file_middleware_get_handler.erl:131,404`; the REST description omits it):
+  1,210 entries in 2 pages of 1,000. **A requirement added through the mirror was found by the data provider's
+  recursive listing** (`effQosInheritancePath` marking the entry) after 3.89 s, two polls, measured by hand: the gated
+  test's own POST went through the mirror before the mirror knew the file and was refused (`OutOfScope`), a defect of
+  the test. Each provider's QoS view is built from the synced requirement documents
+  (`src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`). **Still not measured
+  separately:** that the provider a requirement is added through shows it in its own listing at once, the premise for
+  listing every provider. The quiet stage catches a replication's effect regardless, apart from the documented
+  residual (below). Both facts have their gated live test in `tests/live/test_contract.py` (O33).
 
 **The run's own** are removed by `resetremove.py`: each waited on until it is fulfilled or impossible on every
 provider, deleted, and its deletion waited on until every provider has processed it. The regular files at or under a
@@ -46,8 +51,9 @@ removed requirement's entry are the affected files.
 **Settled, then quiet.** A QoS replication has no transfer to wait for, and a cancel can still place the blocks it had
 in flight. So after the removal the affected files' block maps, on every provider, must stay the same for
 `SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND_S`, or the reset fails. After the eviction and the
-occupancy the quiet stage reads, at one instant T, the block maps of the files the eviction plan evicted, on the
-providers it evicted them from, and of the files a removed requirement applied to, on every provider. Each may hold no
+occupancy, read once every eviction's change can show (below), the quiet stage reads, at one instant T, the block maps
+of the files the eviction plan evicted, on the providers it evicted them from, and of the files a removed requirement
+applied to, on every provider. Each may hold no
 more than it should: nothing where the eviction verified it empty, what the settle saw elsewhere. Then it waits
 `quiet_wait_s` from T and reads the occupancy: no provider other than the data provider may hold more of the space than
 at the occupancy stage. That check does not wait for a requirement to be found: an agent can add one and remove it
@@ -73,15 +79,29 @@ placement:
 - each directory above the parent gets it when the parent's collector flushes, 5 s after its first unflushed change
   (`FLUSH_INTERVAL_MILLIS`, `dir_stats_collector.erl:168,905-918,1037-1057`);
 - so the space root's physical size reflects a placement at most 10 + 5 x (L - 1) s later, L being the levels from the
-  file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`). An eviction flushes at once
-  (`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level above the parent.
+  file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`).
 
-The quiet wait is that lag for the deepest file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest
-regular file of the space, as the scan saw it, since a replication nothing names could reach any file, or the deepest
-affected file when the caller knows the run could set no requirement. So the occupancy is read when every placement
-that landed by T shows in it. Another study measured 9.5 s for a directory after a placement and 0.05 s after an
-eviction, which this fits. A space with directory statistics off answers no physical size at all, and the occupancy
-stage already fails on it.
+**An eviction lags as long (O46).** The source suggests an eviction's change skips the location's flush
+(`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level, and another study measured 0.05 s; the 14 Nov
+live slot (`deploy/compose-federation/day0/2026-11-14-federation-facts-slot.md`, item 4, op-worker f118ed9) saw a
+mirror's root size drop 20.03 s after an eviction at depth 3 was scheduled, the eviction job's own run included, where
+it grew 15.91 s after a placement at that depth (bound 20 s) and 10.76 s at depth 2 (bound 15 s). The slot cannot say
+how much of the 20.03 s was the job's run, so the reset takes **the conservative reading:** an eviction's change lags
+by the placement's bound, 10 + 5 x (L - 1) s, counted from when the reset knows every eviction had finished, the
+eviction stage's end, at or after each eviction job's finish and its block-map verification. Counted from the
+scheduling instead, the measured 20.03 s is past the bound alone and within the bound and margin, 25 s.
+
+So two reads of the occupancy wait. The occupancy stage waits `occupancy_wait_s` from the eviction stage's end, the
+lag for the deepest regular file of the space plus `QUIET_MARGIN_S`: every eviction and every transfer had ended by
+then, the reset's and an earlier run's, at any depth, and the stage keeps a reading only when the transfer listings
+show none ran or ended since (`reset.py`, waiting again otherwise), so its figure shows them all, and the quiet stage
+holds the occupancy to a figure that no longer counts bytes already evicted. Read sooner, that figure still held
+them, and the quiet stage passed a growth up to their size: a false certification. The quiet wait is the same lag for
+the deepest
+file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest regular file of the space, as the scan saw it,
+since a replication nothing names could reach any file, or the deepest affected file when the caller knows the run
+could set no requirement. So the occupancy is read when every placement that landed by T shows in it. A space with
+directory statistics off answers no physical size at all, and the occupancy stage already fails on it.
 """
 
 import re
@@ -117,6 +137,12 @@ def occupancy_lag_s(depth: int) -> float:
 def quiet_wait_s(depth: int) -> float:
     """The quiet stage's wait from T to the occupancy read, for files at most `depth` path parts below the root: the
     lag, by which every placement that landed by T shows, and `QUIET_MARGIN_S`."""
+    return occupancy_lag_s(depth) + QUIET_MARGIN_S
+
+
+def occupancy_wait_s(depth: int) -> float:
+    """The occupancy stage's wait from the eviction stage's end to its read, for files at most `depth` path parts below
+    the root: the same lag, which an eviction's change has too (O46), and `QUIET_MARGIN_S`."""
     return occupancy_lag_s(depth) + QUIET_MARGIN_S
 
 
@@ -414,6 +440,7 @@ __all__ = [
     "SETTLE_STABLE_S",
     "Found",
     "occupancy_lag_s",
+    "occupancy_wait_s",
     "plain_id",
     "quiet",
     "quiet_wait_s",
