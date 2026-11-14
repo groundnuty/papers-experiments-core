@@ -52,7 +52,7 @@ as the outage (O10, O11, C01).
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from expcore.errors import InfraError, register_infra_kind
+from expcore.errors import PROVIDER_OUTAGE, InfraError, register_infra_kind
 from expcore.records.injections import INJECTOR_FAILURE  # the core names it: it sets an attempt aside as this kind
 from expcore_onedata.sandbox import infradeath, killcause
 
@@ -73,7 +73,6 @@ register_infra_kind(
     "says nothing about the agent or the manipulation",
     treatable=False,
 )
-PROVIDER_OUTAGE = "provider_outage"
 register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable", requires_target=True)
 register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
 

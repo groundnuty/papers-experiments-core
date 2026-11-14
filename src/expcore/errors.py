@@ -70,6 +70,11 @@ CORE_KINDS = (
 TOOL_PLANE_INTEGRITY = "tool_plane_integrity"
 BUDGET_HOLD = "budget_hold"
 POST_CHECK_UNVERIFIED = "post_check_unverified"
+# The fault injector's outage: a fault on one target, held to its declared target by the core whoever registers the kind.
+# The name is the core's, as the injector's reading is (`expcore.records.injections`), so a study that declares a kind of
+# this name of its own (`[study.kinds]`) in a process that never imported a platform is held to it too.
+PROVIDER_OUTAGE = "provider_outage"
+TARGETED_NAMES = frozenset({PROVIDER_OUTAGE})
 # The core's kinds that no condition may declare as its treatment, and why.
 CORE_UNTREATABLE: dict[str, str] = {
     TOOL_PLANE_INTEGRITY: "a run whose tool plane failed its integrity checks says nothing about the manipulation",
@@ -222,13 +227,18 @@ def register_infra_kind(
     target it manipulates: the plain name would score any target's failure as the manipulation, so the factor schema
     refuses it and `Outcome.is_treatment` never scores such a kind that has no declared target. It must be treatable,
     since a kind that is never a treatment has no declaration to name a target in, and it cannot be made targetless,
-    or a plain kind targeted, by registering it again.
+    or a plain kind targeted, by registering it again. The name `provider_outage` is held to a target whoever registers
+    it, and is refused without `requires_target=True`.
     """
     _check_name(kind, description)
     if not charged and treatable:
         raise ValueError(f"infrastructure kind {kind!r} costs no attempt, so it must be registered treatable=False")
     if requires_target and not treatable:
         raise ValueError(f"infrastructure kind {kind!r} is never a treatment, so it names no target to require")
+    if kind in TARGETED_NAMES and not requires_target:
+        raise ValueError(
+            f"infrastructure kind {kind!r} is a fault on one target, so it must be registered requires_target=True"
+        )
     with _scope_lock:
         if kind in _study_kinds:
             raise ValueError(f"infrastructure kind {kind!r} is declared by the study in scope ([study.kinds])")
@@ -289,7 +299,7 @@ class _View(NamedTuple):
 def _view() -> _View:
     """Take one view of the vocabulary under the lock: registration and scopes change it under the same lock."""
     with _scope_lock:
-        targeted = frozenset(k for k in _platform_targeted if k in _platform_kinds)
+        targeted = frozenset(k for k in _platform_targeted if k in _platform_kinds) | TARGETED_NAMES
         return _View(dict(_platform_kinds), dict(_platform_untreatable), _study_kinds, targeted)
 
 
@@ -328,7 +338,8 @@ def treatment_vocabulary() -> Vocabulary:
 def targeted_kinds() -> frozenset[str]:
     """Return the kinds that are a fault on one target: a condition declares them as its treatment only with the target
     it manipulates (`register_infra_kind(..., requires_target=True)`), and `Outcome.is_treatment` never scores one that
-    has none. A kind outside the vocabulary is not among them."""
+    has none. They are the platforms' registered with `requires_target=True` and the names the core holds to a target
+    whoever registers them (`TARGETED_NAMES`, the provider outage), a study's own kind of such a name included."""
     return _view().targeted
 
 

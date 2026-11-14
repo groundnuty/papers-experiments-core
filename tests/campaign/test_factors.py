@@ -8,6 +8,7 @@ from campaign_support import STUDY_TOML, chain_schema, make_schema, treatment_sc
 from expcore import errors
 from expcore.campaign.factors import FactorSchema, PlanError, RunKey, load_factor_schema
 from expcore.config.loading import ConfigError
+from expcore.loop.outcomes import Outcome
 
 
 def test_the_study_file_loads_into_a_schema(tmp_path):
@@ -518,6 +519,20 @@ def test_c34_a_schema_cut_to_the_kind_names_alone_loses_the_target_and_is_refuse
         FactorSchema(base.declared, base.order, base.conditions, treatment=names_only)
     kept = {"api-none": [{"kind": k, "target": t} for k, t in schema.treatment_targets["api-none"].items()]}
     assert FactorSchema(base.declared, base.order, base.conditions, treatment=kept).digest == schema.digest
+
+
+def test_c34_a_study_s_own_kind_named_provider_outage_is_held_to_a_target_too(tmp_path, registry):
+    """C34: in a process that never imported the platform, a study that declares a kind named `provider_outage` of its
+    own in `[study.kinds]` is held to the same rule: its plain name is refused, and no outage is scored as its
+    treatment without a declared target, whichever provider failed and whatever the injector held."""
+    plain = TREATMENT_TOML.replace('"sandbox", "endpoint"', '"provider_outage"')
+    with errors.study_kinds({"provider_outage": errors.StudyKind("a study's own outage")}):
+        with pytest.raises(ConfigError, match=r"\[conditions\.api-none\].*'provider_outage'.*no target"):
+            load_factor_schema(write_study(tmp_path, plain))
+        outage = Outcome("infrastructure", "down", infra_kind="provider_outage", infra_target="providers[0]")
+        assert outage.is_treatment(("provider_outage",), 1, injected={"providers[0]"}) is False
+        declared = {"provider_outage": "providers[0]"}
+        assert outage.is_treatment(("provider_outage",), 1, treatment_targets=declared, injected={"providers[0]"})
 
 
 def test_o05_a_schema_built_in_code_refuses_an_untreatable_kind_too(registry):
