@@ -184,10 +184,14 @@ class FactorSchema:
         plain dicts. A study that builds its configuration in code (a smoke cut, a selection) hands over a schema
         built earlier, perhaps outside the scope of its own kinds, perhaps edited since; this is the check that the
         schema it hands over holds against the vocabulary in scope now, including that a kind that is a fault on one
-        target still names it (C34). The result is equal to the schema when it passes; a failure is the constructor's
-        own, naming the file and the key.
+        target still names it (C34). A failure of a rule is the constructor's own, naming the file and the key.
+
+        What the constructor derives from the parts (the lookup of a run's levels to its condition, the digest) is
+        compared with the result too: a schema whose conditions were swapped or edited after it was built would
+        otherwise resolve a run key to another condition's treatment, or fingerprint as what it no longer is. Such a
+        schema is refused, so the schema returned is always equal to this one.
         """
-        return FactorSchema(
+        again = FactorSchema(
             self.declared,
             self.order,
             self.conditions,
@@ -196,6 +200,12 @@ class FactorSchema:
             exclusive=self.exclusive,
             file=self.file,
         )
+        where = Section({}, self.file, "the schema")
+        if again._by_levels != self._by_levels:
+            raise where.fail(None, "no longer matches the lookup of its conditions: it was edited after it was built")
+        if again.digest != self.digest:
+            raise where.fail(None, "no longer matches its digest: it was edited after the digest was taken")
+        return again
 
     # --- validation ---------------------------------------------------------------------------------------------
 

@@ -185,6 +185,30 @@ def test_c35_a_cut_of_tasks_that_leaves_a_condition_naming_a_task_it_dropped_is_
     assert not (loaded.root / "out").exists()
 
 
+@pytest.mark.parametrize(
+    ("seeds", "fragment"), [((), "the plan needs at least one seed"), ((1, 1), "seed 1 appears more than once")]
+)
+def test_c35_a_plan_that_does_not_expand_is_a_config_error_naming_campaign_toml(tmp_path, seeds, fragment):
+    """C35: an empty or repeated seed list is a plan error of the schema; the entry names it for campaign.toml as a
+    ConfigError, so a caller has the one error to expect, and nothing is written."""
+    loaded = load_study(make_copy(tmp_path, "bad-seeds"))
+    cut = dataclasses.replace(loaded, campaign=dataclasses.replace(loaded.campaign, seeds=seeds))
+    with pytest.raises(ConfigError, match=rf"campaign\.toml: the plan does not expand: {fragment}"):
+        run_built_study(cut)
+    assert not (loaded.root / "out").exists()
+
+
+def test_c35_a_schema_whose_conditions_were_swapped_is_refused_before_anything_is_written(tmp_path):
+    """C35: the schema's lookup of a run's condition is derived when it is built; a config whose conditions were swapped
+    afterwards would score a run under the other condition's treatment, so the entry refuses it."""
+    loaded = load_study(make_copy(tmp_path, "swapped"))
+    conditions = loaded.schema.conditions
+    conditions["baseline"], conditions["relay-down"] = conditions["relay-down"], conditions["baseline"]
+    with pytest.raises(ConfigError, match=r"the schema: no longer matches the lookup of its conditions"):
+        run_built_study(loaded)
+    assert not (loaded.root / "out").exists()
+
+
 def test_c35_a_task_without_the_attribute_a_contrast_clusters_by_is_refused(tmp_path):
     """C35: a contrast clusters by an attribute every task has; a task built without it would silently leave the
     contrast, and the loader refuses that, so the entry does too."""

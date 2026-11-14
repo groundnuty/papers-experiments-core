@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.config import CampaignConfig, load_campaign
-from expcore.campaign.factors import FactorSchema, load_factor_schema
+from expcore.campaign.factors import FactorSchema, PlanError, load_factor_schema
 from expcore.campaign.manifest import Manifest, build_manifest
 from expcore.campaign.markers import MARKER_NAME
 from expcore.campaign.shard import ShardError
@@ -349,11 +349,13 @@ def check_study(study: StudyConfig) -> None:
     - each kind in `kinds` is one a study may declare (a core kind, a platform's or a malformed name is refused);
     - the factor schema is built again from its parts (`FactorSchema.rebuilt`), so every rule of its constructor
       holds against the vocabulary of that scope, a treatment kind that is a fault on one target still names its
-      target (C34), and a kind unknown to the config is refused;
+      target (C34), a kind unknown to the config is refused, and so is a schema whose conditions were edited after it
+      was built, whose lookup of a run's condition and digest then no longer match them;
     - the `[scheduler]` health and identity kinds are known, every model of the campaign is in the model table, each
       contrast's cluster is an attribute of every task, a campaign that shards by model and has a budget shares it;
-    - the plan expands: no list is empty or repeats, and a task a condition names is a task of the plan, so a cut of
-      the tasks that leaves a condition naming one it dropped is refused here and not at the first run.
+    - the plan expands: no list is empty or repeats, a seed is an integer, and a task a condition names is a task of
+      the plan, so a cut of the tasks that leaves a condition naming one it dropped is refused here and not at the
+      first run (every refusal is a ConfigError, the plan's own named for campaign.toml).
 
     Not repeated: importing `[study] platforms`, which `load_study` does for the process, since a config names a
     platform's kind only in a process that has imported the platform; and the preregistration against the schema,
@@ -371,8 +373,18 @@ def check_study(study: StudyConfig) -> None:
         _check_scheduler_kinds(study.campaign)
         _check_models(study.campaign, study.models)
         _check_clusters(study.name, study.tasks, study.prereg)
-        study.schema.expand(study.tasks, study.campaign.models, study.campaign.seeds)
+        _check_plan(study)
     _check_shard_budgets(study)
+
+
+def _check_plan(study: StudyConfig) -> None:
+    """Refuse a plan that does not expand: an empty or repeated task, model or seed, a non-integer seed, a condition
+    that names a task the plan lacks. The plan's own refusals are ConfigErrors naming the condition; the rest are
+    its PlanErrors, which are named for the campaign's file here, so a caller has one kind of error to expect."""
+    try:
+        study.schema.expand(study.tasks, study.campaign.models, study.campaign.seeds)
+    except PlanError as error:
+        raise ConfigError(f"{study.campaign.source}: the plan does not expand: {error}") from None
 
 
 def _check_models(campaign: CampaignConfig, models: ModelTable) -> None:
