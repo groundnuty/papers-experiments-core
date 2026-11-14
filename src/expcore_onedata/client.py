@@ -218,7 +218,7 @@ from expcore.records.redact import register_secret
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
 from expcore_onedata.readretry import ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
-from expcore_onedata.streamed import Digest, media_type
+from expcore_onedata.streamed import Digest, ReadOutcome, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
@@ -1201,6 +1201,7 @@ class OnezoneClient:
         timeout_s: float | None = None,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        answers: Callable[[ReadOutcome], None] | None = None,
     ) -> bytes:
         """Read `length` bytes from `offset` of a file's content through a declared provider; return the bytes.
 
@@ -1208,8 +1209,13 @@ class OnezoneClient:
         that provider grows (on-the-fly replication). It changes state, so it passes the same gate as a mutation: the
         path must be `/data/{id}/content`, and the file's space must have a name that starts with a configured prefix,
         or nothing is sent; with `space`, that space alone, as for `mutate`. The answer must be a 206 whose
-        `Content-Range` starts at `offset` and matches the body, and the body must be `length` bytes unless the range
-        ends at the end of the file; anything else is refused. [S8]
+        `Content-Range` starts at `offset`, ends inside the file it names and matches the body, and the body must be
+        `length` bytes unless the range ends at the end of the file; anything else is refused, a 200 (the whole file,
+        whatever it holds) and an empty answer included. [S8]
+
+        `answers`, when given, is called once with what the platform answered (`ReadOutcome`: its status, its
+        `Content-Range` as sent and the bytes of its body) after the answer is accepted, so a range clipped at the end
+        of the file shows as its shorter range; a refused answer reports nothing (O37).
 
         `gate_retry` is the policy of the gate's reads alone, as for `mutate`; the range read itself is one request,
         since it may have made the provider fetch bytes.
@@ -1227,18 +1233,23 @@ class OnezoneClient:
             "GET", path, provider=provider, headers=headers, timeout_s=timeout_s, retry=ONE_ATTEMPT
         )
         label = self._base(provider)[1]
-        found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+        sent = response.headers.get("Content-Range")
+        found = _CONTENT_RANGE.fullmatch(sent or "")
         if response.status_code != 206 or found is None:
             raise PlatformError(f"{label}: a range read was not answered with a 206 and a Content-Range")
         first, last, total = (int(found.group(i)) for i in (1, 2, 3))
         body = response.content
         if (
             first != offset
+            or last < first
+            or last >= total
             or last - first + 1 != len(body)
             or len(body) > length
             or (len(body) < length and last + 1 != total)
         ):
             raise PlatformError(f"{label}: a range read was answered with another range than the one asked for")
+        if answers is not None:
+            answers(ReadOutcome(response.status_code, sent, len(body)))
         return body
 
     def read_content(
@@ -1254,6 +1265,7 @@ class OnezoneClient:
         clock: Callable[[], float] = time.monotonic,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        answers: Callable[[ReadOutcome], None] | None = None,
         stop: int | None = None,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
@@ -1277,6 +1289,11 @@ class OnezoneClient:
         each is given what remains of the deadline when that read begins: its retries and pauses stay within it, so
         they never carry the gate past the deadline, and a read that begins after it was passed is made once. A range
         is streamed once, whatever the policy.
+
+        `answers`, when given, is called once per range, in order, after that range was read whole and found to be
+        exactly the range asked for, with what the platform answered (`ReadOutcome`: 206, the `Content-Range` as sent,
+        the bytes of the body); a range that is refused, or cut short, reports nothing, so a failed read has reported
+        the ranges that came before it and no more (O37).
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -1309,14 +1326,21 @@ class OnezoneClient:
             if remaining <= 0:
                 raise PlatformError(late)
             wait = min(timeout_s if timeout_s is not None else self._timeout_s, remaining)
-            self._stream_range(base + path, label, (first, min(chunk_bytes, end - first), size), wait, consume)
+            self._stream_range(base + path, label, (first, min(chunk_bytes, end - first), size), wait, consume, answers)
         return Digest(end, hasher.hexdigest())
 
     def _stream_range(
-        self, url: str, label: str, span: tuple[int, int, int], wait: float, consume: Callable[[bytes], None]
+        self,
+        url: str,
+        label: str,
+        span: tuple[int, int, int],
+        wait: float,
+        consume: Callable[[bytes], None],
+        answers: Callable[[ReadOutcome], None] | None = None,
     ) -> None:
         """Stream one range, `span` = (first byte, length, the file's size), to `consume` piece by piece; refuse an
-        answer that is not exactly that range of a file of that size."""
+        answer that is not exactly that range of a file of that size. Once it is whole, `answers` is told what the
+        platform answered."""
         first, length, total = span
         last = first + length - 1
         got = 0
@@ -1330,7 +1354,8 @@ class OnezoneClient:
                     raise PlatformError(
                         _answered(label, "GET", status, code, errno), status=status, code=code, errno=errno
                     )
-                found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+                sent = response.headers.get("Content-Range")
+                found = _CONTENT_RANGE.fullmatch(sent or "")
                 if status != 206 or found is None:
                     raise PlatformError(f"{label}: a streamed read's range was not answered with a 206 and a range")
                 if tuple(int(found.group(i)) for i in (1, 2, 3)) != (first, last, total):
@@ -1344,6 +1369,8 @@ class OnezoneClient:
             raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
         if got != length:
             raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
+        if answers is not None:
+            answers(ReadOutcome(status, sent, got))
 
     def content_answer(
         self, path: str, *, provider: str, first_byte: bool, timeout_s: float | None = None

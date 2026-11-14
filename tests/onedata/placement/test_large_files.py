@@ -14,7 +14,7 @@ import pytest
 
 from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, answered_absent
 from expcore_onedata.provision import ProvisionError
-from expcore_onedata.streamed import OCTET_STREAM, Digest
+from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome
 from expcore_onedata.testing import BETA_ID, DATA, PROVIDER, SETTINGS
 from expcore_onedata.testing.fake_federation import ZONE
 
@@ -490,6 +490,55 @@ def test_o25_a_range_answered_with_other_bytes_than_asked_for_is_refused(config,
     client = answering(config, lambda request: httpx.Response(status, content=body, headers=headers))
     with pytest.raises(PlatformError):
         client.read_content("/data/fid/content", provider="alpha", size=8, chunk_bytes=4, deadline_s=5)
+
+
+def test_o35_a_streamed_read_reports_each_range_it_was_answered_with(config):
+    """O37: `answers` is told once per range, in order, with the status, the Content-Range as sent and the body's
+    bytes of that range; the digest is what it was."""
+    content = bytes(range(8))
+
+    def ranges(request):
+        first, last = (int(x) for x in request.headers["Range"].removeprefix("bytes=").split("-"))
+        return httpx.Response(
+            206, content=content[first : last + 1], headers={"Content-Range": f"bytes {first}-{last}/8"}
+        )
+
+    got = []
+    found = answering(config, ranges).read_content(
+        "/data/fid/content", provider="alpha", size=8, chunk_bytes=4, deadline_s=5, answers=got.append
+    )
+    assert found == digest(content)
+    assert got == [ReadOutcome(206, "bytes 0-3/8", 4), ReadOutcome(206, "bytes 4-7/8", 4)]
+
+
+def test_o35_a_streamed_read_whose_second_range_is_refused_has_reported_only_the_first(config):
+    """O37: a range answered with the whole file is refused and never reported; the range before it, accepted, was."""
+    content = bytes(range(8))
+
+    def answer(request):
+        if request.headers["Range"] == "bytes=0-3":
+            return httpx.Response(206, content=content[:4], headers={"Content-Range": "bytes 0-3/8"})
+        return httpx.Response(200, content=content)
+
+    got = []
+    with pytest.raises(PlatformError):
+        answering(config, answer).read_content(
+            "/data/fid/content", provider="alpha", size=8, chunk_bytes=4, deadline_s=5, answers=got.append
+        )
+    assert got == [ReadOutcome(206, "bytes 0-3/8", 4)]
+
+
+def test_o35_the_provisioners_reads_pass_the_answers_on(provisioner, seeded):
+    """O37: `read_file` and `fetch` take `answers` and hand it to the client's reads, so a study that reads through the
+    provisioner sees each answer's status and range too."""
+    file_id = seeded.id_of(SEEDED)
+    got = []
+    assert provisioner.fetch("alpha", file_id, 10, 20, answers=got.append) == DATA[10:30]
+    assert got == [ReadOutcome(206, f"bytes 10-29/{len(DATA)}", 20)]
+    got.clear()
+    assert provisioner.read_file(file_id, answers=got.append) == digest(DATA)
+    assert {o.status for o in got} == {206}
+    assert sum(o.body_bytes for o in got) == len(DATA)
 
 
 def test_o25_a_read_that_passes_its_deadline_stops(config):
