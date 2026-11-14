@@ -214,9 +214,9 @@ class InjectionJournal:
     def open_entries(self) -> list[dict[str, Any]]:
         """Return the open injections, each with `injected` set when it was seen down, `stop_unknown` when the stop was
         asked for (`stopping`, or a stop command that raised) and the target was not then seen down, and
-        `stop_unrecorded` when no line says the stop was asked for and the target was not seen down either; raise
-        ValueError when a complete line is not an injection event. Only an incomplete final line is ignored: it was
-        never acted on."""
+        `stop_unrecorded` when no line says the stop was asked for and the target was not seen down either, and
+        `healed` when a `clear_failed` line says a link heal ran for it (`healing`, O35); raise ValueError when a
+        complete line is not an injection event. Only an incomplete final line is ignored: it was never acted on."""
         if not self.path.exists():
             return []
         with self._section(fcntl.LOCK_SH):
@@ -241,6 +241,8 @@ class InjectionJournal:
                 entries[key]["stop_unknown"] = True  # the stop was asked for: the daemon may still be stopping it
             elif event == "clear_failed" and key in entries:
                 entries[key]["clear_failed"] = str(line.get("how"))  # still open: its restore failed
+                if line.get("healing") is True:  # a link heal ran for it (O35): no process heals it again
+                    entries[key]["healed"] = True
             elif event == "cleared":
                 entries.pop(key, None)
             else:

@@ -62,7 +62,9 @@ def await_sessions(
     """Poll the driver's session gate (`ComposeDriver.sessions_ready`) for a service every `poll_s` until it passes or
     `timeout_s` is over; return the reading for the snapshot: `ok`, `how` (`ready`, `not_ready`, `unarmed`, or `none`
     for a driver with no gate), `waited_s` and the last `detail`. A reading that raises is no pass: it is read again,
-    and its type is the detail; `GateUnarmed` ends the wait at once, closed."""
+    and its type is the detail; `GateUnarmed` ends the wait at once, closed. A reading that passes but ends after
+    `timeout_s` is no pass either: each read has its own bound (`ZONE_TIMEOUT_S`, `DISTRIBUTION_TIMEOUT_S`), so the
+    wait can end one reading past the bound, closed."""
     read = getattr(driver, "sessions_ready", None)
     if read is None:
         return {"ok": True, "how": "none", "waited_s": 0.0, "detail": None}
@@ -78,8 +80,11 @@ def await_sessions(
         except Exception as error:  # a reading that cannot answer is no pass, never a pass
             detail = f"the gate's reading raised {type(error).__name__}"
         else:
-            if detail is None:
-                return {"ok": True, "how": "ready", "waited_s": round(clock() - started, 3), "detail": None}
+            waited = clock() - started
+            if detail is None and waited <= timeout_s:
+                return {"ok": True, "how": "ready", "waited_s": round(waited, 3), "detail": None}
+            if detail is None:  # a reading that ended past the bound passes nothing: the gate's bound is the bound
+                detail = "the gate's reading passed only after gate_timeout_s"
         if clock() - started >= timeout_s:
             break
     return {"ok": False, "how": "not_ready", "waited_s": round(clock() - started, 3), "detail": detail}

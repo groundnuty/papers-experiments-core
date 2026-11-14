@@ -21,6 +21,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     gate_timeout_s = 240             # optional: the longest a restored provider's peers may take to reach it; see below
     heal = "off"                     # optional: "off", "link" or "link_then_container"; see below
     heal_timeout_s = 900             # optional: the longest the heal of a stuck link may take, all its actions together
+    heal_settle_s = 90               # optional: the wait after each heal action before its pairs are checked again
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
@@ -50,7 +51,18 @@ is the 180 s cap of a peer's session renewal backoff (op-worker f118ed9) and a m
 restore closed, as before; `"link"` restarts the rtransfer link of each stuck pair's reader, one at a time, and checks
 again; `"link_then_container"` also restarts a reader's container when its link restart did not mend its pairs
 (`expcore_onedata.fault_heal`). A container restart is itself an outage of that provider, so declare it knowingly.
-`heal_timeout_s` bounds the heal: no action starts that its own wait and the gate's would carry past it.
+`heal_settle_s` is the wait after each action, with no fetch at all, before the gate and the pairs are read again: a
+peer that fetches from a reader while the reader's link comes back can be handed a connection secret the link never
+allowed, which wedges that pair until the peer's own link restarts (seen live: a pair with the restarted reader as its
+source failed 23 s after the restart and still failed 6 minutes on; the mechanism is inferred from op-worker's
+`generate_secret`). A pair with the acted-on reader as its source that fails after the settle is healed by its own
+reader's link restart, within the bounds (`expcore_onedata.fault_heal`). `heal_timeout_s` bounds the
+heal: no action starts whose declared bounds would carry the heal past it, so a declared heal must leave room for one
+round of its own actions: a ping and a link restart (`heal_link_reserve`: three commands at `command_timeout_s`, the
+RPC's bound and its margin, and one settle), and for `"link_then_container"` a container restart too
+(`heal_container_reserve`: four commands, `settle_timeout_s` twice, `ready_timeout_s` and one settle). A smaller
+`heal_timeout_s` is refused at load, naming the key and the least it may be; with the other defaults that is 600 s for
+`"link"`, which the default 900 s covers, and 1,710 s for `"link_then_container"`, which must raise it.
 """
 
 import hashlib
@@ -63,7 +75,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.config.loading import Section, load_toml
-from expcore_onedata.compose import CommandRunner, ComposeDriver, run_command
+from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
 from expcore_onedata.config import PlatformConfig
 
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -76,6 +88,7 @@ DEFAULT_SETTLE_TIMEOUT_S = STOP_GRACE_S + SETTLE_MARGIN_S
 DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48 to 52 s after their restart (measured)
 DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
 DEFAULT_HEAL_TIMEOUT_S = 900.0
+DEFAULT_HEAL_SETTLE_S = 90.0  # peers' links redialled a restarted reader within about 23 to 38 s (seen live), and more
 HEAL_MODES = ("off", "link", "link_then_container")
 _KEYS = (
     "sanctioned",
@@ -94,6 +107,7 @@ _KEYS = (
     "gate_timeout_s",
     "heal",
     "heal_timeout_s",
+    "heal_settle_s",
     "services",
 )
 
@@ -120,6 +134,7 @@ class FaultSettings:
     gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
     heal: str = "off"
     heal_timeout_s: float = DEFAULT_HEAL_TIMEOUT_S
+    heal_settle_s: float = DEFAULT_HEAL_SETTLE_S
     config_sha256: str = ""  # the digest of the platform.toml it was read from: part of the federation's identity
 
 
@@ -164,7 +179,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     words = {}
     for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
         words[key] = tuple(table.strings(key)) or default
-    return FaultSettings(
+    settings = FaultSettings(
         file=file,
         sanctioned=sanctioned,
         journal=(file.parent / table.string("journal")).resolve(),
@@ -183,8 +198,42 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         gate_timeout_s=_number(table, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S, 0),
         heal=heal,
         heal_timeout_s=_number(table, "heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S, 0),
+        heal_settle_s=_number(table, "heal_settle_s", DEFAULT_HEAL_SETTLE_S, 0),
         config_sha256=config.sha256,
     )
+    least = heal_round_s(settings)
+    if settings.heal_timeout_s < least:
+        raise table.fail(
+            "heal_timeout_s",
+            f'must be at least {least:g} for heal = "{heal}": one round of its actions at their declared bounds',
+        )
+    return settings
+
+
+def heal_link_reserve(settings: FaultSettings) -> float:
+    """The declared bounds of a ping and a link restart: two container lookups and the ping, the RPC and its margin,
+    and one settle."""
+    return 3 * settings.command_timeout_s + RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + settings.heal_settle_s
+
+
+def heal_container_reserve(settings: FaultSettings) -> float:
+    """The declared bounds of a reader's container restart: its lookup and inspection, its stop and its start, the
+    waits for it to go down and to come back, the wait for it to serve, and one settle."""
+    return (
+        4 * settings.command_timeout_s
+        + 2 * settings.settle_timeout_s
+        + settings.ready_timeout_s
+        + (settings.heal_settle_s)
+    )
+
+
+def heal_round_s(settings: FaultSettings) -> float:
+    """The least `heal_timeout_s` a declared heal needs: one link restart, and a container restart in
+    `link_then_container`; 0 with the heal off."""
+    if settings.heal == "off":
+        return 0.0
+    container = heal_container_reserve(settings) if settings.heal == "link_then_container" else 0.0
+    return heal_link_reserve(settings) + container
 
 
 def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:

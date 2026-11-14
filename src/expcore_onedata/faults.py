@@ -320,7 +320,7 @@ class FaultInjector:
         self._run = {"run_key": run_key, "attempt": attempt}
         self._admit()
         self._step("sanctioned", True)
-        unsettled = self._recover(heal=True)  # under the exclusive admission just taken
+        unsettled = self._recover(heal=self._holds_exclusive())  # under the exclusive admission just taken
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
             raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
         self._lock = self._journal.try_lock(self.target)
@@ -377,6 +377,21 @@ class FaultInjector:
                 )
             except InfraError as error:
                 raise self._fail(error.detail) from None
+
+    def _holds_exclusive(self) -> bool:
+        """Whether the federation is held exclusively for this injector now: the admission it took itself, or its run's
+        own, still held and for this federation. Only then may a restore heal a link (O35): a run's admission that has
+        ended, or none, heals nothing."""
+        if self._admission is not None and self._admission.held and self._admission.exclusive:
+            return True
+        held = current_admission()
+        if held is None or not held.exclusive:
+            return False
+        try:
+            require_same_federation(held, self._federation.federation)
+        except AdmissionRefused:
+            return False
+        return True
 
     def _release_admission(self) -> None:
         if self._admission is not None:
@@ -624,7 +639,7 @@ class FaultInjector:
                     "stop_unknown": self._stop_unknown,
                     "gate_probe": self._gate_probe,
                 },
-                heal=True,  # the injector holds the federation exclusively until its restore is verified
+                heal=self._holds_exclusive(),  # a heal only under an exclusive admission held now, between runs
             )
         except Exception as error:  # never lose the reading: a clear that failed stays pending and open
             done, how, after, ready_after_s = False, type(error).__name__, None, None

@@ -208,7 +208,8 @@ class Recovery(LinkSettling):
         """
         step = on_step or (lambda *args, **kwargs: None)
         held: list[str] = []
-        for entry in self.entries():
+        # a heal's container restart of a reader first: while it is down, the injection it healed cannot pass its gate
+        for entry in sorted(self.entries(), key=lambda entry: entry.get("heal") is not True):
             target = entry["target"]
             lock = self.journal.try_lock(target)
             if lock is None:
@@ -236,17 +237,20 @@ class Recovery(LinkSettling):
                 raise failure(f"an injection of {target} that an earlier run left open was not cleared ({why})", target)
         return sorted(set(held))
 
-    def settle(self, entry: Mapping[str, Any], *, heal: bool = False, links: bool = True) -> Settled:
+    def settle(
+        self, entry: Mapping[str, Any], *, heal: bool = False, links: bool = True, clear: bool = True
+    ) -> Settled:
         """Leave one injection's target up and serving: find it back, find it never went down, or bring it back with a
         changed identity, and, once it was restored, wait for it to serve, pass the session gate and show every link
         transferring (healing a stuck one when `heal` and `[faults] heal` allow); journal it cleared when it is, and its
         clear failed when it is not, or when settling raised. Return whether it is, how, the new identity's digest if
-        any and the seconds the wait for it to serve took. `links=False` (a reader's container restart inside a heal,
-        which gates and checks itself) stops at serving."""
+        any and the seconds the wait for it to serve took. `links=False` and `clear=False` (a reader's container
+        restart inside a heal, which gates and checks itself and is cleared by the heal) stop at serving, journalling
+        no clear."""
         if links:
             self.restore_record = {}
         try:
-            settled = self._settle(entry, heal=heal, links=links)
+            settled = self._settle(entry, heal=heal, links=links, clear=clear)
         except Exception as error:
             self._clear_failed(entry, type(error).__name__)
             raise
@@ -258,7 +262,7 @@ class Recovery(LinkSettling):
         with contextlib.suppress(OSError):  # the journal may be what failed: the injection stays open all the same
             self.journal.append({"event": "clear_failed", "id": entry["id"], "how": how})
 
-    def _settle(self, entry: Mapping[str, Any], *, heal: bool, links: bool) -> Settled:
+    def _settle(self, entry: Mapping[str, Any], *, heal: bool, links: bool, clear: bool) -> Settled:
         before, injected = entry["identity_sha256"], entry["injected"]
         asked, unrecorded = bool(entry.get("stop_unknown")), bool(entry.get("stop_unrecorded"))
         seen: Observation | None
@@ -302,7 +306,8 @@ class Recovery(LinkSettling):
             stuck = self._links_settled(entry, heal) if links else None
             if stuck is not None:  # it serves, and its peers or a link do not: not restored yet (O35)
                 return Settled(False, stuck, after, ready_after_s)
-        self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
+        if clear:
+            self.journal.append({"event": "cleared", "id": entry["id"], "how": how})
         return Settled(True, how, after, ready_after_s)
 
     def _await_serving(self, service: str) -> float | None:
