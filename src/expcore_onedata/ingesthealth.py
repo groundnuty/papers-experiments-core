@@ -120,23 +120,28 @@ def owner_state(mark: Mapping[str, Any]) -> str | None:
     return liveness.LIVE if alive is True else liveness.ENDED if alive is False else None
 
 
-def is_held(mark: Mapping[str, Any] | None, journal: Path) -> bool:
+def is_held(mark: Mapping[str, Any] | None, journal: Path) -> bool | None:
     """Whether a mark is a run in progress: `open`, its owner not shown ended, and its space's hold taken by a live
-    holder, in this process or another."""
+    holder, in this process or another. None when the hold cannot be read: no proof the run is over, so a recovery
+    is refused, while a start is held back and the health check fails, as for an orphaned mark."""
     if mark is None or mark.get("state") != OPEN or owner_state(mark) == liveness.ENDED:
         return False
     space = mark.get("space")
-    return isinstance(space, str) and hold_taken(journal, space) is True
+    if not isinstance(space, str):
+        return False
+    return hold_taken(journal, space)
 
 
-def read_mark(journal: Path, space: str, mark: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, bool]:
-    """The space's last mark (`mark`, when the caller has just read it) and whether it is held. An `open` mark whose
-    hold is free is read again once, since a restore marks the baseline whole before it lets the hold go. `Unreadable`
-    or OSError for a journal that cannot be read."""
+def read_mark(
+    journal: Path, space: str, mark: dict[str, Any] | None = None
+) -> tuple[dict[str, Any] | None, bool | None]:
+    """The space's last mark (`mark`, when the caller has just read it) and whether it is held (`is_held`). An `open`
+    mark whose hold is not shown taken is read again once, since a restore marks the baseline whole before it lets the
+    hold go. `Unreadable` or OSError for a journal that cannot be read."""
     if mark is None:
         mark = last_marks(journal).get(space)
     held = is_held(mark, journal)
-    if mark is not None and mark["state"] == OPEN and not held:
+    if mark is not None and mark["state"] == OPEN and held is not True:
         mark = last_marks(journal).get(space, mark)
         held = is_held(mark, journal)
     return mark, held
@@ -171,7 +176,7 @@ def _at(mark: Mapping[str, Any]) -> str:
     return f" at {file}'s {step}" if isinstance(file, str) and isinstance(step, str) else ""
 
 
-def start_refusal(mark: Mapping[str, Any] | None, held: bool = False) -> str | None:
+def start_refusal(mark: Mapping[str, Any] | None, held: bool | None = False) -> str | None:
     """Why a start may not begin on this baseline, or None when its last mark is `whole` or there is none: `held` by a
     live run (`read_mark`; the start waits for its reset), or orphaned or `unhealthy` (a recovery must bring it
     back)."""
@@ -190,10 +195,11 @@ def start_refusal(mark: Mapping[str, Any] | None, held: bool = False) -> str | N
     )
 
 
-def recovery_refusal(mark: Mapping[str, Any] | None, plan: str, held: bool = False) -> str | None:
+def recovery_refusal(mark: Mapping[str, Any] | None, plan: str, held: bool | None = False) -> str | None:
     """Why a recovery with the plan of this hash may not run now: a baseline another plan's run left not whole (its
-    files and replicas are what the recovery must verify, and this plan may name others), or a `held` `open` baseline,
-    a run in progress it would write into, unless this process took it outside any attempt; None otherwise."""
+    files and replicas are what the recovery must verify, and this plan may name others), or an `open` baseline that
+    is `held`, a run in progress it would write into, or whose hold cannot be read (None), so no run is shown over,
+    unless this process took it outside any attempt; None otherwise."""
     if mark is None or mark["state"] == WHOLE:
         return None
     if mark.get("plan") != plan:
@@ -203,12 +209,16 @@ def recovery_refusal(mark: Mapping[str, Any] | None, plan: str, held: bool = Fal
         )
     if mark["state"] != OPEN:
         return None
-    if held and not _taken_here_outside_an_attempt(mark):
+    if _taken_here_outside_an_attempt(mark):
+        return None
+    if held is None:
+        return "its baseline's hold cannot be read, so a run may still be on it; recover once it can be read"
+    if held:
         return "its baseline is held by a live attempt's ingest, a run in progress; recover once it has ended"
     return None
 
 
-def health_refusal(mark: Mapping[str, Any], held: bool = False) -> str | None:
+def health_refusal(mark: Mapping[str, Any], held: bool | None = False) -> str | None:
     """Why the health check fails for this mark: `unhealthy`; an `open` one that is not `held`; or, in a check inside
     an attempt, an `open` one that attempt owns, whose ingest ended without its reset."""
     if mark["state"] == UNHEALTHY or (mark["state"] == OPEN and not held):
@@ -222,8 +232,10 @@ def baseline_health(journals: Iterable[Path | str]) -> Health:
     """The ingests' half of the health check, never raising: fails, naming the space, while a baseline is unhealthy
     or orphaned, charging no run (another attempt left it) unless the check runs inside the attempt that wrote the
     failing mark, or when a journal cannot be read; deferred, outside any attempt, while a live run holds a baseline
-    open, so runs wait for its reset; otherwise healthy. A failure of any space wins over a deferral of another."""
+    open, so runs wait for its reset; otherwise healthy. A failure of any space wins over a deferral of another, and
+    one the judged attempt left itself over one another attempt left, so an attempt's own failure is never spared."""
     deferral: Health | None = None
+    failures: list[Health] = []
     for journal in journals:
         path = Path(journal)
         try:
@@ -236,10 +248,12 @@ def baseline_health(journals: Iterable[Path | str]) -> Health:
             refusal = health_refusal(mark, held)
             if refusal is not None:
                 why = f"{mark['space']}: the progressive ingest refuses runs: {refusal}"
-                return Health(False, why, charge=_owned_here(mark))
-            if deferral is None and held and liveness.current() is None:
+                failures.append(Health(False, why, charge=_owned_here(mark)))
+            elif deferral is None and held and liveness.current() is None:
                 why = f"{mark['space']}: the progressive ingest holds runs: {start_refusal(mark, held)}"
                 deferral = Health(False, why, deferred=True, charge=False)
+    if failures:
+        return next((failure for failure in failures if failure.charge), failures[0])
     return deferral or Health(True, "every progressive ingest's baseline is whole or held by a run in progress")
 
 
@@ -258,7 +272,7 @@ class Marks:
         """The space's last mark, or None; `Unreadable` for a journal that cannot be read."""
         return last_marks(self._journal).get(self._space)
 
-    def current(self) -> tuple[dict[str, Any] | None, bool]:
+    def current(self) -> tuple[dict[str, Any] | None, bool | None]:
         """The space's last mark and whether a live run holds it (`read_mark`)."""
         return read_mark(self._journal, self._space)
 

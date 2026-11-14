@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign import liveness
-from expcore.campaign.attempts import classify, unverified
+from expcore.campaign.attempts import classify, is_charged, unverified
 from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
     BackendFactory,
@@ -414,7 +414,9 @@ class AttemptRunner:
         charged. Either way it is not scored and its run is tried again.
 
         An attempt the store would not score, one set aside by the health check, an outage, or its own infrastructure
-        failure or defect, keeps its outcome and the refusal is noted.
+        failure or defect, keeps its outcome and the refusal is noted, but for a refusal that is a platform's hold
+        (C33: an instrument that held its start back, so nothing the run did counts): that one always decides, so the
+        attempt costs no attempt whatever set it aside first, a charged post-run failure included.
         """
         p, refusal = self.p, record.instrument_refusal
         if refusal is None:
@@ -422,7 +424,8 @@ class AttemptRunner:
         who = f"instrument {refusal['namespace']!r} refused the attempt"
         text = f"{key}: {who}: {refusal['infra_kind']}: {refusal['detail']}"
         scored = classify(result, result.treatment_kinds, result.treatment_targets).state == "done"
-        if not scored and (result.outage_kind is not None or result.outcome.set_aside):
+        hold = not is_charged(refusal["infra_kind"])
+        if not hold and not scored and (result.outage_kind is not None or result.outcome.set_aside):
             p.store.event(p.stamp(), "instrument_refused", model, f"{text}; the outcome stands")
             return result
         p.store.event(p.stamp(), "instrument_refused", model, text)

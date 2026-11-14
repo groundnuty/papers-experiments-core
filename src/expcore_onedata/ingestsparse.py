@@ -192,7 +192,7 @@ class SparseBaseline(Baseline):
             raise ProvisionError(f"{self._p.where}{planned.label}: the bytes written do not have the plan's hash")
 
     # -- the baseline's marks (`ingesthealth.py`) ---------------------------------------------------------------------
-    def _current(self) -> tuple[dict[str, Any] | None, bool]:
+    def _current(self) -> tuple[dict[str, Any] | None, bool | None]:
         """The space's last mark and whether a live run holds it; a journal that cannot be read refuses."""
         try:
             return self.marks.current()
