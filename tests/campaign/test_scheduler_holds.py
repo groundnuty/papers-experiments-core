@@ -174,6 +174,31 @@ def test_c33_a_hold_wins_over_a_charged_refusal_of_an_instrument_checked_before_
         ]
 
 
+class Unrestored:
+    """A fault injector's reading filed in the record, whose restore was not verified (O11)."""
+
+    namespace = "fault_injector"
+
+    def start(self, identity):
+        pass
+
+    def finish(self):
+        return {"restore_verified": False, "target": "providers[1]", "how": "timeout"}
+
+
+def test_c33_a_hold_decides_over_an_unverified_restore_in_the_same_record(tmp_path, held_kind):
+    """C33: a record carries both an injector's unverified restore and an instrument's hold: the hold decides, so the
+    attempt costs no attempt, and it is still never scored; an unverified restore alone is charged, as O11 has it."""
+    executor = FakeExecutor({ONE_KEY: [swallowing(Unrestored(), Refusing(held_kind)), swallowing(Unrestored())]})
+    with build(tmp_path, schema=ONE, executor=executor, plan=SMALL) as scheduler:
+        scheduler.run()
+        rows = attempt_rows(scheduler.store, ONE_KEY)
+    assert rows[0] == ("infra_fail", 0, 1, held_kind)
+    assert rows[1][:3] == ("infra_fail", 1, 1)
+    assert rows[1][3] != held_kind
+    assert rows[2] == ("done", 0, 2, None)
+
+
 def test_c33_the_reading_keeps_whether_a_failure_charges_and_a_flag_that_is_not_a_boolean_is_a_failed_check():
     """C33: `charge` is kept through the reading, a plain failure charges as before, and a reading whose flag is not a
     boolean is no reading at all: a failed check, which charges as any does."""
