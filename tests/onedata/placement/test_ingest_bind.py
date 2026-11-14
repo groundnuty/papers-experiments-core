@@ -248,6 +248,57 @@ def test_o27_a_part_recorded_at_another_time_is_refused_though_the_summary_agree
         assert refusal(plan, recorded).field == field, field
 
 
+def test_o27_a_reading_of_malformed_identity_or_kind_is_refused_never_raised_as_another_error(tmp_path, platform):
+    """O27 (#262): a reading whose label is a list or a mapping, whose kind is missing, null, a list or one the ingest
+    never makes, or a written reading without its bytes, raises `PlanMismatch` and nothing else, and passes nothing."""
+    plan = plan_of(tmp_path, platform)
+    cases = [
+        (lambda s: s["steps"][0].update(label=[]), "label"),
+        (lambda s: s["steps"][0].update(label={}), "label"),
+        (lambda s: s["steps"][0].update(label=None), "label"),
+        (lambda s: s["steps"][0].update(part=[]), "part"),  # the note is a file of the plan, its part is not
+        (lambda s: s["steps"][0].update(step=[]), "step"),
+        (lambda s: s["steps"][0].update(step=None), "step"),
+        (lambda s: s["steps"][0].update(step="landed"), "step"),
+        (lambda s: s["steps"][0].pop("step"), "step"),
+        (lambda s: s["steps"].append({**s["steps"][0], "step": "written", "bytes": None}), "bytes"),
+        (
+            lambda s: s["steps"].append({k: v for k, v in s["steps"][0].items() if k != "bytes"} | {"step": "written"}),
+            "bytes",
+        ),
+    ]
+    for edit, field in cases:
+        recorded = snapshot_of(plan)
+        edit(recorded)
+        assert refusal(plan, recorded).field == field, field
+
+
+def test_o27_a_start_that_says_neither_that_it_set_the_start_state_nor_that_it_did_not_binds_nothing(
+    tmp_path, platform
+):
+    """O27 (#262): the completeness of the planned readings is owed by a start that set its state; a start that is
+    missing, a list, an empty mapping or has an `ok` that is not a boolean (1, "true") gets no exemption from it, so a
+    snapshot that records no part at all cannot pass on it."""
+    plan = plan_of(tmp_path, platform)
+    for edit in (
+        lambda s: s.pop("start"),
+        lambda s: s.update(start=[]),
+        lambda s: s.update(start={}),
+        lambda s: s.update(start={"ok": 1}),
+        lambda s: s.update(start={"ok": "true"}),
+        lambda s: s.update(start="ok"),
+    ):
+        recorded = snapshot_of(plan)
+        recorded["steps"] = []
+        edit(recorded)
+        assert refusal(plan, recorded).field == "start"
+    recorded = snapshot_of(plan)
+    recorded.update(steps=[], start={"ok": True})
+    assert refusal(plan, recorded).field == "steps"  # a start that did set its state owes every planned reading
+    recorded.update(start=None)  # a start that never ran owes none
+    check_recorded_plan(plan, recorded)
+
+
 def test_o27_a_snapshot_whose_start_failed_binds_with_the_parts_it_never_recorded(tmp_path, platform):
     """O27: a start that did not set the start state records no part, and the plan it ran still binds to it; the
     readings it does hold are checked all the same."""

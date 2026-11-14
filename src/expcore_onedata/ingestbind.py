@@ -30,6 +30,16 @@ from expcore_onedata.ingestplan import ARRIVAL, IngestPlan, Step
 FILE_FIELDS = ("bytes", "sha256", "at_s", "parts", "over_s", "baseline", "prefix")
 _LEGACY = {"mode": ARRIVAL, "prefix": 0}  # what a snapshot from before O44 means by a key it does not hold
 _SHOWN = 48  # how much of a recorded value a refusal shows
+# The readings of `steps` (`ProgressiveIngest._reading`), each with what it repeats of the plan's part besides its part
+# count and due time: the end byte, and for the one made at the start the prefix's hash.
+READINGS = {
+    "planned": ("bytes", "sha256"),
+    "written": ("bytes",),
+    "confirmed": ("bytes",),
+    "failed": (),
+    "abandoned": (),
+    "not_due": (),
+}
 
 
 class PlanMismatch(ValueError):
@@ -136,34 +146,50 @@ def _check_steps(plan: IngestPlan, snapshot: Mapping[str, Any]) -> None:
         valid = isinstance(label, str) and isinstance(part, int) and not isinstance(part, bool)  # True is not part 1
         step = parts.get((label, part)) if valid else None
         if step is None:
-            field = "part" if label in labels else "label"
+            known = isinstance(label, str) and label in labels
             raise PlanMismatch(
                 f"a step reading names {label!r} part {part!r}, which the plan does not have",
-                label=label if isinstance(label, str) and label in labels else None,
-                field=field,
+                label=label if known else None,
+                field="part" if known else "label",
             )
         _check_reading(step, row)
-        if row.get("step") == "planned":
+        if row["step"] == "planned":
             if (step.label, step.part) in planned:
                 raise PlanMismatch(f"{step.label} part {step.part}: planned twice", label=step.label, field="steps")
             planned.add((step.label, step.part))
-    start = snapshot.get("start")
-    if isinstance(start, Mapping) and start.get("ok") is True:  # the start set its state: every part was planned
+    if _start_set_its_state(snapshot):
         missing = [key for key in parts if key not in planned]
         if missing:
             label, part = missing[0]
             raise _unknown(f"{label} part {part}: it records no planned reading of it", label=label, field="steps")
 
 
+def _start_set_its_state(snapshot: Mapping[str, Any]) -> bool:
+    """Whether the snapshot's start set the start state, so that every part of the plan was planned. A start that did
+    not (`ok` false, or none ran) is a start; one that says neither is not understood, and nothing is passed on it."""
+    if "start" not in snapshot:
+        raise _unknown("it records no start", field="start")
+    start = snapshot["start"]
+    if start is None:
+        return False
+    if not isinstance(start, Mapping) or not isinstance(start.get("ok"), bool):
+        raise _unknown(
+            "it records a start that says neither that it set the start state nor that it did not", field="start"
+        )
+    return start["ok"]
+
+
 def _check_reading(step: Step, row: Mapping[str, Any]) -> None:
-    """One reading against the plan's part: its part count and due time always; its end byte where it holds one, and a
-    `planned` reading's prefix hash."""
+    """One reading against the plan's part: its kind, part count and due time, and what its kind repeats of the part
+    (the end byte, and a `planned` reading's prefix hash)."""
     where = f"{step.label} part {step.part}:"
+    kind = row.get("step")
+    if not isinstance(kind, str) or kind not in READINGS:
+        raise _unknown(
+            f"{where} it records a reading of a kind the ingest does not make", label=step.label, field="step"
+        )
     wanted = {"parts": step.parts, "due_s": step.due_s}
-    if row.get("step") == "planned":
-        wanted |= {"bytes": step.stop, "sha256": step.sha256}
-    elif "bytes" in row:
-        wanted["bytes"] = step.stop
+    wanted |= {field: {"bytes": step.stop, "sha256": step.sha256}[field] for field in READINGS[kind]}
     for field, planned in wanted.items():
         if field not in row:
             raise _unknown(f"{where} it records no {field}", label=step.label, field=field)
@@ -171,4 +197,4 @@ def _check_reading(step: Step, row: Mapping[str, Any]) -> None:
             raise _differs(where, field, planned, row[field], label=step.label)
 
 
-__all__ = ["FILE_FIELDS", "PlanMismatch", "check_recorded_plan"]
+__all__ = ["FILE_FIELDS", "READINGS", "PlanMismatch", "check_recorded_plan"]
