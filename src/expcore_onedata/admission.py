@@ -371,6 +371,11 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
     ) -> Iterator[str]:
         outage = PROVIDER_OUTAGE in treatment_kinds
         target = treatment_targets.get(PROVIDER_OUTAGE) if outage else None
+        if outage and target is None:
+            raise AdmissionRefused(
+                f"a run whose condition declares {PROVIDER_OUTAGE!r} with no target is not admitted: the outage "
+                "names the provider it takes down, and the federation is held for that provider's label"
+            )
         purpose = OUTAGE_RUN if outage else EXCLUSIVE_RUN
         timeout_s = settings.admission_timeout_s
         with lock.held(

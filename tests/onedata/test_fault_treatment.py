@@ -15,8 +15,12 @@ from record_support import hand_made, record_run
 
 from expcore.campaign.executor import result_from_record
 from expcore.campaign.factors import FactorSchema
+from expcore.config.loading import ConfigError
+from expcore.loop.outcomes import Outcome
 from expcore.records.build import RunIdentity
 from expcore.records.instruments import finish_instruments, start_instruments
+from expcore.records.record import decode
+from expcore.records.schema import CURRENT, RecordError, validate
 from expcore.replay.replay import replay_record
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import PROVIDER_OUTAGE, provider_outage
@@ -98,6 +102,94 @@ def test_c01_a_run_that_failed_before_its_first_model_turn_is_set_aside(campaign
         False,
     )
     assert row == ("infra_fail", 0, PROVIDER_OUTAGE)
+
+
+HELD, SPONTANEOUS = "providers[1]", "providers[0]"
+
+
+def outage_of(target):
+    """A provider outage naming `target` (None: naming none)."""
+    return Outcome("infrastructure", "down", infra_kind=PROVIDER_OUTAGE, infra_target=target)
+
+
+@pytest.mark.parametrize(
+    ("named", "injected", "expected", "why"),
+    [
+        (HELD, {HELD}, True, "the declared provider failed while the injector held it down"),
+        (SPONTANEOUS, {HELD}, False, "another provider's outage is not the manipulation"),
+        (SPONTANEOUS, {HELD, SPONTANEOUS}, False, "nor is it when the injector held it down too: it is not declared"),
+        (HELD, set(), False, "the declared provider failed with no injection of it: nothing shows it was held down"),
+        (HELD, {SPONTANEOUS}, False, "the injector held another provider down, not the declared one"),
+        (None, {HELD}, False, "an outage that names no provider is not the declared one"),
+    ],
+)
+def test_c34_an_outage_is_the_treatment_only_of_the_declared_provider_while_the_injector_held_it(
+    named, injected, expected, why
+):
+    """C34: with `providers[1]` declared, only an outage that names it, while the injector's snapshot shows it held
+    down, is the treatment; another provider's outage is never counted, whatever else the injector held."""
+    declared = {PROVIDER_OUTAGE: HELD}
+    assert (
+        outage_of(named).is_treatment((PROVIDER_OUTAGE,), 1, treatment_targets=declared, injected=injected) is expected
+    ), why
+
+
+@pytest.mark.parametrize("target_rule", [True, False], ids=["target-rule", "legacy-rule"])
+@pytest.mark.parametrize("declared", [None, {}], ids=["no-table", "empty-table"])
+@pytest.mark.parametrize("named", [HELD, SPONTANEOUS, None])
+def test_c34_an_outage_declared_with_no_target_is_never_the_treatment(named, declared, target_rule):
+    """C34: a `provider_outage` condition that carries no target (a schema cut to the kind names alone) never scores
+    an outage as its treatment, whichever provider failed, even with the injector's snapshot holding it down and
+    whichever rule of record version decides: the target is what says which outage is the manipulation."""
+    outcome = outage_of(named)
+    options = {"target_rule": target_rule, "treatment_targets": declared, "injected": {HELD, SPONTANEOUS}}
+    assert outcome.is_treatment((PROVIDER_OUTAGE,), 1, **options) is False
+    assert outcome.is_treatment((PROVIDER_OUTAGE,), 1, first_turn_rule=False, **options) is False
+
+
+def test_c34_the_declared_target_of_an_outage_is_checked_whatever_rule_the_record_was_made_under():
+    """C34: the target clause is not waived for an outage by `target_rule=False`: the declared provider, held down by
+    the injector, is the only outage that is the treatment."""
+    options = {"target_rule": False, "treatment_targets": {PROVIDER_OUTAGE: HELD}}
+    assert outage_of(SPONTANEOUS).is_treatment((PROVIDER_OUTAGE,), 1, injected={HELD, SPONTANEOUS}, **options) is False
+    assert outage_of(HELD).is_treatment((PROVIDER_OUTAGE,), 1, injected=set(), **options) is False
+    assert outage_of(HELD).is_treatment((PROVIDER_OUTAGE,), 1, injected={HELD}, **options) is True
+
+
+def test_c34_a_kind_without_the_requirement_is_still_decided_by_its_name_alone():
+    """C34: the requirement is the outage's, not every kind's: a plain `endpoint` declaration still scores any
+    endpoint failure, as it did."""
+    endpoint = Outcome("infrastructure", "down", infra_kind="endpoint")
+    assert endpoint.is_treatment(("endpoint",), 1) is True
+
+
+def test_c34_a_record_cannot_declare_a_provider_outage_without_its_target():
+    """C34: the record is refused when it is built, and when one is read back, if it declares `provider_outage` and no
+    target, so no record of an untargeted outage condition is written or accepted."""
+    script = [[("read", {"x": "1"})], "unreached"]
+    options = {"treatment_kinds": [PROVIDER_OUTAGE]}
+    with pytest.raises(RecordError, match="treatment_kinds: 'provider_outage' is declared with no target"):
+        record_run(script, {}, providers=[FakeProvider({"read": lambda arguments: "ok"})], record_options=options)
+    options["treatment_targets"] = {PROVIDER_OUTAGE: HELD}
+    record = record_run(script, {}, providers=[FakeProvider({"read": lambda arguments: "ok"})], record_options=options)
+    data = decode(record.dumps().encode())
+    assert validate(data) == CURRENT
+    del data["treatment_targets"]
+    with pytest.raises(RecordError, match="treatment_kinds: 'provider_outage' is declared with no target"):
+        validate(data)
+
+
+def test_c34_a_schema_cut_to_the_kind_names_alone_is_refused_naming_the_condition_and_the_kind(campaign):
+    """C34: the cut a study made to run one condition, the kinds without their targets, cannot be built for the outage
+    condition: it would have scored any provider's outage, and the store would have compared the record to the cut."""
+    schema, *_ = campaign
+    names_only = {name: schema.treatment_kinds[name] for name in schema.conditions}
+    with pytest.raises(ConfigError) as caught:
+        FactorSchema(schema.declared, schema.order, schema.conditions, treatment=names_only)
+    message = str(caught.value)
+    assert "[conditions.api-none]" in message
+    assert "'provider_outage'" in message
+    assert "no target" in message
 
 
 class Reading:
