@@ -25,6 +25,7 @@ merge.json's `shards` then also holds the selection, whether it ran sequentially
 
 import dataclasses
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from fractions import Fraction
 from typing import Any
 
@@ -33,9 +34,9 @@ from expcore.campaign.manifest import Manifest
 from expcore.campaign.merge import MergeRefused, ShardFacts, check_environment, check_fingerprints
 from expcore.campaign.selection import SelectionSpec, canonical
 from expcore.campaign.selection_ledger import Pricing, overlaps, spend_json
-from expcore.campaign.shard import micro_usd
 
-_MICRO = 1_000_000
+_FLOAT_NOISE = Fraction(1, 10**9)
+"""How far over a ceiling the summed spends may read: the rounding of adding floats, never a share's micro-dollar."""
 
 
 def is_selection(shard: ShardFacts) -> bool:
@@ -55,6 +56,7 @@ def check_selections(shards: Sequence[ShardFacts], plan: Manifest, pricing: Pric
     _check_kind(shards)
     ordered = numbered(shards)
     check_fingerprints(ordered)
+    _check_plan(plan, ordered[0].fingerprint)
     _check_runs(ordered, plan)
     check_environment(ordered)
     mismatch = None if pricing is None else pricing.mismatch(ordered[0].fingerprint)
@@ -96,8 +98,44 @@ def _check_kind(shards: Sequence[ShardFacts]) -> None:
         labels[shard.spec.label] = shard
 
 
+def _check_plan(plan: Manifest, fingerprint: Mapping[str, Any]) -> None:
+    """The study's plan, which the cover is checked against, must be the whole plan the selections' fingerprint
+    declares: every condition x task x model x seed of it, once. A study copy with a condition, a task, a model or a
+    seed taken out would otherwise let selections that leave those runs out pass as a whole campaign."""
+    schema = fingerprint.get("schema") if isinstance(fingerprint.get("schema"), Mapping) else {}
+    conditions = schema.get("conditions") or {}
+    listed = schema.get("condition_tasks") or {}
+    tasks, models = list(fingerprint.get("tasks") or {}), list(fingerprint.get("models") or {})
+    seeds = [int(seed) for seed in fingerprint.get("seeds") or {}]
+    declared = {
+        (name, task, model, seed)
+        for name in conditions
+        for task in tasks
+        if listed.get(name) is None or task in listed[name]
+        for model in models
+        for seed in seeds
+    }
+    found = []
+    for row in plan.rows:
+        factors = row.key.factors
+        name = next((n for n, levels in conditions.items() if _assigns(levels, factors)), None)
+        found.append((name, factors.get("task"), factors.get("model"), factors.get("seed")))
+    if len(found) != len(declared) or set(found) != declared:
+        raise MergeRefused(
+            f"the study's plan ({len(found)} runs) is not the plan the selections' campaign fingerprint declares "
+            f"({len(declared)} runs): merge with the study at the commit the selections ran"
+        )
+
+
+def _assigns(levels: Any, factors: Mapping[str, Any]) -> bool:
+    """Whether a condition's levels (from a fingerprint) are the ones a run's factors carry."""
+    return isinstance(levels, Mapping) and all(str(factors.get(k)) == str(v) for k, v in levels.items())
+
+
 def _check_runs(shards: Sequence[ShardFacts], plan: Manifest) -> None:
-    """3: every planned run selected by exactly one selection; each store holds what its selection selects."""
+    """3: every planned run selected by exactly one selection; each store holds what its selection selects, judged by
+    the plan's factors of each run key, never by the factors a store says it has."""
+    planned_factors = {row.key.text: row.key.factors for row in plan.rows}
     for row in plan.rows:
         selecting = [s for s in shards if s.spec.selection.selects(row.key.factors)]
         if len(selecting) > 1:
@@ -117,12 +155,13 @@ def _check_runs(shards: Sequence[ShardFacts], plan: Manifest) -> None:
             if key in holder:
                 raise MergeRefused(f"run {key} is in both {holder[key].name} and {shard.name}: the selections overlap")
             holder[key] = shard
-            if not shard.spec.selection.selects(factors):
+            if key not in planned_factors:
+                raise MergeRefused(f"{shard.name}: run {key} is not in the plan")
+            if dict(factors) != dict(planned_factors[key]):
+                raise MergeRefused(f"{shard.name}: its store gives run {key} other factors than its run key has")
+            if not shard.spec.selection.selects(planned_factors[key]):
                 raise MergeRefused(f"{shard.name}: holds run {key}, which its selection does not select")
-    planned = {row.key.text for row in plan.rows}
-    extra = sorted(set(holder) - planned)
-    if extra:
-        raise MergeRefused(f"{holder[extra[0]].name}: run {extra[0]} is not in the plan ({len(extra)} such runs)")
+    planned = set(planned_factors)
     missing = sorted(planned - set(holder))
     if missing:
         raise MergeRefused(
@@ -189,7 +228,11 @@ def _check_record(shard: ShardFacts, earlier: ShardFacts, entry: Mapping[str, An
 
 
 def _check_totals(shards: Sequence[ShardFacts], pricing: Pricing) -> None:
-    """5: the spend of all the selections within `max_usd` and each `per_model_usd`, releases added."""
+    """5: the spend of all the selections within `max_usd` and each `per_model_usd`, releases added.
+
+    Compared exactly: the ceiling as written (decimal), plus every release, against the sum of the spends, each the
+    float the budget gate itself computes; only `_FLOAT_NOISE` (a nano-dollar) is allowed over, the error of adding
+    those floats, which is far below the micro-dollar every share is made in."""
     budget = shards[0].fingerprint.get("caps", {}).get("budget")
     if not isinstance(budget, Mapping):
         return
@@ -203,11 +246,11 @@ def _check_totals(shards: Sequence[ShardFacts], pricing: Pricing) -> None:
         if any(value is None for value in spent):
             raise MergeRefused(f"what the selections spent on {scope} is unknown")
         released = sum(Fraction(s.released.get(scope, 0.0)) for s in shards)
-        limit = micro_usd(ceiling) + int(released * _MICRO)
-        total = round(sum(Fraction(value) for value in spent) * _MICRO)
-        if total > limit:
+        limit = Fraction(Decimal(str(ceiling))) + released
+        total = sum(Fraction(value) for value in spent)
+        if total > limit + _FLOAT_NOISE:
             raise MergeRefused(
-                f"the selections spent {total / _MICRO:.6f} USD together, over {what} = {ceiling:g} USD"
+                f"the selections spent {float(total):.9f} USD together, over {what} = {ceiling:g} USD"
                 + (f" and the {float(released):g} USD released" if released else "")
                 + ": their shares did not keep the total"
             )
