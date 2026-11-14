@@ -4,6 +4,7 @@ The campaign runs once per module with the core's source reported as a version-c
 reach every place an environment is recorded; a real one in these tests is editable and has neither.
 """
 
+import hashlib
 import io
 import json
 import sqlite3
@@ -17,6 +18,8 @@ import pytest
 from package_support import stand_in_vendor, wheel_of
 from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 
+from expcore.campaign.export import EXPORT_FINGERPRINT, export_text, read_export
+from expcore.campaign.manifest import fingerprint_sha256
 from expcore.package import build as package_build
 from expcore.package.build import PACKAGE_FILE, build_package, verify_package
 from expcore.package.spec import PackageError
@@ -92,6 +95,39 @@ def record_files(root: Path) -> list[Path]:
     return [p for p in (root / "out" / "runs").rglob("*.json") if "." in p.stem and p.stem.split(".")[-1].isdigit()]
 
 
+def without_sources(export: bytes) -> bytes:
+    """An export as it reads once its campaign fingerprint has no source in its environment: the fingerprint and, with
+    it, the hash (C35). Written here from the form of the export, not with the code that builds the package."""
+    data = json.loads(export)
+    entry = data[EXPORT_FINGERPRINT]
+    del entry["fingerprint"]["environment"]["sources"]
+    entry["sha256"] = fingerprint_sha256(entry["fingerprint"])
+    return export_text(data).encode("utf-8")
+
+
+def test_c35_the_anonymised_export_holds_the_fingerprint_of_the_anonymised_snapshot_and_no_source(
+    campaign, built, tmp_path
+):
+    """C35: the author's export names the core's source in its fingerprint, as the author's snapshot does; the
+    package's export holds the fingerprint its own snapshot holds, without any source, and the hash of that, so it
+    verifies against the snapshot it ships."""
+    author = json.loads((campaign.root / "out" / "export.json").read_text(encoding="utf-8"))
+    assert author[EXPORT_FINGERPRINT]["fingerprint"]["environment"]["sources"][CORE_DISTRIBUTION] == SOURCE
+    root = unpack(built, tmp_path)
+    export = read_export(root / "out" / "export.json")
+    snapshot = sqlite3.connect(root / "out" / "runs" / "campaign-snapshot.sqlite")
+    try:
+        text = snapshot.execute("SELECT value FROM meta WHERE key = 'fingerprint'").fetchone()[0]
+    finally:
+        snapshot.close()
+    assert export[EXPORT_FINGERPRINT] == {
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "fingerprint": json.loads(text),
+    }
+    assert "sources" not in export[EXPORT_FINGERPRINT]["fingerprint"]["environment"]
+    assert export[EXPORT_FINGERPRINT]["sha256"] != author[EXPORT_FINGERPRINT]["sha256"]
+
+
 def test_k11_no_commit_id_or_source_url_of_the_study_or_the_core_is_anywhere_in_the_package(built, tmp_path):
     """K11: the study's commit and the core's commit and URL, recorded by the campaign in the fingerprint and the
     check, appear in no file of the package, the database and the wheels included."""
@@ -128,7 +164,10 @@ def test_k11_the_anonymised_package_passes_its_own_check_byte_for_byte(campaign,
     assert json.loads((root / STAMP).read_text(encoding="utf-8"))["head"] == pseudo
     for name in OUTPUT_FILES:
         original = (campaign.root / "out" / name).read_bytes()
-        assert (root / "out" / name).read_bytes() == original.replace(HEAD.encode(), pseudo.encode())
+        expected = original.replace(HEAD.encode(), pseudo.encode())
+        if name == "export.json":  # the author's, with the fingerprint the anonymised snapshot holds (C35)
+            expected = without_sources(expected)
+        assert (root / "out" / name).read_bytes() == expected
     done = subprocess.run(
         ["make", "-C", str(root), "-f", "Makefile", "check-installed", f"PYTHON={sys.executable}"],
         capture_output=True,

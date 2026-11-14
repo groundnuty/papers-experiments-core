@@ -289,7 +289,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | C32 | A shard never holds pairs it cannot run, and a campaign can shard by model | `tests/campaign/test_config.py`, `tests/campaign/test_shard.py`, `tests/campaign/test_shard_budget.py`, `tests/campaign/test_shard_run.py`, `tests/study/test_merge_by_model.py`, `tests/study/test_shard_run.py` |
 | C33 | A start the platform holds back costs no attempt, and the campaign holds instead of spinning | `tests/campaign/test_liveness.py`, `tests/campaign/test_scheduler_holds.py`, `tests/test_errors.py` |
 | C34 | A fault on one target is declared with its target, and never scored without it | `tests/campaign/test_factors.py`, `tests/onedata/test_fault_admission.py`, `tests/onedata/test_fault_kinds.py`, `tests/onedata/test_fault_treatment.py`, `tests/test_errors.py` |
-| C35 | An export says which campaign it is of, and a reader can check it | `tests/campaign/test_export_fingerprint.py`, `tests/campaign/test_export_join.py`, `tests/e2e/test_verified_analysis.py`, `tests/study/test_merge.py` |
+| C35 | An export says which campaign it is of, and a reader can check it | `tests/campaign/test_export_fingerprint.py`, `tests/campaign/test_export_join.py`, `tests/e2e/test_verified_analysis.py`, `tests/package/test_anonymised.py`, `tests/study/test_merge.py` |
 | P01 | Unknown code is dirty code, and dirty code does not start a study run | `tests/provenance/test_codestamp.py` |
 | P02 | Code identity includes the data files the code reads, and is re-verified | `tests/provenance/test_codestamp.py`, `tests/study/test_plugin_import.py`, `tests/study/test_plugin_modules.py` |
 | P03 | Tree hashes ignore modification times and caches | `tests/provenance/test_codestamp.py` |

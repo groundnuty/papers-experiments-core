@@ -261,6 +261,8 @@ def _export_without_sources(text: bytes) -> bytes:
     fingerprint = dict(data[EXPORT_FINGERPRINT]["fingerprint"])
     if "environment" in fingerprint:
         fingerprint["environment"] = without_sources(fingerprint["environment"])
+    # the rewritten snapshot stores the fingerprint with sorted keys and an export reads it back in that order
+    fingerprint = json.loads(json.dumps(fingerprint, sort_keys=True, allow_nan=False))
     data[EXPORT_FINGERPRINT] = fingerprint_entry(fingerprint)
     return export_text(data).encode("utf-8")
 
