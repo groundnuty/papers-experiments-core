@@ -1016,10 +1016,32 @@ def families_analysis(*, equivalence=()):
             results.append(replaced.get(s.name) or contrast(s.name, word, p_value=s.p_value, significant=s.reject))
             holm.append(HolmDecision(s.name, s.p_value, s.p_holm, s.level, s.reject))
         members = tuple(s.name for s in family)
-        eq = tuple(HolmDecision(m, 0.01, 0.01, 0.05, True) for m in members if m in replaced)
+        eq = tuple(EQUIVALENCE[m] for m in members if m in replaced)  # each claim alone in its family: at alpha
         families.append(HolmFamily(name, members, family, eq))
     results.append(contrast("side", "difference", in_family=False, exploratory=True))
-    return AnalysisResult(tuple(results), tuple(holm), 0.05, dict(MANIFEST), holm_families=tuple(families))
+    equivalence_holm = tuple(EQUIVALENCE[r.name] for r in equivalence)
+    return AnalysisResult(
+        tuple(results),
+        tuple(holm),
+        0.05,
+        dict(MANIFEST),
+        equivalence_holm=equivalence_holm,
+        holm_families=tuple(families),
+    )
+
+
+EQUIVALENCE = {  # the TOST decisions of h1a and h2a, each the only equivalence claim of its family
+    "h1a": HolmDecision("h1a", 0.002, 0.002, 0.05, True),
+    "h2a": HolmDecision("h2a", 0.01, 0.01, 0.05, True),
+}
+
+
+def equivalence_members():
+    """h1a and h2a as equivalence claims, each judged at alpha / 1 within its own family: a 90% adjusted interval."""
+    return (
+        member("h1a", True, 0.002, 0.002, 0.9, (-0.08, 0.09)),
+        member("h2a", True, 0.01, 0.01, 0.9, (-0.1, 0.12)),
+    )
 
 
 def test_s16_each_named_family_has_a_table_of_its_own_members_with_their_holm_p_within_it():
@@ -1092,11 +1114,38 @@ def test_s16_a_step_whose_numbers_are_not_its_members_holm_decision_is_refused()
         render(bad)
 
 
+def test_s16_a_member_with_two_holm_decisions_is_refused():
+    """S16: a second, contradicting decision for a member would give a reader of analysis.json two verdicts, one
+    of which no family made; the report refuses it."""
+    good = families_analysis()
+    other = HolmDecision("h1a", 0.008, 0.9, 0.05 / 3, False)
+    with pytest.raises(ValueError, match="'h1a' has 2 Holm decisions"):
+        render(dataclasses.replace(good, holm=(other, *good.holm)))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda f: {"phase1": (EQUIVALENCE["h1a"], EQUIVALENCE["h2a"]), "phase2": ()},  # h2a's claim in phase1
+        lambda f: {"phase1": (dataclasses.replace(EQUIVALENCE["h1a"], reject=False),), "phase2": f["phase2"]},
+        lambda f: {"phase1": (), "phase2": f["phase2"]},  # h1a's claim in no family
+    ],
+    ids=["another-familys-claim", "another-verdict", "missing"],
+)
+def test_s16_a_familys_equivalence_decisions_must_be_its_own_members_claims_as_decided(change):
+    """S16, S15: each family holds the equivalence decisions of its own members, exactly as `equivalence_holm` gives
+    them; a claim filed under another family, with another verdict, or under none is refused."""
+    good = families_analysis(equivalence=equivalence_members())
+    current = {f.name: f.equivalence for f in good.holm_families}
+    moved = change(current)
+    families = tuple(dataclasses.replace(f, equivalence=moved[f.name]) for f in good.holm_families)
+    with pytest.raises(ValueError, match="equivalence"):
+        render(dataclasses.replace(good, holm_families=families))
+
+
 def test_s16_the_equivalence_table_names_each_members_holm_family():
     """S16, S15: each equivalence claim is adjusted within its own Holm family, and its row says which."""
-    eq_a = member("h1a", True, 0.002, 0.004, 0.95, (-0.08, 0.09))
-    eq_b = member("h2a", True, 0.01, 0.01, 0.9, (-0.1, 0.12))
-    report = render(families_analysis(equivalence=(eq_a, eq_b)))
+    report = render(families_analysis(equivalence=equivalence_members()))
     table = table_of(report, "### Equivalence family (Holm over two one-sided tests, within each Holm family)")
     assert table["Contrast"][:2] == ["Contrast", "Holm family"]
     assert table["h1a"][1] == "phase1"

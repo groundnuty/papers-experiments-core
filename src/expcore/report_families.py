@@ -18,11 +18,12 @@ Format = Callable[[float | None], str]
 
 def check_families(result: AnalysisResult) -> dict[str, str]:
     """Each confirmatory contrast's family, by contrast name; refuse a result whose families and Holm decisions
-    disagree: a decision in no family or in two, a family member with no decision, or a step whose numbers are not
-    its member's decision. A result with no named family (one flat family) has nothing to check."""
+    disagree: a member with two decisions, a decision in no family or in two, a family member with no decision, a
+    step whose numbers are not its member's decision, or equivalence decisions that are not the family's own (S15).
+    A result with no named family (one flat family) has nothing to check."""
     if not result.holm_families:
         return {}
-    decisions = {d.name: d for d in result.holm}
+    decisions = _unique(result.holm, "Holm decisions")
     family_of: dict[str, str] = {}
     for family in result.holm_families:
         if sorted(family.members) != sorted(s.name for s in family.steps):
@@ -41,7 +42,43 @@ def check_families(result: AnalysisResult) -> dict[str, str]:
     missing = [name for name in decisions if name not in family_of]
     if missing:
         raise ValueError(f"contrast {missing[0]!r} has a Holm decision and is in no Holm family")
+    _check_equivalence(result, family_of)
     return family_of
+
+
+def _unique(decisions: Sequence[HolmDecision], what: str) -> dict[str, HolmDecision]:
+    """The decisions by contrast name; refuse a contrast with two, which would give a reader two verdicts."""
+    by_name: dict[str, HolmDecision] = {}
+    for decision in decisions:
+        if decision.name in by_name:
+            count = sum(d.name == decision.name for d in decisions)
+            raise ValueError(f"contrast {decision.name!r} has {count} {what}; a member has one")
+        by_name[decision.name] = decision
+    return by_name
+
+
+def _check_equivalence(result: AnalysisResult, family_of: dict[str, str]) -> None:
+    """Each family's equivalence decisions are exactly its own members' claims as `equivalence_holm` decided them:
+    none of another family's member, none with other numbers, and none of its claims left out (S15, S16)."""
+    claims = _unique(result.equivalence_holm, "equivalence decisions")
+    held: dict[str, str] = {}
+    for family in result.holm_families:
+        for decision in family.equivalence:
+            if family_of.get(decision.name) != family.name:
+                raise ValueError(
+                    f"Holm family {family.name!r} holds the equivalence decision of {decision.name!r}, which is not "
+                    "its member"
+                )
+            claim = claims.get(decision.name)
+            if decision.name in held or claim is None or not _same(_numbers(decision), _numbers(claim)):
+                raise ValueError(
+                    f"contrast {decision.name!r}: its equivalence decision in Holm family {family.name!r} is not "
+                    "its one decision in equivalence_holm"
+                )
+            held[decision.name] = family.name
+    left_out = [name for name in claims if name not in held]
+    if left_out:
+        raise ValueError(f"contrast {left_out[0]!r} has an equivalence decision that no Holm family holds")
 
 
 def _numbers(decision: HolmStep | HolmDecision) -> tuple[float, float, float, bool]:

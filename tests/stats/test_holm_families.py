@@ -197,6 +197,18 @@ def test_s16_a_preregistration_built_in_code_keeps_its_families_and_their_union_
     assert (copy.holm_family, copy.sha256) == (("h2b", "h1a"), "f" * 64 + "+override")
 
 
+@pytest.mark.parametrize(
+    "families",
+    [{"one": {"h1a", "h1b"}}, {"one": "h1a"}, {"one": {"h1a": 1}}, {"one": ("h1a", 2)}, [("one", ("h1a",))]],
+    ids=["set", "string", "mapping", "not-a-name", "not-a-mapping"],
+)
+def test_s16_a_preregistration_built_in_code_refuses_families_that_are_not_lists_of_names(planted_p, families):
+    """S16, P04: a family given as a set (which freezing would leave the caller's to change), a string (whose
+    letters are not contrasts), a mapping or anything but a list of names is refused, as the loader refuses it."""
+    with pytest.raises(ValueError, match="Holm famil"):
+        parsed(prereg_text()).with_override(holm_families=families, holm_family=())
+
+
 def test_s16_p04_the_families_enter_the_preregistration_hash_every_output_carries(planted_p, tmp_path):
     """S16, P04: the same five contrasts as two families or as one flat family are two preregistrations, with two
     hashes in every output manifest, so no output computed under one can pass for the other."""
@@ -322,8 +334,8 @@ def test_s16_the_flat_holm_decisions_are_each_familys_in_declared_order(planted_
 
 
 def test_s16_a_family_of_one_is_judged_at_alpha_and_is_confirmatory(planted_p):
-    """S16: a stand-alone test at p = 0.04 is rejected at alpha / 1, where in the flat family of three it would face
-    alpha / 3 at best; a contrast in no family stays exploratory."""
+    """S16: a stand-alone test at p = 0.04, a family of one, is compared with alpha / 1 and rejected, and stays
+    confirmatory; a contrast in no family stays exploratory."""
     text = prereg_text('[holm_families]\nphase1 = ["h1a", "h1b"]\nsolo = ["h2a"]\n')
     result = analyse(rows_with_p({**CASE_A, "h2a": 0.04}), parsed(text))
     solo = next(family for family in result.holm_families if family.name == "solo")

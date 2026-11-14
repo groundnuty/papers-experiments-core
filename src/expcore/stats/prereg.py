@@ -178,6 +178,7 @@ class Preregistration:
         that are not each a non-empty list of declared contrasts, each contrast in one family at most, whose union
         is `holm_family` (S16); and an equivalence family that is not of members of the Holm family with a margin
         (S15)."""
+        _check_family_shapes(self.holm_families)  # before freezing, which leaves a set or a string as it is
         names = ("contrasts", "holm_family", "estimator_params", "equivalence_family", "descriptives", "holm_families")
         for name in names:
             object.__setattr__(self, name, freeze(getattr(self, name)))
@@ -272,6 +273,18 @@ class Preregistration:
             level=self.bootstrap.ci_level,
             seed=(self.bootstrap.seed, name_digest(spec.name)),
         )
+
+
+def _check_family_shapes(families: object) -> None:
+    """Refuse named Holm families that are not a mapping of names to lists or tuples of contrast names (S16). A set
+    would stay the caller's to change after freezing, and a string would be read as its letters."""
+    if not isinstance(families, Mapping):
+        raise ValueError(f"Holm families must be a mapping of family names to contrast names, got {type(families)}")
+    for family, members in families.items():
+        if not isinstance(members, list | tuple) or not all(isinstance(name, str) for name in members):
+            raise ValueError(
+                f"Holm family {family!r} must be a list or tuple of contrast names, got {type(members).__name__}"
+            )
 
 
 def name_digest(name: str) -> int:
