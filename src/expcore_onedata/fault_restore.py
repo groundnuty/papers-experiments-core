@@ -46,19 +46,17 @@ def digest(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def unhealed_detail(record: Mapping[str, Any], before: str | None) -> str:
+def unhealed_detail(record: Mapping[str, Any], latest: LinkMatrix, before: str | None) -> str:
     """Why a heal left the links stuck, for the restore's failure: the heal's own why (else the check's detail before
-    it), then each pair the heal's last check found failing, named by its reading provider, the one whose link the
-    remedy restarts, and its source, by label (O35, O12)."""
+    it), then each pair failing at the latest link check that answered, named by its reading provider, the one whose
+    link the remedy restarts, and its source, by label (O35, O12). `latest` is that check: the heal's last one, or,
+    when a later one could not run, the last that answered (the restore's own check when none of the heal's did), so
+    the failure always names the readers the last answer found failing."""
     why = str(record.get("why") or before)
-    after = record.get("after")
-    pairs = after.get("pairs") if isinstance(after, Mapping) else None
-    failing = [
-        f"{pair['reader']} reading from {pair['source']}"
-        for pair in pairs or ()
-        if isinstance(pair, Mapping) and pair.get("ok") is not True
-    ]
-    return f"{why}; failing after the heal, by reading provider: {', '.join(failing)}" if failing else why
+    failing = [f"{pair.reader} reading from {pair.source}" for pair in latest.failing()]
+    if failing:
+        return f"{why}; failing at the latest link check that answered, by reading provider: {', '.join(failing)}"
+    return why
 
 
 class LinkSettling:
@@ -160,6 +158,13 @@ class LinkSettling:
                 children.append(done["entry"])
             return done
 
+        answered = [matrix]  # the latest link check that answered: the restore's own, then each of the heal's
+
+        def read() -> LinkMatrix:
+            latest = self._matrix(service)  # one that cannot be read raises, and the heal reads it as unreadable
+            answered.append(latest)
+            return latest
+
         result = LinkHeal(
             mode=settings.heal,
             driver=self._driver,
@@ -173,7 +178,7 @@ class LinkSettling:
             link_s=heal_link_reserve(settings),
             all_links_s=heal_all_links_reserve(settings),
             container_s=heal_container_reserve(settings),
-            matrix=lambda: self._matrix(service),
+            matrix=read,
             gate=lambda reader, timeout_s: self._gate(reader, gate_probe, timeout_s),
             transfers=self._active_transfers,
             restart_container=restart,
@@ -186,7 +191,7 @@ class LinkSettling:
         for child in children:  # a restarted reader is restored only with every pair passing
             line = {"event": "cleared", "how": "restored"} if result.healed else {"event": "clear_failed"}
             self.journal.append({**line, "id": child, **({} if result.healed else {"how": result.how})})
-        self.links_detail = None if result.healed else unhealed_detail(result.record, self.links_detail)
+        self.links_detail = None if result.healed else unhealed_detail(result.record, answered[-1], self.links_detail)
         return result.how
 
     def _active_transfers(self) -> int | None:
