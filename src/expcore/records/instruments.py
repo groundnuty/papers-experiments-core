@@ -37,7 +37,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from expcore.errors import FirstTurnRefusal, InfraError, is_treatable
+from expcore.errors import FirstTurnRefusal, InfraError, is_treatable, uncharged_kinds
 from expcore.loop.outcomes import DETAIL_LIMIT
 from expcore.loop.timer import AgentTimer
 from expcore.plugin import FIRST_TURN_LABEL, Instrument
@@ -134,7 +134,10 @@ def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
 
     List order, not the finishes' reverse: the instrument listed first is the outermost, the manipulation or the
     restore, and its refusal is the cause of what the ones listed after it read, so it is the one the record keeps.
+    A hold (a kind that costs no attempt, `expcore.errors.uncharged_kinds`: an instrument whose start was held back)
+    wins over a refusal before it, so the checks after a charged refusal still run until one holds.
     """
+    first = None
     for instrument in instruments:
         check = _method(instrument, "check")
         if check is None:
@@ -143,8 +146,12 @@ def _refused_by(instruments: Sequence[Instrument]) -> dict[str, Any] | None:
             check()
         except InfraError as error:
             _require_untreatable(instrument, error, "after the run")
-            return {"namespace": instrument.namespace, "infra_kind": error.kind, "detail": error.detail[:DETAIL_LIMIT]}
-    return None
+            detail = error.detail[:DETAIL_LIMIT]
+            refusal = {"namespace": instrument.namespace, "infra_kind": error.kind, "detail": detail}
+            if error.kind in uncharged_kinds():
+                return refusal
+            first = first or refusal
+    return first
 
 
 def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> RunRecord:
@@ -158,11 +165,13 @@ def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> 
     Each snapshot is added through `RunRecord.with_instrument`, which derives the treatment flag again: a fault
     injector's snapshot decides whether a declared target was held down in this attempt (record version 3).
 
-    Then each instrument that has `check` is asked, in list order, once every snapshot is in; the first to refuse stops
-    the rest, and its refusal is in the returned record (`RunRecord.instrument_refusal`), snapshots and all, so the
-    attempt keeps its record. A check runs even when its instrument's `finish` failed: unknown is not a pass, and the
-    check decides. The executor calls this after the sandbox's collection and before its teardown, so a check can still
-    read what the run left. A check that raises a kind a condition may declare, or anything but a refusal, raises here.
+    Then each instrument that has `check` is asked, in list order, once every snapshot is in. A refusal of a hold kind
+    (one that costs no attempt, C33) stops the rest and is the record's refusal; a charged refusal does not stop them,
+    and is the record's refusal, the first one listed, only when no later check holds. The refusal is in the returned
+    record (`RunRecord.instrument_refusal`), snapshots and all, so the attempt keeps its record. A check runs even when
+    its instrument's `finish` failed: unknown is not a pass, and the check decides. The executor calls this after the
+    sandbox's collection and before its teardown, so a check can still read what the run left. A check that raises a
+    kind a condition may declare, or anything but a refusal, raises here.
     """
     check_instruments(instruments)
     snapshots: dict[str, dict[str, Any]] = {}

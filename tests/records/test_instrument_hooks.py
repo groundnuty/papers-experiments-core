@@ -197,7 +197,8 @@ def test_c31_a_run_with_instruments_that_have_no_check_is_recorded_byte_for_byte
 
 def test_c31_a_check_that_refuses_puts_the_verdict_in_the_record_and_keeps_every_snapshot():
     """C31: the refusal is recorded with the instrument, the kind and the detail; the snapshots, the failing
-    instrument's included, stay for diagnosis; and the checks after the refusing one are not run."""
+    instrument's included, stay for diagnosis; and the checks after a charged refusal still run, in case one holds
+    (C33), while the first refusal stays the record's when none does."""
     log = []
     refusing = Watcher("refusing", check=InfraError(REFUSED, "the plan failed mid-run"), log=log)
     later = Watcher("later", log=log)
@@ -209,7 +210,7 @@ def test_c31_a_check_that_refuses_puts_the_verdict_in_the_record_and_keeps_every
         "detail": "the plan failed mid-run",
     }
     assert set(out.instruments) == {"first", "refusing", "later"}
-    assert log == ["later.finish", "refusing.finish", "refusing.check"]
+    assert log == ["later.finish", "refusing.finish", "refusing.check", "later.check"]
     assert record.instrument_refusal is None  # the argument is not mutated
 
 

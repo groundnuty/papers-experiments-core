@@ -139,14 +139,16 @@ def test_c31_the_checks_run_in_list_order_once_every_finish_has_run_in_reverse()
 
 
 def test_c31_the_first_listed_instrument_to_refuse_is_the_refusal_the_record_keeps():
-    """C31: the first refusal stops the rest, and list order decides which it is: the instrument listed first, the
-    outermost, is the one recorded, never the probe listed after it whose reading it caused."""
+    """C31: list order decides which refusal the record keeps: the instrument listed first, the outermost, is the one
+    recorded, never the probe listed after it whose reading it caused. A charged refusal does not stop the checks after
+    it (C33: one of them may be a hold, which costs no attempt), so the probe's check still runs and its refusal is
+    not the record's."""
     log, kind = [], "tool_plane_integrity"
     outer = Logged("outer", log, refuse=InfraError(kind, "the plan failed mid-run"))
     inner = Logged("inner", log, refuse=InfraError(kind, "a symptom"))
     out = run([outer, inner])
     assert out.instrument_refusal == {"namespace": "outer", "infra_kind": kind, "detail": "the plan failed mid-run"}
-    assert "inner.check" not in log
+    assert [call for call in log if call.endswith(".check")] == ["outer.check", "inner.check"]
 
 
 @pytest.mark.parametrize("failing", ["a", "b", "c"])

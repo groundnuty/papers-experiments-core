@@ -23,6 +23,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import JOURNAL
 from expcore_onedata.faults import RestoreNotVerified, load_faults
+from expcore_onedata.sandbox.kinds import INGEST_HELD
 
 SERVICE = SERVICES["beta"]
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -448,3 +449,29 @@ def test_o11_the_post_run_check_passes_for_a_start_that_took_nothing_down(tmp_pa
     with pytest.raises(InfraError):
         injector.start(RUN)
     injector.check()
+
+
+@pytest.mark.parametrize("exit_by", ["session", "running"])
+def test_o45_a_held_start_in_the_body_stays_the_hold_when_the_restore_fails_too(tmp_path, exit_by):
+    """O45: the ingest's start is held back inside the injector's session (its baseline's mark refused it) and the
+    restore then fails: the hold is raised as it was, with the restore failure in its notes, so the attempt costs no
+    attempt; the injection stays open in the journal, so the health gate still fails for it."""
+    _, injector = unserving(tmp_path)
+    held = InfraError(INGEST_HELD, "the progressive ingest held its start back")
+
+    async def scenario():
+        async with injector.running(RUN):
+            raise held
+
+    def run():
+        if exit_by == "session":
+            in_session(injector, breaks(held))
+        else:
+            asyncio.run(scenario())
+
+    with pytest.raises(InfraError) as caught:
+        run()
+    assert caught.value is held
+    assert not isinstance(caught.value, RestoreNotVerified)
+    assert any(OUTAGE_TARGET in note and "not_serving" in note for note in caught.value.__notes__)
+    assert len(open_injections(tmp_path)) == 1

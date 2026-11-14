@@ -165,7 +165,7 @@ from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any
 
 from expcore.config.loading import ConfigError
-from expcore.errors import InfraError
+from expcore.errors import InfraError, uncharged_kinds
 from expcore.records.injections import FAULT_NAMESPACE
 from expcore_onedata.admission import (
     INJECTOR,
@@ -513,12 +513,16 @@ class FaultInjector:
 
     def _raise_unrestored(self, error: BaseException) -> None:
         """Called after a clear, while `error` is being raised: raise the failure of a restore not verified from
-        `error`, or, when `error` is no `Exception`, attach it as a note and return so that `error` is raised as it was."""
+        `error`, or, when `error` is no `Exception` or is a platform's hold (an `InfraError` of a kind that costs no
+        attempt, C33: an ingest's start its baseline's mark held back), attach it as a note and return so that `error`
+        is raised as it was. A held start costs its run no attempt whatever failed after it; the restore's failure is
+        still in the journal (`clear_failed`), so the health gate fails for it and no run starts on it."""
         with self._mutex:
             failure = self._unrestored()
         if failure is None:
             return
-        if isinstance(error, Exception):
+        held = isinstance(error, InfraError) and error.kind in uncharged_kinds()
+        if isinstance(error, Exception) and not held:
             raise failure from error
         error.add_note(str(failure))
 
