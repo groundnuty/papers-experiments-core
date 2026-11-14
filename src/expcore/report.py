@@ -49,10 +49,13 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.report_notes import (
+    ARM_LOST_HEADINGS,
+    ARM_RUNS_NOTES,
     BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
     COUNT_DEFINITIONS,
     DEPLOYMENT_NOTES,
+    DESCRIPTIVE_NOTES,
     MDE_NOTES,
     MISSING_PAIRS,
     NO_CLAIM,
@@ -64,6 +67,7 @@ from expcore.report_notes import (
 )
 from expcore.report_shards import shard_lines
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
+from expcore.stats.armruns import LOST_CAUSES
 from expcore.stats.pairing import MISSING_CAUSES
 
 EXPLORATORY = "exploratory"
@@ -234,7 +238,7 @@ def _exploratory_only(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *MDE_NOTES]
     if contrasts:
         lines += ["", *_pairs(contrasts, "### Pairs of the exploratory contrasts")]
-    return [*lines, "", *MISSING_PAIRS, ""]
+    return [*lines, "", *MISSING_PAIRS, "", *_arm_runs(contrasts), *_descriptives(result, level)]
 
 
 def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
@@ -267,7 +271,58 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *_pairs(exploratory, "### Pairs of the exploratory contrasts")]
     else:
         lines += ["None declared."]
-    return [*lines, "", *MISSING_PAIRS, ""]
+    return [*lines, "", *MISSING_PAIRS, "", *_arm_runs(result.contrasts), *_descriptives(result, level)]
+
+
+def _finish_rate(value: float) -> str:
+    """A share of planned runs as a percentage; n/a for an arm with no planned run, never 0%."""
+    return _share(value) if math.isfinite(value) else UNKNOWN
+
+
+def _arm_runs(results: Sequence[ContrastResult]) -> list[str]:
+    """What became of each arm's own planned runs, per contrast (S14); nothing for a result that carries none."""
+    rows = [
+        [
+            r.name,
+            a.arm,
+            a.planned,
+            a.finished,
+            _finish_rate(a.finish_rate),
+            a.measured,
+            *(a.lost[c] for c in LOST_CAUSES),
+        ]
+        for r in results
+        for a in r.arm_runs
+    ]
+    if not rows:
+        return []
+    header = ["Contrast", "Arm", "Planned", "Finished", "Finish rate", "Measured", *ARM_LOST_HEADINGS]
+    return ["### Runs of each arm", "", *ARM_RUNS_NOTES, "", *_table(header, rows), ""]
+
+
+def _descriptives(result: AnalysisResult, level: float | None) -> list[str]:
+    """The one-arm estimates (S14), descriptive, with no test; nothing when none is declared."""
+    if not result.descriptives:
+        return []
+    interval = "Interval" if level is None else f"{percent(level)} interval"
+    header = ["Estimate", "Kind", "Arm", "Outcome", "Value", interval, "Clusters", "Runs used", "Finish rate"]
+    rows = [
+        [
+            d.name,
+            d.kind,
+            " + ".join(d.conditions),
+            d.outcome,
+            _num(d.estimate),
+            f"[{_num(d.ci_low)}, {_num(d.ci_high)}]",
+            d.n_clusters,
+            d.n_runs,
+            _finish_rate(d.runs.finish_rate),
+            d.n_undefined_replicates,
+        ]
+        for d in result.descriptives
+    ]
+    lines = ["## One-arm estimates (descriptive)", "", *DESCRIPTIVE_NOTES, ""]
+    return [*lines, *_table([*header, "Undefined replicates"], rows), ""]
 
 
 def _pairs(results: Sequence[ContrastResult], heading: str) -> list[str]:
@@ -374,6 +429,10 @@ def summary_lines(result: AnalysisResult) -> list[str]:
         holm = _p(adjusted[r.name]) if member else EXPLORATORY
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
         lines.append(f"{r.name}: estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}, {word}")
+    for d in result.descriptives:  # no test and no word: a one-arm estimate is descriptive (S14)
+        kind, arm = d.kind.replace("_", " "), " + ".join(d.conditions)
+        interval = f"[{_num(d.ci_low)}, {_num(d.ci_high)}]"
+        lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
     return lines
 
 

@@ -38,6 +38,10 @@ contrast's preregistered `max_unscored_treatment` (0 unless set). An exploratory
 refused.
 
 With power settings, a result also carries the minimum detectable effect at its own number of clusters.
+
+Each contrast's result carries what became of each arm's own planned runs (`arm_runs`, S14), and the analysis carries
+every preregistered one-arm estimate (`descriptives`, `expcore.stats.onearm`), which is descriptive: no test, no
+conclusion and no place in the Holm family.
 """
 
 from __future__ import annotations
@@ -50,7 +54,9 @@ import numpy as np
 
 from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
+from expcore.stats.armruns import ArmRuns
 from expcore.stats.estimators import ModelEstimate, PairedDifferences
+from expcore.stats.onearm import DescriptiveResult, describe
 from expcore.stats.pairing import ContrastSpec, Pairing, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
 from expcore.stats.rejection import rejects
@@ -100,6 +106,7 @@ class ContrastResult:
     )
     conclusion: str  # one of CONCLUSIONS
     minimum_detectable_effect: float | None  # None without power settings, NaN when it cannot be reached
+    arm_runs: tuple[ArmRuns, ...] = ()  # arm A's and arm B's planned runs, measured or lost by cause (S14)
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -131,6 +138,7 @@ class AnalysisResult:
     alpha: float
     manifest: Mapping[str, str]
     exploratory_only: bool = False
+    descriptives: tuple[DescriptiveResult, ...] = ()  # the one-arm estimates, in declared order (S14)
 
     def contrast(self, name: str) -> ContrastResult:
         """Return the result of the contrast with this name."""
@@ -299,6 +307,7 @@ def run_contrast(
         equivalent=equivalent,
         conclusion=conclude(significant, equivalent, untestable),
         minimum_detectable_effect=mde,
+        arm_runs=pairing.arm_runs,
     )
 
 
@@ -329,7 +338,10 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
         else r
         for r in results
     )
-    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest(), prereg.exploratory_only)
+    described = tuple(
+        describe(rows, spec, prereg.descriptive_settings(spec), absent) for spec in prereg.descriptives.values()
+    )
+    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest(), prereg.exploratory_only, described)
 
 
 @dataclasses.dataclass(frozen=True)

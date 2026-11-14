@@ -117,6 +117,23 @@ def test_the_pipeline_recovers_a_planted_effect_within_its_interval(prereg, plan
     assert null.p_value > 0.05
 
 
+def test_s14_the_analysis_carries_each_arms_runs_and_every_one_arm_estimate(planted):
+    """S14: a contrast's result names its two arms' planned runs; a one-arm estimate recovers its planted rate, and
+    stays outside the Holm family."""
+    _, rows = planted
+    text = TEXT + '\n[descriptives.rate-open-x]\nconditions = ["open-x"]\noutcome = "rate"\ncluster = "group"\n'
+    result = analyse(rows, parse(tomllib.loads(text), "inline", "a" * 64, SCHEMA))
+    [described] = result.descriptives
+    assert (described.name, described.kind, described.n_clusters) == ("rate-open-x", "rate", 30)
+    assert described.estimate == pytest.approx(RATE["open-x"], abs=0.06)
+    assert described.ci_low < described.estimate < described.ci_high
+    assert "rate-open-x" not in [d.name for d in result.holm]
+    contrast = result.contrast("open-vs-shut-at-x")
+    assert [arm.arm for arm in contrast.arm_runs] == ["open-x", "shut-x"]
+    assert all(arm.planned == arm.measured == contrast.n_pairs for arm in contrast.arm_runs)
+    assert analyse(rows, parse(tomllib.loads(TEXT), "inline", "a" * 64, SCHEMA)).descriptives == ()
+
+
 def test_holm_runs_over_the_declared_family_with_the_exact_levels(prereg, planted):
     """The decisions follow the family order, the levels are alpha over the remaining hypotheses, and the null stays."""
     _, rows = planted
