@@ -35,6 +35,7 @@ from side_file_support import (
 )
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
+from expcore.campaign.lock import DispatchLock
 from expcore.package import build as package_build
 from expcore.package.archive import SUMS_FILE, render_sums
 from expcore.package.build import PACKAGE_FILE, build_package, verify_package
@@ -281,6 +282,23 @@ def test_r15_check_removes_a_temporary_file_no_record_names_and_passes(copy, cle
     assert not beside_a_record.exists()
     assert not beside_no_record.exists()
     assert stored_check(copy.runs)["failures"] == []
+
+
+def test_r15_check_removes_nothing_while_a_dispatcher_holds_the_campaign_lock_and_still_finishes_a_rename(
+    copy, clean_environment
+):
+    """R15: with the campaign's lock held by another process there may be an attempt staging a file whose record is
+    not written yet, so `check` removes no temporary file; a rename a record names is finished all the same."""
+    placed = side_files(copy.runs)[0]
+    stray = temporary_of(records_without_side_file(copy.runs)[0].parent / SIDE)  # before `placed` joins that list
+    placed.rename(temporary_of(placed))
+    stray.write_bytes(b"an attempt that is staging its file")
+    with DispatchLock(copy.runs.parent):
+        code, output = cli(clean_environment, "check", str(copy.runs))
+    assert code == 0, (output, stored_check(copy.runs)["failures"])
+    assert placed.is_file()
+    assert not temporary_of(placed).exists()
+    assert stray.exists()
 
 
 def test_r15_check_never_puts_a_file_in_place_that_is_not_the_one_its_record_names(copy, clean_environment):

@@ -222,15 +222,52 @@ def test_r15_commit_renames_the_file_into_place_once_the_record_names_it(request
     assert failures(batch) == []
 
 
-def test_r15_commit_is_finished_already_when_a_check_renamed_the_file_meanwhile(request_of):
+def test_r15_commit_succeeds_when_a_check_renamed_the_file_before_it_looked(request_of):
     """R15: a check that ran during the attempt may have finished the rename: the commit then finds the file in place
-    with the hash and succeeds, and refuses when what lies there is another file."""
+    with the hash and succeeds, leaving no temporary copy."""
     _, staged = stage(request_of)
     assert staged is not None
     write_record(request_of, staged.sha256)
     os.replace(temporary(request_of.run_dir), request_of.run_dir / LOGGED.pattern)
     assert staged.commit() == request_of.run_dir / LOGGED.pattern
-    (request_of.run_dir / LOGGED.pattern).write_bytes(b"swapped")
+    assert not temporary(request_of.run_dir).exists()
+
+
+def test_r15_commit_succeeds_when_a_check_renames_the_file_between_its_look_and_its_rename(request_of, monkeypatch):
+    """R15: a check that finishes the rename after the commit saw the temporary file and before it renamed it makes
+    the commit's rename fail on a missing source: the commit finds the file in place with the hash and succeeds."""
+    _, staged = stage(request_of)
+    assert staged is not None
+    write_record(request_of, staged.sha256)
+    real = os.replace
+
+    def raced(source, target):
+        real(source, target)  # the check's rename, first
+        raise FileNotFoundError(source)
+
+    monkeypatch.setattr("expcore.replay.side_file_placement.os.replace", raced)
+    assert staged.commit() == request_of.run_dir / LOGGED.pattern
+    assert (request_of.run_dir / LOGGED.pattern).read_bytes() == CONTENT
+
+
+def test_r15_commit_never_overwrites_a_file_already_at_the_declared_name(request_of):
+    """R15: a file that lies at the declared name with other bytes than the record names is kept, and the commit
+    refuses, so the check's pairing refuses the file instead of the commit turning the discrepancy into a pass."""
+    _, staged = stage(request_of)
+    assert staged is not None
+    write_record(request_of, staged.sha256)
+    (request_of.run_dir / LOGGED.pattern).write_bytes(b"another file")
+    with pytest.raises(PlacementError, match="not overwritten"):
+        staged.commit()
+    assert (request_of.run_dir / LOGGED.pattern).read_bytes() == b"another file"
+
+
+def test_r15_commit_reports_a_file_that_is_neither_staged_nor_in_place_as_lost(request_of):
+    """R15: with the temporary file gone and nothing at the declared name, the commit says the file is lost."""
+    _, staged = stage(request_of)
+    assert staged is not None
+    write_record(request_of, staged.sha256)
+    temporary(request_of.run_dir).unlink()
     with pytest.raises(PlacementError, match="lost"):
         staged.commit()
 
@@ -253,11 +290,11 @@ def test_r15_a_kill_after_the_temporary_file_leaves_no_state_the_check_refuses(r
     _, staged = stage(request_of)
     assert staged is not None
     assert failures(batch) == []
-    [settled] = settle_side_files(batch, DECLARED)
+    [settled] = settle_side_files(batch, DECLARED, remove_unnamed=True)
     assert (settled.action, settled.path) == ("removed", temporary(request_of.run_dir).relative_to(batch).as_posix())
     assert not temporary(request_of.run_dir).exists()
     assert failures(batch) == []
-    assert settle_side_files(batch, DECLARED) == []
+    assert settle_side_files(batch, DECLARED, remove_unnamed=True) == []
 
 
 def test_r15_a_kill_after_the_record_is_finished_by_the_check_and_not_refused(request_of, batch):
@@ -299,7 +336,7 @@ def test_r15_a_temporary_file_that_is_not_the_one_a_record_names_is_never_rename
     assert staged is not None
     write_record(request_of, staged.sha256)
     temporary(request_of.run_dir).write_bytes(CONTENT[:-1] + b"X")  # not what the record names
-    [settled] = settle_side_files(batch, DECLARED)
+    [settled] = settle_side_files(batch, DECLARED, remove_unnamed=True)
     assert settled.action == "removed"
     assert not (request_of.run_dir / LOGGED.pattern).exists()
     [(file, error)] = failures(batch)
@@ -307,36 +344,52 @@ def test_r15_a_temporary_file_that_is_not_the_one_a_record_names_is_never_rename
     assert "but no such file lies beside it" in error
 
 
-def test_r15_a_temporary_file_with_no_record_beside_it_stays_while_attempts_run(request_of, batch):
-    """R15: a check made while attempts run (`check --partial`) cannot tell a kill from an attempt that has staged its
-    file and has not written its record yet, so it leaves such a file; once none runs it is removed."""
+def test_r15_a_temporary_file_with_no_record_beside_it_is_removed_only_when_asked(request_of, batch):
+    """R15: a check made while the campaign runs cannot tell a kill from an attempt that has staged its file and has
+    not written its record yet, so by default nothing is removed; the caller that holds the campaign's lock asks."""
     _, staged = stage(request_of)
     assert staged is not None
-    assert settle_side_files(batch, DECLARED, attempts_running=True) == []
+    assert settle_side_files(batch, DECLARED) == []
     assert temporary(request_of.run_dir).exists()
-    [settled] = settle_side_files(batch, DECLARED)
+    [settled] = settle_side_files(batch, DECLARED, remove_unnamed=True)
     assert settled.action == "removed"
     assert not temporary(request_of.run_dir).exists()
 
 
-def test_r15_a_check_while_attempts_run_still_finishes_a_rename_and_the_commit_accepts_it(request_of, batch):
-    """R15: a rename whose record names the file is finished whether or not attempts run: if the attempt's own
-    commit comes after, it finds the file in place."""
+def test_r15_a_file_being_staged_is_not_removed_when_its_record_lands_during_the_check(request_of, batch):
+    """R15: a check that hashes the temporary file while the attempt is still writing it holds a hash of a prefix; when
+    the attempt then writes the record that names the whole file, the check must not take the mismatch for a file no
+    record names and delete it. By default nothing is removed, and the attempt's own commit succeeds."""
+    _, staged = stage(request_of)
+    assert staged is not None
+    whole = temporary(request_of.run_dir).read_bytes()
+    temporary(request_of.run_dir).write_bytes(whole[:10])  # what the check read: a prefix
+    write_record(request_of, staged.sha256)  # the attempt's record, naming the whole file
+    assert settle_side_files(batch, DECLARED) == []
+    temporary(request_of.run_dir).write_bytes(whole)  # the attempt's write finishes
+    assert staged.commit() == request_of.run_dir / LOGGED.pattern
+    assert failures(batch) == []
+
+
+def test_r15_a_rename_a_record_names_is_finished_without_asking_to_remove_anything(request_of, batch):
+    """R15: a rename whose record names the file is finished whatever the caller allows removing, so a check made
+    while the campaign runs finishes it too: the attempt's own commit, if it comes after, finds the file in place."""
     _, staged = stage(request_of)
     assert staged is not None
     write_record(request_of, staged.sha256)
-    [settled] = settle_side_files(batch, DECLARED, attempts_running=True)
+    [settled] = settle_side_files(batch, DECLARED)
     assert settled.action == "finished"
     assert staged.commit() == request_of.run_dir / LOGGED.pattern
     assert failures(batch) == []
 
 
-def test_r15_a_temporary_file_beside_a_record_that_names_another_is_removed_even_while_attempts_run(request_of, batch):
-    """R15: a record that is there and does not name the file settles it: its attempt is past writing the record."""
+def test_r15_a_temporary_file_beside_a_record_that_names_another_hash_is_removed_when_asked(request_of, batch):
+    """R15: a record that is there and does not name the file leaves it unnamed: removed, when removal is asked for."""
     _, staged = stage(request_of)
     assert staged is not None
     write_record(request_of, digest(b"another file"))
-    [settled] = settle_side_files(batch, DECLARED, attempts_running=True)
+    assert settle_side_files(batch, DECLARED) == []
+    [settled] = settle_side_files(batch, DECLARED, remove_unnamed=True)
     assert settled.action == "removed"
 
 
@@ -367,8 +420,8 @@ def test_r15_a_file_in_place_with_another_hash_is_never_replaced(request_of, bat
 
 
 def test_r15_a_directory_of_several_records_is_never_settled_by_guessing(request_of, batch):
-    """R15: with two records in the directory the file cannot be paired with one of them, so it is not renamed, and
-    the check refuses the directory as it does for any side file there."""
+    """R15: with two records in the directory, one of which names the file, it cannot be paired with one of them, so it
+    is not renamed (and not removed, being named), and the check refuses the directory as for any side file there."""
     _, staged = stage(request_of)
     assert staged is not None
     write_record(request_of, staged.sha256)
@@ -383,7 +436,7 @@ def test_r15_a_record_that_does_not_load_names_nothing(request_of, batch):
     _, staged = stage(request_of)
     assert staged is not None
     (request_of.run_dir / record_for("run-killed").filename).write_text("not json", encoding="utf-8")
-    [settled] = settle_side_files(batch, DECLARED)
+    [settled] = settle_side_files(batch, DECLARED, remove_unnamed=True)
     assert settled.action == "removed"
 
 
@@ -417,7 +470,7 @@ def test_r15_the_recovery_settles_each_declared_side_file_of_a_directory_on_its_
     assert first is not None
     assert second is not None
     record_for(request_of.identity.run_key, extent=first.sha256, surplus=digest(b"another")).write(request_of.run_dir)
-    settled = {s.path.rsplit("/", 1)[1]: s.action for s in settle_side_files(batch, DECLARED)}
+    settled = {s.path.rsplit("/", 1)[1]: s.action for s in settle_side_files(batch, DECLARED, remove_unnamed=True)}
     assert settled == {
         temporary_name(LOGGED.pattern, ATTEMPT): "finished",
         temporary_name(SECOND.pattern, ATTEMPT): "removed",

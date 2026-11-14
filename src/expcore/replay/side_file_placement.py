@@ -19,16 +19,20 @@ state a kill can leave is one `check` settles (`settle_side_files`, which it run
 none is one it refuses for a reason the study did not cause:
 
 - Killed after the temporary file, before the record: a dot-name is never read by the check, and no record names the
-  file, so `check` removes it. While attempts run, a file with no record beside it may be an attempt that has not yet
-  written its own, so it is left until none runs.
+  file, so `check` removes it, once it holds the campaign's lock (no attempt can be staging a file of its own, whose
+  record is not written yet and whose partial hash is not a record's). A check made while the campaign runs leaves it.
 - Killed after the record, before the rename: the record names a hash and the file is still under its temporary name.
   `check` renames it, when the directory holds exactly one record, that record names the file's SHA-256 at the declared
   field, and nothing lies at the declared name; the pairing of the check then hashes and verifies it like any other.
+  That needs no lock: the hash is the record's, and the record is written only once the file is complete.
 - Killed after the rename: complete, nothing to settle.
 
-A temporary file no record in its directory names is removed. A file is never put in place on a guess: a hash that is
-not the record's, a directory of several records, or a file already at the declared name (which the pairing refuses as
-changed) leave it as it is, and the check's pairing still verifies every file that is in place against the record.
+A temporary file no record in its directory names is removed (when the lock is held). A file is never put in place on
+a guess: a hash that is not the record's, a directory of several records that one of them names, or a file already at
+the declared name (which the pairing refuses as changed, and which `commit` never overwrites either) leave it as it
+is, and the check's pairing still verifies every file that is in place against the record. A check of a running
+campaign is a snapshot of a batch that is changing: an attempt it finds between its record and its rename is
+settled when the check lists it, and one that reaches that point after is the next check's to settle.
 """
 
 import hashlib
@@ -109,8 +113,9 @@ class StagedSideFile:
     def commit(self) -> Path:
         """Rename the file to its declared name, once the record on disk names its SHA-256; return its path.
 
-        Refuses, renaming nothing, when the record is not there yet or names another hash. A `check` made meanwhile
-        may have finished the rename already; the file in place with the hash is then the result.
+        Refuses, renaming nothing, when the record is not there yet or names another hash, and never overwrites a file
+        that lies at the declared name with other bytes. A `check` made meanwhile may have finished the rename
+        already; the file in place with the hash is then the result.
         """
         field = self.declaration.hash_field
         if not self.record.is_file():
@@ -124,14 +129,24 @@ class StagedSideFile:
                 f"the record names {named!r} at {field}, not the SHA-256 of {self.declaration.pattern} staged "
                 f"({self.sha256}): put staged.sha256 in the record before the rename"
             )
-        if os.path.lexists(self.temporary):
+        if os.path.lexists(self.path):  # nothing is overwritten: a file in place is for the check's pairing to judge
+            if not _holds(self.path, self.sha256):
+                raise PlacementError(
+                    f"{self.declaration.pattern} already lies in the attempt directory, holding other bytes than "
+                    f"the SHA-256 {self.sha256} the record names: it is not overwritten"
+                )
+            self.temporary.unlink(missing_ok=True)  # a check finished the rename already: this is the same file
+            return self.path
+        try:
             os.replace(self.temporary, self.path)
+        except FileNotFoundError:  # a check finished the rename between the test above and this call
+            if not _holds(self.path, self.sha256):
+                raise PlacementError(
+                    f"{self.declaration.pattern} is lost: neither its temporary file nor a file of the declared name "
+                    f"with the SHA-256 {self.sha256} lies in the attempt directory"
+                ) from None
+        else:
             _fsync_directory(self.run_dir)
-        elif not _holds(self.path, self.sha256):
-            raise PlacementError(
-                f"{self.declaration.pattern} is lost: neither its temporary file nor a file of the declared name "
-                f"with the SHA-256 {self.sha256} lies in the attempt directory"
-            )
         return self.path
 
     def discard(self) -> None:
@@ -271,17 +286,19 @@ class Settled:
 
 
 def settle_side_files(
-    batch: str | os.PathLike[str], side_files: Sequence[SideFile], *, attempts_running: bool = False
+    batch: str | os.PathLike[str], side_files: Sequence[SideFile], *, remove_unnamed: bool = False
 ) -> list[Settled]:
     """Finish or remove the temporary files of declared side files that a kill left in a batch; return what was done.
 
     A temporary file (`temporary_name`, any attempt number) whose directory holds exactly one record, which names its
     SHA-256 at the declaration's field, is renamed to the declared name unless something lies there already: a file
     with the same hash makes the temporary copy redundant and it is removed, any other is left for the check's pairing
-    to refuse. A temporary file no record in its directory names is removed, except that with `attempts_running` (a
-    check made while the campaign runs) one with no record beside it is left: its attempt may not have written the
-    record yet. A file in a directory of several records, and anything that is not a regular file, is left alone.
-    Nothing outside the declared temporary names is touched, and a second call finds nothing to do.
+    to refuse. That is safe whenever it is done: the hash is the record's, which is written only after the file is
+    complete. A temporary file no record in its directory names is removed only with `remove_unnamed`, which the caller
+    sets when no attempt can be writing in the batch (it holds the campaign's lock): an attempt that is staging has a
+    file that no record names yet, and its partial hash is not a record's. A file in a directory of several records
+    that one of them names, and anything that is not a regular file, is left alone. Nothing outside the declared
+    temporary names is touched, and a second call finds nothing to do.
     """
     settled: list[Settled] = []
     if not side_files:
@@ -292,7 +309,7 @@ def settle_side_files(
         for name in sorted(names):
             declaration = _declaration_of(name, side_files)
             if declaration is not None:
-                done = _settle_one(Path(directory), name, declaration, attempts_running)
+                done = _settle_one(Path(directory), name, declaration, remove_unnamed)
                 if done is not None:
                     settled.append(Settled(Path(directory, name).relative_to(root).as_posix(), *done))
     return settled
@@ -307,7 +324,7 @@ def _declaration_of(name: str, side_files: Sequence[SideFile]) -> SideFile | Non
     return None
 
 
-def _settle_one(directory: Path, name: str, declaration: SideFile, attempts_running: bool) -> tuple[str, str] | None:
+def _settle_one(directory: Path, name: str, declaration: SideFile, remove_unnamed: bool) -> tuple[str, str] | None:
     """Settle one temporary file; return (action, why), or None when it is left as it is."""
     temporary = directory / name
     try:
@@ -318,7 +335,7 @@ def _settle_one(directory: Path, name: str, declaration: SideFile, attempts_runn
         names_it = [p for p in records if _named_in(p, declaration.hash_field) == sha256]
         if names_it:
             return _finish(temporary, directory / declaration.pattern, sha256) if len(records) == 1 else None
-        if not records and attempts_running:
+        if not remove_unnamed:
             return None
         temporary.unlink()
         return REMOVED, "no record beside it names its SHA-256" if records else "no record lies beside it to name it"
