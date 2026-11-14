@@ -12,6 +12,7 @@ domain = "expcore-fed5.test"
 study_space = "alpha-space"
 memory_limit = "6g"              # six services: their limits together must fit in the host's available memory
 platform_template = "five-providers.platform.toml.template"
+probe_space = "link-probes"      # the link check's probes (#221), on every provider of a space the agent may reach
 
 [zone]
 port = 29543
@@ -45,6 +46,13 @@ owner = "alder"
 owner = "hazel"
 mirrors = ["alder"]
 support_bytes = 5368709120       # 5 GiB on each of its providers
+
+[spaces.link-probes]             # the probe space: no agent user is a member, and up writes nothing into it
+owner = "aspen"
+mirrors = ["larch", "rowan", "alder", "hazel"]
+agent_visible = false
+baseline = false
+support_bytes = 1073741824       # 1 GiB: a probe is under 1 MiB
 
 [principals.alpha-reader]
 privileges = ["space_view", "space_read_data"]

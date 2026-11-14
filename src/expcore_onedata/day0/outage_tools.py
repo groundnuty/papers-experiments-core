@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from expcore.errors import InfraError
+from expcore.tools.mcp_client import CallTimedOut
 from expcore_onedata.consistency import ENDED_STATES, transfer_state
 from expcore_onedata.day0.outage_cells import ROLES, Roles
 from expcore_onedata.placement import held_bytes, provider_blocks
@@ -195,7 +196,7 @@ class Tools:
             out = await asyncio.wait_for(
                 self._provider.execute(name, dict(args), timeout_s=self.bound_s), timeout=self.bound_s
             )
-        except TimeoutError:
+        except (TimeoutError, CallTimedOut):  # the bound passed: this wait's, or the client's own (L16)
             seconds = round(self._clock() - began, 3)
             return {"outcome": "blocked", "timed_out": True, "seconds": seconds}, None
         except InfraError as error:  # the server closed or failed: no answer from the tool at all

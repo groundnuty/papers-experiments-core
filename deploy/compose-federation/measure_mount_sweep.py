@@ -61,7 +61,7 @@ from expcore_onedata.provision import Provisioner, resolve_provider_ids  # noqa:
 from expcore_onedata.rangemap import load_placement  # noqa: E402
 from expcore_onedata.sandbox import hostops  # noqa: E402
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxError, SandboxSpec  # noqa: E402
-from expcore_onedata.sandbox.containers import ONECLIENT_BIN, effective_log_dir, sidecar_command  # noqa: E402
+from expcore_onedata.sandbox.containers import ONECLIENT_BIN, SIDECAR_LOG_DIR  # noqa: E402
 from expcore_onedata.sandbox.hostops import DockerHost  # noqa: E402
 from expcore_onedata.sandbox.sandbox import DockerSandbox  # noqa: E402
 from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
@@ -366,7 +366,7 @@ def _size(view: Provisioner, path: str, provider: str) -> int | None:
 
 def sidecar_log(host: DockerHost, sandbox: DockerSandbox, spec: SandboxSpec, fixtures: list[dict]) -> dict:
     """oneclient's log files by size and line count, and how many lines name each fixture file; never the text."""
-    sidecar, log_dir = sandbox.names.sidecar, effective_log_dir(sidecar_command(spec.provider.host, sandbox.s))
+    sidecar, log_dir = sandbox.names.sidecar, SIDECAR_LOG_DIR  # the sandbox's own, bound from the run (O05)
     listed = host.docker("exec", sidecar, "find", log_dir, "-type", "f", "-printf", "%s %p\\n", check=False, timeout=60)
     files, text = [], []
     for line in listed.stdout.splitlines():

@@ -1,5 +1,7 @@
 # Provenance: new
 """What is checked once before a campaign admits its first run: the content type the data gate streams on (O05, O11).
+The provider links (O35, `linkcheck.py`) are checked at the same first call, but by `health.PlatformHealth` itself and
+not kept here: a stuck link is remedied while the campaign waits, so its check runs again until it passes.
 
 The data gate streams only a file's content, an answer of 200 or 206 from the content endpoint typed
 `application/octet-stream` (`sandbox/gateboundary.py`); every other answer it buffers whole, up to 4 MiB, and refuses
@@ -30,8 +32,9 @@ Its time. The first call makes a few requests in sequence: the space's root, a l
 path, the gate's walk from the file up to the root before the first read (the root as the gate reads it, and one parent
 link per level of the path; the second read finds it kept), the space's name before each read, and each read's head.
 Each is bounded by the client's timeout (15 s by default). The core's `health_timeout_s` (60 s by default) should exceed
-their sum; a first call that outlives it reads unhealthy once, closing the gate, and the verdict it keeps when it ends
-answers every call after it.
+their sum, and the link check's bounds when platform.toml has a `[link_check]` (`linkcheck.py`, "Where it runs"); a
+first call that outlives it reads unhealthy once, closing the gate, and the verdict it keeps when it ends answers every
+call after it.
 """
 
 import re

@@ -8,7 +8,10 @@ leaves out waits on infrastructure that are open, because the agent's clock is p
 its cap, and the total time against the ceiling. Waking early, for instance because a wait paused the agent's clock,
 only costs another reading; a limit is never passed unseen, because the agent's deadline can move later but not earlier.
 
-A call that finishes first returns its result, whatever the clock says after the fact. A call that is cut is cancelled
+A call that finishes first returns its result, whatever the clock says after the fact. The exception is a call that
+ended by the expiry of its own bound, `CallTimedOut`, at the bound it was handed (the agent's time left, L05): that
+expiry and this watch's cut are one moment, so it is judged as the cut when a reading shows a limit passed (L16). A call
+that is cut is cancelled
 and awaited, and the time that takes is cleanup, which the timer keeps apart from the agent's time. The same cleanup
 runs when the whole run is cancelled from outside, and then the cancellation goes on to the caller.
 
@@ -23,6 +26,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+from expcore.errors import CallTimedOut
 from expcore.loop.timer import AgentTimer, Tick
 
 log = logging.getLogger(__name__)
@@ -61,6 +65,11 @@ class Watcher:
             while True:
                 await asyncio.wait({job, sleeper, nudge}, return_when=asyncio.FIRST_COMPLETED)
                 if job.done():
+                    if _ended_at_the_bound_it_was_given(job, tick):
+                        now = self._timer.check("watch")  # the reading the cut takes, so a replay reads alike
+                        if now.remaining_s <= 0 or now.ceiling_passed:
+                            self._timer.begin_cleanup(now)
+                            raise Cut(now)
                     return job.result()
                 if sleeper.done():
                     sleeper.result()
@@ -115,6 +124,26 @@ class Watcher:
             self._timer.end_cleanup(timed_out=timed_out)
         elif gave_up:
             self._timer.cleanup_timed_out = True
+
+
+def _ended_at_the_bound_it_was_given(job: asyncio.Future, tick: Tick) -> bool:
+    """Tell whether a finished call ended by the expiry of a bound as long as the agent's time it was handed (L16).
+
+    A provider that bounds its own call is handed the agent's time left (L05), so its expiry and this watch's cut are
+    one moment, and which of the two the event loop runs first is chance. The ending must not be: a call that outlasted
+    the agent's time or the ceiling was cut by it, whoever noticed first, so the watch judges such an expiry as a cut
+    when a reading shows a limit passed. An expiry of a shorter bound (a provider's own, tighter one) is the provider's
+    failure, and takes no reading, so a replay, which raises the recorded failure, reads the clock as the run did.
+
+    One case reads the clock in a run and not in its replay: an expiry of a bound as long as the call's whole time that
+    a reading then shows inside both limits. A provider that marks no wait cannot produce it, since its call's wall
+    time is the time charged to the agent, so the expiry lands with the agent's time used up. A provider that does mark
+    waits and also bounds the call by the time it was handed could, and its record would diverge on replay.
+    """
+    if job.cancelled():
+        return False
+    error = job.exception()
+    return isinstance(error, CallTimedOut) and error.bound_s >= tick.remaining_s
 
 
 def _consume(task: asyncio.Future) -> None:

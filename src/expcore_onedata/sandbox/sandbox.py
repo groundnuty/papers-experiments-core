@@ -17,10 +17,14 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     one-shot containers of the agent image find that bundle and read each one, and the run's copy with the CA appended
     is mounted over it read-only;
   * mount data path: a oneclient sidecar that owns the mount and the token (from a file bound into it alone), exported
-    read-only to the agent through bind propagation; the agent has neither the token, nor FUSE, nor a route to any host;
+    read-only to the agent through bind propagation; the agent has neither the token, nor FUSE, nor a route to any host.
+    oneclient's log goes to `LOG_DIR` of the run's directory (owner-only, a bind), so it is part of the run's evidence
+    and is read from the host: `docker cp` from a running sidecar or gate is never used, since it re-mounts the
+    container's binds;
   * no token is ever given to docker, so `docker inspect` shows none, and the host's file of it goes once its holder has
     started and again at every teardown (`_write_token_file`, `_remove_token_files`); a run killed outright before that
-    leaves it until the next start on the root removes it (`reap.reap_token_files`);
+    leaves it until the next start on the root removes it (`reap.reap_token_files`). Each secret is bound with
+    `--mount`, which refuses a missing source where `-v` makes a directory of it (`containers.bind`);
   * no data path: neither;
   * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
   * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
@@ -53,7 +57,18 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool, reap
+from expcore_onedata.sandbox import (
+    copyout,
+    directio,
+    gatelog,
+    gatepolicy,
+    hostops,
+    inputs,
+    kinds,
+    netpool,
+    reap,
+    tokenfiles,
+)
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
@@ -71,21 +86,23 @@ from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     GATE_CA_PATH,
     GATE_TOKEN_PATH,
-    ONECLIENT_LOG_DIR,
+    SIDECAR_LOG_DIR,
     Names,
     agent_run_args,
     certifi_bundle,
     certifi_probe_args,
-    effective_log_dir,
+    extra_args_record,
     gate_run_args,
     gate_upstreams,
+    image_config_record,
     sidecar_abort_args,
-    sidecar_command,
+    sidecar_options,
     sidecar_run_args,
     trust_targets,
 )
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
+from expcore_onedata.sandbox.oneclient_args import DIRECT
 from expcore_onedata.sandbox.oneclient_log import summarize as summarize_oneclient_log
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -97,6 +114,7 @@ GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mou
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run directory, owner-only, while the sidecar starts
 GATE_TOKEN_FILE = Path("gate-secret", "gate-token")  # likewise while the gate starts, owned by the gate's user
+LOG_DIR = "oneclient-log"  # under the run directory, owner-only: the sidecar's oneclient logs here, kept as evidence
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 RUN_START_POLLS = 50  # reads of the gate's log, 0.1 s apart, for the mark of the run's start it was signalled to write
 INIT_SLEEP_POLLS = 50  # reads of the agent's cgroup, 0.1 s apart, for the `sleep` its init starts (O34)
@@ -173,7 +191,6 @@ class DockerSandbox:
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
-        self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
         self._init_sleep: dict[str, Any] | None = None  # the agent's init's `sleep`, by pid and start time (O34)
         self._uptime0: float | None = None
@@ -258,8 +275,17 @@ class DockerSandbox:
                 self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
+        if sp.mode is DataPathMode.MOUNT:
+            self._require_storages()
         # in every data path, so an input never differs by condition; a declared one is hashed again here
-        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s))
+        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
+
+    def _require_storages(self) -> None:
+        """Each storage a direct mount maps must be a directory on this host before anything exists (O40): docker's
+        `--mount` would refuse it only once the sidecar starts. Named by its position, never by its id or path."""
+        for position, (_, path) in enumerate(self.s.mount.storages):
+            if not os.path.isdir(path):
+                raise StartRefused(f"[sandbox.mount.storages] entry {position}: is not a directory on this host")
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -345,6 +371,8 @@ class DockerSandbox:
         )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
+        if share and s.mount.io_mode == DIRECT:
+            self._verify_direct_io()
         self._verify_inputs()
         self._cells.sample_pids()
         self._start_sampler()
@@ -552,14 +580,31 @@ class DockerSandbox:
         """Remove the host's copies of the data-path token (`only` these, else all), verified: once its holder has
         started it keeps the token itself, so the host keeps none (O05). Run for every copy at every teardown. A run
         killed outright between writing a file and removing it (a healthy start's docker call and wait) leaves it, and
-        the next start on this root removes it once it is several times older than that (`reap.reap_token_files`)."""
-        left = []
-        for path in only or tuple(self._token_files):
-            self.host.run(["rm", "-f", str(path)], 20, sudo=True)
-            if os.path.lexists(path):
-                left.append(path)
-        if left:
-            raise SandboxError(f"{len(left)} of the run's copies of the data-path token could not be removed")
+        the next start on this root removes it once it is several times older than that (`reap.reap_token_files`).
+
+        What `rm -f` leaves is examined, never read (`tokenfiles.remove`): its path in the run's directory, kind, size
+        and owner go in `metadata()["teardown"]["token_files"]`. An empty directory at the path, which a bind made as a
+        missing source (the sandbox now binds with `--mount`, which refuses one), is removed and does not fail the
+        teardown; a file, a link or a directory with an entry in it does, and the error names the path and its kind."""
+        found = [
+            item
+            for path in only or tuple(self._token_files)
+            if (item := tokenfiles.remove(self.host, path, self.dir)) is not None
+        ]
+        if not found:
+            return
+        with self._meta_lock:  # `metadata()` may be reading it from another thread
+            teardown = self._meta.setdefault("teardown", {})
+            teardown["run_directory"] = reap.named_directory(self.dir)  # its id and hash, as a record names one (O12)
+            known = {item["path"]: item for item in teardown.get("token_files", [])}
+            teardown["token_files"] = list({**known, **{item["path"]: item for item in found}}.values())
+        if stuck := tokenfiles.stuck(found):
+            what = ", ".join(f"{item['path']} ({item['type']})" for item in stuck)
+            run_id = reap.named_directory(self.dir)["id"]
+            raise SandboxError(
+                f"{len(stuck)} of the run's copies of the data-path token could not be removed (in run directory "
+                f"{run_id}: {what})"
+            )
 
     def _token_files_left(self) -> bool:
         """Whether any of the run's copies of the token is still on the host: looked at, never assumed from a step."""
@@ -576,18 +621,23 @@ class DockerSandbox:
         self.host.run(["mount", "--make-rshared", str(share)], 60, sudo=True)  # so the sidecar's mount propagates out
         self._note_mounted(share)
         host_name = sp.provider.host
-        command = sidecar_command(host_name, s)
-        self._log_dir = effective_log_dir(command)
         self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
-            "io_mode": s.mount.io_mode,
-            "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
+            "io_mode": s.mount.io_mode,  # the declared one, always: oneclient's own detection never runs (O36)
+            "options": sidecar_options(s),  # what the sandbox itself passes to oneclient, in order
+            "extra_args": extra_args_record(s.mount.extra_args),  # the study's, by option name and one hash (O12)
+            "log_dir_from": "sandbox",  # always: `extra_args` may not give oneclient a log directory
             "network": "federation" if s.federation is not None else "default bridge",  # `sidecar_route`'s, by kind
         }
+        if s.mount.io_mode == DIRECT:  # how many storages it reads directly, never an id or a path; the check's below
+            self._meta["mount"]["direct"] = {"storages": len(s.mount.storages), "check": None}
+        log_dir = self.dir / LOG_DIR  # oneclient's log is bound here, owner-only, and kept with the run's evidence
+        log_dir.mkdir(mode=0o700)
+        log_dir.chmod(0o700)  # whatever the driver's umask
         self._register_container(names.sidecar)
         t0 = time.monotonic()
         args = sidecar_run_args(
             s, names, self._label_args(), share, s.oneclient.id, host_name,
-            token_file=self._write_token_file(TOKEN_FILE), ca_copy=self._ca_copy,
+            token_file=self._write_token_file(TOKEN_FILE), log_dir=log_dir, ca_copy=self._ca_copy,
         )  # fmt: skip
         self.host.docker(*args)
         deadline = time.monotonic() + MOUNT_WAIT_S
@@ -599,6 +649,8 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
+        started = self.host.docker("logs", names.sidecar, check=False, timeout=30)  # the entrypoint's one line, first
+        self._meta["mount"]["image_config"] = image_config_record(started.stdout if started.returncode == 0 else None)
         self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
         self.watch_container("sidecar", names.sidecar)
         return share
@@ -690,6 +742,57 @@ class DockerSandbox:
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
+
+    def _verify_direct_io(self) -> None:
+        """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O40,
+        `directio`): the agent reads the check file whole, once the mount says the local provider holds all of it,
+        then the sidecar's log must say forced direct, no forced proxy, and hold no line of detection or fallback."""
+        mount = self.s.mount
+        probe = self._cells.run(
+            directio.probe_source(f"{mount.path}/{mount.direct_check_file}"), directio.READ_DEADLINE_S + 30,
+            record=False,
+        )  # fmt: skip
+        text = self._read_sidecar_log()
+        problems, record = directio.judge(
+            directio.parse_probe(probe.stdout), text or "", [storage_id for storage_id, _ in mount.storages]
+        )
+        self._meta["mount"]["direct"]["check"] = record
+        if text is None:
+            problems.insert(0, "the sidecar's oneclient log could not be read")
+        if problems:
+            log.error("direct I/O check: %s", "; ".join(problems))
+            raise SandboxError(f"direct I/O is not in effect for the mount: {'; '.join(problems)}")
+
+    def direct_io_lines(self) -> list[str] | None:
+        """The names of the lines of `directio.MARKERS` the sidecar's log holds now, or None when it could not be read
+        (O40): with a direct mount, any one of them means some read since the start did not go to the storage."""
+        text = self._read_sidecar_log()
+        return None if text is None else directio.marker_lines(text)
+
+    def _direct_io_held(self) -> None:
+        """At collection, show that every read of a direct run went to the storage itself, or set the run aside (O40). A
+        file whose direct read is refused for permissions is read again through the provider (`fsLogic.cc`,
+        `readInternal`), after the start's check passed, and the log is the only trace; an unreadable log is unknown,
+        never direct. The record keeps the names of the lines found (`mount.direct.during_run`)."""
+        lines = self.direct_io_lines()
+        self._meta["mount"]["direct"]["during_run"] = lines
+        if lines is None:
+            raise kinds.collection_error(
+                "the direct mount's log", "the sidecar's oneclient log could not be read, so no read is shown direct"
+            )
+        if lines:
+            raise kinds.collection_error(
+                "the direct mount",
+                f"the sidecar's oneclient logged {', '.join(lines)}: a read did not go to the storage",
+            )
+
+    def _read_sidecar_log(self) -> str | None:
+        """The sidecar's oneclient INFO log, read as root in the sidecar, or None when it could not be read."""
+        found = self.host.docker(
+            "exec", "-u", "0", self.names.sidecar, "cat", f"{SIDECAR_LOG_DIR}/{directio.LOG_FILE}",
+            check=False, timeout=60,
+        )  # fmt: skip
+        return found.stdout if found.returncode == 0 else None
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory and record its hash, its files and bytes, and its path in
@@ -1067,7 +1170,8 @@ class DockerSandbox:
         object named by its path and what it is, never a link's target, under `refused_output` in its result and in the
         metadata, for the study's scorers; the attempt's outcome is the loop's and the scorers'. A collection that fails
         for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
-        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash)
+        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash,
+        a direct mount whose log shows a read that did not go to the storage, or cannot be read: O40)
         raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
         is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection. A run a
         cell's deadline stopped, or left with a process that outlived its kill, raises `InfraError("cell_unkillable")`
@@ -1103,6 +1207,8 @@ class DockerSandbox:
         except SandboxError as failed:  # the copy command, the disk or the copy failed: the harness's own failure
             raise kinds.collection_error("the run's outputs", str(failed)) from None
         self._inputs_unchanged()
+        if self.spec.mode is DataPathMode.MOUNT and self.s.mount.io_mode == DIRECT:
+            self._direct_io_held()  # while the sidecar runs: its log is read in it
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if refused is not None:
@@ -1208,7 +1314,7 @@ class DockerSandbox:
         if self.spec.mode is not DataPathMode.MOUNT:
             return None
         r = self.host.docker(
-            "exec", self.names.sidecar, "cat", f"{self._log_dir}/oneclient.INFO", check=False, timeout=60
+            "exec", self.names.sidecar, "cat", f"{SIDECAR_LOG_DIR}/oneclient.INFO", check=False, timeout=60
         )
         if r.returncode != 0:
             return {"unavailable": "the oneclient log could not be read", "stderr": stderr_digest(r.stderr)}
@@ -1258,6 +1364,18 @@ class DockerSandbox:
             log.error("teardown step %s failed: %s", getattr(fn, "__name__", "step"), describe_error(e))
             errors.append(f"a teardown step failed ({type(e).__name__})")
 
+    def _step_token_files(self, errors: list[str]) -> None:
+        """The teardown's first step, `_remove_token_files`, with its own message kept in the error the teardown raises:
+        it names the path and kind of what is left (never a content), which an operator needs to find it."""
+        try:
+            self._remove_token_files()
+        except SandboxError as e:
+            log.error("teardown step _remove_token_files failed: %s", describe_error(e))
+            errors.append(str(e))
+        except Exception as e:
+            log.error("teardown step _remove_token_files failed: %s", describe_error(e))
+            errors.append(f"a teardown step failed ({type(e).__name__})")
+
     def _stop_locked(self, force: bool = False) -> None:
         if self._stopped and not force:
             return
@@ -1273,7 +1391,7 @@ class DockerSandbox:
         try:
             # first, on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05), and a
             # step below that raises or hangs must find none left on disk
-            self._step(errors, self._remove_token_files)
+            self._step_token_files(errors)
             held: set[str] = set()
             if self.names.sidecar in self._containers:
                 # a oneclient sidecar was started (or tried), also after a failed start: the readers stop, the FUSE
