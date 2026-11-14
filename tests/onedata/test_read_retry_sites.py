@@ -103,6 +103,13 @@ ONE_ATTEMPT_SITES = {
     ("precampaign.py", "measure_content_type", "consistency.space_root"): ["ONE_ATTEMPT"],
     ("precampaign.py", "measure_content_type", "client.content_answer"): ["<one attempt>", "<one attempt>"],
     ("fault_serves.py", "ServingProbe.__call__", "client.get"): ["ONE_ATTEMPT"],
+    # a restore's session gate (O35): its probe file made before the injection, Onezone's view, each peer's block map
+    ("fault_sessions.py", "SessionGate._root", "consistency.space_root"): ["ONE_ATTEMPT"],
+    ("fault_sessions.py", "SessionGate._find", "client.get"): ["ONE_ATTEMPT"],
+    ("fault_sessions.py", "SessionGate.arm", "client.mutate"): ["ONE_ATTEMPT", "ONE_ATTEMPT"],
+    ("fault_sessions.py", "SessionGate.arm", "consistency.wait_visible"): ["ONE_ATTEMPT"],
+    ("fault_sessions.py", "SessionGate.sessions", "client.get"): ["ONE_ATTEMPT", "ONE_ATTEMPT"],
+    ("fault_sessions.py", "SessionGate.active_transfers", "client.get"): ["ONE_ATTEMPT"],
     # the link check (O35): its fetch is the measurement, and every read and write of setting its probe up is part of
     # the health gate's check, one attempt like the content-type check's
     ("linkcheck.py", "_Check._empty_on", "client.get"): ["ONE_ATTEMPT"],
@@ -282,6 +289,7 @@ MEASURING_MODULES = {
     "linkcheck.py",
     "linkprobe.py",
     "fault_serves.py",
+    "fault_sessions.py",
     "tokens.py",
     "tokenscope.py",
     "health.py",

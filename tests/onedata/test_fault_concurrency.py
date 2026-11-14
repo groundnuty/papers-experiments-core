@@ -16,7 +16,8 @@ from fault_support import LOCAL_TARGET, OUTAGE_TARGET, SERVICES, FakeServices, i
 from expcore.errors import InfraError
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import JOURNAL, InjectionJournal
-from expcore_onedata.faults import INJECTOR_FAILURE, SettledInjections, load_faults
+from expcore_onedata.faults import SettledInjections, load_faults
+from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
 
 OUTAGE_SERVICE = SERVICES["beta"]
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -126,8 +127,10 @@ def test_o11_a_discarded_injector_lets_its_lock_go_so_recovery_restores_the_prov
 
 def test_o11_while_an_injection_is_unsettled_no_other_injection_starts_and_the_health_gate_refuses(tmp_path):
     """O11: a provider held down by a live injector leaves the federation out of its baseline state: another
-    injector's start refuses as injector_failure without touching its own target, and the platform's health check
-    composed with `SettledInjections` refuses every run, whatever its condition, until the injection is cleared."""
+    injector's start refuses without touching its own target, its wait for the federation the live injector holds
+    running out as the hold `federation_busy` (the waiting run did nothing, so it costs no attempt), and the platform's
+    health check composed with `SettledInjections` refuses every run, whatever its condition, until the injection is
+    cleared."""
     platform, services = write_faults(tmp_path), FakeServices()
     config = load_platform(platform, require_secrets=False)
     gate = SettledInjections(load_faults(platform, config))
@@ -141,7 +144,7 @@ def test_o11_while_an_injection_is_unsettled_no_other_injection_starts_and_the_h
     other = injector_for(platform, services, target=LOCAL_TARGET)
     with pytest.raises(InfraError, match=r"unsettled|held") as caught:
         other.start({**RUN, "run_key": "task=task-b|model=m1|seed=1"})
-    assert caught.value.kind == INJECTOR_FAILURE
+    assert caught.value.kind == FEDERATION_BUSY
     assert services.running(SERVICES["alpha"]) is True  # its own target was never touched
     assert services.running(OUTAGE_SERVICE) is False  # nor was the live injection
     assert holder.finish()["ok"] is True
