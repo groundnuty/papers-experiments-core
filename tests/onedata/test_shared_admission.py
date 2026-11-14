@@ -20,6 +20,7 @@ import pytest
 from fault_support import OUTAGE_TARGET, SERVICES, write_faults
 from shared_support import hold_and_die, hold_fork_and_unwind
 
+import expcore_onedata.admission as admission_module
 from expcore.campaign import liveness
 from expcore.errors import InfraError
 from expcore_onedata.admission import (
@@ -480,6 +481,44 @@ def test_o48_an_interrupt_while_a_record_ends_still_lets_the_lock_go(tmp_path):
     admission.endings.append(interrupted)
     with pytest.raises(KeyboardInterrupt):
         admission.close()
+    assert not refused(lock, exclusive=True)
+
+
+class SlowThreading:
+    """The `threading` module as the admission sees it, with an Event whose `is_set` lingers after it has read: a second
+    caller of a once-only call then arrives between its check and its set, where a race would be."""
+
+    class Event(threading.Event):
+        def is_set(self):
+            seen = super().is_set()
+            time.sleep(0.1)
+            return seen
+
+    def __getattr__(self, name):
+        return getattr(threading, name)
+
+
+def test_o48_a_share_given_up_by_two_threads_at_once_counts_once(tmp_path, monkeypatch):
+    """O48: the call that gives a retained share up counts only its first call, whoever makes it: two threads that call
+    it together must not take two shares off the admission, or the owner's own would go and the lock with it."""
+    _, _, lock = federation(tmp_path)
+    monkeypatch.setattr(admission_module, "threading", SlowThreading())
+    admission = lock.acquire(exclusive=False, timeout_s=PROBE_S)
+    give_up = admission.retain()
+    barrier = threading.Barrier(2)
+
+    def call():
+        barrier.wait()
+        give_up()
+
+    callers = [threading.Thread(target=call) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(WAIT_S)
+    assert admission.held, "the owner's share went with a share given up twice"
+    assert refused(lock, exclusive=True)  # the owner still holds it
+    admission.close()
     assert not refused(lock, exclusive=True)
 
 

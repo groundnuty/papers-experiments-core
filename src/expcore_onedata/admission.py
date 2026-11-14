@@ -137,11 +137,10 @@ class Admission:
             if not self.held or self.shares.count == 0:
                 return None
             self.shares.count += 1
-        given_up = threading.Event()
+        once = threading.Lock()  # never released: the first non-blocking acquire, in any thread, is the one that counts
 
         def give_up() -> None:
-            if not given_up.is_set():
-                given_up.set()
+            if once.acquire(blocking=False):
                 self._give_up()
 
         return give_up
