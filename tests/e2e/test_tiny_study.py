@@ -558,6 +558,18 @@ def test_c29_the_report_of_an_unsharded_campaign_is_the_bytes_it_was_before_shar
     assert "Shards" not in clean_pair.first.report
 
 
+def test_s16_the_analysis_json_of_one_holm_family_is_the_bytes_it_was_before_named_families(clean_pair):
+    """S16: a preregistration with one flat `holm_family` gets the analysis.json the core wrote before several named
+    families existed: `tests/data/tiny_study_analysis.json` was made by the code of that time. Only the core version
+    and the example's tree hash are masked, as the report's pin masks them; every other byte is pinned, so a key
+    the families added to a single family's output (a null family name, a steps table) fails here."""
+    golden = (ROOT / "tests" / "data" / "tiny_study_analysis.json").read_text(encoding="utf-8")
+    written = (clean_pair.first.root / "out" / "analysis.json").read_text(encoding="utf-8")
+    masked = re.sub(r'^( *"(?:core_version|tree_sha256)": )"[^"]*"', r'\1"(not pinned)"', written, flags=re.M)
+    assert masked == golden
+    assert "holm_families" not in written
+
+
 def test_every_output_regenerates_from_the_records_byte_for_byte_and_regenerating_writes_nothing(clean_pair, tmp_path):
     """What a replication package's check runs: the four outputs derived anew equal the files, and none is touched."""
     copy = copy_campaign(clean_pair.second, tmp_path, "copy").root
