@@ -161,6 +161,8 @@ class ProgressiveIngest:
         try:
             self._p.verify_space()
             self._base.read_journal()
+            if self._sparse:  # every staged copy, before the restore or the start state removes anything
+                self._base.check_sources()
             restored = self._base.restore_all("start")  # each file on its own, its staged source checked first
             self._base.check_directories()
             for planned in self._plan.files:

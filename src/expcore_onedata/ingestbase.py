@@ -153,6 +153,12 @@ class Baseline:
         if Digest(size, hasher.hexdigest()) != Digest(planned.size, planned.sha256):
             raise ProvisionError(f"{self._p.where}{planned.label}: its staged source no longer has the plan's hash")
 
+    def check_sources(self) -> None:
+        """Every planned file's staged copy is there, at the plan's size and SHA-256: checked whole before anything is
+        removed, so no file goes while the copy of another that would follow it is damaged or gone."""
+        for planned in self._plan.files:
+            self.check_source(planned)
+
     def check_directory(self, planned: PlannedFile) -> None:
         """A planned file's directory exists: the ingest creates none, so the namespace stays the baseline's."""
         *directory, _ = safe_path(planned.path)
