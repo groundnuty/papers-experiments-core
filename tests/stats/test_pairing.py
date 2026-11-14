@@ -534,6 +534,81 @@ def test_a_ratio_contrast_spec_labels_its_outcome_with_its_two_outcomes():
         ContrastSpec("x", "spend", "ratio", "group", conditions=("cond-a", "cond-b"), ratio=form)
 
 
+# --- per-arm columns: each arm's runs are read in that arm's own columns, and only in them -------------------------
+
+ADVERSE = RatioForm(None, "wins", "exclude", numerator_a="spend_high", numerator_b="spend_low")
+POISON = 1e9  # a value in the column an arm does not read: any read of it moves the log ratio by about ln 1e7
+
+
+def adverse_spec(form=ADVERSE):
+    """A ratio contrast whose arm A reads `spend_high` and arm B `spend_low`, both over `wins`."""
+    return ContrastSpec("adverse", form.label, "ratio", "group", conditions=("cond-a", "cond-b"), ratio=form)
+
+
+def bounded(task, condition, high, low, wins, *, seed=1):
+    """A run with an upper and a lower bound of its spend; its `spend` column is None, read by no contrast here."""
+    extra = {"spend_high": high, "spend_low": low}
+    return ratio_row(task, "model-a", seed, None, wins, condition=condition, extra=extra)
+
+
+def adverse_rows():
+    """One cell: A spends 60 (high) for 1 win and 30 for 0, B 10 and 5 (low) for 1 and 0; the columns an arm does not
+    read hold POISON. Its log ratio is ln((90 / 1) / (15 / 1)) = ln 6."""
+    return [
+        bounded("task-a", "cond-a", 60.0, POISON, 1.0),
+        bounded("task-a", "cond-a", 30.0, POISON, 0.0, seed=2),
+        bounded("task-a", "cond-b", POISON, 10.0, 1.0),
+        bounded("task-a", "cond-b", POISON, 5.0, 0.0, seed=2),
+    ]
+
+
+def test_s13_each_arm_sums_its_own_columns_and_never_the_other_arms():
+    """S13: arm A's sum is of spend_high, arm B's of spend_low; the other column of each run holds POISON, so a read
+    of it would show."""
+    pairing = pair_rows(adverse_rows(), adverse_spec())
+    assert pairing.differences.matrix[0, 0] == pytest.approx(math.log(6.0))
+    assert pairing.n_pairs == 2
+
+
+def test_s13_an_arm_need_not_carry_the_other_arms_column_but_must_carry_its_own():
+    """S13: a run is read in its own arm's columns, so arm B's runs without spend_high are paired as they are; a run
+    of arm A without spend_high is refused naming it."""
+    rows = adverse_rows()
+    for row in rows:
+        del row.outcomes["spend_low" if row.condition == "cond-a" else "spend_high"]
+    assert pair_rows(rows, adverse_spec()).differences.matrix[0, 0] == pytest.approx(math.log(6.0))
+    del rows[0].outcomes["spend_high"]
+    with pytest.raises(ValueError, match=r"cond-a.* has no outcome 'spend_high'"):
+        pair_rows(rows, adverse_spec())
+
+
+@pytest.mark.parametrize(
+    ("run", "column", "counted"),
+    [
+        (1, "spend_high", 1),  # arm A's failed run with its own column None: its cost is unmeasured
+        (1, "spend_low", 0),  # arm A's failed run with arm B's column None: arm A never reads it
+        (3, "spend_low", 1),  # arm B's failed run with its own column None
+        (3, "spend_high", 0),  # arm B's failed run with arm A's column None
+    ],
+)
+def test_s13_a_failed_runs_missing_numerator_counts_only_in_the_column_its_arm_reads(run, column, counted):
+    """S13: a run whose denominator is 0 and whose numerator is None is a failure left unmeasured only when the
+    numerator is its own arm's; a None in the other arm's column leaves the pair used and the arm's run measured."""
+    rows = adverse_rows()
+    rows[run].outcomes[column] = None
+    pairing = pair_rows(rows, adverse_spec())
+    assert (pairing.missing["numerator_none_at_zero"], pairing.n_unmeasured_failures) == (counted, counted)
+    assert pairing.n_pairs == 2 - counted
+    assert [arm.measured for arm in pairing.arm_runs] == [2 - counted * (run < 2), 2 - counted * (run >= 2)]
+
+
+def test_s13_a_per_arm_contrast_spec_labels_its_outcome_with_each_arms_columns():
+    """S13: the outcome of a contrast whose arms read different columns names both, arm A's first."""
+    assert adverse_spec().outcome == "spend_high/wins vs spend_low/wins"
+    with pytest.raises(ValueError, match="outcome must be 'spend_high/wins vs spend_low/wins'"):
+        ContrastSpec("x", "spend_high/wins", "ratio", "group", conditions=("cond-a", "cond-b"), ratio=ADVERSE)
+
+
 # --- the difference form's units: estimated per (model, group) cell, the group the independent unit ----------------
 
 

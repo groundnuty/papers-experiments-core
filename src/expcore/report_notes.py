@@ -128,6 +128,13 @@ RATIO_NOTES = [
     "and moves each log ratio most where its sums are small).",
 ]
 
+RATIO_ARM_COLUMNS_NOTES = [  # after the ratio notes, only for a contrast whose arms read different columns
+    "A contrast whose Numerator or Denominator names two columns, each with its arm, reads its own columns in each",
+    "arm: in each cell N_A and D_A are summed from arm A's columns and N_B and D_B from arm B's, such as a",
+    "sensitivity estimate that puts arm A at its upper-bound cost and arm B at its lower-bound one. Its outcome",
+    "names arm A's ratio, then arm B's.",
+]
+
 RATIO_BY_MODEL_NOTES = [  # after the ratio contrasts' table, only for a contrast estimated per model's cell
     "Each model's Estimate is the mean log ratio of its own cells, with its ratio and interval from the same",
     "resamples of the values of the independent unit as the contrast's: a breakdown with no test of its own, outside",

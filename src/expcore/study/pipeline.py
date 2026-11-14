@@ -97,6 +97,7 @@ from expcore.replay.check import (
 from expcore.replay.native import has_native_parser
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
+from expcore.stats.ratio import OMIT_NONE
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
     MODELS_FILE,
@@ -520,9 +521,17 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _finite(value: Any) -> Any:
-    """Reduce a value to JSON data: dataclasses and mappings to dicts, sequences to lists, NaN and infinity to None."""
+    """Reduce a value to JSON data: dataclasses and mappings to dicts, sequences to lists, NaN and infinity to None.
+
+    A dataclass field whose metadata sets `OMIT_NONE` is left out while it is None (a ratio contrast's per-arm columns,
+    S13), so a record that declares none is written byte for byte as before the field existed; every other field is
+    written, None as null."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: _finite(getattr(value, f.name)) for f in dataclasses.fields(value)}
+        return {
+            f.name: _finite(getattr(value, f.name))
+            for f in dataclasses.fields(value)
+            if not (f.metadata.get(OMIT_NONE) and getattr(value, f.name) is None)
+        }
     if isinstance(value, Mapping):
         return {str(k): _finite(v) for k, v in value.items()}
     if isinstance(value, list | tuple):

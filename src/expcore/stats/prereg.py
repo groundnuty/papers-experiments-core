@@ -60,6 +60,15 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     cluster = "group"              # the independent unit, as for every contrast
     estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group, the group their mean (S13)
 
+    [contrasts.cost-per-success-adverse]  # each arm may read its own column (S13): numerator_a, numerator_b,
+    conditions = ["cond-a", "cond-b"]     # denominator_a, denominator_b, each defaulting to the shared key; the
+    estimator = "ratio"                   # shared key beside both arms' own is refused, as no arm reads it
+    numerator_a = "tokens_high"
+    numerator_b = "tokens_low"
+    denominator = "success"
+    zero_denominator = "exclude"
+    cluster = "group"
+
     [descriptives.waited-in-a] # optional, S14: a one-arm estimate, descriptive, never in the Holm family
     conditions = ["cond-a"]    # one condition or a set of them, pooled
     outcome = "waited"         # a rate or share; or `numerator` and `denominator` for a ratio of totals
@@ -84,7 +93,7 @@ from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstim
 from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import MODEL_KEY, TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
-from expcore.stats.ratio import ZERO_RULES, RatioForm
+from expcore.stats.ratio import ARM_SUFFIXES, ROLES, ZERO_RULES, RatioForm
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
@@ -101,8 +110,14 @@ _TOP_KEYS = (
     "descriptives",
 )
 _DESCRIPTIVE_KEYS = ("conditions", "cluster", "outcome", "numerator", "denominator")
-# a ratio contrast's keys (S13)
-_RATIO_KEYS = ("numerator", "denominator", "zero_denominator", "continuity_correction", "estimation_unit")
+# a ratio contrast's keys (S13): its two outcomes, each also per arm, its zero rule and its estimation unit
+_RATIO_KEYS = (
+    *ROLES,
+    *(f"{role}_{suffix}" for role in ROLES for suffix in ARM_SUFFIXES),
+    "zero_denominator",
+    "continuity_correction",
+    "estimation_unit",
+)
 _CONTRAST_KEYS = (
     "conditions",
     "factor",
@@ -502,8 +517,8 @@ def _max_unscored(section: Section, treatment: str | None) -> int:
 
 
 def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
-    """Read a ratio contrast's numerator, denominator and zero rule (S13); refuse them beside an estimator of one
-    outcome, and an outcome beside an estimator of the ratio form."""
+    """Read a ratio contrast's numerator, denominator (each shared or per arm) and zero rule (S13); refuse them beside
+    an estimator of one outcome, and an outcome beside an estimator of the ratio form."""
     if estimators.form(estimator) != "ratio":
         for key in _RATIO_KEYS:
             if key in section.data:
@@ -515,9 +530,8 @@ def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
         raise section.fail(
             "outcome", f"is not read by estimator {estimator!r}, a ratio: name its numerator and denominator instead"
         )
-    numerator, denominator = section.string("numerator"), section.string("denominator")
-    if numerator == denominator:
-        raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+    numerator, denominator = (_ratio_columns(section, role) for role in ROLES)
+    _check_two_outcomes(section, numerator, denominator)
     rule = section.data.get("zero_denominator")
     if rule is None:
         raise section.fail(
@@ -534,7 +548,63 @@ def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
             raise section.fail("continuity_correction", f"must be a positive number, got {correction}")
     elif "continuity_correction" in section.data:
         raise section.fail("continuity_correction", 'is only for zero_denominator = "continuity"')
-    return RatioForm(numerator, denominator, rule, correction)
+    return RatioForm(  # held canonically: a role whose arms read one column keeps it as the shared one
+        numerator[0],
+        denominator[0],
+        rule,
+        correction,
+        numerator_a=numerator[1],
+        numerator_b=numerator[2],
+        denominator_a=denominator[1],
+        denominator_b=denominator[2],
+    )
+
+
+Columns = tuple[str | None, str | None, str | None]  # one role's shared column, then arm A's and arm B's own
+
+
+def _ratio_columns(section: Section, role: str) -> Columns:
+    """Read one role's columns (S13): `role`, the column both arms read, and `role_a` and `role_b`, arm A's and arm
+    B's own, each defaulting to it. The shared column beside both arms' own is read by neither arm and refused, and so
+    is an arm left without a column."""
+    keys = (role, *(f"{role}_{suffix}" for suffix in ARM_SUFFIXES))
+    shared, own_a, own_b = (section.optional_string(key) for key in keys)
+    if shared is None:
+        if own_a is None and own_b is None:
+            raise section.fail(role, "is required")
+        if own_a is None or own_b is None:
+            bare, given = ("A", keys[2]) if own_a is None else ("B", keys[1])
+            raise section.fail(
+                role,
+                f"is required: arm {bare} has no column, since only {given} is given. Name the {role} an arm "
+                f"without its own reads, or each arm's ({keys[1]} and {keys[2]})",
+            )
+    elif own_a is not None and own_b is not None and shared not in (own_a, own_b):
+        raise section.fail(
+            role,
+            f"is read by neither arm: {keys[1]} and {keys[2]} name both arms' columns ({own_a!r} and {own_b!r}). "
+            f"Leave {role} out, or leave out the per-arm key of the arm that reads it",
+        )
+    return shared, own_a, own_b
+
+
+def _check_two_outcomes(section: Section, numerator: Columns, denominator: Columns) -> None:
+    """Require each arm to read two different outcomes as its numerator and its denominator, naming the key that
+    gave the arm the column it reads twice."""
+    for side, arm in enumerate("AB"):
+        own_numerator, own_denominator = numerator[1 + side], denominator[1 + side]
+        read = own_numerator or numerator[0]
+        if read != (own_denominator or denominator[0]):
+            continue
+        suffix = ARM_SUFFIXES[side]
+        if own_denominator is None and own_numerator is None:
+            raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+        key = f"denominator_{suffix}" if own_denominator is not None else f"numerator_{suffix}"
+        raise section.fail(
+            key,
+            f"would make arm {arm} read {read!r} as both its numerator and its denominator: a ratio needs two "
+            "different outcomes",
+        )
 
 
 def _cluster(section: Section) -> str:
