@@ -71,17 +71,17 @@ or a record through it.
 **Bodies are freed when their exchange is used (#259, O47).** httpx binds every answer to a stream that points back at
 it, a reference cycle that holds the answer, its request and both bodies until the cyclic collector runs; a batch of
 large uploads or reads would grow by everything it moved. So every answer is released the moment it is read
-(`_release`: closed, its stream replaced by an empty one), however the read ends (`_exchange` reads a request's answer
-in the open, since `httpx.Client.request` leaves one whose body failed to read in its cycle), on every path that sends
-or receives a body (`_request`, `_stream_range`, `content_answer`), and no error
-holds the httpx error or the answer that caused it: a transport failure is raised after its handler has ended, so the
-`PlatformError` has no `__context__`. The client keeps no answer, request or body, and follows no redirect, whatever
-the HTTP client it was given does: httpx follows one inside its send, out of reach of the release when it fails
-halfway, and takes the `X-Auth-Token` header along to another host (it drops `Authorization` alone); a 3xx answer is
-the answer. The net under that is
-`collect_after_bytes`: once that many bytes of bodies, sent and received, failed exchanges' included, have been counted
-since the last collection, a full collection runs before the next exchange (`collectbudget.py`); it is a fallback, not
-the fix.
+(`_release`: closed, its stream replaced by an empty one), however the read ends, on every path that sends or receives
+a body (`_request`, `_stream_range`, `content_answer`). `_exchange` reads a request's answer in the open, since
+`httpx.Client.request` leaves one whose body failed to read in its cycle; an answer httpx itself fails on inside its
+send, a redirect it cannot parse or a hook that raises, is found in the frames the failure passed through
+(`_release_stranded`). No error holds the httpx error or the answer that caused it: a transport failure is raised after
+its handler has ended, so the `PlatformError` has no `__context__`. The client keeps no answer, request or body, and
+follows no redirect, whatever the HTTP client it was given does: httpx follows one inside its send, and takes the
+`X-Auth-Token` header along to another host (it drops `Authorization` alone); a 3xx answer is the answer. The net under
+all of that is `collect_after_bytes`: once that many bytes of bodies, sent and received, failed exchanges' included,
+have been counted since the last collection, a full collection runs before the next exchange (`collectbudget.py`); it
+is a fallback, not the fix.
 
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
@@ -223,7 +223,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -414,6 +414,23 @@ def _release(response: httpx.Response) -> httpx.Response:
     return response
 
 
+def _release_stranded(error: BaseException) -> None:
+    """Release the answers a failure inside httpx's own send carried off with it (#259, O47).
+
+    httpx can fail on an answer after the transport has delivered it and before it returns it: a redirect whose
+    Location it cannot parse, a hook of the HTTP client that raises. It closes the answer and leaves it in its cycle
+    with the request, and the failure reaches the caller before the caller holds the answer. The answer is a local of
+    the frames the failure passed through, so each answer found there is released. A close that fails on top of the
+    failure being reported adds nothing to it, and the stream is let go whatever the close does (`_release`)."""
+    step = error.__traceback__
+    while step is not None:
+        for value in step.tb_frame.f_locals.values():
+            if isinstance(value, httpx.Response):
+                with suppress(httpx.HTTPError):
+                    _release(value)
+        step = step.tb_next
+
+
 def _received(response: httpx.Response) -> int:
     """The bytes of an answer's body that came: what the transport delivered as it was read, or, for an answer a mock
     transport made whole before any read, what it holds."""
@@ -438,7 +455,8 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
     sent = int(request.headers.get("Content-Length") or 0)
     try:
         response = http.send(request, stream=True, follow_redirects=False)
-    except BaseException:
+    except BaseException as error:
+        _release_stranded(error)
         budget.spent(sent)
         raise
     try:
@@ -457,14 +475,21 @@ def _streamed(
 ) -> Iterator[httpx.Response]:
     """Stream a GET as `http.stream` does, release the answer however the block ends, an error in it included, so that
     an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47)."""
-    with http.stream("GET", url, headers=headers, timeout=timeout, follow_redirects=False) as response:
-        try:
-            yield response
-        finally:
+    entered = False
+    try:
+        with http.stream("GET", url, headers=headers, timeout=timeout, follow_redirects=False) as response:
+            entered = True
             try:
-                _release(response)
+                yield response
             finally:
-                budget.spent(_received(response))
+                try:
+                    _release(response)
+                finally:
+                    budget.spent(_received(response))
+    except BaseException as error:
+        if not entered:  # httpx failed in its send, before there was a block to release the answer in
+            _release_stranded(error)
+        raise
 
 
 class PlatformError(RuntimeError):

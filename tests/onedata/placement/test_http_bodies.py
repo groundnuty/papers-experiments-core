@@ -14,6 +14,7 @@ import sys
 import threading
 import tracemalloc
 import weakref
+from functools import partial
 
 import httpx
 import pytest
@@ -40,16 +41,19 @@ def collector_off():
             gc.enable()
 
 
-def answering_client(config, answer, seen, *, follow_redirects=False, **options):
+def answering_client(config, answer, seen, *, follow_redirects=False, hooks=None, **options):
     """A client whose federation answers every request with `answer(request)`, and `seen` a weak reference to every
-    request and every answer it makes."""
+    request and every answer it makes. The HTTP client it is given follows redirects if `follow_redirects` and runs
+    `hooks` (a list of functions of the answer) on every answer."""
 
     def handler(request):
         response = answer(request)
         seen.extend((weakref.ref(request), weakref.ref(response)))
         return response
 
-    http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=follow_redirects)
+    http = httpx.Client(
+        transport=httpx.MockTransport(handler), follow_redirects=follow_redirects, event_hooks={"response": hooks or []}
+    )
     return OnezoneClient(config, http=http, **options)
 
 
@@ -309,6 +313,53 @@ def test_o47_a_redirect_is_never_followed_whatever_the_client_it_was_given_does(
     assert lingering == 0
     assert len(seen) == 6  # three writes, each sent once
     assert held < SLACK
+
+
+def test_o47_an_answer_that_httpx_itself_fails_on_is_released_with_its_request(config, seen):
+    """O47: httpx can fail on an answer inside its own send, before the client holds it: a redirect whose Location it
+    cannot parse, or a hook of the HTTP client it was given that raises. It closes the answer and leaves it in its cycle
+    with the request and the four MiB written. The client finds the answers such a failure carries off in the frames
+    it passed through and releases them."""
+    badly_moved = {"Location": "https://example.test:bad/path"}
+    unparsable = answering_client(config, lambda request: httpx.Response(307, headers=badly_moved), seen)
+    refused = answering_client(
+        config, lambda request: httpx.Response(500, content=b"no"), seen, hooks=[httpx.Response.raise_for_status]
+    )
+
+    def writes():
+        for client in (unparsable, refused) * 2:
+            assert fails(partial(client._request, "PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE)))
+
+    held, lingering = measured(None, seen, writes)
+    assert len(seen) == 8
+    assert lingering == 0
+    assert held < SLACK
+
+
+def test_o47_a_streamed_read_that_httpx_itself_fails_on_is_released_too(config, fake, seen):
+    """O47: the same for the answers of a streamed range and of a head, which httpx fails on before the block that
+    would release them is entered."""
+    file_id = fake.add_file("study/part.bin", bytes(MIB))
+    badly_moved = {"Location": "https://example.test:bad/path"}
+
+    def answer(request):
+        if request.url.path.endswith("/content"):
+            return httpx.Response(307, headers=badly_moved)
+        return fake.respond(request)
+
+    client = answering_client(config, answer, seen)
+
+    def reads():
+        for _ in range(3):
+            assert fails(lambda: client.content_answer(f"/data/{file_id}/content", provider="alpha", first_byte=True))
+            assert fails(
+                lambda: client.read_content(
+                    f"/data/{file_id}/content", provider="alpha", size=MIB, chunk_bytes=MIB, deadline_s=60
+                )
+            )
+
+    _, lingering = measured(fake, seen, reads)
+    assert lingering == 0
 
 
 # -- what the fakes keep ---------------------------------------------------------------------------------------------
