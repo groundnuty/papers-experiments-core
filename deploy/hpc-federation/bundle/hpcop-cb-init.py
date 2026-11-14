@@ -21,7 +21,9 @@ the cause, when Couchbase has no administrator once onepanel's Couchbase setup i
   10 ms, without credentials, GET /pools (cluster-init's own first call) and, while that shows an unprovisioned
   node (200, no pool listed), GET /pools/default/buckets. Then:
   - a bucket while there is no administrator: onepanel's setup has run (cluster-init, then bucket-create) and
-    left Couchbase without one: FAILED, at the next round of questions after bucket-create;
+    left Couchbase without one: FAILED, at the next round of questions after bucket-create. GET /pools is asked
+    again after the bucket listing, and only a Couchbase still unprovisioned then fails: onepanel may create the
+    administrator and the bucket between the first two questions;
   - an administrator (401, or a pool listed): GET /settings/web must answer 200 to this launch's administrator
     and name it, and 401 without credentials: passed, otherwise FAILED. That endpoint needs {[settings], read},
     which an anonymous caller has only while Couchbase has no administrator (cb_guard in lib.sh has the
@@ -199,7 +201,15 @@ def wait_admin(port, timeout, start, start_pid):
             status, data = request(port, "/pools")
             if status == 200 and pool_count(data) == 0:  # unprovisioned: no administrator yet
                 bstatus, buckets = request(port, "/pools/default/buckets")
-                if bstatus == 200 and isinstance(buckets, list) and buckets:
+                if not (bstatus == 200 and isinstance(buckets, list) and buckets):
+                    time.sleep(ASK)
+                    continue
+                # onepanel may have created the administrator, then the bucket, between the two questions: once one
+                # exists, an anonymous caller may list the password-less bucket. So ask again. An administrator never
+                # goes away, so a Couchbase still unprovisioned now had none when it listed the bucket; one that is
+                # provisioned now goes on to the administrator's check below with this answer.
+                status, data = request(port, "/pools")
+                if status == 200 and pool_count(data) == 0:
                     names = ", ".join(str(b.get("name", "?")) if isinstance(b, dict) else "?" for b in buckets)
                     return fail(
                         start_pid,
@@ -208,8 +218,6 @@ def wait_admin(port, timeout, start, start_pid):
                         "(couchbase-cli 4.5.1 skips it, with exit status 0, for a password over 24 "
                         "characters)" % (HOST, port, names, (time.monotonic() - seen) * 1000),
                     ), None
-                time.sleep(ASK)
-                continue
         except (OSError, http.client.HTTPException):
             time.sleep(ASK)  # not serving yet, or the shim refused the connect: ask again
             continue

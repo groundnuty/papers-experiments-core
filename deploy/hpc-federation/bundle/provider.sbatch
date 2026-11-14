@@ -61,4 +61,11 @@ if ! bash "$B/finish.sh" --workdir "$W" "$svc"; then
 fi
 say "provider up; holding until teardown or the end of the job"
 status=0; wait "$svc" || status=$?
-say "the provider service exited (status $status)"
+# The job's state says how the service ended: a stop teardown.sh asked for is a success, any other end a
+# failure, with the service's own status (1 if it exited 0 by itself).
+if [[ -e $W/stop-requested ]]; then
+  say "the provider service stopped at teardown.sh's request (status $status)"
+  exit 0
+fi
+say "the provider service exited by itself (status $status): the job fails"
+exit $(( status == 0 ? 1 : status ))

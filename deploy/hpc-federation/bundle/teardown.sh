@@ -25,6 +25,8 @@ if [[ -s $W/service.pid ]]; then read -r pid start < "$W/service.pid" || true; f
 ours() {  # the process run_service recorded (supervise.py): same PID, same start time (stat field 22), our uid, alive
   [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ && -O /proc/$pid ]] && running_ours "$pid" "$start"
 }
+# The batch script reads this after the service ends: a stop asked for here is the job's success.
+if ours; then : > "$W/stop-requested"; fi
 if ours && signal_ours "$pid" "$start" TERM; then
   say "SIGTERM sent to the service (pid $pid, started at tick $start); waiting up to ${TIMEOUT}s for a graceful stop"
   end=$((SECONDS + TIMEOUT))

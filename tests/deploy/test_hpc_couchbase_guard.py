@@ -8,7 +8,9 @@ is refused, and fail at once, stopping the start script, otherwise. Everything s
 """
 
 import base64
+import collections
 import http.client
+import importlib.util
 import os
 import secrets
 import socket
@@ -223,3 +225,61 @@ def test_o48_a_failed_verdict_stops_the_start_script_at_once(launch, tmp_path):
     assert shell.returncode == 143, shell.stdout + shell.stderr
     assert marker.read_text(encoding="ascii").strip() == "TERM"
     assert "SIGTERM sent to the start script" in shell.stdout
+
+
+def load_guard(monkeypatch, answers):
+    """The guard as a module, with our listener always there and Couchbase's answers scripted in order:
+    (path, with ours or None, status, body)."""
+    spec = importlib.util.spec_from_file_location("hpcop_cb_init", GUARD)
+    assert spec is not None
+    assert spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    queue = collections.deque(answers)
+
+    def request(port, path, auth=None):
+        assert queue, f"an unscripted request: {path}"
+        want_path, want_auth, status, body = queue.popleft()
+        assert (path, auth) == (want_path, want_auth)
+        return status, body
+
+    monkeypatch.setattr(guard, "own_listener", lambda port: True)
+    monkeypatch.setattr(guard, "request", request)
+    monkeypatch.setattr(guard, "ASK", 0)
+    return guard, queue
+
+
+def test_o48_an_administrator_created_between_two_questions_is_not_taken_for_none(launch, monkeypatch):
+    """O48: onepanel creates the administrator, then the bucket, between the guard's GET /pools (unprovisioned) and its
+    bucket listing (the new bucket, which an anonymous caller may list once there is an administrator). That is a
+    healthy start: the guard asks again whether Couchbase has an administrator before it calls the start failed."""
+    secrets_dir, user, password = launch
+    ours = (user, password)
+    guard, queue = load_guard(
+        monkeypatch,
+        [
+            ("/pools", None, 200, {"pools": []}),
+            ("/pools/default/buckets", None, 200, [{"name": "onedata"}]),
+            ("/pools", None, 200, {"pools": [{"name": "default"}]}),
+            ("/settings/web", ours, 200, {"username": user}),
+            ("/settings/web", None, 401, None),
+        ],
+    )
+    assert guard.watch(str(secrets_dir), WAIT_S, 8091, 0) == 0
+    assert not queue
+
+
+def test_o48_a_bucket_while_couchbase_still_has_no_administrator_fails_on_the_second_look(launch, monkeypatch):
+    """O48: the incident, asked twice: a bucket, and Couchbase still unprovisioned after it (an administrator, once
+    created, never goes away), so there was none when the bucket was listed."""
+    secrets_dir, _, _ = launch
+    guard, queue = load_guard(
+        monkeypatch,
+        [
+            ("/pools", None, 200, {"pools": []}),
+            ("/pools/default/buckets", None, 200, [{"name": "onedata"}]),
+            ("/pools", None, 200, {"pools": []}),
+        ],
+    )
+    assert guard.watch(str(secrets_dir), WAIT_S, 8091, 0) == 2
+    assert not queue

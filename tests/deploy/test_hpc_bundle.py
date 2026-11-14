@@ -34,6 +34,31 @@ def test_every_batch_job_has_a_time_limit_and_is_never_requeued(job):
     assert any(re.fullmatch(r"#SBATCH --time=\d+:\d\d:\d\d", line) for line in directives)
 
 
+@pytest.mark.parametrize("job", ["zone.sbatch", "provider.sbatch"])
+def test_a_service_that_ends_without_a_teardown_fails_its_job(job, tmp_path):
+    """The batch job's state says how its service ended: success only for a stop teardown.sh asked for (its marker in
+    the work directory), and otherwise the service's own status, or 1 when it exited 0 by itself. Run here as the
+    job's own last lines, after `wait` gave the service's status."""
+    text = (BUNDLE / job).read_text(encoding="utf-8")
+    tail = text[text.index('status=0; wait "$svc" || status=$?') :]
+    say = 'say() { printf "%s\\n" "$*"; }\n'
+
+    def end(status: int, requested: bool) -> int:
+        work = tmp_path / f"w{status}{requested}"
+        work.mkdir()
+        if requested:
+            (work / "stop-requested").touch()
+        script = say + f'W="{work}"\nsvc=x\nwait() {{ return {status}; }}\n' + tail
+        return subprocess.run(["bash", "-c", script], capture_output=True, timeout=30, check=False).returncode
+
+    assert end(143, requested=True) == 0
+    assert end(0, requested=True) == 0
+    assert end(0, requested=False) == 1
+    assert end(137, requested=False) == 137
+    teardown = (BUNDLE / "teardown.sh").read_text(encoding="utf-8")
+    assert teardown.index('then : > "$W/stop-requested"; fi') < teardown.index('signal_ours "$pid" "$start" TERM')
+
+
 def test_the_shim_and_the_port_list_name_the_same_public_ports():
     """The shim compiles its public ports in; ports.sh names them for the live check. They must agree."""
     shim = (BUNDLE / "portshim.c").read_text(encoding="utf-8")

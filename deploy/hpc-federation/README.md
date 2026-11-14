@@ -35,12 +35,36 @@ the bundle works in layers:
 service node reads the work directory, the cookies and the bucket. **The study's agent sandboxes must never run on a
 node that hosts an Onedata service.**
 
-What stays exposed on a shared node, for the study to accept: the password-less `onedata` bucket and Couchbase's
-Erlang distribution behind loopback and the owner check for the whole job. Couchbase has no administrator for the
-one or two seconds between its port opening and onepanel's `cluster-init`. goxdcr (Go, outside the shim) listens on
-loopback port 9998 with no owner check. Paths the shim does not see (a static binary, a raw syscall, io_uring,
-`sendto` with `MSG_FASTOPEN`) skip the shim. And 8443 and 6665 are open to the cluster network under Onedata's own
-authentication, with the Onedata test CA, whose key is public.
+**What stays exposed on a shared node,** for the study to accept. Each of these was accepted before the live runs;
+"co-located" means another user with a job on the same node, and `--exclusive` removes them all:
+
+- **Behind loopback and the owner check for the whole job:** the password-less `onedata` bucket (onepanel 25.0
+  cannot give it a password), Couchbase's Erlang distribution with its time-seeded cookies, and memcached's `_admin`
+  user (128 random bits).
+- **Short windows before a secret is in place:**
+  - Couchbase has no administrator for the one or two seconds between its port opening and onepanel's
+    `cluster-init`;
+  - onepanel's 9443 waits about 50 ms for its passphrase.
+- **Secrets on a command line for seconds, in the image's own code:** onepanel passes the deploy-time Couchbase
+  password on `couchbase-cli`'s command line, and Couchbase's stop passes its cookie on `couchbase-server -k`'s. No
+  setting of the image avoids either. `node-init.sh` refuses a node whose `/proc` has no `hidepid`, which hides both
+  from other users, and the password is rotated right after the deployment. The bundle's own scripts put no secret
+  on a command line, a submit line or in the environment.
+- **Clients outside the shim:** goxdcr (Go) dials 8091 and 11210 with Couchbase's internal credentials and listens
+  on loopback port 9998, all with no owner check. The host-side `curl` calls of `finish*.sh`, `cb_guard`, `cb_rotate`
+  and `mint-registration-token.sh` carry the panel passphrase, the Couchbase administrator and the zone admin's
+  password, and they run outside the container, with no owner check on the far end. They dial only once our
+  listeners hold those ports, and the kernel keeps another uid off a port while our listener holds it. What is left
+  is a listener of ours closing (a Couchbase or onepanel restart) and another user binding its port before the call.
+- **Denial of service:** a co-located user can squat a port we are about to bind, flood a loopback listener (one
+  `accept()` drops at most 8 foreign connections, then returns), or make the owner check's table reads slower by
+  opening sockets.
+- **Paths the shim does not see** (a static binary, a raw syscall, io_uring, `sendto` with `MSG_FASTOPEN`) skip the
+  shim. The live port check fails on any listener of ours off loopback that one of them opens.
+- **An earlier job's work directory** that a SIGKILL left in `/tmp` (0700, root can read it) stays until the next job
+  of ours on that node removes it.
+- **8443 and 6665** are open to the cluster network under Onedata's own authentication, with the Onedata test CA,
+  whose key is public, so a client on the path cannot tell our zone from an impostor.
 
 ## The Couchbase administrator and its guard
 
@@ -83,8 +107,9 @@ repository.
 
 ## Steps
 
-Nothing secret is typed, set in the environment or passed as an argument: every secret is generated on the node,
-inside the job, and moves only through 0600 files and stdin. Every `srun` uses `--export=PATH` and, except a step
+Nothing secret is typed, set in the environment or passed as an argument by these steps or the bundle's scripts:
+every secret is generated on the node, inside the job, and moves only through 0600 files and stdin (the image's
+own exceptions are listed under "What stays exposed"). Every `srun` uses `--export=PATH` and, except a step
 whose stdin is the payload, ends in `</dev/null`.
 
 ```bash
@@ -114,7 +139,9 @@ Each batch job runs its service from the batch step itself (`node-init.sh`, `con
 `finish*.sh`), so polling costs no job steps; read a work directory's `run.log` with
 `srun --jobid=<job> --overlap --export=PATH -n1 cat <workdir>/run.log </dev/null`. On a failed start the batch
 script stops the service, deletes and redacts every secret (`scrub.py`) and keeps the logs for
-`HPCOP_INSPECT_SECONDS`. `--exclusive` keeps other users off a node, at the price of the whole node for the job.
+`HPCOP_INSPECT_SECONDS`. A job whose service stopped at `teardown.sh`'s request ends with status 0; a service that
+ends any other way fails the job, with its own status. `--exclusive` keeps other users off a node, at the price of
+the whole node for the job.
 
 ## The scripts
 
