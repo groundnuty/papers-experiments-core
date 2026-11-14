@@ -64,6 +64,17 @@ and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider'
 settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in
 `"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it. **Both
 durations are provisional,** to be tuned as live heals are measured.
+
+**A declared heal needs a token margin that outlives it.** The heal runs inside the outage run's attempt, at the
+injector's restore, which the executor's pattern places inside the tool server's launch (`faults.py`, "Use"): after
+the restore come the collection, `finish_instruments` and the tool server's stop, whose re-verification of the tool
+plane examines the run's token and fails the run as `tool_plane_integrity` once it has expired
+(`toolserver._recheck`). A run's token outlives its whole-time ceiling by `[tokens] margin_s` at least, counted from
+its mint, before the agent's loop and the injector's start. So a declared heal is refused at load unless `margin_s` is
+at least `heal_token_margin_s`: the base margin a platform without a heal relies on (`TOKEN_MARGIN_BASE_S`, the
+default 900 s, a heuristic for the start and the teardown, never a worst case of the restore) plus two heals of
+`heal_timeout_s`, one in the run's own restore and one in its start, which recovers and may heal an injection an
+earlier run left (as the injector's `cancel_wait_s` counts). With the default 4,200 s that is 9,300 s.
 """
 
 import hashlib
@@ -77,7 +88,7 @@ from typing import Any
 
 from expcore.config.loading import Section, load_toml
 from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
-from expcore_onedata.config import PlatformConfig
+from expcore_onedata.config import PlatformConfig, TokenSettings
 
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # A Compose project name as Compose accepts it. Required, because Compose would otherwise take the name from the
@@ -90,6 +101,7 @@ DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48
 DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
 DEFAULT_HEAL_TIMEOUT_S = 4200.0  # provisional: four providers' all-links sequence and one container restart fit it
 DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measurement tunes it
+TOKEN_MARGIN_BASE_S = TokenSettings().margin_s  # the token margin a platform without a heal relies on: the default
 HEAL_MODES = ("off", "all_links", "link_then_container", "link")
 _KEYS = (
     "sanctioned",
@@ -212,7 +224,24 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             "heal_timeout_s",
             f'must be at least {least:g} for heal = "{heal}": one round of its actions at their declared bounds',
         )
+    margin, needed = config.tokens.margin_s, heal_token_margin_s(settings)
+    if margin < needed:
+        raise table.fail(
+            "heal",
+            f'= "{heal}" needs [tokens] margin_s of at least {needed:g} s, not {margin:g} s: the base '
+            f"{TOKEN_MARGIN_BASE_S:g} s and two heals of heal_timeout_s ({settings.heal_timeout_s:g} s), the restore's "
+            "and the start's recovery's, since the tool server's stop examines the run's token after the restore",
+        )
     return settings
+
+
+def heal_token_margin_s(settings: FaultSettings) -> float:
+    """The least `[tokens] margin_s` the declared heal needs, so the run's token outlives its heals and the tool
+    server's stop after them (see the module docstring): the base margin and two heals of `heal_timeout_s`; 0 with the
+    heal off, which asks nothing of the margin."""
+    if settings.heal == "off":
+        return 0.0
+    return TOKEN_MARGIN_BASE_S + 2 * settings.heal_timeout_s
 
 
 def heal_link_reserve(settings: FaultSettings) -> float:
