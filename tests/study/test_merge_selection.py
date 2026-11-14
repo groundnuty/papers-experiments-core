@@ -24,12 +24,14 @@ from selection_support import (
     spent,
 )
 from shard_support import MERGE_TIMES, MERGED_ONLY, merge_into, meta_of, without_shard_section
-from study_support import Campaign, clean_environment, cli, copy_campaign, finish
+from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish
 
 from expcore.campaign.lock import DispatchLock
 from expcore.campaign.selection import RULE_SELECTION
 from expcore.campaign.shard import MERGE_FILE, META_SHARD, META_SHARES
+from expcore.provenance.codestamp import write_stamp
 from expcore.study.config import load_study
+from expcore.study.pipeline import regenerate
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
 
@@ -146,6 +148,25 @@ def test_c35_selections_merged_give_the_analysis_of_one_driver_byte_for_byte(req
             assert joined[key] == one[key], key
     assert set(joined) - set(one) == set(MERGED_ONLY)
     assert _report_differs_only_in_positions(without_shard_section(many.report), whole.report)
+
+
+@pytest.mark.parametrize("which", ["merged", "merged_sequential"])
+def test_c35_regenerate_derives_the_outputs_of_merged_selections_anew(request, which):
+    """C35: the four outputs of merged selections regenerate from their records and snapshots byte for byte."""
+    assert regenerate(request.getfixturevalue(which).root) == []
+
+
+def test_c35_a_merge_under_other_prices_than_the_campaigns_is_refused(base, clean_environment, direct, relay):
+    """C35: the merge counts what the selections spent with the study's prices; a study whose models.toml is not the
+    one the campaign ran under is refused, not used to count."""
+    root = make_selection_study(base, "repriced")
+    models = (root / "models.toml").read_text(encoding="utf-8")
+    assert "input_per_mtok = 1.0" in models
+    (root / "models.toml").write_text(
+        models.replace("input_per_mtok = 1.0", "input_per_mtok = 0.001"), encoding="utf-8"
+    )
+    write_stamp(root, HEAD, load_study(root).scope)
+    refused(clean_environment, Campaign(root), direct.root / "out", relay.root / "out", fragments=("models.toml",))
 
 
 def test_c35_a_contrast_across_selections_pairs_runs_of_both_batches(merged):

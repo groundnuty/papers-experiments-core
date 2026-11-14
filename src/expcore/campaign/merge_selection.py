@@ -57,6 +57,11 @@ def check_selections(shards: Sequence[ShardFacts], plan: Manifest, pricing: Pric
     check_fingerprints(ordered)
     _check_runs(ordered, plan)
     check_environment(ordered)
+    mismatch = None if pricing is None else pricing.mismatch(ordered[0].fingerprint)
+    if mismatch is not None:
+        raise MergeRefused(
+            f"{mismatch}, so what the selections spent cannot be counted: use the study at the commit they ran"
+        )
     if ordered[0].spec.sequential:
         _check_sequence(ordered, pricing)
     if pricing is not None:

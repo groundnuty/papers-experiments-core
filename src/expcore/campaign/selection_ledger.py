@@ -32,10 +32,25 @@ Query = Callable[..., Iterable[Sequence[Any]]]  # query(sql, args=()) -> rows, i
 
 @dataclass(frozen=True)
 class Pricing:
-    """The plan's models by key and the caps every attempt ran under: what bounds an attempt's cost."""
+    """The plan's models by key and the caps every attempt ran under: what bounds an attempt's cost.
+
+    `digests` are the models' entries as the campaign fingerprint holds them and `agent` the loop's caps as its
+    `caps.agent` holds them, so a reader can refuse prices that are not the ones the campaign ran under
+    (`mismatch`)."""
 
     models: Mapping[str, ModelSpec]
     limits: Limits
+    digests: Mapping[str, Any] | None = None
+    agent: Mapping[str, Any] | None = None
+
+    def mismatch(self, fingerprint: Mapping[str, Any]) -> str | None:
+        """Why these prices are not the campaign's whose fingerprint is given; None when they are."""
+        if self.digests is not None and dict(self.digests) != dict(fingerprint.get("models", {})):
+            return "the study's models.toml entries are not the ones the campaign ran under"
+        caps = fingerprint.get("caps")
+        if self.agent is not None and (not isinstance(caps, Mapping) or dict(self.agent) != caps.get("agent")):
+            return "the study's [agent] caps are not the ones the campaign ran under"
+        return None
 
 
 @dataclass(frozen=True)

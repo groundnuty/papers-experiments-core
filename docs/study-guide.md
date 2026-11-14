@@ -618,13 +618,7 @@ It refuses, naming the shard by its index and label and saying why, shards that 
 
 ### Running a study in batches
 
-Some conditions are ready before others: run states S0 and S1 now and S2 and S3 next week. Do not cut the study down to the first batch, which changes its fingerprint (and once dropped a treatment's target); and do not run the whole study, whose later rows would be attempted and refused. Run the campaign as **selections**: each batch is the runs whose declared factors have the levels you name, a shard of the same campaign, with the study, its factor schema and its fingerprint whole. Give each batch its own copy of the study and its own `out/`, as a shard has.
-
-```sh
-python -m expcore run my-study-now   --select state=S0,S1 --shard-label first  --sequential
-python -m expcore run my-study-later --select state=S2,S3 --shard-label second --sequential --after my-study-now/out
-python -m expcore merge my-study/out my-study-now/out my-study-later/out
-```
+Some conditions are ready before others: run states S0 and S1 now and S2 and S3 next week. Do not cut the study down to the first batch, which changes its fingerprint (and once dropped a treatment's target); and do not run the whole study, whose later rows would be attempted and refused. Run the campaign as **selections**: each batch is the runs whose declared factors have the levels you name, a shard of the same campaign, with the study, its factor schema and its fingerprint whole. Give each batch its own copy of the study and its own `out/`, as a shard has. The first batch is `python -m expcore run my-study-now --select state=S0,S1 --shard-label first --sequential`; once it has stopped, the second is `python -m expcore run my-study-later --select state=S2,S3 --shard-label second --sequential --after my-study-now/out`; and `python -m expcore merge my-study/out my-study-now/out my-study-later/out` joins them.
 
 `--select FACTOR=L1,L2` keeps the runs whose value of the factor is one of the levels; give it once per factor, and a run is kept when every factor matches. Only factors the study declares are selected on, never `task`, `model` or `seed`. The selection is given on the command line only, never in `campaign.toml`, so the fingerprint is the whole plan's. `--shard-label` is required, under the shard label's rules. The store, the export, the snapshot and merge.json record the rule `expcore-shard/4` with the selection and its mode. A start is refused before the store is opened for a factor the study does not declare or a level the factor does not have (each named, with what is known), a selection that selects no run or every run, `--select` with `--shard` or with `[shards] per_model` (neither combines with a selection in this version), and a resume under another selection, label or mode, or without `--select`. A selection's plan cannot grow on resume.
 

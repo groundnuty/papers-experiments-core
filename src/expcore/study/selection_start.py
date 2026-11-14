@@ -15,6 +15,7 @@ study and the fingerprint of the whole plan:
 
 import collections
 import dataclasses
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -32,8 +33,14 @@ from expcore.study.config import StudyConfig
 
 
 def pricing_of(study: StudyConfig) -> Pricing:
-    """The study's plan models and the caps every attempt runs under: what a selection's spend is counted with."""
-    return Pricing({key: study.models.resolve(key) for key in study.campaign.models}, study.campaign.agent.limits)
+    """The study's plan models and the caps every attempt runs under: what a selection's spend is counted with, with
+    the models' digests and the loop's caps as the campaign fingerprint holds them (`Pricing.mismatch`)."""
+    from expcore.study.pipeline import model_digest  # the pipeline imports this module
+
+    models = {key: study.models.resolve(key) for key in study.campaign.models}
+    digests = {key: model_digest(spec) for key, spec in models.items()}
+    agent = json.loads(json.dumps(study.campaign.agent.as_dict(), sort_keys=True))  # as the fingerprint keeps it
+    return Pricing(models, study.campaign.agent.limits, digests, agent)
 
 
 def _reservations(pricing: Pricing) -> dict[str, float]:
