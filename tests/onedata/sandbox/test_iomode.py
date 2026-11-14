@@ -173,11 +173,60 @@ def test_o48_a_log_that_cannot_be_parsed_fails_closed_as_unknown_never_as_agreem
     assert all(isinstance(p, str) for p in got["problems"])
 
 
+@pytest.mark.parametrize(
+    ("declared", "log"),
+    [("proxy", PROXY + DIRECT), ("direct", DIRECT + PROXY), ("proxy", PROXY + NEITHER), ("direct", DIRECT + BOTH)],
+    ids=["proxy then direct", "direct then proxy", "proxy then neither", "direct then both"],
+)
+def test_o48_a_start_line_logged_again_with_another_value_is_never_agreement(declared, log):
+    """O48: every logged occurrence of a start line counts, not the first alone: a log whose first start lines say the
+    declared mode and whose later ones say another (a sidecar started again with other options, a line the log was
+    given) is `mixed` and never agrees, whichever came first."""
+    got = judge(declared, log)
+    assert (got["effective"], got["agree"]) == ("mixed", False)
+    assert any("more than once" in problem for problem in got["problems"])
+
+
+@pytest.mark.parametrize("declared", ["proxy", "direct"])
+def test_o48_a_start_line_logged_again_with_a_value_that_is_no_flag_is_unknown(declared):
+    """O48: a later occurrence that is not a 0 or a 1 is not ignored because an earlier one was: unknown, never
+    agree."""
+    first = PROXY if declared == "proxy" else DIRECT
+    got = judge(declared, first + "I1113 10:05:00.000000     1 logging.cc:84] Forced proxy IO: yes\n")
+    assert (got["effective"], got["agree"]) == ("unknown", False)
+
+
+@pytest.mark.parametrize("declared", ["proxy", "direct"])
+def test_o48_a_start_line_logged_again_with_the_same_value_is_still_the_declared_mode(declared):
+    """O48: the same start lines again (a sidecar started again with the same options) say the same mode: agreement."""
+    log = PROXY * 2 if declared == "proxy" else DIRECT * 2
+    got = judge(declared, log)
+    assert (got["effective"], got["agree"]) == (declared, True)
+
+
+def test_o48_a_value_the_log_holds_where_a_flag_belongs_is_never_copied_into_the_reading():
+    """O48: a start line whose value is a path, a token or any other text is `unknown`, and the reading says that it was
+    not a 0 or a 1 without repeating a character of it: the reading reaches the sandbox's metadata, the instrument's
+    snapshot and a refusal's detail, which hold nothing the log holds."""
+    secret = "/private/tok-0123456789"
+    log = HEADER + f"I1113 10:00:00.100300     1 logging.cc:84] Forced direct IO: {secret}\n"
+    log += "I1113 10:00:00.100400     1 logging.cc:85] Forced proxy IO: 1\n"
+    for declared in ("proxy", "direct"):
+        got = judge(declared, log)
+        assert (got["effective"], got["agree"]) == ("unknown", False)
+        assert "private" not in json.dumps(got)
+        assert "tok-0123456789" not in json.dumps(got)
+    assert "'0' or '1'" in json.dumps(judge("proxy", log))
+
+
 def test_o48_a_declared_mode_that_is_neither_proxy_nor_direct_never_agrees():
     """O48: the declared mode is read from the settings, which only take the two words; anything else fails closed."""
     got = judge(None, PROXY)
     assert (got["effective"], got["agree"]) == ("proxy", False)
     assert "declared" in got["problems"][0]
+    other = judge("/private/other", PROXY)  # nor does the reading repeat what it was given
+    assert (other["declared"], other["agree"]) == (None, False)
+    assert "private" not in json.dumps(other)
 
 
 def test_o48_agrees_recomputes_the_flag_and_reads_anything_but_a_matching_mount_snapshot_as_no():

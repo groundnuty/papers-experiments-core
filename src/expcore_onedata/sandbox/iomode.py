@@ -15,9 +15,11 @@ declared mode is the sandbox's own setting; the effective one is what oneclient 
   not itself force proxy (`forced proxy io mode: 0`); a detection that forces it (`1`) is the declared mode.
 
 `effective` is `proxy` or `direct` when the start lines force it and no such line follows, `auto` when none is forced,
-`mixed` when the log contradicts itself (both forced, or a forced mode followed by a line of a read that did not follow
-it), and `unknown` when the log could not be read or its start lines are not `0` or `1`. **`agree` is true only when
-the declared mode and the effective one are the same word, `proxy` or `direct`: unknown is never agreement.**
+`mixed` when the log contradicts itself (both forced, a start line logged again with another value, or a forced mode
+followed by a line of a read that did not follow it), and `unknown` when the log could not be read or a start line is
+missing or, anywhere in the log, is not `0` or `1`. Every logged occurrence of a start line counts, not the first alone.
+**`agree` is true only when the declared mode and the effective one are the same word, `proxy` or `direct`: unknown
+is never agreement.**
 
 The sandbox reads the log once, when it collects (`DockerSandbox.mount_io_mode`, before the direct mount's own check
 that may refuse the collection, so the reading is kept with that evidence), and keeps the reading in its metadata
@@ -64,12 +66,16 @@ FLAGS = ("0", "1")  # what a start line of a force option says
 UNREAD = "the sidecar's oneclient log could not be read"
 NOT_COLLECTED = "the sandbox has not collected: oneclient's log is read by its collection"
 NEVER_READ = "the mount's I/O mode was never read, so it is not shown to be the declared one"
-SHOWN_CHARS = 20  # of a value the log logged where a 0 or a 1 belongs, cut for the record
 
 
-def _shown(value: object, limit: int = SHOWN_CHARS) -> str:
-    """A value for a sentence of the record, cut, so that nothing a log or a setting holds is carried whole."""
-    return repr(value if isinstance(value, str) else type(value).__name__)[:limit]
+def _logged(log_text: str, name: str) -> list[str]:
+    """Every value the log's start lines give an option, in the order logged: not the first alone, which is all that
+    `oneclient_start.start_settings` keeps, so a later line that says otherwise is never ignored."""
+    return [
+        parsed.group(2).strip()
+        for line in log_text.splitlines()
+        if (parsed := start.START_LINE.match(line)) and parsed.group(1) == name
+    ]
 
 
 def _contradicting(forced: str, log_text: str) -> list[str]:
@@ -92,16 +98,23 @@ def _effective(log_text: str | None, why_unread: str) -> dict[str, Any]:
     if log_text is None:
         out["problems"].append(why_unread)
         return out
-    found = start.start_settings(log_text)
-    values = {name: found.get(name) for name in (start.FORCED_DIRECT, start.FORCED_PROXY)}
-    for name, value in values.items():
-        if value is None:
+    values: dict[str, set[str]] = {}
+    for name in (start.FORCED_DIRECT, start.FORCED_PROXY):
+        logged = _logged(log_text, name)
+        if not logged:
             out["problems"].append(f"{name}: not logged")
-        elif value not in FLAGS:
-            out["problems"].append(f"{name}: logged {_shown(value)}, expected '0' or '1'")
+        elif any(value not in FLAGS for value in logged):  # never the value itself: it is the log's text
+            out["problems"].append(f"{name}: logged a value that is not '0' or '1'")
+        else:
+            values[name] = set(logged)
     if out["problems"]:
         return out
-    direct, proxy = values[start.FORCED_DIRECT], values[start.FORCED_PROXY]
+    again = [name for name, logged in values.items() if len(logged) > 1]
+    if again:  # a later line says another mode than an earlier one: the log contradicts itself
+        out["effective"] = MIXED
+        out["problems"] += [f"{name}: logged more than once, with different values" for name in again]
+        return out
+    (direct,), (proxy,) = values[start.FORCED_DIRECT], values[start.FORCED_PROXY]
     out["forced_direct"], out["forced_proxy"] = direct, proxy
     if (direct, proxy) == ("0", "0"):
         out["effective"], out["lines"] = AUTO, directio.marker_lines(log_text)
@@ -124,7 +137,7 @@ def judge(declared: object, log_text: str | None, *, why_unread: str = UNREAD) -
     seen = _effective(log_text, why_unread)
     problems = list(seen["problems"])
     if declared not in IO_MODES:
-        problems.insert(0, f"the declared mode {_shown(declared)} is neither 'proxy' nor 'direct'")
+        problems.insert(0, "the declared mode is neither 'proxy' nor 'direct'")
     elif seen["effective"] != declared:
         problems.insert(0, f"declared {declared!r}, oneclient's start lines show {seen['effective']!r}")
     agree = declared in IO_MODES and seen["effective"] == declared
