@@ -41,6 +41,7 @@ the cause, when Couchbase has no administrator once onepanel's Couchbase setup i
 The credentials come from 0600 files; nothing secret is on a command line or in the environment.
 Python 3.8 (the image's).
 """
+
 import base64
 import http.client
 import json
@@ -52,10 +53,10 @@ import sys
 import time
 
 HOST = "127.0.0.1"
-ASK = 0.01           # between REST questions, once our listener is there
-LOOK = 0.005         # between looks at the socket tables
+ASK = 0.01  # between REST questions, once our listener is there
+LOOK = 0.005  # between looks at the socket tables
 TCP_LISTEN, TCP_SYN_RECV = "0A", "03"
-PASSED = "Couchbase guard passed"      # lib.sh: CB_GUARD_PASSED, CB_GUARD_FAILED
+PASSED = "Couchbase guard passed"  # lib.sh: CB_GUARD_PASSED, CB_GUARD_FAILED
 FAILED = "Couchbase guard FAILED"
 
 
@@ -68,8 +69,10 @@ def table_address(packed):
 # 127.0.0.1 or 0.0.0.0, as IPv4 sockets (tcp) or v4-mapped IPv6 ones (tcp6). Not [::]: it may be v6-only.
 HOLDS = {
     "tcp": {table_address(socket.inet_aton(HOST)), table_address(bytes(4))},
-    "tcp6": {table_address(socket.inet_pton(socket.AF_INET6, "::ffff:" + HOST)),
-             table_address(socket.inet_pton(socket.AF_INET6, "::ffff:0.0.0.0"))},
+    "tcp6": {
+        table_address(socket.inet_pton(socket.AF_INET6, "::ffff:" + HOST)),
+        table_address(socket.inet_pton(socket.AF_INET6, "::ffff:0.0.0.0")),
+    },
 }
 
 
@@ -80,7 +83,7 @@ def own_listener(port):
     for table, addresses in HOLDS.items():
         try:
             with open("/proc/net/" + table, encoding="ascii") as f:
-                next(f, None)   # the header
+                next(f, None)  # the header
                 for line in f:
                     fields = line.split()
                     if len(fields) < 8:
@@ -88,8 +91,12 @@ def own_listener(port):
                     if fields[3] not in (TCP_LISTEN, TCP_SYN_RECV):
                         break
                     address, _, hexport = fields[1].partition(":")
-                    if (fields[3] == TCP_LISTEN and int(hexport, 16) == port and address.upper() in addresses
-                            and fields[7] == str(me)):
+                    if (
+                        fields[3] == TCP_LISTEN
+                        and int(hexport, 16) == port
+                        and address.upper() in addresses
+                        and fields[7] == str(me)
+                    ):
                         return True
         except (OSError, ValueError):
             continue
@@ -148,8 +155,10 @@ def fail(start_pid, cause):
     if start_pid <= 0:
         say("no start script to signal (START_PID %d)" % start_pid)
     elif os.getppid() != start_pid:
-        say("the start script (pid %d) is no longer this guard's parent: not signalled; finish*.sh stops the "
-            "service" % start_pid)
+        say(
+            "the start script (pid %d) is no longer this guard's parent: not signalled; finish*.sh stops the "
+            "service" % start_pid
+        )
     else:
         try:
             os.kill(start_pid, signal.SIGTERM)
@@ -162,7 +171,7 @@ def fail(start_pid, cause):
 def wait_admin(port, timeout, start, start_pid):
     """From the first look that finds our listener to the first sign of an administrator, or a FAILED verdict.
     Returns (None, times) once Couchbase looks provisioned, or (exit status, None) after a verdict."""
-    absent = None    # start of the last look that did not find our listener: the port opened after it
+    absent = None  # start of the last look that did not find our listener: the port opened after it
     while True:
         look = time.monotonic()
         if own_listener(port):
@@ -175,29 +184,38 @@ def wait_admin(port, timeout, start, start_pid):
     while True:
         now = time.monotonic()
         if now - start > timeout:
-            return fail(start_pid, "Couchbase on %s:%d still had no administrator %d ms after it was first seen "
-                        "listening (the guard waits %.0f s)" % (HOST, port, (now - seen) * 1000, timeout)), None
+            return fail(
+                start_pid,
+                "Couchbase on %s:%d still had no administrator %d ms after it was first seen "
+                "listening (the guard waits %.0f s)" % (HOST, port, (now - seen) * 1000, timeout),
+            ), None
         if not own_listener(port):
-            return fail(start_pid, "Couchbase stopped listening on %s:%d %d ms after it was first seen, before it "
-                        "had an administrator" % (HOST, port, (now - seen) * 1000)), None
+            return fail(
+                start_pid,
+                "Couchbase stopped listening on %s:%d %d ms after it was first seen, before it "
+                "had an administrator" % (HOST, port, (now - seen) * 1000),
+            ), None
         try:
             status, data = request(port, "/pools")
-            if status == 200 and pool_count(data) == 0:   # unprovisioned: no administrator yet
+            if status == 200 and pool_count(data) == 0:  # unprovisioned: no administrator yet
                 bstatus, buckets = request(port, "/pools/default/buckets")
                 if bstatus == 200 and isinstance(buckets, list) and buckets:
                     names = ", ".join(str(b.get("name", "?")) if isinstance(b, dict) else "?" for b in buckets)
-                    return fail(start_pid, "Couchbase on %s:%d has a bucket (%s) but no administrator, %d ms after "
-                                "it was first seen listening: onepanel's cluster-init did not create one "
-                                "(couchbase-cli 4.5.1 skips it, with exit status 0, for a password over 24 "
-                                "characters)" % (HOST, port, names, (time.monotonic() - seen) * 1000)), None
+                    return fail(
+                        start_pid,
+                        "Couchbase on %s:%d has a bucket (%s) but no administrator, %d ms after "
+                        "it was first seen listening: onepanel's cluster-init did not create one "
+                        "(couchbase-cli 4.5.1 skips it, with exit status 0, for a password over 24 "
+                        "characters)" % (HOST, port, names, (time.monotonic() - seen) * 1000),
+                    ), None
                 time.sleep(ASK)
                 continue
         except (OSError, http.client.HTTPException):
-            time.sleep(ASK)   # not serving yet, or the shim refused the connect: ask again
+            time.sleep(ASK)  # not serving yet, or the shim refused the connect: ask again
             continue
         if status == 401 or (status == 200 and pool_count(data)):
             return None, (absent, seen, time.monotonic(), status)
-        time.sleep(ASK)       # not ready (5xx) or not Couchbase's answer: ask again
+        time.sleep(ASK)  # not ready (5xx) or not Couchbase's answer: ask again
 
 
 def watch(secrets, timeout, port, start_pid):
@@ -210,8 +228,10 @@ def watch(secrets, timeout, port, start_pid):
     while True:
         now = time.monotonic()
         if now - start > timeout:
-            return fail(start_pid, "Couchbase on %s:%d gave no clear answer to GET /settings/web within %.0f s"
-                        % (HOST, port, timeout))
+            return fail(
+                start_pid,
+                "Couchbase on %s:%d gave no clear answer to GET /settings/web within %.0f s" % (HOST, port, timeout),
+            )
         try:
             mine, settings = request(port, "/settings/web", ours)
             anonymous, _ = request(port, "/settings/web")
@@ -219,27 +239,44 @@ def watch(secrets, timeout, port, start_pid):
             time.sleep(ASK)
             continue
         if mine == 401:
-            return fail(start_pid, "Couchbase on %s:%d has an administrator that is not this launch's (GET "
-                        "/settings/web with ours: HTTP 401)" % (HOST, port))
+            return fail(
+                start_pid,
+                "Couchbase on %s:%d has an administrator that is not this launch's (GET "
+                "/settings/web with ours: HTTP 401)" % (HOST, port),
+            )
         if mine == 200:
             who = settings.get("username") if isinstance(settings, dict) else None
             if who != ours[0]:
-                return fail(start_pid, "Couchbase on %s:%d names %r as its administrator, not this launch's"
-                            % (HOST, port, who))
+                return fail(
+                    start_pid, "Couchbase on %s:%d names %r as its administrator, not this launch's" % (HOST, port, who)
+                )
             if anonymous == 200:
-                return fail(start_pid, "Couchbase on %s:%d answers an anonymous GET /settings/web with HTTP 200: "
-                            "anyone can act as its administrator" % (HOST, port))
+                return fail(
+                    start_pid,
+                    "Couchbase on %s:%d answers an anonymous GET /settings/web with HTTP 200: "
+                    "anyone can act as its administrator" % (HOST, port),
+                )
             if anonymous == 401:
                 break
-        time.sleep(ASK)       # 5xx or another transient answer: ask again
+        time.sleep(ASK)  # 5xx or another transient answer: ask again
     if absent is None:
         opened = "it was already listening when this watcher started, so the time it opened is not known"
     else:
         opened = "at most %d ms after it opened" % ((done - absent) * 1000)
-    say("Couchbase administrator set %d ms after %s:%d was first seen listening, %s (looked every %d ms, then "
+    say(
+        "Couchbase administrator set %d ms after %s:%d was first seen listening, %s (looked every %d ms, then "
         "asked every %d ms); it is this launch's (an anonymous GET /pools then answered HTTP %d%s)"
-        % ((done - seen) * 1000, HOST, port, opened, LOOK * 1000, ASK * 1000, status,
-           "" if status == 401 else ": the password-less onedata bucket lets anyone read [pools]"))
+        % (
+            (done - seen) * 1000,
+            HOST,
+            port,
+            opened,
+            LOOK * 1000,
+            ASK * 1000,
+            status,
+            "" if status == 401 else ": the password-less onedata bucket lets anyone read [pools]",
+        )
+    )
     say("%s: this launch's administrator answers GET /settings/web, and an anonymous one is refused (401)" % PASSED)
     return 0
 
@@ -248,7 +285,7 @@ def guarded_watch(args):
     start_pid = int(args[3])
     try:
         return watch(args[0], float(args[1]), int(args[2]), start_pid)
-    except Exception as e:     # fail closed: an error of the guard is a FAILED verdict, never a silent pass
+    except Exception as e:  # fail closed: an error of the guard is a FAILED verdict, never a silent pass
         return fail(start_pid, "the guard itself failed: %s: %s" % (type(e).__name__, e))
 
 

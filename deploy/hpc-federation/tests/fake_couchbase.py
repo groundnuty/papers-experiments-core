@@ -19,6 +19,7 @@ It opens its port only after DELAY seconds, so the polling of its clients is exe
 seconds. Every request is logged on stdout ("request <method> <path>"), so a test can tell that none arrived.
 Usage: fake_couchbase.py PORT DELAY LIFETIME [USER:PASSWORD (start already provisioned)]
 """
+
 import base64
 import binascii
 import http.server
@@ -88,14 +89,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(400, ["services"])
             state["services"] = "kv"
             return self.reply(200)
-        if self.path in ("/pools/default/buckets", "/pools/default/buckets/"):   # couchbase-cli posts to the second
+        if self.path in ("/pools/default/buckets", "/pools/default/buckets/"):  # couchbase-cli posts to the second
             if state["quota"] is None or not form.get("name") or not form.get("ramQuotaMB", "").isdigit():
                 return self.reply(400, ["bucket"])
             state["buckets"].append(form["name"])
             return self.reply(202)
         if self.path != "/settings/web":
             return self.reply(404)
-        if state["services"] is None:   # as cluster-init does it: services first
+        if state["services"] is None:  # as cluster-init does it: services first
             return self.reply(400, ["services"])
         if form.get("port") != "SAME" or not form.get("username") or not form.get("password"):
             return self.reply(400, ["form"])

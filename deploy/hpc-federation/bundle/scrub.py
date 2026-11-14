@@ -22,6 +22,7 @@ run of base64 characters around it, across one escaped line break each way.
 SECRETS is a 0600 file with one value per line: no value is ever on a command line. Values shorter than 12
 characters are matched in plain text only (the bundle's secrets have 24 or more).
 """
+
 import base64
 import os
 import re
@@ -31,8 +32,8 @@ MARK = b"[hpcop: redacted]"
 PIECE = 12
 MIN_ENCODED = 12
 B64 = rb"[A-Za-z0-9+/=_-]"
-ESCAPED_BREAK = rb"(?:\\r\\n|\\n)"                 # the two characters \n (or four, \r\n), as a repr prints them
-ANY_BREAK = rb"(?:\r?\n|\\r\\n|\\n)"              # also a real LF or CRLF
+ESCAPED_BREAK = rb"(?:\\r\\n|\\n)"  # the two characters \n (or four, \r\n), as a repr prints them
+ANY_BREAK = rb"(?:\r?\n|\\r\\n|\\n)"  # also a real LF or CRLF
 URLSAFE = bytes.maketrans(b"+/", b"-_")
 
 
@@ -47,8 +48,8 @@ def encoded_forms(value):
     forms = []
     for pad in range(3):
         enc = base64.b64encode(b"\0" * pad + value)
-        start = (8 * pad + 5) // 6            # the first character made only of the value's bits
-        end = (8 * (pad + len(value))) // 6   # one past the last such character
+        start = (8 * pad + 5) // 6  # the first character made only of the value's bits
+        end = (8 * (pad + len(value))) // 6  # one past the last such character
         for form in (enc[start:end], enc[start:end].translate(URLSAFE)):
             if form not in forms:
                 forms.append(form)
@@ -57,7 +58,7 @@ def encoded_forms(value):
 
 def pieces(form):
     """Every 12-character piece at a multiple of 12, and the last 12 characters."""
-    out = [form[i:i + PIECE] for i in range(0, len(form) - PIECE + 1, PIECE)]
+    out = [form[i : i + PIECE] for i in range(0, len(form) - PIECE + 1, PIECE)]
     if form[-PIECE:] not in out:
         out.append(form[-PIECE:])
     return out
@@ -65,7 +66,21 @@ def pieces(form):
 
 def widened(core):
     """core, plus the base64 run around it (across one escaped line break on each side)."""
-    return rb"(?:" + B64 + rb"+" + ESCAPED_BREAK + rb")?" + B64 + rb"*" + core + B64 + rb"*(?:" + ESCAPED_BREAK + B64 + rb"+)?"
+    return (
+        rb"(?:"
+        + B64
+        + rb"+"
+        + ESCAPED_BREAK
+        + rb")?"
+        + B64
+        + rb"*"
+        + core
+        + B64
+        + rb"*(?:"
+        + ESCAPED_BREAK
+        + B64
+        + rb"+)?"
+    )
 
 
 def pattern(values):
@@ -77,7 +92,7 @@ def pattern(values):
         for form in encoded_forms(value):
             # The whole form, a line break allowed between any two characters; then any piece of it, so a form
             # cut short (a truncated log line) is caught as well.
-            alternatives.append(widened((ANY_BREAK + b"?").join(re.escape(form[i:i + 1]) for i in range(len(form)))))
+            alternatives.append(widened((ANY_BREAK + b"?").join(re.escape(form[i : i + 1]) for i in range(len(form)))))
             alternatives.extend(widened(re.escape(p)) for p in pieces(form))
     return re.compile(b"|".join(alternatives))
 

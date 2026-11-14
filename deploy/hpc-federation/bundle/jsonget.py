@@ -3,6 +3,7 @@
 PATH is dot-separated object keys and list indexes, e.g. "ids.0". Without --default, a missing field
 exits 2, so a shell caller never mistakes a missing field for an empty one. Run as python3.11 -I.
 """
+
 import json
 import sys
 from typing import Any, List, Optional

@@ -3,7 +3,8 @@
   run -- CMD ARG...        run CMD (run_service's `apptainer exec ...`) as this process's child, forward SIGTERM to it,
                            turn SIGUSR1 into SIGKILL for it, and exit with its status once it ends
   signal PID START SIG     send SIG (TERM, USR1 or KILL) to PID only if it is still the process that started at clock
-                           tick START (field 22 of /proc/PID/stat); exit 0 if sent, 1 if PID is gone or is another process
+                           tick START (field 22 of /proc/PID/stat); exit 0 if sent, 1 if PID is gone or is another
+                           process
   check                    exit 0 if this Python and kernel have pidfd_open and pidfd_send_signal (Linux 5.3 and 5.1)
 
 Why (live run 4): run_service used to exec apptainer, which execs the setuid-root starter under the same PID. On a node
@@ -27,6 +28,7 @@ time in /proc. If the start time is the recorded one, the process holding PID at
 the pidfd refers to it (a PID taken over before the pidfd_open would show a later start time), so a reused PID is
 never signalled.
 """
+
 import os
 import signal
 import sys
@@ -45,7 +47,10 @@ def pidfd_supported():
 
 def check():
     if not pidfd_supported():
-        say("this Python has no os.pidfd_open or signal.pidfd_send_signal (Python 3.9 or later, built on Linux 5.3 or later)")
+        say(
+            "this Python has no os.pidfd_open or signal.pidfd_send_signal (Python 3.9 or later, built on Linux 5.3 "
+            "or later)"
+        )
         return 2
     try:
         fd = os.pidfd_open(os.getpid())
@@ -66,7 +71,7 @@ def start_time(pid):
             stat = f.read().decode("ascii", "replace")
     except OSError:
         return None
-    fields = stat[stat.rfind(")") + 2:].split()   # fields 3.. follow the last ')'; comm may hold spaces
+    fields = stat[stat.rfind(")") + 2 :].split()  # fields 3.. follow the last ')'; comm may hold spaces
     return fields[19] if len(fields) > 19 else None
 
 
@@ -78,7 +83,7 @@ def signal_recorded(pid, start, sig):
     except ProcessLookupError:
         return 1
     try:
-        if start_time(pid) != start:   # another process holds PID now (or none we may read): not ours to signal
+        if start_time(pid) != start:  # another process holds PID now (or none we may read): not ours to signal
             return 1
         signal.pidfd_send_signal(fd, sig)
     except (ProcessLookupError, PermissionError):
@@ -97,7 +102,7 @@ def run(cmd):
             signal.pidfd_send_signal(state["pidfd"], sig)
             say("%s sent to the container's starter (pid %d)" % (signal.Signals(sig).name, state["pid"]))
         except ProcessLookupError:
-            pass   # it has ended and been reaped: nothing to signal
+            pass  # it has ended and been reaped: nothing to signal
 
     def on_signal(signum, _frame):
         sig = signal.SIGKILL if signum == signal.SIGUSR1 else signum
@@ -111,16 +116,16 @@ def run(cmd):
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGUSR1, on_signal)
-    if pending:   # stopped before the container started: do not start it
+    if pending:  # stopped before the container started: do not start it
         return 128 + pending[0]
     # posix_spawn: no Python code runs in the child; caught signals revert to their defaults there, ignored ones stay
     # ignored, as they were for the apptainer this process used to exec.
     pid = os.posix_spawnp(cmd[0], cmd, os.environ)
     state["pid"] = pid
-    state["pidfd"] = os.pidfd_open(pid)   # our unreaped child: PID not recycled before this
+    state["pidfd"] = os.pidfd_open(pid)  # our unreaped child: PID not recycled before this
     for sig in pending:
         deliver(sig)
-    _, status = os.waitpid(pid, 0)        # reaps it; a signal arriving meanwhile is forwarded, then the wait resumes
+    _, status = os.waitpid(pid, 0)  # reaps it; a signal arriving meanwhile is forwarded, then the wait resumes
     os.close(state["pidfd"])
     code = os.waitstatus_to_exitcode(status)
     return 128 - code if code < 0 else code

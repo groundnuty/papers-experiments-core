@@ -8,6 +8,7 @@ this node's name, connected on 127.0.0.1. Exits 1 if support, the default creden
 mapping fails, so a caller never mistakes a partial onboarding for success.
 Usage: python3.11 -I onboard.py [--workdir W]
 """
+
 import base64
 import glob
 import http.client
@@ -76,8 +77,12 @@ class Panel:
         conn = LocalHTTPS(self.fqdn, 9443, timeout=TIMEOUT, context=self.ctx)
         headers = {"Authorization": self.auth, "Content-Type": "application/json"}
         try:
-            conn.request(method, "/api/v3/onepanel/provider" + path,
-                         body=None if body is None else json.dumps(body), headers=headers)
+            conn.request(
+                method,
+                "/api/v3/onepanel/provider" + path,
+                body=None if body is None else json.dumps(body),
+                headers=headers,
+            )
             resp = conn.getresponse()
             return resp.status, resp.read().decode("utf-8", "replace")
         finally:
@@ -96,9 +101,11 @@ def main(argv: List[str]) -> int:
     workdir = find_workdir(explicit)
     rootfs = os.path.join(workdir, "rootfs")
     fqdn = subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
-    panel = Panel(fqdn,
-                  os.path.join(rootfs, "volumes/persistence_backup/etc/op_panel/OnedataTestWebServerCa.pem"),
-                  read_secret(os.path.join(rootfs, "root/.hpcop/passphrase")))
+    panel = Panel(
+        fqdn,
+        os.path.join(rootfs, "volumes/persistence_backup/etc/op_panel/OnedataTestWebServerCa.pem"),
+        read_secret(os.path.join(rootfs, "root/.hpcop/passphrase")),
+    )
     status, body = panel.req("GET", "/storages")
     ids = json.loads(body).get("ids", []) if status == 200 else []
     if not ids:
@@ -109,22 +116,31 @@ def main(argv: List[str]) -> int:
     if status == 200:
         support = "already supported"
     else:
-        status, body = panel.req("POST", "/spaces", {"token": payload["token"], "size": payload.get("size", 20000000000),
-                                                    "storageId": sid})
+        status, body = panel.req(
+            "POST", "/spaces", {"token": payload["token"], "size": payload.get("size", 20000000000), "storageId": sid}
+        )
         support = f"support HTTP {status}"
         if status != 201:
             failures.append(f"support: HTTP {status} {body[:200]}")
-    status, body = panel.req("PUT", f"/storages/{sid}/luma/local_feed/storage_access/posix_compatible/default_credentials/{sp}",
-                             {"uid": uid, "gid": gid})
+    status, body = panel.req(
+        "PUT",
+        f"/storages/{sid}/luma/local_feed/storage_access/posix_compatible/default_credentials/{sp}",
+        {"uid": uid, "gid": gid},
+    )
     if status not in (200, 201, 204):
         failures.append(f"default credentials: HTTP {status} {body[:200]}")
     path = f"/storages/{sid}/luma/local_feed/storage_access/all/onedata_user_to_credentials"
     users = payload.get("users", [])
     mapped = 0
     for user in users:
-        status, _ = panel.req("POST", path, {"onedataUser": {"mappingScheme": "onedataUser", "onedataUserId": user},
-                                             "storageUser": {"storageCredentials": {"type": "posix", "uid": str(uid)},
-                                                             "displayUid": uid}})
+        status, _ = panel.req(
+            "POST",
+            path,
+            {
+                "onedataUser": {"mappingScheme": "onedataUser", "onedataUserId": user},
+                "storageUser": {"storageCredentials": {"type": "posix", "uid": str(uid)}, "displayUid": uid},
+            },
+        )
         if status not in (200, 201, 204):
             status, body = panel.req("GET", f"{path}/{user}")
             if not (status == 200 and f'"uid":"{uid}"' in body.replace(" ", "")):

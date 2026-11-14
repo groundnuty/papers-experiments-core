@@ -4,6 +4,7 @@ Usage: tokenbody.py PROVIDER_NAME ADMIN_USER_ID TTL_SECONDS USAGE_LIMIT
 A short-lived registerOneprovider invite token: valid TTL_SECONDS, usable USAGE_LIMIT times
 ("infinity" for no limit). Run as python3.11 -I.
 """
+
 import json
 import re
 import sys
