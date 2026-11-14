@@ -2,6 +2,8 @@
 file's holdings are read at every provider that can hold the space's bytes, and the reset given the reading lists the
 space no second time (O33, O46)."""
 
+import dataclasses
+
 import pytest
 from qos_world import FILES, calls, federation, provisioner_with, two_providers
 
@@ -81,6 +83,18 @@ def test_o33_a_requirement_the_planners_scan_found_is_removed_and_the_second_sca
     assert record["stages"]["qos"]["removed"] == 1
     assert fake.qos == {}
     assert len(listings(fake)) == before + 2  # the second scan's page on each provider
+
+
+def test_o51_a_planners_reading_of_another_space_is_refused_by_the_spaces_id_before_any_stage(listing, fake, ticker):
+    """O51: a reading is bound to the space it listed by the space's Onezone id, never by a position a configuration
+    gives, so a scan of another space, which another configuration may put at the same position, stands for no scan
+    of this one: it is refused before anything is sent."""
+    holdings = SpaceReset(listing, now=ticker.clock).plan_scan()
+    elsewhere = dataclasses.replace(holdings, scan=dataclasses.replace(holdings.scan, space="sp-another-0009"))
+    calls_before = len(fake.provider_calls)
+    with pytest.raises(ValueError, match="of its own space"):
+        SpaceReset(listing, now=ticker.clock).run(planned=elsewhere)
+    assert len(fake.provider_calls) == calls_before
 
 
 def test_o09_a_planners_reading_of_another_space_or_providers_is_refused_before_any_stage(listing, fake, ticker):

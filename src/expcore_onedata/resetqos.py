@@ -153,19 +153,24 @@ class Found:
     each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, the
     depth of the deepest regular file of the space it saw (0 when it saw none), and the ids of the regular files
     (`REG`) each provider's listing showed, the files the occupancy stage reads the block maps of there (O46); the last
-    two cost no read of their own. A scan also names the space (its position) and the providers it read, so a reset
-    given it can refuse one of another space or of other providers, and the listing gives each regular file's path
-    relative to the root (`paths`, empty for `summaries`), which a planner names its eviction plan by
-    (`resetplan.py`)."""
+    two cost no read of their own. A scan also names the space and the providers it read by their Onezone ids, never a
+    position a configuration gives, so a reset given it refuses one of another space or of other providers, and the
+    listing gives each regular file's path relative to the root (`paths`, empty for `summaries`), which a planner names
+    its eviction plan by (`resetplan.py`)."""
 
     where: dict[str, str]
     files: dict[str, dict[str, int]]
     reads: dict[str, int] = field(default_factory=dict)
     deepest: int = 0
     regular: dict[str, frozenset[str]] = field(default_factory=dict)
-    space: str = ""
-    providers: tuple[str, ...] = ()
+    space: str = ""  # the space's Onezone id
+    providers: tuple[str, ...] = ()  # the Onezone ids of the providers read, in order
     paths: dict[str, str] = field(default_factory=dict)
+
+
+def _ids(p: Provisioner, providers: Sequence[str]) -> tuple[str, ...]:
+    """The Onezone ids of the providers a scan read, which bind it to them whatever a configuration calls them."""
+    return tuple(p.provider_id(provider) for provider in providers)
 
 
 def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:
@@ -227,7 +232,7 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
                 files.setdefault(qid, {})[file_id] = depth
         read += len(entries)
     found = {q: files.get(q, {}) for q in where}
-    return Found(where, found, {"summaries": read}, deepest, regular, p.space.position, tuple(providers))
+    return Found(where, found, {"summaries": read}, deepest, regular, p.space_id, _ids(p, providers))
 
 
 @dataclass(frozen=True)
@@ -352,7 +357,7 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
     deepest = max((len(e.path.split("/")) for e in entries.values() if not e.directory), default=0)
     regular = {provider: frozenset(e.file_id for e in found.values() if e.regular) for provider, found, _ in listings}
     paths = {e.file_id: e.path for e in entries.values() if e.regular}
-    return Found(where, files, reads, deepest, regular, p.space.position, tuple(providers), paths)
+    return Found(where, files, reads, deepest, regular, p.space_id, _ids(p, providers), paths)
 
 
 def scan(p: Provisioner, providers: Sequence[str]) -> Found:
