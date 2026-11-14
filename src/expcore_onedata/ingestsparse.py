@@ -49,8 +49,10 @@ answers the old id absent. The completed file is then replicated to each provide
 provider's block map.
 
 **The baseline's marks** (`ingesthealth.py`): the start marks the baseline open before it changes anything, a failure
-after that marks it unhealthy, and a restore that verifies every file marks it whole. A start is refused unless the last
-mark is whole, so a crash at any point leaves the federation unhealthy until a recovery ends with the complete file.
+after that marks it unhealthy, and a restore that verifies every file marks it whole. A start is held back
+(`BaselineNotWhole`, which the instrument raises as `ingest_held`) unless the last mark is whole, so a crash at any
+point, or an attempt that ends without its reset, leaves the federation unhealthy until a recovery ends with the
+complete file.
 """
 
 import json

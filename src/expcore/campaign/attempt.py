@@ -18,7 +18,9 @@ The order is fixed, and each step is decided by what a kill at that point must l
    after its lease: if one is closed now the admission is let go and the run stays pending, uncharged;
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
-   under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26);
+   under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26). From the
+   row to the store's record of the result the attempt is **live** (`liveness.running`): a hold a platform takes in it
+   names the attempt, and reads as ended the moment the store has the result;
 6. the post-run health check, an instrument's refusal and the served-identity check, which can turn the result into
    infrastructure (C11, C31, C16);
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
@@ -45,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign import liveness
 from expcore.campaign.attempts import classify, unverified
 from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
@@ -114,6 +117,8 @@ class Parts:
     reserved_capped: Callable[[str], bool | None] = lambda run_key: None
     # with a budget: whether the store has taken the model off the reply maximum now (C27); None: no budget, no maximum
     reply_cap_unheld: Callable[[str], bool | None] = lambda model: None
+    # the key the store is registered under for the attempts' liveness (`liveness.register`); None: not registered
+    campaign: str | None = None
 
 
 class AttemptRunner:
@@ -301,60 +306,63 @@ class AttemptRunner:
         # checks more, never less.
         decided = p.reserved_capped(key)
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
-        guard = None
-        if p.ledger is not None:
-            guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=True if decided is None else decided)
-        defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
-        request = RunRequest(
-            RunIdentity(key, factors, begun.number),
-            run_dir,
-            endpoint,
-            backend,
-            timer,
-            p.monotonic,
-            kinds,
-            lease,
-            treatment_targets=targets,
-            models=p.models,
-            defect_log=defects,
-            reserved_capped=decided,  # the row's value, so the record and the store say one thing (C27)
-            reply_cap_unheld=lambda: p.reply_cap_unheld(model),
-        )
-
-        async def go() -> Any:
-            try:  # every request of the attempt, in any task or thread it starts, goes through its guard
-                with contextlib.nullcontext() if guard is None else spend.watching(guard):
-                    return await p.executor(request)
-            finally:
-                await backend.aclose()
-
-        started = p.monotonic()
-        record = None
-        try:
-            record = asyncio.run(go())
-            result = result_from_record(record, ended_utc=p.stamp())
-        except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
-            result = failure_result(
-                error,
-                ended_utc=p.stamp(),
-                wall_s=p.monotonic() - started,
-                treatment_kinds=kinds,
+        live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
+        with live:  # the attempt is live from its row to its result: the executor and the post-run check inside it
+            guard = None
+            if p.ledger is not None:
+                capped = True if decided is None else decided
+                guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=capped)
+            defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
+            request = RunRequest(
+                RunIdentity(key, factors, begun.number),
+                run_dir,
+                endpoint,
+                backend,
+                timer,
+                p.monotonic,
+                kinds,
+                lease,
                 treatment_targets=targets,
-                sent_nothing=sent_no_request(error, backend),
+                models=p.models,
+                defect_log=defects,
+                reserved_capped=decided,  # the row's value, so the record and the store say one thing (C27)
+                reply_cap_unheld=lambda: p.reply_cap_unheld(model),
             )
-            if result.outcome.defect is not None:  # the attempt keeps the class and the stack hash; the log the rest
-                defects(error, result.outcome.defect)
-        result, moved = self._judge(result, record, model, key)
-        mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
 
-        def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
-            self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
-            if mix is not None:
-                p.store.record_deployments(begun.id, mix)
+            async def go() -> Any:
+                try:  # every request of the attempt, in any task or thread it starts, goes through its guard
+                    with contextlib.nullcontext() if guard is None else spend.watching(guard):
+                        return await p.executor(request)
+                finally:
+                    await backend.aclose()
 
-        status = self._finish(begun, run_dir, key, result, bookkeeping)
-        defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
-        return p.settings.retry_delay_s if status == "pending" else 0.0
+            started = p.monotonic()
+            record = None
+            try:
+                record = asyncio.run(go())
+                result = result_from_record(record, ended_utc=p.stamp())
+            except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
+                result = failure_result(
+                    error,
+                    ended_utc=p.stamp(),
+                    wall_s=p.monotonic() - started,
+                    treatment_kinds=kinds,
+                    treatment_targets=targets,
+                    sent_nothing=sent_no_request(error, backend),
+                )
+                if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
+                    defects(error, result.outcome.defect)
+            result, moved = self._judge(result, record, model, key)
+            mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
+
+            def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
+                self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
+                if mix is not None:
+                    p.store.record_deployments(begun.id, mix)
+
+            status = self._finish(begun, run_dir, key, result, bookkeeping)
+            defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
+            return p.settings.retry_delay_s if status == "pending" else 0.0
 
     def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:
         """Apply the post-run health check (C11) and the served-identity check (C16) to a result."""
