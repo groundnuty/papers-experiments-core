@@ -27,7 +27,7 @@ its raw p-value at alpha, and every table or report that shows its conclusion sh
 preregistration with `exploratory_only = true` has no family, so every contrast is exploratory, Holm decides nothing,
 and the result says that no confirmatory claim is made (S12).
 
-A preregistration may declare several named Holm families in place of the one flat family (S16, `[holm_families]`).
+A preregistration may declare several named Holm families in place of the one flat family (S17, `[holm_families]`).
 Each is adjusted on its own at alpha, so a member's level, adjusted p-value and decision are its own family's; its
 minimum detectable effect is judged at alpha over its own family's size; and an equivalence claim is adjusted with the
 other equivalence claims of its own Holm family only. One flat `holm_family` is one family, whose result is the one it
@@ -175,7 +175,7 @@ class HolmDecision:
 
 @dataclasses.dataclass(frozen=True)
 class HolmStep:
-    """One step of a family's step-down (S16): the `step`-th smallest p-value of a family of m, compared with alpha /
+    """One step of a family's step-down (S17): the `step`-th smallest p-value of a family of m, compared with alpha /
     (m - step + 1), with its adjusted p-value and the verdict."""
 
     step: int  # 1 for the smallest p-value; an untestable member counts as p = 1, ties keep the declared order
@@ -188,7 +188,7 @@ class HolmStep:
 
 @dataclasses.dataclass(frozen=True)
 class HolmFamily:
-    """One named Holm family of the preregistration (S16), adjusted on its own at alpha."""
+    """One named Holm family of the preregistration (S17), adjusted on its own at alpha."""
 
     name: str
     members: tuple[str, ...]  # in declared order
@@ -203,7 +203,7 @@ class AnalysisResult:
     `exploratory_only` is the preregistration's statement that it makes no confirmatory claim (S12): there is no Holm
     decision, and every contrast is exploratory.
 
-    With several named families (S16), `holm` holds every member's decision as its own family made it, the families
+    With several named families (S17), `holm` holds every member's decision as its own family made it, the families
     in declared order, and `holm_families` each family's members and steps; with one flat `holm_family` there is no
     named family and `holm_families` is empty.
     """
@@ -215,7 +215,7 @@ class AnalysisResult:
     exploratory_only: bool = False
     equivalence_holm: tuple[HolmDecision, ...] = ()  # Holm over the equivalence family's TOST p-values (S15)
     descriptives: tuple[DescriptiveResult, ...] = ()  # the one-arm estimates, in declared order (S14)
-    holm_families: tuple[HolmFamily, ...] = ()  # the named families, in declared order (S16)
+    holm_families: tuple[HolmFamily, ...] = ()  # the named families, in declared order (S17)
 
     def contrast(self, name: str) -> ContrastResult:
         """Return the result of the contrast with this name."""
@@ -283,7 +283,7 @@ def _minimum_detectable_effect(
     Rejection in the simulation is decided by the p-value function and the parameters the contrast's estimator
     analyses with (a preregistered Wilcoxon `method`, for one), so the effect found is one the analysis itself can
     reject (S06, S09). The level is alpha divided by the size of its own Holm family for a member (of the one flat
-    family, or of the named family it is in, S16) and alpha for any other contrast.
+    family, or of the named family it is in, S17) and alpha for any other contrast.
 
     That level is conservative for a member. Holm's step-down levels are alpha / m, alpha / (m - 1), ..., alpha, and
     alpha / m is the first and hardest of them, so this figure overstates the effect needed for every member except
@@ -480,7 +480,7 @@ def _holm_decisions(names: Sequence[str], p_values: Sequence[float | None], alph
 
 
 def equivalence_groups(prereg: Preregistration) -> tuple[tuple[str | None, tuple[str, ...]], ...]:
-    """The equivalence family split by Holm family (S15, S16): for each Holm family that holds any, its members of
+    """The equivalence family split by Holm family (S15, S17): for each Holm family that holds any, its members of
     the equivalence family, in the equivalence family's declared order. Each group is adjusted on its own, so an
     equivalence claim is adjusted with the other claims of its own Holm family only; with one flat family there is
     one group, the whole equivalence family."""
@@ -495,7 +495,7 @@ def equivalence_groups(prereg: Preregistration) -> tuple[tuple[str | None, tuple
 def _equivalence_family(
     results: tuple[ContrastResult, ...], pairings: Mapping[str, Pairing], prereg: Preregistration
 ) -> tuple[tuple[ContrastResult, ...], tuple[HolmDecision, ...]]:
-    """Holm over the equivalence family's TOST p-values (S15), within each Holm family (S16): each member is
+    """Holm over the equivalence family's TOST p-values (S15), within each Holm family (S17): each member is
     equivalent only when Holm rejects its two one-sided nulls, and carries the interval at 1 - 2 x the level Holm
     compared it with. An untestable member's NaN counts as p = 1, so its group keeps its size and it is never
     equivalent (S02). The decisions are returned in the equivalence family's declared order."""
@@ -538,7 +538,7 @@ def _family_results(
     equivalence: Sequence[HolmDecision],
 ) -> tuple[HolmFamily, ...]:
     """Each named family with its members, its steps and its members' equivalence decisions, in the equivalence
-    family's order (S16); none for the one flat family, whose output is the one it was before families were named."""
+    family's order (S17); none for the one flat family, whose output is the one it was before families were named."""
     if not prereg.holm_families:
         return ()
     return tuple(
@@ -554,7 +554,7 @@ def _family_results(
 
 def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[AbsentRun] = ()) -> AnalysisResult:
     """Run every declared contrast, then Holm over each declared family at the preregistered alpha (one flat family,
-    or each named family on its own, S16), and Holm over the equivalence family's TOST p-values when one is declared,
+    or each named family on its own, S17), and Holm over the equivalence family's TOST p-values when one is declared,
     within each Holm family (S15).
 
     `absent` are the planned runs with no analysed attempt (exhausted, unfinished, left out), from the export.
@@ -606,7 +606,7 @@ class PowerResult:
 
 def power_study(prereg: Preregistration, simulate: bool = True) -> PowerResult:
     """The power table of the preregistration's [power] settings, at alpha and at alpha divided by the family size;
-    at alpha only when the preregistration has no family (S12). With several named families (S16) the size is the
+    at alpha only when the preregistration has no family (S12). With several named families (S17) the size is the
     largest family's, the hardest first step any family has, so the figure is conservative for the others.
 
     It reads nothing but the preregistration and runs scipy's test directly (see power), so it checks the design
@@ -649,7 +649,7 @@ def equivalence_feasibility(prereg: Preregistration, rows: Iterable[Row] | None 
     [power] section's target clusters, simulations and seed (with a digest of the contrast's name). The SD is each of
     the [power] sd_grid's, declared; or, given pilot rows, the contrast's own between-cluster SD of its paired
     differences, estimated. The level is alpha divided by the number of equivalence claims in the member's own Holm
-    family (the whole equivalence family under one flat family, S16), Holm's first and hardest step there, so the
+    family (the whole equivalence family under one flat family, S17), Holm's first and hardest step there, so the
     figure is conservative for every member but the one with the smallest p-value. A claim is `reachable` when its
     chance at 0 meets the target power; a preregistration should state an equivalence hypothesis only if it is, and
     say so if it is not. Only members are simulated: a contrast whose margin no family names is judged by the 1 - 2

@@ -1,5 +1,5 @@
 # Provenance: new
-"""The parts of the report that several named Holm families add (S16, #76): each family's steps, and the check that
+"""The parts of the report that several named Holm families add (S17, #76): each family's steps, and the check that
 the families and the Holm decisions are one computation.
 
 A preregistration with one flat `holm_family` has no named family, and its report is the text it was before families
@@ -59,7 +59,7 @@ def _unique(decisions: Sequence[HolmDecision], what: str) -> dict[str, HolmDecis
 
 def _check_equivalence(result: AnalysisResult, family_of: dict[str, str]) -> None:
     """Each family's equivalence decisions are exactly its own members' claims as `equivalence_holm` decided them:
-    none of another family's member, none with other numbers, and none of its claims left out (S15, S16)."""
+    none of another family's member, none with other numbers, and none of its claims left out (S15, S17)."""
     claims = _unique(result.equivalence_holm, "equivalence decisions")
     held: dict[str, str] = {}
     for family in result.holm_families:

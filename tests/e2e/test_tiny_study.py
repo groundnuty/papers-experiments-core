@@ -443,10 +443,10 @@ def test_s12_an_exploratory_only_preregistration_runs_through_analyze_and_report
 NAMED_FAMILIES = '[holm_families]\nextended = ["extended-vs-baseline"]\nrelay = ["relay-vs-baseline"]'
 
 
-def test_s16_named_holm_families_run_through_analyze_and_report_each_adjusted_on_its_own(
+def test_s17_named_holm_families_run_through_analyze_and_report_each_adjusted_on_its_own(
     resumed, tmp_path, clean_environment, capsys
 ):
-    """S16: through the command line: the two confirmatory contrasts declared as two families of one, check, analyze
+    """S17: through the command line: the two confirmatory contrasts declared as two families of one, check, analyze
     and report succeed; analysis.json gives each family its one step at alpha / 1, where the flat family of two
     adjusted them together, and the report and the terminal show each family apart, the exploratory contrast outside
     every family."""
@@ -594,8 +594,8 @@ def test_c29_the_report_of_an_unsharded_campaign_is_the_bytes_it_was_before_shar
     assert "Shards" not in clean_pair.first.report
 
 
-def test_s16_the_analysis_json_of_one_holm_family_is_the_bytes_it_was_before_named_families(clean_pair):
-    """S16: a preregistration with one flat `holm_family` gets the analysis.json the core wrote before several named
+def test_s17_the_analysis_json_of_one_holm_family_is_the_bytes_it_was_before_named_families(clean_pair):
+    """S17: a preregistration with one flat `holm_family` gets the analysis.json the core wrote before several named
     families existed: `tests/data/tiny_study_analysis.json` was made by the code of that time. Only the core version
     and the example's tree hash are masked, as the report's pin masks them; every other byte is pinned, so a key
     the families added to a single family's output (a null family name, a steps table) fails here."""

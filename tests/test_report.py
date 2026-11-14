@@ -984,7 +984,7 @@ def test_s14_the_terminal_summary_gives_each_one_arm_estimate_as_descriptive():
     assert summary_lines(result)[-1] == "waited-in-a (descriptive, rate of waited in cond-a): 0.25 [0.1, 0.4]"
 
 
-# --- several named Holm families (S16) --------------------------------------------------------------------------------
+# --- several named Holm families (S17) --------------------------------------------------------------------------------
 
 # The steps of case B of tests/stats/test_holm_families.py, worked by hand at alpha = 0.05: phase1 rejects 0.008 at
 # 0.05/3 and stops at 0.030 against 0.05/2; phase2 rejects 0.020 at 0.05/2 and 0.045 at 0.05/1.
@@ -1044,8 +1044,8 @@ def equivalence_members():
     )
 
 
-def test_s16_each_named_family_has_a_table_of_its_own_members_with_their_holm_p_within_it():
-    """S16: the report groups the confirmatory contrasts by family, each table holding its family's members only."""
+def test_s17_each_named_family_has_a_table_of_its_own_members_with_their_holm_p_within_it():
+    """S17: the report groups the confirmatory contrasts by family, each table holding its family's members only."""
     report = render(families_analysis())
     assert "## Preregistered contrasts (2 Holm families, each adjusted on its own at alpha = 0.05)" in report
     phase1 = table_of(report, "### Holm family phase1 (3 contrasts)")
@@ -1057,8 +1057,8 @@ def test_s16_each_named_family_has_a_table_of_its_own_members_with_their_holm_p_
     assert "Holm family of" not in report
 
 
-def test_s16_each_family_shows_its_holm_steps_with_the_level_of_each_step_and_its_verdict():
-    """S16: alpha/3, alpha/2, alpha/1 for the family of three and alpha/2, alpha/1 for the family of two, each step's
+def test_s17_each_family_shows_its_holm_steps_with_the_level_of_each_step_and_its_verdict():
+    """S17: alpha/3, alpha/2, alpha/1 for the family of three and alpha/2, alpha/1 for the family of two, each step's
     raw and adjusted p-value, and where the step-down stopped."""
     report = render(families_analysis())
     phase1 = table_of(report, "Holm steps of phase1")
@@ -1072,15 +1072,15 @@ def test_s16_each_family_shows_its_holm_steps_with_the_level_of_each_step_and_it
     assert "Each Holm family is adjusted on its own" in report
 
 
-def test_s16_the_exploratory_contrasts_are_outside_every_family():
-    """S16: the contrast in no family is apart, labelled exploratory, under a heading that names every family."""
+def test_s17_the_exploratory_contrasts_are_outside_every_family():
+    """S17: the contrast in no family is apart, labelled exploratory, under a heading that names every family."""
     report = render(families_analysis())
     assert set(table_of(report, "## Exploratory contrasts (outside every Holm family)")) - {"Contrast"} == {"side"}
     assert row(report, "side")[8:10] == ["exploratory", "difference (exploratory)"]
 
 
-def test_s16_the_terminal_summary_names_each_members_family():
-    """S16: a member's adjusted p is its own family's, and the line says which family that is."""
+def test_s17_the_terminal_summary_names_each_members_family():
+    """S17: a member's adjusted p is its own family's, and the line says which family that is."""
     lines = {line.split(":")[0]: line for line in summary_lines(families_analysis())}
     assert lines["h1b"] == "h1b: estimate 0.25, p 0.0300, Holm p 0.0600 (family phase1), not_detected"
     assert lines["side"].endswith("Holm p exploratory, difference (exploratory)")
@@ -1094,8 +1094,8 @@ def test_s16_the_terminal_summary_names_each_members_family():
     ],
     ids=["missing", "twice"],
 )
-def test_s16_a_result_whose_families_disagree_with_its_holm_decisions_is_refused(steps):
-    """S16: a member must be in exactly one family, with that family's step as its Holm decision; anything else
+def test_s17_a_result_whose_families_disagree_with_its_holm_decisions_is_refused(steps):
+    """S17: a member must be in exactly one family, with that family's step as its Holm decision; anything else
     would show a member adjusted in the wrong family, so the report refuses it, and so does the summary."""
     bad = dataclasses.replace(families_analysis(), holm_families=named_families(steps))
     with pytest.raises(ValueError, match="Holm famil"):
@@ -1104,8 +1104,8 @@ def test_s16_a_result_whose_families_disagree_with_its_holm_decisions_is_refused
         summary_lines(bad)
 
 
-def test_s16_a_step_whose_numbers_are_not_its_members_holm_decision_is_refused():
-    """S16: the steps and the flat decisions are one computation; a step that disagrees with its member's decision
+def test_s17_a_step_whose_numbers_are_not_its_members_holm_decision_is_refused():
+    """S17: the steps and the flat decisions are one computation; a step that disagrees with its member's decision
     (the level of another family, say) is refused."""
     moved = dataclasses.replace(FAMILY_STEPS["phase2"][0], level=0.05 / 5)
     steps = {"phase1": FAMILY_STEPS["phase1"], "phase2": (moved, FAMILY_STEPS["phase2"][1])}
@@ -1114,8 +1114,8 @@ def test_s16_a_step_whose_numbers_are_not_its_members_holm_decision_is_refused()
         render(bad)
 
 
-def test_s16_a_member_with_two_holm_decisions_is_refused():
-    """S16: a second, contradicting decision for a member would give a reader of analysis.json two verdicts, one
+def test_s17_a_member_with_two_holm_decisions_is_refused():
+    """S17: a second, contradicting decision for a member would give a reader of analysis.json two verdicts, one
     of which no family made; the report refuses it."""
     good = families_analysis()
     other = HolmDecision("h1a", 0.008, 0.9, 0.05 / 3, False)
@@ -1132,8 +1132,8 @@ def test_s16_a_member_with_two_holm_decisions_is_refused():
     ],
     ids=["another-familys-claim", "another-verdict", "missing"],
 )
-def test_s16_a_familys_equivalence_decisions_must_be_its_own_members_claims_as_decided(change):
-    """S16, S15: each family holds the equivalence decisions of its own members, exactly as `equivalence_holm` gives
+def test_s17_a_familys_equivalence_decisions_must_be_its_own_members_claims_as_decided(change):
+    """S17, S15: each family holds the equivalence decisions of its own members, exactly as `equivalence_holm` gives
     them; a claim filed under another family, with another verdict, or under none is refused."""
     good = families_analysis(equivalence=equivalence_members())
     current = {f.name: f.equivalence for f in good.holm_families}
@@ -1143,8 +1143,8 @@ def test_s16_a_familys_equivalence_decisions_must_be_its_own_members_claims_as_d
         render(dataclasses.replace(good, holm_families=families))
 
 
-def test_s16_the_equivalence_table_names_each_members_holm_family():
-    """S16, S15: each equivalence claim is adjusted within its own Holm family, and its row says which."""
+def test_s17_the_equivalence_table_names_each_members_holm_family():
+    """S17, S15: each equivalence claim is adjusted within its own Holm family, and its row says which."""
     report = render(families_analysis(equivalence=equivalence_members()))
     table = table_of(report, "### Equivalence family (Holm over two one-sided tests, within each Holm family)")
     assert table["Contrast"][:2] == ["Contrast", "Holm family"]
@@ -1153,8 +1153,8 @@ def test_s16_the_equivalence_table_names_each_members_holm_family():
     assert "other claims of its own Holm family only" in report
 
 
-def test_s16_a_single_family_report_has_no_family_steps_or_family_column():
-    """S16: one flat family's report is the text it was before named families: no steps, no family column."""
+def test_s17_a_single_family_report_has_no_family_steps_or_family_column():
+    """S17: one flat family's report is the text it was before named families: no steps, no family column."""
     report = render(equivalence_analysis())
     assert "Holm steps of" not in report
     assert "Holm family |" not in report

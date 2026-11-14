@@ -16,7 +16,7 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     equivalence_family = ["a-vs-b"]  # optional (S15): members of holm_family with a margin, whose equivalence
                                # claims are decided by Holm over their two one-sided tests' p-values
 
-    [holm_families]            # in place of holm_family (S16): several named families, each adjusted on its own
+    [holm_families]            # in place of holm_family (S17): several named families, each adjusted on its own
     phase1 = ["a-vs-b"]        # at alpha; a contrast is in one family at most, and a family may hold one
     phase2 = ["gate-effect"]
 
@@ -150,7 +150,7 @@ class Preregistration:
     `exploratory_only` is the preregistration's statement that it makes no confirmatory claim: it has no Holm family,
     and every contrast is exploratory (S12). Exactly one of the two holds: a family, or that statement.
 
-    `holm_families` holds several named families (S16), each adjusted on its own; `holm_family` is then every
+    `holm_families` holds several named families (S17), each adjusted on its own; `holm_family` is then every
     family's members, the families in declared order, so it is always the set of confirmatory contrasts. Built with
     `holm_family` empty, it is filled in from the families; given, it must be exactly that.
 
@@ -170,13 +170,13 @@ class Preregistration:
     exploratory_only: bool = False  # no confirmatory claim: no Holm family, every contrast exploratory (S12)
     equivalence_family: tuple[str, ...] = ()  # contrasts whose equivalence claims Holm adjusts together (S15)
     descriptives: Mapping[str, DescriptiveSpec] = dataclasses.field(default_factory=dict)  # one-arm estimates (S14)
-    holm_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)  # named families (S16)
+    holm_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)  # named families (S17)
 
     def __post_init__(self) -> None:
         """Deep-freeze the contrasts, the families, the estimator parameters and the one-arm estimates into fresh
         read-only containers; refuse a family beside `exploratory_only`, and neither of them (S12); named families
         that are not each a non-empty list of declared contrasts, each contrast in one family at most, whose union
-        is `holm_family` (S16); and an equivalence family that is not of members of the Holm family with a margin
+        is `holm_family` (S17); and an equivalence family that is not of members of the Holm family with a margin
         (S15)."""
         _check_family_shapes(self.holm_families)  # before freezing, which leaves a set or a string as it is
         names = ("contrasts", "holm_family", "estimator_params", "equivalence_family", "descriptives", "holm_families")
@@ -194,7 +194,7 @@ class Preregistration:
 
     def _union_of_families(self) -> tuple[str, ...]:
         """Every named family's members, the families in declared order; refuse a blank name, an empty family, an
-        undeclared contrast, a contrast in two families, and a `holm_family` given as anything else (S16)."""
+        undeclared contrast, a contrast in two families, and a `holm_family` given as anything else (S17)."""
         owner: dict[str, str] = {}
         for family, members in self.holm_families.items():
             if not isinstance(family, str) or not family.strip():
@@ -216,7 +216,7 @@ class Preregistration:
         return union
 
     def families(self) -> tuple[tuple[str | None, tuple[str, ...]], ...]:
-        """Each Holm family with its members, in declared order: the named families (S16), or the one family of
+        """Each Holm family with its members, in declared order: the named families (S17), or the one family of
         `holm_family`, whose name is None; none under `exploratory_only`."""
         if self.holm_families:
             return tuple(self.holm_families.items())
@@ -276,7 +276,7 @@ class Preregistration:
 
 
 def _check_family_shapes(families: object) -> None:
-    """Refuse named Holm families that are not a mapping of names to lists or tuples of contrast names (S16). A set
+    """Refuse named Holm families that are not a mapping of names to lists or tuples of contrast names (S17). A set
     would stay the caller's to change after freezing, and a string would be read as its letters."""
     if not isinstance(families, Mapping):
         raise ValueError(f"Holm families must be a mapping of family names to contrast names, got {type(families)}")
@@ -355,7 +355,7 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
 def _named_families(
     root: Section, contrasts: Mapping[str, ContrastSpec], exploratory_only: bool
 ) -> dict[str, tuple[str, ...]]:
-    """Read the optional [holm_families] table (S16): each key a family's name, each value a non-empty list of
+    """Read the optional [holm_families] table (S17): each key a family's name, each value a non-empty list of
     declared contrasts, each named once in all the families. It is refused beside holm_family and beside
     exploratory_only; absent, the result is empty and holm_family declares the one family."""
     key = "holm_families"
@@ -411,7 +411,7 @@ def _equivalence_family(
 ) -> tuple[str, ...]:
     """Read the optional equivalence_family (S15): declared contrasts, each once, each in a Holm family, with an
     equivalence margin and an estimator that registers a TOST p-value; none beside exploratory_only. `named` says
-    the families are the named ones of [holm_families] (S16), which the message then names."""
+    the families are the named ones of [holm_families] (S17), which the message then names."""
     key = "equivalence_family"
     if key not in root.data:
         return ()
@@ -823,7 +823,7 @@ def _check_family_claims(
     named: bool = False,
 ) -> None:
     """Refuse a family beside `exploratory_only`, and a setting only a member of the family uses on a contrast that is
-    not one (S10, S12), naming [holm_families] when the families are named (S16)."""
+    not one (S10, S12), naming [holm_families] when the families are named (S17)."""
     if exploratory_only and "holm_family" in root.data:
         raise root.fail(
             "holm_family",

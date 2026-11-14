@@ -56,7 +56,7 @@ def contrast_notes(alpha: float, family: bool = True) -> list[str]:
     ]
 
 
-FAMILY_NOTES = [  # beside the named Holm families' tables (S16)
+FAMILY_NOTES = [  # beside the named Holm families' tables (S17)
     "Each Holm family is adjusted on its own, at alpha. Its members' p-values are taken from the smallest up, and the",
     "k-th of a family of m is compared with alpha / (m - k + 1), its step's Level; the first that misses its level",
     "stops the family, so it and every later member are not rejected, whatever their raw p-values. Holm p is the",
@@ -68,7 +68,7 @@ FAMILY_NOTES = [  # beside the named Holm families' tables (S16)
 
 def equivalence_family_notes(alpha: float, by_family: bool = False) -> list[str]:
     """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces.
-    `by_family` adds what several named Holm families change (S16): each claim is adjusted within its own."""
+    `by_family` adds what several named Holm families change (S17): each claim is adjusted within its own."""
     one = [
         "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two"
     ]

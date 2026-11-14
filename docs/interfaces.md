@@ -1091,7 +1091,7 @@ class DescriptiveResult:  # AnalysisResult.descriptives, in declared order
 
 ### Several Holm families
 
-`expcore.stats.prereg` and `expcore.stats.analysis` (S16, #76). A preregistration whose confirmatory hypotheses form distinct families, such as one per outcome or one per phase, declares them by name in place of `holm_family`:
+`expcore.stats.prereg` and `expcore.stats.analysis` (S17, #76). A preregistration whose confirmatory hypotheses form distinct families, such as one per outcome or one per phase, declares them by name in place of `holm_family`:
 
 ```toml
 [holm_families]                # each key a family's name, each value its contrasts; a family of one is a stand-alone test

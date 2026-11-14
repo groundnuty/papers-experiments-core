@@ -10,7 +10,7 @@ are the same text: no clock, no path and no random number enters it.
   Holm decisions is refused, so no table or summary line can show an exploratory contrast as confirmatory. A
   preregistration with `exploratory_only = true` has no family: its report has no family table, shows every contrast
   in the exploratory one, and says in its summary and on the terminal that it makes no confirmatory claim (S12).
-- With several named Holm families (S16) each family has a table of its own, followed by its steps (each step's
+- With several named Holm families (S17) each family has a table of its own, followed by its steps (each step's
   level as alpha over the hypotheses left, its raw and adjusted p-value and its verdict), the exploratory heading
   says "outside every Holm family", the equivalence table names each claim's Holm family, and the terminal line of a
   member names its family. A result whose families and Holm decisions disagree is refused
@@ -292,7 +292,7 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     exploratory = [r for r in result.contrasts if _exploratory(r, adjusted)]
     with_mde = any(r.minimum_detectable_effect is not None for r in result.contrasts)
     alpha = result.alpha
-    if result.holm_families:  # several named families (S16): a table and the steps for each
+    if result.holm_families:  # several named families (S17): a table and the steps for each
         lines = _named_families(result, adjusted, level, with_mde)
     else:
         lines = [f"## Preregistered contrasts (Holm family of {len(family)}, alpha = {alpha:g})", ""]
@@ -331,7 +331,7 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
 def _named_families(
     result: AnalysisResult, adjusted: Mapping[str, float], level: float | None, with_mde: bool
 ) -> list[str]:
-    """Each named Holm family's contrasts in a table of their own, then its steps (S16), after the check that every
+    """Each named Holm family's contrasts in a table of their own, then its steps (S17), after the check that every
     member's decision is its own family's."""
     check_families(result)
     by_name = {r.name: r for r in result.contrasts}
@@ -404,7 +404,7 @@ def _equivalence_family(result: AnalysisResult) -> list[str]:
     members = [r for r in result.contrasts if r.in_equivalence_family]
     if not members:
         return []
-    family_of = check_families(result)  # several named families (S16): each claim is adjusted within its own
+    family_of = check_families(result)  # several named families (S17): each claim is adjusted within its own
     rows = []
     for r in members:
         low, high = r.equivalence_interval_adjusted or (math.nan, math.nan)
@@ -619,7 +619,7 @@ def summary_lines(result: AnalysisResult) -> list[str]:
     printed without the basis it rests on, and `untestable` is never printed for a contrast that used a pair, or
     any other word for one that used none."""
     _check_no_claim(result)
-    family_of = check_families(result)  # empty for one flat family, whose lines are as they were (S16)
+    family_of = check_families(result)  # empty for one flat family, whose lines are as they were (S17)
     adjusted = {d.name: d.p_holm for d in result.holm}
     lines = [f"No confirmatory claim: {NO_CLAIM}."] if result.exploratory_only else []
     for r in result.contrasts:

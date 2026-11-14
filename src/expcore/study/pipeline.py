@@ -661,7 +661,7 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
 
 def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
     """The Holm decisions `analysis.json` holds: `holm`, every member's decision as its own family made it, and,
-    only for several named families (S16), `holm_families`, each family's name, members, steps and equivalence
+    only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
     decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named."""
     entries: dict[str, Any] = {"holm": result.holm}
     if result.holm_families:
@@ -672,7 +672,7 @@ def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
-    Holm decision, with each named family's steps (S16). `exploratory_only` is true when the preregistration makes no
+    Holm decision, with each named family's steps (S17). `exploratory_only` is true when the preregistration makes no
     confirmatory claim (S12): there is then no Holm decision, and every contrast is exploratory."""
     return {
         "preregistration": dict(analysis.result.manifest),
