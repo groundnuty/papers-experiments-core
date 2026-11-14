@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from expcore_onedata.client import API_ZONE, OnezoneClient, PlatformError
+from expcore_onedata.consistency import converge
 from expcore_onedata.provision import Provisioner, resolve_provider_ids
 from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.testing import ROOT_ID
@@ -148,6 +149,40 @@ def test_o47_the_policy_the_3xx_tests_use_does_retry_a_read_that_timed_out(confi
     client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(timed_out)))
     assert refusal(lambda: client.get("/spaces/s", retry=policy))[1] is True
     assert (len(asked), policy.retries) == (3, 2)
+
+
+class Stalled(httpx.SyncByteStream):
+    """A body that never comes: reading it raises the read timeout of a stalled connection, and says it was read."""
+
+    def __init__(self):
+        self.read = False
+
+    def __iter__(self):
+        self.read = True
+        raise httpx.ReadTimeout("the body stalled")
+
+
+@every_status
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_o47_a_3xx_answer_is_refused_before_its_body_is_read_so_a_stalled_body_is_no_timeout(config, status, method):
+    """O47: the answer's body is read in the open, and one that stalls raises a read timeout, which a GET under a
+    policy of three attempts retries and which loses the status. A 3xx is refused whole, as soon as its head is in, and
+    its body, which may be large or never come, is not read: one attempt, the 3xx's status, no retry counted."""
+    stream = Stalled()
+    asked = []
+
+    def moved(request):
+        asked.append(request)
+        return httpx.Response(status, headers={"Location": f"https://{ELSEWHERE}/moved"}, stream=stream)
+
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(moved), follow_redirects=True))
+    policy = ReadRetry(sleep=lambda seconds: None)
+    if method == "GET":
+        outcome = refusal(lambda: client.get("/spaces/s", retry=policy))
+    else:
+        outcome = refusal(lambda: client._request("PUT", "/spaces/s", provider=None, headers={}, content=b"written"))
+    assert outcome[:2] == (status, False)
+    assert (len(asked), policy.retries, stream.read) == (1, 0, False)
 
 
 # -- a write, a mutation and an upload ------------------------------------------------------------------------------
@@ -305,3 +340,23 @@ def test_o47_an_answer_that_is_no_3xx_is_not_refused_as_one(config, fake, status
     client = moving.client(config)
     assert client.get("/spaces/s") == {}
     assert moving.moved == 1
+
+
+@every_status
+def test_o47_a_poll_over_a_3xx_answer_ends_unconverged_and_never_as_a_match(config, fake, ticker, status):
+    """O47: a poll counts every failed read as a poll that did not match, so it reads a 3xx again within its own bound;
+    what it never does is match one: a read that used to return `{}` for a bodyless 3xx matched any test of an empty
+    answer, and a wait for it passed."""
+    moving = moved_with(fake, status, "bare", anything)
+    client = moving.client(config)
+    result = converge(
+        lambda: client.get("/spaces/s"),
+        lambda value: True,
+        timeout_s=3,
+        poll_s=1,
+        clock=ticker.clock,
+        sleep=ticker.sleep,
+    )
+    assert result.converged is False
+    assert {check["probe_ok"] for check in result.checks} == {False}
+    assert moving.moved == len(result.checks)

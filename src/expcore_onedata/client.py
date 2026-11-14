@@ -82,8 +82,11 @@ follows no redirect, whatever the HTTP client it was given does: httpx follows o
 client gets, and it is never a result: a bodyless one would decode to `{}`, an empty success, a false pass for a write
 as much as for a read. Every 3xx, on every path (`_request` through `_checked`, `_stream_range` and `content_answer`
 through `_streamed`), is a `PlatformError` that names the status and whether a `Location` came, never its value
-(`_refuse_redirect`). It is raised after the answer is released, as an answer, not a transport failure, so it is
-retried by no policy: the GET retry takes only a timeout, which raises, and a probe retries only `transport`.
+(`_refuse_redirect`). It is raised after the answer is released, as an answer, not a transport failure, so no retry
+policy of the client repeats it: the GET retry takes only a timeout, which raises, and a probe retries only `transport`.
+The layer's own polls and bounded waits (`consistency.converge`, the visibility and absence waits, the reset's) count a
+failed read of any status as a poll that did not match, as a 403 or a 500 is, so they poll a 3xx again until their own
+bound, and end as not converged: never as a pass.
 
 What none of this reaches is an HTTP client the caller injected whose hooks, authentication flow or transport keep a
 reference of their own to an answer or a request, and a cycle inside httpx or httpcore that no answer the client holds
@@ -484,7 +487,8 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
     its body read in the open. A redirect is never followed, whatever the client was built to do: httpx follows one
     inside `send`, and a redirect that failed halfway leaves its answers in their cycles out of reach, and a request of
     the layer goes where its configuration says and nowhere else, with the credential header it carries (O09). A 3xx
-    answer is returned like any other, released, and refused by `_checked` (`_refuse_redirect`)."""
+    answer is returned like any other, released and refused by `_checked` (`_refuse_redirect`), and its body is never
+    read: one that stalls would raise a timeout, which a GET under a retry policy would try again, losing the status."""
     request = http.build_request(method, url, **options)
     sent = int(request.headers.get("Content-Length") or 0)
     try:
@@ -493,7 +497,8 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
         budget.spent(sent + _release_stranded(error, request))
         raise
     try:
-        response.read()
+        if not _is_redirect(response.status_code):  # a 3xx is refused unread (`_refuse_redirect`), whatever it holds
+            response.read()
     finally:
         try:
             _release(response)
@@ -594,6 +599,11 @@ def _answered(label: str, method: str, status: int, code: str | None, errno: str
     return f"{label}: {method} answered {status}" + (f" ({shown})" if shown else "")
 
 
+def _is_redirect(status: int) -> bool:
+    """Tell whether a status is a 3xx, 300 to 399. The client follows none, and takes none for a result."""
+    return 300 <= status < 400
+
+
 def _refuse_redirect(response: httpx.Response, method: str, label: str) -> None:
     """Raise the PlatformError of a 3xx answer, whatever its status, and return for any other.
 
@@ -601,9 +611,10 @@ def _refuse_redirect(response: httpx.Response, method: str, label: str) -> None:
     success, a false pass for a write as much as for a read. None is taken for a result, a 304 included, since the
     client sends no validator that would earn one. The error names the status, and says whether the answer names a
     `Location`, never what it names or what its body holds, which may carry a host or a credential. It is an answer, not
-    a transport failure, so a caller that retries on a timeout, or on `transport`, does not retry it."""
+    a transport failure, so a caller that retries on a timeout, or on `transport`, does not retry it. A poll that counts
+    every failed read as one that did not match still polls it again, within its bound, as it does any error."""
     status = response.status_code
-    if 300 <= status < 400:
+    if _is_redirect(status):
         named = " (it names a Location)" if "location" in response.headers else ""
         raise PlatformError(
             f"{label}: {method} answered {status}, which is neither followed nor taken for a result{named}",
