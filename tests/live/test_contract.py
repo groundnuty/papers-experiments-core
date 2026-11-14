@@ -605,8 +605,8 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
 
 
 # -- the reset's QoS listing and the occupancy's lag (issue #209, O33) -----------------------------------------------
-# `[placement] qos_scan = "listing"` rests on two facts the source states and no live run has shown: the first two
-# tests check them, and "summaries" stays the default until both pass. The third measures how long the space root's
+# `[placement] qos_scan = "listing"`, the default, rests on two facts the source states: the first two tests check
+# them (the 14 Nov 2026 slot showed the first, and the second by hand). The third measures how long the space root's
 # physical size lags a placement, which the reset's quiet wait assumes from the source. Each prints its figures for
 # the dated facts file and leaves nothing behind: its requirement is removed and the scratch files are torn down.
 

@@ -9,12 +9,12 @@ Sources are op-worker `f118ed9` (paths below are its own) and ctool `8ae7baf` (`
 (`src/modules/qos/qos_traverse.erl:298-305,332-338`), so the transfer listing cannot show one either. `[placement]
 qos_scan` chooses how the reset finds them:
 
-- `summaries` (the default): on every provider, the space is walked, each directory listed once, and the summary of
+- `summaries`: on every provider, the space is walked, each directory listed once, and the summary of
   the root and of every leaf is read; a leaf's summary holds the requirements on it and on every ancestor
   (`file_middleware_get_handler.erl:493-500`), so together they hold every requirement. One read per leaf per
   provider: about 52,000 reads for a large tree (#209).
-- `listing`: on **every provider that supports the space**, one recursive listing of the space root, `GET
-  /data/{root}/files` with `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`,
+- `listing` (the default): on **every provider that supports the space**, one recursive listing of the space root,
+  `GET /data/{root}/files` with `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`,
   `include_directories=true` and `limit`, its pages followed by `token` until `nextPageToken` is null
   (`basic_file_operations_rest_routes.erl:59-70`; the parameters, query or JSON body,
   `file_middleware_get_handler.erl:124-138`, `rest_handler.erl:313-325`; the answer, `files`, `inaccessiblePaths` and
@@ -32,12 +32,17 @@ qos_scan` chooses how the reset finds them:
   read on each provider that marks it. For N supporting providers the scan makes, besides each provider's read of the
   space root, N x ceil(E / `LISTING_PAGE`) page reads for E entries, one summary per entry per provider that marks it
   (a handful), and one record per requirement; the record gives `listings`, `listing_pages`, `summaries` and `records`.
-  **A fact it rests on is not verified live:** that the listing takes `include_directories` (the code does,
-  `file_middleware_get_handler.erl:131,404`; the REST description omits it). The gated live tests in
-  `tests/live/test_contract.py` (O33) check it, and also that a requirement added through one provider is found
-  through another once dbsync settles (each provider's QoS view is built from the synced requirement documents,
-  `src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`), which the reset itself no longer
-  needs to find a requirement; until the first has passed on the federation, `summaries` stays the default.
+  **The live facts** (the combined live slot of 14 Nov 2026, the 25.0 development build, op-worker `f118ed9`,
+  `deploy/compose-federation/day0/2026-11-14-federation-facts-slot.md`): **the recursive listing took
+  `include_directories`** (the code does, `file_middleware_get_handler.erl:131,404`; the REST description omits it):
+  1,210 entries in 2 pages of 1,000. **A requirement added through the mirror was found by the data provider's
+  recursive listing** (`effQosInheritancePath` marking the entry) after 3.89 s, two polls, measured by hand: the gated
+  test's own POST went through the mirror before the mirror knew the file and was refused (`OutOfScope`), a defect of
+  the test. Each provider's QoS view is built from the synced requirement documents
+  (`src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`). **Still not measured
+  separately:** that the provider a requirement is added through shows it in its own listing at once, the premise for
+  listing every provider. The quiet stage catches a replication's effect regardless, apart from the documented
+  residual (below). Both facts have their gated live test in `tests/live/test_contract.py` (O33).
 
 **The run's own** are removed by `resetremove.py`: each waited on until it is fulfilled or impossible on every
 provider, deleted, and its deletion waited on until every provider has processed it. The regular files at or under a
