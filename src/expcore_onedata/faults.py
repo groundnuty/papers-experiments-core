@@ -658,7 +658,9 @@ class FaultInjector:
         if self._pending is None:
             return True
         with self._restoring() as (admission, own, refused):
-            if refused is not None:  # the federation could not be taken for the restore: nothing was restored
+            if refused is not None:
+                # the federation could not be taken for the restore, so nothing was restored and nothing is journalled
+                # (settle never ran): the injection stays open and pending, which fails closed
                 self._step("cleared", False, how="federation_unavailable")
                 return False
             return self._settle_pending(admission, own)
@@ -720,7 +722,7 @@ class FaultInjector:
         provider it restored went down in a run this injector knows nothing of, so its sessions are unknown whatever the
         current run's sandbox says: the exclusive admission it restores under owes the full drain from the start of the
         recovery (`SessionDrain.owe`), decided against the injections the recovery has just read and before it settles
-        one (`fault_drain`)."""
+        one (`fault_drain`), including one a live injector holds, which makes the drain longer than needed and no worse."""
         self._require_sanction()
         with self._restoring() as (admission, _, refused):
             if refused is not None:
@@ -741,6 +743,11 @@ class FaultInjector:
           sandbox of the run is under it), which waits for the federation inside `[faults] admission_timeout_s`; one it
           cannot get is `refused`, an InfraError of kind `injector_failure`, and nothing is restored;
         - with `session_drain_s` 0, nothing: there is no drain to keep.
+
+        Declared limits. A restore that holds no admission waits for the federation (and for a drain still standing)
+        inside `admission_timeout_s`, which `cancel_wait_s` does not count: inside `running` the run's or the injector's
+        own admission is always held, so only a later retry of `clear` or `finish` takes that branch. The holder record
+        of an admission taken for a restore names this injector's own target, not the one recovered.
         """
         if self._settings.session_drain_s <= 0:
             yield None, False, None

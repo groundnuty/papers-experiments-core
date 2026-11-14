@@ -22,9 +22,10 @@ admission, shared or exclusive, checks that record once it holds the lock (`Fede
 `try_acquire` refuses). So the drain is kept by the federation itself and not by the process that began it: an
 interrupt, a restore that holds no admission (it takes the federation for the restore) and a recovery in another
 process cannot reopen it. An injector that holds the federation by an admission of its own also waits the drain out in
-`clear`, so its snapshot records the wait (`SessionDrain.wait`). When the record cannot be written, the release waits in process, the lock held, instead of going
-(`close_out`). An admission nothing armed (every shared admission, an exclusive control, an outage run whose provider
-never went down) writes nothing and is let go at once.
+`clear`, so its snapshot records the wait (`SessionDrain.wait`). When the record cannot be written, the release waits
+in process, the lock held, instead of going (`close_out`); and when that wait is interrupted the lock is kept for the
+life of the process. An admission nothing armed (every shared admission, an exclusive control, an outage run whose
+provider never went down) writes nothing and is let go at once.
 
 **Where the times come from.** The sandbox (`DockerSandbox.session_ends`) records the moment its gate's stop was
 confirmed and the moment its mount's sidecar was shown gone, and the sandbox platform (`SandboxPlatform.launch`) reports
