@@ -560,7 +560,27 @@ def test_c35_a_schema_whose_conditions_were_swapped_after_it_was_built_is_refuse
         schema.conditions["mount-read"],
     )
     assert schema.condition_of(key) == before  # the stale lookup still answers, which is the hazard
-    with pytest.raises(ConfigError, match=r"the schema: no longer matches the lookup of its conditions"):
+    with pytest.raises(ConfigError, match=r"the schema: no longer matches .*\(its lookup of a condition by its levels"):
+        schema.rebuilt()
+
+
+@pytest.mark.parametrize(
+    ("deleted", "label"),
+    [
+        ("treatment_kinds", "its treatment kinds"),
+        ("treatment_targets", "its treatment targets"),
+        ("condition_tasks", "its condition tasks"),
+        ("exclusive", "its exclusive conditions"),
+    ],
+)
+def test_c35_a_schema_with_a_condition_deleted_from_one_of_its_parts_is_refused_not_given_the_default(deleted, label):
+    """C35: a rebuild gives a condition missing from a part the default the constructor gives, which would equal the
+    digest, while the schema's own accessors would raise KeyError for that condition's run keys at run time; the
+    schema is refused naming the part that differs."""
+    schema = chain_schema()
+    assert schema.digest  # taken before the edit
+    del getattr(schema, deleted)["download-write"]
+    with pytest.raises(ConfigError, match=rf"the schema: no longer matches .*\({label} differs\)"):
         schema.rebuilt()
 
 

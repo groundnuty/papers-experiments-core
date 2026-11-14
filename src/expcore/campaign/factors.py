@@ -97,6 +97,18 @@ EXCLUSIVE_KEY = "exclusive"
 # A factor name becomes part of a SQL column name in the store, so it is held to a plain identifier.
 _NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _SEPARATOR = "|"
+# What a schema holds, and how each is told in a refusal; `rebuilt` compares every one with what the constructor makes.
+_STATE = (
+    ("file", "its file"),
+    ("declared", "its factors"),
+    ("order", "its identity order"),
+    ("conditions", "its conditions"),
+    ("treatment_targets", "its treatment targets"),
+    ("treatment_kinds", "its treatment kinds"),
+    ("condition_tasks", "its condition tasks"),
+    ("exclusive", "its exclusive conditions"),
+    ("_by_levels", "its lookup of a condition by its levels"),
+)
 
 
 class PlanError(ValueError):
@@ -186,23 +198,28 @@ class FactorSchema:
         schema it hands over holds against the vocabulary in scope now, including that a kind that is a fault on one
         target still names it (C34). A failure of a rule is the constructor's own, naming the file and the key.
 
-        What the constructor derives from the parts (the lookup of a run's levels to its condition, the digest) is
-        compared with the result too: a schema whose conditions were swapped or edited after it was built would
-        otherwise resolve a run key to another condition's treatment, or fingerprint as what it no longer is. Such a
-        schema is refused, so the schema returned is always equal to this one.
+        Every attribute is then compared with the one the constructor made, and so is the digest: a schema whose
+        conditions were swapped, or a part of it deleted, after it was built would otherwise resolve a run key to
+        another condition's treatment, lack a part its accessors read, or fingerprint as what it no longer is. Such
+        a schema is refused, naming the first attribute that differs, so the schema returned equals this one.
         """
+        treatment: dict[str, list[Any]] = {}
+        for name, kinds in self.treatment_kinds.items():
+            targets = self.treatment_targets.get(name, {})  # a part deleted since is found by the comparison below
+            treatment[name] = [{"kind": kind, "target": targets[kind]} if kind in targets else kind for kind in kinds]
         again = FactorSchema(
             self.declared,
             self.order,
             self.conditions,
-            treatment={name: self._treatment_json(name) for name in self.treatment_kinds},
+            treatment=treatment,
             tasks={name: listed for name, listed in self.condition_tasks.items() if listed is not None},
             exclusive=self.exclusive,
             file=self.file,
         )
         where = Section({}, self.file, "the schema")
-        if again._by_levels != self._by_levels:
-            raise where.fail(None, "no longer matches the lookup of its conditions: it was edited after it was built")
+        for attribute, label in _STATE:
+            if getattr(again, attribute) != getattr(self, attribute):
+                raise where.fail(None, f"no longer matches what its constructor makes of its parts ({label} differs)")
         if again.digest != self.digest:
             raise where.fail(None, "no longer matches its digest: it was edited after the digest was taken")
         return again

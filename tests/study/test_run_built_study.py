@@ -204,7 +204,7 @@ def test_c35_a_schema_whose_conditions_were_swapped_is_refused_before_anything_i
     loaded = load_study(make_copy(tmp_path, "swapped"))
     conditions = loaded.schema.conditions
     conditions["baseline"], conditions["relay-down"] = conditions["relay-down"], conditions["baseline"]
-    with pytest.raises(ConfigError, match=r"the schema: no longer matches the lookup of its conditions"):
+    with pytest.raises(ConfigError, match=r"the schema: no longer matches .*\(its lookup of a condition"):
         run_built_study(loaded)
     assert not (loaded.root / "out").exists()
 
