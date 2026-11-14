@@ -29,7 +29,7 @@ space without directory statistics does).
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
 `distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and an
 eviction alike** (the module docstring of `expcore_onedata.resetqos` traces the placement's lag in op-worker f118ed9,
-and the 14 Nov live slot measured an eviction's as long, O45): bytes that land or leave show in it
+and the 14 Nov live slot measured an eviction's as long, O46): bytes that land or leave show in it
 `blocks_flush_delay_s + dir_stats_flush_s x (L - 1)` seconds later, 10 + 5 x (L - 1) by default, L being the parts of
 the file's path below the directory asked (the levels from the file's parent up to it). Each change shows on its own,
 so bytes that land and leave within the lag show for a while, where the build's flush may merge the two; the fake is

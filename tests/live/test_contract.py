@@ -688,7 +688,7 @@ def test_the_space_roots_occupancy_follows_a_placement_within_the_sources_bound(
 
 @MUTATE
 def test_the_space_roots_occupancy_follows_an_eviction_within_the_resets_wait(scratch):
-    """O45: a scratch file one directory below the root is replicated to the receiver and, once the root's physical
+    """O46: a scratch file one directory below the root is replicated to the receiver and, once the root's physical
     size there shows it, evicted from there; the size is then read every quarter second until it has dropped back. The
     drop must come within the occupancy stage's wait for that depth counted from the eviction's verified end
     (`resetqos.occupancy_wait_s(2)`), the reading the reset takes; the seconds from the scheduling and from the end are

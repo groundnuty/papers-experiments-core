@@ -229,7 +229,7 @@ def evict_ids(
     """Evict files, given by id, from a provider, at most `concurrency` requests at once, and return a record once
     every file's block map there shows nothing held. Never from the data provider; no id means nothing to do.
     `scheduled`, when given, is called with the ids of each attempt's transfers: the reset tells its own jobs from
-    others' by them (O45)."""
+    others' by them (O46)."""
     provisioner.check_eviction(from_provider)
     ids = list(dict.fromkeys(file_ids))
     if not ids:
@@ -273,7 +273,7 @@ def evict_tree(
     already) must be a directory. An attempt that left bytes schedules the directory's eviction again. `listed`, when
     given, is called with the ids of the files the listing found, before the transfer: the reset's quiet check holds
     those files' block maps on this provider to the empty map the eviction verified (O33), so it never lists the tree a
-    second time. `scheduled`, when given, is called with each attempt's transfer id (O45), as `evict_ids` does."""
+    second time. `scheduled`, when given, is called with each attempt's transfer id (O46), as `evict_ids` does."""
     provisioner.check_eviction(from_provider)
     began = provisioner.clock()
     provisioner.verify_space()

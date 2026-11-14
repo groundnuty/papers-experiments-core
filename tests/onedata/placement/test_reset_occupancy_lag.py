@@ -1,6 +1,6 @@
 """The reset's occupancy stage reads the space root's physical size only once every eviction's and every ended
 transfer's change can show in it: from the eviction stage's end, the occupancy's longest lag for the deepest file of the
-space and the margin (O45). The 14 Nov live slot saw a mirror's size drop 20.03 s after an eviction at depth 3, where
+space and the margin (O46). The 14 Nov live slot saw a mirror's size drop 20.03 s after an eviction at depth 3, where
 the reset had taken an eviction to show at once; read sooner, the occupancy stage's figure still holds the evicted
 bytes, and the quiet stage, which holds the occupancy to it, can certify quiet over a growth no larger than them."""
 
@@ -126,10 +126,10 @@ def root_reads(fake, ticker) -> list[float]:
     return seen
 
 
-def test_o45_a_growth_before_t_is_not_hidden_by_an_evictions_drop_that_had_not_shown(
+def test_o46_a_growth_before_t_is_not_hidden_by_an_evictions_drop_that_had_not_shown(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O45: the false certification. The plan evicts `study` from beta, which may keep as much as it held, and a
+    """O46: the false certification. The plan evicts `study` from beta, which may keep as much as it held, and a
     replication of another file lands on beta after the occupancy stage, before T. Read right after the eviction, the
     occupancy stage's figure still held the evicted bytes; the quiet stage's read showed the drop and the landing
     together, no more than that figure, and certified quiet. Read once the eviction can show, the figure is 0, and the
@@ -141,10 +141,10 @@ def test_o45_a_growth_before_t_is_not_hidden_by_an_evictions_drop_that_had_not_s
     assert caught.value.record["stages"]["occupancy"]["physical_bytes"]["providers[1]"] == 0
 
 
-def test_o45_an_earlier_runs_eviction_that_had_not_shown_hides_no_growth_with_an_empty_plan(
+def test_o46_an_earlier_runs_eviction_that_had_not_shown_hides_no_growth_with_an_empty_plan(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O45: the eviction need not be the reset's. An agent evicted `study` from beta just before the reset began, and
+    """O46: the eviction need not be the reset's. An agent evicted `study` from beta just before the reset began, and
     the plan evicts nothing; the occupancy stage still waits from the eviction stage's end, so its figure shows the
     agent's drop, and a landing before T is growth over it."""
     arm(client)
@@ -157,10 +157,10 @@ def test_o45_an_earlier_runs_eviction_that_had_not_shown_hides_no_growth_with_an
     assert caught.value.record["stages"]["occupancy"]["physical_bytes"]["providers[1]"] == 0
 
 
-def test_o45_an_earlier_runs_replication_that_had_not_shown_fails_the_occupancy_stage(
+def test_o46_an_earlier_runs_replication_that_had_not_shown_fails_the_occupancy_stage(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O45: the other direction, with the quiet check skipped. An earlier run's replication into beta ended just before
+    """O46: the other direction, with the quiet check skipped. An earlier run's replication into beta ended just before
     the reset began, on a file four directories down; read at once, the occupancy showed beta holding nothing and the
     reset passed. Read once it can show, beta holds bytes beyond what the reset allows."""
     for path in FILES:
@@ -173,8 +173,8 @@ def test_o45_an_earlier_runs_replication_that_had_not_shown_fails_the_occupancy_
         SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
 
 
-def test_o45_with_nothing_allowed_a_reset_that_evicts_a_mirror_passes_its_occupancy_stage(scanned, fake, ticker):
-    """O45: read right after the eviction, the occupancy showed beta still holding what it had just evicted, and a
+def test_o46_with_nothing_allowed_a_reset_that_evicts_a_mirror_passes_its_occupancy_stage(scanned, fake, ticker):
+    """O46: read right after the eviction, the occupancy showed beta still holding what it had just evicted, and a
     reset that allows beta nothing failed there; read once the eviction can show, beta holds nothing, and the stage
     records the wait."""
     occupancy = SpaceReset(scanned, now=ticker.clock).run({"beta": ["study"]}, qos_rights=False)["stages"]["occupancy"]
@@ -183,10 +183,10 @@ def test_o45_with_nothing_allowed_a_reset_that_evicts_a_mirror_passes_its_occupa
 
 
 @pytest.mark.parametrize(("extra", "depth"), [(None, 2), ("deep/er/still/data.bin", 4)])
-def test_o45_the_occupancy_is_read_no_earlier_than_the_last_evictions_finish_and_the_wait(
+def test_o46_the_occupancy_is_read_no_earlier_than_the_last_evictions_finish_and_the_wait(
     scanned, fake, ticker, extra, depth
 ):
-    """O45: the wait runs from the eviction stage's end, at or after every eviction's finish time, for the deepest
+    """O46: the wait runs from the eviction stage's end, at or after every eviction's finish time, for the deepest
     regular file of the space, which an earlier run's eviction could have reached: with a file four directories down,
     the wait is that depth's even though the plan's files are one directory down, and even with no QoS right."""
     if extra:
@@ -199,10 +199,10 @@ def test_o45_the_occupancy_is_read_no_earlier_than_the_last_evictions_finish_and
     assert record["stages"]["occupancy"]["depth"] == depth
 
 
-def test_o45_the_listings_are_read_after_the_wait_and_before_the_occupancy(
+def test_o46_the_listings_are_read_after_the_wait_and_before_the_occupancy(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O45, O01: a transfer can start during the wait, so the occupancy stage requires no transfer running after it,
+    """O46, O01: a transfer can start during the wait, so the occupancy stage requires no transfer running after it,
     and reads the occupancy only then."""
     events: list[tuple] = []
     listing, distribution = fake._list_transfers, fake._distribution
@@ -229,10 +229,10 @@ def test_o45_the_listings_are_read_after_the_wait_and_before_the_occupancy(
     assert ("listing",) in events[wait:first]
 
 
-def test_o45_an_eviction_that_ends_during_the_occupancy_wait_makes_the_stage_wait_again(
+def test_o46_an_eviction_that_ends_during_the_occupancy_wait_makes_the_stage_wait_again(
     client, config, platform_file, ticker, tmp_path, fake, monkeypatch
 ):
-    """O45: a job no stage sent can end during the wait, after the instant it counts from. Here an eviction of a file
+    """O46: a job no stage sent can end during the wait, after the instant it counts from. Here an eviction of a file
     beta may keep ends as the wait ends; read then, the figure still held its bytes, and a landing at T, no larger,
     passed the quiet stage. The ended listing's first page shows a job the stage had not seen, so the stage waits again
     from when none runs, reads a figure without the evicted bytes, and the landing fails the quiet stage."""
@@ -248,10 +248,10 @@ def test_o45_an_eviction_that_ends_during_the_occupancy_wait_makes_the_stage_wai
     assert occupancy["waited_s"] == 2 * resetqos.occupancy_wait_s(2)
 
 
-def test_o45_a_replication_that_ends_during_the_occupancy_wait_is_in_the_figure(
+def test_o46_a_replication_that_ends_during_the_occupancy_wait_is_in_the_figure(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O45: the same for a placement, with the quiet check skipped: a replication into beta ends as the wait ends;
+    """O46: the same for a placement, with the quiet check skipped: a replication into beta ends as the wait ends;
     read then, the occupancy showed beta holding nothing and the reset passed. The stage waits again, and beta holds
     bytes beyond what the reset allows."""
     for path in FILES:
@@ -263,10 +263,10 @@ def test_o45_a_replication_that_ends_during_the_occupancy_wait_is_in_the_figure(
         SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
 
 
-def test_o45_an_eviction_that_ends_during_the_quiet_stage_fails_it(
+def test_o46_an_eviction_that_ends_during_the_quiet_stage_fails_it(
     client, config, platform_file, ticker, tmp_path, fake, monkeypatch
 ):
-    """O45: after the occupancy stage's figure, an eviction that ends before the quiet stage's read can hide a growth
+    """O46: after the occupancy stage's figure, an eviction that ends before the quiet stage's read can hide a growth
     no larger than it there. Here one ends at T, beside a landing of the same size, and the read shows no more than the
     figure: the stage fails, since a transfer ran or ended in its window, and certifies nothing."""
     kept, late = fake.add_file("other/kept.bin", DATA), fake.add_file("other/late.bin", DATA)
@@ -285,10 +285,10 @@ def test_o45_an_eviction_that_ends_during_the_quiet_stage_fails_it(
     assert caught.value.record["stages"]["occupancy"]["physical_bytes"]["providers[1]"] == len(DATA)
 
 
-def test_o45_a_replication_listed_late_after_the_occupancy_wait_is_still_waited_for(
+def test_o46_a_replication_listed_late_after_the_occupancy_wait_is_still_waited_for(
     client, config, ticker, tmp_path, fake
 ):
-    """O45, O07: a transfer listing shows a job up to `transfer_settle_s` late. A replication into beta ends as the
+    """O46, O07: a transfer listing shows a job up to `transfer_settle_s` late. A replication into beta ends as the
     wait ends and is listed 25 s later; observed at once, the listings showed nothing new and the reading, beta holding
     nothing, passed with the quiet check skipped. With that check skipped the stage observes the listings
     `transfer_settle_s` after its reading, sees the job, waits again, and beta holds bytes beyond what it may."""
@@ -302,10 +302,10 @@ def test_o45_a_replication_listed_late_after_the_occupancy_wait_is_still_waited_
         SpaceReset(provisioner, now=ticker.clock).run(None, qos_rights=False)
 
 
-def test_o45_an_eviction_listed_late_during_the_quiet_stage_fails_it(
+def test_o46_an_eviction_listed_late_during_the_quiet_stage_fails_it(
     client, config, ticker, tmp_path, fake, monkeypatch
 ):
-    """O45, O07: an eviction of a file beta may keep ends at T, beside a landing of its size, and is listed 25 s later.
+    """O46, O07: an eviction of a file beta may keep ends at T, beside a landing of its size, and is listed 25 s later.
     The quiet stage's reading at T + 20 s shows the drop and the landing together, no more than the figure, and
     observed at once the listings showed nothing new; the stage observes them `transfer_settle_s` after its reading,
     sees the job, and fails."""
@@ -326,8 +326,8 @@ def test_o45_an_eviction_listed_late_during_the_quiet_stage_fails_it(
 
 
 @pytest.mark.parametrize("rights", [True, False])
-def test_o45_the_resets_own_evictions_listed_late_are_no_new_job(client, config, ticker, tmp_path, fake, rights):
-    """O45, O07: the reset's own eviction jobs can be listed late too, after the first pages read at the eviction
+def test_o46_the_resets_own_evictions_listed_late_are_no_new_job(client, config, ticker, tmp_path, fake, rights):
+    """O46, O07: the reset's own eviction jobs can be listed late too, after the first pages read at the eviction
     stage's end. They had ended by then, so a look that finds them later counts no new job: the reset passes in one
     wait, whether the quiet stage runs or not, where taking them for new would fail every reset that evicts."""
     platform = slow_listings(fake, ticker, tmp_path, late=lambda tid, job: job.kind == "eviction")
@@ -338,10 +338,10 @@ def test_o45_the_resets_own_evictions_listed_late_are_no_new_job(client, config,
     assert record["stages"]["quiet"]["ran"] is rights
 
 
-def test_o45_transfers_that_keep_ending_during_the_occupancy_wait_fail_the_stage_at_its_bound(
+def test_o46_transfers_that_keep_ending_during_the_occupancy_wait_fail_the_stage_at_its_bound(
     client, config, platform_file, ticker, tmp_path, fake
 ):
-    """O45: a job ending in every wait leaves no reading that shows them all; after `OCCUPANCY_ROUNDS` waits the stage
+    """O46: a job ending in every wait leaves no reading that shows them all; after `OCCUPANCY_ROUNDS` waits the stage
     fails, closed, rather than read a figure that may miss one."""
     late = fake.add_file("other/late.bin", DATA)
     jobs = iter(range(1, 100))
@@ -357,14 +357,14 @@ def test_o45_transfers_that_keep_ending_during_the_occupancy_wait_fail_the_stage
 
 
 @pytest.mark.parametrize(("depth", "wait"), [(1, 15.0), (2, 20.0), (3, 25.0), (4, 30.0)])
-def test_o45_the_occupancy_stages_wait_is_the_lag_for_the_depth_and_the_margin(depth, wait):
-    """O45: the wait from the eviction stage's end is the replication formula's lag, 10 + 5 x (L - 1) s, applied to an
+def test_o46_the_occupancy_stages_wait_is_the_lag_for_the_depth_and_the_margin(depth, wait):
+    """O46: the wait from the eviction stage's end is the replication formula's lag, 10 + 5 x (L - 1) s, applied to an
     eviction too, and the margin of 5 s."""
     assert resetqos.occupancy_wait_s(depth) == resetqos.occupancy_lag_s(depth) + resetqos.QUIET_MARGIN_S == wait
 
 
-def test_o45_the_live_slots_measures_fit_the_waits():
-    """O45: the 14 Nov live slot (op-worker f118ed9) saw a placement show in a mirror's root size 10.76 s after it at
+def test_o46_the_live_slots_measures_fit_the_waits():
+    """O46: the 14 Nov live slot (op-worker f118ed9) saw a placement show in a mirror's root size 10.76 s after it at
     depth 2 and 15.91 s at depth 3, within the lag; and an eviction at depth 3 show 20.03 s after it was scheduled, the
     job's own run included: past the lag alone counted from the scheduling, within the wait, and the wait counts from
     the eviction stage's end, later still."""

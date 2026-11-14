@@ -76,7 +76,7 @@ placement:
 - so the space root's physical size reflects a placement at most 10 + 5 x (L - 1) s later, L being the levels from the
   file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`).
 
-**An eviction lags as long (O45).** The source suggests an eviction's change skips the location's flush
+**An eviction lags as long (O46).** The source suggests an eviction's change skips the location's flush
 (`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level, and another study measured 0.05 s; the 14 Nov
 live slot (`deploy/compose-federation/day0/2026-11-14-federation-facts-slot.md`, item 4, op-worker f118ed9) saw a
 mirror's root size drop 20.03 s after an eviction at depth 3 was scheduled, the eviction job's own run included, where
@@ -137,7 +137,7 @@ def quiet_wait_s(depth: int) -> float:
 
 def occupancy_wait_s(depth: int) -> float:
     """The occupancy stage's wait from the eviction stage's end to its read, for files at most `depth` path parts below
-    the root: the same lag, which an eviction's change has too (O45), and `QUIET_MARGIN_S`."""
+    the root: the same lag, which an eviction's change has too (O46), and `QUIET_MARGIN_S`."""
     return occupancy_lag_s(depth) + QUIET_MARGIN_S
 
 
