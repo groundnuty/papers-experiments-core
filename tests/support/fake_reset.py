@@ -14,8 +14,11 @@ and with these changes to the calls it inherits:
   `id_of`, `held`, `exists` and `add_qos` take `space=` (the study space by default);
 - a job's record has the `spaceId` of its file's space, and a cancelled job reports `cancelled`, with no start or
   finish time (0) when it was cancelled while still waiting;
-- an eviction scheduled on a directory evicts every file under it when it ends, unless `evictions_noop_first` makes
-  it one that evicted nothing, as FakeData's file evictions are;
+- an eviction scheduled on a directory evicts every file under it that the provider holds when it ends, unless
+  `evictions_noop_first` makes it one that evicted nothing, as FakeData's file evictions are, or `qos_covered` names a
+  file under it, which keeps its blocks; its record counts every file under the directory in `filesProcessed` and
+  the files it removed in `filesEvicted`, so a file the provider did not hold, or one cancelled per file, is processed
+  and not evicted, with `filesFailed` 0, as op-worker counts them;
 - every provider call is answered under one lock, so a bulk operation's threads never interleave inside the fake.
 
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
@@ -24,14 +27,16 @@ while a reset runs), and `dir_stats_disabled` (a directory's distribution answer
 space without directory statistics does).
 
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
-`distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and not an
-eviction**, as the build's does (op-worker f118ed9, the module docstring of `expcore_onedata.resetqos` traces it): bytes
-that land show in it `blocks_flush_delay_s + dir_stats_flush_s x (L - 1)` seconds later, 10 + 5 x (L - 1) by default,
-L being the parts of the file's path below the directory asked (the levels from the file's parent up to it); bytes
-that leave show at once. A test sets the two attributes (both 0: no lag). Only changes made once the fake has been
-called are dated: what a test puts in place before the first provider call, its setup, is old, and shows at once. A
-change is dated on the fake's `clock` by the write to `blocks` (a replication's landing, a hook's assignment) and an
-eviction by the removal of its entry; a list of blocks edited in place is not seen.
+`distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and an
+eviction alike** (the module docstring of `expcore_onedata.resetqos` traces the placement's lag in op-worker f118ed9,
+and the 14 Nov live slot measured an eviction's as long, O46): bytes that land or leave show in it
+`blocks_flush_delay_s + dir_stats_flush_s x (L - 1)` seconds later, 10 + 5 x (L - 1) by default, L being the parts of
+the file's path below the directory asked (the levels from the file's parent up to it). Each change shows on its own,
+so bytes that land and leave within the lag show for a while, where the build's flush may merge the two; the fake is
+no faster than the build either way. A test sets the two attributes (both 0: no lag). Only changes made once the fake
+has been called are dated: what a test puts in place before the first provider call, its setup, is old, and shows at
+once. A change is dated on the fake's `clock` by the write to `blocks` (a replication's landing, a hook's assignment)
+and an eviction by the removal of its entry; a list of blocks edited in place is not seen.
 """
 
 from __future__ import annotations
@@ -52,22 +57,22 @@ def _held(blocks: list[list[int]] | None) -> int:
 
 class _Placements(dict):
     """The fake's table of blocks, `(file id, provider id)` to `[offset, length]` lists, which dates its changes once
-    `armed()` says so: each is kept as `(when, bytes held after it, whether it grew)`, so that `reported` can say how
-    many bytes a directory's physical size shows at a later time. A growth shows `lag` seconds after it, a shrink (an
-    eviction, `pop` and `del` included) at once. Before the first change of a key the entry is old: it shows as held."""
+    `armed()` says so: each is kept as `(when, bytes held after it)`, so that `reported` can say how many bytes a
+    directory's physical size shows at a later time. A change shows `lag` seconds after it, a growth and a shrink (an
+    eviction, `pop` and `del` included) alike. Before the first change of a key the entry is old: it shows as held."""
 
     def __init__(self, clock: Callable[[], float], armed: Callable[[], bool]) -> None:
         super().__init__()
         self._clock, self._armed = clock, armed
-        self._changes: dict[tuple[str, str], list[tuple[float, int, bool]]] = {}
+        self._changes: dict[tuple[str, str], list[tuple[float, int]]] = {}
 
     def _note(self, key: tuple[str, str], now_held: int) -> None:
         if not self._armed():
             return
         before = _held(self.get(key))
         if now_held != before:
-            changes = self._changes.setdefault(key, [(-math.inf, before, False)])
-            changes.append((self._clock(), now_held, now_held > before))
+            changes = self._changes.setdefault(key, [(-math.inf, before)])
+            changes.append((self._clock(), now_held))
 
     def __setitem__(self, key: tuple[str, str], value: list[list[int]]) -> None:
         self._note(key, _held(value))
@@ -83,17 +88,17 @@ class _Placements(dict):
         return super().pop(key, *default)
 
     def reported(self, key: tuple[str, str], lag: float) -> int:
-        """The bytes of `key` a directory shows now, a growth showing `lag` seconds after it was made."""
-        now, held = self._clock(), _held(self.get(key))
-        for when, after, grew in reversed(self._changes.get(key, [])):
-            if when + (lag if grew else 0.0) <= now:
-                return min(held, after)
-        return held
+        """The bytes of `key` a directory shows now, each change showing `lag` seconds after it was made."""
+        now = self._clock()
+        for when, after in reversed(self._changes.get(key, [])):
+            if when + lag <= now:
+                return after
+        return _held(self.get(key))  # never changed since the setup: old, shown as held
 
 
 class FakeReset(FakeData):
     """FakeData with several data spaces, QoS requirements, cancels, directory evictions, a lock, and a directory
-    size that lags a placement."""
+    size that lags a placement and an eviction."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -224,7 +229,7 @@ class FakeReset(FakeData):
             body["spaceId"] = self.space_of(transfer.file_id)
         if getattr(transfer, "cancelled", False):
             body["evictionStatus" if transfer.kind == "eviction" else "replicationStatus"] = "cancelled"
-            body.update(bytesReplicated=0, filesReplicated=0, filesEvicted=0)
+            body.update(bytesReplicated=0, filesReplicated=0, filesEvicted=0, filesProcessed=0)
         return httpx.Response(200, json=body)
 
     def _list_transfers(self, space: str, query: httpx.QueryParams, provider: str) -> httpx.Response:
@@ -255,14 +260,19 @@ class FakeReset(FakeData):
                 "replication", transfer.file_id, self.spawn_on_evict, scheduled=now, started=now
             )
         if transfer.kind == "eviction" and node is not None and node.kind == "DIR":
+            files = self._files_under(node.file_id)
+            transfer.processed = len(files)
             if self.evictions_noop_first > 0:  # completed, and nothing evicted
                 self.evictions_noop_first -= 1
                 transfer.noop = True
                 return
+            keys = [(f, transfer.provider_id) for f in files]
+            held = [key for key in keys if self.blocks.get(key) and key not in self.qos_covered]
+            transfer.evicted = len(held) if self.evictions_remove_blocks else len(files)  # a lying job claims them all
             if self.evictions_remove_blocks:
-                for file_id in self._files_under(node.file_id):
-                    self.blocks.pop((file_id, transfer.provider_id), None)
-                    self.pending.pop((file_id, transfer.provider_id), None)
+                for key in (k for k in keys if k not in self.qos_covered):
+                    self.blocks.pop(key, None)
+                    self.pending.pop(key, None)
             return
         super()._finish(transfer)
 

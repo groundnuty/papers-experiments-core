@@ -16,7 +16,9 @@ reports `completed` for an eviction that removed nothing), and the verdict on a 
 layer's per-run reset (#118: many files evicted in one call and verified together on the block maps, one listing per
 operation) is to replace the directory eviction and the sweep below behind that signature, by calling the layer's
 eviction (the successor of `Provisioner.evict` and `require_empty`) instead of the providers' REST interfaces directly.
-QoS requirements and running transfers, which #118 also resets, are not touched here.
+QoS requirements and running transfers, which #118 also resets, are not touched here. The layout's `probe_space` is
+left alone: each link probe in it is held by the provider that wrote it, its owner or not, and the link check evicts
+the copies it fetched itself (#221).
 """
 
 import time
@@ -180,8 +182,9 @@ def evict_replicas(boot: Bootstrap, timeout_s: float) -> dict[str, Evicted]:
     and verify them gone; return what was done, by space. No file is removed and no owner's block is evicted."""
     replicas = Replicas(boot)
     spec = replicas.spec
+    spaces = [space for space in spec.spaces if space.name != spec.probe_space]  # its probes are each source's own
     found = {}
-    for space in spec.spaces:
+    for space in spaces:
         owner = spec.provider(space.owner)
         files = replicas.files(owner, space.name)
         before = replicas.sweep(files, owner, tuple(spec.provider(name) for name in space.mirrors))
@@ -191,4 +194,4 @@ def evict_replicas(boot: Bootstrap, timeout_s: float) -> dict[str, Evicted]:
                 "mirror may hold the only copy; nothing was evicted in any space"
             )
         found[space.name] = (files, before)
-    return {space.name: replicas.reset_space(space, *found[space.name], timeout_s=timeout_s) for space in spec.spaces}
+    return {space.name: replicas.reset_space(space, *found[space.name], timeout_s=timeout_s) for space in spaces}

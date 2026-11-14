@@ -30,7 +30,7 @@ The study directory holds four configuration files and the plugin, the Python fi
 | `scorers` | `Scorer`s: a pure function of a record, returning named numeric outcomes | `TinyScorer` |
 | `prompts`, `tools` | per condition, the SHA-256 of its prompt template and of its tool set; both go into the campaign fingerprint | from `PromptTemplate` and `tools_sha256` ([what it hashes](interfaces.md#several-providers-and-the-hash-of-a-tool-set)) |
 | tools | `ToolProvider`s the executor passes to `record_run`: plain functions through `FunctionProvider`, or an MCP server through `McpToolProvider` | `lookup` and `submit` |
-| instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read. An instrument can also refuse the attempt, with `at_first_turn` and `check` ([below](#an-instrument-that-refuses-an-attempt)) | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
+| instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read. The instruments start in list order and finish in the reverse of it: an instrument listed earlier finishes later ([the order](#the-order-instruments-start-and-finish-in)). An instrument can also refuse the attempt, with `at_first_turn` and `check` ([below](#an-instrument-that-refuses-an-attempt)) | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
 | `health`, `probe`, `lease_group`, `lease_keys` | the platform's health check, resource probe and leases; the Onedata layer supplies real ones | stubs that always succeed |
 | `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name; a factory imported from an installed package must declare the installed version of the distribution that owns its module's file, one defined in a file `[study] code` lists, which the code identity covers, may declare any, and one from anywhere else is refused. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
@@ -150,6 +150,36 @@ assert relay.accepted_fingerprints == ("fp-northern-deploy", "fp-southern-deploy
 assert study.models.resolve("alpha-stub").accepted_fingerprints == ()  # checked against a baseline, as before
 ```
 
+### Bounding one tool call
+
+A tool call's only bound in the loop is the agent's time left. A tool server that hangs mid-run therefore waits out the whole cap, and the run is scored as the agent's time cap. If your conditions differ in how many tools they call, such hangs fall on them unevenly and bias the comparison. `[agent] tool_call_bound_s` in `campaign.toml` declares a bound on one call, in seconds: positive and finite, and optional.
+
+- Each call runs under the shorter of the bound and the agent's time left. A call that outlasts the bound first ends as infrastructure of kind `knowledge` (the tool server did not answer, the message naming the tool and the bound): the attempt is set aside, like any other infrastructure ending, and the agent is not charged. A call that outlasts the time left first is the agent's time cap as before, unless the bound had already passed when the loop cut it: that call hung first, and is `knowledge` infrastructure too.
+- Pick the bound well above the slowest call that is not a hang, and below the time cap, or it never decides anything. A bound at or above the time cap leaves every call as it was, though it still changes the caps in the fingerprint.
+- It is a bound on wall time, and it reaches the provider as its `timeout_s`. `McpToolProvider` honours it; a function you wrote as a tool must bound itself with the `timeout_s` it is handed, or only the time left will cut it.
+- Each call's record has `elapsed_s`, the seconds it took, so you can count hangs and what they cost per condition. A condition that declares `knowledge` as its treatment kind scores such an attempt as a treatment outcome, since the failure is of that kind.
+- Declare it before the campaign starts. The bound is one of the campaign's caps, which are in its fingerprint, and `campaign.toml`'s hash is in it too, so a store that started without the key is not resumed with it: start a new store. A study that never declares it keeps its fingerprint, its configuration and its behaviour.
+
+```python
+import shutil
+from pathlib import Path
+
+from expcore.campaign.config import load_campaign
+
+assert study.campaign.agent.tool_call_bound_s is None  # the example declares none
+assert "tool_call_bound_s" not in study.campaign.caps()["agent"]  # so its caps are what they were
+
+bounded = Path("bounded-study")
+shutil.copytree("my-study", bounded)
+toml = bounded / "campaign.toml"
+toml.write_text(toml.read_text().replace("[agent]\n", "[agent]\ntool_call_bound_s = 300\n", 1))
+declared = load_campaign(toml)
+assert declared.agent.tool_call_bound_s == 300.0
+assert declared.caps()["agent"]["tool_call_bound_s"] == 300.0
+assert declared.caps() != study.campaign.caps()  # another fingerprint: a store without the bound is not resumed with it
+shutil.rmtree(bounded)
+```
+
 ### Prices and the budget
 
 A model's price is `[models.<key>.price]` in `models.toml`, in US dollars per million tokens: `input_per_mtok` and `output_per_mtok`, and optionally `cache_write_per_mtok` and `cache_read_per_mtok`, which are the input price when left out. A model the study hosts itself says `free = true` instead. With a budget, every planned model that is not free also declares its endpoint's context window, `context_tokens`, for the reason given below. `run` refuses to start or resume the campaign without it, naming `models.toml` and the model's key; checking, analysing, reporting and a package's check of a finished study do not need it.
@@ -233,6 +263,41 @@ alpha = study.models.resolve("alpha-stub")
 assert round(bound_usd(alpha, study.campaign.agent.limits), 6) == 0.056384  # (20,000 + 8,192) x 2, per million
 ```
 
+### An abandoned request
+
+When a run gives up a request in flight, the record cannot say what it cost. Its `route.abandoned_request` holds the bound the adapter took when it built that request: `prompt_bound_tokens`, `prompt_bound_by` (`bytes`, or `window` where the byte assumption cannot be used: the first request, a reply that left a count out, a conversation in which a reply reported more than its bound), and the `reply_max_tokens` it carried. A cost scorer that charges an abandoned run for that request prices it with `abandoned_request_bound`, in place of the window and the reply maximum, and reports which basis it used. The budget gate does not read it, and the reservation above is unchanged. Pass `reply_capped` from the record's own totals, which say whether the attempt was held to its reply maximum; a record with neither field was not.
+
+For the tiered model above, a run that had sent 100,000 tokens when its next request was given up has a bound of 100,500 tokens, and the prompt cannot reach the upper tier. The request is at most that prompt and a reply of 8,000 tokens at the lower tier's dearest rates, $0.0414, where the window's bound, which reaches the upper tier, is $0.145:
+
+```python
+from expcore.campaign.abandoned_bound import abandoned_request_bound, held_to_reply_maximum
+
+entry = {
+    "reason": "read_timeout",
+    "usage": "unknown",
+    "prompt_bound_tokens": 100_500,
+    "prompt_bound_by": "bytes",
+    "reply_max_tokens": 8000,
+    "window_tokens": 200_000,
+    "bound_checked": 3,
+    "bound_exceeded": 0,
+    "bound_unreported": 0,
+    "bound_overlapped": 0,
+}
+totals = {"reserved_capped": True, "reply_cap_unheld": False}  # as the record's totals say
+tight = abandoned_request_bound(model, limits, entry, reply_capped=held_to_reply_maximum(totals))
+assert (tight.request_bound_tokens, tight.prompt_by, tight.reply_by) == (108_500, "bytes", "reply_maximum")
+assert round(tight.request_bound_usd, 8) == 0.04140625  # 100,500 x 0.3125 + 8,000 x 1.25, per million
+assert (tight.tripwire_checked, tight.tripwire_fired_before) == (3, False)  # what the tight bound rests on
+loose = abandoned_request_bound(model, limits, {"reason": "read_timeout", "usage": "unknown"}, reply_capped=True)
+assert (loose.prompt_by, round(loose.request_bound_usd, 6)) == ("window", 0.145)  # an older record: `overshoot_usd`
+assert (loose.tripwire_checked, loose.tripwire_fired_before) == (None, None)  # not recorded, which is not a clean run
+```
+
+The basis says what its bound rests on: `tripwire_checked`, the requests of that model in that run that were bounded by bytes and tested against the reply that came back, and `tripwire_exceeded`, `tripwire_unreported` and `tripwire_overlapped`, the replies that reported a prompt above their bound, the replies that left a count out and the requests built while another was in flight, each kept as its own count. `tripwire_fired_before` is true when any of the three is above zero. Report them beside the cost: a tight bound with `tripwire_checked` of 3 and nothing fired rests on three tests, and one with 0 rests on none. The counts are None for a record that lacks them, never 0.
+
+The byte bound rests on three assumptions, derived in [`interfaces.md`](interfaces.md#the-request-given-up): a token stands for at least one byte of the text it was read from, a reply's reported prompt is the whole prompt it was billed, and the history only grows (checked by digest, with the window as the answer when it fails). Every completed request tests the first, and a conversation in which a reply reported more than its bound is bounded by the window from then on, so check `tripwire_exceeded` (the entry's `bound_exceeded`) before trusting an entry. A backend of your own that does not record the bound keeps the window's.
+
 ### The federation's certificate
 
 On the Onedata platform four clients talk to the federation: the platform layer's REST client, the data gate that carries the agent's REST data path, oneclient in the mount sidecar, and the MCP tool server. All four take their certificate check from one `[tls]` table of `platform.toml`, so no two can check differently. Without the table, every client verifies the federation's certificate against its own default CAs, which is right for a federation with a publicly trusted certificate. A federation whose certificate no default trusts, such as a self-signed one, takes one of two modes:
@@ -282,7 +347,38 @@ Which network the sidecar and the gate are on depends on how containers can reac
 - **Without `[sandbox.federation]`**, the sidecar and the gate start on Docker's default bridge. The sidecar dials the host of the local provider's URL in `[providers]`; the gate serves and dials the hosts and ports of the URLs of `[zone]` and the local provider. This is right for a federation at public addresses, which containers reach as the host does.
 - **With `[sandbox.federation]`**, the sidecar and the gate start on the federation's own Docker network instead, never on the default bridge as well, and dial the federation by its names on that network, the names its certificates hold, on port 443 (oneclient's default, and the port a Compose service listens on inside its network). A federation the host reaches at addresses a container cannot use needs this. One example is a Compose deployment that publishes its services on the host's loopback, since inside a container the loopback is the container itself. The gate also joins the sandbox's internal network, where the agent reaches it, and serves the agent the same names, so a client that follows the zone to the provider's registered domain comes back to the gate. The table has three keys. `network` names an existing network of the federation's deployment, never Docker's default bridge, the host's network or `none`. `providers.<name> = "<host name>"` gives the local provider's name there, keyed by `[support] local`; any other provider is refused, and so is a table that no longer names the local one. `zone = "<host name>"` gives the zone's name there; the gate alone dials the zone, so it is required with a rest level and refused without one. The table is accepted only with a mount or a rest level in `[sandbox.data_paths]`. On the Compose federation of `deploy/compose-federation` the names are the ones `facts.json` gives as `domain_on_project_network`, and the network is `<project>_fed`.
 
+**Declare how oneclient reaches storage; never leave it to oneclient's detection.** `[sandbox.mount]` needs `io_mode`, `"proxy"` or `"direct"`, and a mount table without it is refused at load. `"proxy"` reads every space through the provider and needs nothing else. `"direct"` reads the local provider's storage itself and needs that storage mapped into the sidecar (below). There is no third choice, and `extra_args` may not carry either force option. The reason is oneclient 25.0's own detection (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`): started with neither option, it hangs the first read of a second space backed by the same storage, because the code locks a mutex it already holds, and nothing is logged. The rule is general: declare every behaviour of oneclient that it would otherwise decide at run time, and let only fixed defaults stand. The only such decision in the client is the storage's access type, which is why `io_mode` is required and no other option is; its other defaults are constants (`interfaces.md`, "The mount's I/O mode"). Nor does oneclient read anything the argv does not say: the sidecar passes `--config /dev/null`, so the image's own configuration file is never parsed, and removes `ONECLIENT_OVERRIDE` and `ONECLIENT_CONFIG` from its environment, which holds the token and nothing else that sets an option. `extra_args` may not name the config file, the TLS flag, the log directory or an `ONECLIENT_` setting either. The run's metadata records the effective mode and the options the sandbox passed (`mount.io_mode`, `mount.options`), the study's `extra_args` by the names of oneclient's own options and one hash (`<value>` for any other word that starts with a dash), and the SHA-256 of the image's configuration file that is never read (`mount.image_config`). The mode is in the campaign fingerprint, for each mount level, so a resume under the other mode is refused, and so is the resume of a store started before the mode was declared (its levels have no `io_mode`): start a new store.
+
+**Direct I/O: declare the storage, and keep proxy unless placement is shown the same.** A direct mount names each storage of the local provider that the sidecar reads, by its id, with the directory that holds it on the host, and a file the local provider holds in full that every start reads: beside `io_mode = "direct"`, `direct_check_file = "<space>/<path>"` (outside the study's data) and a table `[sandbox.mount.storages]` of `"<storage id>" = "<host directory>"` entries. The storage id is the provider panel's (`GET /api/v3/onepanel/provider/storages`), also a key of `distributionPerStorageBackend` in a file's distribution. The storage must be on a filesystem the sandbox's host shares with the provider (on HPC, a shared filesystem rather than node-local tmpfs), and the agent never gets it: the Docker sandbox binds it into the sidecar alone, and the HPC driver (#179) must keep it out of the agent's container in the same way. The start shows direct I/O in effect or refuses the sandbox: the agent reads the check file whole, but only when the local provider holds all of it, so the check never places a block, and the sidecar's log must say forced direct and hold no line of detection or of a fallback to the provider. The fallback is the reason the log is read: oneclient with `--force-direct-io` still reads a file through the provider when its direct read is refused for permissions, so the storage's modes must let the uid the provider maps the space's users to read it. A file of the data can fall back the same way during the run, so the collection reads the log again and sets aside a run in which a read went through the provider. Each run records the check under `mount.direct`.
+
+Direct I/O changes what the provider sees. It no longer serves the reads of data its storage holds, so a measure of its own proxied reads, or an audit of them, loses those reads; the client still reports each read as a file-read event (unless `--disable-read-events`), which is the client's report, not a read the provider served. Blocks the local provider lacks are still fetched through it and placed on its storage before the client reads them, so block maps and transfers record fetches as under proxy, and the data gate's byte counts belong to the REST path. A study whose placement model was validated under proxy keeps proxy unless direct I/O places the same bytes per read sequence: run `deploy/compose-federation/measure_direct_vs_proxy.py` with the study's read sequences (with `--control` for the proxy-against-proxy noise floor) and switch only on a verdict of yes. Direct I/O is not live-verified until that comparison run passes on a live federation. The I/O mode is in the campaign fingerprint, so one store never mixes the two.
+
 The sandbox never creates, changes or removes the federation's network: a mount or REST run whose network is not on the host is refused before anything exists, and removing the sidecar or the gate at teardown takes it off the network. The agent never joins it. Each mount run's metadata records the kind of network the sidecar was on (`mount.network`: `default bridge` or `federation`), never its name.
+
+### What the code tool tells the agent of its output
+
+A model reads these strings, and a study freezes them, so they are given exactly. The Onedata layer's code tool keeps the first 1 MiB (1,048,576 bytes, cut at a whole character) of each of a cell's stdout and stderr and drops the rest. When it cut a stream, the text the tool returns ends with a line after a newline, `[output cut by the sandbox: the first K of the P bytes of stdout were kept]`, where P is what the cell wrote and K what was kept, both plain digits; when both streams were cut, the line has the clause for stdout, then `; `, then the same clause with `stderr`. The call's `source_truncated` is then `True`, and the run's record keeps the same numbers (`output_cut` on the cell, `cell_output_cuts` in the sandbox's metadata). A cell that prints 3 MiB gives a text of 1 MiB of its output followed by `[output cut by the sandbox: the first 1048576 of the 3145728 bytes of stdout were kept]`.
+
+Your `output_cap_chars` (`[agent]` in `campaign.toml`) then applies to that whole text, the line included, and the order never changes: the sandbox cuts first, the tool adds its line, and the cap cuts last, from the end, ending the text with `[output truncated: D of T characters dropped by the harness cap]` (a newline before it, counted inside the cap; T is the length of the text the tool returned, not what the cell wrote). So:
+
+- A cap of 2 MiB and 1 KiB (2,098,176 characters) or more never cuts the tool's text, and the model reads the sandbox's line as the last line.
+- A smaller cap that can hold the cap's own line (77 characters for this print; a shorter cap cuts the text plain and ends it with no line at all), 8,000 or any other under 1 MiB, cuts the text from its end: the sandbox's line goes with the tail, and the model reads the cap's line alone. With a cap of 10,000, the 3 MiB print above reaches the model as 9,923 characters of its output followed by `[output truncated: 1038741 of 1048664 characters dropped by the harness cap]`. The model is not told that the cell wrote 3 MiB; the record is (`output_cut`, and `raw_text`, which holds the text and the line whole), with `truncated` and `source_truncated` both `True`. So under such a cap, the T in the cap's line counts the characters left after the sandbox's cut, never what the cell wrote, and **the record's `source_truncated` is the authority** on whether the cell's own output was cut.
+- A cap only a few characters below the whole text leaves a piece of the sandbox's line before the cap's, because the cap's own line takes room from the cap as well: for this print the caps from 1,048,650 to 1,048,663 (1 to 14 characters below the whole text of 1,048,664) do it, and 1,048,649 does not. Keep `output_cap_chars` under 1 MiB or at 2 MiB and 1 KiB or more, and what the model reads between them depends on how much the cell wrote.
+
+The same text, the same cap and the same cut give the same text for the model every time.
+
+### Collecting a run's evidence
+
+**Never run `docker cp` from a running sidecar or gate.** `docker cp` re-mounts a running container's binds. A bind written `-v` makes a missing source as a directory owned by root, so after the host's copy of a data-path token was removed, one such copy left an empty directory at the token's path, and the run's teardown refused to finish. The sandbox now binds each secret with `--mount type=bind,...,readonly`, which refuses a missing source, but a copy out of a running container is still the wrong way to read its files. Read them on the host instead, under the run's directory (`sandbox.work_root`, the directory whose name ends in the run's id):
+
+| Evidence | Where |
+|---|---|
+| the data gate's request log | `gatelog/requests.jsonl` |
+| oneclient's log, from the mount sidecar | `oneclient-log/` (its `oneclient.INFO` is the INFO log) |
+
+`oneclient-log` is owner-only (mode 0700) and kept with the run's evidence when a run is kept. oneclient is always started with `--log-dir` pointing at it: the sandbox owns oneclient's log directory, so `[sandbox.mount] extra_args` may not give one (`-l`, `--log-dir`, or an abbreviation of it, in any spelling), and `platform.toml` is refused at load if it does. oneclient takes the token from its environment, never its command line, and the INFO log read on 11 Nov was 17 lines of start-up settings (version, provider, TLS verification, I/O modes, the mountpoint) with no token in them (`deploy/compose-federation/day0/2026-11-11-federation-facts-mount.md`). The sandbox does not redact the directory, though: it replaces the token with `<token>` only in the copy `sidecar_errors` summarises, so the directory is owner-only like the rest of the run's evidence.
+
+When a teardown finds something at a token's path that `rm -f` cannot remove, `metadata()["teardown"]["token_files"]` lists it, never its content: its path in the run's directory, its kind (file, directory, symlink or other), size and owner's uid, and what was done. An empty directory is removed (`empty directory left by a bind; removed`) and the teardown goes on; a file, a link or a directory with an entry in it fails the teardown, and the error names its path and kind. The run's directory is then found by the id in `teardown.run_directory`.
 
 ## 3. Declare the design
 
@@ -421,6 +517,11 @@ Each run that uses the platform's users leases one slot: a pair of a data-path u
 
 - **Declare at least two slots per rights group.** A teardown that cannot be proven holds its slot until it is cleared, so a group with one slot stops every run of its conditions until then.
 - **Size the slots of each group to the plan's mix.** The dispatcher does not look for a group with a free slot: when the next runs all belong to one group, workers wait for that group's slots even while another group's sit idle. Give each group roughly its share of the concurrent runs.
+- **Size each group to how long a run holds its slot: slots per rights group ≥ ceil(hold ÷ typical run length) + 1.** A slot stays held after its run ends until its tokens can no longer be used ([C19](regressions.md)). When the run's end revokes them and the revocation is confirmed, the hold is the run's length, its teardown and the revocation's settle, `[tokens] revocation_settle_s` (330 s by default, and never less than 315 s, the bound of the revocation's propagation to the providers), plus up to a minute for the lease pool's next look. Without a confirmed revocation (it failed, or the run ended before this release) the hold is the run's token window plus 60 s: its whole-time ceiling plus `margin_s` and `mint_headroom_s`, plus 60 s. The rule is for one run of the group in flight at a time; with several at once, multiply by their number.
+
+  For runs of about 54 min (3,240 s) with a token window of about 24.85 h (89,460 s), the hold without revocation is 89,520 s, so ceil(89,520 ÷ 3,240) + 1 = 29 slots per group. With revocation it is about 3,240 + 60 + 330 + 60 = 3,690 s, so ceil(3,690 ÷ 3,240) + 1 = 3, and never fewer than the two of the first rule. A main study run as shards sizes each shard's slots the same way, from that shard's own runs, since every shard has its own platform and lease pool. A slot held from before revocation existed can be freed by hand once its run has ended: `python -m expcore_onedata.lease revoke --platform platform.toml --leases out/leases --slot NAME` revokes its tokens and frees it after the settle. It needs the slot's lease lock to itself, so stop the campaign that holds the slot first: it refuses a slot whose lock a run or a running campaign holds, and one whose sandbox is not shown gone. A campaign started afterwards only looks at the slot a moment at a time; if the command is refused during such a look, run it again.
+
+A run that takes no lease, a one-off check of the data path say, needs no slots: build the platform without `slots` and `journal` (`SandboxPlatform(config, issuer, host, events=...)`) and launch it with no `lease`. Its data-path token is the fixed `[principals.data_path]` user's, never a slot's, and nothing is journalled or revoked. Anything that needs a slot (a tool-server condition, a lease, the pool's keys or probe) is refused with an error that names the missing `slots` and `journal`, before anything is minted. Leave `probe`, `lease_keys` and `lease_group` out of the study's plugin: with no probe the core builds no lease pool.
 
 ### Files an agent writes
 
@@ -440,7 +541,17 @@ A side file may hold at most 64 MiB (`expcore.replay.side_files.MAX_SIDE_FILE_BY
 
 ### The reset between runs on the Onedata platform
 
-A study that gives a run the platform's space resets it with `SpaceReset.run` at the start of each run, and the reset clears what **earlier** runs left. Its `qos_rights` therefore says whether **any run since the last verified reset** could have set a QoS requirement, never whether the run about to start can: combine `Condition.manages_qos`, which describes one condition, over every run since the last verified reset. `True`, or leaving it out (`None`), runs the reset's quiet check and is the safe choice; pass `False` only when you know that no run since the last verified reset had the right to manage QoS. Keyed on the next run's condition, a read-only run that follows a writing run would skip the check exactly when it is needed. The check reads the block maps of the files the reset evicts once, then the space's occupancy after a wait, so its cost follows the eviction plan and not the size of the space ([`interfaces.md`](interfaces.md)). What it proves is that no replica of those files, and no growth of the occupancy, had landed by the instant it read the block maps; a replication still running then can land later, and the check does not see it.
+A study that gives a run the platform's space resets it with `SpaceReset.run` at the start of each run, and the reset clears what **earlier** runs left. Its `qos_rights` therefore says whether **any run since the last verified reset** could have set a QoS requirement, never whether the run about to start can: combine `Condition.manages_qos`, which describes one condition, over every run since the last verified reset. `True`, or leaving it out (`None`), runs the reset's quiet check and is the safe choice; pass `False` only when you know that no run since the last verified reset had the right to manage QoS. Keyed on the next run's condition, a read-only run that follows a writing run would skip the check exactly when it is needed. The check reads the block maps of the files the reset evicts once, then the space's occupancy after a wait, so its cost follows the eviction plan and not the size of the space ([`interfaces.md`](interfaces.md)). The reset finds the space's QoS requirements, before it removes the run's own, by one recursive listing of the space root on each provider that supports it, about one read per 1,000 entries per provider (`[placement] qos_scan = "listing"`, the default); declare `qos_scan = "summaries"` to read a summary per leaf on every provider instead, about one read per file per provider. The setting is in no fingerprint, so changing it does not refuse a resume, and the reset's record names the scan it ran. What it proves is that no replica of those files, and no growth of the occupancy, had landed by the instant it read the block maps; a replication still running then can land later, and the check does not see it. Every reset, whatever `qos_rights` says, also waits before its occupancy stage reads: from the end of its eviction, the occupancy's lag for the deepest file of the space and a margin, 20 s for files one directory below the root and 5 s more per further level, since an eviction's change shows in the occupancy as late as a placement's (O46), and once more `transfer_settle_s` (30 s by default) before its last look at the transfer listings, which show a job late. Budget that time between runs, and run no transfer on the space while it resets: one that runs or ends during that wait makes the reset wait again (three waits at most, then it fails), and one during the quiet check fails the reset.
+
+### The provider links on the Onedata platform
+
+A provider's link to a peer can stick with nothing logged, and every read of that peer's files through it then hangs until the run's bound: an agent's hung read would be the only symptom, and the study would score it. So when the federation has more than one provider in a space, the platform's health check refuses to admit a run until every ordered pair of providers that share a space (a reading provider and the provider it reads from, the agent's local provider and a mirror alike: n·(n-1) pairs, 20 for five providers) has fetched a probe of its own within a bound. Declare where the probes live with `[link_check]` in `platform.toml`: a space no agent can see, never one of the study's spaces, with its `name`, `id` and `prefixes` as for a space, and `providers`, the providers that support it, which must include the local provider and every provider of the study's spaces. A provider that supports the probe space and is not listed should never come to hold a probe, since nothing reads the probe space through it: the check evicts a probe only from the providers it lists, and one that does not list a provider holding any of the probe fails the pair, named, because that provider could serve the fetch while the link under test is stuck. List such a provider to let the check evict from it. On `deploy/compose-federation` that is the layout's `probe_space`, declared `agent_visible = false` and supported by every provider; the committed layouts and templates have one. Without the table, no run of a campaign on such a federation is admitted, and the detail names the number of untested pairs.
+
+The check runs at the campaign's first health call and again every `every_s` (600 s by default). A pair that does not fetch its probe within `timeout_s` (30 s) holds every run from the campaign's start, or, later, closes the health gate: the run whose check found it is an infrastructure outcome and never scored. Either way the whole campaign waits, and the gate's re-checks run the check again until it passes, so the remedy reopens it without restarting the campaign. The detail names the pair by position and the remedy: restart the local provider's rtransfer link (`rtransfer_config:restart_link()` in its op-worker), or restart that provider's container alone, never a Compose `down`; left alone, a stuck link cleared after about 1,800 s on the first study's federation. A probe whose fetch failed is replaced by a new file in the probe space (`expcore-link-probe-<hash>-g1`, then `-g2`) for the next check, because the provider keeps waiting on the stuck fetch of the old file and a read of it would wait on the same job even once the link works; the old file is deleted, and it is recorded as retired in the probe space (an `expcore-link-retired-` marker file), so no later check reads it even when the deletion failed. When no fresh file can be written either, the pair fails with "no fresh probe for providers[j] to providers[i]: creation failed" until one can. A fault injector's restore checks every pair, not the restored provider's alone, since an outage of one provider can leave a link between two others stuck, and stays unverified until they pass. The check's first run after the probe space was emptied writes the probes and takes some seconds more, and the pairs are checked 8 at once, so 20 pairs take about three rounds of what two took; keep `health_timeout_s` in `campaign.toml` above `visible_timeout_s + timeout_s + evict_timeout_s` of `[link_check]`, 150 s with the defaults. `PlatformHealth.links` holds the last check's record, each pair's seconds and bytes and the transfers it made, for a study that wants it in its own records ([`interfaces.md`](interfaces.md)).
+
+### A dataset provisioned by storage import on the Onedata platform
+
+A federation's owner can hold your dataset on an imported storage instead of uploading it: the provider scans a directory that already holds the files, which saves each federation's upload and, read-only, lets every federation import one shared copy. Declare it in `platform.toml` with `import = { readonly = true }` in `[space]` or the `[[spaces]]` entry. Make the dataset's manifest once from the copy you keep (`manifest_of_tree` from `expcore_onedata.storageimport`, written beside it with `write_manifest`), and at each federation, before its first run, have `ImportedSpace(provisioner, load_manifest(path)).provision(timeout_s=...)` show that the owner's panel holds the declared import, that the scan completed, and that the space holds exactly the manifest, every file whole on the owner; keep the record it returns, since it says how long each step took. A read-only imported space takes no write: the provisioner refuses any, the progressive ingest is refused there (run it in an uploaded space of its own), and a condition whose agent can write, delete or evict in the space can damage the owner's copy for good, so keep such conditions away from it or run `verify` before each run. [`storage-import.md`](storage-import.md) has what the import is known to change (the files' owner, mode and times) and the live checks to run on your federation before you rely on it.
 
 ### Running one campaign on several hosts
 
@@ -664,7 +775,7 @@ assert counts == Counter()  # the example study runs without the platform
 
 ### Fault injection: compare like isolation with like
 
-On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
+On the Onedata platform a condition whose manipulation is a provider outage (`infrastructure_is_treatment = [{ kind = "provider_outage", target = "providers[1]" }]`, with `[faults]` in platform.toml and `platforms = ["expcore_onedata.sandbox.kinds"]` in `[study]`, the module that registers `provider_outage` and the injector's own failure, `injector_failure`, which no condition may declare) runs alone on the federation: its run admission is exclusive, so no other run shares the federation while the provider is down. The injector hands the federation back only when the restored provider serves, not merely when its container runs with a new identity: a restarted provider can refuse connections for the better part of a minute, and a control run that started on it would meet outage-like refusals that its agent may absorb without any recorded infrastructure error. It waits, at most `ready_timeout_s` of `[faults]` (180 s by default), until the provider's container is healthy and the platform's authenticated read through it answers, records the wait as `ready_after_s` in its snapshot, and otherwise leaves the restore unverified, the injection open and the health gate failing. A restore that is not verified is never scored either: the injector's reading in the record says `restore_verified: false` (with `how`, `identity_changed` and `serving`), and the campaign sets such an attempt aside as `injector_failure` and runs it again, whatever its outcome was and whatever the post-run health check decided, even when the executor kept its record (`FaultInjector.running` returns for it, and `session` raises). A control that shares the federation with concurrent runs differs from it in load as well as in the fault, and a contrast between the two confounds them. Either give the control the same isolation, a condition with no fault that declares `exclusive = true`, or restrict the contrast to measures that do not depend on the federation's load. `exclusive = true` needs a run admission to hold: on a platform without `[faults]` it is refused at the start, naming the file and the key. Before analysing, check what each compared attempt actually held: the export's `admission` is `shared`, `exclusive`, or `none` for a study without admission, as stored when the attempt was admitted, never inferred from its condition.
 
 ```python
 import expcore_onedata.sandbox.kinds  # what [study] platforms imports before study.toml's conditions are validated
@@ -787,9 +898,70 @@ For a measure such as bytes moved but never consumed, the Onedata layer counts t
 
 To check an agent's claimed reads file by file, read `files`: one row per file whose content the gate served, keyed by its file id, with the answers it got (`requests`), the unique byte ranges they served (`ranges`, each `[start, stop]` with `stop` excluded) and the bytes in them (`range_bytes`), and every body byte (`body_bytes`). Map your own file paths to file ids from the data you provisioned; the table names files by id only. `listings` does the same per directory listed. Check each claimed read with `lookup_bytes(snapshot, file_id, start, stop)` from `expcore_onedata.sandbox.served` rather than by reading the table yourself: it answers `served`, `not_served` (a read the gate never served) or `unknown`, and it reads a cut table correctly. The tables are bounded, 1000 files, 1000 directories and 64 ranges a file by default; a file a cap left out reads as `unknown`, never as not served. If your runs read more, raise the caps so every file is checkable: a `[sandbox.served_bytes]` table in `platform.toml` takes `max_files`, `max_directories` and `max_ranges_per_file`, each an integer of at least 1 (`max_files = 4000`, say). Declare them before the campaign starts: a declared table is in the campaign fingerprint, so a resume under other caps is refused. Each run's snapshot records the caps it had (`caps`), and a file's `ranges` are `None` when the log cannot place one of its answers.
 
-If your executor checks the sandbox before the agent's loop starts (its data path, read as the agent's user, say), run the check with `sandbox.exec(code, timeout_s, record=False)`, which records it as a harness step and never as one of the agent's cells, then call `sandbox.mark_run_start()` just before the loop. Both belong before the loop: once the mark is set or the agent's first cell has begun, a step and a mark are refused. The counts, the tables and the lookups then hold only what the agent was served, and the check's answers are counted apart, in `before_run_start`. When the returned `confirmed` is false the run's count will be unknown; whether such a run goes on is your executor's decision.
+If your executor checks the sandbox before the agent's loop starts (its data path, read as the agent's user, say), run the check with `sandbox.exec(code, timeout_s, record=False)`, which records it as a harness step and never as one of the agent's cells, then call `sandbox.mark_run_start()` just before the loop. A step has no timer, so a read that hangs is ended by the container's own `timeout` a second after `timeout_s`; the result then has `timed_out` true and `bound == "container_timeout"`, and the step's record says the same, so a hung read is not mistaken for a crash. A step that exits 137 sooner (a process that killed itself) is not timed out, and `bound` is None ([`interfaces.md`](interfaces.md#the-platform-layers-sandbox) says how the two are told apart). Both belong before the loop: once the mark is set or the agent's first cell has begun, a step and a mark are refused. The counts, the tables and the lookups then hold only what the agent was served, and the check's answers are counted apart, in `before_run_start`. When the returned `confirmed` is false the run's count will be unknown; whether such a run goes on is your executor's decision.
 
 The count is `None`, with its reasons in `unknown`, wherever it is not known: always on a mount (`mount_not_through_gate`, since oneclient's reads pass no gate), and on a REST run whose gate log may lack a line. The tables are `None` with it, never a part of the run's reads. As with the probes' estimates, count those per condition and reason over every attempt and report them beside the analysis; never treat one as zero. A run with no data path reads zero, with empty tables. [`interfaces.md`](interfaces.md#instrument) lists every field and reason.
+
+### The order instruments start and finish in
+
+Instruments nest, like a setup and its teardown. `start_instruments` starts them in list order and `finish_instruments` finishes them in the reverse of it, so **an instrument listed earlier finishes later**. The first listed starts first and finishes last; one listed after another starts after it and finishes before it.
+
+Use it to read between a manipulation and its undo. List the instrument that changes something first, a fault injector (its `finish` is the restore) or a progressive ingest (its `finish` restores the dataset), and the instruments that read the state the run left after it: they start once the manipulation is in place, and finish before it is undone, so they record what the agent left and not the restore's transfers. The block shows the order with two stand-ins:
+
+```python
+import json
+from pathlib import Path
+
+from expcore.records.instruments import finish_instruments, start_instruments
+from expcore.records.record import load_record, record_filename
+
+export = json.loads(Path("my-study/out/export.json").read_text())
+entry = export["analysed_attempts"][0]
+stored = load_record(Path("my-study/out/runs") / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"]))
+calls = []
+
+
+class Outage:
+    """Takes something away in `start` and puts it back in `finish`, as the fault injector and the ingest do."""
+
+    namespace = "outage"
+
+    def start(self, identity):
+        calls.append("outage injected")
+
+    def finish(self):
+        calls.append("outage restored")
+        return {"ok": True}
+
+
+class Reader:
+    """Reads the platform in `start` and again in `finish`, as the platform probes do."""
+
+    namespace = "reader"
+
+    def start(self, identity):
+        calls.append("reader before")
+
+    def finish(self):
+        calls.append("reader after")
+        return {"ok": True}
+
+
+instruments = [Outage(), Reader()]  # the outage first: the reader finishes before it restores
+start_instruments(instruments, {"run_key": entry["run_key"], "factors": {}, "attempt": entry["attempt"]})
+finished = finish_instruments(stored, instruments)
+assert calls == ["outage injected", "reader before", "reader after", "outage restored"]
+assert list(finished.instruments)[-2:] == ["outage", "reader"]  # the record keeps the list's order
+```
+
+An instrument that must finish first, one that stamps the end of the run before anything is restored, goes last in the list. A study written when instruments finished in list order, with such an instrument listed first, lists it last now.
+
+What stays in list order: the snapshots in the record, so its `instruments` keep the list's key order, though what an instrument reads can differ with the order of the calls; `at_first_turn`, which is one moment, not a nest; and `check`, which runs once every `finish` has run. The first listed instrument that refuses is the one the record keeps, so a refusal of the injector or the ingest, the cause, wins over a refusal of a probe listed after it. A `finish` that raises is recorded as failed and the instruments listed before it still finish.
+
+Whether readers should finish before or after a restore depends on what the restore does, and the two Onedata instruments differ:
+
+- **A progressive ingest's restore makes transfers:** it completes each file and replicates it again to the providers its `replicas` declare. Readers that must record the state the agent left are listed after the ingest, so they finish before its restore, as in the block above.
+- **A fault injector's restore makes none:** starting a provider's container again moves no data and leaves the local provider's block maps as the agent left them. While the owner is down, a transfer listing also misses the owner's tree. So in a fault condition, readers can finish after the restore, and reading then gives them the whole listing. The injector's `running` clears the provider when its block exits, so a `finish_instruments` called after the block finishes every instrument after that restore, whatever the order. Call it inside the block only if a reader must read with the provider still down. A restore that was not verified at the exit is tried again by the injector's `finish`, and for that retry the order decides again.
 
 ### An instrument that refuses an attempt
 
@@ -917,6 +1089,64 @@ ingest.check()  # what finish_instruments asks after the snapshots: nothing to r
 assert [s["step"] for s in snapshot["steps"] if s["step"] != "planned"] == ["written", "confirmed", "not_due"]
 assert [e["event"] for e in snapshot["ids"]] == ["restored", "removed", "created", "restored"]
 assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]  # whole again, from the staged copy
+
+del os.environ[ADMIN_ENV]
+shutil.rmtree(workdir)
+```
+
+**A file that is there but still being written.** When the agent must not tell from the namespace that anything is missing, set `mode = "preallocated"` under `[ingest]` and give each file a `prefix`, the bytes written at the start. Every planned file must then be `"complete"`: at the start the instrument makes it again at its final size with only the prefix written, so a listing and a `stat` show the file as in your baseline, while the rest reads as zeros (through REST and the mount alike) until its parts arrive. Only the block map tells the gap from written zeros. The parts' times count from the agent's first model turn, not from the instrument's start, so the setup before the loop does not eat into the agent's window: call `first_turn_instruments` in your executor just before the loop starts, as for any instrument with a first-turn hook ([An instrument that refuses an attempt](#an-instrument-that-refuses-an-attempt)); a run whose first turn never came is refused. After the run the instrument completes each file in place from its staged copy and never removes it, so the files every other condition reads stay in the dataset. Each start makes the files again, so their ids change every run: the snapshot's `id_map` maps each file's old id to its new one, the id the run's reads and the reset use, so a map you key by file id (as a data gate's rows are) follows it; `ids` and `start.files` give the same with each file's label. `start_s` is the start's seconds, which run before the first turn and so outside the agent's time.
+
+The removal takes every replica of a file with it. If another provider holds a file whole between runs, a mirror that an outage condition reads through, list it in the file's `replicas`: the reset then replicates the completed file there and checks that provider's block map, so the next run, whatever its condition, finds the mirror as in your baseline. A replication can report `completed` and still leave the mirror short. The mirror runs it from its own copy of the owner's map, which lags a write by seconds, and nothing the REST API answers shows that lag. So the reset schedules the replication again, within the settle bound, and records each try in the snapshot (`restore.files[label].replications`). Your agents' own replications are subject to the same lag: judge one by the target's own block map, never by its status (`deploy/compose-federation/day0/2026-11-14-federation-facts-replication-lag.md`). The start refuses, before it removes anything, when a declared provider does not hold the file whole, when one you did not declare holds any of it (evict it, or declare it), or when any planned file's staged copy is damaged or missing.
+
+A start or a reset that fails part-way leaves files sparse or missing, so the instrument writes the baseline's state into its journal, and the start's own recovery marks it whole again only when it verifies every file. Otherwise every later start is held back before it sends anything, and the platform's health check closes the gate if you give it the journals: `PlatformHealth(config, client, issuer, ingest_journals=[journal])`, one per plan's journal. Bring the baseline back with `ProgressiveIngest(own, plan, journal=journal).recover()`, over the plan the failed run used (another plan is refused), when no run is on the space: it restores every file and its replicas, verified, and reopens both. Each mark names the attempt that wrote it and its process, so a run whose process died, and an attempt that ended without its reset (an instrument your executor dropped before `finish`), leave the same state the moment the campaign's store has the attempt's result: you do not wait for the run's ceiling. Start the instrument in your executor, or in `asyncio.to_thread` from it, not in a thread of your own: the attempt it runs in is how its mark names it and how its hold on the baseline is let go when the attempt ends.
+
+**A held start costs no attempt.** While a run is on the baseline, another run's start waits for its reset; a start the marks hold back raises `InfraError("ingest_held")`, a kind that never costs the run an attempt, however often it happens, so no run is lost to `max_attempts` for it. With the journals, the campaign holds before any attempt begins: the pre-run check is deferred while a live attempt holds the baseline, and the run is asked again every `recheck_s` (keep `max_defer_s` above your longest run, or a deferral past it closes the gate as blocking), and a baseline left not whole closes the gate without charging the run that found it, until `recover()`. Without the journals each held start is still free, but it is an attempt, set aside, every `retry_delay_s`. Let the instrument's errors reach the caller of your executor as they are: one wrapped in another error is charged as that error is.
+
+The block runs a preallocated plan of one file in three parts against the fakes. The run ends after the first part, and the finish completes the day.
+
+```python
+ticker = Ticker()
+fake = make_federation(clock=ticker.clock)
+fake.add_provider(BETA_ID, "beta.test")
+fake.add_file("records/day-13.csv", DAY)  # the dataset's last day, held whole by its owner
+
+workdir = Path(tempfile.mkdtemp())
+os.environ[ADMIN_ENV] = fake.admin_token
+platform = write_platform(workdir, both_providers)
+config = load_platform(platform)
+client = OnezoneClient(config, http=fake.client_http())
+own = Provisioner(
+    client,
+    config,
+    load_placement(platform, config).settings,
+    provider_ids=resolve_provider_ids(config),
+    log=workdir / "ingest-changes.jsonl",
+    clock=ticker.clock,
+    sleep=ticker.sleep,
+)
+(workdir / "staged").mkdir()
+(workdir / "staged" / "day-13.csv").write_bytes(DAY)
+(workdir / "ingest.toml").write_text(
+    '[ingest]\nstaging = "staged"\nmode = "preallocated"\n\n[[ingest.files]]\nlabel = "day-13"\n'
+    'path = "records/day-13.csv"\nsource = "day-13.csv"\nat_s = 60\nbaseline = "complete"\nprefix = 150\n'
+    "parts = 3\nover_s = 60\n",
+    encoding="utf-8",
+)
+plan = load_ingest_plan(workdir / "ingest.toml", config)
+ingest = ProgressiveIngest(own, plan, journal=workdir / "ingest-journal.jsonl", max_wait_s=0.001)
+
+ingest.start({})  # the day is at its full size with its first 150 bytes written: the namespace is the baseline's
+assert len(fake.nodes[fake.id_of("records/day-13.csv")].content) == len(DAY)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 150]]
+ingest.at_first_turn({"clock_s": 0.0})  # what first_turn_instruments calls just before the loop: the schedule's zero
+ticker.sleep(60)
+while ingest.progress < 1:
+    time.sleep(0.001)
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, 300]]  # the prefix and the first part, nothing beyond
+snapshot = ingest.finish()  # the run ended before the rest: the day is completed in place, never removed
+ingest.check()
+assert (snapshot["anchor"], snapshot["files"]["day-13"]["state"]) == ("first_turn", "partial")
+assert fake.held("records/day-13.csv", ALPHA_ID) == [[0, len(DAY)]]
 
 del os.environ[ADMIN_ENV]
 shutil.rmtree(workdir)

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import binascii
 import dataclasses
+import hashlib
 import json
 import pathlib
 import re
@@ -31,15 +32,32 @@ from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+BODY_KEPT_BYTES = 64 * 1024  # the most of a request's body a fake's log keeps whole; JSON and short writes fit in it
+
 
 @dataclasses.dataclass
 class Request:
+    """One request a fake received, as its log (`.requests`) records it.
+
+    `body` is the request's body when it is at most `BODY_KEPT_BYTES`, so a test asserts on a JSON body or a short write
+    as ever. A larger body is not kept: a log that held every body of a batch of uploads held the whole batch, and no
+    collection could free it (#259). `body` is then empty, and `size` and `sha256` say what the body was; they are the
+    body's whatever its size, so a test of a large write compares those and never the bytes."""
+
     method: str
     path: str
     query: dict
     range: str | None
     token: str | None
     body: bytes = b""
+    size: int = dataclasses.field(init=False, default=0)
+    sha256: str = dataclasses.field(init=False, default="")
+
+    def __post_init__(self) -> None:
+        self.size = len(self.body)
+        self.sha256 = hashlib.sha256(self.body).hexdigest()
+        if self.size > BODY_KEPT_BYTES:
+            self.body = b""
 
 
 class MockOnedata:

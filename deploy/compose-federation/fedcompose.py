@@ -5,17 +5,18 @@
 Every command of federation.py generates the file from its layout and hands it to `docker compose` with this directory
 as the project directory, so `./start.sh` resolves here. What keeps the federation to itself is part of the generator,
 not of any layout: one project name, only the two pinned images and never a pull, every published port on the host's
-loopback, every bind source below the root (or `./start.sh`) and never created by the daemon, no privileged container,
-and a label on every container naming the root it binds. `compose.yaml` beside this file is the default layout's
-output, committed for review; a test keeps it equal to what the generator makes.
+loopback, every bind source below the root (or `./start.sh`, or the source of a read-only import, named by its variable
+and mounted read-only) and never created by the daemon, no privileged container, and a label on every container naming
+the root it binds. `compose.yaml` beside this file is the default layout's output, committed for review; a test keeps
+it equal to what the generator makes.
 """
 
 import json
 import re
 from typing import Any
 
-from fedlayout import IMAGES, NODE, ROOT_MARKER
-from fedspec import LOOPBACK, ZONE, Service, Spec
+from fedlayout import IMAGES, IMPORT_MOUNT, NODE, REGULAR_STORAGE, ROOT_MARKER
+from fedspec import LOOPBACK, ZONE, Service, Space, Spec
 
 ROOT = "${EXPCORE_FED_ROOT:?set by federation.py}"  # no default: a file run by hand binds no root by accident
 ROOT_LABEL = "org.expcore.fed.root"  # every container names the root it binds: commands refuse another root's
@@ -66,7 +67,7 @@ def provider_config(spec: Spec, service: Service) -> str:
     return (
         cluster(service.domain)
         + "  storages:\n"
-        + "    posix:\n"
+        + f"    {REGULAR_STORAGE}:\n"
         + '      type: "posix"\n'
         + '      mountPoint: "/volumes/storage"\n'
         + "oneprovider:\n"
@@ -85,6 +86,18 @@ def provider_config(spec: Spec, service: Service) -> str:
     )
 
 
+def import_bind(space: Space) -> dict[str, Any]:
+    """The bind of an imported space's directory into its owner's service, below the imports' mount point.
+
+    A read-only import binds the dataset's own directory, which the host names by the variable `federation.py` sets
+    from the layout's `source_env`, and mounts it read-only, so nothing the platform does can change the dataset. A
+    writable one binds the copy `up` made in the root, so it goes with the root at down."""
+    target = f"{IMPORT_MOUNT}/{space.name}"
+    if space.imported.readonly:
+        return bind("${" + space.imported.source_env + ":?set by federation.py}", target, read_only=True)
+    return bind(f"{ROOT}/{space.owner}/import/{space.name}", target)
+
+
 def service_model(spec: Spec, service: Service) -> dict[str, Any]:
     """One Onedata service: the stock image under start.sh, its panel config, its binds and its one loopback port."""
     zone = service.name == ZONE
@@ -93,6 +106,7 @@ def service_model(spec: Spec, service: Service) -> dict[str, Any]:
     if not zone:
         volumes += [
             bind(f"{ROOT}/{name}/storage", "/volumes/storage"),
+            *(import_bind(s) for s in spec.spaces if s.imported and s.owner == name),
             bind(f"{ROOT}/secrets/{name}.regtoken", "/expcore/registration-token", read_only=True),
         ]
     volumes += [

@@ -24,7 +24,9 @@ reads what the injector did from its snapshot, so the check has the injector's g
 **The outage is the injector's `running` (#27).** `down` takes the provider down for the body of an `async with`
 through `FaultInjector.running`: the start runs in a worker thread whose future is kept, so a cancellation waits for it
 (a thread cannot be stopped) instead of leaving it stopping the provider while nothing restores it, and the clear runs
-in `finally`, shielded. The check never awaits the injector's start or clear in a bare `asyncio.to_thread`.
+in `finally`, shielded. The check never awaits the injector's start or clear in a bare `asyncio.to_thread`. A restore
+the injector could not verify does not raise as `down` ends (`running` returns, and the snapshot says `restore_verified`
+false); the check reads it from the snapshot as `restored`'s facts (`verified` false, with the injector's word for how).
 
 `down` and `restored` turn the injector's outcome into the check's facts: whether the provider was seen down, and
 whether it is back (`cleared`: nothing is left down) and restored (`verified`: back with a changed identity, and

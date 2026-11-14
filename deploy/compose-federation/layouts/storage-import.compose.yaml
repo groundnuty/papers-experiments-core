@@ -1,0 +1,380 @@
+# The Compose file of the federation layout storage-import.toml (project expcore-fedimp), made by fedcompose.py.
+#
+# Never edit it, and never run it with docker compose alone: federation.py generates it from the layout at
+# every command, makes the CA, the certificates and the secrets these services read, and bootstraps the
+# federation. To see what a layout generates: federation.py --layout PATH compose
+name: "expcore-fedimp"
+services:
+  zone:
+    image: "docker.onedata.org/onezone:ID-ba7a778696"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/onezone.sh"]
+    hostname: "node1"
+    domainname: "zone.expcore-fedimp.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/zone.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEZONE_CONFIG: |
+        cluster:
+          domainName: "zone.expcore-fedimp.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+        onezone:
+          name: "expcore-fedimp-zone"
+          domainName: "zone.expcore-fedimp.test"
+          letsEncryptEnabled: false
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/zone/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29643"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["zone.expcore-fedimp.test"]
+  pine:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "pine.expcore-fedimp.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/pine.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "pine.expcore-fedimp.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "pine"
+          adminEmail: "admin@pine.expcore-fedimp.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "pine.expcore-fedimp.test"
+        onezone:
+          domainName: "zone.expcore-fedimp.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/pine/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/pine/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_IMPORT_ALPHA:?set by federation.py}"
+        target: "/volumes/import/alpha-import"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/pine.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29644"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["pine.expcore-fedimp.test"]
+  birch:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "birch.expcore-fedimp.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/birch.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "birch.expcore-fedimp.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "birch"
+          adminEmail: "admin@birch.expcore-fedimp.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "birch.expcore-fedimp.test"
+        onezone:
+          domainName: "zone.expcore-fedimp.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/birch/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/birch/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/birch.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29645"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["birch.expcore-fedimp.test"]
+  cedar:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    restart: "no"
+    entrypoint: ["/bin/bash", "/expcore/start.sh"]
+    command: ["/root/oneprovider.sh"]
+    hostname: "node1"
+    domainname: "cedar.expcore-fedimp.test"
+    stop_grace_period: "120s"
+    mem_limit: "6g"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    healthcheck:
+      test: ["CMD", "test", "-f", "/root/service-ready.lock"]
+      interval: "10s"
+      timeout: "5s"
+      retries: 3
+      start_period: "900s"
+    env_file:
+      - path: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/cedar.env"
+        required: false
+    environment:
+      ONEPANEL_BATCH_MODE: "true"
+      ONEPANEL_LOG_LEVEL: "info"
+      ONEPROVIDER_CONFIG: |
+        cluster:
+          domainName: "cedar.expcore-fedimp.test"
+          nodes:
+            n1:
+              hostname: "node1"
+          managers:
+            mainNode: "n1"
+            nodes: ["n1"]
+          workers:
+            nodes: ["n1"]
+          databases:
+            serverQuota: 256
+            bucketQuota: 256
+            nodes: ["n1"]
+          storages:
+            posix:
+              type: "posix"
+              mountPoint: "/volumes/storage"
+        oneprovider:
+          geoLatitude: 0.0
+          geoLongitude: 0.0
+          register: true
+          name: "cedar"
+          adminEmail: "admin@cedar.expcore-fedimp.test"
+          tokenProvisionMethod: "fromFile"
+          tokenFile: "/expcore/registration-token"
+          letsEncryptEnabled: false
+          subdomainDelegation: false
+          domain: "cedar.expcore-fedimp.test"
+        onezone:
+          domainName: "zone.expcore-fedimp.test"
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/cedar/persistence"
+        target: "/volumes/persistence"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/cedar/storage"
+        target: "/volumes/storage"
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/secrets/cedar.regtoken"
+        target: "/expcore/registration-token"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}/ca/federation-ca.pem"
+        target: "/expcore/federation-ca.pem"
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: "bind"
+        source: "./start.sh"
+        target: "/expcore/start.sh"
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - target: 443
+        host_ip: "127.0.0.1"
+        published: "29646"
+        protocol: "tcp"
+    networks:
+      fed:
+        aliases: ["cedar.expcore-fedimp.test"]
+  janitor:
+    image: "docker.onedata.org/oneprovider:ID-765309c84f"
+    pull_policy: "never"
+    profiles: ["janitor"]
+    network_mode: "none"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"
+    entrypoint: ["sh", "-c", "test \"$$(cat /fed/.expcore-fed-root 2>/dev/null)\" = expcore-fedimp || { echo \"not this federation root\" >&2; exit 3; }; find /fed -mindepth 1 -delete"]
+    volumes:
+      - type: "bind"
+        source: "${EXPCORE_FED_ROOT:?set by federation.py}"
+        target: "/fed"
+        bind:
+          create_host_path: false
+networks:
+  fed:
+    driver: "bridge"
+    labels:
+      org.expcore.fed.root: "${EXPCORE_FED_ROOT:?set by federation.py}"

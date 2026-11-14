@@ -215,11 +215,18 @@ def tool_entry(spec: ToolSpec) -> dict[str, Any]:
     }
 
 
-def call_entry(call: Any) -> dict[str, Any]:
-    """Return a tool-call log entry as the record keeps it."""
+def call_entry(call: Any, schema_version: str = CURRENT, schemas: Sequence[SchemaVersion] = SCHEMAS) -> dict[str, Any]:
+    """Return a tool-call log entry as the record keeps it, as a record of `schema_version` keeps it.
+
+    `elapsed_s` is the last field, and is left out where there is nothing to say: for a call that never started, never
+    written as a null, and for a version that predates it (L17).
+    """
     entry = plain(dataclasses.asdict(call))
+    elapsed = entry.pop("elapsed_s")
     entry["detail"] = stable_call_detail(entry["status"], entry["detail"])
     entry["rendering_verified"] = True  # until redaction changes what the cap or the error text is computed from
+    if elapsed is not None and "elapsed_s" in fields_of("tool_call", schema_version, schemas):
+        entry["elapsed_s"] = elapsed
     return entry
 
 
@@ -431,7 +438,7 @@ def _build_record(
         "core_version": core_version,
         "transcript": turns,
         "failed_request": failed,
-        "tool_calls": [call_entry(c) for c in result.tool_calls],
+        "tool_calls": [call_entry(c, schema_version, schemas) for c in result.tool_calls],
         "clock": [[label, value] for label, value in result.clock_readings],
         "outcome": outcome_entry(
             result.outcome,

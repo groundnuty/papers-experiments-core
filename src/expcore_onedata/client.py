@@ -30,10 +30,12 @@ Reads and mutations are separate calls:
   else, a path of a provider among it, resolves to no space and is refused, so a mistaken or hostile target cannot
   reach a space outside the study's. What remains is the interval between the name's read and the platform acting on
   the request, which a client cannot close;
-- `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
-  password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
+- `mint_own_token`, `own_temporary_generation` and `revoke_own_temporary_tokens` are the operations on credentials,
+  each sent as one platform user with its own password (HTTP Basic), on that user's own temporary tokens alone: the
+  user mints one, as the earlier code did, reads their generation, or revokes all of them, which needs no privilege
+  and reaches no other user's (C19). They act on no space, so they have calls of their own; the password is
   registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
-  the client itself uses, when the client is built. Tokens are not revoked: they end with their lifetime.
+  the client itself uses, when the client is built.
 
 **The space of a file.** Onedata 25.0 gives a file no path and no space attribute, so the gate walks the file's
 parent links: `GET /data/{id}?attribute=parent_id` through the provider the request is for, from the file up, until it
@@ -65,6 +67,32 @@ files left revokes nothing) belong to provisioning and the sandbox (step 4b); th
 A failure raises `PlatformError` with the status and Onedata's error id only. The message never holds a URL, a body or a
 header, and names a provider by its position (`providers[1]`), so neither a token nor a federation name reaches a log
 or a record through it.
+
+**Bodies are freed when their exchange is used (#259, O47).** httpx binds every answer to a stream that points back at
+it, a reference cycle that holds the answer, its request and both bodies until the cyclic collector runs; a batch of
+large uploads or reads would grow by everything it moved. So every answer is released the moment it is read
+(`_release`: closed, its stream replaced by an empty one), however the read ends, on every path that sends or receives
+a body (`_request`, `_stream_range`, `content_answer`). `_exchange` reads a request's answer in the open, since
+`httpx.Client.request` leaves one whose body failed to read in its cycle; an answer httpx itself fails on inside its
+send, a redirect it cannot parse or a hook that raises, is found in the frames the failure passed through
+(`_release_stranded`). No error holds the httpx error or the answer that caused it: a transport failure is raised after
+its handler has ended, so the `PlatformError` has no `__context__`. The client keeps no answer, request or body, and
+follows no redirect, whatever the HTTP client it was given does: httpx follows one inside its send, and takes the
+`X-Auth-Token` header along to another host (it drops `Authorization` alone). A 3xx answer is therefore the answer the
+client gets, and it is never a result: a bodyless one would decode to `{}`, an empty success, a false pass for a write
+as much as for a read. Every 3xx, on every path (`_request` through `_checked`, `_stream_range` and `content_answer`
+through `_streamed`), is a `PlatformError` that names the status and whether a `Location` came, never its value
+(`_refuse_redirect`). It is raised after the answer is released, as an answer, not a transport failure, so no retry
+policy of the client repeats it: the GET retry takes only a timeout, which raises, and a probe retries only `transport`.
+The layer's polls that count a failed read as one that did not match (`consistency.converge`, `converge_each`, and
+what is built on them) treat a 3xx as they do a 403 or a 500: they read again until their own bound and end as not
+converged, never as a pass; a wait that waits out only absence (`wait_visible`, `space_root`) raises it at once.
+
+What none of this reaches is an HTTP client the caller injected whose hooks, authentication flow or transport keep a
+reference of their own to an answer or a request, and a cycle inside httpx or httpcore that no answer the client holds
+reaches. The net under all of it is `collect_after_bytes`: once that many bytes of bodies, sent and received, failed
+exchanges' included, have been counted since the last collection, a full collection runs before the next exchange
+(`collectbudget.py`); it is a fallback, not the fix.
 
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
@@ -107,6 +135,21 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   has made it, so it is in `UNVERIFIED_ENDPOINTS`.
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
+- The revocation of a run's tokens at its end (`users.SlotTokens.revoke`, C19): `own_temporary_generation` is `GET
+  /user/tokens/temporary` and `revoke_own_temporary_tokens` is `DELETE /user/tokens/temporary`, each with
+  `Authorization: Basic` of the user itself, the path `mint_own_token` posts to. The DELETE gives the user a new
+  secret and a generation one higher, which revokes every temporary token of that user, and answers 204; the GET
+  answers `{"generation": N}`. Neither needs a privilege. A temporary token is checked by its generation, so this is
+  the only revocation of one; per-token revocation exists for named tokens alone. `query` sends `POST
+  /tokens/verify_access_token`, body `{"token"}`, with no header, as the scope inference is sent: it compares the
+  token's generation with its user's before any caveat and answers an older one 400 `tokenRevoked`, while
+  `/tokens/examine` only decodes a token and never shows it revoked. All three are named by onedata/oz-worker at
+  14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55: src/http/rest/routes/token_routes.erl:163-176 (the two routes, "does not
+  require any specific privileges"), src/logic/token_logic_plugin.erl:165-176 (the verification), 330-331 and
+  379-380 (the revocation, authorised for the user itself), src/datastore/models/temporary_token_secret.erl:72-89 and
+  199-224 (the new generation, and its read), src/auth/token_auth.erl:357-364 (generations compared first); and
+  onedata/ctool's `tokenRevoked`, HTTP 400 (src/errors/types/auth/token/od_error_token_revoked.erl:50-52). No live
+  run has made them, so they are in `UNVERIFIED_ENDPOINTS`.
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
 - Step 4b2 sends to a provider (all confirmed by [S8], whose code sends them and reads the answers as the layer does):
   `GET /spaces/{space}` (the key `fileId` is the space's root; [L1] shows it the same on every provider),
@@ -120,8 +163,13 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
   `application/octet-stream` for both, is confirmed by [L1]. `read_content` is a run of range reads, each streamed and
   hashed as it comes (O25).
-- A write of content without the `offset` query, which truncates the file first and which a restarted upload relies
-  on: only the provider's API description states it, and no source sends it; see `UNVERIFIED_ENDPOINTS`.
+- A write of content always names its `offset`: without one the provider truncates the file to 0 first (op-worker
+  f118ed9, file_content_rest_handler.erl:224-228), so `mutate` refuses it unsent
+  (`TruncatingWrite`, O44). An empty body at an offset past the file's end extends its size to that offset and writes
+  no block: measured on the Compose federation (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A
+  file at its final size with only a prefix written": a 204, the size read back, the block map the prefix alone), and
+  traced in op-worker f118ed9 (file_upload_utils.erl:136-150, read_write_req.erl:58-86, replica_updater.erl:187-192,
+  fslogic_blocks.erl:125-126, which drops the zero-size block). A preallocated ingest relies on it (#107).
 - `file_space_id`: `GET /data/{id}` with the query `attribute=parent_id`, answered `{"parent_id": <id>}`, and
   `{"parent_id": null}` for a space's root. Confirmed by [L1] (a file two levels down, its directory and the root, on
   each of the three providers), which also refuted the `path` attribute the gate read before: [S9], the earlier
@@ -150,13 +198,22 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   named only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET
   /data/{id}/qos/summary` (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}`
   (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only), `DELETE
-  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"`, the
-  recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`; answer
-  `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`). A cancel's and a
+  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"` (the
+  default), the recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`;
+  answer `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`) and sent by one
+  live run, the 14 Nov 2026 slot, which showed that it takes `include_directories`. A cancel's and a
   removal's space is read from the
   record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
   requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
   provisioner's own) has every target checked against that space alone, its id, its name and its own prefixes.
+- A space held on an imported storage (O41, `storageimport.py`) is checked through the data provider's Onepanel, under
+  `/api/v3/onepanel` on the provider's own address, as the Compose federation's bootstrap calls it, with the admin
+  token, which must be a member of that provider's cluster: `panel_get` reads `GET /provider/spaces/{space}` (answer
+  `storageId`, `storageImport`), `GET /provider/storages/{id}` (answer `importedStorage`, `readonly`, `mountPoint`) and
+  `GET /provider/spaces/{space}/storage-import/auto/info` (answer `status` and the scan's counters), and nothing
+  else; `force_scan` sends `POST /provider/spaces/{space}/storage-import/auto/force-start`, gated as a mutation bound
+  to its space. All four are named only by onepanel 25.0 (e0de555b, `src/http/rest/api/rest_model.erl`), so they are in
+  `UNVERIFIED_ENDPOINTS`, covered by `tests/live/test_storage_import.py`.
 (All Onezone paths are under `/api/v3/onezone`, confirmed by [S1].)
 
 The gate's own reads, the ones that find a target's space, are plumbing: a caller that is the harness's own passes its
@@ -166,13 +223,13 @@ caller that measures the platform leaves the default, one attempt. The request t
 gate stays closed: each attempt that is answered is read afresh and decides, and after the last timeout the mutation
 or the range read is refused as not sent (`ScopeUnread`).
 
-No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
-which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, the
-reads of a user's Onezone admin privileges and of the clusters a token's user is a member of, and Onezone's reading of
-the global clock, since [L1] confirmed every other call and detail the layer relies on.
-Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
-deployment answers otherwise.
+A token ends with the lifetime it was minted with, which derives from the attempt's whole-time ceiling (O06), unless
+its user revokes it first: the one revocation this client sends is a slot user's own, of all its temporary tokens, at
+the end of a run that held the slot (C19). `UNVERIFIED_ENDPOINTS` lists what neither a source nor [L1] confirms: only
+the reset's QoS calls and its cancel, the reads of a user's Onezone admin privileges and of the clusters a token's user
+is a member of, Onezone's reading of the global clock, the three calls of a run's revocation, and the four panel calls
+of an imported space, since [L1] confirmed every other call and detail the layer relies on. Each entry, and each call
+[L1] confirmed, keeps its live test (`tests/live/`, marked `covers:`), which fails if a deployment answers otherwise.
 """
 
 import base64
@@ -182,8 +239,10 @@ import re
 import socket
 import threading
 import time
+import traceback
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -191,19 +250,39 @@ import httpx
 
 from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
+from expcore_onedata.collectbudget import COLLECT_AFTER_BYTES, CollectBudget
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
 from expcore_onedata.readretry import ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
-from expcore_onedata.streamed import Digest, media_type
+from expcore_onedata.streamed import Digest, ReadOutcome, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
 API_PROVIDER = "/api/v3/oneprovider"  # [S7]
+# A provider's Onepanel, served on the provider's own address, as the Compose federation's bootstrap calls it
+# (deploy/compose-federation/fedrest.py, PANEL_API): the storage import's state lives there alone (O41).
+API_PANEL = "/api/v3/onepanel"
+# The Onepanel reads the layer sends, for a space held on an imported storage (`storageimport.py`): the support's
+# storage and import mode, the storage's flags, and the state of the space's auto import scan. No other panel read is.
+PANEL_READS = (
+    re.compile(r"/provider/spaces/[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}"),
+    re.compile(r"/provider/spaces/[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}/storage-import/auto/info"),
+    re.compile(r"/provider/storages/[A-Za-z0-9_@=-][A-Za-z0-9_.@=-]{0,127}"),
+)
+FORCE_SCAN_PATH = "/provider/spaces/{space}/storage-import/auto/force-start"  # the one panel mutation (`force_scan`)
 AUTH_HEADER = "X-Auth-Token"  # [S2]
 MUTATING = ("POST", "PUT", "PATCH", "DELETE")
 UPLOAD_CONTENT_TYPE = "application/octet-stream"  # of every raw body a mutation sends; [L1]: 25.0 refuses one without
 # POSTs that only read, and whether they are sent with the admin credential: the examination is [S4], [S5], called as
-# an admin; the scope inference is [S6], called without a header.
-READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_access_token_scope": False}
+# an admin; the scope inference is [S6], called without a header, and so is the verification of an access token, which
+# a revocation is confirmed by (C19).
+VERIFY_TOKEN_PATH = "/tokens/verify_access_token"
+READING_POSTS: Mapping[str, bool] = {
+    "/tokens/examine": True,
+    "/tokens/infer_access_token_scope": False,
+    VERIFY_TOKEN_PATH: False,
+}
+# A user's own temporary tokens: POST mints one, GET reads their generation, DELETE revokes all of them (HTTP Basic).
+TEMPORARY_TOKENS_PATH = "/user/tokens/temporary"
 # Onezone's reading of the global clock, which a job's times are stamped on: a GET it answers to anyone, so `get_dated`
 # sends it with no credential header when asked to (`anonymous`), and for this path alone.
 ZONE_TIME_PATH = "/provider/public/get_current_time"
@@ -213,17 +292,10 @@ PUBLIC_READS: tuple[str, ...] = (ZONE_TIME_PATH,)
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a writing
-# tool-server user's Onezone admin privileges and of the clusters its token's user is a member of, and Onezone's
-# reading of the global clock, which the transfer log and the reset's history place their window by.
+# live run has made yet, the reads of a writing tool-server user's Onezone admin privileges and of the clusters its
+# token's user is a member of, and Onezone's reading of the global clock, which the transfer log and the reset's
+# history place their window by.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
-    (
-        "PUT",
-        "/data/{id}/content",
-        "a provider call: a write without the offset query truncates the file to the bytes it sends, which a "
-        "restarted upload relies on; named only by the provider's API description (25.0), and every source sends an "
-        "offset [S8]",
-    ),
     (
         "DELETE",
         "/transfers/{id}",
@@ -251,9 +323,10 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "GET",
         "/data/{id}/files",
-        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, with "
-        "include_directories, which the provider's API description omits, and effQosInheritancePath; read from the "
-        "source of the federation's build (resetqos.py), never sent by a live run, and not the default until it is",
+        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, the default, "
+        "with include_directories, which the provider's API description omits, and effQosInheritancePath; read from "
+        "the source of the federation's build (resetqos.py), and sent by one live run (14 Nov 2026), which showed "
+        "it takes include_directories",
     ),
     (
         "GET",
@@ -275,6 +348,55 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "a Onezone call sent with no credential: the global clock, which a job's times are stamped on, in epoch "
         "milliseconds under timeMillis, which the transfer log and the reset's history place their window by; named "
         "only by oz-worker's source (14b5bda, provider_routes.erl:192-198), which says it needs no privilege",
+    ),
+    (
+        "GET",
+        TEMPORARY_TOKENS_PATH,
+        "a Onezone call sent as the user itself (HTTP Basic): the generation of its temporary tokens under "
+        "generation, read before and after a revocation, which must make it rise; named only by oz-worker's source "
+        "(14b5bda, token_routes.erl:163-169, temporary_token_secret.erl:199-224)",
+    ),
+    (
+        "DELETE",
+        TEMPORARY_TOKENS_PATH,
+        "a Onezone call sent as the user itself (HTTP Basic), with no privilege: revokes every temporary token of "
+        "that user by a new generation, answered 204, at the end of a run that held the user's slot; named only by "
+        "oz-worker's source (14b5bda, token_routes.erl:170-176, token_logic_plugin.erl:330-331, 379-380)",
+    ),
+    (
+        "POST",
+        VERIFY_TOKEN_PATH,
+        "a Onezone call sent with no credential, as the scope inference is: a token older than its user's generation "
+        "answered 400 tokenRevoked before any caveat is checked, which confirms a revocation; named only by "
+        "oz-worker's source (14b5bda, token_logic_plugin.erl:165-176, token_auth.erl:357-364) and ctool's error",
+    ),
+    (
+        "GET",
+        "/provider/spaces/{space}",
+        "a panel call with the admin token: a supported space's storageId and its storageImport (mode and auto "
+        "config), which an imported space's check reads; named only by onepanel's REST model (e0de555b, "
+        "rest_model.erl, space_details_model)",
+    ),
+    (
+        "GET",
+        "/provider/storages/{id}",
+        "a panel call with the admin token: a storage's importedStorage, readonly and mountPoint, which an imported "
+        "space's check compares with its declaration; named only by onepanel's REST model (e0de555b, rest_model.erl, "
+        "posix_model)",
+    ),
+    (
+        "GET",
+        "/provider/spaces/{space}/storage-import/auto/info",
+        "a panel call with the admin token: the state of a space's auto import scan (status, start, stop, "
+        "createdFiles, modifiedFiles, deletedFiles, unmodifiedFiles, failedFiles, totalScans), which an import's "
+        "wait reads; named only by onepanel's routes and REST model (e0de555b, storage_import_rest_routes.erl:57-58, "
+        "rest_model.erl, auto_storage_import_info_model)",
+    ),
+    (
+        "POST",
+        FORCE_SCAN_PATH,
+        "a panel call with the admin token: starts a new scan of a space's auto import, which the re-scan check "
+        "sends; named only by onepanel's routes (e0de555b, storage_import_rest_routes.erl:35-36)",
     ),
 )
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
@@ -329,6 +451,135 @@ def _build_http(config: PlatformConfig, timeout_s: float) -> httpx.Client:
     return httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
 
 
+_NO_BODY = httpx.ByteStream(b"")  # holds nothing and points at nothing: what a released answer's stream is made
+
+
+def _release(response: httpx.Response) -> httpx.Response:
+    """Close an answer and cut the reference cycle httpx builds around it, so that its body, and its request's, are
+    freed when the last name for it goes, not at the next full collection (#259, O47).
+
+    httpx replaces an answer's stream with one that holds the answer (`BoundSyncStream`, which stamps `elapsed` when the
+    stream closes), and the answer holds the stream: a cycle of the answer, its request, both bodies and, over a real
+    connection, httpcore's pool objects for it. Once an answer is closed the stream has nothing left to do, so it is
+    swapped for an empty one, even when the close itself failed. What the answer holds of its own (`status_code`,
+    `headers`, `content`, `json()`, `num_bytes_downloaded`) is untouched, and a stream that was not read stays unread:
+    it cannot be read after a close either way. A redirect is never followed (`_exchange`, `_streamed`), so an answer
+    has no earlier one to release."""
+    try:
+        response.close()
+    finally:
+        response.stream = _NO_BODY
+    return response
+
+
+def _answers(response: httpx.Response, request: httpx.Request) -> bool:
+    """Tell whether an answer is the answer to this request. An answer no request was set on, a mock transport handler's
+    own, answers none."""
+    try:
+        return response.request is request
+    except RuntimeError:
+        return False
+
+
+def _release_stranded(error: BaseException, request: httpx.Request) -> int:
+    """Release the answers to `request` that a failure inside httpx's own send carried off with it, and return the
+    bytes of body they had delivered (#259, O47).
+
+    httpx can fail on an answer after the transport has delivered it and before it returns it: a redirect whose
+    Location it cannot parse, a hook of the HTTP client that raises. It closes the answer and leaves it in its cycle
+    with the request, and the failure reaches the caller before the caller holds the answer. The answer is a local of
+    the frames the failure passed through, so each answer to `request` found there is released, once. An answer of
+    another request, which a mock transport's handler may hold in a local of its own, is left as it is.
+
+    The first frame of the failure's traceback is the caller's own, and is not read: its locals hold the failure
+    itself, and before Python 3.13 reading them copies them into a cache the frame keeps, a cycle of the frame, the
+    failure and its traceback that holds the request and the body written. The frames below it are cleared at the end,
+    which drops the copies reading them made and whatever else they held. Clearing every one of them, not only those
+    that held an answer, is deliberate: they are finished, and what they held of the request and its body is not
+    wanted. A close that fails on top of the failure being reported adds nothing to it, and is let go."""
+    first = error.__traceback__
+    below = None if first is None else first.tb_next
+    delivered: dict[int, int] = {}  # by the answer's identity: the same answer is a local of more than one frame
+    step = below
+    while step is not None:
+        for value in step.tb_frame.f_locals.values():
+            if isinstance(value, httpx.Response) and id(value) not in delivered and _answers(value, request):
+                delivered[id(value)] = _received(value)
+                with suppress(httpx.HTTPError):
+                    _release(value)
+        step = step.tb_next
+    if below is not None:
+        traceback.clear_frames(below)
+    return sum(delivered.values())
+
+
+def _received(response: httpx.Response) -> int:
+    """The bytes of an answer's body that came: what the transport delivered as it was read, or, for an answer a mock
+    transport made whole before any read, what it holds."""
+    if response.num_bytes_downloaded:
+        return response.num_bytes_downloaded
+    try:
+        return len(response.content)
+    except httpx.ResponseNotRead:
+        return 0
+
+
+def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, **options: Any) -> httpx.Response:
+    """Send one request on `http`, read its answer whole and release it however the read ends, and count the bytes of
+    the bodies it moved, the failed ones' too, for the fallback collection (#259, O47).
+
+    `http.request` raises from inside when an answer's body fails to read, before the caller has the answer to release,
+    and leaves it in its cycle with the request and the body sent. So the request is built and sent here, streamed, and
+    its body read in the open. A redirect is never followed, whatever the client was built to do: httpx follows one
+    inside `send`, and a redirect that failed halfway leaves its answers in their cycles out of reach, and a request of
+    the layer goes where its configuration says and nowhere else, with the credential header it carries (O09). A 3xx
+    answer is returned like any other, released and refused by `_checked` (`_refuse_redirect`), and its body is never
+    read: one that stalls would raise a timeout, which a GET under a retry policy would try again, losing the status."""
+    request = http.build_request(method, url, **options)
+    sent = int(request.headers.get("Content-Length") or 0)
+    try:
+        response = http.send(request, stream=True, follow_redirects=False)
+    except BaseException as error:
+        budget.spent(sent + _release_stranded(error, request))
+        raise
+    try:
+        if not _is_redirect(response.status_code):  # a 3xx is refused unread (`_refuse_redirect`), whatever it holds
+            response.read()
+    finally:
+        try:
+            _release(response)
+        finally:
+            budget.spent(sent + _received(response))
+    return response
+
+
+@contextmanager
+def _streamed(
+    http: httpx.Client, budget: CollectBudget, url: str, *, headers: Mapping[str, str], timeout: float, label: str
+) -> Iterator[httpx.Response]:
+    """Stream a GET as `http.stream` does, release the answer however the block ends, an error in it included, so that
+    an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47).
+
+    The request is sent here, as `_exchange` sends one, so that an answer httpx fails on inside its send can be found
+    and released, which `http.stream` leaves to its caller who never holds it. A 3xx answer is refused here, before
+    the block is entered, so that no caller of a streamed answer can take one for a result, and it is released as any
+    other (`_refuse_redirect`); its body, which is never read, may name a credential or a host."""
+    request = http.build_request("GET", url, headers=headers, timeout=timeout)
+    try:
+        response = http.send(request, stream=True, follow_redirects=False)
+    except BaseException as error:
+        budget.spent(_release_stranded(error, request))
+        raise
+    try:
+        _refuse_redirect(response, "GET", label)
+        yield response
+    finally:
+        try:
+            _release(response)
+        finally:
+            budget.spent(_received(response))
+
+
 class PlatformError(RuntimeError):
     """A request failed or was answered with something unreadable; the message holds no URL, body or header.
 
@@ -363,6 +614,11 @@ class OutOfScope(NotSent):
     """A mutation's target is no study space, or a path leaves the API; the mutation was not sent."""
 
 
+class TruncatingWrite(OutOfScope):
+    """A write of content without a whole `offset` of 0 or more, which truncates the file to 0 before it writes
+    (op-worker f118ed9, file_content_rest_handler.erl:224-228); refused before anything is read or sent (O44)."""
+
+
 class ScopeUnread(NotSent):
     """A read the gate makes to find a request's target space failed, so the request was not sent (fail closed).
 
@@ -387,6 +643,44 @@ def _answered(label: str, method: str, status: int, code: str | None, errno: str
     """The message of an error answer: the label, the method, the status, and the error id with its errno."""
     shown = f"{code}: {errno}" if code and errno else code
     return f"{label}: {method} answered {status}" + (f" ({shown})" if shown else "")
+
+
+def _is_redirect(status: int) -> bool:
+    """Tell whether a status is a 3xx, 300 to 399. The client follows none, and takes none for a result."""
+    return 300 <= status < 400
+
+
+def _refuse_redirect(response: httpx.Response, method: str, label: str) -> None:
+    """Raise the PlatformError of a 3xx answer, whatever its status, and return for any other.
+
+    The client follows no redirect, so a 3xx is the answer it gets, and a bodyless one decodes to `{}`: an empty
+    success, a false pass for a write as much as for a read. None is taken for a result, a 304 included, since the
+    client sends no validator that would earn one. The error names the status, and says whether the answer names a
+    `Location`, never what it names or what its body holds, which may carry a host or a credential. It is an answer, not
+    a transport failure, so a caller that retries on a timeout, or on `transport`, does not retry it. A poll that counts
+    every failed read as one that did not match still polls it again, within its bound, as it does any error."""
+    status = response.status_code
+    if _is_redirect(status):
+        named = " (it names a Location)" if "location" in response.headers else ""
+        raise PlatformError(
+            f"{label}: {method} answered {status}, which is neither followed nor taken for a result{named}",
+            status=status,
+        )
+
+
+def _checked(response: httpx.Response, method: str, label: str) -> httpx.Response:
+    """Return an answer whose status is below 300, and raise the PlatformError of one that is a 3xx
+    (`_refuse_redirect`) or a 400 or more."""
+    _refuse_redirect(response, method, label)
+    if response.status_code >= 400:
+        code, errno = _error_fields(response)
+        raise PlatformError(
+            _answered(label, method, response.status_code, code, errno),
+            status=response.status_code,
+            code=code,
+            errno=errno,
+        )
+    return response
 
 
 def answered_absent(error: PlatformError) -> bool:
@@ -416,6 +710,20 @@ def _check_path(path: str) -> str:
     if not path.startswith("/") or path.startswith("//") or "://" in path or ".." in path.split("/") or "\\" in path:
         raise OutOfScope("the request path is not a plain path of the API")
     return path
+
+
+def _refuse_truncation(method: str, path: str, params: Mapping[str, Any] | None) -> None:
+    """Refuse a write of content (a PUT to a path that ends in `/content`) unless it names a whole offset of 0 or more:
+    without one, the provider truncates the file to 0 first, which would drop the blocks of a file that is still
+    arriving and of any baseline file (O44). An empty body at an offset is a write too, and is sent."""
+    if method != "PUT" or not path.rstrip("/").endswith("/content"):
+        return
+    offset = (params or {}).get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise TruncatingWrite(
+            "a write of content needs a whole offset of 0 or more: without one the provider truncates the file to 0 "
+            "first, so it is never sent"
+        )
 
 
 def _target_space_id(path: str) -> str:
@@ -494,14 +802,21 @@ class OnezoneClient:
         environ: Mapping[str, str] | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         kept_links: int = MAX_KEPT_LINKS,
+        collect_after_bytes: int | None = COLLECT_AFTER_BYTES,
     ) -> None:
         """Build the client; the admin credential comes from `admin_token` or else from the configured source.
 
         The client it builds checks certificates as the platform's `[tls]` says (`tls.py`): its own default CAs, the
         configured CA bundle alone, or not at all. An injected `http` is the caller's, with its own TLS. `kept_links`
-        bounds the parent links the gate keeps (`MAX_KEPT_LINKS` by default)."""
+        bounds the parent links the gate keeps (`MAX_KEPT_LINKS` by default).
+
+        Every answer is released as soon as it is used, so a body is freed with its exchange (#259, O47).
+        `collect_after_bytes` is the fallback under that: once the bodies sent and received since the last collection
+        reach it, a full collection runs before the next exchange (`COLLECT_AFTER_BYTES`, 128 MiB, by default; None for
+        a caller that collects itself). A positive whole number of bytes, or ValueError."""
         if kept_links < 1:
             raise ValueError("the client keeps at least one parent link")
+        self._budget = CollectBudget(collect_after_bytes)
         self._config = config
         self._http = http if http is not None else _build_http(config, timeout_s)
         self._owns_http = http is None
@@ -535,16 +850,20 @@ class OnezoneClient:
         """Name the client without its credential."""
         return f"OnezoneClient(zone={self._config.zone.name!r})"
 
-    def _base(self, provider: str | None) -> tuple[str, str]:
-        """Return the base URL and the label used in messages: `zone`, or `providers[i]` for the i-th declared one.
+    def _base(self, provider: str | None, *, panel: bool = False) -> tuple[str, str]:
+        """Return the base URL and the label used in messages: `zone`, or `providers[i]` for the i-th declared one;
+        with `panel`, the provider's Onepanel (`API_PANEL`) on the same address.
 
         The label is a role or a position in the file, never the provider's name, so a message holds no federation name.
         """
         if provider is None:
+            if panel:
+                raise OutOfScope("a panel request names no provider")
             return self._config.zone.url + API_ZONE, "zone"
         if provider not in self._config.providers:
             raise OutOfScope("the request names a provider that is not declared")
-        return self._config.providers[provider].url + API_PROVIDER, self._config.provider_label(provider)
+        api = API_PANEL if panel else API_PROVIDER
+        return self._config.providers[provider].url + api, self._config.provider_label(provider)
 
     def provider_label(self, provider: str) -> str:
         """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
@@ -579,17 +898,21 @@ class OnezoneClient:
         retry: ReadRetry = ONE_ATTEMPT,
         deadline_s: float | None = None,
         fresh: bool = False,
+        panel: bool = False,
     ) -> httpx.Response:
-        """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError.
+        """Send one request and return the answer; a transport failure or a status of 300 or more is a PlatformError.
 
         A transport failure (a reset, a refusal, a timeout) has `transport` set and a real answer has its status, so
-        a caller that retries can tell the two apart (O08). Only a GET under a policy of more than one attempt is
-        retried, and only when it timed out (`readretry.py`); anything else is sent once. With `fresh` the request,
-        sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
+        a caller that retries can tell the two apart (O08). A 3xx is a real answer, refused with its status as a 400 or
+        more is: the client follows no redirect, and one is no result (`_refuse_redirect`). Only a GET under a policy of
+        more than one attempt is retried, and only when it timed out (`readretry.py`); anything else is sent once. With
+        `fresh` the request, sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
+        With `panel` it goes to the provider's Onepanel (`_base`).
         """
-        base, label = self._base(provider)
+        base, label = self._base(provider, panel=panel)
         url = base + _check_path(path)
         wait = timeout_s if timeout_s is not None else self._timeout_s
+        self._budget.before_exchange()  # a collection owed for earlier exchanges runs now, none of this one's alive
 
         def send(timeout: float, trace: Trace | None, new_connection: bool) -> httpx.Response:
             options: dict[str, Any] = {
@@ -602,40 +925,47 @@ class OnezoneClient:
             }
             if new_connection and self._owns_http:  # a connection of its own, never one of the pool's idle ones
                 with _build_http(self._config, self._timeout_s) as one_shot:
-                    return one_shot.request(method, url, **options)
-            return self._http.request(method, url, **options)
+                    return _exchange(one_shot, self._budget, method, url, **options)
+            return _exchange(self._http, self._budget, method, url, **options)
 
         try:
-            if method == "GET" and retry.attempts > 1:
-                response = run_attempts(
-                    send,
-                    retry=retry,
-                    label=label,
-                    timeout_s=wait,
-                    timeouts=RETRIED_TIMEOUTS,
-                    deadline_s=deadline_s,
-                    served=self._served_before,
-                )
-            elif method == "PUT" and content is not None:
-                response = self._send_content(send, label, len(content), wait, fresh)
-            else:
-                response = send(wait, None, fresh)
+            response = self._dispatch(send, method, label, content, wait, retry, deadline_s, fresh)
         except Exhausted as spent:
-            raise PlatformError(
-                f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts",
-                transport=True,
-            ) from None
+            failed = f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts"
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: {method} failed ({type(error).__name__})", transport=True) from None
-        if response.status_code >= 400:
-            code, errno = _error_fields(response)
-            raise PlatformError(
-                _answered(label, method, response.status_code, code, errno),
-                status=response.status_code,
-                code=code,
-                errno=errno,
+            failed = f"{label}: {method} failed ({type(error).__name__})"
+        else:
+            return _checked(response, method, label)
+        # Raised here, with the handlers over: an error raised inside one has the httpx error as its context, and that
+        # holds the request, its body and the frames the failure passed through, for as long as the error lives (#259).
+        raise PlatformError(failed, transport=True)
+
+    def _dispatch(
+        self,
+        send: Callable[[float, Trace | None, bool], httpx.Response],
+        method: str,
+        label: str,
+        content: bytes | None,
+        wait: float,
+        retry: ReadRetry,
+        deadline_s: float | None,
+        fresh: bool,
+    ) -> httpx.Response:
+        """Send one request as its kind asks: a GET under a policy of more than one attempt is retried when it timed
+        out, a write of content is sent once and logged with how its connection began, and any other is sent once."""
+        if method == "GET" and retry.attempts > 1:
+            return run_attempts(
+                send,
+                retry=retry,
+                label=label,
+                timeout_s=wait,
+                timeouts=RETRIED_TIMEOUTS,
+                deadline_s=deadline_s,
+                served=self._served_before,
             )
-        return response
+        if method == "PUT" and content is not None:
+            return self._send_content(send, label, len(content), wait, fresh)
+        return send(wait, None, fresh)
 
     def _send_content(
         self,
@@ -685,6 +1015,7 @@ class OnezoneClient:
         retry: ReadRetry = ONE_ATTEMPT,
         deadline_s: float | None = None,
         fresh: bool = False,
+        panel: bool = False,
     ) -> Any:
         """Send one request and return the decoded JSON; map every failure to a PlatformError without detail."""
         response = self._request(
@@ -699,8 +1030,47 @@ class OnezoneClient:
             retry=retry,
             deadline_s=deadline_s,
             fresh=fresh,
+            panel=panel,
         )
         return self._decoded(response, method, provider)
+
+    def panel_get(self, provider: str, path: str, *, retry: ReadRetry = ONE_ATTEMPT) -> Any:
+        """GET one of the Onepanel reads the layer knows (`PANEL_READS`) from a declared provider's panel, with the
+        admin credential: a space's support (its `storageId` and `storageImport`), a storage's flags
+        (`importedStorage`, `readonly`, `mountPoint`) and the state of a space's auto import scan (O41). Any other
+        panel path, and an undeclared provider, is refused unsent (`OutOfScope`). The admin credential must be a
+        member of the provider's cluster for the panel to answer; a refusal is the panel's 401 or 403, raised as it
+        came. `retry` is as for `get`."""
+        path = _check_path(path)
+        if any(mark in path for mark in "%?#") or not any(read.fullmatch(path) for read in PANEL_READS):
+            raise OutOfScope("the panel path is not one of the reads the layer sends; nothing was sent")
+        return self._send("GET", path, provider=provider, headers=self._admin, retry=retry, panel=True)
+
+    def force_scan(self, provider: str, space: Space, *, gate_retry: ReadRetry = ONE_ATTEMPT) -> Any:
+        """Force a new auto storage import scan of `space` on a provider's Onepanel (`FORCE_SCAN_PATH`), gated as a
+        mutation bound to that space: the space's live name is read on Onezone right before, and the request is
+        refused unsent unless the id, the name and the prefixes are the space's own and the name lies under a declared
+        prefix (`OutOfScope`), or when that read fails (`ScopeUnread`). With a scan's detection of modifications and
+        deletions off, a forced scan only adds what is new on the storage (op-worker f118ed9,
+        `storage_import_engine.erl`, `maybe_update_file`)."""
+        self._base(provider, panel=True)  # an undeclared provider is refused before anything is read
+        if not _SPACE_ID.fullmatch(space.id):
+            raise OutOfScope("the space's id is not a plain path segment; nothing was sent")
+        try:
+            name = self._space_name(space.id, _GateReads(gate_retry))
+        except NotSent:
+            raise
+        except PlatformError as error:
+            raise ScopeUnread(
+                f"the gate could not read the target's space ({error}); nothing was sent",
+                status=error.status,
+                code=error.code,
+                errno=error.errno,
+                transport=error.transport,
+            ) from None
+        self._require_in_scope((space.id, name), space)
+        path = FORCE_SCAN_PATH.format(space=space.id)
+        return self._send("POST", path, provider=provider, headers=dict(self._admin), panel=True)
 
     def _decoded(self, response: httpx.Response, method: str, provider: str | None) -> Any:
         """Return an answer's decoded JSON, or a PlatformError without detail when it is not JSON."""
@@ -709,7 +1079,8 @@ class OnezoneClient:
         try:
             return response.json()
         except ValueError:
-            raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
+            pass  # the decoder's error holds the whole text it could not read, so it is no context of ours (#259)
+        raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON")
 
     def get_dated(
         self,
@@ -816,11 +1187,17 @@ class OnezoneClient:
         provider's `GET /spaces/{id}`, read once per space and provider and kept once it was answered. An absence
         (`answered_absent`) is a space the provider does not hold, left out and asked again next time; when the
         provider holds none of them, the target resolves to no space (OutOfScope). Any other failure, or an answer
-        without a plain id, raises PlatformError and keeps nothing of that space."""
+        without a plain id, raises PlatformError and keeps nothing of that space. The link check's probe space
+        (`[link_check]`, O35) is asked too, of a provider that supports it, so a probe file resolves to it; only a
+        request bound to it passes the gate there (`_require_in_scope`)."""
         roots: dict[str, str] = {}
         declared = self._config.spaces
         supported = [entry for entry in declared if provider in entry.support.providers] or declared
-        for space_id in dict.fromkeys(entry.space.id for entry in supported):
+        ids = [entry.space.id for entry in supported]
+        probe = self._config.link_check
+        if probe is not None and provider in probe.providers:
+            ids.append(probe.space.id)
+        for space_id in dict.fromkeys(ids):
             root = self._space_root(provider, space_id, reads)
             if root is not None:
                 roots[root] = space_id
@@ -1045,10 +1422,14 @@ class OnezoneClient:
     def _require_in_scope(self, target: tuple[str, str], space: Space | None) -> None:
         """Refuse a target space whose name starts with no declared space's prefix (every `[[spaces]]` entry's), and,
         for a request bound to one space (`space`), a target that is not that space: another id, another name, or a
-        name outside its own prefixes, whatever the other spaces' prefixes allow."""
+        name outside its own prefixes, whatever the other spaces' prefixes allow. A request bound to the link check's
+        probe space (`PlatformConfig.probe_space`, O35) passes on that space alone; no other request reaches it, since
+        its prefixes are not among the study's."""
         space_id, name = target
         if space is not None and (space_id != space.id or name != space.name or not name.startswith(space.prefixes)):
             raise OutOfScope("the target lies in another space than the one the request is bound to; nothing was sent")
+        if space is not None and space == self._config.probe_space:
+            return
         if not name.startswith(self._config.prefixes):
             raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
 
@@ -1096,6 +1477,7 @@ class OnezoneClient:
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
+        _refuse_truncation(method, path, params)
         media = UPLOAD_CONTENT_TYPE if content_type is None else media_type(content_type)
         self._base(provider)  # an undeclared provider is refused before anything is read
         self._require_in_scope(self._target(method, path, provider, json, _GateReads(gate_retry)), space)
@@ -1124,6 +1506,7 @@ class OnezoneClient:
         timeout_s: float | None = None,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        answers: Callable[[ReadOutcome], None] | None = None,
     ) -> bytes:
         """Read `length` bytes from `offset` of a file's content through a declared provider; return the bytes.
 
@@ -1131,8 +1514,13 @@ class OnezoneClient:
         that provider grows (on-the-fly replication). It changes state, so it passes the same gate as a mutation: the
         path must be `/data/{id}/content`, and the file's space must have a name that starts with a configured prefix,
         or nothing is sent; with `space`, that space alone, as for `mutate`. The answer must be a 206 whose
-        `Content-Range` starts at `offset` and matches the body, and the body must be `length` bytes unless the range
-        ends at the end of the file; anything else is refused. [S8]
+        `Content-Range` starts at `offset`, ends inside the file it names and matches the body, and the body must be
+        `length` bytes unless the range ends at the end of the file; anything else is refused, a 200 (the whole file,
+        whatever it holds) and an empty answer included. [S8]
+
+        `answers`, when given, is called once with what the platform answered (`ReadOutcome`: its status, its
+        `Content-Range` as sent and the bytes of its body) after the answer is accepted, so a range clipped at the end
+        of the file shows as its shorter range; a refused answer reports nothing (O37).
 
         `gate_retry` is the policy of the gate's reads alone, as for `mutate`; the range read itself is one request,
         since it may have made the provider fetch bytes.
@@ -1150,18 +1538,23 @@ class OnezoneClient:
             "GET", path, provider=provider, headers=headers, timeout_s=timeout_s, retry=ONE_ATTEMPT
         )
         label = self._base(provider)[1]
-        found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+        sent = response.headers.get("Content-Range")
+        found = _CONTENT_RANGE.fullmatch(sent or "")
         if response.status_code != 206 or found is None:
             raise PlatformError(f"{label}: a range read was not answered with a 206 and a Content-Range")
         first, last, total = (int(found.group(i)) for i in (1, 2, 3))
         body = response.content
         if (
             first != offset
+            or last < first
+            or last >= total
             or last - first + 1 != len(body)
             or len(body) > length
             or (len(body) < length and last + 1 != total)
         ):
             raise PlatformError(f"{label}: a range read was answered with another range than the one asked for")
+        if answers is not None:
+            answers(ReadOutcome(response.status_code, sent, len(body)))
         return body
 
     def read_content(
@@ -1177,9 +1570,12 @@ class OnezoneClient:
         clock: Callable[[], float] = time.monotonic,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        answers: Callable[[ReadOutcome], None] | None = None,
+        stop: int | None = None,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
-        size and the SHA-256 of what was read (O25).
+        size and the SHA-256 of what was read (O25). With `stop`, only the first `stop` bytes are read, each answer
+        still checked against the file's `size`: the prefix of a file at its final size (O44).
 
         Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
         delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of
@@ -1198,12 +1594,20 @@ class OnezoneClient:
         each is given what remains of the deadline when that read begins: its retries and pauses stay within it, so
         they never carry the gate past the deadline, and a read that begins after it was passed is made once. A range
         is streamed once, whatever the policy.
+
+        `answers`, when given, is called once per range, in order, after that range was read whole and found to be
+        exactly the range asked for, with what the platform answered (`ReadOutcome`: 206, the `Content-Range` as sent,
+        the bytes of the body); a range that is refused, or cut short, reports nothing, so a failed read has reported
+        the ranges that came before it and no more (O37).
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
             raise OutOfScope("a content read is of /data/{id}/content only")
         if size < 0 or chunk_bytes < 1 or not deadline_s > 0:
             raise OutOfScope("a streamed read needs its bounds: a size of zero or more, a positive chunk and deadline")
+        end = size if stop is None else stop
+        if not 0 <= end <= size:
+            raise OutOfScope("a streamed read's stop lies within the file's size")
         path = _check_path(path)
         base, label = self._base(provider)
         hasher, began = hashlib.sha256(), clock()
@@ -1219,28 +1623,41 @@ class OnezoneClient:
             if clock() - began > deadline_s:
                 raise PlatformError(late)
 
-        if size == 0:
+        if end == 0:
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
-        for first in range(0, size, chunk_bytes):
+        for first in range(0, end, chunk_bytes):
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
             remaining = deadline_s - (clock() - began)
             if remaining <= 0:
                 raise PlatformError(late)
             wait = min(timeout_s if timeout_s is not None else self._timeout_s, remaining)
-            self._stream_range(base + path, label, (first, min(chunk_bytes, size - first), size), wait, consume)
-        return Digest(size, hasher.hexdigest())
+            self._stream_range(base + path, label, (first, min(chunk_bytes, end - first), size), wait, consume, answers)
+        return Digest(end, hasher.hexdigest())
 
     def _stream_range(
-        self, url: str, label: str, span: tuple[int, int, int], wait: float, consume: Callable[[bytes], None]
+        self,
+        url: str,
+        label: str,
+        span: tuple[int, int, int],
+        wait: float,
+        consume: Callable[[bytes], None],
+        answers: Callable[[ReadOutcome], None] | None = None,
     ) -> None:
         """Stream one range, `span` = (first byte, length, the file's size), to `consume` piece by piece; refuse an
-        answer that is not exactly that range of a file of that size."""
+        answer that is not exactly that range of a file of that size. Once it is whole, `answers` is told what the
+        platform answered."""
         first, length, total = span
         last = first + length - 1
         got = 0
+        self._budget.before_exchange()
         try:
-            with self._http.stream(
-                "GET", url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
+            with _streamed(
+                self._http,
+                self._budget,
+                url,
+                headers={**self._admin, "Range": f"bytes={first}-{last}"},
+                timeout=wait,
+                label=label,
             ) as response:
                 status = response.status_code
                 if status >= 400:
@@ -1248,7 +1665,8 @@ class OnezoneClient:
                     raise PlatformError(
                         _answered(label, "GET", status, code, errno), status=status, code=code, errno=errno
                     )
-                found = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+                sent = response.headers.get("Content-Range")
+                found = _CONTENT_RANGE.fullmatch(sent or "")
                 if status != 206 or found is None:
                     raise PlatformError(f"{label}: a streamed read's range was not answered with a 206 and a range")
                 if tuple(int(found.group(i)) for i in (1, 2, 3)) != (first, last, total):
@@ -1259,9 +1677,14 @@ class OnezoneClient:
                         raise PlatformError(f"{label}: a streamed read's range carried more bytes than it asked for")
                     consume(piece)
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
-        if got != length:
-            raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
+            failed = f"{label}: GET failed ({type(error).__name__})"
+        else:
+            if got != length:
+                raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
+            if answers is not None:
+                answers(ReadOutcome(status, sent, got))
+            return
+        raise PlatformError(failed, transport=True)  # with the handler over, so the httpx error is no context (#259)
 
     def content_answer(
         self, path: str, *, provider: str, first_byte: bool, timeout_s: float | None = None
@@ -1271,7 +1694,7 @@ class OnezoneClient:
         The body is never read: the answer is closed once its head has arrived, so a large file costs nothing. It passes
         the same gate as `read_range`, since a read through a provider that lacks the bytes fetches them: the path must
         be `/data/{id}/content` and the file's space must have a configured prefix, or nothing is sent. A transport
-        failure or a status of 400 or more is a `PlatformError`. The pre-campaign check is its caller (O05).
+        failure, a 3xx or a status of 400 or more is a `PlatformError`. The pre-campaign check is its caller (O05).
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -1280,19 +1703,27 @@ class OnezoneClient:
         base, label = self._base(provider)
         self._require_in_scope(self._target("GET", path, provider, None, _ONE_ATTEMPT), None)
         headers = {**self._admin, **({"Range": "bytes=0-0"} if first_byte else {})}
+        self._budget.before_exchange()
         try:
-            with self._http.stream(
-                "GET", base + path, headers=headers, timeout=timeout_s if timeout_s is not None else self._timeout_s
+            with _streamed(
+                self._http,
+                self._budget,
+                base + path,
+                headers=headers,
+                timeout=timeout_s if timeout_s is not None else self._timeout_s,
+                label=label,
             ) as response:
                 status, content_type = response.status_code, response.headers.get("Content-Type")
                 code, errno = (None, None)
                 if status >= 400 and response.read() is not None:
                     code, errno = _error_fields(response)
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
-        if status >= 400:
-            raise PlatformError(_answered(label, "GET", status, code, errno), status=status, code=code, errno=errno)
-        return status, content_type
+            failed = f"{label}: GET failed ({type(error).__name__})"
+        else:
+            if status >= 400:
+                raise PlatformError(_answered(label, "GET", status, code, errno), status=status, code=code, errno=errno)
+            return status, content_type
+        raise PlatformError(failed, transport=True)  # with the handler over, so the httpx error is no context (#259)
 
     def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:
         """Mint a temporary access token for a user, as that user, with exactly these caveats; return the value.
@@ -1300,23 +1731,46 @@ class OnezoneClient:
         The user authenticates with its own password (HTTP Basic), read from its credential file the moment it is
         needed and registered as a secret, and the minted value is registered before it is returned (R12). [S1]
         """
-        users = self._config.users
-        if users is None:
-            raise MintNotSent("zone: platform.toml declares no [credentials.users], so no user can mint a token")
-        try:
-            password = users.read(principal.username, self._environ)
-        except ConfigError as error:
-            raise MintNotSent(f"zone: a user's credential cannot be used ({error})") from None
-        basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
         body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}
-        answer = self._send(
-            "POST", "/user/tokens/temporary", provider=None, headers={"Authorization": f"Basic {basic}"}, json=body
-        )
+        headers = self._as_user(principal, MintNotSent, "mint a token")
+        answer = self._send("POST", TEMPORARY_TOKENS_PATH, provider=None, headers=headers, json=body)
         value = answer.get("token") if isinstance(answer, dict) else None
         if not isinstance(value, str) or not value:
             raise PlatformError("zone: the answer to a token request holds no token")
         register_secret(value)
         return value
+
+    def own_temporary_generation(self, principal: Principal) -> int:
+        """Read, as the user itself, the generation of its temporary tokens: a whole number that a revocation raises.
+
+        An answer without one is a PlatformError; a user whose credential cannot be read is `NotSent`.
+        """
+        headers = self._as_user(principal, NotSent, "read its tokens")
+        # one attempt: a failed read writes no revoked line, so the slot stays held by its expiry (fail closed)
+        answer = self._send("GET", TEMPORARY_TOKENS_PATH, provider=None, headers=headers, retry=ONE_ATTEMPT)
+        generation = answer.get("generation") if isinstance(answer, dict) else None
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise PlatformError("zone: the answer to a read of a user's temporary tokens holds no generation")
+        return generation
+
+    def revoke_own_temporary_tokens(self, principal: Principal) -> None:
+        """Revoke, as the user itself, every temporary token of that user, and of no other: Onezone gives the user a
+        new generation, so each token of an older one is refused. It needs no privilege; a failure is a PlatformError
+        (`NotSent` when the user's credential cannot be read), and only a later read of the generation confirms it."""
+        headers = self._as_user(principal, NotSent, "revoke its tokens")
+        self._request("DELETE", TEMPORARY_TOKENS_PATH, provider=None, headers=headers)
+
+    def _as_user(self, principal: Principal, refused: type[NotSent], what: str) -> dict[str, str]:
+        """The header that logs in as the user (HTTP Basic), its password read now; `refused` when it cannot be."""
+        users = self._config.users
+        if users is None:
+            raise refused(f"zone: platform.toml declares no [credentials.users], so no user can {what}")
+        try:
+            password = users.read(principal.username, self._environ)
+        except ConfigError as error:
+            raise refused(f"zone: a user's credential cannot be used ({error})") from None
+        basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
+        return {"Authorization": f"Basic {basic}"}
 
 
 def tcp_connect(host: str, port: int, timeout_s: float) -> float:

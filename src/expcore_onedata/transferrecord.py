@@ -113,6 +113,28 @@ def _count(body: Mapping[str, Any], key: str) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _evicted_key(body: Mapping[str, Any]) -> str:
+    """The name a record carries its eviction counter under: `filesEvicted`, or the older `fileReplicasEvicted`."""
+    return "filesEvicted" if "filesEvicted" in body else "fileReplicasEvicted"
+
+
+def eviction_counters(body: Any) -> tuple[int, int, int] | None:
+    """`(filesProcessed, filesEvicted, filesFailed)` of a transfer's record, or None when the record is not an object
+    or any of the three is missing or not a count: unknown is never zero.
+
+    In op-worker's source (f118ed9, `replica_eviction_worker.erl`) a file is counted in `filesProcessed` however it
+    ended, and in `filesEvicted` or `filesFailed` only when it was evicted or failed. So `filesProcessed` above the
+    other two counts files the eviction skipped without a failure: ones the provider holds nothing of, ones cancelled
+    per file (a QoS requirement still covering the file there), ones open, and ones for which the provider knows of no
+    other copy yet, which is how an eviction right after a placement can complete having evicted nothing (O01)."""
+    if not isinstance(body, dict):
+        return None
+    processed = _count(body, "filesProcessed")
+    evicted = _count(body, _evicted_key(body))
+    failed = _count(body, "filesFailed")
+    return None if processed is None or evicted is None or failed is None else (processed, evicted, failed)
+
+
 def _time(body: Mapping[str, Any], key: str) -> float | None:
     value = body.get(key)
     if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
@@ -141,7 +163,6 @@ def job_of(transfer_id: str, listed_as: str, body: Any) -> Job:
         raise Unreadable(f"a {kind} record names no replicatingProviderId")
     if kind in REPLICATING and moved is None:
         raise Unreadable(f"a {kind} record has no readable bytesReplicated")
-    evicted = "filesEvicted" if "filesEvicted" in body else "fileReplicasEvicted"
     return Job(
         transfer_id=transfer_id,
         listed_as=listed_as,
@@ -152,7 +173,7 @@ def job_of(transfer_id: str, listed_as: str, body: Any) -> Job:
         state=_state(body),
         bytes_replicated=moved,
         files_replicated=_count(body, "filesReplicated"),
-        files_evicted=_count(body, evicted),
+        files_evicted=_count(body, _evicted_key(body)),
         files_failed=_count(body, "filesFailed"),
         scheduled=scheduled,
         started=_time(body, "startTime"),

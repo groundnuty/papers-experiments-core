@@ -2,18 +2,20 @@
 
 The Compose file runs on a shared Docker daemon, so what keeps it to itself is checked here, for every layout the
 generator is given: one project name, only the two pinned images and never a pull, every published port on the host's
-loopback, no privileged container, every bind source below the federation's root or the file's own directory, and a
-janitor that deletes only in a root carrying the declared project's mark. The CA, the certificates, the secrets, the
+loopback, no privileged container, every bind source below the federation's root or the file's own directory (a
+read-only import's source, named by its variable, is the one exception), and a janitor that deletes only in a root
+carrying the declared project's mark. The CA, the certificates, the secrets, the
 root's checks and platform.toml's rendering are checked offline too.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 
 import pytest
-from federation_support import DEPLOY, EXAMPLE
+from federation_support import DEPLOY, EXAMPLE, STORAGE_IMPORT
 
 from expcore_onedata.fault_settings import FaultSettings
 
@@ -72,6 +74,19 @@ def test_no_container_reaches_the_daemon_or_runs_privileged(fed, any_spec):
         assert not FORBIDDEN_SERVICE_KEYS & set(service)
 
 
+IMPORT_SOURCE = re.compile(r"\$\{EXPCORE_FED_IMPORT_[A-Z0-9_]{1,48}:\?set by federation\.py\}")
+
+
+def is_read_only_import_source(volume) -> bool:
+    """The one bind source outside the root: a read-only mount, below the imports' mount point, of the directory a
+    layout's variable names. Nothing else that is not below the root or beside the file may be bound."""
+    return (
+        volume.get("read_only") is True
+        and volume["target"].startswith("/volumes/import/")
+        and IMPORT_SOURCE.fullmatch(volume["source"]) is not None
+    )
+
+
 def test_every_bind_source_is_below_the_root_or_beside_the_file_and_is_never_created(fed, any_spec):
     root = fed.compose.ROOT
     sources = []
@@ -79,11 +94,29 @@ def test_every_bind_source_is_below_the_root_or_beside_the_file_and_is_never_cre
         for volume in service["volumes"]:
             assert volume["type"] == "bind"
             assert volume["bind"] == {"create_host_path": False}
+            inside = volume["source"].startswith(root + "/") or volume["source"] in (root, "./start.sh")
+            assert inside or is_read_only_import_source(volume), volume["target"]
             sources.append(volume["source"])
         for env_file in service.get("env_file", []):
             assert env_file["path"].startswith(root + "/secrets/")
     assert sources
-    assert all(s.startswith(root + "/") or s == root or s == "./start.sh" for s in sources)
+
+
+def test_a_bind_source_outside_the_root_is_allowed_only_as_a_read_only_import(fed):
+    """The exception is one shape: read-only, below /volumes/import/, named by an EXPCORE_FED_IMPORT_ variable."""
+    good = {
+        "source": "${EXPCORE_FED_IMPORT_FERN:?set by federation.py}",
+        "target": "/volumes/import/fern",
+        "read_only": True,
+    }
+    assert is_read_only_import_source(good)
+    assert not is_read_only_import_source({**good, "read_only": False})
+    assert not is_read_only_import_source({key: value for key, value in good.items() if key != "read_only"})
+    assert not is_read_only_import_source({**good, "target": "/volumes/storage"})
+    assert not is_read_only_import_source({**good, "source": "/srv/data"})
+    assert not is_read_only_import_source({**good, "source": "${HOME:?set by federation.py}"})
+    assert not is_read_only_import_source({**good, "source": "${EXPCORE_FED_IMPORT_FERN}"})
+    assert not is_read_only_import_source({**good, "source": good["source"] + "/more"})
 
 
 def test_every_service_has_its_declared_memory_limit_and_names_its_root(fed, any_spec):
@@ -114,7 +147,11 @@ def test_the_janitor_has_no_network_runs_only_when_asked_and_deletes_only_under_
 
 @pytest.mark.parametrize(
     ("layout", "committed"),
-    [(None, DEPLOY / "compose.yaml"), (EXAMPLE, EXAMPLE.with_suffix(".compose.yaml"))],
+    [
+        (None, DEPLOY / "compose.yaml"),
+        (EXAMPLE, EXAMPLE.with_suffix(".compose.yaml")),
+        (STORAGE_IMPORT, STORAGE_IMPORT.with_suffix(".compose.yaml")),
+    ],
 )
 def test_the_committed_compose_files_are_what_the_generator_makes(fed, layout, committed):
     """compose.yaml and the example's file are generated, never edited: a change to the generator shows in them."""
@@ -133,7 +170,11 @@ def test_docker_compose_reads_the_generated_file_as_the_generator_meant(fed, any
     file = tmp_path / "compose.yaml"
     file.write_text(fed.compose.render(any_spec), encoding="utf-8")
     root = "/mnt/volume2/expcore-federation/check"
-    env = {**os.environ, "EXPCORE_FED_ROOT": root, "DOCKER_CONFIG": str(tmp_path)}
+    data = (
+        "/mnt/volume2/expcore-federation-data/check"  # a read-only import's source: outside the root, by its variable
+    )
+    imports = {s.imported.source_env: data for s in any_spec.spaces if s.imported and s.imported.readonly}
+    env = {**os.environ, "EXPCORE_FED_ROOT": root, "DOCKER_CONFIG": str(tmp_path), **imports}
     command = ["docker", "compose", "--file", str(file), "--project-directory", str(DEPLOY), "--profile", "janitor"]
     done = subprocess.run([*command, "config", "--format", "json"], env=env, capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
@@ -144,6 +185,9 @@ def test_docker_compose_reads_the_generated_file_as_the_generator_meant(fed, any
         assert all(p["host_ip"] == "127.0.0.1" for p in service.get("ports", []))
         assert service["labels"][fed.compose.ROOT_LABEL] == root
         for volume in service["volumes"]:
+            if volume["target"].startswith("/volumes/import/") and volume.get("read_only"):
+                assert volume["source"] == data, name  # the variable the file names, as federation.py sets it
+                continue
             assert volume["source"].startswith(root) or volume["source"] == str(DEPLOY / "start.sh"), name
 
 
@@ -308,6 +352,44 @@ def test_o03_the_mount_live_test_puts_the_sidecar_on_the_federation_network_dial
     assert sorted(p.name for p in root.iterdir()) == before  # nothing written beside the original
     with pytest.raises(ValueError, match="already has a"):
         derive_platform(own / "platform.toml", tmp_path, table)
+
+
+@needs_openssl
+def test_o40_a_direct_mount_table_for_the_federation_maps_the_local_providers_storage_and_loads(fed, tmp_path):
+    """O40: the comparison harness's direct pass derives the platform as the proxy one does, with the local provider's
+    storage (the Compose layout's directory of it) mapped and a check file named; the copy loads, and the federation's
+    root gets nothing written beside the original."""
+    from measure_direct_vs_proxy import mount_keys, storage_of
+    from mount_live import derive_platform, federation_network, sandbox_table
+
+    from expcore_onedata.config import load_platform
+
+    root, own = tmp_path / "root", tmp_path / "own"
+    root.mkdir()
+    own.mkdir()
+    layout = fed.layout.Layout(root)
+    fed.facts.write_facts(layout, fake_boot(fed, layout))
+    (root / "ca").mkdir()
+    fed.pki.make_ca(root / "ca" / "federation-ca.pem", tmp_path / "ca.key", "test CA")
+    facts = json.loads(layout.facts.read_text(encoding="utf-8"))
+    local = layout.spec.holder
+    storage = storage_of("0a1b2c3d", None, layout.platform, local)
+    assert storage == ("0a1b2c3d", str(layout.storage(local).resolve()))
+    table = sandbox_table(
+        work_root=own / "work",
+        images={"agent": ("agent:1", "sha256:" + "a" * 64), "oneclient": ("mounter:1", "sha256:" + "c" * 64)},
+        pool="10.77.0.0/24",
+        network=federation_network(facts),
+        local=local,
+        local_address=facts["providers"][local]["domain_on_project_network"],
+        **mount_keys("direct", storage, "space-x/run/check.bin"),
+    )
+    before = sorted(p.name for p in root.iterdir())
+    mount = load_platform(derive_platform(layout.platform, own, table), require_secrets=False).sandbox.mount
+    assert mount.io_mode == "direct"
+    assert mount.storages == (storage,)
+    assert mount.direct_check_file == "space-x/run/check.bin"
+    assert sorted(p.name for p in root.iterdir()) == before
 
 
 @needs_openssl

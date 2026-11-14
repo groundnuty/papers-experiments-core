@@ -27,7 +27,7 @@ transfer_settle_s = 30.0        # the wait between two observations of the trans
 transfer_settle_polls = 4       # the most observations of the listing before it counts as not settled (2 or more)
 clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that widen the run's window (O08)
 concurrency = 16                # the most requests a bulk operation has in flight at once (eviction, block maps, reset)
-qos_scan = "summaries"          # how the reset finds QoS requirements: "summaries" (a read per leaf) or "listing" (O33)
+qos_scan = "listing"            # how the reset finds QoS requirements: "listing" or "summaries" (a read per leaf, O33)
 qos_fulfil_timeout_s = 120      # the longest the reset waits for a run's QoS requirement to be fulfilled before deleting it
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
@@ -62,10 +62,13 @@ PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")
 # threshold, which with these defaults is every full chunk, is sent on a new connection (`OnezoneClient.mutate`).
 DEFAULT_CHUNK_BYTES = 16 << 20
 DEFAULT_FRESH_CONNECTION_BYTES = 16 << 20
-# How the reset finds a space's QoS requirements (O33): `summaries`, a summary per leaf on every provider (the default
-# until the listing's two live facts are verified, `tests/live/test_qos_listing.py`), or `listing`, one recursive
-# listing with `effQosInheritancePath` and a summary per entry a requirement is on.
+# How the reset finds a space's QoS requirements (O33): `listing` (the default), one recursive listing with
+# `effQosInheritancePath` and a summary per entry a requirement is on, or `summaries`, a summary per leaf on every
+# provider. The listing became the default after the 14 Nov 2026 live slot showed it takes `include_directories` and
+# finds a requirement added through another provider (`resetqos.py`); it is in no fingerprint, so a study's store
+# does not depend on it.
 QOS_SCANS = ("summaries", "listing")
+DEFAULT_QOS_SCAN = "listing"
 
 
 @dataclass(frozen=True)
@@ -85,7 +88,7 @@ class PlacementSettings:
     transfer_settle_polls: int = 4
     clock_skew_allowance_s: float = 5.0  # beyond the providers' estimated clock offsets
     concurrency: int = 16  # the named bound on a bulk operation's requests in flight (eviction, block maps, reset)
-    qos_scan: str = QOS_SCANS[0]  # how the reset finds QoS requirements (`resetqos.py`); see QOS_SCANS
+    qos_scan: str = DEFAULT_QOS_SCAN  # how the reset finds QoS requirements (`resetqos.py`); see QOS_SCANS
     qos_fulfil_timeout_s: float = 120.0  # the reset's wait for a requirement to be fulfilled (`resetremove.py`)
     # Last, so a caller that passes the settings positionally keeps the order it had before #196 (O25): every field
     # added later goes at the end of the class.
@@ -258,7 +261,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
     holder = table.string("holder")
     if holder not in config.providers:
         raise table.fail("holder", "must be a provider declared in [providers]")
-    qos_scan = table.optional_string("qos_scan") or QOS_SCANS[0]
+    qos_scan = table.optional_string("qos_scan") or DEFAULT_QOS_SCAN
     if qos_scan not in QOS_SCANS:
         raise table.fail("qos_scan", f"must be one of {', '.join(QOS_SCANS)}")
     settings = PlacementSettings(

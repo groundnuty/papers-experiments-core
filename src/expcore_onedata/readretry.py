@@ -13,11 +13,11 @@ two, and the client (`OnezoneClient.get`) applies it:
   never handed out again. The pool may still hold other idle connections, which a retry could be given, so a client
   that owns its connection pool sends each retry through a one-shot client of the same settings: its own new
   connection, closed when the answer is in. Tests against a real socket hold both.
-- **What is never retried:** any answer (an error status included), a connection error (a provider that is down must
-  look down), a write timeout, a PUT, POST, PATCH or DELETE (reading POSTs included), a range read and a streamed
-  read. The client takes `retry` on `get` and on the reads that find a target's space (`space_name`, `file_space_id`),
-  and `gate_retry` on `mutate`, `read_range` and `read_content`, which applies to their gate's reads alone, so no write,
-  no range read and no streamed read can be handed a policy for itself.
+- **What is never retried:** any answer (an error status or a 3xx included), a connection error (a provider that is
+  down must look down), a write timeout, a PUT, POST, PATCH or DELETE (reading POSTs included), a range read and a
+  streamed read. The client takes `retry` on `get` and on the reads that find a target's space (`space_name`,
+  `file_space_id`), and `gate_retry` on `mutate`, `read_range` and `read_content`, which applies to their gate's reads
+  alone, so no write, no range read and no streamed read can be handed a policy for itself.
 - **Who asks:** every call site names its choice (`retry=`, or `gate_retry=` for a mutation's or a range read's gate).
   The harness's own plumbing passes a `ReadRetry`; whatever measures the platform passes `ONE_ATTEMPT`, so that a
   timeout stays the recorded timeout it is. A test holds the choice of every call site
