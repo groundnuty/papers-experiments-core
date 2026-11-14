@@ -32,7 +32,10 @@ empty write and given its prefix, each step confirmed. The schedule starts at th
 first-turn hook (`at_first_turn`, C31), which an executor calls with `first_turn_instruments`; a run whose first turn
 never came is refused by the post-run check. Each part is written at its offsets once the data provider's block map is
 exactly the ranges before it, then its prefix's hash is read back and the block maps must show exactly the written
-ranges at the final size. The restore completes each file in place and never removes it.
+ranges at the final size. The restore completes each file in place and never removes it, and replicates it to each
+provider the file's `replicas` declare. The baseline's marks in the journal (`ingesthealth.py`) refuse a start on a
+baseline that a failed start or reset, or a run that died, left not whole; **`recover`**, on an instrument that has not
+started, brings it back, verified, and the platform's health check given the journals fails until then.
 
 The snapshot (version 1) is clock-labelled: a reading carries `clock`, the provisioner's monotonic clock, which the
 loop's clock readings use too, `t_rel_s` from the schedule's start (`anchor`: `instrument_start`, or `first_turn` in
@@ -41,8 +44,9 @@ of the start, `after_start_s`) and `utc`. In the preallocated mode `start.files`
 (its old and new id, its size and blocks), and a file no part of which has arrived is `prefix_only`. `steps`
 holds each part as planned, written (with how late), confirmed (with the seconds each provider took to show it),
 failed, abandoned or not due; `ids` every file id the ingest removed, created or restored, with the old and new id and
-the file's label, so a study can map a gate's errors to files after the run. Providers are named by their position,
-files by their label, never by a name or a path (O12).
+the file's label, so a study can map a gate's errors to files after the run, and `id_map` each old id to the new one
+in its place, for a map keyed by id; `start_s` is the start's seconds, before the first turn. Providers are named by
+their position, files by their label, never by a name or a path (O12).
 
 The provisioner given to the instrument must be its own: its change log tells the restore which files the ingest made,
 and must never be given to a teardown, which would delete the dataset's restored files. The instrument claims the log

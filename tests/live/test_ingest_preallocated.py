@@ -163,3 +163,50 @@ def test_o44_the_instrument_sets_the_start_state_writes_its_parts_from_the_first
         if FACTS_OUT and snapshot is not None:
             Path(FACTS_OUT).write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
     assert not left, left
+
+
+def test_o44_the_reset_restores_a_mirrors_replica_of_the_file_the_start_made_again(platform, tmp_path):
+    """O44: a seeded baseline file replicated to a mirror (a provider of the space other than the data provider),
+    declared in the plan's `replicas`: the start removes it with the mirror's replica and makes it again with nothing
+    on the mirror, and the reset completes it in place and replicates it to the mirror, whose own block map then covers
+    the file the start made, as an outage run reading through the mirror next needs it."""
+    seed = provisioner(platform, tmp_path / "seed.jsonl")
+    own = provisioner(platform, tmp_path / "ingest-changes.jsonl")
+    holder = own.settings.holder
+    mirror = next((name for name in own.space.support.providers if name != holder), None)
+    if mirror is None:
+        pytest.skip("the first study space has no provider but its data provider to hold a replica")
+    staging = tmp_path / "staged"
+    staging.mkdir()
+    (staging / "day.bin").write_bytes(CONTENT)
+    directory, snapshot = f"expcore-live-{secrets.token_hex(6)}", None
+    try:
+        seed.upload(f"{directory}/day.bin", staging / "day.bin")
+        seed.replicate(f"{directory}/day.bin", mirror)
+        plan_file = tmp_path / "ingest.toml"
+        plan_file.write_text(
+            f'[ingest]\nstaging = "staged"\nmode = "preallocated"\n\n[[ingest.files]]\nlabel = "day"\n'
+            f'path = "{directory}/day.bin"\nsource = "day.bin"\nat_s = 2\nbaseline = "complete"\nprefix = {PREFIX}\n'
+            f"replicas = {json.dumps([mirror])}\n",
+            encoding="utf-8",
+        )
+        ingest = ProgressiveIngest(
+            own, load_ingest_plan(plan_file, platform[0]), journal=tmp_path / "ingest-journal.jsonl"
+        )
+        ingest.start({"run_key": "live-mirror"})
+        made = own.resolve(f"{directory}/day.bin").file_id
+        assert own.blocks(made, mirror) == []
+        ingest.at_first_turn({"clock_s": time.monotonic()})
+        deadline = time.monotonic() + 300
+        while ingest.progress < 1 and ingest.failure is None and time.monotonic() < deadline:
+            time.sleep(0.5)
+        snapshot = ingest.finish()
+        ingest.check()
+        assert snapshot["restore"]["files"]["day"]["replicas"] == {own.client.provider_label(mirror): "replicated"}
+        assert own.blocks(made, mirror) == [(0, FINAL)]
+        assert own.read_file(made, size=FINAL) == digest_of(CONTENT)
+    finally:
+        left = remove_scratch(seed, directory)
+        if FACTS_OUT and snapshot is not None:
+            Path(FACTS_OUT).with_suffix(".mirror.json").write_text(json.dumps(snapshot, indent=2) + "\n")
+    assert not left, left

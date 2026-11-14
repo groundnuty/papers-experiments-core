@@ -13,6 +13,10 @@ oneclient about seven `SynchronizeBlock` round trips before it returns zeros (it
 measured). A write of content without an offset truncates the file to 0 first (file_content_rest_handler.erl:224-228),
 so none is ever sent (`client.TruncatingWrite`).
 
+**Before anything is removed** every staged copy is checked against the plan (`admit_start`, before the start's
+restore), and each file's holdings against its declared `replicas` (`check_holdings`, before the first removal): the
+removal takes every replica with the file, and the reset brings back only the declared ones.
+
 **The start state** of each file, in the plan's order. The complete file is removed: its staged copy is checked
 first and the intent journalled, and the start waits until every provider answers its old id absent, since 25.0
 deletes asynchronously and a name used again at once was measured to lose files (#29, F7). Then a new file is made
@@ -41,7 +45,12 @@ ingest did not make is left as it is when its bytes are its staged source's (the
 and refused otherwise, but for an empty file at a path whose journal ends with the start's intent to make it again: a
 creation whose answer was lost, or whose change-log line a crash cut, which holds nothing, so it is removed and the
 file written back whole. A name removed by a crashed start is written back from the staged source once every provider
-answers the old id absent. So a crash at any point ends with the complete file after the next start.
+answers the old id absent. The completed file is then replicated to each provider its `replicas` name, verified by that
+provider's block map.
+
+**The baseline's marks** (`ingesthealth.py`): the start marks the baseline open before it changes anything, a failure
+after that marks it unhealthy, and a restore that verifies every file marks it whole. A start is refused unless the last
+mark is whole, so a crash at any point leaves the federation unhealthy until a recovery ends with the complete file.
 """
 
 import json
