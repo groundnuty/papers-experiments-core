@@ -1034,6 +1034,64 @@ The cells of one value share its response to the treatment and are not independe
 
 **In the outputs.** `analysis.json` gives every contrast `ratio` (the form, or null), its two units, `estimation_unit` (`["model", "group"]` for a contrast of one outcome, `["group"]` by default for a ratio contrast) and `independent_unit` (the cluster), and its cells, `n_cells` and `cells_lost` by cause (`no_pair`, then a ratio contrast's `zero_denominator` and `zero_numerator`, zeros included); a ratio contrast estimated per model's cell its `per_model`, and a ratio contrast's `pairs_missing` the three `RATIO_CAUSES` after the five others, zeros included; `n_pairs_missing` counts the None causes, `numerator_none_at_zero` among them. `report.md` shows a ratio contrast's outcome as `ln(numerator/denominator)`, adds a section "Ratio contrasts" (each one's two outcomes, its estimation unit, its independent unit, its cells used and lost by cause, its rule, and exp of its estimate and interval, then, for a contrast estimated per model's cell, "Ratio contrasts by model (exploratory)" with each model's estimate, ratio and interval) and the three causes as columns of the pairs tables, `-` in the row of a contrast of one outcome, and the terminal summary marks its estimate `(ln ratio)`. A report with no ratio contrast has none of these, byte for byte as before.
 
+### A smallest effect of interest
+
+`expcore.stats.smallest` (S16, #81). A contrast may declare the smallest effect that counts, in the form its estimator reads, and the sign it claims:
+
+```toml
+[contrasts.a-vs-b]             # a contrast of one outcome
+smallest_effect = 0.1          # a positive difference on the outcome's scale, here 10 points of a proportion
+direction = "higher"           # optional: "higher" (A above B) or "lower"; left out, the rule holds either way
+
+[contrasts.cost-per-success]   # a ratio contrast
+smallest_ratio = 2             # a positive ratio other than 1, a factor of two, compared as ln 2 = 0.6931
+direction = "lower"            # optional: A's cost per success at most half of B's
+```
+
+```python
+@dataclass(frozen=True)
+class Rule:                       # ContrastSpec.smallest_rule; None when the contrast declares none
+    form: str                     # "difference" (smallest_effect) or "ratio" (smallest_ratio)
+    declared: float               # as preregistered
+    direction: str                # "higher", "lower", or "either" when none is declared
+    threshold: float              # a property: the difference, or |ln ratio|, on the scale of the estimate
+
+@dataclass(frozen=True)
+class SmallestEffect:             # ContrastResult.smallest_effect; None, and absent from analysis.json, without one
+    form: str
+    declared: float
+    threshold: float              # on the estimate's scale
+    direction: str
+    decision: str                 # one of DECISIONS
+    interval: str | None          # one of INTERVAL_RELATIONS; None when the interval is undefined
+    detectable: bool | None       # the minimum detectable effect is at most the threshold; None when unknown
+    minimum_detectable_ratio: float | None  # a ratio contrast's exp(minimum detectable effect); else None
+
+DECISIONS = ("meets", "meets_either_direction", "opposite_direction", "falls_short", "not_significant", "untestable")
+INTERVAL_RELATIONS = ("beyond", "includes", "short_of")
+def rule(*, smallest_effect=None, smallest_ratio=None, direction=None, ratio: bool) -> Rule | None  # RuleError(key)
+def decide(significant, estimate, threshold, direction, untestable=False) -> str
+def interval_relation(low, high, threshold, direction) -> str | None
+def detectable(minimum_detectable_effect, threshold) -> bool | None
+```
+
+**The scale.** A ratio contrast's estimate, interval and minimum detectable effect are natural-log ratios ([above](#a-ratio-contrast)), so its smallest ratio r is compared as |ln r|: r and 1 / r are one size, and `direction` says which side the claim is on. `Rule.threshold` is the one place a declared ratio is taken to the log scale; every comparison takes that threshold and the result's own numbers, and exp serves only to show a log ratio as a ratio. A contrast of one outcome compares its difference as declared.
+
+**Refused, naming the key** (by the loader, and as a `ValueError` naming the contrast for a spec built past it): `smallest_ratio` on a contrast of one outcome and `smallest_effect` on a ratio contrast; a value that is not a finite number; a `smallest_effect` of 0 or less (it is a size; `direction = "lower"` claims a decrease); a `smallest_ratio` of 0 or less, or of 1, which is no effect; a `direction` other than `"higher"` or `"lower"`, or one with no threshold beside it; and a `smallest_ratio` below 1 beside `direction = "higher"`, which names a decrease as an increase. A contrast in the Holm family and an exploratory one may both declare one.
+
+**The decision.** The study's rule: a difference counts when it is significant and its point estimate is at least the threshold. Significant is the contrast's own `significant`, Holm's decision for a member of the family and the raw p-value at alpha for any other, so `analyse` judges the rule after Holm has decided (`run_contrast` alone judges it on the raw p-value):
+- `meets`: a direction is declared, the test is significant and the estimate is at or beyond the threshold on that side (estimate >= threshold for `"higher"`, <= -threshold for `"lower"`);
+- `meets_either_direction`: no direction is declared, the test is significant and |estimate| >= threshold; the report and the terminal write the estimate's sign beside it, so it never reads as a bare "meets";
+- `opposite_direction`: a direction is declared, the test is significant and the estimate is on the other side of zero, whatever its size: a significant drop never confirms a claimed rise;
+- `falls_short`: significant, the estimate short of the threshold on its side (zero included);
+- `not_significant`, and `untestable` for a contrast that used no pair (S11).
+
+**Beside it.** `interval` sets the contrast's reported interval (at `ci_level`) against the threshold on the direction's side (either side for `"either"`): `beyond` when every value is at or beyond it, `short_of` when every value is short of it, so the interval excludes the smallest effect either way, and `includes` otherwise. `detectable` is true when the contrast's minimum detectable effect, a size on the same scale, is at most the threshold, false when it is larger, and None when it is unknown (no `[power]` section, or a NaN figure), never false on that account. A member's minimum detectable effect is at alpha over the family size ([the estimator](#estimator)), so a true `detectable` is conservative. It says the test reaches the target power at a true effect of exactly the threshold; the estimate reaches the threshold only about half the time there, so `meets` does not reach that power. Every comparison is on the kernel's snapping grid (`contrasts.snap`), so 0.6 - 0.5 meets a threshold of 0.1.
+
+**An equivalence margin beside it.** A contrast may declare both, and neither is derived from the other or checked against it: the margin bounds the differences the study calls negligible and decides `equivalent` and `trivial_difference`, while the smallest effect is what a difference must reach to count. The conclusion word and the decision are reported side by side, each on its own rule.
+
+**In the outputs.** The declaration is in `preregistration.toml`, so in the preregistration hash every output carries (P04). `analysis.json` gives a declaring contrast `smallest_effect`, the `SmallestEffect` above; a contrast that declares none has no such key, so a study that declares none keeps the bytes of its `analysis.json`. `report.md` adds a section "Smallest effects of interest", only when a contrast declares one, with the smallest effect as declared (a ratio with its natural log), the direction, the signed estimate and its interval (a ratio contrast's with their ratios), the decision (`meets (either direction)` for the two-sided word, labelled exploratory outside the family), the interval against it, the minimum detectable effect (with its ratio) and whether the design detects it; the terminal line of a declaring contrast adds its smallest effect, the decision and the signed estimate.
+
 ### One-arm estimates and each arm's runs
 
 `expcore.stats.onearm` and `expcore.stats.armruns` (S14, #139).
