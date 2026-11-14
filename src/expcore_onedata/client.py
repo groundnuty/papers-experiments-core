@@ -68,6 +68,32 @@ A failure raises `PlatformError` with the status and Onedata's error id only. Th
 header, and names a provider by its position (`providers[1]`), so neither a token nor a federation name reaches a log
 or a record through it.
 
+**Bodies are freed when their exchange is used (#259, O47).** httpx binds every answer to a stream that points back at
+it, a reference cycle that holds the answer, its request and both bodies until the cyclic collector runs; a batch of
+large uploads or reads would grow by everything it moved. So every answer is released the moment it is read
+(`_release`: closed, its stream replaced by an empty one), however the read ends, on every path that sends or receives
+a body (`_request`, `_stream_range`, `content_answer`). `_exchange` reads a request's answer in the open, since
+`httpx.Client.request` leaves one whose body failed to read in its cycle; an answer httpx itself fails on inside its
+send, a redirect it cannot parse or a hook that raises, is found in the frames the failure passed through
+(`_release_stranded`). No error holds the httpx error or the answer that caused it: a transport failure is raised after
+its handler has ended, so the `PlatformError` has no `__context__`. The client keeps no answer, request or body, and
+follows no redirect, whatever the HTTP client it was given does: httpx follows one inside its send, and takes the
+`X-Auth-Token` header along to another host (it drops `Authorization` alone). A 3xx answer is therefore the answer the
+client gets, and it is never a result: a bodyless one would decode to `{}`, an empty success, a false pass for a write
+as much as for a read. Every 3xx, on every path (`_request` through `_checked`, `_stream_range` and `content_answer`
+through `_streamed`), is a `PlatformError` that names the status and whether a `Location` came, never its value
+(`_refuse_redirect`). It is raised after the answer is released, as an answer, not a transport failure, so no retry
+policy of the client repeats it: the GET retry takes only a timeout, which raises, and a probe retries only `transport`.
+The layer's polls that count a failed read as one that did not match (`consistency.converge`, `converge_each`, and
+what is built on them) treat a 3xx as they do a 403 or a 500: they read again until their own bound and end as not
+converged, never as a pass; a wait that waits out only absence (`wait_visible`, `space_root`) raises it at once.
+
+What none of this reaches is an HTTP client the caller injected whose hooks, authentication flow or transport keep a
+reference of their own to an answer or a request, and a cycle inside httpx or httpcore that no answer the client holds
+reaches. The net under all of it is `collect_after_bytes`: once that many bytes of bodies, sent and received, failed
+exchanges' included, have been counted since the last collection, a full collection runs before the next exchange
+(`collectbudget.py`); it is a fallback, not the fix.
+
 Every REST path and payload the layer uses, with where it was confirmed. The sources `[S1]` to `[S11]` are the
 `merged:` lines of this file's header (repository, commit, file:line); a path is confirmed when working code or a
 client test in a source sends it and reads the answer as this layer does. `[L1]` is the live contract tests
@@ -206,8 +232,10 @@ import re
 import socket
 import threading
 import time
+import traceback
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,6 +243,7 @@ import httpx
 
 from expcore.config.loading import ConfigError
 from expcore.records.redact import register_secret
+from expcore_onedata.collectbudget import COLLECT_AFTER_BYTES, CollectBudget
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
 from expcore_onedata.readretry import ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
@@ -376,6 +405,135 @@ def _build_http(config: PlatformConfig, timeout_s: float) -> httpx.Client:
     return httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
 
 
+_NO_BODY = httpx.ByteStream(b"")  # holds nothing and points at nothing: what a released answer's stream is made
+
+
+def _release(response: httpx.Response) -> httpx.Response:
+    """Close an answer and cut the reference cycle httpx builds around it, so that its body, and its request's, are
+    freed when the last name for it goes, not at the next full collection (#259, O47).
+
+    httpx replaces an answer's stream with one that holds the answer (`BoundSyncStream`, which stamps `elapsed` when the
+    stream closes), and the answer holds the stream: a cycle of the answer, its request, both bodies and, over a real
+    connection, httpcore's pool objects for it. Once an answer is closed the stream has nothing left to do, so it is
+    swapped for an empty one, even when the close itself failed. What the answer holds of its own (`status_code`,
+    `headers`, `content`, `json()`, `num_bytes_downloaded`) is untouched, and a stream that was not read stays unread:
+    it cannot be read after a close either way. A redirect is never followed (`_exchange`, `_streamed`), so an answer
+    has no earlier one to release."""
+    try:
+        response.close()
+    finally:
+        response.stream = _NO_BODY
+    return response
+
+
+def _answers(response: httpx.Response, request: httpx.Request) -> bool:
+    """Tell whether an answer is the answer to this request. An answer no request was set on, a mock transport handler's
+    own, answers none."""
+    try:
+        return response.request is request
+    except RuntimeError:
+        return False
+
+
+def _release_stranded(error: BaseException, request: httpx.Request) -> int:
+    """Release the answers to `request` that a failure inside httpx's own send carried off with it, and return the
+    bytes of body they had delivered (#259, O47).
+
+    httpx can fail on an answer after the transport has delivered it and before it returns it: a redirect whose
+    Location it cannot parse, a hook of the HTTP client that raises. It closes the answer and leaves it in its cycle
+    with the request, and the failure reaches the caller before the caller holds the answer. The answer is a local of
+    the frames the failure passed through, so each answer to `request` found there is released, once. An answer of
+    another request, which a mock transport's handler may hold in a local of its own, is left as it is.
+
+    The first frame of the failure's traceback is the caller's own, and is not read: its locals hold the failure
+    itself, and before Python 3.13 reading them copies them into a cache the frame keeps, a cycle of the frame, the
+    failure and its traceback that holds the request and the body written. The frames below it are cleared at the end,
+    which drops the copies reading them made and whatever else they held. Clearing every one of them, not only those
+    that held an answer, is deliberate: they are finished, and what they held of the request and its body is not
+    wanted. A close that fails on top of the failure being reported adds nothing to it, and is let go."""
+    first = error.__traceback__
+    below = None if first is None else first.tb_next
+    delivered: dict[int, int] = {}  # by the answer's identity: the same answer is a local of more than one frame
+    step = below
+    while step is not None:
+        for value in step.tb_frame.f_locals.values():
+            if isinstance(value, httpx.Response) and id(value) not in delivered and _answers(value, request):
+                delivered[id(value)] = _received(value)
+                with suppress(httpx.HTTPError):
+                    _release(value)
+        step = step.tb_next
+    if below is not None:
+        traceback.clear_frames(below)
+    return sum(delivered.values())
+
+
+def _received(response: httpx.Response) -> int:
+    """The bytes of an answer's body that came: what the transport delivered as it was read, or, for an answer a mock
+    transport made whole before any read, what it holds."""
+    if response.num_bytes_downloaded:
+        return response.num_bytes_downloaded
+    try:
+        return len(response.content)
+    except httpx.ResponseNotRead:
+        return 0
+
+
+def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, **options: Any) -> httpx.Response:
+    """Send one request on `http`, read its answer whole and release it however the read ends, and count the bytes of
+    the bodies it moved, the failed ones' too, for the fallback collection (#259, O47).
+
+    `http.request` raises from inside when an answer's body fails to read, before the caller has the answer to release,
+    and leaves it in its cycle with the request and the body sent. So the request is built and sent here, streamed, and
+    its body read in the open. A redirect is never followed, whatever the client was built to do: httpx follows one
+    inside `send`, and a redirect that failed halfway leaves its answers in their cycles out of reach, and a request of
+    the layer goes where its configuration says and nowhere else, with the credential header it carries (O09). A 3xx
+    answer is returned like any other, released and refused by `_checked` (`_refuse_redirect`), and its body is never
+    read: one that stalls would raise a timeout, which a GET under a retry policy would try again, losing the status."""
+    request = http.build_request(method, url, **options)
+    sent = int(request.headers.get("Content-Length") or 0)
+    try:
+        response = http.send(request, stream=True, follow_redirects=False)
+    except BaseException as error:
+        budget.spent(sent + _release_stranded(error, request))
+        raise
+    try:
+        if not _is_redirect(response.status_code):  # a 3xx is refused unread (`_refuse_redirect`), whatever it holds
+            response.read()
+    finally:
+        try:
+            _release(response)
+        finally:
+            budget.spent(sent + _received(response))
+    return response
+
+
+@contextmanager
+def _streamed(
+    http: httpx.Client, budget: CollectBudget, url: str, *, headers: Mapping[str, str], timeout: float, label: str
+) -> Iterator[httpx.Response]:
+    """Stream a GET as `http.stream` does, release the answer however the block ends, an error in it included, so that
+    an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47).
+
+    The request is sent here, as `_exchange` sends one, so that an answer httpx fails on inside its send can be found
+    and released, which `http.stream` leaves to its caller who never holds it. A 3xx answer is refused here, before
+    the block is entered, so that no caller of a streamed answer can take one for a result, and it is released as any
+    other (`_refuse_redirect`); its body, which is never read, may name a credential or a host."""
+    request = http.build_request("GET", url, headers=headers, timeout=timeout)
+    try:
+        response = http.send(request, stream=True, follow_redirects=False)
+    except BaseException as error:
+        budget.spent(_release_stranded(error, request))
+        raise
+    try:
+        _refuse_redirect(response, "GET", label)
+        yield response
+    finally:
+        try:
+            _release(response)
+        finally:
+            budget.spent(_received(response))
+
+
 class PlatformError(RuntimeError):
     """A request failed or was answered with something unreadable; the message holds no URL, body or header.
 
@@ -439,6 +597,44 @@ def _answered(label: str, method: str, status: int, code: str | None, errno: str
     """The message of an error answer: the label, the method, the status, and the error id with its errno."""
     shown = f"{code}: {errno}" if code and errno else code
     return f"{label}: {method} answered {status}" + (f" ({shown})" if shown else "")
+
+
+def _is_redirect(status: int) -> bool:
+    """Tell whether a status is a 3xx, 300 to 399. The client follows none, and takes none for a result."""
+    return 300 <= status < 400
+
+
+def _refuse_redirect(response: httpx.Response, method: str, label: str) -> None:
+    """Raise the PlatformError of a 3xx answer, whatever its status, and return for any other.
+
+    The client follows no redirect, so a 3xx is the answer it gets, and a bodyless one decodes to `{}`: an empty
+    success, a false pass for a write as much as for a read. None is taken for a result, a 304 included, since the
+    client sends no validator that would earn one. The error names the status, and says whether the answer names a
+    `Location`, never what it names or what its body holds, which may carry a host or a credential. It is an answer, not
+    a transport failure, so a caller that retries on a timeout, or on `transport`, does not retry it. A poll that counts
+    every failed read as one that did not match still polls it again, within its bound, as it does any error."""
+    status = response.status_code
+    if _is_redirect(status):
+        named = " (it names a Location)" if "location" in response.headers else ""
+        raise PlatformError(
+            f"{label}: {method} answered {status}, which is neither followed nor taken for a result{named}",
+            status=status,
+        )
+
+
+def _checked(response: httpx.Response, method: str, label: str) -> httpx.Response:
+    """Return an answer whose status is below 300, and raise the PlatformError of one that is a 3xx
+    (`_refuse_redirect`) or a 400 or more."""
+    _refuse_redirect(response, method, label)
+    if response.status_code >= 400:
+        code, errno = _error_fields(response)
+        raise PlatformError(
+            _answered(label, method, response.status_code, code, errno),
+            status=response.status_code,
+            code=code,
+            errno=errno,
+        )
+    return response
 
 
 def answered_absent(error: PlatformError) -> bool:
@@ -560,14 +756,21 @@ class OnezoneClient:
         environ: Mapping[str, str] | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         kept_links: int = MAX_KEPT_LINKS,
+        collect_after_bytes: int | None = COLLECT_AFTER_BYTES,
     ) -> None:
         """Build the client; the admin credential comes from `admin_token` or else from the configured source.
 
         The client it builds checks certificates as the platform's `[tls]` says (`tls.py`): its own default CAs, the
         configured CA bundle alone, or not at all. An injected `http` is the caller's, with its own TLS. `kept_links`
-        bounds the parent links the gate keeps (`MAX_KEPT_LINKS` by default)."""
+        bounds the parent links the gate keeps (`MAX_KEPT_LINKS` by default).
+
+        Every answer is released as soon as it is used, so a body is freed with its exchange (#259, O47).
+        `collect_after_bytes` is the fallback under that: once the bodies sent and received since the last collection
+        reach it, a full collection runs before the next exchange (`COLLECT_AFTER_BYTES`, 128 MiB, by default; None for
+        a caller that collects itself). A positive whole number of bytes, or ValueError."""
         if kept_links < 1:
             raise ValueError("the client keeps at least one parent link")
+        self._budget = CollectBudget(collect_after_bytes)
         self._config = config
         self._http = http if http is not None else _build_http(config, timeout_s)
         self._owns_http = http is None
@@ -646,16 +849,18 @@ class OnezoneClient:
         deadline_s: float | None = None,
         fresh: bool = False,
     ) -> httpx.Response:
-        """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError.
+        """Send one request and return the answer; a transport failure or a status of 300 or more is a PlatformError.
 
         A transport failure (a reset, a refusal, a timeout) has `transport` set and a real answer has its status, so
-        a caller that retries can tell the two apart (O08). Only a GET under a policy of more than one attempt is
-        retried, and only when it timed out (`readretry.py`); anything else is sent once. With `fresh` the request,
-        sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
+        a caller that retries can tell the two apart (O08). A 3xx is a real answer, refused with its status as a 400 or
+        more is: the client follows no redirect, and one is no result (`_refuse_redirect`). Only a GET under a policy of
+        more than one attempt is retried, and only when it timed out (`readretry.py`); anything else is sent once. With
+        `fresh` the request, sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
         """
         base, label = self._base(provider)
         url = base + _check_path(path)
         wait = timeout_s if timeout_s is not None else self._timeout_s
+        self._budget.before_exchange()  # a collection owed for earlier exchanges runs now, none of this one's alive
 
         def send(timeout: float, trace: Trace | None, new_connection: bool) -> httpx.Response:
             options: dict[str, Any] = {
@@ -668,40 +873,47 @@ class OnezoneClient:
             }
             if new_connection and self._owns_http:  # a connection of its own, never one of the pool's idle ones
                 with _build_http(self._config, self._timeout_s) as one_shot:
-                    return one_shot.request(method, url, **options)
-            return self._http.request(method, url, **options)
+                    return _exchange(one_shot, self._budget, method, url, **options)
+            return _exchange(self._http, self._budget, method, url, **options)
 
         try:
-            if method == "GET" and retry.attempts > 1:
-                response = run_attempts(
-                    send,
-                    retry=retry,
-                    label=label,
-                    timeout_s=wait,
-                    timeouts=RETRIED_TIMEOUTS,
-                    deadline_s=deadline_s,
-                    served=self._served_before,
-                )
-            elif method == "PUT" and content is not None:
-                response = self._send_content(send, label, len(content), wait, fresh)
-            else:
-                response = send(wait, None, fresh)
+            response = self._dispatch(send, method, label, content, wait, retry, deadline_s, fresh)
         except Exhausted as spent:
-            raise PlatformError(
-                f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts",
-                transport=True,
-            ) from None
+            failed = f"{label}: {method} failed ({type(spent.error).__name__}) after {spent.attempts} attempts"
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: {method} failed ({type(error).__name__})", transport=True) from None
-        if response.status_code >= 400:
-            code, errno = _error_fields(response)
-            raise PlatformError(
-                _answered(label, method, response.status_code, code, errno),
-                status=response.status_code,
-                code=code,
-                errno=errno,
+            failed = f"{label}: {method} failed ({type(error).__name__})"
+        else:
+            return _checked(response, method, label)
+        # Raised here, with the handlers over: an error raised inside one has the httpx error as its context, and that
+        # holds the request, its body and the frames the failure passed through, for as long as the error lives (#259).
+        raise PlatformError(failed, transport=True)
+
+    def _dispatch(
+        self,
+        send: Callable[[float, Trace | None, bool], httpx.Response],
+        method: str,
+        label: str,
+        content: bytes | None,
+        wait: float,
+        retry: ReadRetry,
+        deadline_s: float | None,
+        fresh: bool,
+    ) -> httpx.Response:
+        """Send one request as its kind asks: a GET under a policy of more than one attempt is retried when it timed
+        out, a write of content is sent once and logged with how its connection began, and any other is sent once."""
+        if method == "GET" and retry.attempts > 1:
+            return run_attempts(
+                send,
+                retry=retry,
+                label=label,
+                timeout_s=wait,
+                timeouts=RETRIED_TIMEOUTS,
+                deadline_s=deadline_s,
+                served=self._served_before,
             )
-        return response
+        if method == "PUT" and content is not None:
+            return self._send_content(send, label, len(content), wait, fresh)
+        return send(wait, None, fresh)
 
     def _send_content(
         self,
@@ -775,7 +987,8 @@ class OnezoneClient:
         try:
             return response.json()
         except ValueError:
-            raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
+            pass  # the decoder's error holds the whole text it could not read, so it is no context of ours (#259)
+        raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON")
 
     def get_dated(
         self,
@@ -1344,9 +1557,15 @@ class OnezoneClient:
         first, length, total = span
         last = first + length - 1
         got = 0
+        self._budget.before_exchange()
         try:
-            with self._http.stream(
-                "GET", url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
+            with _streamed(
+                self._http,
+                self._budget,
+                url,
+                headers={**self._admin, "Range": f"bytes={first}-{last}"},
+                timeout=wait,
+                label=label,
             ) as response:
                 status = response.status_code
                 if status >= 400:
@@ -1366,11 +1585,14 @@ class OnezoneClient:
                         raise PlatformError(f"{label}: a streamed read's range carried more bytes than it asked for")
                     consume(piece)
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
-        if got != length:
-            raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
-        if answers is not None:
-            answers(ReadOutcome(status, sent, got))
+            failed = f"{label}: GET failed ({type(error).__name__})"
+        else:
+            if got != length:
+                raise PlatformError(f"{label}: a streamed read's range carried fewer bytes than it asked for")
+            if answers is not None:
+                answers(ReadOutcome(status, sent, got))
+            return
+        raise PlatformError(failed, transport=True)  # with the handler over, so the httpx error is no context (#259)
 
     def content_answer(
         self, path: str, *, provider: str, first_byte: bool, timeout_s: float | None = None
@@ -1380,7 +1602,7 @@ class OnezoneClient:
         The body is never read: the answer is closed once its head has arrived, so a large file costs nothing. It passes
         the same gate as `read_range`, since a read through a provider that lacks the bytes fetches them: the path must
         be `/data/{id}/content` and the file's space must have a configured prefix, or nothing is sent. A transport
-        failure or a status of 400 or more is a `PlatformError`. The pre-campaign check is its caller (O05).
+        failure, a 3xx or a status of 400 or more is a `PlatformError`. The pre-campaign check is its caller (O05).
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -1389,19 +1611,27 @@ class OnezoneClient:
         base, label = self._base(provider)
         self._require_in_scope(self._target("GET", path, provider, None, _ONE_ATTEMPT), None)
         headers = {**self._admin, **({"Range": "bytes=0-0"} if first_byte else {})}
+        self._budget.before_exchange()
         try:
-            with self._http.stream(
-                "GET", base + path, headers=headers, timeout=timeout_s if timeout_s is not None else self._timeout_s
+            with _streamed(
+                self._http,
+                self._budget,
+                base + path,
+                headers=headers,
+                timeout=timeout_s if timeout_s is not None else self._timeout_s,
+                label=label,
             ) as response:
                 status, content_type = response.status_code, response.headers.get("Content-Type")
                 code, errno = (None, None)
                 if status >= 400 and response.read() is not None:
                     code, errno = _error_fields(response)
         except httpx.HTTPError as error:
-            raise PlatformError(f"{label}: GET failed ({type(error).__name__})", transport=True) from None
-        if status >= 400:
-            raise PlatformError(_answered(label, "GET", status, code, errno), status=status, code=code, errno=errno)
-        return status, content_type
+            failed = f"{label}: GET failed ({type(error).__name__})"
+        else:
+            if status >= 400:
+                raise PlatformError(_answered(label, "GET", status, code, errno), status=status, code=code, errno=errno)
+            return status, content_type
+        raise PlatformError(failed, transport=True)  # with the handler over, so the httpx error is no context (#259)
 
     def mint_own_token(self, principal: Principal, caveats: Sequence[Mapping[str, Any]]) -> str:
         """Mint a temporary access token for a user, as that user, with exactly these caveats; return the value.

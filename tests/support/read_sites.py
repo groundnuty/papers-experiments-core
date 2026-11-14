@@ -275,7 +275,7 @@ class _Scanner:
             self._read(where, attr, _keyword(call, "retry") or MISSING)
         elif attr in ("_send", "_request") and receiver == "self":
             self._internal_request(call, where, attr)
-        elif attr in ("stream", "request") and _segment(func.value) in CLIENT_NAMES | {"one_shot"}:
+        elif attr in ("stream", "request", "send") and _segment(func.value) in CLIENT_NAMES | {"one_shot"}:
             self._read(where, f"http.{attr}", "<streamed>" if attr == "stream" else "<transport>")
         elif attr in GATE_INTERNALS and receiver == "self":
             self._read(where, f"self.{attr}", _reads_of(call))

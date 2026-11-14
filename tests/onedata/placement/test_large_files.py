@@ -114,7 +114,7 @@ def test_o25_a_large_file_goes_in_a_chunk_at_a_time_and_is_never_read_whole(prov
     assert max(sizes) <= CHUNK
     sent = writes(fake)
     assert len(sent) == math.ceil(len(BULKY) / CHUNK)
-    assert max(len(r.body) for r in sent) <= CHUNK
+    assert max(r.size for r in sent) <= CHUNK
     assert [int(r.query["offset"]) for r in sent] == list(range(0, len(BULKY), CHUNK))
     assert stored(fake, result.file_id) == BULKY
     assert result.file_id in [line["id"] for line in provisioner.logged()]  # a creation, so teardown removes it

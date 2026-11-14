@@ -151,7 +151,7 @@ CLIENT_INTERNAL = {
     ("client.py", "OnezoneClient.get", "self._send(GET)"): ["retry"],
     ("client.py", "OnezoneClient.get_dated", "self._request(GET)"): ["retry"],
     ("client.py", "OnezoneClient._send", "self._request(<method>)"): ["retry"],
-    ("client.py", "OnezoneClient._request.send", "http.request"): ["<transport>", "<transport>"],
+    ("client.py", "_exchange", "http.send"): ["<transport>"],  # every request, a retry's one-shot client's included
     ("client.py", "OnezoneClient.mutate", "self._send(<method>)"): ["<none>"],  # a write: never retried
     ("client.py", "OnezoneClient.mutate", "self._target"): ["_GateReads(gate_retry)"],
     ("client.py", "OnezoneClient.read_range", "self._target"): ["_GateReads(gate_retry)"],
@@ -159,9 +159,9 @@ CLIENT_INTERNAL = {
     # a revocation's confirmation: a failed read writes no revoked line, so the slot stays held (fail closed)
     ("client.py", "OnezoneClient.own_temporary_generation", "self._send(GET)"): ["ONE_ATTEMPT"],
     ("client.py", "OnezoneClient.read_content", "self._target"): ["gate", "gate"],  # bounded by the deadline left
-    ("client.py", "OnezoneClient._stream_range", "http.stream"): ["<streamed>"],
     ("client.py", "OnezoneClient.content_answer", "self._target"): ["_ONE_ATTEMPT"],  # the pre-campaign measurement
-    ("client.py", "OnezoneClient.content_answer", "http.stream"): ["<streamed>"],
+    # a streamed range and a content head both go through `_streamed`, which sends once and releases the answer (O47)
+    ("client.py", "_streamed", "http.send"): ["<transport>"],
     ("client.py", "OnezoneClient.space_name", "self._space_name"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_id", "self._file_space_id"): ["_GateReads(retry, deadline_s)"],
     ("client.py", "OnezoneClient.file_space_name", "self._space_name"): ["reads"],
