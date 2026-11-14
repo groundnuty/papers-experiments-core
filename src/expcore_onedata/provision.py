@@ -14,10 +14,15 @@ configured name or lies outside the prefixes. On top of that gate:
 - **A large file is never held whole** (O25). `upload` sends a local file a chunk at a time, skips a target that
   already holds its bytes, resumes one that holds a prefix, and reports success only once the size and SHA-256 read
   back match; `read_file` reads a file back by streamed ranges, hashing as it goes. Every write carries a content type.
+- **No write truncates** (O44): every write of content names its offset, since one without truncates the file to 0
+  first. `preallocate` makes a file at its final size with no block written (an empty write at that offset), and
+  `write_range` writes a range of a local file into the same range of one, so a file can be at its final size with
+  only some of its ranges written; `read_file(stop=)` reads and hashes its prefix.
 - **A listing ends only on its last-page marker** (O26, `next_page_token`): a page without one is refused.
 - **Placement is what the block map says** (O01). A replication job that reports `completed` is a report; `replicate`
   returns only when `GET /data/{id}/distribution` on the receiving provider covers the whole file on consecutive polls,
-  and raises `NotPlaced` with the shortfall otherwise. An eviction is confirmed the same way, by the block map showing
+  and raises `NotPlaced` with the shortfall otherwise. A replication that completed short, as one scheduled while the
+  target's copy of the source's map lags does, is scheduled again, bounded by the settle bound (`replicate_file`). An eviction is confirmed the same way, by the block map showing
   the provider holding nothing of the file.
 - **The data provider's own copy is never evicted** (O09): a request to evict from the provider `[placement] holder`
   names is refused before anything is sent, by name and by id.
@@ -35,7 +40,8 @@ configured name or lies outside the prefixes. On top of that gate:
   An instrument's own read (`resolve(wait=False)`) is one attempt.
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
-no token and no credential.
+no token and no credential. A last line a crash cut short (no newline after it, and not a whole line) is no line, and
+is dropped before the next line is written; any other line that cannot be read fails closed (ProvisionError).
 """
 
 import dataclasses
@@ -70,6 +76,17 @@ SHORT_FILES_SHOWN = 50
 EVICTION_ATTEMPTS = 5
 EVICTION_RETRY_PAUSE_S = 10.0
 EVICTION_CHECK_S = 10.0
+# A replication runs on its target from the target's own copy of the other providers' file locations, which dbsync
+# brings it, while the block map read through any provider gathers each provider's map from that provider (op-worker
+# f118ed9: replica_synchronizer.erl:1368-1372 and replica_finder.erl:48-89, against data_distribution.erl:183-199 and
+# provider_reg_distribution.erl:31-38). One scheduled before that copy holds the source's last write fetches only what
+# the copy shows and reports `completed`, and no REST call shows the lag
+# (`deploy/compose-federation/day0/2026-11-14-federation-facts-replication-lag.md`). So while the target's own block
+# map is short `REPLICATION_CHECK_S` after a replication ended, it is scheduled again after a pause on the order of
+# dbsync's delay (about 8 s, 15 s more on a gap), at most `REPLICATION_ATTEMPTS` in all, within the settle bound.
+REPLICATION_ATTEMPTS = 5
+REPLICATION_RETRY_PAUSES_S = (5.0, 10.0, 15.0, 15.0)  # before the second try, the third, the fourth and the fifth
+REPLICATION_CHECK_S = 10.0
 
 Listings = dict[tuple[str, str], dict[str, "Entry"]]  # (provider, directory id) -> its entries, for one operation
 
@@ -367,14 +384,50 @@ class Provisioner:
         """Append one line to the change log; fail loudly, since an unlogged creation could never be torn down."""
         self._log.parent.mkdir(parents=True, exist_ok=True)
         line = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "action": action, **fields}
-        with self._log_lock, open(self._log, "a", encoding="utf-8") as handle:  # a bulk eviction writes from threads
-            handle.write(json.dumps(line, sort_keys=True) + "\n")
-            handle.flush()
+        with self._log_lock:  # a bulk eviction writes from threads
+            self._cut_torn_tail()
+            with open(self._log, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(line, sort_keys=True) + "\n")
+                handle.flush()
+
+    def _cut_torn_tail(self) -> None:
+        """End a last line a crash left without its newline, so the next line starts on a line of its own: kept when it
+        reads whole, dropped when it was cut short, since it then recorded nothing that can be read. Called under the
+        log's lock."""
+        if not self._log.exists():
+            return
+        with open(self._log, "rb") as handle:  # the last byte alone, as a rule: the log grows with every run
+            end = handle.seek(0, os.SEEK_END)
+            if end == 0 or (handle.seek(end - 1), handle.read(1))[1] == b"\n":
+                return
+            handle.seek(0)
+            data = handle.read()
+        start = data.rfind(b"\n") + 1
+        try:
+            json.loads(data[start:])
+            kept = data + b"\n"
+        except ValueError:  # a JSONDecodeError, or bytes that are no UTF-8
+            kept = data[:start]
+        partial = self._log.with_name(self._log.name + ".part")
+        partial.write_bytes(kept)
+        os.replace(partial, self._log)
 
     def _lines(self) -> list[dict[str, Any]]:
+        """Every line of the change log. A last line a crash cut short is no line (`_cut_torn_tail`); any other line
+        that cannot be read fails closed."""
         if not self._log.exists():
             return []
-        return [json.loads(text) for text in self._log.read_text(encoding="utf-8").splitlines() if text.strip()]
+        text = self._log.read_text(encoding="utf-8")
+        rows = text.splitlines()
+        if rows and not text.endswith("\n"):
+            try:
+                json.loads(rows[-1])
+            except json.JSONDecodeError:
+                rows = rows[:-1]
+        try:
+            return [json.loads(row) for row in rows if row.strip()]
+        except json.JSONDecodeError:
+            raise ProvisionError(f"{self._where}the change log has a line that cannot be read") from None
 
     def logged(self) -> list[dict[str, Any]]:
         """Return the creations the log holds that no later deletion line cancels, oldest first."""
@@ -546,8 +599,12 @@ class Provisioner:
           made is skipped too, and stays out of the log;
         - a strict prefix of the local file, in a file the log says this provisioner created: the rest is sent from
           where the target ends, by offset writes (`resumed`);
-        - anything else in a file it created: the file is written again from its first byte, the first write without
-          an offset, which truncates it (`restarted`);
+        - other bytes, in a file it created that is no longer than the local file: the file is written again from its
+          first byte, every write at its offset, so the writes cover the whole target and leave it the local file's
+          size (`restarted`);
+        - a file it created that is longer than the local file: refused before anything is written. Only a write
+          without an offset could shorten it, by truncating it to 0 first, and none is ever sent (O44): remove the file
+          first;
         - anything else in a file it did not create: refused before anything is written, as `put_file` refuses (O09).
 
         Success is reported only once the size and the SHA-256 read back equal those of the bytes read from the local
@@ -574,7 +631,7 @@ class Provisioner:
         # The caller's stop, never the size taken above: without one, a local file appended to meanwhile is read to its
         # new end and fails the size check below instead of being cut to its first bytes and reported done.
         blocks = _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=stop), hasher)
-        sent = self._write_chunks(file_id, blocks, media, truncate=action == "restarted")
+        sent = self._write_chunks(file_id, blocks, media)
         expected = Digest(start + sent, hasher.hexdigest())
         if expected.size != size:
             raise ProvisionError(f"{self._where}the local file changed size while it was uploaded")
@@ -603,6 +660,11 @@ class Provisioner:
                 self._require_created(existing.file_id)
                 return "resumed", existing.size, hasher
         self._require_created(existing.file_id)
+        if existing.size > size:
+            raise ProvisionError(
+                f"{self._where}the target is longer than the local file, and only a write without an offset, which "
+                "truncates and is never sent, could shorten it; nothing was written"
+            )
         return "restarted", 0, hashlib.sha256()
 
     def _require_created(self, file_id: str) -> None:
@@ -612,31 +674,86 @@ class Provisioner:
                 "overwrite or adopt it, and nothing was written"
             )
 
-    def _write_chunks(
-        self, file_id: str, blocks: Iterable[tuple[int, bytes]], media: str, *, truncate: bool = False
-    ) -> int:
-        """Write `(offset, bytes)` blocks to a file's content on the data provider, each a PUT through the gate; return
-        the bytes sent. With `truncate`, the first write goes without an offset, which truncates the file (with an
-        empty body when there is no block)."""
+    def preallocate(self, path: str, size: int, *, content_type: str = OCTET_STREAM) -> str:
+        """Create a file at a path of the space, in a directory that exists, at `size` bytes with no byte written; log
+        it and return its id (O44, #107).
+
+        The file is created, then extended by an empty write at offset `size`, which on 25.0 sets the size and writes
+        no block (measured on 10 Nov, `deploy/compose-federation/day0/2026-11-10-federation-facts.md`; op-worker
+        f118ed9, read_write_req.erl:58-86). Extending first keeps the size `size` from the first moment the file holds
+        anything, since every later write lies inside it. A path that exists, or whose directory does not, is refused
+        before anything is written; a size read back other than `size` is a ProvisionError, the file left logged.
+        """
+        media = media_type(content_type)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ProvisionError(f"{self._where}a preallocated file has a size of one byte or more")
+        self._verified()
+        *directory, name = safe_path(path)
+        try:
+            parent = self.resolve("/".join(directory)) if directory else Entry(self.root(), "", 0, "DIR")
+        except KeyError:
+            raise ProvisionError(
+                f"{self._where}a preallocated file's directory is not there; nothing was written"
+            ) from None
+        if parent.kind != "DIR":
+            raise ProvisionError(
+                f"{self._where}a preallocated file's directory is not a directory; nothing was written"
+            )
+        if name in self.children(parent.file_id):
+            raise ProvisionError(
+                f"{self._where}the file already exists; a preallocation makes a new one, so nothing was written"
+            )
+        file_id = self._create(parent.file_id, name, "REG", path)
+        self._put(file_id, b"", size, media)
+        if self._size_of(file_id) != size:
+            raise ProvisionError(f"{self._where}the size read back after a preallocation is not the size asked for")
+        return file_id
+
+    def write_range(
+        self, file_id: str, source: Path | str, start: int, stop: int, *, content_type: str = OCTET_STREAM
+    ) -> Digest:
+        """Write bytes `start` to `stop` of a local file into the same range of a file this provisioner made, chunk by
+        chunk, each at its offset; return the size and SHA-256 of the bytes sent (O44, #107). Nothing else of the file
+        is touched: no write truncates, and a write inside the file's size leaves the size as it was.
+
+        A file the change log does not hold is refused, since writing into it adopts it (O09), and so is a range that
+        is empty or outside the local file; a local file that ends before `stop` meanwhile is a ProvisionError. The
+        caller verifies what the file holds."""
+        media, source = media_type(content_type), Path(source)
+        whole = source.stat().st_size
+        if any(isinstance(n, bool) or not isinstance(n, int) for n in (start, stop)) or not 0 <= start < stop <= whole:
+            raise ProvisionError(f"{self._where}a written range lies within the local file and holds a byte at least")
+        self._verified()
+        self._require_created(file_id)
+        hasher = hashlib.sha256()
+        sent = self._write_chunks(
+            file_id, _hashing(chunks(source, self._settings.chunk_bytes, start=start, stop=stop), hasher), media
+        )
+        if sent != stop - start:
+            raise ProvisionError(f"{self._where}the local file changed size while a range of it was written")
+        return Digest(sent, hasher.hexdigest())
+
+    def _write_chunks(self, file_id: str, blocks: Iterable[tuple[int, bytes]], media: str) -> int:
+        """Write `(offset, bytes)` blocks to a file's content on the data provider, each a PUT at its offset through the
+        gate; return the bytes sent."""
         self._verified()
         sent = 0
         for offset, block in blocks:
-            if truncate and sent == 0 and offset != 0:
-                raise ProvisionError(f"{self._where}a truncating write starts at the file's first byte")
-            self._put(file_id, block, None if truncate and sent == 0 else offset, media)
+            self._put(file_id, block, offset, media)
             sent += len(block)
-        if truncate and sent == 0:
-            self._put(file_id, b"", None, media)
         return sent
 
-    def _put(self, file_id: str, block: bytes, offset: int | None, media: str) -> None:
-        """One write of content, bound to this provisioner's space: at `offset`, or without one, which truncates the file
-        first. A body of `fresh_connection_bytes` or more goes on a connection of its own (#186)."""
+    def _put(self, file_id: str, block: bytes, offset: int, media: str) -> None:
+        """One write of content at `offset`, bound to this provisioner's space. There is no write without an offset,
+        which would truncate the file to 0 first: one is refused here and by the client's gate, before it is sent
+        (O44). A body of `fresh_connection_bytes` or more goes on a connection of its own (#186)."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ProvisionError(f"{self._where}a write of content needs a whole offset of 0 or more; nothing was sent")
         self.mutate(
             "PUT",
             f"/data/{_segment(file_id)}/content",
             provider=self._settings.holder,
-            params=None if offset is None else {"offset": offset},
+            params={"offset": offset},
             content=block,
             timeout_s=self._settings.request_timeout_s,
             content_type=media,
@@ -657,9 +774,11 @@ class Provisioner:
         size: int | None = None,
         deadline_s: float | None = None,
         answers: Callable[[ReadOutcome], None] | None = None,
+        stop: int | None = None,
     ) -> Digest:
         """Read a file's whole content through a provider (the data provider unless named), hashing it as it comes,
-        and write it to `dest` when one is given; return its size and SHA-256 (O25).
+        and write it to `dest` when one is given; return its size and SHA-256 (O25). With `stop`, only its first `stop`
+        bytes are read and hashed, of a file of `size` bytes (O44): the prefix of a file at its final size.
 
         The read is the client's `read_content`: by ranges of `chunk_bytes`, each gated as a range read and streamed,
         so the file is never held. It is bounded in bytes by `size`, or else by the size the file's attributes give,
@@ -681,11 +800,14 @@ class Provisioner:
             size = answer.get("size") if isinstance(answer, dict) else None
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise PlatformError("a file's attributes hold no size, so its read has no bound")
+        if stop is not None and (isinstance(stop, bool) or not isinstance(stop, int) or not 0 <= stop <= size):
+            raise ProvisionError(f"{self._where}a read's stop is a whole number of bytes within the file")
         read = functools.partial(
             self._client.read_content,
             f"/data/{_segment(file_id)}/content",
             provider=provider,
             size=size,
+            stop=stop,
             chunk_bytes=self._settings.chunk_bytes,
             deadline_s=deadline,
             timeout_s=self._settings.request_timeout_s,
@@ -808,13 +930,17 @@ class Provisioner:
         reads it under `retry`."""
         return sum(held_bytes(self.blocks(fid, provider, retry=retry)) for fid in file_ids)
 
-    def confirm_placed(self, provider: str, wanted: Mapping[str, list[Range]]) -> Confirmation:
-        """Wait, within the bound, for the block map to show every wanted range on `provider` on consecutive polls."""
+    def confirm_placed(
+        self, provider: str, wanted: Mapping[str, list[Range]], *, timeout_s: float | None = None
+    ) -> Confirmation:
+        """Wait, within the bound, for the block map to show every wanted range on `provider` on consecutive polls.
+
+        The bound is `timeout_s`, the settings' `settle_timeout_s` unless given."""
         began = self._clock()
         result = consistency.converge(
             lambda: self.placement_report(provider, wanted),
             lambda report: report.fully_placed,
-            timeout_s=self._settings.settle_timeout_s,
+            timeout_s=self._settings.settle_timeout_s if timeout_s is None else timeout_s,
             poll_s=self._settings.poll_s,
             consecutive=self._settings.consecutive_polls,
             clock=self._clock,
@@ -866,10 +992,7 @@ class Provisioner:
 
     def transfers(self) -> list[tuple[str, str, str]]:
         """Return `(provider, transfer id, kind)` of every transfer the log says this provisioner scheduled."""
-        if not self._log.exists():
-            return []
-        lines = (json.loads(t) for t in self._log.read_text(encoding="utf-8").splitlines() if t.strip())
-        return [(x["provider"], x["id"], x["kind"]) for x in lines if x.get("action") == "transfer"]
+        return [(x["provider"], x["id"], x["kind"]) for x in self._lines() if x.get("action") == "transfer"]
 
     def replicate(self, path: str, to_provider: str) -> dict[str, Any]:
         """Replicate a whole file to a provider and return a record once its block map there covers the file (O01).
@@ -879,33 +1002,70 @@ class Provisioner:
         """
         self._verified()
         entry = self.resolve(path)
-        if entry.size < 1:
+        return self.replicate_file(entry.file_id, entry.size, to_provider)
+
+    def replicate_file(self, file_id: str, size: int, to_provider: str) -> dict[str, Any]:
+        """`replicate` for a file named by its id, whose size the caller knows: a progressive ingest's reset replicates
+        the file it completed, and never a file another entry now has at its path (O44).
+
+        A replication that ended short is scheduled again (the target's copy of the source's map can lag,
+        `REPLICATION_ATTEMPTS`): while the target's own block map does not cover the file `REPLICATION_CHECK_S` after
+        a job ended, another is scheduled after the next of `REPLICATION_RETRY_PAUSES_S`, at most `REPLICATION_ATTEMPTS`
+        in all. One deadline, the first job's end plus `settle_timeout_s`, bounds every step after it: a later job's
+        wait is cut to what is left (a job still running there is `WaitTimeout`, as any job that outlives its wait),
+        each check too, the last waits out what is left, and no job is scheduled once a check and its pause leave no
+        time; then `NotPlaced` refuses it. As in every bounded poll of the layer, a read begun before the deadline may
+        end after it. Every job's id is in the change log and in the record, with the tries (`tries`) and the seconds
+        from the first job's end until the map covered the file (`converged_s`)."""
+        self._verified()
+        if size < 1:
             raise ProvisionError(f"{self._where}an empty file has nothing to place")
-        wanted = {entry.file_id: [(0, entry.size)]}
-        began = self._clock()
-        tid = self.schedule_transfer("replication", entry.file_id, to_provider)
-        done = consistency.require_ended(
-            consistency.wait_transfers(
-                self._client,
-                to_provider,
-                [tid],
-                timeout_s=self._settings.transfer_timeout_s,
-                poll_s=self._settings.poll_s,
-                clock=self._clock,
-                sleep=self._sleep,
-                retry=self._retry,
-            ),
-            "replication",
-        )
-        confirmation = self.confirm_placed(to_provider, wanted)
+        wanted = {file_id: [(0, size)]}
+        began, settings = self._clock(), self._settings
+        ids: list[str] = []
+        states: dict[str, int] = {}
+        first_end, deadline = began, None  # the first job's end, and it plus the settle bound
+        for attempt in range(1, REPLICATION_ATTEMPTS + 1):
+            ids.append(self.schedule_transfer("replication", file_id, to_provider))
+            wait_s = settings.transfer_timeout_s  # the first job's, then what is left once this one is scheduled
+            if deadline is not None:
+                wait_s = max(min(wait_s, deadline - self._clock()), 0.0)
+            done = consistency.require_ended(
+                consistency.wait_transfers(
+                    self._client,
+                    to_provider,
+                    [ids[-1]],
+                    timeout_s=wait_s,
+                    poll_s=settings.poll_s,
+                    clock=self._clock,
+                    sleep=self._sleep,
+                    retry=self._retry,
+                ),
+                "replication",
+            )
+            for state, count in done.states().items():
+                states[state] = states.get(state, 0) + count
+            if deadline is None:
+                first_end = self._clock()
+                deadline = first_end + settings.settle_timeout_s
+            left = max(deadline - self._clock(), 0.0)
+            pause = REPLICATION_RETRY_PAUSES_S[attempt - 1] if attempt < REPLICATION_ATTEMPTS else 0.0
+            last = attempt == REPLICATION_ATTEMPTS or left <= REPLICATION_CHECK_S + pause  # no room for another try
+            confirmation = self.confirm_placed(to_provider, wanted, timeout_s=left if last else REPLICATION_CHECK_S)
+            if confirmation.placed or last or deadline - self._clock() <= pause:  # placed, or no time for another try
+                break
+            self._sleep(pause)  # completed, and the target's own map is short: its copy may lag; schedule it again
         if not confirmation.placed:
             raise NotPlaced(
-                f"{self._where}the transfer reported {done.states()} but the block map does not cover the file "
-                f"({confirmation.report.bytes_short} B short)",
+                f"{self._where}the transfers reported {states} over {len(ids)} tries but the block map does not cover "
+                f"the file ({confirmation.report.bytes_short} B short)",
                 confirmation.report,
             )
         return {
-            "transfer_states": done.states(),
+            "transfer_states": states,
+            "tries": len(ids),
+            "transfer_ids": ids,
+            "converged_s": round(self._clock() - first_end, 3),
             "placement": confirmation.report.to_json(),
             "seconds": round(self._clock() - began, 3),
         }

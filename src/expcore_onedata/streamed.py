@@ -8,7 +8,8 @@ of a provider's answer on as it comes (`OnezoneClient.read_content`), both hashi
 - `created`: the target did not exist; it was created and every byte sent;
 - `skipped`: the target already held the same size and SHA-256; nothing was sent;
 - `resumed`: the target held a strict prefix of the file; the rest was sent from where it ended;
-- `restarted`: the target held something else; it was written again from its first byte, truncated by the first write.
+- `restarted`: the target held something else and was no longer; it was written again from its first byte, every
+  write at its offset (a longer target is refused: no write that truncates is ever sent, O44).
 
 A read also says what the platform answered, range by range (`ReadOutcome`, handed to the read's `answers`): the
 status, the `Content-Range` as it was sent (None when there was none) and the bytes of the body, so a whole answer

@@ -2,7 +2,9 @@
 """The vocabulary of attempts: their states, how each is charged, which are treatment, and the store's refusals.
 
 Charging (C03). An attempt counts against the attempt limit only when the infrastructure failed, the cause was neither
-the key's nor the budget's (`UNCHARGED_KINDS`) and no outage overlapped it. Interrupted, outage-discarded and
+the key's nor the budget's (`UNCHARGED_KINDS`) nor a platform's hold (`expcore.errors.uncharged_kinds`: a start held
+back because what the run needs is held by another live attempt, or was left unfit by an earlier one) and no outage
+overlapped it. Interrupted, outage-discarded and
 harness-error attempts are never charged. The charge is decided once, when the attempt finishes, and stored in the row.
 
 Treatment. A condition may declare infrastructure kinds that are its treatment (`FactorSchema.treatment_kinds`). An
@@ -29,7 +31,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from expcore.campaign.markers import AttemptResult
-from expcore.errors import POST_CHECK_UNVERIFIED
+from expcore.errors import POST_CHECK_UNVERIFIED, uncharged_kinds
 from expcore.loop.outcomes import Outcome
 
 STATES = ("running", "done", "infra_fail", "outage_discarded", "interrupted", "harness_error")
@@ -120,10 +122,16 @@ def classify(
     if result.outage_kind is not None:
         return Classified("outage_discarded", False)
     if outcome.name == "infrastructure":
-        return Classified("infra_fail", outcome.infra_kind not in UNCHARGED_KINDS)
+        return Classified("infra_fail", is_charged(outcome.infra_kind))
     if outcome.name == "harness_defect":
         return Classified("harness_error", False)
     return Classified("done", False)
+
+
+def is_charged(kind: str | None) -> bool:
+    """Tell whether an infrastructure failure of this kind costs its run an attempt: not the key's, not the budget's
+    (`UNCHARGED_KINDS`) and not a platform's hold (`expcore.errors.uncharged_kinds`)."""
+    return kind not in UNCHARGED_KINDS and kind not in uncharged_kinds()
 
 
 def unverified(result: AttemptResult, detail: str) -> AttemptResult:

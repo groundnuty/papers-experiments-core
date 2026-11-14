@@ -311,6 +311,44 @@ def test_o03_the_mount_live_test_puts_the_sidecar_on_the_federation_network_dial
 
 
 @needs_openssl
+def test_o40_a_direct_mount_table_for_the_federation_maps_the_local_providers_storage_and_loads(fed, tmp_path):
+    """O40: the comparison harness's direct pass derives the platform as the proxy one does, with the local provider's
+    storage (the Compose layout's directory of it) mapped and a check file named; the copy loads, and the federation's
+    root gets nothing written beside the original."""
+    from measure_direct_vs_proxy import mount_keys, storage_of
+    from mount_live import derive_platform, federation_network, sandbox_table
+
+    from expcore_onedata.config import load_platform
+
+    root, own = tmp_path / "root", tmp_path / "own"
+    root.mkdir()
+    own.mkdir()
+    layout = fed.layout.Layout(root)
+    fed.facts.write_facts(layout, fake_boot(fed, layout))
+    (root / "ca").mkdir()
+    fed.pki.make_ca(root / "ca" / "federation-ca.pem", tmp_path / "ca.key", "test CA")
+    facts = json.loads(layout.facts.read_text(encoding="utf-8"))
+    local = layout.spec.holder
+    storage = storage_of("0a1b2c3d", None, layout.platform, local)
+    assert storage == ("0a1b2c3d", str(layout.storage(local).resolve()))
+    table = sandbox_table(
+        work_root=own / "work",
+        images={"agent": ("agent:1", "sha256:" + "a" * 64), "oneclient": ("mounter:1", "sha256:" + "c" * 64)},
+        pool="10.77.0.0/24",
+        network=federation_network(facts),
+        local=local,
+        local_address=facts["providers"][local]["domain_on_project_network"],
+        **mount_keys("direct", storage, "space-x/run/check.bin"),
+    )
+    before = sorted(p.name for p in root.iterdir())
+    mount = load_platform(derive_platform(layout.platform, own, table), require_secrets=False).sandbox.mount
+    assert mount.io_mode == "direct"
+    assert mount.storages == (storage,)
+    assert mount.direct_check_file == "space-x/run/check.bin"
+    assert sorted(p.name for p in root.iterdir()) == before
+
+
+@needs_openssl
 def test_o03_the_rest_live_test_puts_the_gate_on_the_federation_network_dialling_names_the_certificates_hold(
     fed, tmp_path
 ):
