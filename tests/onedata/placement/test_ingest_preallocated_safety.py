@@ -198,3 +198,24 @@ def test_o44_a_reset_is_verified_by_the_owners_block_map_as_well_as_by_the_hash(
     assert content(fake, DAY_PATH) == DAY
     assert snapshot["restore"]["ok"] is False
     assert "block map" in snapshot["restore"]["files"]["day-13"]["detail"]
+
+
+# -- 3. the old-to-new id map, and the start's duration ----------------------------------------------------------------
+
+
+def test_o44_the_snapshot_maps_each_recreated_files_old_id_to_its_new_one_and_times_the_start(make, fake, ticker):
+    """O44: a study's id map is keyed by file id (a data gate's rows are), so the snapshot maps the id each file had in
+    the baseline to the one the start made, the id the run's reads and the reset use, for every file it made again;
+    and it records the start's seconds, spent before the first turn and so outside the agent's time."""
+    old = {label: fake.id_of(path) for label, path in (("day-13", DAY_PATH), ("day-12", KEPT_PATH))}
+    ingest = make(ROW, KEPT_ROW)
+    began = ticker.now
+    ingest.start({})
+    took = ticker.now - began
+    new = {label: fake.id_of(path) for label, path in (("day-13", DAY_PATH), ("day-12", KEPT_PATH))}
+    ingest.at_first_turn({"clock_s": 0.0})
+    snapshot = ingest.finish()
+    assert snapshot["id_map"] == {old[label]: new[label] for label in old}
+    assert all(snapshot["files"][label]["restored_id"] == new[label] for label in old)
+    assert snapshot["start_s"] == snapshot["start"]["seconds"] == round(took, 3)
+    assert snapshot["start_s"] > 0

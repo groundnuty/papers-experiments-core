@@ -72,6 +72,12 @@ ANCHOR = "instrument_start"  # the arrival schedule's zero: the end of `start`
 FIRST_TURN = "first_turn"  # the preallocated schedule's zero: the agent's first model turn (`at_first_turn`)
 
 
+def id_map(ids: list[dict[str, Any]]) -> dict[str, str]:
+    """Each id a planned file had, mapped to the id the ingest gave it in its place, in the order the changes came: the
+    map a study keyed by file id follows (a data gate's rows are keyed so), the start's recreations among them."""
+    return {e["old_id"]: e["new_id"] for e in ids if e["old_id"] and e["new_id"] and e["old_id"] != e["new_id"]}
+
+
 class ProgressiveIngest:
     """The instrument of one run's progressive ingest: one per run, over a provisioner of its own."""
 
@@ -435,6 +441,8 @@ class ProgressiveIngest:
             "start": self._start,
             "steps": steps,
             "ids": ids,
+            "id_map": id_map(ids),
+            "start_s": None if self._start is None else self._start["seconds"],
             "files": files,
             "failure": self._failure,
             "defect": self._defect,
