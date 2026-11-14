@@ -276,8 +276,9 @@ class Recovery:
         return Settled(True, how, after, ready_after_s)
 
     def _stuck_links(self, service: str) -> str | None:
-        """The link check of the pairs a restored service's provider is in, when the driver has one
-        (`ComposeDriver.restored_links`): None when each passed, else why not. A check that raises fails closed."""
+        """The link check of every ordered pair of providers, not the restored provider's pairs alone, when the driver
+        has one (`ComposeDriver.restored_links`): None when each passed, else why not. A check that raises fails
+        closed."""
         check = getattr(self._driver, "restored_links", None)
         if check is None:
             return None
