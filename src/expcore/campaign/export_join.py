@@ -16,6 +16,9 @@ snapshot and this module joins the results:
   of the first shard, in index order, that did. Each shard serves one model under `expcore-shard/3`, and a store keeps
   a record of accepted fingerprints only when the models of its plan declare a set, so a shard's export may lack the
   key that another's has: it counts as no entries, and the joined export has the key exactly when any shard's does;
+- `reset_settings` (C35), when any shard's store recorded the platform's settings: every shard's changes and unknown
+  earlier starts, in shard order, each with `"shard"` added, since each shard's store records its own platform's
+  settings and nothing of them adds up. A shard whose store recorded none exports none and adds none;
 - `shard_retries_by_kind` keeps what the sum of `retries_by_kind` loses: every row of every shard's own table, in shard
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
@@ -36,6 +39,7 @@ from typing import Any
 
 from expcore.campaign.deployments import fingerprint_order
 from expcore.campaign.export import RUN_LISTS, ExportError, none_last
+from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.shard import EXPORT_KEY
 from expcore.errors import CORE_KINDS
 
@@ -53,7 +57,7 @@ _TABLES = {
 DEPLOYMENTS = "deployment_shares"
 _MODEL_SUMS = ("analysed_runs", "runs_without_mix", "mixed_runs", "turns")
 _FINGERPRINT_SUMS = ("turns", "runs")
-_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS)  # keys that one shard's export may have and another's lack
+_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, SETTINGS_KEY)  # keys that one shard's export may have and another's lack
 
 
 def join_exports(
@@ -75,6 +79,9 @@ def join_exports(
     for key in _keys_of_the_join(exports, order):
         if key == DEPLOYMENTS:  # a shard whose plan has no model with a set exports none: it has no entries
             joined[key] = _join_deployments([exports[index].get(key, ()) for index in order])
+            continue
+        if key == SETTINGS_KEY:  # a shard whose store recorded no settings exports none: it adds nothing
+            joined[key] = _join_settings({index: exports[index].get(key) for index in order})
             continue
         parts = [exports[index][key] for index in order]
         if key in LISTS:
@@ -120,10 +127,13 @@ def _require_the_plan(joined: Mapping[str, Any], seq_of: Mapping[str, int]) -> N
 
 def _keys_of_the_join(exports: Mapping[int, Mapping[str, Any]], order: Sequence[int]) -> list[str]:
     """The keys of the joined export, in the first shard's order, without the shard's own key. `deployment_shares`
-    is in when any shard's export has it, where `export_run_state` puts it, after `kinds`."""
+    and `reset_settings` are in when any shard's export has them, where `export_run_state` puts them: after `kinds`,
+    the first of them before the second."""
     keys = [key for key in exports[order[0]] if key != EXPORT_KEY]
-    if DEPLOYMENTS not in keys and any(DEPLOYMENTS in exports[index] for index in order):
-        keys.insert(keys.index("kinds") + 1 if "kinds" in keys else len(keys), DEPLOYMENTS)
+    for extra in (DEPLOYMENTS, SETTINGS_KEY):
+        if extra not in keys and any(extra in exports[index] for index in order):
+            anchors = [keys.index(key) for key in ("kinds", DEPLOYMENTS) if key in keys]
+            keys.insert(max(anchors) + 1 if anchors else len(keys), extra)
     return keys
 
 
@@ -174,6 +184,19 @@ def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict
             cell["turn_share"] = cell["turns"] / held["turns"] if held["turns"] else None
             cell["run_share"] = cell["runs"] / with_mix if with_mix else None
     return [models[model] for model in sorted(models)]
+
+
+def _join_settings(parts: Mapping[int, Mapping[str, Any] | None]) -> dict[str, list[dict[str, Any]]]:
+    """Join the shards' `reset_settings` (C35), given by shard index in shard order: every change and every start of
+    unknown earlier settings, each shard's in its own order, with the shard that saw it added last. Each shard's store
+    records its own platform's settings, so nothing is summed or merged, and a shard that exports none adds none."""
+    joined: dict[str, list[dict[str, Any]]] = {"changes": [], "unknown_before": []}
+    for index, part in parts.items():
+        if part is None:
+            continue
+        for name in joined:
+            joined[name] += [{**entry, SHARD_KEY: index} for entry in part[name]]
+    return joined
 
 
 def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, Any]]) -> None:

@@ -55,6 +55,12 @@ counts the runs served by more than one, and `runs_without_mix` the analysed run
 recovery committed from its marker). A campaign without such a model has no `deployment_shares`, so its export is
 the one it had before the key.
 
+A campaign whose platform supplied settings that are in no fingerprint (`campaign.reset_settings`, C35) also exports
+`reset_settings`, after `deployment_shares`: `changes`, one entry for each setting a resume found changed (`at`, the
+start's time; `key`; `old` and `new`, each absent where that side lacked the key), and `unknown_before`, one entry
+(`at`) for each start that found a store with no record, whose earlier settings are unknown. Both lists are written out
+when empty, so the key says the settings were recorded. A campaign whose platform supplied none has no such key.
+
 A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
@@ -73,6 +79,8 @@ from typing import Any, Protocol
 
 from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
+from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
+from expcore.campaign.reset_settings import exported as exported_settings
 from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
 from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
@@ -137,6 +145,10 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         identities = {run["run_key"]: _identity(store, run) for run in runs}
         declared = store.q("SELECT value FROM meta WHERE key=?", (ACCEPTED_META,))
         shard = _shard_facts(store)
+        try:
+            settings = exported_settings(store)
+        except ValueError as error:
+            raise ExportError(f"the store's {SETTINGS_KEY} cannot be exported: {error}") from None
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
     scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
@@ -204,6 +216,8 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
             data["deployment_shares"] = deployment_shares(json.loads(declared[0]["value"]), scored)
         except (ValueError, DeploymentsUnreadable) as error:
             raise ExportError(f"the store's {ACCEPTED_META} cannot be exported: {error}") from None
+    if settings is not None:  # only a campaign whose platform supplied settings has the key (C35)
+        data[SETTINGS_KEY] = settings
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)

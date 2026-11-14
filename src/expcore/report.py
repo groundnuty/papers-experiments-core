@@ -27,6 +27,9 @@ are the same text: no clock, no path and no random number enters it.
   0 is never mistaken for "not reported" (C23); and per condition and model the attempts a budget hold set aside, a row
   of zeros for each pair the plan runs, so a reader sees whether the budget stopped one model more than another (C26).
   Those come from the export's `budget_holds`, which counts a hold by its own kind even where an outage overlapped it.
+  A campaign whose platform supplied settings that are in no fingerprint (the export's `reset_settings`) has one more
+  section in between, with each start that found one changed and its old and new value, and each start of a store whose
+  earlier settings are unknown (C35); without the key the report is the text it was.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
@@ -47,6 +50,7 @@ are the same text: no clock, no path and no random number enters it.
   the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
 """
 
+import json
 import math
 import statistics
 from collections import Counter, defaultdict
@@ -69,6 +73,8 @@ from expcore.report_notes import (
     RATIO_BY_MODEL_NOTES,
     RATIO_MISSING_PAIRS,
     RATIO_NOTES,
+    RESET_SETTINGS_NOTES,
+    RESET_SETTINGS_UNCHANGED,
     UNKNOWN,
     contrast_notes,
     equivalence_family_notes,
@@ -520,6 +526,7 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         *lines,
         *_infrastructure(export, [cell["condition"] for cell in accounting]),
         "",
+        *_reset_settings(export),
         *_budget_holds(export),
         "",
     ]
@@ -550,6 +557,38 @@ def _infrastructure(export: Mapping[str, Any], conditions: Sequence[str]) -> lis
         return [*lines, "No condition has a planned run."]
     header = ["Condition", "Kind", "Declared treatment", "Set aside (all runs)", "Scored as treatment", "Left out"]
     return [*lines, *_table(header, rows), "", *COUNT_DEFINITIONS]
+
+
+def _setting(entry: Mapping[str, Any], side: str) -> str:
+    """A value of a changed setting as JSON, or `absent` where the platform did not report the key on that side."""
+    return json.dumps(entry[side]) if side in entry else "absent"
+
+
+def _reset_settings(export: Mapping[str, Any]) -> list[str]:
+    """The platform's settings outside the fingerprint that changed across the campaign's starts, with the starts of a
+    store whose earlier settings are unknown (C35); nothing for an export without `reset_settings`, which a campaign
+    whose platform supplied none has. In a batch merged from shards each entry names its shard."""
+    if "reset_settings" not in export:
+        return []
+    found = export["reset_settings"]
+    changes, unknown = found["changes"], found["unknown_before"]
+    lines = ["### Platform settings outside the fingerprint", "", *RESET_SETTINGS_NOTES, ""]
+    if changes:
+        header = ["Recorded", "Key", "Before", "After"]
+        rows = [[c["at"], c["key"], _setting(c, "old"), _setting(c, "new")] for c in changes]
+        if any("shard" in c for c in changes):  # a merged batch: each change names the shard that found it
+            header, rows = ["Shard", *header], [[c["shard"], *row] for c, row in zip(changes, rows, strict=True)]
+        lines += [*_table(header, rows), ""]
+    for entry in unknown:
+        where = f" in shard {entry['shard']}" if "shard" in entry else ""
+        lines += [
+            f"- At the start of {entry['at']}{where} the store held no record of these settings: the settings of the "
+            "runs before it are unknown.",
+            "",
+        ]
+    if not changes and not unknown:
+        lines += [RESET_SETTINGS_UNCHANGED, ""]
+    return lines
 
 
 def _budget_holds(export: Mapping[str, Any]) -> list[str]:

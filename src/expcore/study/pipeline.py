@@ -267,6 +267,7 @@ def _run_campaign(
             backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
             on_hold=_say_hold,
             shard=started,
+            reset_settings=plugin.reset_settings,
             **options,
         ) as scheduler:
             return scheduler.run()

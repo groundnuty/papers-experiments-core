@@ -41,12 +41,14 @@ Every message names the file and the key and never echoes a value. `trace_reads`
 the study runs its own code on a local copy and the map records every byte that code read.
 """
 
+import hashlib
 import io
+import json
 import math
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +96,17 @@ class PlacementSettings:
     # added later goes at the end of the class.
     fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
 
+    def reset_settings(self) -> dict[str, Any]:
+        """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
+
+        Every field after its default, as `placement.<name>`: numbers and text only. They are in no fingerprint, since
+        they change how placement and the reset work and not what an agent sees, so a campaign resumed after one
+        changed (or after a default changed under a file that never declared it) says so. The data provider's name is
+        left out, since the record travels with the export and the replication package, which name no provider. The
+        map is not here either: `Placement.reset_settings()` adds it, as its digest.
+        """
+        return {f"placement.{item.name}": getattr(self, item.name) for item in fields(self) if item.name != "holder"}
+
 
 @dataclass(frozen=True)
 class RangeRow:
@@ -128,6 +141,29 @@ class RangeMap:
         """Return the bytes the map asks to be placed, over all rows."""
         return sum(length for row in self.rows for _, length in row.ranges)
 
+    def canonical(self) -> str:
+        """The map in one form that does not depend on how the file wrote it (C35): a JSON array of the rows sorted by
+        space, file and receiving provider, each an object of `file`, `provider`, `ranges` (the merged
+        `[offset, length]` pairs) and `space`, with the keys sorted and no spaces. The same rows in another order, or
+        ranges written unmerged, give the same text. Nothing else of the platform hashes the map, so this is its
+        definition."""
+        rows = sorted(self.rows, key=lambda row: (row.space, row.file, row.provider))
+        entries = [
+            {
+                "file": row.file,
+                "provider": row.provider,
+                "ranges": [[offset, length] for offset, length in merged(row.ranges)],
+                "space": row.space,
+            }
+            for row in rows
+        ]
+        return json.dumps(entries, sort_keys=True, separators=(",", ":"))
+
+    def digest(self) -> str:
+        """The SHA-256, in lower-case hexadecimal, of the UTF-8 bytes of `canonical()`: all that is recorded of the map,
+        since a row names a file and a provider and the record is shipped with the export."""
+        return hashlib.sha256(self.canonical().encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True)
 class Placement:
@@ -135,6 +171,15 @@ class Placement:
 
     settings: PlacementSettings
     map: RangeMap
+
+    def reset_settings(self) -> dict[str, Any]:
+        """What a study gives its plugin as `StudyPlugin(reset_settings=...)` (C35): the settings
+        (`PlacementSettings.reset_settings`) and the map as one setting, `placement.range_map_sha256`, its digest.
+
+        The map decides which bytes a state places, so a resume after it changed starts from another state, which is
+        what the core's warning is for; the digest says that it changed and never what it holds, since a row names a
+        file and a provider."""
+        return {**self.settings.reset_settings(), "placement.range_map_sha256": self.map.digest()}
 
 
 def safe_path(path: str) -> tuple[str, ...]:

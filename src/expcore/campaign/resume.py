@@ -9,6 +9,10 @@ and against the store it must be the same set, or a superset when growth is allo
 dropped. The pins, the fingerprint, the check of the run set and the insertion of the runs happen in one transaction,
 so a refused start leaves the store as it found it.
 
+The platform's settings that are in no fingerprint are recorded in the same transaction, after every check that can
+refuse, and a resume compares them with the record: a change is logged and recorded as an event and never refuses the
+start (`campaign.reset_settings`, C35).
+
 A shard of a sharded campaign (#154) starts with the part of the plan its pairs are assigned to, checked against that
 part of the plan the fingerprint declares, and pins its shard facts with the order seed (`campaign.shard_run`). The
 plan of a sharded store never grows on resume, whatever `allow_growth` says: the assignment of pairs to shards depends
@@ -17,6 +21,7 @@ on the whole plan.
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -25,6 +30,9 @@ from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ORDER_RULE, Manifest, compare_fingerprints, plan_problem
 from expcore.campaign.recovery import Recovery, recover
+from expcore.campaign.reset_settings import Noted, note_within
+from expcore.campaign.reset_settings import checked as checked_settings
+from expcore.campaign.reset_settings import say as say_settings
 from expcore.campaign.shard_run import GROWTH_HINT, ShardStart, pin_shard
 from expcore.campaign.store import Store
 
@@ -79,6 +87,7 @@ def open_campaign(
     max_attempts: int,
     allow_growth: bool = False,
     shard: ShardStart | None = None,
+    reset_settings: Mapping[str, Any] | None = None,
 ) -> tuple[Store, Recovery]:
     """Open the store at `path`, check the start against what it records, add the plan's runs and settle a kill.
 
@@ -87,13 +96,23 @@ def open_campaign(
     experiment, RunSetMismatch for the runs, SchemaMismatch for the factors, ShardMismatch for the shard) and leaves
     the store unchanged. The caller must hold the campaign's exclusive lock, because recovery treats every 'running'
     attempt as stale.
+
+    `reset_settings` are the platform's settings that are in no fingerprint (`StudyPlugin.reset_settings`): a first
+    start records them, a resume compares them with the record and, when they differ, records the change and warns,
+    and never refuses (`campaign.reset_settings`, C35). A value that is not a flat mapping of plain data is a
+    ValueError, raised before the store is opened.
     """
+    try:
+        settings = checked_settings({} if reset_settings is None else reset_settings)
+    except ValueError as error:
+        raise ValueError(f"reset_settings: {error}") from None
     problem = plan_problem(schema, manifest, fingerprint, None if shard is None else shard.spec)
     if problem is not None:
         raise RunSetMismatch(problem)
     store = Store(path, schema)
     try:
-        store.transact(lambda: _start(store, manifest, fingerprint, now, allow_growth, shard))
+        noted = store.transact(lambda: _start(store, manifest, fingerprint, now, allow_growth, shard, settings))
+        say_settings(noted)  # once the start has committed, so a start that was refused says nothing
         recovery = recover(store, now, max_attempts)
     except BaseException:
         store.close()
@@ -102,9 +121,18 @@ def open_campaign(
 
 
 def _start(
-    store: Store, manifest: Manifest, fingerprint: dict, now: str, allow_growth: bool, shard: ShardStart | None = None
-) -> None:
-    """Pin, compare the fingerprint, check the run set and insert the runs; the caller's transaction holds it all."""
+    store: Store,
+    manifest: Manifest,
+    fingerprint: dict,
+    now: str,
+    allow_growth: bool,
+    shard: ShardStart | None = None,
+    settings: Mapping[str, Any] | None = None,
+) -> Noted:
+    """Pin, compare the fingerprint, check the run set and insert the runs; the caller's transaction holds it all.
+
+    Last, record the platform's settings or compare them with the record, after every check that can refuse the start,
+    so a refused start leaves them as they were. Returns what the comparison found."""
     store.pin_within("order_seed", str(manifest.order_seed), now)
     store.pin_within("order_rule", ORDER_RULE, now)
     started = store.db.execute("SELECT 1 FROM meta WHERE key=?", (FINGERPRINT_KEY,)).fetchone() is not None
@@ -114,6 +142,7 @@ def _start(
     _check_fingerprint(store, fingerprint, now, allow_growth, "" if shard is None else GROWTH_HINT)
     _check_run_set(store, manifest, allow_growth)
     store.sync_manifest_within(manifest.rows)
+    return note_within(store, settings, started=started, now=now)
 
 
 def _check_fingerprint(store: Store, fingerprint: dict, now: str, allow_growth: bool, no_growth: str = "") -> None:
