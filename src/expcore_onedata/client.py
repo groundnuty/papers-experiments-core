@@ -172,9 +172,10 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   named only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET
   /data/{id}/qos/summary` (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}`
   (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only), `DELETE
-  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"`, the
-  recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`; answer
-  `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`). A cancel's and a
+  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"` (the
+  default), the recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`;
+  answer `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`) and sent by one
+  live run, the 14 Nov 2026 slot, which showed that it takes `include_directories`. A cancel's and a
   removal's space is read from the
   record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
   requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
@@ -275,9 +276,10 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     (
         "GET",
         "/data/{id}/files",
-        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, with "
-        "include_directories, which the provider's API description omits, and effQosInheritancePath; read from the "
-        "source of the federation's build (resetqos.py), never sent by a live run, and not the default until it is",
+        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, the default, "
+        "with include_directories, which the provider's API description omits, and effQosInheritancePath; read from "
+        "the source of the federation's build (resetqos.py), and sent by one live run (14 Nov 2026), which showed "
+        "it takes include_directories",
     ),
     (
         "GET",

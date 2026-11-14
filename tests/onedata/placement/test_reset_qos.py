@@ -9,8 +9,9 @@ import pytest
 from qos_world import FILES, federation, provisioner_with, two_providers
 
 from expcore_onedata import resetqos
+from expcore_onedata.config import load_platform
 from expcore_onedata.provision import Provisioner
-from expcore_onedata.rangemap import load_placement
+from expcore_onedata.rangemap import DEFAULT_QOS_SCAN, QOS_SCANS, load_placement
 from expcore_onedata.reset import ResetFailed, SpaceReset
 from expcore_onedata.testing import BETA_ID, DATA, with_placement, write_platform
 from expcore_onedata.testing.fake_data import ROOT_ID
@@ -174,13 +175,52 @@ def test_o33_block_maps_that_change_once_settle_and_ones_that_keep_changing_fail
     assert resetqos.SETTLE_BOUND_S <= seconds <= resetqos.SETTLE_BOUND_S + resetqos.SETTLE_POLL_S
 
 
-def test_o33_the_scan_setting_is_one_of_the_two_and_summaries_by_default(config, platform_file, tmp_path):
-    """O33: `[placement] qos_scan` is `summaries` until the listing's live facts are verified, and nothing else."""
-    assert load_placement(platform_file, config).settings.qos_scan == "summaries"
+def test_o33_the_scan_setting_is_one_of_the_two_and_listing_by_default(config, platform_file, tmp_path):
+    """O33: `[placement] qos_scan` is `listing` when the file does not say, `summaries` and `listing` are both
+    accepted when it does, and nothing else."""
+    assert load_placement(platform_file, config).settings.qos_scan == "listing"
+    assert DEFAULT_QOS_SCAN == "listing"
+    assert set(QOS_SCANS) == {"summaries", "listing"}
+    for scan in QOS_SCANS:
+        (tmp_path / scan).mkdir()
+        declared = write_platform(tmp_path / scan, lambda d, scan=scan: with_placement(d, qos_scan=scan))
+        assert load_placement(declared, config).settings.qos_scan == scan
     (tmp_path / "bad").mkdir()
     bad = write_platform(tmp_path / "bad", lambda d: with_placement(d, qos_scan="walk"))
     with pytest.raises(Exception, match="qos_scan"):
         load_placement(bad, config)
+
+
+def test_o33_a_study_that_declares_no_scan_has_the_fingerprint_of_one_that_declares_either(tmp_path, fake):
+    """O33: `qos_scan` is a way to find requirements and changes none of what the reset removes, so it is in no
+    fingerprint: the platform's half is the same without the key, with `summaries` and with `listing`, and a store
+    started under the old default resumes under the new one."""
+    fingerprints = []
+    for name, extra in (("none", {}), ("summaries", {"qos_scan": "summaries"}), ("listing", {"qos_scan": "listing"})):
+        (tmp_path / name).mkdir()
+        file = write_platform(tmp_path / name, lambda d, extra=extra: with_placement(d, **extra))
+        fingerprints.append(load_platform(file).fingerprint())
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2] == {"tls": {"mode": "verify"}}
+
+
+def test_o33_a_reset_on_the_default_settings_finds_the_requirements_by_the_listing(provisioner, fake, ticker):
+    """O33: a provisioner built from a file that does not declare `qos_scan` finds the requirements by the recursive
+    listing of each provider's space root, with a summary read only where an entry is marked and not one per leaf;
+    the reset's stage records the scan."""
+    assert provisioner.settings.qos_scan == "listing"
+    kept = fake.add_qos(FILES[0])
+    reset = SpaceReset(provisioner, now=ticker.clock)
+    before = len(fake.provider_calls)
+    baseline = reset.qos_requirements()
+    assert baseline == {kept}
+    made = fake.provider_calls[before:]
+    assert len([c for c in made if c[2].endswith("/files")]) == 2  # the space root's listing on each provider
+    assert len([c for c in made if c[2].endswith("/qos/summary")]) < 2 * (1 + len(FILES))  # not one per leaf
+    added = fake.add_qos(FILES[1])
+    record = reset.run({"beta": ["study"]}, qos_baseline=baseline)
+    stage = record["stages"]["qos"]
+    assert (stage["scan"], stage["found"], stage["kept"], stage["removed"]) == ("listing", 2, 1, 1)
+    assert added not in fake.qos
 
 
 def test_o33_the_fakes_recursive_listing_marks_requirements_on_an_entry_and_its_ancestors(client, fake):
