@@ -17,6 +17,7 @@ from expcore.campaign.executor import record_run
 from expcore.errors import InfraError, is_treatable
 from expcore.records.instruments import finish_instruments, start_instruments
 from expcore_onedata.ingest import NAMESPACE, ProgressiveIngest
+from expcore_onedata.ingestbind import PlanMismatch, check_recorded_plan
 from expcore_onedata.ingestplan import load_ingest_plan
 from expcore_onedata.provision import Provisioner, ProvisionError, resolve_provider_ids
 from expcore_onedata.sandbox.kinds import INGEST_FAILURE
@@ -152,6 +153,28 @@ def test_o27_a_file_in_parts_is_missing_then_partial_then_whole(make, fake, tick
     confirmed = [s for s in snapshot["steps"] if s["step"] == "confirmed"]
     assert [(s["part"], s["bytes"]) for s in confirmed] == [(1, 2560), (2, 5120), (3, 7680), (4, 10240)]
     assert snapshot["files"]["day-13"]["state"] == "arrived"
+
+
+def test_o27_a_real_snapshot_binds_to_its_plan_and_not_to_the_same_files_on_another_schedule(
+    make, fake, ticker, config, tmp_path
+):
+    """O27 (#262): the snapshot of a run, read back from its record as JSON, binds to the plan it ran under, loaded
+    again; the same labels, sizes and sources with the day 300 s later are refused, naming the day and `at_s`."""
+    rows = [{**DAY_ROW, "parts": 4, "over_s": 60}, NOTE_ROW]
+    ingest = make(*rows)
+    ingest.start({})
+    run_to(ingest, ticker, ticker.now, 100, 1)  # the note has arrived, the day's parts are not due
+    recorded = json.loads(json.dumps(ingest.finish()))
+    assert recorded["ok"] is True
+    check_recorded_plan(load_ingest_plan(tmp_path / "ingest.toml", config), recorded)
+    later = load_ingest_plan(write_plan(tmp_path, [{**rows[0], "at_s": 600}, rows[1]]), config)
+    with pytest.raises(PlanMismatch, match="day-13") as caught:
+        check_recorded_plan(later, recorded)
+    assert (caught.value.label, caught.value.field) == ("day-13", "at_s")
+    note_later = load_ingest_plan(write_plan(tmp_path, [rows[0], {**rows[1], "at_s": 130}]), config)
+    with pytest.raises(PlanMismatch) as caught:
+        check_recorded_plan(note_later, recorded)
+    assert (caught.value.label, caught.value.field) == ("note", "at_s")
 
 
 def test_o27_each_arrival_is_verified_on_every_provider_that_must_see_it(make, fake, ticker):
