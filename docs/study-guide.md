@@ -30,7 +30,7 @@ The study directory holds four configuration files and the plugin, the Python fi
 | `scorers` | `Scorer`s: a pure function of a record, returning named numeric outcomes | `TinyScorer` |
 | `prompts`, `tools` | per condition, the SHA-256 of its prompt template and of its tool set; both go into the campaign fingerprint | from `PromptTemplate` and `tools_sha256` ([what it hashes](interfaces.md#several-providers-and-the-hash-of-a-tool-set)) |
 | tools | `ToolProvider`s the executor passes to `record_run`: plain functions through `FunctionProvider`, or an MCP server through `McpToolProvider` | `lookup` and `submit` |
-| instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read. An instrument can also refuse the attempt, with `at_first_turn` and `check` ([below](#an-instrument-that-refuses-an-attempt)) | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
+| instruments | `Instrument`s the executor runs around the loop, fresh for every run, since each holds one run's reading and runs can overlap: `start_instruments(instruments, identity)` before `record_run`, `record = finish_instruments(record, instruments)` after, both through `asyncio.to_thread`, then write the record `finish_instruments` returned. `identity` is the request's `RunIdentity` as a plain mapping: `{"run_key": ..., "factors": {...}, "attempt": ...}`. The loop returns a record however the run ended, an infrastructure failure included, so every attempt with a record gets its snapshots. A scorer reads a snapshot at `record.instruments[namespace]`, the only platform state it may read. The instruments start in list order and finish in the reverse of it: an instrument listed earlier finishes later ([the order](#the-order-instruments-start-and-finish-in)). An instrument can also refuse the attempt, with `at_first_turn` and `check` ([below](#an-instrument-that-refuses-an-attempt)) | `FactsServed`, the stub platform's own count of the facts it served, which `TinyScorer` reads as its `served` outcome |
 | `health`, `probe`, `lease_group`, `lease_keys` | the platform's health check, resource probe and leases; the Onedata layer supplies real ones | stubs that always succeed |
 | `backend_factory` | optional: a `BackendFactory` that builds the backend of every model, for a study with a model backend of its own. Its model entries name that backend in `models.toml` with a plain lower-case `backend` value; the factory serves those and hands every other model to the core's `default_backend_factory`. It carries a `version` attribute that goes into the campaign fingerprint with its name; a factory imported from an installed package must declare the installed version of the distribution that owns its module's file, one defined in a file `[study] code` lists, which the code identity covers, may declare any, and one from anywhere else is refused. Without a factory, such a model is refused when the plugin is loaded | none: the core's factory builds the stub |
 
@@ -883,6 +883,67 @@ To check an agent's claimed reads file by file, read `files`: one row per file w
 If your executor checks the sandbox before the agent's loop starts (its data path, read as the agent's user, say), run the check with `sandbox.exec(code, timeout_s, record=False)`, which records it as a harness step and never as one of the agent's cells, then call `sandbox.mark_run_start()` just before the loop. A step has no timer, so a read that hangs is ended by the container's own `timeout` a second after `timeout_s`; the result then has `timed_out` true and `bound == "container_timeout"`, and the step's record says the same, so a hung read is not mistaken for a crash. A step that exits 137 sooner (a process that killed itself) is not timed out, and `bound` is None ([`interfaces.md`](interfaces.md#the-platform-layers-sandbox) says how the two are told apart). Both belong before the loop: once the mark is set or the agent's first cell has begun, a step and a mark are refused. The counts, the tables and the lookups then hold only what the agent was served, and the check's answers are counted apart, in `before_run_start`. When the returned `confirmed` is false the run's count will be unknown; whether such a run goes on is your executor's decision.
 
 The count is `None`, with its reasons in `unknown`, wherever it is not known: always on a mount (`mount_not_through_gate`, since oneclient's reads pass no gate), and on a REST run whose gate log may lack a line. The tables are `None` with it, never a part of the run's reads. As with the probes' estimates, count those per condition and reason over every attempt and report them beside the analysis; never treat one as zero. A run with no data path reads zero, with empty tables. [`interfaces.md`](interfaces.md#instrument) lists every field and reason.
+
+### The order instruments start and finish in
+
+Instruments nest, like a setup and its teardown. `start_instruments` starts them in list order and `finish_instruments` finishes them in the reverse of it, so **an instrument listed earlier finishes later**. The first listed starts first and finishes last; one listed after another starts after it and finishes before it.
+
+Use it to read between a manipulation and its undo. List the instrument that changes something first, a fault injector (its `finish` is the restore) or a progressive ingest (its `finish` restores the dataset), and the instruments that read the state the run left after it: they start once the manipulation is in place, and finish before it is undone, so they record what the agent left and not the restore's transfers. The block shows the order with two stand-ins:
+
+```python
+import json
+from pathlib import Path
+
+from expcore.records.instruments import finish_instruments, start_instruments
+from expcore.records.record import load_record, record_filename
+
+export = json.loads(Path("my-study/out/export.json").read_text())
+entry = export["analysed_attempts"][0]
+stored = load_record(Path("my-study/out/runs") / entry["run_dir"] / record_filename(entry["run_key"], entry["attempt"]))
+calls = []
+
+
+class Outage:
+    """Takes something away in `start` and puts it back in `finish`, as the fault injector and the ingest do."""
+
+    namespace = "outage"
+
+    def start(self, identity):
+        calls.append("outage injected")
+
+    def finish(self):
+        calls.append("outage restored")
+        return {"ok": True}
+
+
+class Reader:
+    """Reads the platform in `start` and again in `finish`, as the platform probes do."""
+
+    namespace = "reader"
+
+    def start(self, identity):
+        calls.append("reader before")
+
+    def finish(self):
+        calls.append("reader after")
+        return {"ok": True}
+
+
+instruments = [Outage(), Reader()]  # the outage first: the reader finishes before it restores
+start_instruments(instruments, {"run_key": entry["run_key"], "factors": {}, "attempt": entry["attempt"]})
+finished = finish_instruments(stored, instruments)
+assert calls == ["outage injected", "reader before", "reader after", "outage restored"]
+assert list(finished.instruments)[-2:] == ["outage", "reader"]  # the record keeps the list's order
+```
+
+An instrument that must finish first, one that stamps the end of the run before anything is restored, goes last in the list. A study written when instruments finished in list order, with such an instrument listed first, lists it last now.
+
+What stays in list order: the snapshots in the record, so its `instruments` keep the list's key order, though what an instrument reads can differ with the order of the calls; `at_first_turn`, which is one moment, not a nest; and `check`, which runs once every `finish` has run. The first listed instrument that refuses is the one the record keeps, so a refusal of the injector or the ingest, the cause, wins over a refusal of a probe listed after it. A `finish` that raises is recorded as failed and the instruments listed before it still finish.
+
+Whether readers should finish before or after a restore depends on what the restore does, and the two Onedata instruments differ:
+
+- **A progressive ingest's restore makes transfers:** it completes each file and replicates it again to the providers its `replicas` declare. Readers that must record the state the agent left are listed after the ingest, so they finish before its restore, as in the block above.
+- **A fault injector's restore makes none:** starting a provider's container again moves no data and leaves the local provider's block maps as the agent left them. While the owner is down, a transfer listing also misses the owner's tree. So in a fault condition, readers can finish after the restore, and reading then gives them the whole listing. The injector's `running` clears the provider when its block exits, so a `finish_instruments` called after the block finishes every instrument after that restore, whatever the order. Call it inside the block only if a reader must read with the provider still down. A restore that was not verified at the exit is tried again by the injector's `finish`, and for that retry the order decides again.
 
 ### An instrument that refuses an attempt
 
