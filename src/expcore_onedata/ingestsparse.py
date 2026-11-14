@@ -98,7 +98,7 @@ class SparseBaseline(Baseline):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.written: dict[str, int] = {}  # label -> the end of what the ingest has written and confirmed
-        self.marks = Marks(self._journal, self._p.space.position, self.journal)
+        self.marks = Marks(self._journal, self._p.space.position, self.journal, self._plan.sha256)
         self.at: dict[str, str] | None = None  # the file and the step the start state is at, for a failure's mark
         if any(self.holder in planned.replicas for planned in self._plan.files):
             raise ValueError("a planned file's replicas name the data provider, which holds the file itself")
@@ -196,18 +196,25 @@ class SparseBaseline(Baseline):
         except Unreadable as error:
             raise ProvisionError(f"{self._p.where}{error}") from None
 
-    def admit_start(self) -> None:
-        """Refuse a start on a baseline whose last mark is not `whole`; check every staged copy; then mark the baseline
-        open, pushed to disk before the start's restore or its first removal changes anything."""
+    def _refuse_start(self) -> None:
         refusal = start_refusal(self._last_mark())
         if refusal is not None:
             raise BaselineNotWhole(f"{self._p.where}{refusal}")
+
+    def admit_start(self) -> None:
+        """Refuse a start on a baseline whose last mark is not `whole`; check every staged copy; then, under the
+        journal's admission lock, read the mark again and mark the baseline open, pushed to disk before the start's
+        restore or its first removal changes anything. So a start admitted meanwhile refuses this one."""
+        self._refuse_start()
         self.check_sources()
-        self.marks.mark(OPEN, "start")
+        with self.marks.locked():
+            self._refuse_start()
+            self.marks.mark(OPEN, "start")
 
     def admit_recovery(self) -> None:
-        """Refuse a recovery while another process that still runs holds the baseline open: a run in progress."""
-        refusal = recovery_refusal(self._last_mark())
+        """Refuse a recovery with another plan than the one whose run left the baseline not whole, and one while
+        another process that still runs holds the baseline open: a run in progress. The caller holds the lock."""
+        refusal = recovery_refusal(self._last_mark(), self._plan.sha256)
         if refusal is not None:
             raise BaselineNotWhole(f"{self._p.where}{refusal}")
 

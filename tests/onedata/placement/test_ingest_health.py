@@ -76,20 +76,25 @@ def test_o44_a_start_is_refused_on_any_baseline_that_is_not_whole_whoever_holds_
     assert "not whole" in start_refusal({"state": "unhealthy", "phase": "restore", "holder": here()})
 
 
-def test_o44_a_recovery_is_refused_only_for_a_baseline_another_live_process_holds_open(gone):
-    """O44: the recovery writes into the planned files, so it waits for a run another live process is on; this
-    process's own dropped instrument, a dead holder and an unhealthy mark are what it is for."""
+def test_o44_a_recovery_is_refused_for_another_plan_or_a_baseline_another_live_process_holds_open(gone):
+    """O44: the recovery verifies the files and replicas of its own plan, so it is refused for a baseline another
+    plan's run left not whole, or a mark that names no plan; and it writes into the planned files, so it waits for a
+    run another live process is on. This process's own dropped instrument, a dead holder and an unhealthy mark of its
+    plan are what it is for."""
+    plan = "a" * 64
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        assert "another process" in recovery_refusal(
-            {"state": "open", "phase": "run", "holder": {"pid": other.pid, "boot_id": boot_id()}}
-        )
+        held = {"state": "open", "phase": "run", "plan": plan, "holder": {"pid": other.pid, "boot_id": boot_id()}}
+        assert "another process" in recovery_refusal(held, plan)
     finally:
         other.kill()
         other.wait()
-    assert recovery_refusal({"state": "open", "phase": "run", "holder": here()}) is None
-    assert recovery_refusal({"state": "open", "phase": "run", "holder": gone}) is None
-    assert recovery_refusal({"state": "unhealthy", "phase": "start", "holder": gone}) is None
+    assert recovery_refusal({"state": "open", "phase": "run", "plan": plan, "holder": here()}, plan) is None
+    assert recovery_refusal({"state": "open", "phase": "run", "plan": plan, "holder": gone}, plan) is None
+    assert recovery_refusal({"state": "unhealthy", "phase": "start", "plan": plan, "holder": gone}, plan) is None
+    assert "another plan" in recovery_refusal({"state": "unhealthy", "phase": "start", "plan": "b" * 64}, plan)
+    assert "another plan" in recovery_refusal({"state": "open", "phase": "run", "holder": gone}, plan)
+    assert recovery_refusal({"state": "whole", "phase": "restore", "plan": "b" * 64}, plan) is None
 
 
 def test_o44_a_torn_last_line_is_skipped_and_any_other_unreadable_line_fails_the_check(tmp_path, gone):

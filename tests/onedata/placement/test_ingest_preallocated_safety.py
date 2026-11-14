@@ -3,8 +3,10 @@ reset restoring each file whole at its path and the mirror's replica of it, the 
 mid-start or mid-reset marking the federation unhealthy until a verified recovery."""
 
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -442,3 +444,78 @@ def test_o44_a_journal_line_a_crash_cut_short_is_cut_off_before_the_next_line_is
     again.finish()
     again.check()
     assert mark_of(tmp_path)["state"] == "whole"
+
+
+def test_o44_a_start_admitted_between_anothers_check_and_its_mark_refuses_the_other(make, fake, tmp_path, monkeypatch):
+    """O44: two instruments over one journal: the second starts while the first is between reading the baseline's mark
+    and writing its own (hashing its staged copies). The mark is read again under the journal's admission lock, so
+    the first is refused once the second holds the baseline open, and never completes the second's sparse files."""
+    first, second = make(ROW), make(ROW)
+    hashing = first._base.check_sources
+
+    def meanwhile():
+        hashing()
+        second.start({})  # the other run is admitted while this one has read the mark and not yet written its own
+
+    monkeypatch.setattr(first._base, "check_sources", meanwhile)
+    with pytest.raises(InfraError, match="held open"):
+        first.start({})
+    assert (mark_of(tmp_path)["state"], mark_of(tmp_path)["phase"]) == ("open", "run")
+    assert fake.held(DAY_PATH, ALPHA_ID) == [[0, PREFIX]]  # the second's start state, untouched by the first
+    second.at_first_turn({"clock_s": 0.0})
+    second.finish()
+    second.check()
+
+
+@pytest.mark.parametrize("plan", ["no replicas", "another file only"])
+def test_o44_a_recovery_with_another_plan_than_the_runs_is_refused_and_clears_nothing(
+    make, mirrored, provisioner, tmp_path, monkeypatch, dead_holder, plan
+):
+    """O44: a mirrored run dies after the start made the day again, its mirror holding nothing. A recovery with a plan
+    that leaves out the mirror, or the day, could not verify what the run left, so it is refused with nothing sent and
+    the baseline stays marked; the run's own plan recovers it, the mirror's replica included."""
+    fault = Fault(provisioner)
+    with monkeypatch.context() as patch:
+        patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+        fault.arm("prefix", "dies")
+        with pytest.raises(Died):
+            make(MIRRORED).start({})
+    other = make(ROW) if plan == "no replicas" else make(KEPT_ROW)
+    since = len(mirrored.provider_calls)
+    with pytest.raises(InfraError, match="another plan"):
+        other.recover()
+    assert changes(mirrored, since) == []
+    assert mark_of(tmp_path)["state"] == "open"
+    assert not baseline_health([tmp_path / "journal.jsonl"]).ok
+    assert make(MIRRORED).recover()["ok"]
+    assert mirrored.held(DAY_PATH, BETA_ID) == [[0, len(DAY)]]
+    fault.remove()
+
+
+def test_o44_the_journal_and_its_directories_are_made_durable_when_the_first_line_creates_them(
+    provisioner, config, fake, tmp_path, monkeypatch
+):
+    """O44: the first line of a new journal creates the file, and perhaps its directories; each new entry is pushed to
+    disk in its parent before the line counts as written, so a host crash after the start's first removal cannot lose
+    the journal, and with it the mark that refuses the next start. A later line creates nothing and syncs no
+    directory."""
+    synced = []
+    real = os.fsync
+
+    def fsync(descriptor):
+        synced.append(Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    journal = tmp_path / "new" / "deeper" / "journal.jsonl"
+    plan = load_ingest_plan(write_plan(tmp_path, [ROW]), config)
+    ingest = ProgressiveIngest(provisioner, plan, journal=journal, max_wait_s=0.001)
+    ingest.start({})
+    first = synced.index(journal)  # the first line, the open mark, before anything is removed
+    assert {tmp_path, tmp_path / "new"} <= set(synced[:first])  # each new directory, in its parent
+    assert synced[first + 1] == journal.parent  # the new journal's own entry, before anything is removed
+    ingest.at_first_turn({"clock_s": 0.0})
+    ingest.finish()
+    later = synced[first + 2 :]
+    assert later.count(journal.parent) == 0  # no later line creates anything
+    assert last_marks(journal)["spaces[0]"]["state"] == "whole"

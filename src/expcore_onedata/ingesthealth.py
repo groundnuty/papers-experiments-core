@@ -5,8 +5,9 @@ A preallocated start removes each planned file and makes it again with only its 
 first removal and the reset's verified completion the dataset's baseline is not whole: by design while a run is on it,
 and by accident when a start or a reset fails or the process running it dies. The journal says which, as the fault
 injector's journal says whether a provider is down (`fault_journal.py`): a **baseline mark** is a line of the ingest's
-journal, pushed to disk before the step it announces, with the space's position, a `state`, the `phase` that wrote it
-and the writer (`holder`: its pid and boot id, `fault_journal.holder`).
+journal, pushed to disk before the step it announces (a new journal's entry, and its directories', included), with the
+space's position, a `state`, the `phase` that wrote it, the plan's hash (`plan`) and the writer (`holder`: its pid and
+boot id, `fault_journal.holder`).
 
 - `open`: a start is about to change the baseline (journalled before its first removal, and before the restore it runs
   first), or a run is on it (`phase` `run`). It stays until the reset verifies every file whole.
@@ -18,9 +19,12 @@ and the writer (`holder`: its pid and boot id, `fault_journal.holder`).
 
 **A start is refused** (`start_refusal`), before anything is read or sent, unless the space's last mark is `whole` or
 there is none: an `unhealthy` baseline, and an `open` one, whoever holds it (a live holder is a run in progress, or an
-instrument of this process that was never restored). **`ProgressiveIngest.recover` is the way back**: it restores
-every file, verified, and marks the baseline `whole`, or `unhealthy` again when it fails. It is refused only for an
-`open` mark whose holder is another process that still runs (`recovery_refusal`).
+instrument of this process that was never restored). The start reads the mark again under the journal's admission
+lock (`Marks.locked`) before it writes `open`, so no two starts pass one `whole` mark. **`ProgressiveIngest.recover`
+is the way back**: under the same lock it restores every file, verified, and marks the baseline `whole`, or
+`unhealthy` again when it fails. It is refused for a mark of another plan than its own (that run's files and replicas
+are what it must verify) and for an `open` mark whose holder is another process that still runs
+(`recovery_refusal`).
 
 **The health check reads the marks** (`baseline_health`; `health.PlatformHealth(..., ingest_journals=...)`) and fails,
 so no run is admitted, while a space's last mark is `unhealthy`, or `open` with a holder that is gone (its pid names no
@@ -32,14 +36,16 @@ as the journal's other readers skip it. A missing journal has no marks: no preal
 The detail names the space by its position and a file by its label, never a path, a host or a name (O12).
 """
 
+import contextlib
+import fcntl
 import json
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from expcore.campaign.healthgate import Health
-from expcore_onedata.fault_journal import holder, holder_alive
+from expcore_onedata.fault_journal import holder, holder_alive, make_directories
 
 BASELINE = "baseline"  # the entry of a baseline mark in the ingest's journal
 OPEN, UNHEALTHY, WHOLE = "open", "unhealthy", "whole"
@@ -107,10 +113,18 @@ def start_refusal(mark: Mapping[str, Any] | None) -> str | None:
     )
 
 
-def recovery_refusal(mark: Mapping[str, Any] | None) -> str | None:
-    """Why a recovery may not run now: an `open` baseline held by another process that still runs, whose run it would
-    write into; None otherwise."""
-    if mark is None or mark["state"] != OPEN:
+def recovery_refusal(mark: Mapping[str, Any] | None, plan: str) -> str | None:
+    """Why a recovery with the plan of this hash may not run now: a baseline another plan's run left not whole (its
+    files and replicas are what the recovery must verify, and this plan may name others), or an `open` baseline held
+    by another process that still runs, whose run it would write into; None otherwise."""
+    if mark is None or mark["state"] == WHOLE:
+        return None
+    if mark.get("plan") != plan:
+        return (
+            "its baseline was left not whole by a run of another plan, or one its mark does not name: recover with "
+            "the plan that run used, whose files and replicas the recovery verifies"
+        )
+    if mark["state"] != OPEN:
         return None
     named = mark.get("holder")
     pid = named.get("pid") if isinstance(named, Mapping) else None
@@ -143,18 +157,32 @@ def baseline_health(journals: Iterable[Path | str]) -> Health:
 
 
 class Marks:
-    """The baseline marks of one space in one ingest's journal: written through `write` (the baseline's journal, which
-    pushes each line to disk) and read back from `journal`."""
+    """The baseline marks of one space in one ingest's journal, each naming the plan's hash: written through `write`
+    (the baseline's journal, which pushes each line to disk) and read back from `journal`. `locked` holds the
+    journal's admission lock (`<journal>.lock`, an exclusive `flock` across processes and instruments), under which a
+    start reads the mark again before it writes its own, so no two starts pass one `whole` mark, and a recovery runs
+    whole."""
 
-    def __init__(self, journal: Path, space: str, write: Callable[..., None]) -> None:
-        self._journal, self._space, self._write = journal, space, write
+    def __init__(self, journal: Path, space: str, write: Callable[..., None], plan: str) -> None:
+        self._journal, self._space, self._write, self._plan = journal, space, write, plan
 
     def last(self) -> dict[str, Any] | None:
         """The space's last mark, or None; `Unreadable` for a journal that cannot be read."""
         return last_marks(self._journal).get(self._space)
 
     def mark(self, state: str, phase: str, **extra: Any) -> None:
-        self._write(**mark_fields(state, phase, **extra))
+        self._write(**mark_fields(state, phase, plan=self._plan, **extra))
+
+    @contextlib.contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold the journal's admission lock, waiting for it; the kernel drops it with a holder that dies."""
+        make_directories(self._journal.parent)  # durable, as the journal's own are
+        descriptor = os.open(self._journal.with_name(self._journal.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)  # closing the descriptor drops the lock
 
 
 __all__ = [

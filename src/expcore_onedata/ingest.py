@@ -393,6 +393,15 @@ class ProgressiveIngest:
         while another process that still runs holds the baseline open: run it with no run on the plan's space."""
         if self._started:
             raise RuntimeError("recover() is for an instrument that has not started: make a new one")
+        with self._marks.marks.locked() if self._marks is not None else contextlib.nullcontext():
+            files, seconds = self._recover_whole()
+        with self._base.lock:
+            changed = id_map(list(self._base.ids))  # a name written back has a new id, which a study's map follows
+        return {"ok": True, "seconds": seconds, "files": files, "id_map": changed}
+
+    def _recover_whole(self) -> tuple[dict[str, Any], float]:
+        """`recover`'s restore, under the journal's admission lock in the preallocated mode, so no start is admitted
+        until it has marked the baseline; the files' results by label, and its seconds."""
         began, marking = self._p.clock(), False
         try:
             self._p.verify_space()
@@ -411,9 +420,7 @@ class ProgressiveIngest:
             ) from None
         if self._marks is not None:
             self._marks.marks.mark(WHOLE, "recover")
-        with self._base.lock:
-            changed = id_map(list(self._base.ids))  # a name written back has a new id, which a study's map follows
-        return {"ok": True, "seconds": round(self._p.clock() - began, 3), "files": files, "id_map": changed}
+        return files, round(self._p.clock() - began, 3)
 
     def _restored(self, files: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         """Note the id each restored file ends with; return the restore's results."""

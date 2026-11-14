@@ -36,6 +36,7 @@ from typing import Any
 
 from expcore_onedata import consistency
 from expcore_onedata.client import PlatformError, answered_absent
+from expcore_onedata.fault_journal import make_directories
 from expcore_onedata.ingestplan import IngestPlan, PlannedFile
 from expcore_onedata.provision import Entry, NotPlaced, Provisioner, ProvisionError
 from expcore_onedata.rangemap import safe_path
@@ -67,6 +68,15 @@ def plain(file_id: str) -> str:
     if not isinstance(file_id, str) or not _PLAIN_ID.fullmatch(file_id):
         raise PlatformError("a file id is not a plain path segment")
     return file_id
+
+
+def fsync_directory(directory: Path) -> None:
+    """Push a directory's entries to disk: a file created in it survives a host crash only once this has returned."""
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _cut_torn_tail(handle: Any) -> None:
@@ -115,13 +125,17 @@ class Baseline:
         """Append one line to the journal and push it to disk: an id change must outlive a crash. A last line a crash
         cut short is cut off first, so the new line is never glued to it (readers skip a torn last line, and a mark
         glued to one would be skipped with it)."""
-        self._journal.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock, open(self._journal, "a+b") as handle:
-            _cut_torn_tail(handle)
-            line = json.dumps({"space": self._p.space.position, **fields}, sort_keys=True) + "\n"
-            handle.write(line.encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
+        with self.lock:
+            make_directories(self._journal.parent)  # each one it makes is durable in its parent
+            created = not self._journal.exists()
+            with open(self._journal, "a+b") as handle:
+                _cut_torn_tail(handle)
+                line = json.dumps({"space": self._p.space.position, **fields}, sort_keys=True) + "\n"
+                handle.write(line.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            if created:  # the new file's entry too, or a host crash could lose the journal with its marks
+                fsync_directory(self._journal.parent)
 
     def read_journal(self) -> None:
         """Take each planned file's last id from the journal, a crashed run's included. A torn last line, which a
