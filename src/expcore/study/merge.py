@@ -76,7 +76,7 @@ def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: b
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir()
     try:
-        pricing = pricing_of(study)  # what a selection's spend is counted with (C35); a shard's is not read
+        pricing = pricing_of(study)  # what a selection's spend is counted with (C38); a shard's is not read
         facts = [read_shard(path, stage / f"read-{n}.sqlite", pricing) for n, path in enumerate(shard_outs)]
         shards = check_shards(facts, study.manifest, pricing)
         for shard in shards:

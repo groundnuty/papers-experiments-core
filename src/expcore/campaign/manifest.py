@@ -91,7 +91,7 @@ def shard_manifest(manifest: Manifest, spec: ShardSpec, layout: ModelShards | No
 
 
 def selection_manifest(manifest: Manifest, selection: Selection) -> Manifest:
-    """Return the runs a selection keeps (C35), each keeping its place in the whole plan and the plan's order (C08)."""
+    """Return the runs a selection keeps (C38), each keeping its place in the whole plan and the plan's order (C08)."""
     return Manifest(manifest.order_seed, tuple(row for row in manifest.rows if selection.selects(row.key.factors)))
 
 
@@ -225,10 +225,10 @@ def plan_problem(
     different experiment whatever the fingerprint says, so a start whose two disagree is refused. A shard's plan is the
     part of that one its pairs are assigned to, with the assignment made from the whole declared plan (C28) under the
     shard's rule, by model with the `[shards]` layout the fingerprint declares (C32); a selection's is the runs of that
-    plan its levels select (C35).
+    plan its levels select (C38).
     """
     keys = schema.expand(fingerprint["tasks"], fingerprint["models"], [int(seed) for seed in fingerprint["seeds"]])
-    if isinstance(shard, SelectionSpec):  # a selection's part is the runs its levels select (C35)
+    if isinstance(shard, SelectionSpec):  # a selection's part is the runs its levels select (C38)
         keys = [key for key in keys if shard.selection.selects(key.factors)]
     elif shard is not None:
         try:

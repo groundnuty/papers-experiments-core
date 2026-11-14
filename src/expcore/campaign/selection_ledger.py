@@ -1,5 +1,5 @@
 # Provenance: new
-"""What a selection's store says it spent and when it ran (C35): the figures its successors and the merge compare.
+"""What a selection's store says it spent and when it ran (C38): the figures its successors and the merge compare.
 
 - **Spend** (`spend_of`) is the budget gate's own figure (`campaign.gate`): every attempt's cost by
   `attempt_bounds.attempt_costs` (measured, or the bound its row records it was reserved at, top-ups included), plus

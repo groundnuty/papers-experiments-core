@@ -20,7 +20,7 @@ snapshot and this module joins the results:
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
 - `shards` is merge.json's list of shards, as it is.
-- In a merge of selections (C35), each run entry also gains `"selection"`, the label of the selection that ran it,
+- In a merge of selections (C38), each run entry also gains `"selection"`, the label of the selection that ran it,
   and `shards` lists each selection's levels; a merge of shards has neither.
 
 The joined run lists must hold every run of the whole plan exactly once, and the planned runs must add up to it: a
@@ -42,7 +42,7 @@ from expcore.campaign.shard import EXPORT_KEY
 from expcore.errors import CORE_KINDS
 
 SHARD_KEY = "shard"  # the key of each run entry in a merged export: the index of the shard that ran it
-SELECTION_KEY = "selection"  # in a merge of selections (C35), each run entry's: the label of the selection that ran it
+SELECTION_KEY = "selection"  # in a merge of selections (C38), each run entry's: the label of the selection that ran it
 SHARDS_KEY = "shards"  # the top-level key of a merged export: merge.json's list of shards
 SHARD_RETRIES_KEY = "shard_retries_by_kind"  # the top-level key of a merged export: each shard's own retries rows
 LISTS = (*RUN_LISTS, "excluded_attempts")
@@ -142,7 +142,7 @@ def _same_shape(first: Mapping[str, Any], other: Mapping[str, Any], at: int, ind
 
 
 def _selection_labels(shards: Sequence[Mapping[str, Any]]) -> dict[int, str]:
-    """The label of each selection of a merge of selections (C35), by index; empty for a merge of shards."""
+    """The label of each selection of a merge of selections (C38), by index; empty for a merge of shards."""
     return {shard["index"]: shard["label"] for shard in shards if "selection" in shard}
 
 

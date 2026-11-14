@@ -1,5 +1,5 @@
 # Provenance: new
-"""The start of a selection of a study's campaign (C35): its part of the plan, its shares, and every refusal first.
+"""The start of a selection of a study's campaign (C38): its part of the plan, its shares, and every refusal first.
 
 `run STUDY --select FACTOR=L1,L2 --shard-label L [--sequential [--after EARLIER_OUT ...]]` runs the selected runs of
 the campaign as a shard of it (`campaign.selection`). Everything here is decided before the store is opened, from the

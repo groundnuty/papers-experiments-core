@@ -1,5 +1,5 @@
 # Provenance: new
-"""One campaign run in batches chosen by factor levels (C35): a selection shard, `expcore-shard/4`.
+"""One campaign run in batches chosen by factor levels (C38): a selection shard, `expcore-shard/4`.
 
 A study that runs some of its conditions now and the rest later (stages early and mid now, late and last next week)
 keeps one campaign: the study, its factor schema and its fingerprint stay whole, and each batch is a **selection** of

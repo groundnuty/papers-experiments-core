@@ -21,7 +21,7 @@ replay check (`study.merge`) last:
 5. each shard passes the replay check `python -m expcore check` performs on a batch;
 6. every shard records the same environment identity.
 
-A campaign run in **selections** (`expcore-shard/4`, C35) is merged by the same command, with the checks of
+A campaign run in **selections** (`expcore-shard/4`, C38) is merged by the same command, with the checks of
 `campaign.merge_selection` in place of 1, 3 and 4: the selections are disjoint and cover the plan, sequential ones ran
 one after another, and their spend together stayed within the budget.
 
@@ -74,7 +74,7 @@ RUNS_DIR = "runs"
 CHECK_KEY = "merge"  # the key of the replay check that says which merge.json it was made under
 _SKIPPED = frozenset({"replay-check.json", SNAPSHOT_FILE})  # a shard's own check of its batch: not part of the union
 _SHARD_KEYS = {"index", "label", "started_utc", "shares", "runs", "snapshot_sha256"}
-_SELECTION_KEYS = {"selection", "sequential", "window"}  # what a selection's entry has beyond a shard's (C35)
+_SELECTION_KEYS = {"selection", "sequential", "window"}  # what a selection's entry has beyond a shard's (C38)
 _DOCUMENT_KEYS = {"schema", "fingerprint", "rule", "count", "environment_identity", "shards"}
 Query = Callable[..., Iterable[Sequence[Any]]]  # query(sql, args=()) on a store, or a snapshot of one: the rows
 
@@ -96,7 +96,7 @@ class ShardFacts:
     shares: Any
     fingerprint: Mapping[str, Any]
     runs: Mapping[str, Mapping[str, Any]]  # the factors of each run the shard's store holds, by run key
-    window: tuple[str, str] | None = None  # a selection's: its first start and its last attempt's time (C35)
+    window: tuple[str, str] | None = None  # a selection's: its first start and its last attempt's time (C38)
     released: Mapping[str, float] = dataclasses.field(default_factory=dict)  # a selection's releases, by scope
     spend: Spend | None = None  # a selection's spend, when the reader was given the study's prices
 
@@ -333,7 +333,7 @@ def check_environment(shards: Sequence[ShardFacts]) -> None:
 
 def merge_document(shards: Sequence[ShardFacts]) -> dict[str, Any]:
     """The content of merge.json for shards that passed `check_shards`, in index order; selections are numbered here
-    as the merge numbers them, and each entry also holds the selection, its mode and its window (C35)."""
+    as the merge numbers them, and each entry also holds the selection, its mode and its window (C38)."""
     selections = any(isinstance(shard.spec, SelectionSpec) for shard in shards)
     if selections:
         from expcore.campaign.merge_selection import numbered  # it builds on this module's checks

@@ -232,7 +232,7 @@ def _check_run_options(parser: argparse.ArgumentParser, args: argparse.Namespace
 
 
 def _selection_refusal(args: argparse.Namespace) -> str | None:
-    """Why `run`'s selection options do not combine (C35), said as a refusal (a usage error's message is never
+    """Why `run`'s selection options do not combine (C38), said as a refusal (a usage error's message is never
     shown, and these name only options); None when they do."""
     if args.shard is not None and args.select:
         return "--select cannot be combined with --shard in this version: run a selection, or a shard"

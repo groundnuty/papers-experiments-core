@@ -1,4 +1,4 @@
-"""A campaign run in batches by factor levels (C35): selections run, refused, merged, and analysed as one driver's.
+"""A campaign run in batches by factor levels (C38): selections run, refused, merged, and analysed as one driver's.
 
 The selections are the example study run for real with `run --select access=... --shard-label L`
 (`selection_support.run_selection`): `access=direct` holds the conditions `baseline` and `extended`, `access=relay`
@@ -115,7 +115,7 @@ def refused(env, study: Campaign, *outs: Path, fragments: tuple[str, ...]) -> st
 # --- the analysis of merged selections is one driver's ---------------------------------------------------------------
 
 OWN = {"shard", *("selection",), "dispatch_seq", "started_at", "lease_wait_s", *MERGE_TIMES}
-"""The fields of an export entry a merge of selections documents as its own (C29, C35), excluded from the comparison."""
+"""The fields of an export entry a merge of selections documents as its own (C29, C38), excluded from the comparison."""
 
 
 def _report_differs_only_in_positions(merged: str, whole: str) -> bool:
@@ -131,8 +131,8 @@ def _report_differs_only_in_positions(merged: str, whole: str) -> bool:
 
 
 @pytest.mark.parametrize("which", ["merged", "merged_sequential"])
-def test_c35_selections_merged_give_the_analysis_of_one_driver_byte_for_byte(request, whole, which):
-    """C35: the direct and relay selections, run separately (concurrently or one after the other) and merged, give
+def test_c38_selections_merged_give_the_analysis_of_one_driver_byte_for_byte(request, whole, which):
+    """C38: the direct and relay selections, run separately (concurrently or one after the other) and merged, give
     scores and analysis byte-identical to one driver of the same campaign; the export differs only in the documented
     fields of a merge (shard, selection and each selection's own dispatch figures), and the report in the dispatch
     positions and its `## Shards` section."""
@@ -151,13 +151,13 @@ def test_c35_selections_merged_give_the_analysis_of_one_driver_byte_for_byte(req
 
 
 @pytest.mark.parametrize("which", ["merged", "merged_sequential"])
-def test_c35_regenerate_derives_the_outputs_of_merged_selections_anew(request, which):
-    """C35: the four outputs of merged selections regenerate from their records and snapshots byte for byte."""
+def test_c38_regenerate_derives_the_outputs_of_merged_selections_anew(request, which):
+    """C38: the four outputs of merged selections regenerate from their records and snapshots byte for byte."""
     assert regenerate(request.getfixturevalue(which).root) == []
 
 
-def test_c35_a_merge_under_other_prices_than_the_campaigns_is_refused(base, clean_environment, direct, relay):
-    """C35: the merge counts what the selections spent with the study's prices; a study whose models.toml is not the
+def test_c38_a_merge_under_other_prices_than_the_campaigns_is_refused(base, clean_environment, direct, relay):
+    """C38: the merge counts what the selections spent with the study's prices; a study whose models.toml is not the
     one the campaign ran under is refused, not used to count."""
     root = make_selection_study(base, "repriced")
     models = (root / "models.toml").read_text(encoding="utf-8")
@@ -169,8 +169,8 @@ def test_c35_a_merge_under_other_prices_than_the_campaigns_is_refused(base, clea
     refused(clean_environment, Campaign(root), direct.root / "out", relay.root / "out", fragments=("models.toml",))
 
 
-def test_c35_a_contrast_across_selections_pairs_runs_of_both_batches(merged):
-    """C35: the contrast of relay-down (the relay selection) with baseline (the direct selection) is analysed with
+def test_c38_a_contrast_across_selections_pairs_runs_of_both_batches(merged):
+    """C38: the contrast of relay-down (the relay selection) with baseline (the direct selection) is analysed with
     pairs made of one run of each batch."""
     analysis = read(merged, "analysis.json")
     export = read(merged, "export.json")
@@ -183,8 +183,8 @@ def test_c35_a_contrast_across_selections_pairs_runs_of_both_batches(merged):
     assert crossing[0]["n_pairs"] > 0, crossing
 
 
-def test_c35_merge_json_the_export_and_the_report_name_each_runs_selection(merged, direct, relay):
-    """C35: merge.json lists each selection with its levels and mode under rule expcore-shard/4, numbered by its
+def test_c38_merge_json_the_export_and_the_report_name_each_runs_selection(merged, direct, relay):
+    """C38: merge.json lists each selection with its levels and mode under rule expcore-shard/4, numbered by its
     levels; every run entry of the export names its selection; the report's table names each with its levels."""
     document = json.loads((merged.root / "out" / MERGE_FILE).read_text(encoding="utf-8"))
     assert (document["rule"], document["count"]) == (RULE_SELECTION, 2)
@@ -207,8 +207,8 @@ def test_c35_merge_json_the_export_and_the_report_name_each_runs_selection(merge
 # --- the run side ----------------------------------------------------------------------------------------------------
 
 
-def test_c35_a_selection_runs_its_runs_only_in_the_whole_plans_places(direct):
-    """C35: the direct selection's store holds exactly the plan's direct runs, at their places in the whole plan, and
+def test_c38_a_selection_runs_its_runs_only_in_the_whole_plans_places(direct):
+    """C38: the direct selection's store holds exactly the plan's direct runs, at their places in the whole plan, and
     pins the selection spec under expcore-shard/4."""
     study = load_study(direct.root)
     expected = {row.key.text: row.seq for row in study.manifest.rows if row.key.factors["access"] == "direct"}
@@ -218,8 +218,8 @@ def test_c35_a_selection_runs_its_runs_only_in_the_whole_plans_places(direct):
     assert spec == {"rule": RULE_SELECTION, "label": "direct", "select": {"access": ["direct"]}, "sequential": False}
 
 
-def test_c35_concurrent_selections_share_the_caps_and_the_budget_within_the_totals(direct, relay):
-    """C35: two concurrent selections get parts of each unit's cap (4) and of max_usd (5.0) by their planned runs,
+def test_c38_concurrent_selections_share_the_caps_and_the_budget_within_the_totals(direct, relay):
+    """C38: two concurrent selections get parts of each unit's cap (4) and of max_usd (5.0) by their planned runs,
     rounded down, so together they never pass the totals."""
     one, two = shares_of(direct), shares_of(relay)
     assert one["unit_caps"] == {"alpha-stub": 2, "beta-stub": 2}  # 4 x 7 of 11 runs on each unit
@@ -228,8 +228,8 @@ def test_c35_concurrent_selections_share_the_caps_and_the_budget_within_the_tota
     assert "after" not in one
 
 
-def test_c35_sequential_selections_have_the_full_caps_the_first_the_whole_budget_the_second_what_it_left(now, later):
-    """C35: under --sequential the first selection gets the full caps and the whole $5, and the second the full caps
+def test_c38_sequential_selections_have_the_full_caps_the_first_the_whole_budget_the_second_what_it_left(now, later):
+    """C38: under --sequential the first selection gets the full caps and the whole $5, and the second the full caps
     and $5 minus what the first actually spent, which it records with the first's start."""
     first, second = shares_of(now), shares_of(later)
     assert first["unit_caps"] == second["unit_caps"] == {"alpha-stub": 4, "beta-stub": 4}
@@ -252,8 +252,8 @@ def test_c35_sequential_selections_have_the_full_caps_the_first_the_whole_budget
         (["access=direct,relay"], "selects every run of the plan"),
     ],
 )
-def test_c35_a_selection_that_cannot_be_run_is_refused_at_start(tmp_path, clean_environment, selects, fragment):
-    """C35: an unknown factor or level, a selection that selects nothing, and one that selects everything are
+def test_c38_a_selection_that_cannot_be_run_is_refused_at_start(tmp_path, clean_environment, selects, fragment):
+    """C38: an unknown factor or level, a selection that selects nothing, and one that selects everything are
     refused before the store is opened."""
     root = make_selection_study(tmp_path, "study")
     code, errors = run_refused(clean_environment, root, *select_args(selects, "batch"))
@@ -271,8 +271,8 @@ def test_c35_a_selection_that_cannot_be_run_is_refused_at_start(tmp_path, clean_
         (["--sequential"], "need --select"),
     ],
 )
-def test_c35_options_that_do_not_combine_are_refused_saying_why(tmp_path, clean_environment, args, fragment):
-    """C35: --select with --shard (refused in this version), without a label, --after without --sequential and
+def test_c38_options_that_do_not_combine_are_refused_saying_why(tmp_path, clean_environment, args, fragment):
+    """C38: --select with --shard (refused in this version), without a label, --after without --sequential and
     --sequential without --select are refused before the study is read, the refusal naming the options."""
     root = make_selection_study(tmp_path, "study")
     code, errors = cli(clean_environment, "run", str(root), *args)
@@ -281,8 +281,8 @@ def test_c35_options_that_do_not_combine_are_refused_saying_why(tmp_path, clean_
     assert not (root / "out").exists()
 
 
-def test_c35_a_selection_of_a_campaign_that_shards_by_model_is_refused_in_this_version(tmp_path, clean_environment):
-    """C35: [shards] per_model and --select do not combine yet, and the refusal says so."""
+def test_c38_a_selection_of_a_campaign_that_shards_by_model_is_refused_in_this_version(tmp_path, clean_environment):
+    """C38: [shards] per_model and --select do not combine yet, and the refusal says so."""
     extra = "\n[shards]\nper_model = { alpha-stub = 1, beta-stub = 1 }\n"
     root = make_selection_study(tmp_path, "study", extra=extra)
     code, errors = run_refused(clean_environment, root, *select_args([DIRECT], "batch"))
@@ -290,8 +290,8 @@ def test_c35_a_selection_of_a_campaign_that_shards_by_model_is_refused_in_this_v
     assert "cannot be combined with [shards] per_model in this version" in errors, errors
 
 
-def test_c35_a_concurrent_share_below_one_runs_reservation_is_refused_naming_the_model(tmp_path, clean_environment):
-    """C35: a budget whose proportional part cannot pay one run of a model the selection runs is refused at start,
+def test_c38_a_concurrent_share_below_one_runs_reservation_is_refused_naming_the_model(tmp_path, clean_environment):
+    """C38: a budget whose proportional part cannot pay one run of a model the selection runs is refused at start,
     naming the model and pointing to --sequential."""
     root = make_selection_study(tmp_path, "study", budget=0.1)
     code, errors = run_refused(clean_environment, root, *select_args([RELAY], "batch"))
@@ -300,8 +300,8 @@ def test_c35_a_concurrent_share_below_one_runs_reservation_is_refused_naming_the
     assert "--sequential" in errors, errors
 
 
-def test_c35_a_selection_resumes_only_as_itself(base, clean_environment, direct):
-    """C35: a selection's store resumes under the same selection (nothing left to run), and is refused under another
+def test_c38_a_selection_resumes_only_as_itself(base, clean_environment, direct):
+    """C38: a selection's store resumes under the same selection (nothing left to run), and is refused under another
     selection, another label, or no selection at all."""
     copy = copy_campaign(direct, base, "direct-resumed")
     code, errors = run_refused(clean_environment, copy.root, *select_args([DIRECT], "direct"))
@@ -317,10 +317,10 @@ def test_c35_a_selection_resumes_only_as_itself(base, clean_environment, direct)
     assert "--select access=direct --shard-label direct" in errors, errors
 
 
-def test_c35_after_must_name_a_stopped_sequential_selection_of_the_campaign_disjoint_from_this_one(
+def test_c38_after_must_name_a_stopped_sequential_selection_of_the_campaign_disjoint_from_this_one(
     base, clean_environment, direct, now
 ):
-    """C35: --after refuses a selection that ran concurrently, one that selects runs of this one, and a path with no
+    """C38: --after refuses a selection that ran concurrently, one that selects runs of this one, and a path with no
     store."""
     root = make_selection_study(base, "after-refused")
     for after, fragment in (
@@ -337,8 +337,8 @@ def test_c35_after_must_name_a_stopped_sequential_selection_of_the_campaign_disj
     assert not (root / "out" / "state.sqlite").exists()
 
 
-def test_c35_after_refuses_an_earlier_selection_still_running(base, clean_environment, now):
-    """C35: while a driver holds the earlier selection's store, a later one cannot read what it spent: refused."""
+def test_c38_after_refuses_an_earlier_selection_still_running(base, clean_environment, now):
+    """C38: while a driver holds the earlier selection's store, a later one cannot read what it spent: refused."""
     root = make_selection_study(base, "after-running")
     with DispatchLock(now.root / "out"):
         code, errors = run_refused(
@@ -349,8 +349,8 @@ def test_c35_after_refuses_an_earlier_selection_still_running(base, clean_enviro
     assert not (root / "out" / "state.sqlite").exists()
 
 
-def test_c35_a_later_selection_resumed_after_its_earlier_one_spent_more_is_refused(base, clean_environment, now, later):
-    """C35: the second selection's shares hold what the first had spent; if the first's store says otherwise when
+def test_c38_a_later_selection_resumed_after_its_earlier_one_spent_more_is_refused(base, clean_environment, now, later):
+    """C38: the second selection's shares hold what the first had spent; if the first's store says otherwise when
     the second resumes, the resume is refused."""
     first = copy_campaign(now, base, "now-spent-more")
     second = copy_campaign(later, base, "later-resumed")
@@ -365,64 +365,64 @@ def test_c35_a_later_selection_resumed_after_its_earlier_one_spent_more_is_refus
 # --- the merge's refusals --------------------------------------------------------------------------------------------
 
 
-def test_c35_a_merge_of_one_selection_is_refused(clean_environment, whole, direct):
-    """C35: selections merge with selections only, at least two of them."""
+def test_c38_a_merge_of_one_selection_is_refused(clean_environment, whole, direct):
+    """C38: selections merge with selections only, at least two of them."""
     refused(clean_environment, whole, direct.root / "out", fragments=("at least 2",))
 
 
-def test_c35_selections_that_overlap_are_refused_naming_both(base, clean_environment, whole, direct):
-    """C35: two selections that both select a run (access=direct and tools=basic both hold baseline) are refused."""
+def test_c38_selections_that_overlap_are_refused_naming_both(base, clean_environment, whole, direct):
+    """C38: two selections that both select a run (access=direct and tools=basic both hold baseline) are refused."""
     basic = run_selection(base, "basic", clean_environment, ["tools=basic"], "basic")
     refused(clean_environment, whole, direct.root / "out", basic.root / "out", fragments=("both select run",))
 
 
-def test_c35_selections_that_do_not_cover_the_plan_are_refused(base, clean_environment, whole, relay):
-    """C35: relay-down and extended leave baseline in no selection: refused, counting the runs left out."""
+def test_c38_selections_that_do_not_cover_the_plan_are_refused(base, clean_environment, whole, relay):
+    """C38: relay-down and extended leave baseline in no selection: refused, counting the runs left out."""
     extended = run_selection(base, "extended", clean_environment, ["tools=extended"], "extended")
     refused(clean_environment, whole, relay.root / "out", extended.root / "out", fragments=("is in no selection",))
 
 
-def test_c35_concurrent_and_sequential_selections_are_not_merged_together(clean_environment, whole, direct, later):
-    """C35: the caps of a sequential selection are the full caps, so it never merges with one that ran on a part."""
+def test_c38_concurrent_and_sequential_selections_are_not_merged_together(clean_environment, whole, direct, later):
+    """C38: the caps of a sequential selection are the full caps, so it never merges with one that ran on a part."""
     refused(clean_environment, whole, direct.root / "out", later.root / "out", fragments=("--sequential",))
 
 
-def test_c35_a_later_selection_started_without_after_is_refused_at_merge(base, clean_environment, whole, now):
-    """C35: the core cannot tell a first selection from a later one whose --after was left out; the merge can: two
+def test_c38_a_later_selection_started_without_after_is_refused_at_merge(base, clean_environment, whole, now):
+    """C38: the core cannot tell a first selection from a later one whose --after was left out; the merge can: two
     selections that each ran after none are not one chain."""
     orphan = run_selection(base, "orphan", clean_environment, [RELAY], "orphan", sequential=True)
     refused(clean_environment, whole, now.root / "out", orphan.root / "out", fragments=("--after",))
 
 
-def test_c35_sequential_selections_whose_windows_overlap_are_refused(base, clean_environment, whole, now, later):
-    """C35: a first selection whose attempts ran on past the second's start is refused at merge, naming both."""
+def test_c38_sequential_selections_whose_windows_overlap_are_refused(base, clean_environment, whole, now, later):
+    """C38: a first selection whose attempts ran on past the second's start is refused at merge, naming both."""
     first = copy_campaign(now, base, "now-overlapping")
     execute(first.root / "out" / "state.sqlite", "UPDATE attempts SET ended_utc='2099-01-01T00:00:00Z'")
     refused(clean_environment, whole, first.root / "out", later.root / "out", fragments=("must not overlap",))
 
 
-def test_c35_an_earlier_selection_that_spent_more_after_the_later_started_is_refused_at_merge(
+def test_c38_an_earlier_selection_that_spent_more_after_the_later_started_is_refused_at_merge(
     base, clean_environment, whole, now, later
 ):
-    """C35: the second selection recorded what the first had spent; a first whose store now says more is refused."""
+    """C38: the second selection recorded what the first had spent; a first whose store now says more is refused."""
     first = copy_campaign(now, base, "now-spent-again")
     execute(first.root / "out" / "state.sqlite", "INSERT OR REPLACE INTO meta(key,value,set_utc) VALUES"
             "('probe_spend_usd', '{\"alpha-stub\": 0.5}', '2026-11-01T00:00:00Z')")  # fmt: skip
     refused(clean_environment, whole, first.root / "out", later.root / "out", fragments=("ran again after",))
 
 
-def test_c35_selections_whose_spend_passes_the_budget_are_refused_at_merge(
+def test_c38_selections_whose_spend_passes_the_budget_are_refused_at_merge(
     base, clean_environment, whole, direct, relay
 ):
-    """C35: the merge sums what every selection spent and refuses a total over max_usd."""
+    """C38: the merge sums what every selection spent and refuses a total over max_usd."""
     over = copy_campaign(direct, base, "direct-over")
     execute(over.root / "out" / "state.sqlite", "INSERT OR REPLACE INTO meta(key,value,set_utc) VALUES"
             "('probe_spend_usd', '{\"alpha-stub\": 9.0}', '2026-11-01T00:00:00Z')")  # fmt: skip
     refused(clean_environment, whole, over.root / "out", relay.root / "out", fragments=("over [budget] max_usd",))
 
 
-def test_c35_a_selections_snapshot_under_another_index_is_refused_by_the_check(base, clean_environment, merged):
-    """C35: the merge numbers selections by their levels, so swapping the two snapshots of a merged batch (and the
+def test_c38_a_selections_snapshot_under_another_index_is_refused_by_the_check(base, clean_environment, merged):
+    """C38: the merge numbers selections by their levels, so swapping the two snapshots of a merged batch (and the
     hashes merge.json names) is refused by the check."""
     copy = copy_campaign(merged, base, "merged-swapped")
     out = copy.root / "out"

@@ -227,7 +227,7 @@ def run_study(
     an attempt. With `shard` the campaign is that shard of N: its part of the plan, its shares of the caps and the
     budget, and the environment identity the plugin gives, kept in the store (`campaign.shard_run`); a shard that has
     no run, or whose share of a total is nothing, is refused before the store is touched. A `SelectionSpec` runs the
-    selected runs instead (C35, `study.selection_start`), after the earlier selections `after` names when sequential.
+    selected runs instead (C38, `study.selection_start`), after the earlier selections `after` names when sequential.
     """
     study = load_study(path)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
@@ -461,7 +461,7 @@ def _check_merged(
     try:
         merged = read_merge(raw, out / MERGE_FILE)
         loaded = load_study(study.root) if merged["rule"] == RULE_SELECTION else None
-        pricing = None if loaded is None else pricing_of(loaded)  # a selection's spend is checked again (C35)
+        pricing = None if loaded is None else pricing_of(loaded)  # a selection's spend is checked again (C38)
         held = read_held(out, merged, pricing)
     except MergeRefused as error:
         raise Refused(str(error)) from None

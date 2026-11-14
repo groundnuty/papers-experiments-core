@@ -1,5 +1,5 @@
 # Provenance: new
-"""A selection's share of the campaign's caps and budget (C35): never past the totals, across all its selections.
+"""A selection's share of the campaign's caps and budget (C38): never past the totals, across all its selections.
 
 A selection knows only itself when it starts, never how many batches its campaign will have, so every share is a part
 of the **whole plan's** figure, rounded down; the merge refuses selections that are not disjoint and covering, so the

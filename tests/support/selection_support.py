@@ -1,4 +1,4 @@
-"""Helpers for tests of selection shards (C35): batches of the example study's campaign, run for real.
+"""Helpers for tests of selection shards (C38): batches of the example study's campaign, run for real.
 
 `run_selection` runs a copy of the example with `python -m expcore run --select ... --shard-label L`, as a study
 running its campaign in batches does, so the stores, records and shares are what the run side writes. The example's

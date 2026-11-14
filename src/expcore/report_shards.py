@@ -77,7 +77,7 @@ def _shards_by_index(export: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _selections(export: Mapping[str, Any]) -> dict[int, str]:
-    """Each selection of a batch merged from selections of its campaign (C35), by index: its label with its levels,
+    """Each selection of a batch merged from selections of its campaign (C38), by index: its label with its levels,
     as `run --select` gave them (`first (stage=early,mid)`); empty for a batch merged from shards."""
     shards = export["shards"]
     named = {}

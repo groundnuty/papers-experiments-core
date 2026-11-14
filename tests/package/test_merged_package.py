@@ -1,4 +1,4 @@
-"""The replication package of a merged batch (#154, C29, C35): merge.json and each shard's (or selection's) snapshot go
+"""The replication package of a merged batch (#154, C29, C38): merge.json and each shard's (or selection's) snapshot go
 in with the records, the package's own check passes, and an anonymised build leaves no source in any snapshot and keeps
 the hashes true.
 
@@ -145,7 +145,7 @@ def test_c29_an_anonymised_package_of_a_merged_batch_has_no_source_and_hashes_th
 
 @pytest.fixture(scope="module")
 def selections(tmp_path_factory, clean_environment, core_from_a_repository) -> Campaign:
-    """The example study run as two sequential selections (C35), merged into a copy that lists the merged files."""
+    """The example study run as two sequential selections (C38), merged into a copy that lists the merged files."""
     home = tmp_path_factory.mktemp("selections") / f"{PRIVATE}-home"
     home.mkdir()
     now = run_selection(home, "now", clean_environment, [DIRECT], "now", sequential=True)
@@ -163,10 +163,10 @@ def selections(tmp_path_factory, clean_environment, core_from_a_repository) -> C
 
 
 @pytest.mark.parametrize("anonymised", [False, True], ids=["plain", "anonymised"])
-def test_c35_the_package_of_merged_selections_passes_its_own_check(
+def test_c38_the_package_of_merged_selections_passes_its_own_check(
     selections, hashes, anonymisation, tmp_path, anonymised
 ):
-    """C35: merged selections package as merged shards do, plain and anonymised: merge.json with each selection's
+    """C38: merged selections package as merged shards do, plain and anonymised: merge.json with each selection's
     levels, mode and window, a snapshot per selection, and a check that regenerates every output byte for byte."""
     archive = build_package(
         selections.root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation if anonymised else None

@@ -1,5 +1,5 @@
 # Provenance: new
-"""The earlier selections a later sequential one runs after (`--after`, C35): read, verified, and what they spent.
+"""The earlier selections a later sequential one runs after (`--after`, C38): read, verified, and what they spent.
 
 `run --select ... --sequential --after EARLIER_OUT ...` names every selection of the campaign that ran before this one,
 each by its `out/` (or its store). Each is read from a snapshot of its store, taken while its dispatch lock is held,

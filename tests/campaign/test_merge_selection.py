@@ -1,4 +1,4 @@
-"""The merge's checks of selections (C35), on facts built here: the plan bound to the fingerprint, a run judged by its
+"""The merge's checks of selections (C38), on facts built here: the plan bound to the fingerprint, a run judged by its
 key, and the total spend compared exactly with the ceilings and the releases."""
 
 from pathlib import Path
@@ -60,22 +60,22 @@ PRICING = Pricing(
 )
 
 
-def test_c35_selections_merge_when_they_cover_the_plan_the_fingerprint_declares():
-    """C35: two selections that together hold every run of the fingerprint's plan pass, numbered by their levels."""
+def test_c38_selections_merge_when_they_cover_the_plan_the_fingerprint_declares():
+    """C38: two selections that together hold every run of the fingerprint's plan pass, numbered by their levels."""
     ordered = check_selections([facts("two", ("late", "last")), facts("one", ("early",))], PLAN, None)
     assert [(s.spec.label, s.spec.index, s.spec.count) for s in ordered] == [("one", 1, 2), ("two", 2, 2)]
 
 
-def test_c35_a_study_plan_cut_to_what_the_selections_ran_is_refused():
-    """C35: merged against a study whose plan lacks condition c, selections of a and b would cover it; the plan must
+def test_c38_a_study_plan_cut_to_what_the_selections_ran_is_refused():
+    """C38: merged against a study whose plan lacks condition c, selections of a and b would cover it; the plan must
     be the whole plan the selections' fingerprint declares."""
     cut = build_manifest([row.key for row in PLAN.rows if row.key.factors["stage"] != "last"], 7)
     with pytest.raises(MergeRefused, match="not the plan the selections' campaign fingerprint declares"):
         check_selections([facts("one", ("early",)), facts("two", ("late",))], cut, None)
 
 
-def test_c35_a_run_is_judged_by_its_run_key_never_by_the_factors_its_store_gives():
-    """C35: a store that holds another selection's run under factors rewritten to look like its own is refused."""
+def test_c38_a_run_is_judged_by_its_run_key_never_by_the_factors_its_store_gives():
+    """C38: a store that holds another selection's run under factors rewritten to look like its own is refused."""
     one, two = facts("one", ("early",)), facts("two", ("late", "last"))
     stolen = next(key for key, f in two.runs.items() if f["stage"] == "late")
     forged = {**one.runs, stolen: {**two.runs[stolen], "stage": "early"}}
@@ -93,8 +93,8 @@ def test_c35_a_run_is_judged_by_its_run_key_never_by_the_factors_its_store_gives
         ((0.5, 0.5000007), {"ALL": 0.0000006}, True),
     ],
 )
-def test_c35_the_total_spend_is_compared_exactly_with_the_ceiling_and_the_releases(spent, released, refused):
-    """C35: the selections' spend together is held to `max_usd` plus what releases added, with no micro-dollar
+def test_c38_the_total_spend_is_compared_exactly_with_the_ceiling_and_the_releases(spent, released, refused):
+    """C38: the selections' spend together is held to `max_usd` plus what releases added, with no micro-dollar
     rounding either way."""
     budget = {"max_usd": 1.0, "per_model_usd": {}}
     shards = [
@@ -108,8 +108,8 @@ def test_c35_the_total_spend_is_compared_exactly_with_the_ceiling_and_the_releas
         check_selections(shards, PLAN, PRICING)
 
 
-def test_c35_a_models_ceiling_is_held_across_selections_too():
-    """C35: the selections' spend on a model is held to its `per_model_usd` ceiling."""
+def test_c38_a_models_ceiling_is_held_across_selections_too():
+    """C38: the selections' spend on a model is held to its `per_model_usd` ceiling."""
     budget = {"max_usd": 10.0, "per_model_usd": {"model-a": 1.0}}
     shards = [
         facts("one", ("early",), budget=budget, spent=0.6),

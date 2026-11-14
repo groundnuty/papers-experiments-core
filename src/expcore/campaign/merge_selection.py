@@ -1,5 +1,5 @@
 # Provenance: new
-"""The merge of a campaign run in selections (C35, `expcore-shard/4`): the checks and the merged layout's facts.
+"""The merge of a campaign run in selections (C38, `expcore-shard/4`): the checks and the merged layout's facts.
 
 `python -m expcore merge OUT SELECTION_OUT...` merges selections as it merges shards (`campaign.merge`), with the
 checks a selection needs in place of the partition's. It refuses, naming the selection and the reason, unless:

@@ -71,7 +71,7 @@ class ShardMismatch(ResumeRefused):
 class ShardStart:
     """A shard's start: its spec, the environment identity it reads, checked, and the shares of the caps and budget."""
 
-    spec: Spec  # a shard's, or a selection's (C35)
+    spec: Spec  # a shard's, or a selection's (C38)
     environment: Mapping[str, str]
     shares: Mapping[str, Any]  # {"unit_caps": {unit: n}, "budget": {"max_usd": x, "per_model_usd": {...}} or None}
 
@@ -263,7 +263,7 @@ _REASONS = {
 _SELECTION_REASONS = {
     META_SHARD: (
         "this store started as {what}, and this start gives another selection, label, mode or rule: a selection "
-        "resumes only as itself (C35)"
+        "resumes only as itself (C38)"
     ),
     META_ENVIRONMENT: (
         "the environment identity of {what} changed since its first start: it would no longer have run against what "

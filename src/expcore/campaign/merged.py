@@ -49,7 +49,7 @@ def snapshot_rel(index: int) -> str:
 def read_held(out: Path, document: Mapping[str, Any], pricing: Pricing | None = None) -> dict[int, ShardFacts]:
     """What the snapshot of each shard merge.json lists says of itself, by index; each is read once and its bytes are
     compared with the hash the file names. Refuses a snapshot missing or changed, naming the shard, and anything under
-    `shards/` the file does not list. `pricing` counts a selection's spend (C35)."""
+    `shards/` the file does not list. `pricing` counts a selection's spend (C38)."""
     held: dict[int, ShardFacts] = {}
     for shard in document["shards"]:
         index = shard["index"]
@@ -98,7 +98,7 @@ def verify_merged(
 ) -> None:
     """Refuse merge.json unless it is the document a merge of the snapshots `held` (by the index of the directory each
     lies in) writes for `plan`: a snapshot under another shard's index, shards that are not one whole campaign of the
-    plan, or a field that differs, each named. Selections are numbered by the merge (C35), so a selection's snapshot
+    plan, or a field that differs, each named. Selections are numbered by the merge (C38), so a selection's snapshot
     must lie under the index the merge gives it; with `pricing`, their spend together is checked against the budget."""
     if not held:
         raise MergeRefused(f"{SHARDS_DIR}/ holds no shard's snapshot; merge the shards again")
