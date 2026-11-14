@@ -181,9 +181,12 @@ class Recovery(LinkSettling):
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         labels: Mapping[str, str] | None = None,
+        wall: Callable[[], float] = time.time,
     ) -> None:
-        """`labels` maps each provider's label to its service, which the heal needs to act on a reader by its label."""
+        """`labels` maps each provider's label to its service, which the heal needs to act on a reader by its label;
+        `wall` is the clock a settle is journalled on, which every process shares."""
         self._settings, self._driver, self._clock, self._sleep = settings, driver, clock, sleep
+        self._wall = wall
         self.journal = InjectionJournal(settings.journal)
         self.last: Observation | None = None  # the latest reading `wait` took
         self.unreadable = 0  # the readings of the latest `wait` that failed and counted as no answer
@@ -193,6 +196,7 @@ class Recovery(LinkSettling):
         self._labels = dict(labels or {})
         self._deadline: float | None = None  # while a heal's container restart runs: the clock time it must end by
         self._quiet_until: float | None = None  # the end of the latest settle a heal held: no gate read or check before
+        self._waited_wall = 0.0  # the latest journalled settle (wall clock) this recovery has waited for or set itself
         self._healed: set[str] = set()  # the injections this recovery healed once already: never twice
 
     def entries(self, target: str | None = None) -> list[dict[str, Any]]:

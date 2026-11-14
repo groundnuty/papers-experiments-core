@@ -57,23 +57,39 @@ class LinkSettling:
     _healed: set[str]
     _deadline: float | None
     _quiet_until: float | None
+    _wall: Callable[[], float]
+    _waited_wall: float
     journal: InjectionJournal
     links_detail: str | None
     restore_record: dict[str, Any]
     settle: Callable[..., Any]
     wait: Callable[..., Observation | None]
 
-    def hold(self, seconds: float) -> None:
+    def hold(self, seconds: float, entry: str | None = None) -> None:
         """Mark that nothing may read through the links for `seconds` from now: a heal sends it before and after every
-        restart, so a later gate read or link check of this recovery, even one after an interrupted heal, waits until
-        the settle could have ended (`_await_quiet`)."""
+        restart, so a later gate read or link check, even one after an interrupted heal, waits until the settle could
+        have ended (`_await_quiet`). With `entry`, the healed injection's journal id, the hold is also journalled
+        durably (`settle_until`, on the wall clock, on a `clear_failed` line), so a recovery in another process, after
+        this one died or exited mid-settle, waits for it too. A journal that cannot take it raises: no restart is then
+        sent."""
         self._quiet_until = self._clock() + seconds
+        if entry is not None:
+            until = self._wall() + seconds
+            self.journal.append({"event": "clear_failed", "id": entry, "how": "links_stuck", "settle_until": until})
+            self._waited_wall = max(self._waited_wall, until)  # its own: the clock's wait above covers it
 
     def _await_quiet(self) -> None:
-        """Wait out what is left of the latest held settle, before any gate read or link check."""
+        """Wait out what is left of the latest held settle, this recovery's own and every one the journal holds for
+        an open injection, before any gate read or link check. A journal that cannot be read raises (fail closed)."""
         until = self._quiet_until
         if until is not None and self._clock() < until:
             self._sleep(until - self._clock())
+        journalled = [entry.get("settle_until") for entry in self.journal.open_entries()]
+        latest = max((value for value in journalled if isinstance(value, int | float)), default=None)
+        if latest is not None and latest > self._waited_wall:  # another's hold, or one this recovery has not waited
+            if self._wall() < latest:
+                self._sleep(latest - self._wall())
+            self._waited_wall = latest
 
     def _gate(self, service: str, gate_probe: str | None, timeout_s: float | None = None) -> dict[str, Any]:
         """The session gate for a provider's service, polled within `gate_timeout_s`, or `timeout_s` when shorter;
@@ -146,7 +162,8 @@ class LinkSettling:
             gate=lambda reader, timeout_s: self._gate(reader, gate_probe, timeout_s),
             transfers=self._active_transfers,
             restart_container=restart,
-            hold=self.hold,
+            hold=lambda seconds: self.hold(seconds, str(entry["id"])),
+            container_fallback=settings.heal_container_fallback,
             clock=self._clock,
             sleep=self._sleep,
         ).run()

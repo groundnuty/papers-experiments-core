@@ -14,7 +14,7 @@ The file is validated when it is loaded, with messages that name the file and th
     output_cap_chars = 4000
     max_output_tokens = 1024
     malformed_policy = "report"   # optional: "report" (the default) or "end"
-    tool_call_bound_s = 300       # optional: the longest one tool call may take, in seconds (L17)
+    tool_server_call_bound_s = 300   # optional: the longest one call to a tool server may take, in seconds (L17)
 
     [scheduler]                   # optional: every key of `SchedulerConfig` that is a number, a flag or a kind
     max_attempts = 3
@@ -57,6 +57,15 @@ from expcore.loop.config import MALFORMED_POLICIES, AgentConfig
 
 _TOP_KEYS = ("order_seed", "seeds", "models", "agent", "scheduler", "budget", "endpoints", "shards")
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
+# The key the per-call bound had before its scope was fixed (L17): it capped every tool call, the code tool's too, which
+# is not what it was for. It is refused with the new name and the reason, never read as the new key.
+RENAMED_BOUND = "tool_call_bound_s"
+RENAMED_BOUND_REASON = (
+    "was renamed tool_server_call_bound_s, because its scope was wrong: it capped every tool call, a code cell too, "
+    "while the bound is only for calls to a tool server (an MCP server), so that a hang of one is knowledge "
+    "infrastructure and not the agent's time. A code cell and any other tool keep the agent's time left. The old key "
+    "is refused rather than read under the new meaning: declare tool_server_call_bound_s if that is what you want"
+)
 _SCHEDULER_KINDS: dict[str, type] = {
     "max_attempts": int,
     "workers": int,
@@ -127,7 +136,9 @@ def _number(section: Section, key: str) -> float:
 
 def _agent(root: Section) -> AgentConfig:
     section = _table(root, "agent")
-    section.reject_unknown([*_AGENT_KEYS, "malformed_policy", "tool_call_bound_s"])
+    if RENAMED_BOUND in section.data:  # refused before the generic message of an unknown key: it names the new key
+        raise section.fail(RENAMED_BOUND, RENAMED_BOUND_REASON)
+    section.reject_unknown([*_AGENT_KEYS, "malformed_policy", "tool_server_call_bound_s"])
     for key in _AGENT_KEYS:
         if key not in section.data:
             raise section.fail(key, "is required")
@@ -139,9 +150,9 @@ def _agent(root: Section) -> AgentConfig:
         max_output_tokens=_typed(section, "max_output_tokens", int),
     )
     policy = section.optional_string("malformed_policy") or MALFORMED_POLICIES[0]
-    bound = _typed(section, "tool_call_bound_s", float) if "tool_call_bound_s" in section.data else None
+    bound = _typed(section, "tool_server_call_bound_s", float) if "tool_server_call_bound_s" in section.data else None
     try:
-        return AgentConfig(limits, malformed_policy=policy, tool_call_bound_s=bound)
+        return AgentConfig(limits, malformed_policy=policy, tool_server_call_bound_s=bound)
     except ValueError as error:
         raise ConfigError(f"{root.file}: {section.where}: {error}") from None
 

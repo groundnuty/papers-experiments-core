@@ -183,7 +183,7 @@ def _hangs_until_its_bound(clock: FakeClock, provider: FakeProvider):
 def _tool_bound_expiry() -> RunRecord:
     """A tool server hangs past the study's declared per-call bound, with the agent's time and the ceiling far off: the
     call fails as `knowledge` infrastructure, and the record is the run's, set aside (L17)."""
-    clock, provider = FakeClock(), FakeProvider({"echo": None})
+    clock, provider = FakeClock(), FakeProvider({"echo": None}, tool_server=True)
     provider.handlers["echo"] = _hangs_until_its_bound(clock, provider)
     return record_run(
         [[("echo", {"x": "1"}), ("echo", {"x": "2"})], "never"],
@@ -191,14 +191,14 @@ def _tool_bound_expiry() -> RunRecord:
         providers=[provider],
         clock=clock,
         sleep=ClockSleep(clock),
-        tool_call_bound_s=60,
+        tool_server_call_bound_s=60,
     )
 
 
 def _tool_bound_past_the_time_left() -> RunRecord:
     """The declared bound is longer than the agent's time left, so the call is handed the time left, and the expiry at
     it is the loop's own cut, a time cap: the shorter of the two wins (L17)."""
-    clock, provider = FakeClock(), FakeProvider({"echo": None})
+    clock, provider = FakeClock(), FakeProvider({"echo": None}, tool_server=True)
     provider.handlers["echo"] = _hangs_until_its_bound(clock, provider)
     return record_run(
         [[("echo", {"x": "1"})], "never"],
@@ -206,7 +206,7 @@ def _tool_bound_past_the_time_left() -> RunRecord:
         providers=[provider],
         clock=clock,
         sleep=ClockSleep(clock),
-        tool_call_bound_s=500,
+        tool_server_call_bound_s=500,
     )
 
 
@@ -222,11 +222,32 @@ def _tool_bound_cut() -> RunRecord:
 
     return record_run(
         [[("echo", {"x": "1"})], "never"],
-        {"echo": holds},
+        {},
+        providers=[FakeProvider({"echo": holds}, tool_server=True)],
         clock=clock,
         sleep=ClockSleep(clock),
         time_cap_s=61,
-        tool_call_bound_s=60,
+        tool_server_call_bound_s=60,
+    )
+
+
+def _tool_bound_code_cell_cut() -> RunRecord:
+    """The same hold, the same bound and the same cap, but the tool is no tool server (a code cell): the bound is not
+    its own, so the loop's cut at the agent's time left is the agent's time cap, with no judgement by it (L17)."""
+    clock = FakeClock()
+
+    async def holds(_args):
+        clock.advance(61)
+        await asyncio.Event().wait()
+
+    return record_run(
+        [[("echo", {"x": "1"})], "never"],
+        {},
+        providers=[FakeProvider({"echo": holds})],
+        clock=clock,
+        sleep=ClockSleep(clock),
+        time_cap_s=61,
+        tool_server_call_bound_s=60,
     )
 
 
@@ -402,6 +423,7 @@ SCENARIOS: dict[str, tuple[Callable[[], RunRecord], str]] = {
     "tool_bound_expiry": (_tool_bound_expiry, "infrastructure"),
     "tool_bound_past_the_time_left": (_tool_bound_past_the_time_left, "time_cap"),
     "tool_bound_cut": (_tool_bound_cut, "infrastructure"),
+    "tool_bound_code_cell_cut": (_tool_bound_code_cell_cut, "time_cap"),
     "ceiling_cut": (_ceiling_cut, "infrastructure"),
     "cleanup_in_time": (_cleanup_in_time, "time_cap"),
     "cleanup_timeout": (_cleanup_timeout, "time_cap"),

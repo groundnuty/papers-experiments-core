@@ -23,6 +23,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     heal_timeout_s = 4200            # optional, provisional: the longest the heal of a stuck link may take in all
     heal_settle_s = 180              # optional, provisional: the no-fetch wait after a heal's restarts
     session_drain_s = 320            # optional: how long an outage run's admission outlives its sessions; see below
+    heal_container_fallback = true   # optional: false, and "all_links" restarts links only, never a container
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
@@ -75,8 +76,11 @@ link restart: three commands at `command_timeout_s`, the RPC's bound and its mar
 restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice, `ready_timeout_s`
 and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one
 settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in
-`"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it. **Both
-durations are provisional,** to be tuned as live heals are measured.
+`"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it.
+`heal_container_fallback = false` keeps `"all_links"` to link restarts: a pair they do not mend fails the restore
+closed, for an operator to decide, and no container is restarted; its least `heal_timeout_s` then holds no container
+restart (2,220 s for four providers, 2,730 s for five, with the other defaults). `"link_then_container"` with it false
+is refused. **Both durations are provisional,** to be tuned as live heals are measured.
 """
 
 import hashlib
@@ -124,6 +128,7 @@ _KEYS = (
     "heal_timeout_s",
     "heal_settle_s",
     "session_drain_s",
+    "heal_container_fallback",
     "services",
 )
 
@@ -152,6 +157,7 @@ class FaultSettings:
     heal_timeout_s: float = DEFAULT_HEAL_TIMEOUT_S
     heal_settle_s: float = DEFAULT_HEAL_SETTLE_S
     session_drain_s: float = DEFAULT_SESSION_DRAIN_S
+    heal_container_fallback: bool = True
     config_sha256: str = ""  # the digest of the platform.toml it was read from: part of the federation's identity
 
 
@@ -193,6 +199,9 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     heal = table.data.get("heal", "off")
     if heal not in HEAL_MODES:
         raise table.fail("heal", "must be one of " + ", ".join(f'"{mode}"' for mode in HEAL_MODES))
+    fallback = table.data.get("heal_container_fallback", True)
+    if not isinstance(fallback, bool):
+        raise table.fail("heal_container_fallback", "must be true or false")
     words = {}
     for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
         words[key] = tuple(table.strings(key)) or default
@@ -217,8 +226,11 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         heal_timeout_s=_number(table, "heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S, 0),
         heal_settle_s=_number(table, "heal_settle_s", DEFAULT_HEAL_SETTLE_S, 0),
         session_drain_s=_number(table, "session_drain_s", DEFAULT_SESSION_DRAIN_S, 0),
+        heal_container_fallback=fallback,
         config_sha256=config.sha256,
     )
+    if heal == "link_then_container" and not fallback:  # a mode of container restarts, declared to make none
+        raise table.fail("heal_container_fallback", 'is false, which "link_then_container" contradicts: use "link"')
     uncovered = sorted(heal_participants(config) - set(settings.services))
     if heal == "all_links" and uncovered:  # a partial sequence is what leaves pairs stale
         shown = config.provider_labels(uncovered)
@@ -272,7 +284,8 @@ def heal_round_s(settings: FaultSettings) -> float:
     if settings.heal == "off":
         return 0.0
     if settings.heal == "all_links":
-        return heal_all_links_reserve(settings) + heal_container_reserve(settings)
+        container = heal_container_reserve(settings) if settings.heal_container_fallback else 0.0
+        return heal_all_links_reserve(settings) + container
     container = heal_container_reserve(settings) if settings.heal == "link_then_container" else 0.0
     return heal_link_reserve(settings) + container
 

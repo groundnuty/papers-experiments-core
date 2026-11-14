@@ -1029,3 +1029,149 @@ def test_o35_a_restart_that_raises_settles_before_the_failure_unwinds(tmp_path):
     sent_at = next(at for verb, _, at in services.at if verb == "restart_link")
     assert services.clock.now >= sent_at + 30  # the settle ran before the clear returned
     assert not [checked for checked in services.checked_at if sent_at < checked < sent_at + 30]
+
+
+# --- the PI's authority: link restarts on any provider, a container only where declared ------------------------
+
+
+def test_o35_all_links_without_the_container_fallback_restarts_links_only_and_fails_closed(tmp_path):
+    """O35: with `heal_container_fallback = false`, `all_links` restarts every link and nothing else: a pair the link
+    restarts do not mend fails the restore closed for an operator to decide, and no container but the injection's own
+    target is ever stopped."""
+    services = HealServices()
+    services.link_fixes = dict.fromkeys(SERVICE, ())  # no link restart mends anything
+    services.container_fixes.add(READER)  # a container restart would, were one allowed
+    injector_, services = injector(tmp_path, services, heal="all_links", heal_container_fallback=False)
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "links_stuck"
+    assert len(acted(services, "restart_link")) == 4
+    assert acted(services, "stop", "start") == [("stop", RESTORED), ("start", RESTORED)]
+    assert "fallback off" in step(injector_, "heal")["why"]
+
+
+@pytest.mark.parametrize(("mode", "least"), [("all_links", 2130), ("link", 600)])
+def test_o35_a_heal_without_the_container_fallback_needs_no_container_reserve(tmp_path, mode, least):
+    """O35: without the fallback, the least `heal_timeout_s` holds no container restart: four providers' all-links
+    sequence alone at 120 s commands and a 90 s settle is 2,130 s."""
+    slow = {"command_timeout_s": 120, "heal_settle_s": 90, "heal": mode, "heal_container_fallback": False}
+    platform = write_platform(tmp_path, lambda data: four_providers(data, heal_timeout_s=least - 1, **slow))
+    with pytest.raises(ConfigError, match=rf"heal_timeout_s.*at least {least}\b"):
+        load_faults(platform, load_platform(platform, require_secrets=False))
+    platform = write_platform(tmp_path, lambda data: four_providers(data, heal_timeout_s=least, **slow))
+    assert load_faults(platform, load_platform(platform, require_secrets=False)).heal_container_fallback is False
+
+
+def test_o35_link_then_container_with_the_container_fallback_off_is_refused(tmp_path):
+    """O35: a mode of container restarts declared to make none is a contradiction, refused at load naming the key."""
+    platform = write_platform(
+        tmp_path, lambda data: four_providers(data, heal="link_then_container", heal_container_fallback=False)
+    )
+    with pytest.raises(ConfigError, match="heal_container_fallback"):
+        load_faults(platform, load_platform(platform, require_secrets=False))
+
+
+FIVE = ("alpha", "beta", "gamma", "delta", "epsilon")
+FIVE_STORES = {name: f"store-{name}" for name in FIVE}
+FIVE_LABEL = {FIVE_STORES[name]: f"providers[{index}]" for index, name in enumerate(FIVE)}
+
+
+class FiveServices(FakeServices):
+    """Five providers' services: one stale pair (providers[3] reading providers[0]), mended by its reader's own link
+    restart; every step any service sees is recorded, by the provider's label."""
+
+    def __init__(self):
+        super().__init__(tuple(FIVE_STORES.values()))
+        self.stuck = {("providers[3]", "providers[0]")}
+        self.seen: list[tuple[str, str]] = []
+
+    def stop(self, service):
+        self.seen.append(("stop", FIVE_LABEL[service]))
+        super().stop(service)
+
+    def start(self, service):
+        self.seen.append(("start", FIVE_LABEL[service]))
+        super().start(service)
+
+    def link_matrix(self, service):
+        labels = list(FIVE_LABEL.values())
+        pairs = tuple(
+            PairState(r, s, (r, s) not in self.stuck, 0.1, (r, s) in self.stuck)
+            for r in labels
+            for s in labels
+            if r != s
+        )
+        return LinkMatrix(not self.stuck, "stuck" if self.stuck else "every pair passed", pairs)
+
+    def active_transfers(self):
+        return 0
+
+    def ping(self, service):
+        self.seen.append(("ping", FIVE_LABEL[service]))
+        return True
+
+    def restart_link(self, service):
+        label = FIVE_LABEL[service]
+        self.seen.append(("restart_link", label))
+        self.stuck = {pair for pair in self.stuck if pair[0] != label}
+        return "ok"
+
+
+def five_providers(data, **faults):
+    for name, index in (("gamma", 3), ("delta", 4), ("epsilon", 5)):
+        data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
+    data["faults"] = faults_table(
+        **{"services": dict(FIVE_STORES), "command_timeout_s": 10, "heal_settle_s": 30, **faults}
+    )
+
+
+@pytest.mark.parametrize("heal", ["off", "all_links"])
+def test_o35_a_listed_service_is_never_an_injection_target_and_the_heal_only_pings_and_restarts_its_link(
+    tmp_path, heal
+):
+    """O35 (and #263): `[faults.services]` lists five providers so that the heal can reach them; only the target the
+    condition declares is ever injected. The injector stops and journals that one alone, and the heal, links only
+    (`heal_container_fallback = false`), touches every other provider by `ping` and `restart_link` and nothing else."""
+    platform = write_platform(tmp_path, lambda data: five_providers(data, heal=heal, heal_container_fallback=False))
+    services = FiveServices()
+    clock = FakeClock()
+    injector_ = injector_for(platform, services, target="providers[1]", clock=clock)
+    injector_.start(RUN)
+    injector_.clear()
+    injected = [line for line in journal_lines(tmp_path) if line["event"] == "injecting"]
+    assert [line["target"] for line in injected] == ["providers[1]"]
+    assert [step for step in services.seen if step[0] in ("stop", "start")] == [
+        ("stop", "providers[1]"),
+        ("start", "providers[1]"),
+    ]
+    others = [step for step in services.seen if step[1] != "providers[1]"]
+    assert {verb for verb, _ in others} <= {"ping", "restart_link"}
+    if heal == "all_links":
+        assert sorted(label for verb, label in others if verb == "restart_link") == [
+            "providers[0]",
+            "providers[2]",
+            "providers[3]",
+            "providers[4]",
+        ]
+        assert injector_.snapshot()["restore_verified"] is True
+    else:
+        assert others == []
+
+
+def test_o35_a_settle_one_recovery_held_holds_every_other_recoverys_reads(tmp_path):
+    """O35: a heal holds each restart's settle in the journal on the wall clock, so another recovery (the health
+    check's, or the next process's after this one died mid-settle) reads no gate and checks no pair before it ends."""
+    injector_, services = injector(tmp_path, stale(), heal="link")
+    injector_.start(RUN)
+    platform = tmp_path / "platform.toml"
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    clock = FakeClock()
+    holding = Recovery(settings, services, clock=clock, sleep=clock.sleep, labels=SERVICE, wall=clock)
+    (entry,) = holding.entries()
+    holding.hold(30, entry["id"])
+    other = Recovery(settings, services, clock=clock, sleep=clock.sleep, labels=SERVICE, wall=clock)
+    began = clock.now
+    other._gate(SERVICE[RESTORED], None)
+    assert clock.now >= began + 30
+    (reread,) = other.entries()
+    assert reread["settle_until"] == began + 30
