@@ -62,10 +62,19 @@ def sandbox_table(
     local: str,
     local_address: str,
     extra_args: Sequence[str] = (),
+    io_mode: str = "proxy",
+    storages: Mapping[str, str] | None = None,
+    direct_check_file: str | None = None,
 ) -> dict[str, Any]:
     """The `[sandbox]` table of one mount level on the federation: `images` maps agent and oneclient to (name, id), and
-    `extra_args` are further oneclient arguments (`[sandbox.mount] extra_args`, which refuses a TLS flag)."""
-    mount: dict[str, Any] = {"path": MOUNT_PATH, "io_mode": "proxy"}  # the providers' storage is not the sidecar's
+    `extra_args` are further oneclient arguments (`[sandbox.mount] extra_args`, which refuses a TLS flag). The mount
+    reads through the provider unless `io_mode` is `"direct"`, which takes `storages` (storage id -> the host directory
+    that holds it) and `direct_check_file` (`<space>/<path>`, a file the local provider holds in full; O40)."""
+    mount: dict[str, Any] = {"path": MOUNT_PATH, "io_mode": io_mode}
+    if storages is not None:
+        mount["storages"] = dict(storages)
+    if direct_check_file is not None:
+        mount["direct_check_file"] = direct_check_file
     if extra_args:
         mount["extra_args"] = list(extra_args)
     return {

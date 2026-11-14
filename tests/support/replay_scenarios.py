@@ -6,7 +6,7 @@ from collections.abc import Callable
 from loop_support import ClockSleep, FakeClock, FakeProvider, ScriptedBackend, call, malformed, never, turn
 from record_support import record_run
 
-from expcore.errors import ContextOverflow, InfraError, RequestAbandoned
+from expcore.errors import CallTimedOut, ContextOverflow, InfraError, RequestAbandoned
 from expcore.models.adapters import ModelTurn, StubAdapter, ToolCall
 from expcore.plugin import ToolOutput
 from expcore.records.record import RunRecord
@@ -154,6 +154,18 @@ def _tool_cut() -> RunRecord:
         await asyncio.Event().wait()
 
     return record_run([[("echo", {})], "never"], {"echo": stalls}, clock=clock, sleep=ClockSleep(clock))
+
+
+def _tool_expiry_cut() -> RunRecord:
+    """A tool provider's own expiry at the bound it was handed (the agent's time left) arrives before the loop's cut:
+    the loop judges it as the cut it stands for (L16)."""
+    clock = FakeClock()
+
+    async def expires(_args):
+        clock.advance(400)
+        raise CallTimedOut("echo", 400)
+
+    return record_run([[("echo", {})], "never"], {"echo": expires}, clock=clock, sleep=ClockSleep(clock))
 
 
 def _model_cut() -> RunRecord:
@@ -324,6 +336,7 @@ SCENARIOS: dict[str, tuple[Callable[[], RunRecord], str]] = {
     "tool_crash": (_tool_crash, "harness_defect"),
     "abandoned_worker": (_abandoned_worker, "finished"),
     "tool_cut": (_tool_cut, "time_cap"),
+    "tool_expiry_cut": (_tool_expiry_cut, "time_cap"),
     "ceiling_cut": (_ceiling_cut, "infrastructure"),
     "cleanup_in_time": (_cleanup_in_time, "time_cap"),
     "cleanup_timeout": (_cleanup_timeout, "time_cap"),

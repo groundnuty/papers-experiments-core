@@ -180,10 +180,10 @@ def test_o36_a_declared_io_mode_is_read_as_declared(tmp_path):
     assert load(tmp_path, edit).mount.io_mode == "proxy"
 
 
-def test_o36_direct_io_is_refused_at_load_until_the_storage_is_mapped_into_the_sidecar(tmp_path):
-    """O36: `io_mode = "direct"` reads the providers' storage itself, and the sidecar never gets that storage, so a
-    mount that loaded would start and then could not read: the load refuses it, naming the key, the reason and the
-    issue that lifts it. The command's code for `direct` stays (test_containers)."""
+def test_o36_o40_direct_io_without_its_storage_mapping_is_refused_at_load(tmp_path):
+    """O36, O40: `io_mode = "direct"` reads the local provider's storage itself, so a mount without the storage
+    mapped into the sidecar would start and then could not read: the load refuses it, naming the key, what it needs
+    and the mode that needs neither. With the mapping it loads (test_settings_direct)."""
 
     def edit(data):
         data["sandbox"]["mount"]["io_mode"] = "direct"
@@ -191,10 +191,8 @@ def test_o36_direct_io_is_refused_at_load_until_the_storage_is_mapped_into_the_s
     with pytest.raises(ConfigError, match="io_mode") as caught:
         load(tmp_path, edit)
     message = str(caught.value)
-    assert "not supported yet" in message
-    assert "storage" in message
-    assert "mapped into the sidecar" in message
-    assert "#223" in message
+    assert "[sandbox.mount.storages]" in message
+    assert "direct_check_file" in message
     assert '"proxy"' in message
 
 
@@ -441,13 +439,17 @@ def test_o21_a_campaign_does_not_resume_after_a_level_changed_its_listing_mode(t
 
 
 def mount_fingerprint(tmp_path, mode):
-    """The platform's half of the fingerprint with the mount declared as `mode`: loaded as `proxy`, then the mode set in
-    the settings, since the loader refuses `direct` until the storage mapping exists (#223)."""
-    import dataclasses
+    """The platform's half of the fingerprint with the mount declared as `mode`, a direct one with an invented storage
+    mapping and check file (O40)."""
 
-    config = load_platform(write_platform(tmp_path, add_sandbox), require_secrets=False)
-    mount = dataclasses.replace(config.sandbox.mount, io_mode=mode)
-    return dataclasses.replace(config, sandbox=dataclasses.replace(config.sandbox, mount=mount)).fingerprint()
+    def edit(data):
+        add_sandbox(data)
+        if mode == "direct":
+            data["sandbox"]["mount"].update(
+                io_mode="direct", storages={"0a1b2c": "/srv/invented"}, direct_check_file="space-x/f"
+            )
+
+    return load_platform(write_platform(tmp_path, edit), require_secrets=False).fingerprint()
 
 
 def resume_with(path, fingerprint):
