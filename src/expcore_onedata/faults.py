@@ -171,7 +171,8 @@ a heal is declared and the federation is held exclusively for it:
 A study that declares the long margin, `[tokens] margin_s` of at least `fault_settings.heal_token_margin_s` (900 s
 plus two heals of `heal_timeout_s`, 9,300 s with the default), heals as before whatever still runs; a heal that is off
 asks nothing. Steps that no launch counts (a tool server or sandbox of the study's own) are not seen: such a study
-stops them before `running`'s exit, or declares the long margin.
+stops them before `running`'s exit, or declares the long margin. The day-0 outage check reads through its sandbox and
+tool server after its restore, so with a heal declared it needs the long margin (`day0/outage.py`).
 
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
 so on cancellation it waits for it (shielded, bounded), clears however the block ends and raises the cancellation again.
