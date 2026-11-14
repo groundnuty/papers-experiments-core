@@ -72,7 +72,7 @@ def test_o35_every_ordered_pair_is_checked_through_its_reader_with_a_probe_of_it
     report = run(config, client, ticker)
     assert report.ok, report.detail
     labels = {name: f"providers[{index}]" for index, name in enumerate(PROVIDERS)}
-    assert [(p.local, p.source) for p in report.pairs] == [(labels[r], labels[s]) for r, s in ORDERED]
+    assert [(p.reader, p.source) for p in report.pairs] == [(labels[r], labels[s]) for r, s in ORDERED]
     size = config.link_check.probe_bytes
     probes = []
     for reader, source in ORDERED:
@@ -122,8 +122,8 @@ def test_o35_a_stuck_link_between_providers_other_than_the_local_one_fails_the_c
     report = run(config, client, ticker)
     assert not report.ok
     failed = [p for p in report.pairs if not p.ok]
-    assert [(p.local, p.source) for p in failed] == [
-        (pair_of(report, reader, source).local, pair_of(report, reader, source).source)
+    assert [(p.reader, p.source) for p in failed] == [
+        (pair_of(report, reader, source).reader, pair_of(report, reader, source).source)
     ]
     labels = list(PROVIDERS)
     stuck = failed[0]
@@ -134,6 +134,29 @@ def test_o35_a_stuck_link_between_providers_other_than_the_local_one_fails_the_c
     assert f"restart the rtransfer link on providers[{labels.index(reader)}]" in stuck.remedy
     assert all(p.ok for p in report.pairs if p is not stuck)
     assert all(p.evicted is None for p in report.pairs)
+
+
+def test_o35_a_pair_names_its_reader_and_local_stays_as_the_deprecated_alias(fake, config, client, ticker):
+    """O35: since #254 a pair's `local` is the provider that reads it, whichever that is, and a study read it as the
+    platform's local provider. The pair records `reader` (the same value), and `local` stays for the records written
+    before: in the object and in the record, for a pair read through gamma, which is not the local provider. The
+    failure names the reader in its message and its remedy, and the passing detail names it too."""
+    assert run(config, client, ticker).ok
+    stick(fake, ticker, "gamma", "alpha")
+    report = run(config, client, ticker)
+    stuck = pair_of(report, "gamma", "alpha")
+    assert (stuck.reader, stuck.local, stuck.source) == ("providers[2]", "providers[2]", "providers[0]")
+    record = stuck.to_json()
+    assert (record["reader"], record["local"], record["source"]) == ("providers[2]", "providers[2]", "providers[0]")
+    assert all(entry["reader"] == entry["local"] for entry in report.to_json()["pairs"])
+    assert stuck.reason.startswith(f"no transfer from providers[0] to providers[2] within {BOUND_S:g} s")
+    assert stuck.remedy == linkcheck.REMEDY.format(reader="providers[2]")
+    assert stuck.remedy.count("providers[2]") == 2  # the link's, and the container's
+    assert "providers[0]" not in stuck.remedy  # the source, which is the platform's local provider, is not restarted
+    fake.links.clear()
+    ok = run(config, client, ticker)
+    assert ok.ok
+    assert "providers[0]->providers[2]" in ok.detail  # source->reader
 
 
 def test_o35_a_stuck_link_is_found_when_another_reader_fetched_the_same_source_first(fake, config, client, ticker):
