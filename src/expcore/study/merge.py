@@ -35,6 +35,7 @@ from expcore.study.pipeline import (
     import_what_the_records_need,
     study_environment,
 )
+from expcore.study.selection_start import pricing_of
 
 _SHOWN_FAILURES = 3
 
@@ -75,8 +76,9 @@ def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: b
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir()
     try:
-        facts = [read_shard(path, stage / f"read-{n}.sqlite") for n, path in enumerate(shard_outs)]
-        shards = check_shards(facts, study.manifest)
+        pricing = pricing_of(study)  # what a selection's spend is counted with (C35); a shard's is not read
+        facts = [read_shard(path, stage / f"read-{n}.sqlite", pricing) for n, path in enumerate(shard_outs)]
+        shards = check_shards(facts, study.manifest, pricing)
         for shard in shards:
             _replay(study, shard, code, env)
         lay_out(stage, shards)

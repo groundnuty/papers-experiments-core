@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.manifest import fingerprint_sha256
+from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec, describe, resume_hint
 from expcore.campaign.shard import (
     META_ENVIRONMENT,
     META_SHARD,
@@ -70,7 +71,7 @@ class ShardMismatch(ResumeRefused):
 class ShardStart:
     """A shard's start: its spec, the environment identity it reads, checked, and the shares of the caps and budget."""
 
-    spec: ShardSpec
+    spec: Spec  # a shard's, or a selection's (C35)
     environment: Mapping[str, str]
     shares: Mapping[str, Any]  # {"unit_caps": {unit: n}, "budget": {"max_usd": x, "per_model_usd": {...}} or None}
 
@@ -158,7 +159,7 @@ def refuse_unrunnable(
         )
 
 
-def environment_block(spec: ShardSpec, environment: Mapping[str, Any]) -> str:
+def environment_block(spec: Spec, environment: Mapping[str, Any]) -> str:
     """The environment part of the campaign fingerprint, as one block of text a shard prints as it starts.
 
     The first line gives the whole environment's SHA-256 (the digest `fingerprint_sha256` makes of the section, which
@@ -170,10 +171,14 @@ def environment_block(spec: ShardSpec, environment: Mapping[str, Any]) -> str:
     """
     versions = environment["distributions"]
     sources = environment.get("sources", {})
+    if isinstance(spec, SelectionSpec):
+        what, every = spec.name, "selection"
+    else:
+        what, every = f"shard {spec.index} of {spec.count}", "shard"
     lines = [
-        f"run: shard {spec.index} of {spec.count}: environment sha256 {fingerprint_sha256(environment)}, "
+        f"run: {what}: environment sha256 {fingerprint_sha256(environment)}, "
         f"python {environment['python']}, {len(versions)} distributions "
-        "(every shard of the campaign must print this same digest)"
+        f"(every {every} of the campaign must print this same digest)"
     ]
     for name in sorted(versions):
         if len(versions) <= LIST_LIMIT:
@@ -195,6 +200,11 @@ def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -
     if shard is None:
         if META_SHARD in held:
             recorded = json.loads(held[META_SHARD])
+            if recorded.get("rule") == RULE_SELECTION:
+                raise ShardMismatch(
+                    f"this store belongs to {describe(recorded)} of a campaign run in selections, and this start "
+                    f"gives no selection: resume it with {resume_hint(recorded)}"
+                )
             raise ShardMismatch(
                 f"this store belongs to shard {recorded['index']} of {recorded['count']} ({recorded['label']!r}) of a "
                 f"sharded campaign, and this start gives no shard: resume it with --shard "
@@ -222,7 +232,11 @@ def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -
         return
     first = next(iter(refused))
     lines = "\n  ".join(line for found in refused.values() for line in found)
-    raise ShardMismatch(f"{_REASONS[first].format(**recorded_spec)}:\n  {lines}")
+    if RULE_SELECTION in (recorded_spec.get("rule"), shard.spec.rule):
+        reason = _SELECTION_REASONS[first].format(what=describe(recorded_spec))
+    else:
+        reason = _REASONS[first].format(**recorded_spec)
+    raise ShardMismatch(f"{reason}:\n  {lines}")
 
 
 def _wide_flag(recorded: Mapping[str, Any]) -> str:
@@ -246,10 +260,30 @@ _REASONS = {
 }
 
 
+_SELECTION_REASONS = {
+    META_SHARD: (
+        "this store started as {what}, and this start gives another selection, label, mode or rule: a selection "
+        "resumes only as itself (C35)"
+    ),
+    META_ENVIRONMENT: (
+        "the environment identity of {what} changed since its first start: it would no longer have run against what "
+        "its first runs did"
+    ),
+    META_SHARES: (
+        "the shares of the caps and the budget of {what} changed since its first start, or the earlier selections it "
+        "ran after (--after) or what they spent: they are fixed when it starts, so that the selections' shares never "
+        "sum past the totals"
+    ),
+}
+
+
 def _spec_differences(recorded: Mapping[str, Any], now: Mapping[str, Any]) -> list[str]:
+    names = ("rule", "index", "count", "label")
+    if RULE_SELECTION in (recorded.get("rule"), now.get("rule")):
+        names = tuple(sorted(set(recorded) | set(now)))
     return [
         f"{name}: recorded {recorded.get(name)!r}, now {now.get(name)!r}"
-        for name in ("rule", "index", "count", "label")
+        for name in names
         if recorded.get(name) != now.get(name)
     ]
 
