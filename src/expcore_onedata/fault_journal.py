@@ -38,7 +38,9 @@ never shows down is `stop_unsettled` after the first, and `never_down` after the
 whole bound showed it running with its identity. Beside the journal,
 whoever holds the federation exclusively keeps a holder record (`federation.holder`, written whole and fsynced by
 `write_holder`; `expcore_onedata.admission`): its pid and boot id, its purpose, the target's label and the time it took
-the lock.
+the lock. A tool outside a campaign that holds the federation shared records who it is in `shared-holds.jsonl` beside
+the journal (`expcore_onedata.shared_holds`), through `append_to`, under the same journal-wide lock; the journal itself
+keeps to injection events.
 """
 
 import contextlib
@@ -155,6 +157,25 @@ def make_directories(directory: Path) -> None:
         _fsync_directory(made.parent)
 
 
+def _cut_tail(path: Path) -> None:
+    """Cut off the last line of a file a crash left without its newline, and make the cut durable."""
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return
+    if size == 0:
+        return
+    with open(path, "r+b") as handle:
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return
+        handle.seek(0)
+        keep = handle.read().rfind(b"\n") + 1
+        handle.truncate(keep)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 class InjectionJournal:
     """Append-only record of every injection and its clear: the target's label, its service, its identity's digest and
     its holder.
@@ -185,31 +206,39 @@ class InjectionJournal:
         make_directories(self.directory)
         with self._section():
             self._cut_incomplete_line()
-            new_file = not self.path.exists()
-            with open(self.path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(dict(line), sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            if new_file:
-                _fsync_directory(self.directory)
+            self._write_line(self.path, line)
+
+    def append_to(self, name: str, line: Mapping[str, Any]) -> None:
+        """`append` to a record file of its own beside the journal (`name`), under the same journal-wide lock."""
+        make_directories(self.directory)
+        path = self.directory / name
+        with self._section():
+            _cut_tail(path)
+            self._write_line(path, line)
+
+    def _write_line(self, path: Path, line: Mapping[str, Any]) -> None:
+        """Under the section: append one line to `path`, fsynced, and the directory too when the line made the file."""
+        new_file = not path.exists()
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(line), sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if new_file:
+            _fsync_directory(self.directory)
+
+    def complete_text(self, name: str = JOURNAL) -> str:
+        """The complete lines of a file beside the journal, read under the journal-wide lock: an incomplete final line
+        is left out, and a missing file has none."""
+        path = self.directory / name
+        if not path.exists():
+            return ""
+        with self._section(fcntl.LOCK_SH):
+            data = path.read_bytes()
+        return data[: data.rfind(b"\n") + 1].decode("utf-8")
 
     def _cut_incomplete_line(self) -> None:
         """Cut off a last line a crash left without its newline, and make the cut durable."""
-        try:
-            size = self.path.stat().st_size
-        except FileNotFoundError:
-            return
-        if size == 0:
-            return
-        with open(self.path, "r+b") as handle:
-            handle.seek(-1, os.SEEK_END)
-            if handle.read(1) == b"\n":
-                return
-            handle.seek(0)
-            keep = handle.read().rfind(b"\n") + 1
-            handle.truncate(keep)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _cut_tail(self.path)
 
     def open_entries(self) -> list[dict[str, Any]]:
         """Return the open injections, each with `injected` set when it was seen down, `stop_unknown` when the stop was
@@ -217,11 +246,7 @@ class InjectionJournal:
         `stop_unrecorded` when no line says the stop was asked for and the target was not seen down either; raise
         ValueError when a complete line is not an injection event. Only an incomplete final line is ignored: it was
         never acted on."""
-        if not self.path.exists():
-            return []
-        with self._section(fcntl.LOCK_SH):
-            data = self.path.read_bytes()
-        complete = data[: data.rfind(b"\n") + 1].decode("utf-8")
+        complete = self.complete_text()
         entries: dict[str, dict[str, Any]] = {}
         for number, text in enumerate(complete.splitlines(), 1):
             try:
