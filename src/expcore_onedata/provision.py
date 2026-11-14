@@ -998,10 +998,12 @@ class Provisioner:
         A replication that ended short is scheduled again (the target's copy of the source's map can lag,
         `REPLICATION_ATTEMPTS`): while the target's own block map does not cover the file `REPLICATION_CHECK_S` after
         a job ended, another is scheduled after the next of `REPLICATION_RETRY_PAUSES_S`, at most `REPLICATION_ATTEMPTS`
-        in all, and the last is waited on for what is left of `settle_timeout_s`, counted from the first job's end,
-        which bounds the checks, the pauses and every later job's wait; then `NotPlaced` refuses it. Every job's id is
-        in the change log and in the record, with the tries (`tries`) and the seconds from the first job's end until the
-        map covered the file (`converged_s`)."""
+        in all. One deadline, the first job's end plus `settle_timeout_s`, bounds every step after it: a later job's
+        wait is cut to what is left (a job still running there is `WaitTimeout`, as any job that outlives its wait),
+        each check too, the last waits out what is left, and no job is scheduled once a check and its pause leave no
+        time; then `NotPlaced` refuses it. As in every bounded poll of the layer, a read begun before the deadline may
+        end after it. Every job's id is in the change log and in the record, with the tries (`tries`) and the seconds
+        from the first job's end until the map covered the file (`converged_s`)."""
         self._verified()
         if size < 1:
             raise ProvisionError(f"{self._where}an empty file has nothing to place")
@@ -1009,16 +1011,18 @@ class Provisioner:
         began, settings = self._clock(), self._settings
         ids: list[str] = []
         states: dict[str, int] = {}
-        first_end: float | None = None
+        first_end, deadline = began, None  # the first job's end, and it plus the settle bound
         for attempt in range(1, REPLICATION_ATTEMPTS + 1):
-            left = None if first_end is None else first_end + settings.settle_timeout_s - self._clock()
             ids.append(self.schedule_transfer("replication", file_id, to_provider))
+            wait_s = settings.transfer_timeout_s  # the first job's, then what is left once this one is scheduled
+            if deadline is not None:
+                wait_s = max(min(wait_s, deadline - self._clock()), 0.0)
             done = consistency.require_ended(
                 consistency.wait_transfers(
                     self._client,
                     to_provider,
                     [ids[-1]],
-                    timeout_s=settings.transfer_timeout_s if left is None else min(settings.transfer_timeout_s, left),
+                    timeout_s=wait_s,
                     poll_s=settings.poll_s,
                     clock=self._clock,
                     sleep=self._sleep,
@@ -1028,14 +1032,14 @@ class Provisioner:
             )
             for state, count in done.states().items():
                 states[state] = states.get(state, 0) + count
-            first_end = self._clock() if first_end is None else first_end
-            left = first_end + settings.settle_timeout_s - self._clock()
+            if deadline is None:
+                first_end = self._clock()
+                deadline = first_end + settings.settle_timeout_s
+            left = max(deadline - self._clock(), 0.0)
             pause = REPLICATION_RETRY_PAUSES_S[attempt - 1] if attempt < REPLICATION_ATTEMPTS else 0.0
             last = attempt == REPLICATION_ATTEMPTS or left <= REPLICATION_CHECK_S + pause  # no room for another try
-            confirmation = self.confirm_placed(
-                to_provider, wanted, timeout_s=max(left, 0.0) if last else REPLICATION_CHECK_S
-            )
-            if confirmation.placed or last:
+            confirmation = self.confirm_placed(to_provider, wanted, timeout_s=left if last else REPLICATION_CHECK_S)
+            if confirmation.placed or last or deadline - self._clock() <= pause:  # placed, or no time for another try
                 break
             self._sleep(pause)  # completed, and the target's own map is short: its copy may lag; schedule it again
         if not confirmation.placed:

@@ -26,8 +26,9 @@ records); `file:line` in that repository's own tree.
 | A file location is a synced document: another provider's reaches the target through dbsync | `src/modules/datastore/models/file/location/file_location.erl:51` (`sync_enabled => true`) |
 | dbsync's timers: changes are broadcast every 5 s, and a receiver that sees a gap in the sequence asks again after 15 s | `src/modules/dbsync/dbsync_worker.erl:237-239`, `src/modules/dbsync/dbsync_in_stream_worker.erl:445-452` |
 
-**[inference]** On a quiet space the copy lags by up to about 8 s, and by 15 s more when a batch must be asked for
-again; that sum was built from the timers above, not measured.
+**[inference]** On a quiet space the copy lags by up to the 5 s broadcast interval plus the time to send and apply a
+batch, and by 15 s more when a batch must be asked for again. An earlier reading of dbsync's timers, which are not all
+cited here, put the quiet case at about 8 s. Neither figure was measured.
 
 ## Seen live
 
@@ -57,4 +58,5 @@ the prefix alone.
 before (O01). While that map is short after a job ended, it schedules the replication again after a pause of 5 s, then
 10 s, then 15 s, five times at most, all within `settle_timeout_s` from the first job's end. Every job's id is in the
 change log and in the record (`tries`, `transfer_ids`, `converged_s`). A map that never covers the file is refused as
-`NotPlaced`, as before. Each try leaves an ended transfer record, which never expires.
+`NotPlaced`, as before. Each try leaves a transfer record. Once ended, a record never expires. A try still running at
+the deadline is refused as `WaitTimeout`, and it may still change the replica.

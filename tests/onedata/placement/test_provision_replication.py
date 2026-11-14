@@ -3,9 +3,18 @@ providers' block maps, which dbsync brings late, so a replication scheduled righ
 copy showed and still report completed. The provisioner judges by the target's own block map and tries again, bounded
 by the settle bound, recording every try (op-worker f118ed9; `2026-11-14-federation-facts-replication-lag.md`)."""
 
+import dataclasses
+
 import pytest
 
-from expcore_onedata.provision import REPLICATION_ATTEMPTS, REPLICATION_RETRY_PAUSES_S, NotPlaced
+from expcore_onedata import consistency
+from expcore_onedata.provision import (
+    REPLICATION_ATTEMPTS,
+    REPLICATION_RETRY_PAUSES_S,
+    NotPlaced,
+    Provisioner,
+    resolve_provider_ids,
+)
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, SETTINGS, write_with_placement
 
 CHUNK = SETTINGS["chunk_bytes"]
@@ -82,6 +91,42 @@ def test_o01_a_replication_whose_target_never_catches_up_fails_closed_after_its_
     assert ticker.now - began <= SETTLE_S + 2 * SETTINGS["poll_s"]
     logged = [tid for provider, tid, kind in provisioner.transfers() if kind == "replication" and provider == "beta"]
     assert logged == [tid for tid, _ in jobs]
+
+
+def test_o01_a_try_still_running_at_the_deadline_fails_as_a_wait_timeout_within_the_settle_bound(
+    fake, provisioner, client, config, placement, ticker, tmp_path, monkeypatch
+):
+    """O01: with a settle bound of 20 s, the first try copies nothing and the second takes 3 s to schedule and never
+    ends. Its wait is cut to what is left of the bound once it is scheduled, counted from the first try's end, so the
+    replication fails as `WaitTimeout`, a job that may still change the replica, by the deadline; it never passes, and
+    both ids are in the change log."""
+    file_id = completed_late(fake, provisioner, ticker, tmp_path, lag_s=10.0**6)
+    settings = dataclasses.replace(placement.settings, settle_timeout_s=20.0)
+    short = Provisioner(
+        client,
+        config,
+        settings,
+        provider_ids=resolve_provider_ids(config),
+        log=tmp_path / "short.jsonl",
+        clock=ticker.clock,
+        sleep=ticker.sleep,
+    )
+    schedule = short.schedule_transfer
+
+    def slow_second(kind, target_id, provider):
+        if len(short.transfers()) == 1:  # the second try: slow to schedule, and never ends
+            ticker.sleep(3.0)
+            fake.transfer_flip_after = 10**6
+        return schedule(kind, target_id, provider)
+
+    monkeypatch.setattr(short, "schedule_transfer", slow_second)
+    began = ticker.now
+    with pytest.raises(consistency.WaitTimeout, match="had not ended"):
+        short.replicate_file(file_id, FINAL, "beta")
+    first_end = began + SETTINGS["poll_s"]  # the first try's record is read twice, a poll apart
+    assert ticker.now <= first_end + 20.0 + SETTINGS["poll_s"]
+    assert len(short.transfers()) == 2
+    assert fake.held(TARGET, BETA_ID) == []
 
 
 def test_o01_a_replication_that_places_the_file_at_once_is_scheduled_once(fake, provisioner, ticker, tmp_path):
