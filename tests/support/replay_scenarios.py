@@ -168,6 +168,68 @@ def _tool_expiry_cut() -> RunRecord:
     return record_run([[("echo", {})], "never"], {"echo": expires}, clock=clock, sleep=ClockSleep(clock))
 
 
+def _hangs_until_its_bound(clock: FakeClock, provider: FakeProvider):
+    """A handler for a provider that honours the `timeout_s` it is handed: it hangs until that bound passes on the fake
+    clock and raises the expiry of that bound (L16, L17)."""
+
+    async def expires(_args):
+        handed = provider.calls[-1][2]
+        clock.advance(handed)
+        raise CallTimedOut("echo", handed)
+
+    return expires
+
+
+def _tool_bound_expiry() -> RunRecord:
+    """A tool server hangs past the study's declared per-call bound, with the agent's time and the ceiling far off: the
+    call fails as `knowledge` infrastructure, and the record is the run's, set aside (L17)."""
+    clock, provider = FakeClock(), FakeProvider({"echo": None})
+    provider.handlers["echo"] = _hangs_until_its_bound(clock, provider)
+    return record_run(
+        [[("echo", {"x": "1"}), ("echo", {"x": "2"})], "never"],
+        {},
+        providers=[provider],
+        clock=clock,
+        sleep=ClockSleep(clock),
+        tool_call_bound_s=60,
+    )
+
+
+def _tool_bound_past_the_time_left() -> RunRecord:
+    """The declared bound is longer than the agent's time left, so the call is handed the time left, and the expiry at
+    it is the loop's own cut, a time cap: the shorter of the two wins (L17)."""
+    clock, provider = FakeClock(), FakeProvider({"echo": None})
+    provider.handlers["echo"] = _hangs_until_its_bound(clock, provider)
+    return record_run(
+        [[("echo", {"x": "1"})], "never"],
+        {},
+        providers=[provider],
+        clock=clock,
+        sleep=ClockSleep(clock),
+        tool_call_bound_s=500,
+    )
+
+
+def _tool_bound_cut() -> RunRecord:
+    """The declared per-call bound passed, and the loop's cut at the agent's time left arrived a moment later, while the
+    call was still holding on: the loop judges the cut by the bound that passed first, as `knowledge` infrastructure
+    (L17)."""
+    clock = FakeClock()
+
+    async def holds(_args):
+        clock.advance(61)
+        await asyncio.Event().wait()
+
+    return record_run(
+        [[("echo", {"x": "1"})], "never"],
+        {"echo": holds},
+        clock=clock,
+        sleep=ClockSleep(clock),
+        time_cap_s=61,
+        tool_call_bound_s=60,
+    )
+
+
 def _model_cut() -> RunRecord:
     clock = FakeClock()
     return record_run([], HANDLERS, backend=Hangs([], clock, 400), clock=clock, sleep=ClockSleep(clock))
@@ -337,6 +399,9 @@ SCENARIOS: dict[str, tuple[Callable[[], RunRecord], str]] = {
     "abandoned_worker": (_abandoned_worker, "finished"),
     "tool_cut": (_tool_cut, "time_cap"),
     "tool_expiry_cut": (_tool_expiry_cut, "time_cap"),
+    "tool_bound_expiry": (_tool_bound_expiry, "infrastructure"),
+    "tool_bound_past_the_time_left": (_tool_bound_past_the_time_left, "time_cap"),
+    "tool_bound_cut": (_tool_bound_cut, "infrastructure"),
     "ceiling_cut": (_ceiling_cut, "infrastructure"),
     "cleanup_in_time": (_cleanup_in_time, "time_cap"),
     "cleanup_timeout": (_cleanup_timeout, "time_cap"),

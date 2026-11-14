@@ -151,3 +151,35 @@ def test_a_missing_file_and_bad_toml_name_the_file(tmp_path):
     with pytest.raises(ConfigError, match="file not found"):
         load_campaign(tmp_path / "campaign.toml")
     refused(tmp_path, "order_seed = ", "not valid TOML")
+
+
+def test_l17_tool_call_bound_s_is_optional_and_enters_the_caps_only_when_declared(tmp_path):
+    """L17: `[agent] tool_call_bound_s` is read as seconds (an integer may stand for a float). Undeclared, the loop's
+    caps in the fingerprint are what they were before the key existed; declared, they differ, so a store started
+    without it cannot be resumed with it."""
+    plain = load(tmp_path)
+    assert plain.agent.tool_call_bound_s is None
+    assert "tool_call_bound_s" not in plain.caps()["agent"]
+    declared = load(
+        tmp_path, VALID.replace("max_output_tokens = 256", "max_output_tokens = 256\ntool_call_bound_s = 300")
+    )
+    assert declared.agent.tool_call_bound_s == 300.0
+    assert declared.caps()["agent"]["tool_call_bound_s"] == 300.0
+    assert declared.caps() != plain.caps()
+
+
+@pytest.mark.parametrize(
+    ("value", "fragments"),
+    [
+        ("0", ("[agent]", "tool_call_bound_s", "positive")),
+        ("-5", ("[agent]", "tool_call_bound_s", "positive")),
+        ("inf", ("[agent]", "tool_call_bound_s", "finite")),
+        ("nan", ("[agent]", "tool_call_bound_s", "finite")),
+        ('"300"', ("[agent]", "tool_call_bound_s", "must be a float")),
+        ("true", ("[agent]", "tool_call_bound_s", "must be a float")),
+    ],
+)
+def test_l17_a_tool_call_bound_that_cannot_work_is_refused_naming_the_table_and_the_key(tmp_path, value, fragments):
+    """L17: refused at load, naming the file, the table and the key."""
+    text = VALID.replace("max_output_tokens = 256", f"max_output_tokens = 256\ntool_call_bound_s = {value}")
+    refused(tmp_path, text, *fragments)
