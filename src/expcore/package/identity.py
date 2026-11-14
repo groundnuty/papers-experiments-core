@@ -252,7 +252,7 @@ def _anonymised_check(
 
 
 def _export_without_sources(text: bytes) -> bytes:
-    """The author's export as it reads once the snapshot's fingerprint has lost the environment's sources (C35): the
+    """The author's export as it reads once the snapshot's fingerprint has lost the environment's sources (C36): the
     export holds the fingerprint, which the anonymised snapshot holds without them, and the hash of it that changes with
     them. An export without the key (from before it, or of a store that records none) is as it is."""
     data = json.loads(text)

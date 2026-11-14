@@ -20,7 +20,7 @@ snapshot and this module joins the results:
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
 - `shards` is merge.json's list of shards, as it is;
-- `campaign_fingerprint` (C35) is the fingerprint every shard shares, once, where the shards have it: a merge refuses
+- `campaign_fingerprint` (C36) is the fingerprint every shard shares, once, where the shards have it: a merge refuses
   shards of different fingerprints, and a join of exports whose fingerprints differ, or of which only some carry one,
   is refused too. Its hash is the `fingerprint` merge.json names.
 
@@ -107,7 +107,7 @@ def join_exports(
 
 
 def _shared_fingerprint(parts: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-    """The campaign fingerprint every shard's export carries (C35): one, or the shards are of other campaigns. A merge
+    """The campaign fingerprint every shard's export carries (C36): one, or the shards are of other campaigns. A merge
     refuses such shards already (C29); a join that is handed exports of them refuses them too."""
     first = parts[0]
     for part in parts[1:]:

@@ -670,7 +670,7 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
 
 def _require_campaign(export: Mapping[str, Any], verified: VerifiedBatch) -> None:
     """Refuse an export that is not of the campaign the analysis read: its campaign fingerprint's hash must be that of
-    every snapshot, and, for a merged batch, the `fingerprint` merge.json names (C35). A snapshot that records no
+    every snapshot, and, for a merged batch, the `fingerprint` merge.json names (C36). A snapshot that records no
     fingerprint has nothing to compare with."""
     held = [stored_fingerprint_sha256(snapshot) for snapshot in verified.snapshots.values()]
     if verified.merge is not None:
@@ -767,7 +767,7 @@ def regenerate(
 def _export_difference(derived: Mapping[str, Any], held: bytes) -> str | None:
     """Say how a saved export that differs from the derived one differs in the campaign fingerprint, if it does: it is
     of another campaign (or its entry is not the hash of its fingerprint), or it records none (an export from before the
-    key, which is read as it was and only said so, C35). None when the fingerprint is not what differs."""
+    key, which is read as it was and only said so, C36). None when the fingerprint is not what differs."""
     try:
         saved = json.loads(held)
     except ValueError:

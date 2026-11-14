@@ -97,7 +97,7 @@ def record_files(root: Path) -> list[Path]:
 
 def without_sources(export: bytes) -> bytes:
     """An export as it reads once its campaign fingerprint has no source in its environment: the fingerprint and, with
-    it, the hash (C35). Written here from the form of the export, not with the code that builds the package."""
+    it, the hash (C36). Written here from the form of the export, not with the code that builds the package."""
     data = json.loads(export)
     entry = data[EXPORT_FINGERPRINT]
     del entry["fingerprint"]["environment"]["sources"]
@@ -105,10 +105,10 @@ def without_sources(export: bytes) -> bytes:
     return export_text(data).encode("utf-8")
 
 
-def test_c35_the_anonymised_export_holds_the_fingerprint_of_the_anonymised_snapshot_and_no_source(
+def test_c36_the_anonymised_export_holds_the_fingerprint_of_the_anonymised_snapshot_and_no_source(
     campaign, built, tmp_path
 ):
-    """C35: the author's export names the core's source in its fingerprint, as the author's snapshot does; the
+    """C36: the author's export names the core's source in its fingerprint, as the author's snapshot does; the
     package's export holds the fingerprint its own snapshot holds, without any source, and the hash of that, so it
     verifies against the snapshot it ships."""
     author = json.loads((campaign.root / "out" / "export.json").read_text(encoding="utf-8"))
@@ -165,7 +165,7 @@ def test_k11_the_anonymised_package_passes_its_own_check_byte_for_byte(campaign,
     for name in OUTPUT_FILES:
         original = (campaign.root / "out" / name).read_bytes()
         expected = original.replace(HEAD.encode(), pseudo.encode())
-        if name == "export.json":  # the author's, with the fingerprint the anonymised snapshot holds (C35)
+        if name == "export.json":  # the author's, with the fingerprint the anonymised snapshot holds (C36)
             expected = without_sources(expected)
         assert (root / "out" / name).read_bytes() == expected
     done = subprocess.run(

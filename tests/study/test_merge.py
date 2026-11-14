@@ -238,10 +238,10 @@ def test_c29_the_merged_export_tags_every_run_with_its_shard_and_lists_the_shard
     assert export["planned_runs"] == sum(shard["runs"] for shard in export["shards"])
 
 
-def test_c35_the_merged_export_carries_the_one_fingerprint_every_shard_records_and_merge_json_names(
+def test_c36_the_merged_export_carries_the_one_fingerprint_every_shard_records_and_merge_json_names(
     merged, shard1, shard2
 ):
-    """C35: the merged export's `campaign_fingerprint` is the fingerprint each shard's store holds, which is the one
+    """C36: the merged export's `campaign_fingerprint` is the fingerprint each shard's store holds, which is the one
     merge.json hashes, and the export verifies against merge.json's hash and each shard snapshot's."""
     export = read(merged, "export.json")
     merge = json.loads((merged.root / "out" / MERGE_FILE).read_text(encoding="utf-8"))
@@ -257,8 +257,8 @@ def test_c35_the_merged_export_carries_the_one_fingerprint_every_shard_records_a
     assert list(export)[-3:] == [EXPORT_FINGERPRINT, "shard_retries_by_kind", "shards"]
 
 
-def test_c35_a_merged_batchs_export_is_refused_against_the_hash_of_another_campaign(merged):
-    """C35: an analysis that reads the merged export with another campaign's hash is refused."""
+def test_c36_a_merged_batchs_export_is_refused_against_the_hash_of_another_campaign(merged):
+    """C36: an analysis that reads the merged export with another campaign's hash is refused."""
     with pytest.raises(ExportError, match="another campaign"):
         verify_export_fingerprint(read(merged, "export.json"), hashlib.sha256(b"another campaign").hexdigest())
 

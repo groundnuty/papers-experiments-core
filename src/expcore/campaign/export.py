@@ -60,7 +60,7 @@ A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campa
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
 export has no such key, and every byte of it is what it was before shards existed.
 
-**The campaign fingerprint (#243, C35).** An export of a store that records a campaign fingerprint has one more key,
+**The campaign fingerprint (#243, C36).** An export of a store that records a campaign fingerprint has one more key,
 `campaign_fingerprint` (`EXPORT_FINGERPRINT`), after every other and before `shard`: `{"sha256", "fingerprint"}`, the
 fingerprint exactly as the store keeps it (never one computed again) and the SHA-256 of its canonical JSON
 (`manifest.fingerprint_sha256`, the hash merge.json names for a merged batch). A report can then read a setting that
@@ -93,7 +93,7 @@ from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
 FORMAT = "campaign-export-1"
 EXPORT_FINGERPRINT = "campaign_fingerprint"
-"""The export's key for the campaign fingerprint and its hash (C35)."""
+"""The export's key for the campaign fingerprint and its hash (C36)."""
 NOT_RECORDED = "fingerprint not recorded"
 """What `verify_export_fingerprint` says of an export that carries no campaign fingerprint."""
 _FINGERPRINT_META = "fingerprint"  # the store's meta key (`campaign.resume.FINGERPRINT_KEY`)
@@ -229,7 +229,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
-    if fingerprint is not None:  # only a store that records one has the key (C35)
+    if fingerprint is not None:  # only a store that records one has the key (C36)
         data[EXPORT_FINGERPRINT] = fingerprint_entry(fingerprint)
     if shard is not None:
         data[EXPORT_KEY] = shard
@@ -286,7 +286,7 @@ def _checked_entry(entry: object) -> dict[str, Any]:
 
 
 def verify_export_fingerprint(data: Mapping[str, Any], expected_sha256: str | None = None) -> str:
-    """Say which campaign an export is of, and refuse it when it is not the campaign it is read with (C35).
+    """Say which campaign an export is of, and refuse it when it is not the campaign it is read with (C36).
 
     `expected_sha256` is the hash of the store's or snapshot's fingerprint (`stored_fingerprint_sha256`), or the
     `fingerprint` of a merged batch's merge.json. Returns a line for the person reading: the hash the export carries,
@@ -553,7 +553,7 @@ def read_export(path: Path) -> dict[str, Any]:
     listed = sum(len(data[name]) for name in RUN_LISTS) + len(data.get("excluded_attempts", ()))
     if listed != data["planned_runs"]:
         raise ExportError(f"{path}: lists {listed} runs but the plan held {data['planned_runs']}")
-    if EXPORT_FINGERPRINT in data:  # optional (C35): an export without it reads as it did
+    if EXPORT_FINGERPRINT in data:  # optional (C36): an export without it reads as it did
         try:
             _checked_entry(data[EXPORT_FINGERPRINT])
         except ExportError as error:

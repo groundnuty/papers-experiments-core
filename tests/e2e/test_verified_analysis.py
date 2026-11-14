@@ -399,7 +399,7 @@ def test_r04_partial_check_records_that_attempts_were_running_and_analysis_then_
         assert (saved["partial"], saved["running_attempts"], saved["excluded_attempts"]) == (True, 1, [])
 
 
-# --- the campaign fingerprint in the export (#243, C35) --------------------------------------------------------------
+# --- the campaign fingerprint in the export (#243, C36) --------------------------------------------------------------
 
 
 def snapshot_fingerprint(campaign: Campaign) -> str:
@@ -411,8 +411,8 @@ def snapshot_fingerprint(campaign: Campaign) -> str:
         snapshot.close()
 
 
-def test_c35_the_saved_export_carries_the_fingerprint_the_live_store_and_the_snapshot_record(finished):
-    """C35: `export.json` holds the fingerprint as the store keeps it and its hash, so a report can read a setting that
+def test_c36_the_saved_export_carries_the_fingerprint_the_live_store_and_the_snapshot_record(finished):
+    """C36: `export.json` holds the fingerprint as the store keeps it and its hash, so a report can read a setting that
     holds for the whole campaign (the platform's data paths, the caps) without opening state.sqlite."""
     text = snapshot_fingerprint(finished)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -424,8 +424,8 @@ def test_c35_the_saved_export_carries_the_fingerprint_the_live_store_and_the_sna
     assert digest in verify_export_fingerprint(export, digest)
 
 
-def test_c35_package_check_names_an_export_that_is_another_campaigns(copy):
-    """C35: an export whose fingerprint hash is not the snapshot's is named for what it is, not only as a difference."""
+def test_c36_package_check_names_an_export_that_is_another_campaigns(copy):
+    """C36: an export whose fingerprint hash is not the snapshot's is named for what it is, not only as a difference."""
     path = copy.root / "out" / "export.json"
     export = json.loads(path.read_text(encoding="utf-8"))
     export[EXPORT_FINGERPRINT] = fingerprint_entry({**export[EXPORT_FINGERPRINT]["fingerprint"], "seeds": [999]})
@@ -435,8 +435,8 @@ def test_c35_package_check_names_an_export_that_is_another_campaigns(copy):
     assert export[EXPORT_FINGERPRINT]["sha256"] in problem
 
 
-def test_c35_an_export_from_before_the_key_reads_and_is_said_not_to_record_a_fingerprint(copy):
-    """C35: an old export without the key is still read; the check says 'fingerprint not recorded' and does not refuse
+def test_c36_an_export_from_before_the_key_reads_and_is_said_not_to_record_a_fingerprint(copy):
+    """C36: an old export without the key is still read; the check says 'fingerprint not recorded' and does not refuse
     it for that, though the file is not what the records now give."""
     path = copy.root / "out" / "export.json"
     export = json.loads(path.read_text(encoding="utf-8"))
@@ -447,8 +447,8 @@ def test_c35_an_export_from_before_the_key_reads_and_is_said_not_to_record_a_fin
     assert pipeline.regenerate(copy.root) == [f"export.json: differs from what the records give ({NOT_RECORDED})"]
 
 
-def test_c35_the_analysis_refuses_an_export_whose_fingerprint_is_not_that_of_the_snapshot_it_read(copy, monkeypatch):
-    """C35: the export the analysis builds is checked against the fingerprint of every snapshot it read."""
+def test_c36_the_analysis_refuses_an_export_whose_fingerprint_is_not_that_of_the_snapshot_it_read(copy, monkeypatch):
+    """C36: the export the analysis builds is checked against the fingerprint of every snapshot it read."""
     built = pipeline.export_run_state
 
     def of_another_campaign(store, **kwargs):
