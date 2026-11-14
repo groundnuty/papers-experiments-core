@@ -49,8 +49,8 @@ injection open and the federation's exclusive admission held, as a failed restor
 the injection, its block map read through each peer, has no error entry for the restored provider. Its default, 240 s,
 is the 180 s cap of a peer's session renewal backoff (op-worker f118ed9) and a margin.
 
-`session_drain_s` is how long the federation's exclusive admission of an outage run is kept after the run's mount
-disconnected and its REST gate stopped, whichever is later (`expcore_onedata.fault_drain`). During an outage an agent's
+`session_drain_s` is how long the federation admits no run after an outage run's mount disconnected and its REST
+gate stopped, whichever is later (`expcore_onedata.fault_drain`). During an outage an agent's
 read of a file only the stopped provider holds leaves an on-demand sync job on the local provider that nothing calls
 back, and a later read of the same file and range, from any session, joins it and hangs. The job is cancelled when the
 run's callers end: a REST read's seconds after its client closes the connection, a mount's about 300 s after oneclient's

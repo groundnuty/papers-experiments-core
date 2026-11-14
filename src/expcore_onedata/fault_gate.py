@@ -88,9 +88,10 @@ class FaultGate:
         *,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        wall: Callable[[], float] = time.time,
     ) -> None:
         self._clock, self._sleep, self._drain_s = clock, sleep, settings.session_drain_s
-        self._lock = FederationLock(settings, clock=clock, sleep=sleep)
+        self._lock = FederationLock(settings, clock=clock, sleep=sleep, wall=wall)
         self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep)
         self._journal = self._recovery.journal
         self._may_recover = settings.sanctioned is True
@@ -111,7 +112,7 @@ class FaultGate:
                         self._recovery.recover()
                     finally:  # a provider it brought back went down in a run it knows nothing of: drain in full
                         if self._recovery.restored and self._drain_s > 0 and exclusive.drain is not None:
-                            exclusive.drain.arm(began, clock=self._clock, sleep=self._sleep)
+                            exclusive.drain.owe(began, clock=self._clock, sleep=self._sleep)
                         exclusive.close()
             try:
                 shared = self._lock.acquire(exclusive=False, timeout_s=self._wait_s)
@@ -136,6 +137,14 @@ class FaultGate:
         entries = self._recovery.entries()
         if any("clear_failed" in entry for entry in entries):
             return _unsettled(entries)  # a restore failed: a fault of the federation, whoever still holds it
+        draining = self._lock.drain_left()
+        if draining > 0:  # nobody holds it: it is closed while an outage run's sessions drain, and that charges no run
+            return Health(
+                False,
+                f"the federation is closed for {draining:.0f} s more while an outage run's sessions drain: "
+                "the check waits for it",
+                deferred=True,
+            )
         record = self._journal.read_holder()
         if record is None or holder_alive(record) is not False:  # contention: a wait, which charges no run
             return Health(False, f"{_named(record)} holds the federation: the check waits for it", deferred=True)
@@ -149,8 +158,13 @@ class FaultGate:
                 return Health(
                     False, f"the federation's lock is stuck{at}: {_named(record)} is gone and left an injection open"
                 )
-            self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
-            done = f"what it left open is recovered; {done}"
+            began = self._clock()
+            try:
+                self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
+            finally:  # it holds no admission, so the federation is closed for the drain it owes by the record itself
+                if self._recovery.restored and self._drain_s > 0:
+                    self._lock.hold_for(max(0.0, self._drain_s - (self._clock() - began)))
+            done = f"what it left open is recovered, and the federation closed for its drain; {done}"
         return Health(
             False, f"the federation's lock is stuck{at}: {_named(record)} is gone, yet the lock stays held; {done}"
         )

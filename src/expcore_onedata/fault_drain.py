@@ -1,5 +1,5 @@
 # Provenance: new
-"""The session drain of an outage run: its exclusive admission is let go only after its sessions have ended (O11).
+"""The session drain of an outage run: no run is admitted to the federation until its sessions have ended (O11).
 
 **Why.** During an outage an agent's read of a file only the stopped provider holds, through the local provider, leaves
 an on-demand sync job on that provider's per-file synchronizer, and nothing calls it back. A later read of the same file
@@ -9,18 +9,25 @@ when its HTTP request process dies (seconds after the client closes the socket, 
 `fuse_session_grace_period_seconds`), plus about 15 s if the removal retries. Eviction, a transfer cancel, deleting the
 file and `restart_link` cancel nothing; only a container restart does. (Source-read of op-worker f118ed9, not measured.)
 
-**What.** `SessionDrain` is carried by an exclusive `Admission` (`expcore_onedata.admission`) and is armed by the
-fault injector once a provider it took down is verified restored (`FaultInjector.clear`, and the recovery of a crashed
-run's injection). Once armed, the admission's lock is let go only at the `until` of its plan: `[faults] session_drain_s`
-(320 s by default) after the later of the run's mount disconnecting and its REST gate stopping. The wait is on the
-admission's last release (`Admission._release`), so every way the federation is let go (the campaign's run admission,
-the injector's own, the health gate's recovery) waits, the lock held and the holder record in place, so the health check
-reads it as an outage run in progress and defers. An admission nothing armed (every shared admission, an exclusive
-control, an outage run whose provider never went down) is let go at once.
+**What.** `SessionDrain` is carried by an exclusive `Admission` (`expcore_onedata.admission`). The fault injector
+arms it once a provider it took down is verified restored (`FaultInjector.clear`), and `owe` arms it for a provider
+that a recovery brought back after an earlier run. Once armed, the federation admits no run before the drain has
+ended: the plan's `until` is `[faults] session_drain_s` (320 s by default) after the later of the run's mount
+disconnecting and its REST gate stopping.
+
+**How it is kept.** When an armed admission is let go, `SessionDrain.publish` writes `until`, on the wall clock, to the
+journal's drain record (`InjectionJournal.raise_drain`, `federation.drain`), which only ever moves later; and every
+admission, shared or exclusive, checks that record once it holds the lock (`FederationLock.acquire` waits for it,
+`try_acquire` refuses). So the drain is kept by the federation itself and not by the process that began it: an
+interrupt, a restore that holds no admission and a recovery in another process cannot reopen it. An injector that
+holds the federation by an admission of its own also waits the drain out in `clear`, so its snapshot records the wait
+(`SessionDrain.wait`). When the record cannot be written, the release waits in process, the lock held, instead of going
+(`close_out`). An admission nothing armed (every shared admission, an exclusive control, an outage run whose provider
+never went down) writes nothing and is let go at once.
 
 **Where the times come from.** The sandbox (`DockerSandbox.session_ends`) records the moment its gate's stop was
-confirmed and the moment its mount's sidecar was shown gone, and the sandbox platform (`SandboxPlatform.launch`)
-reports each to the drain of the admission the run holds, as the launch ends. It begins its sandbox's kinds
+confirmed and the moment its mount's sidecar was shown gone, and the sandbox platform (`SandboxPlatform.launch`) reports
+each to the drain of the admission the run holds, as the launch ends. It begins its sandbox's kinds
 (`SessionDrain.begin`) when the sandbox is built, so an end that was never reported is known to be missing.
 
 **The deadline.** The drain is one deadline, `until`, not a duration, so whatever the restore took before it (a heal's
@@ -29,19 +36,23 @@ settle included) counts, and only the remainder is waited:
 - every end known: `until = (the later end) + drain_s`; basis `session_end`;
 - an end that is missing, a sandbox that reported none, or one whose stop was cut, failed or left the mount live:
   unknown, and unknown is never zero. `until = (the restore's start) + drain_s`, and never earlier than any known end
-  plus `drain_s`; basis `restore_start`. A restore that never began reads as the moment the wait starts;
+  plus `drain_s`; basis `restore_start`. A restore that never began reads as the moment the plan is made;
+- sessions owed to an earlier run (`owe`: a recovery restored a provider that a run left down): unknown whatever the
+  current run's sandbox says, so `until` is never earlier than the recovery's start plus `drain_s`; basis
+  `restore_start`;
 - a sandbox with no mount and no gate (a run with no data path): no session, no wait; basis `no_session`;
 - `session_drain_s = 0`: no drain, declared; basis `off`.
 
 **Order, in a run.** The gate's stop is in the sandbox's collection, the injector's restore (`clear`) follows, and the
 mount's end is at the launch's exit, after it; the run's admission ends after that, and so after the post-run check. The
 restore therefore cannot wait for a mount that is still connected: it records its plan with the mount unknown
-(`deferred`) and the run's admission waits at its own end, with every end known. An injector that holds the federation
-by an admission of its own (a run that holds none) has no sandbox of its run, so it waits in `clear`, before it lets go.
+(`deferred`), and the run's admission publishes the drain when it ends, with every end known. An injector that holds the
+federation by an admission of its own (a run that holds none) has no sandbox of its run, so it waits in `clear`.
 
-**Not covered.** A process killed between the restore and the admission's release drops the lock with the kernel, and no
-wait follows it. A harness that kills its sandbox without `launch`'s stop reports no end, and the drain is then the
-full wait from the restore's start.
+**Not covered.** A process killed before its admission is let go publishes nothing, and the lock goes with the kernel:
+the next start finds the injection settled, or recovers it, in which case the recovery owes the full drain from its own
+start. A crashed run's orphaned sandbox keeps its mount connected until the next sandbox start reaps it, which is after
+the drain such a recovery owes.
 """
 
 import dataclasses
@@ -50,14 +61,16 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # the journal imports nothing of this module: the import is for the annotation only
+    from expcore_onedata.fault_journal import InjectionJournal
 
 log = logging.getLogger(__name__)
 
 MOUNT, GATE = "mount", "gate"  # the kinds of session a sandbox's data path can end: its mount, its REST gate
 OFF, SESSION_END, RESTORE_START, NO_SESSION = "off", "session_end", "restore_start", "no_session"
 _KINDS = {MOUNT: "the mount's end", GATE: "the gate's stop"}
-_MAX_PASSES = 3  # a sleep that returns before its time is slept again, at most this often
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,8 +110,9 @@ class SessionTicket:
 class SessionDrain:
     """The drain of one exclusive admission (see the module docstring); safe to use from several threads.
 
-    `clock` and `sleep` are the drain's own and are replaced by `arm`: the injector arms it with its own, so a fake
-    clock of a test is the one that decides, wherever the admission was made.
+    `clock` and `sleep` are the drain's own and are replaced by `arm` and `owe`: the injector arms it with its own, so a
+    fake clock of a test is the one that decides, wherever the admission was made. `journal` and `wall` are where the
+    drain is published (`publish`): with no journal a release can only wait in process.
     """
 
     def __init__(
@@ -107,18 +121,22 @@ class SessionDrain:
         *,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        journal: "InjectionJournal | None" = None,
+        wall: Callable[[], float] = time.time,
     ) -> None:
         number = isinstance(drain_s, int | float) and not isinstance(drain_s, bool)
         if not number or not math.isfinite(drain_s) or drain_s < 0:
             raise ValueError("the drain must be a finite number of seconds, 0 or more")
         self.drain_s, self.clock, self.sleep = float(drain_s), clock, sleep
+        self._journal, self._wall = journal, wall
         self._lock = threading.Lock()
         self._armed = False
         self._restore_started: float | None = None
+        self._owed: float | None = None  # the start of a recovery whose run's sessions are unknown (`owe`)
         self._tickets = 0
         self._pending: dict[str, int] = {}  # the sessions begun and not yet ended, by kind
         self._ends: dict[str, float] = {}  # the latest end of each kind
-        self.last: dict[str, Any] | None = None  # the record of the latest wait
+        self.last: dict[str, Any] | None = None  # the record of the latest wait or publication
 
     @property
     def armed(self) -> bool:
@@ -132,17 +150,35 @@ class SessionDrain:
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
     ) -> None:
-        """An outage was restored: from now this admission is let go only after the drain. `restore_started` is when
-        the restore began, on `clock`; with none the wait counts from when it starts. A later arming moves the start
+        """An outage was restored: from now this admission is let go only into a drain. `restore_started` is when the
+        restore began, on `clock`; with none the wait counts from when the plan is made. A later arming moves the start
         later."""
         with self._lock:
-            if clock is not None:
-                self.clock = clock
-            if sleep is not None:
-                self.sleep = sleep
+            self._set(clock, sleep)
             self._armed = True
             if restore_started is not None:
                 self._restore_started = restore_started
+
+    def owe(
+        self,
+        since: float,
+        *,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        """A recovery restored a provider that an earlier run left down, from `since` on `clock`: that run's sessions
+        are unknown, whatever this admission's own sandbox says of its own, so the drain is never over before `since`
+        plus `drain_s`. The sandbox's reports cannot remove what is owed."""
+        with self._lock:
+            self._set(clock, sleep)
+            self._armed = True
+            self._owed = since if self._owed is None else min(self._owed, since)
+
+    def _set(self, clock: Callable[[], float] | None, sleep: Callable[[float], None] | None) -> None:
+        if clock is not None:
+            self.clock = clock
+        if sleep is not None:
+            self.sleep = sleep
 
     def begin(self, *kinds: str) -> SessionTicket:
         """A sandbox starts sessions of these kinds (none, for one with no data path); whoever ends them says so on the
@@ -162,11 +198,12 @@ class SessionDrain:
             self._pending[kind] = max(0, self._pending.get(kind, 0) - 1)
             self._ends[kind] = max(self._ends.get(kind, at), at)
 
-    def plan(self) -> DrainPlan:
-        """When the drain ends, from what is known now (see the module docstring)."""
+    def plan(self, now: float | None = None) -> DrainPlan:
+        """When the drain ends, from what is known now (see the module docstring). `now` is the moment a restore that
+        never began is taken to have started: the clock's, by default."""
         with self._lock:
             ends, pending, tickets = dict(self._ends), dict(self._pending), self._tickets
-            started = self._restore_started
+            started, owed = self._restore_started, self._owed
         mount, gate = ends.get(MOUNT), ends.get(GATE)
 
         def plan(until: float | None, basis: str, why: str) -> DrainPlan:
@@ -177,11 +214,18 @@ class SessionDrain:
         unknown = [f"{_KINDS[kind]} was not recorded" for kind in (MOUNT, GATE) if pending.get(kind, 0) > 0]
         if tickets == 0:
             unknown.append("no sandbox reported its sessions")
+        if owed is not None:
+            unknown.append("the sessions of the run a recovery restored are unknown")
         if not unknown and not ends:
             return plan(None, NO_SESSION, "the run's sandbox had no mount and no REST gate")
         candidates = [end + self.drain_s for end in ends.values()]
         if unknown:
-            candidates.append((self.clock() if started is None else started) + self.drain_s)
+            if started is not None:
+                candidates.append(started + self.drain_s)
+            elif owed is None:  # a restore that never began: taken to begin when the plan is made
+                candidates.append((self.clock() if now is None else now) + self.drain_s)
+            if owed is not None:
+                candidates.append(owed + self.drain_s)
             why = "; ".join(unknown) + ": the drain runs in full from the restore's start"
             return plan(max(candidates), RESTORE_START, why)
         why = "the drain runs from the later of the mount's end and the gate's stop"
@@ -189,18 +233,49 @@ class SessionDrain:
 
     def wait(self) -> dict[str, Any]:
         """Wait until the drain has ended, if armed, and return its record: the plan's mapping and `waited_s`, the
-        seconds waited on the drain's clock. Only the sleep's own interrupt escapes it, and then the lock is let go by
-        whoever called (there is nothing else to hold it for). Calling it again is harmless."""
+        seconds waited on the drain's clock. It returns only once the clock has reached `until`, planned afresh before
+        each sleep so that an end or a debt noted meanwhile counts: a sleep that comes back early is slept again, and
+        the one exception is a clock that did not move across a sleep, which no wait can outlast (a fake whose sleep
+        does nothing). Only the sleep's own interrupt escapes it. Calling it again is harmless."""
         started = self.clock()
-        plan = self.plan()
+        plan = self.plan(started)
         if not self.armed:
             return {**plan.record(), "armed": False, "waited_s": 0.0}
-        for _ in range(_MAX_PASSES):
-            left = None if plan.until is None else plan.until - self.clock()
-            if left is None or left <= 0:
+        last: float | None = None
+        while plan.until is not None:
+            now = self.clock()
+            left = plan.until - now
+            if left <= 0 or (last is not None and now <= last):
                 break
+            last = now
             log.info("the federation is held %.0f s more, until the run's sessions have drained (%s)", left, plan.basis)
             self.sleep(left)
+            plan = self.plan(started)
         record = {**plan.record(), "armed": True, "waited_s": max(0.0, self.clock() - started)}
         self.last = record
         return record
+
+    def publish(self) -> dict[str, Any]:
+        """Write the drain's end to the federation's drain record, so that no admission is granted before it, and return
+        the plan's record with `published`, the wall-clock time written (None when nothing needed writing: not armed, or
+        nothing to wait for). Raises what the journal raises when it cannot write."""
+        plan = self.plan()
+        record: dict[str, Any] = {**plan.record(), "armed": self.armed, "waited_s": 0.0, "published": None}
+        if not record["armed"] or plan.until is None or self._journal is None:
+            return record
+        until_wall = self._wall() + (plan.until - self.clock())
+        self._journal.raise_drain(until_wall)
+        record["published"] = until_wall
+        self.last = record
+        return record
+
+    def close_out(self) -> dict[str, Any]:
+        """What an admission does when it is let go: publish the drain, or, when it cannot be published (no journal, or
+        the journal cannot be written), wait it out in process so that the lock is never let go inside it."""
+        if self._journal is None:
+            return self.wait()
+        try:
+            return self.publish()
+        except OSError as error:
+            log.error("the drain could not be recorded (%s): the admission waits it out", type(error).__name__)
+            return self.wait()

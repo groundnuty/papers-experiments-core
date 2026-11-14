@@ -125,6 +125,15 @@ settle, and the platform's standard health check (`PlatformHealth`), whenever pl
 recovers what a crashed run left, holds the federation shared for the whole check, is deferred (charging no run)
 while an outage run holds it, and fails only for an injection that stays open.
 
+**The session drain (O11).** A restored federation is not yet one the next run can read from: an agent's reads of a file
+only the stopped provider holds, during the outage, leave on-demand sync jobs on the local provider that a later read of
+the same file and range would join and hang on, until the run's callers end (`expcore_onedata.fault_drain`). So once a
+restore of a provider that went down is verified, the federation admits no run for `[faults] session_drain_s` (320 s)
+after the later of the run's mount disconnecting and its REST gate stopping, and a recovery of a crashed run's injection
+owes the full drain from its own start. An injector that holds the federation by an admission of its own waits it out in
+`clear` and records a `drain` step (the times used, the wait, why); with a run's admission, whose sandbox is still up at
+the restore, the step is `deferred` and the admission closes the federation for what is left when it ends.
+
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
 The injection's own entry holds `target`, `injected`, `cleared`, `verified` and, once its provider served, `ready_after_s`.
@@ -241,8 +250,10 @@ class FaultInjector:
         driver: FaultDriver,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        wall: Callable[[], float] = time.time,
     ) -> None:
-        """Check the sanction and the target; act on nothing yet. `target` is a provider's label (`providers[1]`)."""
+        """Check the sanction and the target; act on nothing yet. `target` is a provider's label (`providers[1]`);
+        `wall` is the clock the federation's drain record is on (`FederationLock`)."""
         self._settings, self._sanctioned = settings, sanctioned
         self._require_sanction()
         names = {config.provider_label(name): name for name in config.providers}
@@ -258,7 +269,7 @@ class FaultInjector:
         self._journal = self._recovery.journal
         self._gate_probe: str | None = None  # the open injection's session gate probe file (`fault_sessions`)
         self._lock: HeldLock | None = None
-        self._federation = FederationLock(settings)
+        self._federation = FederationLock(settings, clock=clock, sleep=sleep, wall=wall)
         self._admission: Admission | None = None  # the exclusive admission it took itself, when its run held none
         self._cancel = threading.Event()  # set when `running` is cancelled: an admission still awaited is given up
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
@@ -691,17 +702,26 @@ class FaultInjector:
 
     def _recover(self, *, heal: bool = False) -> list[str]:
         """Recovery, healing a stuck link only when `heal`: the caller holds the federation exclusively (`_start`). A
-        provider it restored went down in a run this injector knows nothing of, so the exclusive admission held arms its
-        drain with no times: the full wait from the start of the recovery (`fault_drain`)."""
+        provider it restored went down in a run this injector knows nothing of, so its sessions are unknown whatever the
+        current run's sandbox says: the exclusive admission held owes the full drain from the start of the recovery
+        (`SessionDrain.owe`), and with no admission held the federation is closed for it at once (`hold_for`), so that
+        no recovery ends with the federation open inside the drain (`fault_drain`)."""
         self._require_sanction()
         began = self._clock()
         try:
             return self._recovery.recover(self._step, heal=heal)
         finally:
             if self._recovery.restored and self._settings.session_drain_s > 0:
-                admission = self._exclusive_admission()
-                if admission is not None and admission.drain is not None:
-                    admission.drain.arm(began, clock=self._clock, sleep=self._sleep)
+                self._owe_drain(began)
+
+    def _owe_drain(self, began: float) -> None:
+        """A recovery that began at `began` restored a provider: owe its drain on the admission held, or, with none,
+        close the federation for what is left of it (a record that cannot be written fails as `injector_failure`)."""
+        admission = self._exclusive_admission()
+        if admission is not None and admission.drain is not None:
+            admission.drain.owe(began, clock=self._clock, sleep=self._sleep)
+            return
+        self._federation.hold_for(max(0.0, self._settings.session_drain_s - (self._clock() - began)))
 
     def _drain(self, how: str, began: float) -> None:
         """After a verified restore of a provider that went down: arm the drain of the exclusive admission that holds the

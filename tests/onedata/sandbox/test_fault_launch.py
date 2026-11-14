@@ -12,7 +12,7 @@ import time
 
 import pytest
 from fake_host import FakeHost
-from fault_support import OUTAGE_TARGET, FakeServices, faults_table, injector_for
+from fault_support import OUTAGE_TARGET, FakeClock, FakeServices, faults_table, injector_for
 from sandbox_support import FAST, add_sandbox
 
 from expcore.campaign.lease import LeasePool
@@ -194,9 +194,10 @@ def test_o11_a_cancelled_launch_whose_start_thread_outlives_its_wait_keeps_the_f
 
 
 def draining_lock(config):
-    """The federation's lock whose exclusive admissions drain on the real clock but never really sleep: a test that
-    leaves an armed drain would otherwise wait out the 320 s."""
-    return FederationLock(load_faults(config.file, config), sleep=lambda seconds: None)
+    """The federation's lock whose exclusive admissions drain on a fake clock that their sleeps move: a test that leaves
+    an armed drain would otherwise wait out the 320 s."""
+    clock = FakeClock()
+    return FederationLock(load_faults(config.file, config), clock=clock, sleep=clock.sleep)
 
 
 def lease_for(built, tmp_path):
