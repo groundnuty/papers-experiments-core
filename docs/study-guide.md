@@ -243,8 +243,15 @@ For the tiered model above, a run that had sent 100,000 tokens when its next req
 from expcore.campaign.abandoned_bound import abandoned_request_bound, held_to_reply_maximum
 
 entry = {
-    "reason": "read_timeout", "usage": "unknown", "prompt_bound_tokens": 100_500, "prompt_bound_by": "bytes",
-    "reply_max_tokens": 8000, "window_tokens": 200_000, "bound_checked": 3, "bound_exceeded": 0, "bound_unreported": 0,
+    "reason": "read_timeout",
+    "usage": "unknown",
+    "prompt_bound_tokens": 100_500,
+    "prompt_bound_by": "bytes",
+    "reply_max_tokens": 8000,
+    "window_tokens": 200_000,
+    "bound_checked": 3,
+    "bound_exceeded": 0,
+    "bound_unreported": 0,
     "bound_overlapped": 0,
 }
 totals = {"reserved_capped": True, "reply_cap_unheld": False}  # as the record's totals say
