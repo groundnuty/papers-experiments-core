@@ -13,12 +13,15 @@ ended, and none begins one while another space is still in an earlier one):
   `transfer_settle_s` then covers every space's next observation. **The fast settle:** a space whose first observation
   shows nothing waiting or ongoing, and that cancelled nothing, settles on its second observation when that shows
   nothing either, one `transfer_settle_s` after the first: the listing shows a job at most `transfer_settle_s` after
-  it is scheduled (the setting's meaning, O07), and the reset runs between runs, under the run's exclusive admission,
-  so nothing but the reset schedules a job meanwhile; a job scheduled before the first observation and still waiting or
-  ongoing at the second is therefore listed at the second. The transfer log settles on the same two observations
-  (`transferlog.py`). A space where anything was seen waiting or ongoing, or cancelled, at any observation needs
-  `transfer_settle_polls` clean observations in a row, within twice that many, as before. The record says which
-  (`fast`), with the observations and the cancels.
+  it is scheduled (the setting's meaning, O07), so a job scheduled before the first observation and still waiting or
+  ongoing at the second is listed at the second. A job scheduled in the space after the first observation is the
+  caller's to rule out, as before: a reset runs between runs, and a run acting on the space during its reset breaks
+  every stage's verdict whatever the settle; neither two observations nor four cover a job scheduled after the last,
+  and the later stages' looks at the listings (the eviction's before its block maps, the occupancy and quiet stages'
+  for a job that ran or ended) still catch one scheduled after the settle. The transfer log settles on the same two
+  observations (`transferlog.py`). A space where anything was seen waiting or ongoing, or cancelled, at any
+  observation needs `transfer_settle_polls` clean observations in a row, within twice that many, as before. The record
+  says which (`fast`), with the observations and the cancels.
 - **occupancy:** one wait, to the latest instant any space may read its occupancy at (each space's eviction end plus
   the lag for its deepest file, O46), then every space's reading; one more `transfer_settle_s` when any space's quiet
   stage is skipped, then every space's look at its listings; a space whose look shows a job that ran or ended waits

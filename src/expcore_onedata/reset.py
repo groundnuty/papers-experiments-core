@@ -28,8 +28,9 @@ read and every check is made on each provider that supports the space, since eac
    nothing waiting or ongoing on every provider in `transfer_settle_polls` observations in a row, `transfer_settle_s`
    apart (the listing's lag, O07), within twice that many observations; **a space whose every observation showed
    nothing, so that nothing was cancelled, settles on two**, one `transfer_settle_s` apart, by when a job scheduled
-   before the first is listed: the reset runs between runs, under the run's exclusive admission, so nothing else
-   schedules one meanwhile (`resetspaces.py` has the argument, and the record says `fast`). `cancelled` counts the
+   before the first is listed (O07); a job scheduled after the first is the caller's to rule out, as for every stage,
+   and the later stages' looks at the listings still catch one scheduled after the settle (`resetspaces.py` has the
+   argument, and the record says `fast`). `cancelled` counts the
    distinct jobs the stage sent a cancel to, from its own actions, so a job it cancelled while still scheduled, which
    the history cannot see, is never invisible.
 3. **eviction**: the files the caller names leave each provider named (`eviction.py`): a directory in one transfer, a
@@ -336,7 +337,7 @@ class SpaceReset:
         before it is listed (O07): a transfer that ran or ended since the occupancy stage's wait began fails the stage
         (O46), since an eviction there can hide a growth in the reading, and a job the occupancy stage's own look
         missed, listed late, made its figure wrong. Return the stage's record."""
-        moved = self._moved(run["ended_head"], self._ended_heads(), run["own"])
+        moved = self._moved(run["ended_head"], self._ended_heads(), run)
         if moved:
             raise ProvisionError(
                 f"a transfer ran or ended on {', '.join(moved)} after the occupancy stage's wait began: an eviction "
@@ -386,14 +387,16 @@ class SpaceReset:
         return {p: frozenset(self._page(p, "ended", None)[0]) for p in self._providers}
 
     def _moved(
-        self, before: Mapping[str, frozenset[str]], now: Mapping[str, frozenset[str]], own: Collection[str]
+        self, before: Mapping[str, frozenset[str]], now: Mapping[str, frozenset[str]], run: Mapping[str, Any]
     ) -> list[str]:
         """The labels of the providers whose ended listing's first page holds a job `before` did not (it ended
         between the two readings), or that list a transfer waiting or ongoing now; none when no transfer has run or
-        ended since `before`. A job of the reset's own (`own`, which it sent or cancelled and saw end before the
-        occupancy's wait began) is never new, though its listing may come late (O07)."""
-        moved = [p for p in self._providers if now[p] - before.get(p, frozenset()) - frozenset(own)]
-        moved += [p for p, _ in self._active()]
+        ended since `before`. A job of the reset's own (`run["own"]`, which it sent or cancelled and saw end before the
+        occupancy's wait began) is never new, though its listing may come late (O07), and one whose record reported it
+        ended (`run["ended"]`) is not running, though a listing may still show it ongoing (O51)."""
+        own, ended = frozenset(run["own"]), run["ended"]
+        moved = [p for p in self._providers if now[p] - before.get(p, frozenset()) - own]
+        moved += [p for p, tid in self._active() if tid not in ended]
         return [self._label(p) for p in dict.fromkeys(moved)]
 
     def _cancel(self, provider: str, tid: str) -> None:
@@ -557,7 +560,7 @@ class SpaceReset:
         the instant the wait counts from, and its change may not show: let it end, count the next wait from then, and
         return False, up to `OCCUPANCY_ROUNDS` waits in all, then fail."""
         state = run["occupancy_wait"]
-        if not self._moved(state["before"], self._ended_heads(), run["own"]):
+        if not self._moved(state["before"], self._ended_heads(), run):
             return True
         if state["rounds"] == OCCUPANCY_ROUNDS:
             raise ProvisionError(

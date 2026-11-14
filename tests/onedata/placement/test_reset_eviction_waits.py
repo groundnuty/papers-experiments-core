@@ -70,6 +70,18 @@ def test_o07_the_resets_own_eviction_still_listed_ongoing_after_it_ended_holds_n
     assert fake.held(FILES[0], BETA_ID) == []
 
 
+def test_o51_the_resets_own_eviction_listed_ongoing_past_the_occupancy_wait_makes_it_wait_no_round_more(
+    provisioner, fake, ticker
+):
+    """O51: the reset's own eviction, its record ended, is still listed ongoing when the occupancy stage looks at the
+    listings after its wait; it is no job that ran since the wait began, so the stage keeps its first reading, where it
+    waited a round more (and read every file again) for it."""
+    fake.ended_listed_ongoing_s = 28.0  # past the occupancy stage's 20 s wait for files one directory down
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=True)
+    assert record["stages"]["occupancy"]["rounds"] == 1
+    assert "listed_running" not in record["stages"]["eviction"]["waits"]
+
+
 def test_o01_a_job_the_reset_did_not_send_still_listed_ongoing_is_waited_for(provisioner, fake, ticker):
     """O51: a replication no stage sent ends as the eviction does and is still listed ongoing; the reset cannot tell
     from the listing that it has stopped changing maps, so it waits for the listings to show none, and records the
