@@ -19,6 +19,9 @@ trust_paths = []                # optional: paths in the agent image of CA bundl
 content_check_file = "dir/f"    # a provisioned file under the space root, read once before a campaign to confirm
                                 # the content type the gate streams on (`precampaign.py`); required with a rest level
 placeholder_token = "placeholder"  # optional: the agent's ONEDATA_TOKEN on a rest data path, never a credential (O23)
+kill_grace_s = 5                # optional, 1 to 60: how long a cell's processes have to end after their kill at its
+                                # deadline before the mount is aborted or the sandbox stopped (deadline.py, O34); the
+                                # whole escalation lasts at most two graces and 20 s past the cap (deadline.margin_s)
 
 [sandbox.images.agent]          # also the gate's image unless [sandbox.images.gate] names another
 name = "image:tag"              # a tag or an id, only ever resolved to the id below
@@ -44,8 +47,13 @@ gate_memory_bytes = 1073741824  # optional
 
 [sandbox.mount]                 # required when a data path is a mount
 path = "/data"                  # where the agent sees the space, read-only
-io_mode = "direct"              # optional: "direct" or "proxy"
-extra_args = []                 # further oneclient arguments, never one that changes the TLS mode
+io_mode = "proxy"               # required, no default: "proxy" or "direct" (O36)
+extra_args = []                 # further oneclient arguments, never one that sets the TLS mode, the I/O mode, the
+                                # config file, a storage override, oneclient's environment or its log directory
+direct_check_file = "space/f"   # "direct" only, and required with it: a space's directory under the mount, then a file
+                                # in it that the local provider holds in full; read at every start (O40)
+[sandbox.mount.storages]        # "direct" only, and required with it: each storage the sidecar reads directly
+"<storage id>" = "/host/dir"    # the directory that holds it on the host, bound read-only into the sidecar alone
 
 [sandbox.data_paths]            # the levels of the study's data_path factor, each one of mount, rest, none
 <level> = "rest"                # the kind alone; a rest level then pages its listings as the server does
@@ -63,6 +71,21 @@ zone = "host"                   # the zone's host name on that network, the one 
 providers.<local> = "host"      # the local provider's host name on that network, the one its certificate holds;
                                 # keyed by [support] local, the only provider accepted (the agent is pinned to it)
 ```
+
+`io_mode` is declared, never detected (O36). oneclient 25.0 started with neither force option detects each storage's
+access type at the first read of each space, and for a second space on a storage already detected as proxied it takes a
+plain mutex it already holds (`src/cache/helpersCache.h`, `performAutoIOStorageDetection`, the recursion at the end of
+its `!forceProxyIO` branch), so the read waits for ever and nothing is logged. `proxy` (`--force-proxy-io`) reads every
+space through the provider. `direct` (`--force-direct-io`) reads the local provider's storage itself, so it loads only
+with `[sandbox.mount.storages]` and `direct_check_file`, which a proxy mount may not have (O40): each mapped storage is
+bound read-only into the sidecar alone and named to oneclient by `--override <id>:mountPoint:<its place there>`, and
+the start reads the check file and the sidecar's log to show direct I/O in effect, or refuses the sandbox
+(`directio`). A storage is named in a message by its position, never by its id or path, and none may be, hold or lie
+under `work_root`. There is no third word for oneclient's own detection, and the extra arguments may not carry either
+force option, nor an override. The sidecar's oneclient reads no configuration file (`--config
+/dev/null`) and its environment holds the token alone (`env -u` of `ONECLIENT_INSECURE`, `ONECLIENT_OVERRIDE` and
+`ONECLIENT_CONFIG`), so its effective options are the argv and the token. The I/O mode is in the campaign fingerprint,
+for each mount level, as the listing is for a REST level.
 
 `listing` is a REST data path's option (O21): `paged`, the default, passes the server's page of a listing as it comes,
 and `complete` has the data gate answer every listing with all of the directory's entries (`gatepolicy`). It is refused
@@ -108,6 +131,14 @@ from expcore_onedata.sandbox.api import DataPathMode
 from expcore_onedata.sandbox.gatelog import DEFAULT_CAPS, Caps
 from expcore_onedata.sandbox.gatepolicy import LISTINGS, PAGED
 from expcore_onedata.sandbox.hostops import strict_networks
+from expcore_onedata.sandbox.oneclient_args import (
+    IO_MODES,
+    direct_keys_problem,
+    mode_arg_problem,
+    mount_problem,
+    nested,
+    storages_problem,
+)
 from expcore_onedata.tls import TlsSettings, moved
 
 PREFIX_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
@@ -119,11 +150,22 @@ SPACE_PART = re.compile(r"[^/\x00-\x1f\\]{1,255}")  # one name of a path under t
 # drops it, so it is printable ASCII without white space; the default is a plain word no one takes for a real token.
 PLACEHOLDER_TOKEN = "placeholder"
 PLACEHOLDER_RE = re.compile(r"[!-~]{1,128}")
-IO_MODES = ("direct", "proxy")
-FORBIDDEN_ARGS = {"-i", "--insecure"}  # TLS is set by the platform's [tls] only
 NETWORK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")  # a docker network's name; no `container:<id>`
 NOT_A_FEDERATION_NETWORK = ("bridge", "default", "host", "none")  # docker's own: no name resolves, or no isolation
 HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
+KILL_GRACE_S = 5.0  # [sandbox] kill_grace_s unless declared: a few seconds, so a dying process is not taken for a wedge
+# a cell's whole escalation past its cap is bounded by `deadline.margin_s`: two graces (after the kill, after an
+# abort) and `deadline.COMMANDS_S` for its commands; 30 s at the default grace, 140 s at this maximum
+KILL_GRACE_MAX_S = 60.0
+
+
+IO_MODE_REFUSAL = (
+    'is required and must be "proxy" or "direct": a mount never leaves the storage access to oneclient\'s own '
+    "detection, which hangs the first read of a second space backed by the same storage (oneclient 25.0, "
+    'src/cache/helpersCache.h, performAutoIOStorageDetection takes its access-type mutex twice). "proxy" reads every '
+    'space through the provider; "direct" reads the local provider\'s storage itself and needs it mapped in '
+    "[sandbox.mount.storages] (#223)"
+)
 
 
 @dataclass(frozen=True)
@@ -162,8 +204,21 @@ class MountSettings:
     """How the oneclient sidecar mounts the space and where the agent sees it; its TLS is `SandboxSettings.tls`."""
 
     path: str
-    io_mode: str | None = None
+    io_mode: str  # "proxy" or "direct", declared, never left to oneclient's detection (O36)
     extra_args: tuple[str, ...] = ()
+    # direct I/O only (O40): (storage id, the directory that holds it on the host), in the file's order, by which a
+    # message or a record names one; bound read-only into the sidecar alone, each named to oneclient by an override
+    # of its POSIX mount point
+    storages: tuple[tuple[str, str], ...] = ()
+    direct_check_file: str | None = None  # direct I/O only: `<space>/<path>` under the mount, read at every start
+
+    def __post_init__(self) -> None:
+        """Settings built in code are held to what the loader holds a file to: a known mode, no extra argument that
+        sets what the core declares (O36), and a direct mount's storage mapping and check file, which a proxy mount
+        may not have (O40). `ValueError`; the message never holds an argument, an id or a path."""
+        problem = mount_problem(self.io_mode, self.extra_args, self.storages, self.direct_check_file)
+        if problem is not None:
+            raise ValueError(problem)
 
 
 @dataclass(frozen=True)
@@ -202,6 +257,7 @@ class SandboxSettings:
     served_caps_declared: bool = False  # the table is in the file: its caps are in the campaign fingerprint (C06)
     federation: FederationNetwork | None = None  # [sandbox.federation]: None puts the sidecar on the default bridge
     placeholder_token: str = PLACEHOLDER_TOKEN  # the REST agent's ONEDATA_TOKEN: no credential, the gate drops it (O23)
+    kill_grace_s: float = KILL_GRACE_S  # a cell's processes' time to end after the kill at its deadline (O34)
 
     def mode_of(self, level: str) -> DataPathMode:
         """The data path of a level of the study's `data_path` factor; `ValueError` for a level not mapped."""
@@ -215,12 +271,23 @@ class SandboxSettings:
             return None
         return self.listings.get(level, PAGED)
 
+    def io_mode_of(self, level: str) -> str | None:
+        """The I/O mode of a level (O36): the mount's `io_mode` for a mount data path, None for any other."""
+        if self.mode_of(level) is not DataPathMode.MOUNT or self.mount is None:
+            return None
+        return self.mount.io_mode
+
     def data_path_record(self) -> dict[str, dict[str, str]]:
-        """Every level's data path as the campaign fingerprint holds it: its kind and, for REST, its listing mode."""
+        """Every level's data path as the campaign fingerprint holds it: its kind, for REST its listing mode and for a
+        mount the I/O mode it runs with."""
         out: dict[str, dict[str, str]] = {}
         for level, mode in self.data_paths.items():
-            listing = self.listing_of(level)
-            out[level] = {"kind": mode.value} | ({"listing": listing} if listing is not None else {})
+            listing, io_mode = self.listing_of(level), self.io_mode_of(level)
+            out[level] = (
+                {"kind": mode.value}
+                | ({"listing": listing} if listing is not None else {})
+                | ({"io_mode": io_mode} if io_mode is not None else {})
+            )
         return out
 
     def label(self, name: str) -> str:
@@ -303,21 +370,51 @@ def _served_caps(section: Section) -> Caps:
     )
 
 
+def _storages(section: Section) -> tuple[tuple[str, str], ...] | None:
+    """Read [sandbox.mount.storages] (O40), in the file's order, or None when the mount declares none. Each entry is a
+    configured id and path, so a message names it by its position and never echoes either (O12)."""
+    if "storages" not in section.data:
+        return None
+    table = section.section("storages")
+    declared = tuple(table.data.items())
+    problem = storages_problem(declared)
+    if problem is not None:
+        raise table.fail(None, problem)
+    return declared
+
+
 def _mount(section: Section) -> MountSettings:
-    """Read [sandbox.mount]: the path in the agent and the oneclient options; TLS is the platform's [tls]."""
+    """Read [sandbox.mount]: the path in the agent and the oneclient options; TLS is the platform's [tls]. A direct
+    mount also maps its storages and names its check file (O40), which a proxy mount may not."""
     if "tls" in section.data:
         raise moved(section, "tls")
-    section.reject_unknown(("path", "io_mode", "extra_args"))
+    section.reject_unknown(("path", "io_mode", "extra_args", "storages", "direct_check_file"))
     path = section.string("path")
     if not path.startswith("/") or path == "/" or ".." in path.split("/") or any(c.isspace() for c in path):
         raise section.fail("path", "must be an absolute path inside the agent, not the root")
-    io_mode = section.optional_string("io_mode")
-    if io_mode is not None and io_mode not in IO_MODES:
-        raise section.fail("io_mode", f"must be one of: {', '.join(IO_MODES)}")
+    io_mode = section.data.get("io_mode")
+    if io_mode not in IO_MODES:
+        raise section.fail("io_mode", IO_MODE_REFUSAL)
     extra = section.strings("extra_args") if "extra_args" in section.data else ()
-    if any(a in FORBIDDEN_ARGS or (a.startswith("-") and not a.startswith("--") and "i" in a[1:]) for a in extra):
-        raise section.fail("extra_args", "must not carry the TLS flag: the platform's [tls] alone sets it")
-    return MountSettings(path, io_mode, tuple(extra))
+    for argument in extra:
+        problem = mode_arg_problem(io_mode, argument)
+        if problem is not None:
+            raise section.fail("extra_args", problem)
+    storages, check = _storages(section), section.data.get("direct_check_file")
+    found = direct_keys_problem(io_mode, storages, check)
+    if found is not None:
+        raise section.fail(*found)
+    return MountSettings(path, io_mode, tuple(extra), storages or (), check)
+
+
+def _storages_clear_of(section: Section, mount: MountSettings, work_root: Path) -> None:
+    """Refuse a storage whose directory is, holds or lies under the work root (O40): the sandbox makes, unmounts and
+    removes directories there, and the reaper removes what a killed run left, so a provider's files could go."""
+    table = section.section("mount").section("storages") if mount.storages else None
+    for position, (_, path) in enumerate(mount.storages):
+        if table is not None and nested(str(Path(path).resolve()), str(work_root)):
+            why = "is, holds or lies under [sandbox] work_root, where the sandbox makes and removes directories"
+            raise table.fail(None, f"entry {position}: {why}")
 
 
 def _entry_string(section: Section, key: str, position: int) -> str:
@@ -437,6 +534,14 @@ def _placeholder(section: Section) -> str:
     return value
 
 
+def _kill_grace(section: Section) -> float:
+    """Read the optional grace of a cell's kill at its deadline (O34): a number of seconds from 1 to 60."""
+    grace = float(_number(section, "kill_grace_s", minimum=1, default=KILL_GRACE_S))
+    if grace > KILL_GRACE_MAX_S:
+        raise section.fail("kill_grace_s", f"must be at most {KILL_GRACE_MAX_S:g} seconds")
+    return grace
+
+
 def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """Read an optional list of command words (a path or an option), with no space or control character."""
     words = section.strings(key) if key in section.data else default
@@ -469,6 +574,7 @@ def load_sandbox(
         "trust_paths",
         "content_check_file",
         "placeholder_token",
+        "kill_grace_s",
     )
     if "users" in section.data:  # one pool of leased users: a second one here would lease a user the slots also hold
         raise section.fail(
@@ -489,6 +595,8 @@ def load_sandbox(
     mount = _mount(section.section("mount")) if "mount" in section.data else None
     if DataPathMode.MOUNT in data_paths.values() and (mount is None or oneclient is None):
         raise section.fail("mount", "and [sandbox.images.oneclient] are required when a data path is a mount")
+    if mount is not None:
+        _storages_clear_of(section, mount, work_root)
     federation = None
     if "federation" in section.data:
         if not {DataPathMode.MOUNT, DataPathMode.REST} & set(data_paths.values()):
@@ -530,6 +638,7 @@ def load_sandbox(
         served_caps_declared="served_bytes" in section.data,
         federation=federation,
         placeholder_token=_placeholder(section),
+        kill_grace_s=_kill_grace(section),
     )
 
 

@@ -3,13 +3,15 @@
     EXPCORE_LIVE_PLATFORM=/path/to/platform.toml uv run pytest tests/live
     EXPCORE_LIVE_SLOW=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live   # also the test that waits out a lifetime
     EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live  # also the test that takes a provider down
+    EXPCORE_LIVE_REVOKE=1 EXPCORE_LIVE_PLATFORM=... uv run pytest tests/live  # also the test that revokes tokens
 
 They check what the fake can only assume: that the endpoints the layer calls answer in the shape it parses. They read
 (health, discovery, the examination of a token, and, with EXPCORE_LIVE_CONTENT_PATH naming a provisioned file by its
 path in the space, that file's content) and mint a short-lived token per plane for the configured fixed users.
-Tokens are never revoked, so each one ends with its lifetime. Nothing here changes a space, a file or a privilege, and
-without the variable nothing is constructed or contacted. Only with EXPCORE_LIVE_FAULTS=1 as well does the fault test
-take a provider declared in `[faults]` down and bring it back.
+Each one ends with its lifetime; only with EXPCORE_LIVE_REVOKE=1 does one test revoke every temporary token of the
+`[principals.service]` user, as a run's teardown revokes its slot users'. Nothing here changes a space, a file or a
+privilege, and without the variable nothing is constructed or contacted. Only with EXPCORE_LIVE_FAULTS=1 as well does
+the fault test take a provider declared in `[faults]` down and bring it back.
 """
 
 import os
@@ -47,7 +49,7 @@ from expcore_onedata.federation import pin_local_provider, read_space  # noqa: E
 from expcore_onedata.health import PlatformHealth  # noqa: E402
 from expcore_onedata.sandbox import gateboundary  # noqa: E402
 from expcore_onedata.tokencheck import CaveatSpec  # noqa: E402
-from expcore_onedata.tokens import TokenIssuer, data_path_spec  # noqa: E402
+from expcore_onedata.tokens import RevocationUnconfirmed, TokenIssuer, data_path_spec  # noqa: E402
 from expcore_onedata.tokenscope import admin_privileges, effective_clusters  # noqa: E402
 
 CEILING_S = 300.0
@@ -261,7 +263,7 @@ def test_a_writing_tool_server_token_acts_in_no_cluster(config, client, issuer):
 
 @SLOW
 def test_a_token_stops_working_when_its_lifetime_ends(config, client):
-    """Tokens are not revoked; they expire. Mint with a minimal lifetime, wait it out, expect a refusal: 401 or 403, or
+    """A token not revoked expires. Mint with a minimal lifetime, wait it out, expect a refusal: 401 or 403, or
     the 400 `tokenCaveatUnverified` with which Onedata 25.0 answers the scope inference of a token past its time
     caveat (seen on the Compose federation of deploy/compose-federation, 10 Nov 2026)."""
     user = service_user(config)
@@ -273,6 +275,30 @@ def test_a_token_stops_working_when_its_lifetime_ends(config, client):
         read_space(client, value, config.space.id)
     answer = (refused.value.status, refused.value.code)
     assert answer[0] in (401, 403) or answer == (400, "tokenCaveatUnverified")
+
+
+REVOKE = pytest.mark.skipif(
+    os.environ.get("EXPCORE_LIVE_REVOKE") != "1",
+    reason="EXPCORE_LIVE_REVOKE=1 is not set; this test revokes every temporary token of [principals.service]",
+)
+
+
+@REVOKE
+def test_a_users_own_revocation_raises_its_generation_and_its_token_then_verifies_as_revoked(config, client, issuer):
+    """C19: the revocation a run's teardown sends for each slot user, sent here for the health check's own user, whose
+    tokens are minted per check: run it only when nothing else holds a token of that user. Before it the token is not
+    revoked (it verifies, or is refused for its data-access caveats); after it the user's generation has risen and the
+    token verifies as 400 `tokenRevoked`. Named by oz-worker's source alone (14b5bda, `token_routes.erl:163-176`)."""
+    # covers: GET /user/tokens/temporary
+    # covers: DELETE /user/tokens/temporary
+    # covers: POST /tokens/verify_access_token
+    user = service_user(config)
+    token = issuer.mint(data_path_spec(config.space.id), user, ceiling_s=CEILING_S)
+    with pytest.raises(RevocationUnconfirmed):  # it verifies, or is refused for its caveats: either way not revoked
+        issuer.require_revoked(token.reveal())
+    before, after = issuer.revoke_own(user)
+    assert after > before
+    issuer.require_revoked(token.reveal())  # answered 400 tokenRevoked, and nothing else
 
 
 # -- step 4b2: placement, probes and day-0 checks ----------------------------------------------------------------------
@@ -360,6 +386,31 @@ def test_the_transfer_listing_answers_every_state_the_probes_read(config, client
         assert len(ids) <= 1
     _, date = client.get_dated(f"/spaces/{config.space.id}/transfers", provider=provider, params={"state": "ended"})
     assert offset_of(date, time.time()) is not None
+
+
+def test_onezones_public_current_time_answers_the_global_clock_in_milliseconds(client):
+    """O32: a job's times are stamped on the platform's global clock, which Onezone's public current-time endpoint
+    reads (oz-worker 14b5bda, `provider_routes.erl:192-198`: "does not require any specific privileges"), and the
+    transfer log and the reset's history place their window by it. Sent with no credential header, it answers
+    `{"timeMillis": N}`, epoch milliseconds, within a minute of this host's clock on a deployment whose clocks are
+    kept; the same answer's Date header is the answering node's system clock, which may differ and is only recorded.
+    No source sends this call and no live run had made it before this test (`client.UNVERIFIED_ENDPOINTS`)."""
+    # covers: GET /provider/public/get_current_time
+    from expcore_onedata.client import ZONE_TIME_PATH
+    from expcore_onedata.transferwindow import zone_clock_of
+
+    sent = time.time()
+    answer, date = client.get_dated(ZONE_TIME_PATH, anonymous=True)
+    received = time.time()
+    assert isinstance(answer, dict), "the answer is no object"
+    assert isinstance(answer.get("timeMillis"), int | float), "no timeMillis number"
+    assert answer["timeMillis"] > 10**12, "timeMillis is not epoch milliseconds"
+    reading = zone_clock_of(answer, date, sent, received)
+    assert reading is not None
+    assert abs(reading.offset) < 60, f"the global clock is {reading.offset:.1f} s from this host's"
+    print(
+        f"global clock offset {reading.offset:.3f} s, half trip {reading.half_trip:.3f} s, Date {reading.date_offset}"
+    )
 
 
 def test_a_transfer_record_has_the_fields_the_probes_read(config, client):
@@ -553,6 +604,121 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
     assert all(isinstance(stage["seconds"], float) for stage in record["stages"].values())
 
 
+# -- the reset's QoS listing and the occupancy's lag (issue #209, O33) -----------------------------------------------
+# `[placement] qos_scan = "listing"` rests on two facts the source states and no live run has shown: the first two
+# tests check them, and "summaries" stays the default until both pass. The third measures how long the space root's
+# physical size lags a placement, which the reset's quiet wait assumes from the source. Each prints its figures for
+# the dated facts file and leaves nothing behind: its requirement is removed and the scratch files are torn down.
+
+QOS_SEEN_S = 120.0  # the longest a requirement added through one provider is waited for through another
+
+
+def scratch_requirement(provisioner, provider, file_id):
+    """Put an `anyStorage` requirement on an entry through one provider and return its id."""
+    body = {"fileId": file_id, "expression": "anyStorage", "replicasNum": 1}
+    return provisioner.client.mutate("POST", "/qos_requirements", provider=provider, json=body)["qosRequirementId"]
+
+
+@MUTATE
+def test_the_recursive_listing_takes_include_directories_and_marks_a_requirements_entry(scratch):
+    """O33: the space root's recursive listing with `include_directories`, which the REST description omits, holds
+    the root as "." and the scratch directory, and with a requirement on the directory, the directory says `direct`
+    and its two files `ancestor`; the pages read are printed."""
+    # covers: GET /data/{id}/files
+    from expcore_onedata import resetqos
+
+    provisioner, _, directory, _ = scratch
+    holder = provisioner.settings.holder
+    qid = scratch_requirement(provisioner, holder, provisioner.resolve(directory).file_id)
+    try:
+        entries, pages = resetqos.listed(provisioner, holder)
+        by_path = {entry.path: entry for entry in entries.values()}
+        assert "." in by_path
+        assert by_path[directory].directory
+        assert by_path[directory].inheritance in resetqos.DIRECT
+        assert [by_path[f"{directory}/part-{i}.bin"].inheritance for i in range(2)] == ["ancestor", "ancestor"]
+        print(f"recursive listing: {len(entries)} entries in {pages} page(s) of {resetqos.LISTING_PAGE}")
+    finally:
+        provisioner.client.mutate("DELETE", f"/qos_requirements/{qid}", provider=holder)
+
+
+@MUTATE
+def test_a_requirement_added_through_one_provider_is_found_by_the_listing_through_another(scratch):
+    """O33: a requirement put on a scratch file through the receiver is found by the listing scan on the data
+    provider once dbsync settles, within `QOS_SEEN_S`, and applies to that file; the seconds it took are printed."""
+    from expcore_onedata import resetqos
+
+    provisioner, receiver, _, ids = scratch
+    holder = provisioner.settings.holder
+    qid = scratch_requirement(provisioner, receiver, ids[0])
+    try:
+        began = time.monotonic()
+        found = resetqos.by_listing(provisioner, [holder])
+        while qid not in found.where:
+            assert time.monotonic() - began < QOS_SEEN_S, "the data provider's listing never showed the requirement"
+            time.sleep(2.0)
+            found = resetqos.by_listing(provisioner, [holder])
+        print(f"a requirement added through another provider was found after {time.monotonic() - began:.1f} s")
+        assert ids[0] in found.files[qid]
+    finally:
+        provisioner.client.mutate("DELETE", f"/qos_requirements/{qid}", provider=receiver)
+
+
+@MUTATE
+def test_the_space_roots_occupancy_follows_a_placement_within_the_sources_bound(scratch):
+    """O33: a scratch file one directory below the root is replicated to the receiver, and the space root's physical
+    size there is read every quarter second until it has grown by the file's bytes. The seconds are printed, and must
+    be within the source's bound for that depth (`resetqos.occupancy_lag_s(2)`, the quiet wait less its margin), plus a
+    second for the reads themselves."""
+    from expcore_onedata import resetqos
+    from expcore_onedata.occupancy import physical_sizes
+
+    provisioner, receiver, directory, _ = scratch
+    providers = list(provisioner.space.support.providers)
+    before = physical_sizes(provisioner, providers)[receiver]
+    provisioner.replicate(f"{directory}/part-0.bin", receiver)
+    placed, size = time.monotonic(), 1024  # the scratch files are 1024 bytes each
+    while physical_sizes(provisioner, providers)[receiver] < before + size:
+        assert time.monotonic() - placed < resetqos.quiet_wait_s(2), "the root's physical size never showed the file"
+        time.sleep(0.25)
+    lag = time.monotonic() - placed
+    print(f"the space root's physical size showed the placement after {lag:.2f} s")
+    assert lag <= resetqos.occupancy_lag_s(2) + 1.0
+
+
+@MUTATE
+def test_the_space_roots_occupancy_follows_an_eviction_within_the_resets_wait(scratch):
+    """O46: a scratch file one directory below the root is replicated to the receiver and, once the root's physical
+    size there shows it, evicted from there; the size is then read every quarter second until it has dropped back. The
+    drop must come within the occupancy stage's wait for that depth counted from the eviction's verified end
+    (`resetqos.occupancy_wait_s(2)`), the reading the reset takes; the seconds from the scheduling and from the end are
+    printed beside the lag the reset assumes, which the 14 Nov slot could not split."""
+    from expcore_onedata import resetqos
+    from expcore_onedata.occupancy import physical_sizes
+
+    provisioner, receiver, directory, _ = scratch
+    providers = list(provisioner.space.support.providers)
+    path, size = f"{directory}/part-1.bin", 1024  # the scratch files are 1024 bytes each
+    before = physical_sizes(provisioner, providers)[receiver]
+    provisioner.replicate(path, receiver)
+    placed = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] < before + size:
+        assert time.monotonic() - placed < resetqos.quiet_wait_s(2), "the root's physical size never showed the file"
+        time.sleep(0.25)
+    scheduled = time.monotonic()
+    provisioner.evict(path, receiver)  # returns once the receiver's block map shows the file empty
+    ended = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] > before:
+        assert time.monotonic() - ended < resetqos.occupancy_wait_s(2), "the root's size never dropped within the wait"
+        time.sleep(0.25)
+    dropped = time.monotonic()
+    print(
+        f"the space root's physical size showed the eviction {dropped - scheduled:.2f} s after its scheduling and "
+        f"{dropped - ended:.2f} s after its verified end (the job took {ended - scheduled:.2f} s; the reset assumes "
+        f"up to {resetqos.occupancy_lag_s(2):.0f} s from the end)"
+    )
+
+
 # -- large files (issue #127) -----------------------------------------------------------------------------------------
 
 LARGE_FILE_BYTES = 40 << 20  # tens of MB: ten chunks of the size below, quick to move
@@ -590,19 +756,19 @@ def copy_prefix(source, dest, size):
 
 
 @MUTATE
-def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_back_by_its_hash(
+def test_a_large_file_resumes_by_offset_writes_refuses_a_shorter_one_and_reads_back_by_its_hash(
     config, client, tmp_path
 ):
-    """O25: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
-    nothing, a shorter file over the longer target is written again from a write without an offset (which must
-    truncate it), and the streamed read gives each file's SHA-256. Everything is under a fresh scratch directory and
-    torn down; skipped without a [placement] table."""
+    """O25, O44: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
+    nothing, a shorter file over the longer target is refused with nothing written (only a write without an offset,
+    which truncates and is never sent, could shorten it), and the streamed read gives each file's SHA-256.
+    Everything is under a fresh scratch directory and torn down; skipped without a [placement] table."""
     # covers: PUT /data/{id}/content
     import dataclasses
     import secrets
 
     from expcore.config.loading import ConfigError
-    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+    from expcore_onedata.provision import Provisioner, ProvisionError, resolve_provider_ids
     from expcore_onedata.rangemap import load_placement
 
     try:
@@ -619,17 +785,18 @@ def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_
     prefix_sha = copy_prefix(whole, prefix, cut)
     path = f"expcore-live-{secrets.token_hex(6)}/large.bin"
     try:
-        assert provisioner.upload(path, prefix).action == "created"
+        created = provisioner.upload(path, prefix)
+        assert (created.action, created.digest.sha256) == ("created", prefix_sha)
         resumed = provisioner.upload(path, whole)
         assert (resumed.action, resumed.sent_bytes) == ("resumed", LARGE_FILE_BYTES - cut)
         assert (resumed.digest.size, resumed.digest.sha256) == (LARGE_FILE_BYTES, whole_sha)
         assert provisioner.upload(path, whole).action == "skipped"
-        restarted = provisioner.upload(path, prefix)  # the target is longer, so only a truncating write fits it
-        assert (restarted.action, restarted.digest.sha256) == ("restarted", prefix_sha)
+        with pytest.raises(ProvisionError, match="longer"):  # only a truncating write could fit it, never sent
+            provisioner.upload(path, prefix)
         back = tmp_path / "back.bin"
-        found = provisioner.read_file(restarted.file_id, dest=back)
-        assert (found.size, found.sha256) == (cut, prefix_sha)
-        assert back.stat().st_size == cut
+        found = provisioner.read_file(resumed.file_id, dest=back)
+        assert (found.size, found.sha256) == (LARGE_FILE_BYTES, whole_sha)
+        assert back.stat().st_size == LARGE_FILE_BYTES
     finally:
         report = provisioner.teardown()
     assert report.ok, report.left

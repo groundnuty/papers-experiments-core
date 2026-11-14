@@ -12,6 +12,7 @@ commands the package uses; anything else fails loudly, so a new command shows up
 pass.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -36,6 +37,8 @@ REPEATED = {"--label", "-l", "-v", "--volume", "--mount", "-e", "--env", "--add-
 BOOT_ID = "0f0f0f0f-1111-2222-3333-444455556666"
 CERTIFI_BUNDLE = "/usr/lib/python3/site-packages/certifi/cacert.pem"  # where the fake agent image keeps certifi's
 PID_NS = "pid:[4026531836]"
+ONECLIENT_CONFIG_PATH = "/etc/invented/oneclient.conf"  # where the fake oneclient image keeps the file its help names
+ONECLIENT_CONFIG_SHA256 = hashlib.sha256(b"an invented oneclient configuration file\n").hexdigest()
 
 
 @dataclass
@@ -54,6 +57,7 @@ class FakeContainer:
     logs: str = ""
     started_at: str = "2026-01-01T00:00:00Z"
     paused: bool = False
+    init_child: int = 0  # the `sleep` docker-init started, in a container run with `--init ... sleep infinity`
 
     def mount_specs(self) -> list[str]:
         return [*self.options.get("-v", []), *self.options.get("--mount", [])]
@@ -68,6 +72,19 @@ def _mounts_json(c: FakeContainer) -> list[dict[str, str]]:
     for spec in c.options.get("-v", []):
         parts = spec.split(":")
         out.append({"Source": parts[0], "Destination": parts[1] if len(parts) > 1 else ""})
+    return out
+
+
+def bound_files(options: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Each bind of `docker run`'s options, `-v` or `--mount type=bind`, as (host path, path in the container)."""
+    out = []
+    for spec in options.get("-v", []):
+        source, destination, *_ = spec.split(":")
+        out.append((source, destination))
+    for spec in options.get("--mount", []):
+        fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
+        if fields.get("type") == "bind":
+            out.append((fields["src"], fields["dst"]))
     return out
 
 
@@ -149,6 +166,10 @@ class FakeHost:
         }
         self.links = {"/proc/self/ns/pid": PID_NS}
         self.alive: set[int] = set()
+        # processes a signal does not end: a read waiting in the kernel on a FUSE mount, which takes its kill only when
+        # it returns (O34); a test releases one by removing it from here and from /proc
+        self.unkillable: set[int] = set()
+        self.init_starts_sleep = True  # docker-init starts the `sleep` of a `--init ... sleep infinity` container
         self.calls: list[tuple] = []
         self.routes = "default via 192.0.2.1 dev eth0\n"
         self.dmesg = ""
@@ -312,6 +333,8 @@ class FakeHost:
                 return CmdResult(0, text) if text is not None else CmdResult(1, "", "No such file")
             case "kill":
                 for pid in argv[argv.index("-s") + 2 :] if "-s" in argv else argv[1:]:
+                    if int(pid) in self.unkillable:
+                        continue
                     self.alive.discard(int(pid))
                     self.files.pop(f"/proc/{pid}/stat", None)
                 return CmdResult(0)
@@ -329,7 +352,16 @@ class FakeHost:
                 shutil.rmtree(argv[-1], ignore_errors=True)
                 return CmdResult(0)
             case "rm" if "-f" in argv:  # one file; a missing one is not an error, as with the real command
-                Path(argv[-1]).unlink(missing_ok=True)
+                try:
+                    Path(argv[-1]).unlink(missing_ok=True)
+                except OSError:  # a directory: `rm -f` without `-r` refuses it, and says so
+                    return CmdResult(1, "", f"cannot remove '{argv[-1]}': Is a directory")
+                return CmdResult(0)
+            case "rmdir":  # what `rmdir` does: an empty directory only
+                try:
+                    Path(argv[-1]).rmdir()
+                except OSError as e:
+                    return CmdResult(1, "", f"failed to remove '{argv[-1]}': {e.strerror}")
                 return CmdResult(0)
             case "mkdir":
                 Path(argv[-1]).mkdir(parents=True, exist_ok=True)
@@ -412,6 +444,11 @@ class FakeHost:
             return CmdResult(125, "", "cannot start the container")
         if name in self.containers:
             return CmdResult(125, "", f"Conflict. The container name {name} is already in use")
+        for spec in options.get("--mount", []):  # unlike `-v`, which makes a directory of it, `--mount` refuses
+            fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
+            if fields.get("type") == "bind" and not os.path.lexists(fields.get("src", "")):
+                # docker's own words name the path; the real `HostOps.docker` digests them, so the fake's carry none
+                return CmdResult(125, "", 'invalid mount config for type "bind": bind source path does not exist')
         labels = dict(item.split("=", 1) for item in options.get("--label", []))
         self.next_pid += 1
         container = FakeContainer(
@@ -427,16 +464,22 @@ class FakeHost:
         self.alive.add(container.pid)
         self.containers[name] = container
         self.add_stat(container.pid, "tini", 1)
-        self.add_cgroup(container, [container.pid], events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+        if options.get("--init") and command == ["sleep", "infinity"] and self.init_starts_sleep:
+            self.next_pid += 1
+            container.init_child = self.next_pid
+            self.add_stat(container.init_child, "sleep", container.pid, start=2)
+        procs = [container.pid, *([container.init_child] if container.init_child else [])]
+        self.add_cgroup(container, procs, events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
         container.options["_files"] = {  # what each file bound in held when the container started, by destination
-            spec.split(":")[1]: Path(spec.split(":")[0]).read_text(encoding="utf-8")
-            for spec in options.get("-v", [])
-            if Path(spec.split(":")[0]).is_file()
+            destination: Path(source).read_text(encoding="utf-8")
+            for source, destination in bound_files(options)
+            if Path(source).is_file()
         }
         return CmdResult(0, container.id + "\n")
 
     def _mount_oneclient(self, container: FakeContainer) -> None:
+        container.logs = f"expcore-oneclient-config sha256={ONECLIENT_CONFIG_SHA256} path={ONECLIENT_CONFIG_PATH}\n"
         for spec in container.options.get("--mount", []):
             fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
             if fields.get("dst") == "/mnt/oneclient":

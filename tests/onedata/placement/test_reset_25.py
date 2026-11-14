@@ -95,12 +95,113 @@ def test_o01_an_eviction_the_block_map_never_shows_done_fails_after_the_last_att
     assert len(posted_transfers(stocked)) == EVICTION_ATTEMPTS
 
 
-def test_o11_a_reset_whose_eviction_evicted_nothing_at_first_still_ends_with_beta_empty(provisioner, stocked):
+def test_o11_a_reset_whose_eviction_evicted_nothing_at_first_still_ends_with_beta_empty(provisioner, stocked, ticker):
     """O11: the reset's eviction stage follows the same rule, and records the attempts per provider."""
     stocked.evictions_noop_first = 1
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert on_beta(stocked) == []
     assert record["stages"]["eviction"]["providers"]["providers[1]"]["attempts"] == 2
+
+
+# -- an eviction cancelled per file ------------------------------------------------------------------------------------
+
+
+def cover(fake, path):
+    """A QoS requirement still covers the file on beta, so op-worker cancels that file's eviction there."""
+    fake.qos_covered.add((fake.id_of(path), BETA_ID))
+
+
+def beta_counts(record):
+    return record["stages"]["eviction"]["providers"]["providers[1]"]
+
+
+def counted(record):
+    """The attempts and the counters of the last attempt's jobs that the record holds for beta."""
+    counts = beta_counts(record)
+    return counts["attempts"], counts["files_processed"], counts["files_evicted"], counts["files_failed"]
+
+
+def test_o01_a_reset_whose_eviction_is_cancelled_for_a_file_fails_naming_the_counts_and_the_cause(provisioner, stocked):
+    """O01: a QoS requirement still covers one file on beta, so op-worker cancels that file's eviction: every job
+    completes with filesProcessed above filesEvicted and filesFailed 0, and the file keeps its bytes. The reset fails
+    at its eviction stage; the message names the provider, the counts of the last attempt and the likely cause, the
+    failed stage's record carries the counts, and no later stage runs."""
+    cover(stocked, FILES[1])
+    with pytest.raises(ResetFailed) as caught:
+        SpaceReset(provisioner).run({"beta": ["study"]})
+    assert caught.value.stage == "eviction"
+    message = str(caught.value)
+    for part in ("providers[1]", "filesProcessed 4", "filesEvicted 0", "filesFailed 0", "cancelled per file", "QoS"):
+        assert part in message
+    stage = caught.value.record["stages"]["eviction"]
+    assert stage["ok"] is False
+    assert stage["providers"]["providers[1]"] == {
+        "files_processed": 4,
+        "files_evicted": 0,
+        "files_failed": 0,
+        "transfers": EVICTION_ATTEMPTS,
+        "attempts": EVICTION_ATTEMPTS,
+    }
+    assert "occupancy" not in caught.value.record["stages"]
+    assert stocked.held(FILES[1], BETA_ID)
+
+
+def test_o01_files_cancelled_per_file_are_named_in_the_refusal_of_a_bulk_eviction(provisioner, stocked):
+    """O01: the same for files evicted in parallel: only the covered file is scheduled again, until the last attempt,
+    whose one job processed it and evicted none; the refusal says so, and its `facts` hold the counts."""
+    cover(stocked, FILES[2])
+    with pytest.raises(NotPlaced, match="1 of 4 file") as caught:
+        evict_ids(provisioner, [stocked.id_of(p) for p in FILES], "beta")
+    assert "filesProcessed 1, filesEvicted 0 and filesFailed 0" in str(caught.value)
+    assert "cancelled per file" in str(caught.value)
+    assert caught.value.facts["providers"]["providers[1]"]["files_processed"] == 1
+
+
+def test_o01_a_gap_that_a_later_attempt_clears_is_not_a_failure(provisioner, stocked, ticker):
+    """O01: the first attempt's job processed four files and evicted none, as 25.0's does right after a placement,
+    which the counters show as a gap too; the block map judges, the second attempt evicts, the reset passes, and the
+    record counts the last attempt's job: four processed, four evicted."""
+    stocked.evictions_noop_first = 1
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
+    assert counted(record) == (2, 4, 4, 0)
+
+
+def test_o01_files_the_provider_never_held_are_processed_not_evicted_and_the_reset_passes(provisioner, stocked, ticker):
+    """O01: op-worker counts a file the evicting provider holds nothing of as processed, never evicted, so a gap with
+    empty block maps is no failure: two of four files held, both evicted, the reset passes at one attempt."""
+    for path in FILES[:2]:
+        del stocked.blocks[(stocked.id_of(path), BETA_ID)]
+    assert counted(SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})) == (1, 4, 2, 0)
+
+
+def test_o01_a_full_eviction_passes_with_every_file_counted_evicted(provisioner, stocked, ticker):
+    """O01: nothing cancelled and nothing missing: the reset passes at one attempt and the record counts four files
+    processed and evicted, none failed, next to the keys it always had."""
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
+    assert record["ok"] is True
+    assert beta_counts(record) | {"seconds": 0} == {
+        "trees": 1,
+        "files": 4,
+        "transfers": 1,
+        "polls": beta_counts(record)["polls"],
+        "attempts": 1,
+        "files_processed": 4,
+        "files_evicted": 4,
+        "files_failed": 0,
+        "seconds": 0,
+    }
+
+
+def test_o01_counters_a_record_does_not_carry_are_unknown_never_zero(provisioner, stocked, ticker):
+    """O01: a job's record without filesProcessed leaves the counts unknown (None) and the block map decides, so a full
+    eviction still passes; a refusal then names no cause, which it could not tell from the counts."""
+    stocked.transfer_omit = {"filesProcessed"}
+    assert counted(SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})) == (1, None, None, None)
+    cover(stocked, FILES[0])
+    stocked.blocks[(stocked.id_of(FILES[0]), BETA_ID)] = [[0, len(DATA)]]
+    with pytest.raises(NotPlaced) as caught:
+        evict_ids(provisioner, [stocked.id_of(FILES[0])], "beta")
+    assert "cancelled per file" not in str(caught.value)
 
 
 # -- visibility --------------------------------------------------------------------------------------------------------
@@ -122,25 +223,25 @@ def test_o07_a_directory_the_evicting_provider_does_not_see_yet_is_waited_for_no
 
 
 def test_o11_a_federation_answering_absence_as_25_does_has_its_requirements_removed_and_shown_gone(
-    provisioner, stocked
+    provisioner, stocked, ticker
 ):
     """O11: a removed requirement read on 25.0 answers 400 posix enoent, which is absence, so the qos stage passes
     and the whole reset with it."""
     stocked.answer_missing_as_25()
     stocked.add_qos(FILES[1])
-    record = SpaceReset(provisioner).run({"beta": ["study"]})
+    record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert record["ok"] is True
     assert stocked.qos == {}
     assert record["stages"]["qos"]["removed"] == 1
 
 
-def test_o11_a_removed_requirement_answered_with_another_400_fails_the_qos_stage_closed(provisioner, stocked):
+def test_o11_a_removed_requirement_answered_with_another_400_fails_the_qos_stage_closed(provisioner, stocked, ticker):
     """O11: a 400 that is not posix enoent is no absence: the requirement is never shown gone, so the reset fails at
     its qos stage and evicts nothing."""
     stocked.missing_answer = (400, "badValueNotAllowed", None)
     stocked.add_qos(FILES[1])
     with pytest.raises(ResetFailed, match="qos stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert caught.value.stage == "qos"
     assert all(stocked.held(path, BETA_ID) for path in FILES)
 
@@ -153,7 +254,7 @@ def test_o09_a_cancel_the_gate_refused_unsent_is_never_taken_for_an_ended_job(pr
     tid = stocked.add_transfer("replication", "other/left.bin", BETA_ID, scheduled=ticker.now, ended=False)
     stocked.statuses = [[f"/transfers/{tid}", 1, 400]]
     with pytest.raises(ResetFailed, match="transfers stage") as caught:
-        SpaceReset(provisioner).run({"beta": ["study"]})
+        SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert "ScopeUnread" in str(caught.value)
     assert not [c for c in stocked.provider_calls if c[1] == "DELETE" and c[2] == f"/transfers/{tid}"]
     assert not stocked.transfers[tid].ended

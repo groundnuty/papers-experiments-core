@@ -28,7 +28,15 @@ from expcore_onedata.testing import (
     with_placement,
     write_platform,
 )
-from expcore_onedata.testing.world import SPACE_IDS, SPACE_LABELS, SPACE_NAMES, with_spaces
+from expcore_onedata.testing.world import (
+    PROBE_SPACE_ID,
+    PROBE_SPACE_NAME,
+    SPACE_IDS,
+    SPACE_LABELS,
+    SPACE_NAMES,
+    with_link_check,
+    with_spaces,
+)
 from expcore_onedata.tokens import TokenIssuer
 
 OWNED = SPACE_LABELS[1]  # the second space, whose own data provider is beta
@@ -214,7 +222,7 @@ def test_o11_a_reset_of_one_space_reads_and_changes_that_space_alone(owned, fake
     fake.transfers[mine].file_id = fake.id_of("study/a.bin", SPACE_IDS[1])
     theirs = fake.add_transfer("replication", "study/b.bin", BETA_ID, scheduled=ticker.now, ended=False)
     fake.transfer_flip_after = 10**6
-    record = SpaceReset(owned).run()
+    record = SpaceReset(owned, now=ticker.clock).run()
     assert record["space"] == "spaces[1]"
     assert fake.transfers[mine].cancelled
     assert not fake.transfers[theirs].ended
@@ -224,14 +232,17 @@ def test_o11_a_reset_of_one_space_reads_and_changes_that_space_alone(owned, fake
 def test_o05_the_content_type_check_reads_its_file_in_the_first_space_the_data_path_reaches(tmp_path, fake, ticker):
     """O05: with several spaces and a REST data path, the pre-campaign check finds its file under the root of the first
     space the data path's token reaches, here the second, through the agent's local provider; and the platform's
-    health check, which composes it, reads every space without refusing on the several-space configuration."""
+    health check, which composes it, reads every space without refusing on the several-space configuration; with the
+    link check (O35) probing alpha <- beta in a probe space of its own."""
 
     def document(data):
         two_spaces(data)
         add_sandbox(data)
         data["sandbox"]["content_check_file"] = "study/probing.bin"
         data["spaces"][0]["tokens"] = ["tool_server"]
+        with_link_check(data)
 
+    fake.add_data_space(PROBE_SPACE_ID, PROBE_SPACE_NAME, [ALPHA_ID, BETA_ID])
     config = load_platform(write_platform(tmp_path, document))
     client = OnezoneClient(config, http=fake.client_http())
     fake.add_file("study/probing.bin", DATA, space=SPACE_IDS[1])
@@ -240,5 +251,11 @@ def test_o05_the_content_type_check_reads_its_file_in_the_first_space_the_data_p
     listed = {c[2] for c in fake.provider_calls if c[2].endswith("/children")}  # the gate reads every space's root
     assert f"/data/{fake.space_roots[SPACE_IDS[1]]}/children" in listed
     assert f"/data/{fake.space_roots[SPACE_IDS[0]]}/children" not in listed
-    health = PlatformHealth(config, client, TokenIssuer(client, config, clock=ticker.clock), clock=ticker.clock)
+    issuer = TokenIssuer(client, config, clock=ticker.clock)
+    health = PlatformHealth(config, client, issuer, clock=ticker.clock, monotonic=ticker.clock, sleep=ticker.sleep)
     assert health().ok
+    assert health.links.ok
+    assert [(p.local, p.source) for p in health.links.pairs] == [
+        ("providers[0]", "providers[1]"),
+        ("providers[1]", "providers[0]"),
+    ]

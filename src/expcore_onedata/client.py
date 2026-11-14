@@ -30,10 +30,12 @@ Reads and mutations are separate calls:
   else, a path of a provider among it, resolves to no space and is refused, so a mistaken or hostile target cannot
   reach a space outside the study's. What remains is the interval between the name's read and the platform acting on
   the request, which a client cannot close;
-- `mint_own_token` is the one operation on credentials: a platform user mints its own temporary token with its own
-  password (HTTP Basic), as the earlier code did. It acts on no space, so it has a call of its own; the password is
+- `mint_own_token`, `own_temporary_generation` and `revoke_own_temporary_tokens` are the operations on credentials,
+  each sent as one platform user with its own password (HTTP Basic), on that user's own temporary tokens alone: the
+  user mints one, as the earlier code did, reads their generation, or revokes all of them, which needs no privilege
+  and reaches no other user's (C19). They act on no space, so they have calls of their own; the password is
   registered as a secret when it is read and the minted value before the call returns (R12), and so is the admin token
-  the client itself uses, when the client is built. Tokens are not revoked: they end with their lifetime.
+  the client itself uses, when the client is built.
 
 **The space of a file.** Onedata 25.0 gives a file no path and no space attribute, so the gate walks the file's
 parent links: `GET /data/{id}?attribute=parent_id` through the provider the request is for, from the file up, until it
@@ -107,6 +109,21 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   has made it, so it is in `UNVERIFIED_ENDPOINTS`.
 - `mint_own_token`: `POST /user/tokens/temporary` with `Authorization: Basic` of the user itself, body
   `{"type": {"accessToken": {}}, "caveats": [...]}`, answer key `token`. Confirmed by [S1].
+- The revocation of a run's tokens at its end (`users.SlotTokens.revoke`, C19): `own_temporary_generation` is `GET
+  /user/tokens/temporary` and `revoke_own_temporary_tokens` is `DELETE /user/tokens/temporary`, each with
+  `Authorization: Basic` of the user itself, the path `mint_own_token` posts to. The DELETE gives the user a new
+  secret and a generation one higher, which revokes every temporary token of that user, and answers 204; the GET
+  answers `{"generation": N}`. Neither needs a privilege. A temporary token is checked by its generation, so this is
+  the only revocation of one; per-token revocation exists for named tokens alone. `query` sends `POST
+  /tokens/verify_access_token`, body `{"token"}`, with no header, as the scope inference is sent: it compares the
+  token's generation with its user's before any caveat and answers an older one 400 `tokenRevoked`, while
+  `/tokens/examine` only decodes a token and never shows it revoked. All three are named by onedata/oz-worker at
+  14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55: src/http/rest/routes/token_routes.erl:163-176 (the two routes, "does not
+  require any specific privileges"), src/logic/token_logic_plugin.erl:165-176 (the verification), 330-331 and
+  379-380 (the revocation, authorised for the user itself), src/datastore/models/temporary_token_secret.erl:72-89 and
+  199-224 (the new generation, and its read), src/auth/token_auth.erl:357-364 (generations compared first); and
+  onedata/ctool's `tokenRevoked`, HTTP 400 (src/errors/types/auth/token/od_error_token_revoked.erl:50-52). No live
+  run has made them, so they are in `UNVERIFIED_ENDPOINTS`.
 - Provider base `/api/v3/oneprovider`, which step 4b uses; step 4a sends nothing to a provider. Confirmed by [S7].
 - Step 4b2 sends to a provider (all confirmed by [S8], whose code sends them and reads the answers as the layer does):
   `GET /spaces/{space}` (the key `fileId` is the space's root; [L1] shows it the same on every provider),
@@ -120,8 +137,13 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
   `application/octet-stream` for both, is confirmed by [L1]. `read_content` is a run of range reads, each streamed and
   hashed as it comes (O25).
-- A write of content without the `offset` query, which truncates the file first and which a restarted upload relies
-  on: only the provider's API description states it, and no source sends it; see `UNVERIFIED_ENDPOINTS`.
+- A write of content always names its `offset`: without one the provider truncates the file to 0 first (op-worker
+  f118ed9, file_content_rest_handler.erl:224-228), so `mutate` refuses it unsent
+  (`TruncatingWrite`, O44). An empty body at an offset past the file's end extends its size to that offset and writes
+  no block: measured on the Compose federation (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A
+  file at its final size with only a prefix written": a 204, the size read back, the block map the prefix alone), and
+  traced in op-worker f118ed9 (file_upload_utils.erl:136-150, read_write_req.erl:58-86, replica_updater.erl:187-192,
+  fslogic_blocks.erl:125-126, which drops the zero-size block). A preallocated ingest relies on it (#107).
 - `file_space_id`: `GET /data/{id}` with the query `attribute=parent_id`, answered `{"parent_id": <id>}`, and
   `{"parent_id": null}` for a space's root. Confirmed by [L1] (a file two levels down, its directory and the root, on
   each of the three providers), which also refuted the `path` attribute the gate read before: [S9], the earlier
@@ -131,9 +153,17 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   `limit`, `page_token`; answer `transfers`, a list of ids, and `nextPageToken`, followed until null), confirmed by
   [S10] for the states `ongoing` and `ended`, and each id's `GET /transfers/{id}`, whose `fileId` [S10] and state and
   counters [S11] are confirmed. The state `waiting`, the listing answer's `Date` header (`get_dated`, the provider's
-  clock), and a record's `type`, provider ids and times (epoch seconds), for a replication and an eviction, are
-  confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state `transferStatus`, as
-  [S11] reads them.
+  system clock, which places nothing), and a record's `type`, provider ids and times (epoch seconds), for a replication
+  and an eviction, are confirmed by [L1], which also shows the eviction counter named `filesEvicted` and the state
+  `transferStatus`, as [S11] reads them. A job's times are stamped on the platform's global clock, so the transfer log
+  and the reset's history also read Onezone's own reading of it, `GET /provider/public/get_current_time`
+  (`get_dated` with `anonymous=True`, so no credential header; answer `{"timeMillis": N}`, epoch milliseconds), the
+  public call the providers synchronise their clocks to: onedata/oz-worker at 14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55,
+  src/http/rest/routes/provider_routes.erl:192-198 (the route, "does not require any specific privileges"),
+  src/logic/provider_logic_plugin.erl:304-305 (answers `global_clock:timestamp_millis()`) and :491-492 (authorised for
+  any client), src/http/rest/translators/provider_rest_translator.erl:128-129 (the `timeMillis` body) and
+  src/logic/provider_logic.erl:548-554 ("used by providers to synchronize clocks with onezone"). No live run has made
+  it, so it is in `UNVERIFIED_ENDPOINTS`; the `Date` header of the same answer is recorded beside it as a cross-check.
 - The reset (`reset.py`, `eviction.py`, `occupancy.py`) sends a `POST /transfers` eviction of a directory, which covers
   every file under it, confirmed by [L1] (`day0/2026-11-11-federation-facts.md`: the mirror's block map of a file in
   the directory was empty once the directory's eviction ended), and reads a directory's `GET /data/{id}/distribution`
@@ -141,8 +171,11 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   (`day0/2026-11-11-federation-facts-posix-and-fuse.md`). Its other calls no source sends and no live run has made yet,
   named only by Oneprovider 25.0's REST description, so each is in `UNVERIFIED_ENDPOINTS`: `GET
   /data/{id}/qos/summary` (answer `requirements`, keyed by requirement id), `GET` and `DELETE /qos_requirements/{qid}`
-  (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only) and `DELETE
-  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended). A cancel's and a removal's space is read from the
+  (answer `fileId`), `POST /qos_requirements` (body `fileId`, `expression`; a live test's only), `DELETE
+  /transfers/{id}` (a cancel: 204, or 400 for a job that has ended) and, with `[placement] qos_scan = "listing"`, the
+  recursive listing `GET /data/{id}/files` (query `attributes`, `include_directories`, `limit`, `token`; answer
+  `files`, `inaccessiblePaths`, `nextPageToken`), read from op-worker's source (`resetqos.py`). A cancel's and a
+  removal's space is read from the
   record right before the mutation: a transfer's `spaceId`, which [L1] shows in a record, or the space of a
   requirement's `fileId`, found by its parent links (`_record_space`). A caller bound to one space (`space`, a
   provisioner's own) has every target checked against that space alone, its id, its name and its own prefixes.
@@ -155,10 +188,11 @@ caller that measures the platform leaves the default, one attempt. The request t
 gate stays closed: each attempt that is answered is read afresh and decides, and after the last timeout the mutation
 or the range read is refused as not sent (`ScopeUnread`).
 
-No source revokes a token, so this client has no call that does: a token ends with the lifetime it was minted with,
-which derives from the attempt's whole-time ceiling (O06). `UNVERIFIED_ENDPOINTS` lists what neither a source nor
-[L1] confirms: only the reset's QoS calls and its cancel, the truncation by a write of content without an offset, and
-the reads of a user's Onezone admin privileges and of the clusters a token's user is a member of, since [L1] confirmed
+A token ends with the lifetime it was minted with, which derives from the attempt's whole-time ceiling (O06), unless
+its user revokes it first: the one revocation this client sends is a slot user's own, of all its temporary tokens, at
+the end of a run that held the slot (C19). `UNVERIFIED_ENDPOINTS` lists what neither a source nor [L1] confirms: only
+the reset's QoS calls and its cancel, the reads of a user's Onezone admin privileges and of the clusters a token's user
+is a member of, Onezone's reading of the global clock, and the three calls of a run's revocation, since [L1] confirmed
 every other call and detail the layer relies on.
 Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
@@ -191,23 +225,29 @@ AUTH_HEADER = "X-Auth-Token"  # [S2]
 MUTATING = ("POST", "PUT", "PATCH", "DELETE")
 UPLOAD_CONTENT_TYPE = "application/octet-stream"  # of every raw body a mutation sends; [L1]: 25.0 refuses one without
 # POSTs that only read, and whether they are sent with the admin credential: the examination is [S4], [S5], called as
-# an admin; the scope inference is [S6], called without a header.
-READING_POSTS: Mapping[str, bool] = {"/tokens/examine": True, "/tokens/infer_access_token_scope": False}
+# an admin; the scope inference is [S6], called without a header, and so is the verification of an access token, which
+# a revocation is confirmed by (C19).
+VERIFY_TOKEN_PATH = "/tokens/verify_access_token"
+READING_POSTS: Mapping[str, bool] = {
+    "/tokens/examine": True,
+    "/tokens/infer_access_token_scope": False,
+    VERIFY_TOKEN_PATH: False,
+}
+# A user's own temporary tokens: POST mints one, GET reads their generation, DELETE revokes all of them (HTTP Basic).
+TEMPORARY_TOKENS_PATH = "/user/tokens/temporary"
+# Onezone's reading of the global clock, which a job's times are stamped on: a GET it answers to anyone, so `get_dated`
+# sends it with no credential header when asked to (`anonymous`), and for this path alone.
+ZONE_TIME_PATH = "/provider/public/get_current_time"
+PUBLIC_READS: tuple[str, ...] = (ZONE_TIME_PATH,)
 
 # What no source and no live run confirms, or a live run refuted: (method, path, what). Each has a test in
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a writing
-# tool-server user's Onezone admin privileges and of the clusters its token's user is a member of.
+# live run has made yet, the reads of a writing tool-server user's Onezone admin privileges and of the clusters its
+# token's user is a member of, and Onezone's reading of the global clock, which the transfer log and the reset's
+# history place their window by.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
-    (
-        "PUT",
-        "/data/{id}/content",
-        "a provider call: a write without the offset query truncates the file to the bytes it sends, which a "
-        "restarted upload relies on; named only by the provider's API description (25.0), and every source sends an "
-        "offset [S8]",
-    ),
     (
         "DELETE",
         "/transfers/{id}",
@@ -234,6 +274,13 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "GET",
+        "/data/{id}/files",
+        "a provider call: the recursive listing the reset's QoS scan reads with qos_scan = listing, with "
+        "include_directories, which the provider's API description omits, and effQosInheritancePath; read from the "
+        "source of the federation's build (resetqos.py), never sent by a live run, and not the default until it is",
+    ),
+    (
+        "GET",
         "/users/{id}/effective_privileges",
         "a Onezone call with the admin token: a user's effective admin privileges in Onezone under privileges, which "
         "a writing tool-server user must have none of; named only by Onezone's REST description (25.0), which says "
@@ -245,6 +292,34 @@ UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
         "a Onezone call sent as the token being checked: the clusters its user is an effective member of under "
         "clusters, which a writing tool-server user must have none of; named only by Onezone's REST description "
         "(25.0), which says it is for the current user, and by oz-worker's route of that path",
+    ),
+    (
+        "GET",
+        ZONE_TIME_PATH,
+        "a Onezone call sent with no credential: the global clock, which a job's times are stamped on, in epoch "
+        "milliseconds under timeMillis, which the transfer log and the reset's history place their window by; named "
+        "only by oz-worker's source (14b5bda, provider_routes.erl:192-198), which says it needs no privilege",
+    ),
+    (
+        "GET",
+        TEMPORARY_TOKENS_PATH,
+        "a Onezone call sent as the user itself (HTTP Basic): the generation of its temporary tokens under "
+        "generation, read before and after a revocation, which must make it rise; named only by oz-worker's source "
+        "(14b5bda, token_routes.erl:163-169, temporary_token_secret.erl:199-224)",
+    ),
+    (
+        "DELETE",
+        TEMPORARY_TOKENS_PATH,
+        "a Onezone call sent as the user itself (HTTP Basic), with no privilege: revokes every temporary token of "
+        "that user by a new generation, answered 204, at the end of a run that held the user's slot; named only by "
+        "oz-worker's source (14b5bda, token_routes.erl:170-176, token_logic_plugin.erl:330-331, 379-380)",
+    ),
+    (
+        "POST",
+        VERIFY_TOKEN_PATH,
+        "a Onezone call sent with no credential, as the scope inference is: a token older than its user's generation "
+        "answered 400 tokenRevoked before any caveat is checked, which confirms a revocation; named only by "
+        "oz-worker's source (14b5bda, token_logic_plugin.erl:165-176, token_auth.erl:357-364) and ctool's error",
     ),
 )
 # The most parent links the gate follows from a file up to its space's root. A file deeper than this, or links that
@@ -333,6 +408,11 @@ class OutOfScope(NotSent):
     """A mutation's target is no study space, or a path leaves the API; the mutation was not sent."""
 
 
+class TruncatingWrite(OutOfScope):
+    """A write of content without a whole `offset` of 0 or more, which truncates the file to 0 before it writes
+    (op-worker f118ed9, file_content_rest_handler.erl:224-228); refused before anything is read or sent (O44)."""
+
+
 class ScopeUnread(NotSent):
     """A read the gate makes to find a request's target space failed, so the request was not sent (fail closed).
 
@@ -386,6 +466,20 @@ def _check_path(path: str) -> str:
     if not path.startswith("/") or path.startswith("//") or "://" in path or ".." in path.split("/") or "\\" in path:
         raise OutOfScope("the request path is not a plain path of the API")
     return path
+
+
+def _refuse_truncation(method: str, path: str, params: Mapping[str, Any] | None) -> None:
+    """Refuse a write of content (a PUT to a path that ends in `/content`) unless it names a whole offset of 0 or more:
+    without one, the provider truncates the file to 0 first, which would drop the blocks of a file that is still
+    arriving and of any baseline file (O44). An empty body at an offset is a write too, and is sent."""
+    if method != "PUT" or not path.rstrip("/").endswith("/content"):
+        return
+    offset = (params or {}).get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise TruncatingWrite(
+            "a write of content needs a whole offset of 0 or more: without one the provider truncates the file to 0 "
+            "first, so it is never sent"
+        )
 
 
 def _target_space_id(path: str) -> str:
@@ -682,11 +776,26 @@ class OnezoneClient:
             raise PlatformError(f"{self._base(provider)[1]}: {method} answered something that is not JSON") from None
 
     def get_dated(
-        self, path: str, *, provider: str | None = None, params: Mapping[str, Any] | None = None
+        self,
+        path: str,
+        *,
+        provider: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        retry: ReadRetry = ONE_ATTEMPT,
+        anonymous: bool = False,
     ) -> tuple[Any, str | None]:
         """GET as `get` does with the admin credential, and return with the decoded answer its `Date` header as sent,
-        or None when it has none. The transfer log estimates a provider's clock offset from it (`transferlog.py`)."""
-        response = self._request("GET", path, provider=provider, headers=self._admin, params=params, retry=ONE_ATTEMPT)
+        or None when it has none. The transfer log and the reset's history estimate a provider's system-clock offset
+        from it, and read Onezone's global clock through it (`transferlog.py`, `reset.py`). `retry` is the call site's
+        choice, as for `get`: the header is the answered attempt's.
+
+        With `anonymous` the request carries no credential header: it is for the calls Onezone answers to anyone
+        (`PUBLIC_READS`, a path of Onezone's, not a provider's), so a token's caveats can never refuse it; any other
+        path is refused, unsent."""
+        if anonymous and (provider is not None or path not in PUBLIC_READS):
+            raise OutOfScope("only a public read of Onezone's is sent with no credential; nothing was sent")
+        headers = {} if anonymous else self._admin
+        response = self._request("GET", path, provider=provider, headers=headers, params=params, retry=retry)
         return self._decoded(response, "GET", provider), response.headers.get("date")
 
     def get(
@@ -706,8 +815,8 @@ class OnezoneClient:
 
         `retry` is the call site's choice, named by every caller: a `ReadRetry` for the harness's own plumbing, which
         tries a read that timed out again, boundedly and in the log, and `ONE_ATTEMPT` (the default) for whatever
-        measures the platform, so that a timeout stays the recorded timeout it is. It is on `get` alone: no other call
-        of the client takes one. `deadline_s` bounds the whole call, its retries and pauses included (`readretry.py`).
+        measures the platform, so that a timeout stays the recorded timeout it is. Of the plain reads it is on `get`
+        and `get_dated` alone. `deadline_s` bounds the whole call, its retries and pauses included (`readretry.py`).
         """
         headers = {AUTH_HEADER: token} if token is not None else self._admin
         return self._send(
@@ -771,11 +880,17 @@ class OnezoneClient:
         provider's `GET /spaces/{id}`, read once per space and provider and kept once it was answered. An absence
         (`answered_absent`) is a space the provider does not hold, left out and asked again next time; when the
         provider holds none of them, the target resolves to no space (OutOfScope). Any other failure, or an answer
-        without a plain id, raises PlatformError and keeps nothing of that space."""
+        without a plain id, raises PlatformError and keeps nothing of that space. The link check's probe space
+        (`[link_check]`, O35) is asked too, of a provider that supports it, so a probe file resolves to it; only a
+        request bound to it passes the gate there (`_require_in_scope`)."""
         roots: dict[str, str] = {}
         declared = self._config.spaces
         supported = [entry for entry in declared if provider in entry.support.providers] or declared
-        for space_id in dict.fromkeys(entry.space.id for entry in supported):
+        ids = [entry.space.id for entry in supported]
+        probe = self._config.link_check
+        if probe is not None and provider in probe.providers:
+            ids.append(probe.space.id)
+        for space_id in dict.fromkeys(ids):
             root = self._space_root(provider, space_id, reads)
             if root is not None:
                 roots[root] = space_id
@@ -1000,10 +1115,14 @@ class OnezoneClient:
     def _require_in_scope(self, target: tuple[str, str], space: Space | None) -> None:
         """Refuse a target space whose name starts with no declared space's prefix (every `[[spaces]]` entry's), and,
         for a request bound to one space (`space`), a target that is not that space: another id, another name, or a
-        name outside its own prefixes, whatever the other spaces' prefixes allow."""
+        name outside its own prefixes, whatever the other spaces' prefixes allow. A request bound to the link check's
+        probe space (`PlatformConfig.probe_space`, O35) passes on that space alone; no other request reaches it, since
+        its prefixes are not among the study's."""
         space_id, name = target
         if space is not None and (space_id != space.id or name != space.name or not name.startswith(space.prefixes)):
             raise OutOfScope("the target lies in another space than the one the request is bound to; nothing was sent")
+        if space is not None and space == self._config.probe_space:
+            return
         if not name.startswith(self._config.prefixes):
             raise OutOfScope("the target space is not one of the configured prefixes; nothing was sent")
 
@@ -1051,6 +1170,7 @@ class OnezoneClient:
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
+        _refuse_truncation(method, path, params)
         media = UPLOAD_CONTENT_TYPE if content_type is None else media_type(content_type)
         self._base(provider)  # an undeclared provider is refused before anything is read
         self._require_in_scope(self._target(method, path, provider, json, _GateReads(gate_retry)), space)
@@ -1132,9 +1252,11 @@ class OnezoneClient:
         clock: Callable[[], float] = time.monotonic,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        stop: int | None = None,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
-        size and the SHA-256 of what was read (O25).
+        size and the SHA-256 of what was read (O25). With `stop`, only the first `stop` bytes are read, each answer
+        still checked against the file's `size`: the prefix of a file at its final size (O44).
 
         Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
         delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of
@@ -1159,6 +1281,9 @@ class OnezoneClient:
             raise OutOfScope("a content read is of /data/{id}/content only")
         if size < 0 or chunk_bytes < 1 or not deadline_s > 0:
             raise OutOfScope("a streamed read needs its bounds: a size of zero or more, a positive chunk and deadline")
+        end = size if stop is None else stop
+        if not 0 <= end <= size:
+            raise OutOfScope("a streamed read's stop lies within the file's size")
         path = _check_path(path)
         base, label = self._base(provider)
         hasher, began = hashlib.sha256(), clock()
@@ -1174,16 +1299,16 @@ class OnezoneClient:
             if clock() - began > deadline_s:
                 raise PlatformError(late)
 
-        if size == 0:
+        if end == 0:
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
-        for first in range(0, size, chunk_bytes):
+        for first in range(0, end, chunk_bytes):
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
             remaining = deadline_s - (clock() - began)
             if remaining <= 0:
                 raise PlatformError(late)
             wait = min(timeout_s if timeout_s is not None else self._timeout_s, remaining)
-            self._stream_range(base + path, label, (first, min(chunk_bytes, size - first), size), wait, consume)
-        return Digest(size, hasher.hexdigest())
+            self._stream_range(base + path, label, (first, min(chunk_bytes, end - first), size), wait, consume)
+        return Digest(end, hasher.hexdigest())
 
     def _stream_range(
         self, url: str, label: str, span: tuple[int, int, int], wait: float, consume: Callable[[bytes], None]
@@ -1255,23 +1380,46 @@ class OnezoneClient:
         The user authenticates with its own password (HTTP Basic), read from its credential file the moment it is
         needed and registered as a secret, and the minted value is registered before it is returned (R12). [S1]
         """
-        users = self._config.users
-        if users is None:
-            raise MintNotSent("zone: platform.toml declares no [credentials.users], so no user can mint a token")
-        try:
-            password = users.read(principal.username, self._environ)
-        except ConfigError as error:
-            raise MintNotSent(f"zone: a user's credential cannot be used ({error})") from None
-        basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
         body = {"type": {"accessToken": {}}, "caveats": [dict(c) for c in caveats]}
-        answer = self._send(
-            "POST", "/user/tokens/temporary", provider=None, headers={"Authorization": f"Basic {basic}"}, json=body
-        )
+        headers = self._as_user(principal, MintNotSent, "mint a token")
+        answer = self._send("POST", TEMPORARY_TOKENS_PATH, provider=None, headers=headers, json=body)
         value = answer.get("token") if isinstance(answer, dict) else None
         if not isinstance(value, str) or not value:
             raise PlatformError("zone: the answer to a token request holds no token")
         register_secret(value)
         return value
+
+    def own_temporary_generation(self, principal: Principal) -> int:
+        """Read, as the user itself, the generation of its temporary tokens: a whole number that a revocation raises.
+
+        An answer without one is a PlatformError; a user whose credential cannot be read is `NotSent`.
+        """
+        headers = self._as_user(principal, NotSent, "read its tokens")
+        # one attempt: a failed read writes no revoked line, so the slot stays held by its expiry (fail closed)
+        answer = self._send("GET", TEMPORARY_TOKENS_PATH, provider=None, headers=headers, retry=ONE_ATTEMPT)
+        generation = answer.get("generation") if isinstance(answer, dict) else None
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise PlatformError("zone: the answer to a read of a user's temporary tokens holds no generation")
+        return generation
+
+    def revoke_own_temporary_tokens(self, principal: Principal) -> None:
+        """Revoke, as the user itself, every temporary token of that user, and of no other: Onezone gives the user a
+        new generation, so each token of an older one is refused. It needs no privilege; a failure is a PlatformError
+        (`NotSent` when the user's credential cannot be read), and only a later read of the generation confirms it."""
+        headers = self._as_user(principal, NotSent, "revoke its tokens")
+        self._request("DELETE", TEMPORARY_TOKENS_PATH, provider=None, headers=headers)
+
+    def _as_user(self, principal: Principal, refused: type[NotSent], what: str) -> dict[str, str]:
+        """The header that logs in as the user (HTTP Basic), its password read now; `refused` when it cannot be."""
+        users = self._config.users
+        if users is None:
+            raise refused(f"zone: platform.toml declares no [credentials.users], so no user can {what}")
+        try:
+            password = users.read(principal.username, self._environ)
+        except ConfigError as error:
+            raise refused(f"zone: a user's credential cannot be used ({error})") from None
+        basic = base64.b64encode(f"{principal.username}:{password}".encode()).decode()
+        return {"Authorization": f"Basic {basic}"}
 
 
 def tcp_connect(host: str, port: int, timeout_s: float) -> float:

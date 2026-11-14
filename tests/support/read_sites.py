@@ -18,6 +18,8 @@ What counts as reaching a GET, and why nothing that retries can go unseen:
   called (`self._onezone.read_range(...)`, `oz.space_name(...)`): a call that names its keyword is a read with that
   policy, and one that names none is `<missing>` on a receiver named for a client and unclassified on any other, since
   `**options` may carry the policy. The provisioner's own `mutate` (no `gate_retry`) is its helper, below.
+- **The client's dated read** (`get_dated`, which returns the answer's `Date` header too) takes `retry=` as `get` does,
+  and is found on a receiver named for a client: one that names no policy is `<missing>`.
 - **The consistency waits and the occupancy read are found by name**, as `consistency.space_root(...)`, as a name
   imported from the module (an alias included) and as a name handed to `functools.partial`. A reference to one that is
   no call and no partial is unclassified.
@@ -50,7 +52,8 @@ WAITS = {"space_root", "wait_visible", "wait_transfers"}  # the consistency modu
 OCCUPANCY = {"physical_sizes"}  # `occupancy.physical_sizes`, which reads a distribution
 GATED = {"mutate", "read_range", "read_content"}  # client calls whose gate reads under `gate_retry=`
 SPACE_READS = {"space_name", "file_space_id", "file_space_name"}  # client reads that find a space, under `retry=`
-NO_POLICY = {"get_dated", "content_answer"}  # client calls with no policy at all: one attempt by construction
+NO_POLICY = {"content_answer"}  # client calls with no policy at all: one attempt by construction
+DATED = {"get_dated"}  # the client's read that returns its answer's Date header too, under `retry=` as `get` is
 # The client's internal calls into the gate; each passes how the gate reads as its `reads`, last positional or named.
 GATE_INTERNALS = {
     "_target",
@@ -79,6 +82,7 @@ PROVISIONER_HELPERS: dict[str, str | None] = {
     "read_through": None,
     "schedule_transfer": None,
     "replicate": None,
+    "replicate_file": None,
     "evict": None,
     "teardown": None,
     "verify_space": None,
@@ -101,6 +105,7 @@ WATCHED_ATTRS = (
     | GATED
     | SPACE_READS
     | NO_POLICY
+    | DATED
     | GATE_INTERNALS
     | set(PROVISIONER_HELPERS)
     | POLICY_HELPERS
@@ -214,7 +219,7 @@ class _Scanner:
     def _reference(self, node: ast.Attribute | ast.Name, where: str) -> None:
         """A watched name used as a value, which no call follows: the scanner cannot see what is passed to it."""
         name = node.attr if isinstance(node, ast.Attribute) else self.aliases.get(node.id, node.id)
-        watched = WAITS | OCCUPANCY | GATED | SPACE_READS | NO_POLICY | LAYER_RETRIES
+        watched = WAITS | OCCUPANCY | GATED | SPACE_READS | NO_POLICY | DATED | LAYER_RETRIES
         imported_retry = isinstance(node, ast.Name) and name in IMPORTED_RETRIES and node.id in self.aliases
         client_get = isinstance(node, ast.Attribute) and name == "get" and _segment(node.value) in CLIENT_NAMES
         watched_name = name in watched and (isinstance(node, ast.Attribute) or node.id in self.aliases)
@@ -274,7 +279,7 @@ class _Scanner:
             self._read(where, f"http.{attr}", "<streamed>" if attr == "stream" else "<transport>")
         elif attr in GATE_INTERNALS and receiver == "self":
             self._read(where, f"self.{attr}", _reads_of(call))
-        elif attr in GATED | SPACE_READS or (attr in NO_POLICY and _segment(func.value) in CLIENT_NAMES):
+        elif attr in GATED | SPACE_READS or (attr in NO_POLICY | DATED and _segment(func.value) in CLIENT_NAMES):
             self._client_call(call, where, func, classes)
         elif attr in set(PROVISIONER_HELPERS) | POLICY_HELPERS:
             self._provisioner(call, where, func, classes)
@@ -300,9 +305,10 @@ class _Scanner:
         self._read(where, f"self.{attr}(<method>)", _keyword(call, "retry") or NONE)
 
     def _client_call(self, call: ast.Call, where: str, func: ast.Attribute, classes: list[str]) -> None:
-        """A call of the client's gated or space reads, which is the client's on any receiver: it names its policy in
-        `gate_retry=` or `retry=`. Without one it is `<missing>` on a receiver named for a client; elsewhere it may be
-        the provisioner's `mutate`, which takes none, and is otherwise unclassified."""
+        """A call of the client's gated or space reads, which is the client's on any receiver, or of its dated read on
+        a receiver named for a client: it names its policy in `gate_retry=` or `retry=`. Without one it is `<missing>`
+        on a receiver named for a client; elsewhere it may be the provisioner's `mutate`, which takes none, and is
+        otherwise unclassified."""
         attr = func.attr
         if attr in NO_POLICY:
             self._read(where, f"client.{attr}", "<one attempt>")

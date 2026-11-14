@@ -5,10 +5,11 @@ table is added to the platform document without that module knowing it.
 """
 
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.rights import BASELINE_RIGHTS as BASELINE
 from expcore_onedata.sandbox import teardown
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxSpec
 from expcore_onedata.sandbox.hostops import CmdResult
@@ -45,12 +46,18 @@ FAST = teardown.Waits(
 )
 
 
-def slots_data() -> dict[str, Any]:
-    """The default `[slots]` document: two slots, each a lease key with a data-path user and a tool-server user."""
+def slots_data(rights: Mapping[str, Sequence[str]] | None = None) -> dict[str, Any]:
+    """The default `[slots]` document: two slots, each a lease key with a data-path user and a tool-server user. Each
+    tool-server user declares the baseline rights, unless `rights` gives a slot (by its name) others."""
+    declared = rights or {}
     return {
         name: {
             "data_path": {"username": f"{name}-data", "user_id": SLOT_USERS[f"{name}-data"][1]},
-            "toolserver": {"username": f"{name}-tools", "user_id": SLOT_USERS[f"{name}-tools"][1]},
+            "toolserver": {
+                "username": f"{name}-tools",
+                "user_id": SLOT_USERS[f"{name}-tools"][1],
+                "rights": list(declared.get(name, BASELINE)),
+            },
         }
         for name in ("slot-a", "slot-b")
     }
@@ -80,7 +87,7 @@ def sandbox_data() -> dict[str, Any]:
             "shm_bytes": 1 << 26,
             "work_disk_bytes": 1 << 28,
         },
-        "mount": {"path": MOUNT_PATH},
+        "mount": {"path": MOUNT_PATH, "io_mode": "proxy"},  # a mount table declares how oneclient reaches storage (O36)
         "data_paths": {**LEVELS, COMPLETE_LEVEL: {"kind": "rest", "listing": "complete"}},
         "content_check_file": CHECK_FILE,
     }
@@ -133,9 +140,24 @@ def make_spec(world, level="via-gate", *, token=TOKEN, lease_key=None, run_key="
     )
 
 
+class SleptClock:
+    """A clock that moves only by what the code under test sleeps: a cell's deadline counts its graces by the clock, and
+    with the sleeps not real a real clock would make it poll for the whole grace."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(seconds, 0.0)
+
+
 def start_options(world) -> dict:
-    """No sampler thread, no real sleeping, short teardown waits, and the test's own registry."""
-    return {"registry": world.registry, "waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None}
+    """No sampler thread, no real sleeping (a clock moved by the sleeps), short teardown waits, the test's registry."""
+    clock = SleptClock()
+    return {"registry": world.registry, "waits": FAST, "sample_period_s": None, "sleep": clock.sleep, "clock": clock}
 
 
 def is_listing(argv: Sequence[str]) -> bool:

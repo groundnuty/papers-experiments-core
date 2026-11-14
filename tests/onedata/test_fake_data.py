@@ -5,6 +5,7 @@ HTTP requests it answers, and use the public names of `expcore_onedata.testing` 
 """
 
 import base64
+from email.utils import parsedate_to_datetime
 
 import httpx
 import pytest
@@ -40,8 +41,8 @@ def blocks(fake: FakeData, file_id: str, provider: str) -> list[list[int]]:
     return answer["distributionPerProvider"][provider]["distributionPerStorageBackend"]["storage-1"]["blocks"]
 
 
-def run_job(fake: FakeData, provider: str, kind: str, file_id: str) -> None:
-    """Post a replication or an eviction for a provider and read its record until it has ended."""
+def run_job(fake: FakeData, provider: str, kind: str, file_id: str) -> dict:
+    """Post a replication or an eviction for a provider, read its record until it has ended and return the record."""
     field = "evictingProviderId" if kind == "eviction" else "replicatingProviderId"
     made = call(fake, ALPHA_ID, "POST", "/transfers", json={"type": kind, field: provider, "fileId": file_id})
     assert made.status_code == 201
@@ -49,6 +50,7 @@ def run_job(fake: FakeData, provider: str, kind: str, file_id: str) -> None:
     for _ in range(fake.transfer_flip_after + 1):
         record = call(fake, ALPHA_ID, "GET", f"/transfers/{job}").json()
     assert record.get("replicationStatus", record.get("evictionStatus")) == "completed"
+    return record
 
 
 def children(fake: FakeData, provider: str, directory: str = ROOT_ID) -> list[str]:
@@ -77,6 +79,89 @@ def test_each_providers_block_map_follows_a_range_read_a_replication_and_an_evic
     assert blocks(fake, file_id, ALPHA_ID) == [[0, len(DATA)]]
     assert fake.held("study/data.bin", BETA_ID) == []
     assert fake.held("study/data.bin", ALPHA_ID) == [[0, len(DATA)]]
+
+
+def write(fake: FakeData, file_id: str, offset: int | None, body: bytes) -> httpx.Response:
+    params = {} if offset is None else {"offset": offset}
+    return call(fake, ALPHA_ID, "PUT", f"/data/{file_id}/content", params=params, content=body, headers=TYPED)
+
+
+def distribution(fake: FakeData, file_id: str, reader: str = ALPHA_ID) -> dict:
+    return call(fake, reader, "GET", f"/data/{file_id}/distribution").json()["distributionPerProvider"]
+
+
+def test_o44_an_empty_write_past_the_end_extends_the_size_and_writes_no_block():
+    """O44: as op-worker f118ed9 does (read_write_req.erl:58-86, fslogic_blocks.erl:125-126) and the 10 Nov facts
+    measured: an empty body at an offset sets the size to that offset, and every provider's block map keeps only what
+    was written, before the prefix is written and after; the file's physical size is the prefix's."""
+    fake = make_federation(clock=Ticker().clock)
+    file_id = make_on_alpha(fake)
+    assert write(fake, file_id, 8192, b"").status_code == 204
+    assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").json()["size"] == 8192
+    assert (blocks(fake, file_id, ALPHA_ID), blocks(fake, file_id, BETA_ID)) == ([], [])
+    write(fake, file_id, 0, DATA[:1000])
+    write(fake, file_id, 4096, b"")  # inside the size: nothing changes
+    per = distribution(fake, file_id)
+    assert per[ALPHA_ID]["virtualSize"] == 8192
+    assert per[ALPHA_ID]["distributionPerStorageBackend"]["storage-1"] == {"physicalSize": 1000, "blocks": [[0, 1000]]}
+    assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").json()["size"] == 8192
+
+
+def test_o44_an_unwritten_range_reads_as_zeros_and_places_no_block_anywhere():
+    """O44: no provider holds the gap, so a range read of it, through the holder or another provider, answers 206 with
+    zeros at the range's full length and fetches nothing (replica_finder.erl:53-89 keeps only blocks a remote provider
+    holds); a read across the prefix's end places on the reader only the part the holder has."""
+    fake = make_federation(clock=Ticker().clock)
+    file_id = make_on_alpha(fake)
+    write(fake, file_id, 8192, b"")
+    write(fake, file_id, 0, DATA[:1000])
+    for reader in (ALPHA_ID, BETA_ID):
+        read = call(fake, reader, "GET", f"/data/{file_id}/content", headers={"Range": "bytes=4096-8191"})
+        assert (read.status_code, read.content) == (206, bytes(4096))
+        assert read.headers["Content-Range"] == "bytes 4096-8191/8192"
+    assert (blocks(fake, file_id, ALPHA_ID), blocks(fake, file_id, BETA_ID)) == ([[0, 1000]], [])
+    across = call(fake, BETA_ID, "GET", f"/data/{file_id}/content", headers={"Range": "bytes=900-1099"})
+    assert across.content == DATA[900:1000] + bytes(100)
+    assert blocks(fake, file_id, BETA_ID) == [[900, 100]]
+    fake.onthefly_unit = 4096  # a 1 MiB-like window stops at the end of what a provider holds
+    call(fake, BETA_ID, "GET", f"/data/{file_id}/content", headers={"Range": "bytes=0-9"})
+    assert blocks(fake, file_id, BETA_ID) == [[0, 1000]]
+
+
+def test_o44_a_content_write_without_an_offset_truncates_the_file_first():
+    """O44: as the API describes and the source shows (file_content_rest_handler.erl:224-228), which is why the client
+    never sends one: the file's bytes and every provider's blocks are gone before the body is written at 0."""
+    fake = make_federation(clock=Ticker().clock)
+    file_id = make_on_alpha(fake)
+    write(fake, file_id, 8192, b"")
+    write(fake, file_id, 0, DATA[:1000])
+    write(fake, file_id, None, b"xy")
+    assert bytes(fake.nodes[file_id].content) == b"xy"
+    assert blocks(fake, file_id, ALPHA_ID) == [[0, 2]]
+
+
+def test_o44_a_replication_copies_only_what_its_targets_lagging_view_of_the_source_showed():
+    """O44: with `replication_view_lag_s` a replication's target sees the other providers' blocks as they stood that
+    many seconds of `clock` before the job was scheduled, as op-worker f118ed9's synchronizer reads its dbsync copy of
+    their file locations (replica_synchronizer.erl:1370-1372). One scheduled before that copy holds the last write
+    copies only the prefix and still reports completed, with the prefix's bytes; one scheduled once the lag has passed
+    copies the rest. The block map, read through either provider, shows the source's current blocks at once, since each
+    provider answers for its own (data_distribution.erl:184-199), so it shows nothing of the lag."""
+    ticker = Ticker()
+    fake = make_federation(clock=ticker.clock)
+    fake.replication_view_lag_s = 8.0
+    file_id = make_on_alpha(fake)
+    write(fake, file_id, 8192, b"")
+    write(fake, file_id, 0, DATA[:1000])
+    ticker.sleep(30.0)  # the prefix is in every provider's copy
+    write(fake, file_id, 1000, bytes(7192))
+    shown = distribution(fake, file_id, BETA_ID)[ALPHA_ID]["distributionPerStorageBackend"]["storage-1"]["blocks"]
+    assert shown == [[0, 8192]]
+    record = run_job(fake, BETA_ID, "replication", file_id)
+    assert (record["bytesReplicated"], blocks(fake, file_id, BETA_ID)) == (1000, [[0, 1000]])
+    ticker.sleep(8.0)
+    record = run_job(fake, BETA_ID, "replication", file_id)
+    assert (record["bytesReplicated"], blocks(fake, file_id, BETA_ID)) == (7192, [[0, 8192]])
 
 
 def test_an_eviction_that_ends_without_removing_a_block_can_be_scripted():
@@ -326,3 +411,96 @@ def test_asked_for_a_path_a_file_answers_400_as_in_25_0_and_its_attributes_name_
     file_id = fake.add_file("study/data.bin", DATA)
     assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}", params={"attribute": "path"}).status_code == 400
     assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").json()["parent_id"] == fake.id_of("study")
+
+
+# -- the transfer listing's order (O32) ------------------------------------------------------------------------------
+
+
+def listed(fake: FakeData, state: str, limit: int, token: str | None = None) -> dict:
+    """One page of the space's transfer listing in one state, as alpha answers it."""
+    params = {"state": state, "limit": limit, **({"page_token": token} if token else {})}
+    return call(fake, ALPHA_ID, "GET", f"/spaces/{fake.SPACE_ID}/transfers", params=params).json()
+
+
+def test_o32_the_transfer_listing_is_newest_first_and_a_page_resumes_after_its_token():
+    """O32: as on the 25.0 build (op-worker f118ed9, transfer_links.erl:160-164), an ended job is listed by its finish
+    time and a waiting or ongoing one by its schedule time, the newest first, whatever order they were made in; a full
+    page's token resumes the listing right after the last job it gave, and a short page ends it."""
+    fake = make_federation(clock=Ticker().clock)
+    fake.add_file("study/data.bin", DATA)
+    middle = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=100, finished=300)
+    oldest = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=150, finished=200)
+    newest = fake.add_transfer("eviction", "study/data.bin", BETA_ID, scheduled=50, finished=400)
+    late = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=90, ended=False)
+    early = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=500, ended=False)
+    first = listed(fake, "ended", 2)
+    assert first["transfers"] == [newest, middle]
+    assert listed(fake, "ended", 2, first["nextPageToken"]) == {"transfers": [oldest], "nextPageToken": None}
+    assert listed(fake, "ongoing", 10)["transfers"] == [early, late]
+
+
+def test_o32_a_listing_time_puts_a_job_out_of_its_order_for_a_test_of_a_readers_check():
+    """O32: `listing_time` gives the time a job's listing key is built from in place of its record's, so a test can
+    list an old job ahead of newer ones while its record keeps its own finish time."""
+    fake = make_federation(clock=Ticker().clock)
+    fake.add_file("study/data.bin", DATA)
+    old = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=100, finished=100)
+    new = fake.add_transfer("replication", "study/data.bin", BETA_ID, scheduled=200, finished=200)
+    fake.listing_time[old] = 300
+    assert listed(fake, "ended", 10)["transfers"] == [old, new]
+    assert call(fake, ALPHA_ID, "GET", f"/transfers/{old}").json()["finishTime"] == 100
+
+
+# -- Onezone's reading of the global clock, and the Date header of its answers -------------------------------------
+
+ZONE_TIME = "https://onezone.test/api/v3/onezone/provider/public/get_current_time"
+
+
+def zone_time(fake: FakeData, **headers) -> httpx.Response:
+    """Ask Onezone for the global clock, as anyone may: with no credential unless the test names a header."""
+    return fake.respond(httpx.Request("GET", ZONE_TIME, headers=headers))
+
+
+def test_o32_onezones_current_time_answers_the_fakes_clock_in_milliseconds_with_no_credential():
+    """O32: as oz-worker's `get_current_time` does (14b5bda, `provider_routes.erl:192-198`, no privilege needed;
+    `provider_rest_translator.erl:128-129`, the body), the public call answers `{"timeMillis": N}`, the global clock,
+    which is the fake's `clock`, the one a job's times are stamped on. A credential is not needed, and one is
+    accepted."""
+    fake = make_federation(clock=lambda: 1234.5)
+    assert zone_time(fake).status_code == 200
+    assert zone_time(fake).json() == {"timeMillis": 1234500}
+    assert zone_time(fake, **{"X-Auth-Token": fake.admin_token}).json() == {"timeMillis": 1234500}
+    assert [r.token for r in fake.requests if r.path.endswith("get_current_time")] == [None, None, fake.admin_token]
+
+
+def test_o32_the_date_header_of_the_answer_is_onezones_node_clock_not_the_global_one():
+    """O32: the header is the answering node's system clock, which `zone_skew` moves and the global clock does not: a
+    node 8 s ahead dates its answer 1008 while `timeMillis` still says 1000, as a node whose global-clock bias is -8 s
+    does. `zone_date` replaces the header, and None removes it."""
+    fake = make_federation(clock=lambda: 1000.0)
+    fake.zone_skew = 8.0
+    answer = zone_time(fake)
+    assert parsedate_to_datetime(answer.headers["Date"]).timestamp() == 1008.0
+    assert answer.json() == {"timeMillis": 1000000}
+    fake.zone_date = None
+    assert "Date" not in zone_time(fake).headers
+    fake.zone_date = "not a date"
+    assert zone_time(fake).headers["Date"] == "not a date"
+
+
+def test_o32_a_test_can_fail_or_reshape_the_current_time_answer_alone():
+    """O32: `time_status` makes the current-time call alone fail with that status and `time_hook` replaces its body,
+    while every other call of Onezone's goes on answering; `status_override` still fails every call."""
+    fake = make_federation(clock=lambda: 1000.0)
+    fake.time_status = 503
+    assert zone_time(fake).status_code == 503
+    assert (
+        fake.respond(
+            httpx.Request("GET", ZONE_TIME.replace("/provider/public/get_current_time", "/spaces/x"))
+        ).status_code
+        == 401
+    )
+    fake.time_status, fake.time_hook = None, lambda answer: {"timeMillis": answer["timeMillis"] + 5000}
+    assert zone_time(fake).json() == {"timeMillis": 1005000}
+    fake.status_override = 500
+    assert zone_time(fake).status_code == 500

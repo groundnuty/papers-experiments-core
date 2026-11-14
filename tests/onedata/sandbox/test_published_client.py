@@ -167,8 +167,11 @@ def test_o23_the_published_client_lists_and_reads_through_the_gate_with_the_plac
     assert said["sha256"] == hashlib.sha256(FILES["dir/a.bin"]).hexdigest()
     assert TOKEN not in json.dumps(env)
     assert platform.requests, "the platform received nothing"
-    assert {request.token for request in platform.requests} == {TOKEN}
     scope = [request for request in platform.requests if request.path.endswith("infer_access_token_scope")]
     assert scope
+    # O30: the inference carries the gate's token in its body and none in a header (the zone answers 401 to a
+    # data-path token there); every other call carries the gate's token in its header
     assert {json.loads(request.body)["token"] for request in scope} == {TOKEN}
+    assert {request.token for request in scope} == {None}
+    assert {request.token for request in platform.requests if request not in scope} == {TOKEN}
     assert not [r for r in platform.requests if world.s.placeholder_token.encode() in r.body]

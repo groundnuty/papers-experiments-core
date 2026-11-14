@@ -3,9 +3,10 @@
 import ast
 from pathlib import Path
 
+import httpx
 import pytest
 
-from expcore_onedata.client import AUTH_HEADER, OnezoneClient, OutOfScope, PlatformError
+from expcore_onedata.client import AUTH_HEADER, NotSent, OnezoneClient, OutOfScope, PlatformError
 from expcore_onedata.credentials import Principal
 from expcore_onedata.testing import DATA_PATH_USER as DATA
 from expcore_onedata.testing import SPACE_NAME, SPACE_PREFIX
@@ -207,13 +208,57 @@ def test_o09_an_undeclared_provider_is_refused(client, fake):
 
 
 def test_o09_a_user_mints_its_own_token_with_its_own_credential_and_no_other_way_exists(client, fake):
-    """O09: the one credential call logs in as the user (HTTP Basic) at the user's own path; there is no revoke call."""
+    """O09: the mint logs in as the user (HTTP Basic) at the user's own path. The one revocation is the user's own,
+    with the same credential; there is no call that revokes another user's tokens or mints for one."""
     value = client.mint_own_token(DATA, [{"type": "time", "validUntil": 1}])
     sent = fake.requests[-1]
     assert (sent.method, sent.path, sent.token) == ("POST", "/api/v3/onezone/user/tokens/temporary", None)
     assert fake.issued[value]["subject"]["id"] == DATA.user_id
     assert not hasattr(client, "revoke_temporary_tokens")
     assert not hasattr(client, "mint_temporary_token")
+
+
+def test_c19_a_user_reads_and_revokes_its_own_temporary_tokens_with_its_own_credential(client, fake):
+    """C19: the generation is read and the user's temporary tokens revoked as the user itself (HTTP Basic), at the
+    user's own path, with no admin token and no privilege; the revocation raises the generation by one."""
+    value = client.mint_own_token(DATA, [{"type": "time", "validUntil": 1}])
+    before = client.own_temporary_generation(DATA)
+    client.revoke_own_temporary_tokens(DATA)
+    after = client.own_temporary_generation(DATA)
+    assert (before, after) == (1, 2)
+    sent = [(r.method, r.path, r.token) for r in fake.requests[-3:]]
+    assert sent == [
+        ("GET", "/api/v3/onezone/user/tokens/temporary", None),
+        ("DELETE", "/api/v3/onezone/user/tokens/temporary", None),
+        ("GET", "/api/v3/onezone/user/tokens/temporary", None),
+    ]
+    with pytest.raises(PlatformError) as caught:
+        client.query("/tokens/verify_access_token", {"token": value})
+    assert (caught.value.status, caught.value.code) == (400, "tokenRevoked")
+    assert fake.requests[-1].token is None  # the verification is sent with no credential, as the scope's is
+
+
+@pytest.mark.parametrize("answer", [{}, {"generation": "2"}, {"generation": True}, {"generation": -1}, []])
+def test_c19_a_generation_that_is_not_a_whole_number_is_unreadable(config, fake, monkeypatch, answer):
+    respond = fake.respond
+
+    def odd(request):
+        if request.method == "GET" and request.url.path.endswith("/user/tokens/temporary"):
+            return httpx.Response(200, json=answer)
+        return respond(request)
+
+    monkeypatch.setattr(fake, "respond", odd)
+    odd_client = OnezoneClient(config, http=fake.client_http())
+    with pytest.raises(PlatformError, match="generation"):
+        odd_client.own_temporary_generation(DATA)
+
+
+def test_c19_a_user_without_a_credential_file_cannot_revoke_and_nothing_is_sent(client, fake):
+    nobody = Principal("login-nobody", "u-nobody")
+    for call in (client.own_temporary_generation, client.revoke_own_temporary_tokens):
+        with pytest.raises(NotSent, match="credential cannot be used"):
+            call(nobody)
+    assert fake.requests == []
 
 
 def test_o09_a_wrong_password_or_an_unknown_user_gets_no_token_and_the_error_has_no_secret(client, fake, tmp_path):

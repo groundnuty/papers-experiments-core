@@ -27,6 +27,7 @@ SKIP_REASONS = {
     "ended": "not executed: the attempt ended at an earlier call in this turn",
     "time": "not executed: the run's time was used up before this call started",
     "cut": "not completed: the run's time was used up while this call was running",
+    "bound": "not completed: this call outlasted the bound declared for one tool call, and the attempt ended",
     "failed": "not completed: this call failed and the attempt ended",
     "cap": "not executed: the attempt ended on a cap before any call of this reply ran",
 }
@@ -54,6 +55,7 @@ class ToolRun:
         round_no: int,
         started_s: float | None,
         ended_s: float | None,
+        elapsed_s: float | None = None,
         status: str | None = None,
         detail: str = "",
         waited_s: float = 0.0,
@@ -81,6 +83,7 @@ class ToolRun:
             infra_wait_s=waited_s,
             started_s=started_s,
             ended_s=ended_s,
+            elapsed_s=elapsed_s,
             detail=detail,
             source_truncated=self.source_truncated,
             waits_left_open=waits_left_open,

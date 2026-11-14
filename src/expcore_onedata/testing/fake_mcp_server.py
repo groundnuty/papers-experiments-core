@@ -7,12 +7,13 @@
 every description. `--hang` makes the server never speak.
 
 Models: an MCP server over stdio that lists and calls tools, with a small catalogue (`CATALOGUE`: `echo`, `add`, `fail`
-that raises, `crash` that kills the process, and `extra`, a tool nobody froze), the allow-list, and a server that
-hangs. Does not model: any real server's tools, its settings or its behaviour under load; the Onedata server is
-`fake_onedata_mcp`, which is configured from this one.
+that raises, `crash` that kills the process, `extra`, a tool nobody froze, and `stall`, a call the server accepts and
+never answers while it stays up), the allow-list, and a server that hangs. Does not model: any real server's tools, its
+settings or its behaviour under load; the Onedata server is `fake_onedata_mcp`, which is configured from this one.
 """
 
 import argparse
+import asyncio
 import os
 import sys
 import time
@@ -40,12 +41,18 @@ def extra() -> str:
     return "extra"
 
 
+async def stall() -> str:
+    await asyncio.sleep(3600)  # the server stays responsive; only this call never returns
+    return "stalled"
+
+
 CATALOGUE = {
     "echo": (echo, "Echo the text back."),
     "add": (add, "Add two integers."),
     "fail": (fail, "Always fails with the given message."),
     "crash": (crash, "Kills the server."),
     "extra": (extra, "A tool nobody froze."),
+    "stall": (stall, "Accepts the call and never answers it."),
 }
 
 

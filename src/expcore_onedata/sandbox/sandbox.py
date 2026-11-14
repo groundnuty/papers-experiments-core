@@ -17,10 +17,14 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     one-shot containers of the agent image find that bundle and read each one, and the run's copy with the CA appended
     is mounted over it read-only;
   * mount data path: a oneclient sidecar that owns the mount and the token (from a file bound into it alone), exported
-    read-only to the agent through bind propagation; the agent has neither the token, nor FUSE, nor a route to any host;
+    read-only to the agent through bind propagation; the agent has neither the token, nor FUSE, nor a route to any host.
+    oneclient's log goes to `LOG_DIR` of the run's directory (owner-only, a bind), so it is part of the run's evidence
+    and is read from the host: `docker cp` from a running sidecar or gate is never used, since it re-mounts the
+    container's binds;
   * no token is ever given to docker, so `docker inspect` shows none, and the host's file of it goes once its holder has
     started and again at every teardown (`_write_token_file`, `_remove_token_files`); a run killed outright before that
-    leaves it until the next start on the root removes it (`reap.reap_token_files`);
+    leaves it until the next start on the root removes it (`reap.reap_token_files`). Each secret is bound with
+    `--mount`, which refuses a missing source where `-v` makes a directory of it (`containers.bind`);
   * no data path: neither;
   * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
   * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
@@ -53,7 +57,19 @@ from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
-from expcore_onedata.sandbox import copyout, gatelog, gatepolicy, hostops, inputs, kinds, netpool, reap
+from expcore_onedata.sandbox import (
+    copyout,
+    directio,
+    gatelog,
+    gatepolicy,
+    hostops,
+    inputs,
+    kinds,
+    netpool,
+    reap,
+    tokenfiles,
+)
+from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
@@ -70,20 +86,23 @@ from expcore_onedata.sandbox.cells import CellRunner
 from expcore_onedata.sandbox.containers import (
     GATE_CA_PATH,
     GATE_TOKEN_PATH,
-    ONECLIENT_LOG_DIR,
+    SIDECAR_LOG_DIR,
     Names,
     agent_run_args,
     certifi_bundle,
     certifi_probe_args,
-    effective_log_dir,
+    extra_args_record,
     gate_run_args,
     gate_upstreams,
-    sidecar_command,
+    image_config_record,
+    sidecar_abort_args,
+    sidecar_options,
     sidecar_run_args,
     trust_targets,
 )
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
+from expcore_onedata.sandbox.oneclient_args import DIRECT
 from expcore_onedata.sandbox.oneclient_log import summarize as summarize_oneclient_log
 from expcore_onedata.sandbox.registry import DEFAULT, Registry
 from expcore_onedata.sandbox.settings import SandboxSettings
@@ -95,8 +114,10 @@ GATE_FILES = Path(__file__).resolve().parent  # gate.py and its siblings are mou
 MOUNT_RECORDS = "_mounts"  # under the work root: one <sid>.json per sandbox, the mounts it made (C19)
 TOKEN_FILE = Path("sidecar-secret", "oneclient-token")  # under the run directory, owner-only, while the sidecar starts
 GATE_TOKEN_FILE = Path("gate-secret", "gate-token")  # likewise while the gate starts, owned by the gate's user
+LOG_DIR = "oneclient-log"  # under the run directory, owner-only: the sidecar's oneclient logs here, kept as evidence
 GATE_STOP_WAIT_S = 3.0  # how long `collect` waits for a gate that was sent SIGTERM; the gate's own budget is 1 s
 RUN_START_POLLS = 50  # reads of the gate's log, 0.1 s apart, for the mark of the run's start it was signalled to write
+INIT_SLEEP_POLLS = 50  # reads of the agent's cgroup, 0.1 s apart, for the `sleep` its init starts (O34)
 TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TEARDOWN LINE FAILED")  # gate.teardown
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
 NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
@@ -125,9 +146,11 @@ class DockerSandbox:
         sample_period_s: float | None = 1.0,
         sleep: Callable[[float], None] = time.sleep,
         config_sha256: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.host, self.s, self.spec, self.registry = host, settings, spec, registry
         self.waits, self._sample_period, self._sleep = waits or TD.WAITS, sample_period_s, sleep
+        self._clock = clock  # what a cell's deadline counts its graces and its margin by (O34), with `sleep`
         key = spec.lease_key or re.sub(r"[^A-Za-z0-9_.-]", "_", spec.run_key)[:48]
         self.sid = f"{key}-{uuid.uuid4().hex[:8]}"
         self.names = Names.make(settings.name_prefix, self.sid)
@@ -150,7 +173,10 @@ class DockerSandbox:
             "images": {},
             "tls": settings.tls.record(),  # the mode every client of the federation used, a bundle by its hash (O12)
             "certifi": None,  # a REST agent's: `run_ca_added`, or `not_in_image` (O23); never the bundle's path
+            # each cell's deadline: `cell_deadlines`, each bounded by the margin past its cap (deadline.margin_s, O34)
+            "cell_deadline": {"grace_s": settings.kill_grace_s, "margin_s": DL.margin_s(settings.kill_grace_s)},
         }
+        self._meta_lock = threading.RLock()  # a cell's deadline writes here from its timer's thread (cells.py)
         if config_sha256:  # the configuration is named by its hash in a record, never by a value in it (O12)
             self._meta["platform_config_sha256"] = config_sha256
         self._stopped, self._stop_lock = True, threading.Lock()
@@ -165,8 +191,8 @@ class DockerSandbox:
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
-        self._log_dir = ONECLIENT_LOG_DIR
         self.keep_evidence = False
+        self._init_sleep: dict[str, Any] | None = None  # the agent's init's `sleep`, by pid and start time (O34)
         self._uptime0: float | None = None
         self.teardown_log: list[dict] = []
 
@@ -249,8 +275,17 @@ class DockerSandbox:
                 self._ca_bytes = s.tls.bundle()
             except ConfigError as error:
                 raise StartRefused(str(error)) from None
+        if sp.mode is DataPathMode.MOUNT:
+            self._require_storages()
         # in every data path, so an input never differs by condition; a declared one is hashed again here
-        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s))
+        self._inputs = inputs.validate(sp.inputs, inputs.taken_paths(s), storages=inputs.storage_paths(s))
+
+    def _require_storages(self) -> None:
+        """Each storage a direct mount maps must be a directory on this host before anything exists (O40): docker's
+        `--mount` would refuse it only once the sidecar starts. Named by its position, never by its id or path."""
+        for position, (_, path) in enumerate(self.s.mount.storages):
+            if not os.path.isdir(path):
+                raise StartRefused(f"[sandbox.mount.storages] entry {position}: is not a directory on this host")
 
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
@@ -324,12 +359,20 @@ class DockerSandbox:
         share = self._start_mount() if mode is DataPathMode.MOUNT else None
         self._checkpoint()
         self._start_agent(work, share, gate_ip, list(hosts))
+        self._init_sleep = self._identify_init_sleep()  # before any cell: a probe's process would be one more
         self._checkpoint()
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
         if share:
             roles["sidecar"] = self.names.sidecar
-        self._cells = CellRunner(self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started)
+        escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock)
+        self._cells = CellRunner(
+            self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation,
+            stop=self._stop_at_deadline, meta_lock=self._meta_lock,
+        )  # fmt: skip
+        self._cells.init_sleep = self._init_sleep
         self._verify_read_only()
+        if share and s.mount.io_mode == DIRECT:
+            self._verify_direct_io()
         self._verify_inputs()
         self._cells.sample_pids()
         self._start_sampler()
@@ -537,14 +580,31 @@ class DockerSandbox:
         """Remove the host's copies of the data-path token (`only` these, else all), verified: once its holder has
         started it keeps the token itself, so the host keeps none (O05). Run for every copy at every teardown. A run
         killed outright between writing a file and removing it (a healthy start's docker call and wait) leaves it, and
-        the next start on this root removes it once it is several times older than that (`reap.reap_token_files`)."""
-        left = []
-        for path in only or tuple(self._token_files):
-            self.host.run(["rm", "-f", str(path)], 20, sudo=True)
-            if os.path.lexists(path):
-                left.append(path)
-        if left:
-            raise SandboxError(f"{len(left)} of the run's copies of the data-path token could not be removed")
+        the next start on this root removes it once it is several times older than that (`reap.reap_token_files`).
+
+        What `rm -f` leaves is examined, never read (`tokenfiles.remove`): its path in the run's directory, kind, size
+        and owner go in `metadata()["teardown"]["token_files"]`. An empty directory at the path, which a bind made as a
+        missing source (the sandbox now binds with `--mount`, which refuses one), is removed and does not fail the
+        teardown; a file, a link or a directory with an entry in it does, and the error names the path and its kind."""
+        found = [
+            item
+            for path in only or tuple(self._token_files)
+            if (item := tokenfiles.remove(self.host, path, self.dir)) is not None
+        ]
+        if not found:
+            return
+        with self._meta_lock:  # `metadata()` may be reading it from another thread
+            teardown = self._meta.setdefault("teardown", {})
+            teardown["run_directory"] = reap.named_directory(self.dir)  # its id and hash, as a record names one (O12)
+            known = {item["path"]: item for item in teardown.get("token_files", [])}
+            teardown["token_files"] = list({**known, **{item["path"]: item for item in found}}.values())
+        if stuck := tokenfiles.stuck(found):
+            what = ", ".join(f"{item['path']} ({item['type']})" for item in stuck)
+            run_id = reap.named_directory(self.dir)["id"]
+            raise SandboxError(
+                f"{len(stuck)} of the run's copies of the data-path token could not be removed (in run directory "
+                f"{run_id}: {what})"
+            )
 
     def _token_files_left(self) -> bool:
         """Whether any of the run's copies of the token is still on the host: looked at, never assumed from a step."""
@@ -561,18 +621,23 @@ class DockerSandbox:
         self.host.run(["mount", "--make-rshared", str(share)], 60, sudo=True)  # so the sidecar's mount propagates out
         self._note_mounted(share)
         host_name = sp.provider.host
-        command = sidecar_command(host_name, s)
-        self._log_dir = effective_log_dir(command)
         self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
-            "io_mode": s.mount.io_mode,
-            "log_dir_from": "sandbox.mount.extra_args" if self._log_dir != ONECLIENT_LOG_DIR else "default",
+            "io_mode": s.mount.io_mode,  # the declared one, always: oneclient's own detection never runs (O36)
+            "options": sidecar_options(s),  # what the sandbox itself passes to oneclient, in order
+            "extra_args": extra_args_record(s.mount.extra_args),  # the study's, by option name and one hash (O12)
+            "log_dir_from": "sandbox",  # always: `extra_args` may not give oneclient a log directory
             "network": "federation" if s.federation is not None else "default bridge",  # `sidecar_route`'s, by kind
         }
+        if s.mount.io_mode == DIRECT:  # how many storages it reads directly, never an id or a path; the check's below
+            self._meta["mount"]["direct"] = {"storages": len(s.mount.storages), "check": None}
+        log_dir = self.dir / LOG_DIR  # oneclient's log is bound here, owner-only, and kept with the run's evidence
+        log_dir.mkdir(mode=0o700)
+        log_dir.chmod(0o700)  # whatever the driver's umask
         self._register_container(names.sidecar)
         t0 = time.monotonic()
         args = sidecar_run_args(
             s, names, self._label_args(), share, s.oneclient.id, host_name,
-            token_file=self._write_token_file(TOKEN_FILE), ca_copy=self._ca_copy,
+            token_file=self._write_token_file(TOKEN_FILE), log_dir=log_dir, ca_copy=self._ca_copy,
         )  # fmt: skip
         self.host.docker(*args)
         deadline = time.monotonic() + MOUNT_WAIT_S
@@ -584,6 +649,8 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
+        started = self.host.docker("logs", names.sidecar, check=False, timeout=30)  # the entrypoint's one line, first
+        self._meta["mount"]["image_config"] = image_config_record(started.stdout if started.returncode == 0 else None)
         self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
         self.watch_container("sidecar", names.sidecar)
         return share
@@ -645,6 +712,22 @@ class DockerSandbox:
         self._register_container(self.names.agent)
         self.host.docker(*args, env=env)
 
+    def _identify_init_sleep(self) -> dict[str, Any]:
+        """The agent's init's `sleep infinity`, by its pid and start time, read once the container has started and before
+        any cell runs (`teardown.init_sleep`): the one process the kill at a cell's deadline, the quiesce and the
+        teardown spare besides the init. A process of the agent's can name itself `sleep` and be reparented to the init,
+        but it cannot take this start time (O34). The init starts it just after docker returns, so it is looked for a few
+        times; a container whose `sleep` cannot be told from the agent's processes could not bound a cell, so its start
+        fails."""
+        for _ in range(INIT_SLEEP_POLLS):
+            info = TD._inspect(self.host, self.names.agent, self.waits)
+            if info is not None and info["running"] and info["pid"] > 0:
+                found = TD.init_sleep(self.host, info)
+                if found is not None:
+                    return found
+            self._sleep(0.1)
+        raise SandboxError("the agent container's init and its sleep could not be identified at its start")
+
     def _verify_read_only(self) -> None:
         """Prove the root and the mount refuse a write, from inside the agent, and refuse to hand out a sandbox that does not."""
         paths = {"root": "/ro-probe"}
@@ -659,6 +742,57 @@ class DockerSandbox:
                 raise SandboxError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
+
+    def _verify_direct_io(self) -> None:
+        """Show that the direct mount reads the local provider's storage itself, or refuse to hand the sandbox out (O40,
+        `directio`): the agent reads the check file whole, once the mount says the local provider holds all of it,
+        then the sidecar's log must say forced direct, no forced proxy, and hold no line of detection or fallback."""
+        mount = self.s.mount
+        probe = self._cells.run(
+            directio.probe_source(f"{mount.path}/{mount.direct_check_file}"), directio.READ_DEADLINE_S + 30,
+            record=False,
+        )  # fmt: skip
+        text = self._read_sidecar_log()
+        problems, record = directio.judge(
+            directio.parse_probe(probe.stdout), text or "", [storage_id for storage_id, _ in mount.storages]
+        )
+        self._meta["mount"]["direct"]["check"] = record
+        if text is None:
+            problems.insert(0, "the sidecar's oneclient log could not be read")
+        if problems:
+            log.error("direct I/O check: %s", "; ".join(problems))
+            raise SandboxError(f"direct I/O is not in effect for the mount: {'; '.join(problems)}")
+
+    def direct_io_lines(self) -> list[str] | None:
+        """The names of the lines of `directio.MARKERS` the sidecar's log holds now, or None when it could not be read
+        (O40): with a direct mount, any one of them means some read since the start did not go to the storage."""
+        text = self._read_sidecar_log()
+        return None if text is None else directio.marker_lines(text)
+
+    def _direct_io_held(self) -> None:
+        """At collection, show that every read of a direct run went to the storage itself, or set the run aside (O40). A
+        file whose direct read is refused for permissions is read again through the provider (`fsLogic.cc`,
+        `readInternal`), after the start's check passed, and the log is the only trace; an unreadable log is unknown,
+        never direct. The record keeps the names of the lines found (`mount.direct.during_run`)."""
+        lines = self.direct_io_lines()
+        self._meta["mount"]["direct"]["during_run"] = lines
+        if lines is None:
+            raise kinds.collection_error(
+                "the direct mount's log", "the sidecar's oneclient log could not be read, so no read is shown direct"
+            )
+        if lines:
+            raise kinds.collection_error(
+                "the direct mount",
+                f"the sidecar's oneclient logged {', '.join(lines)}: a read did not go to the storage",
+            )
+
+    def _read_sidecar_log(self) -> str | None:
+        """The sidecar's oneclient INFO log, read as root in the sidecar, or None when it could not be read."""
+        found = self.host.docker(
+            "exec", "-u", "0", self.names.sidecar, "cat", f"{SIDECAR_LOG_DIR}/{directio.LOG_FILE}",
+            check=False, timeout=60,
+        )  # fmt: skip
+        return found.stdout if found.returncode == 0 else None
 
     def _snapshot_inputs(self) -> list[tuple[Path, str]]:
         """Copy each read-only input into the run's directory and record its hash, its files and bytes, and its path in
@@ -811,7 +945,13 @@ class DockerSandbox:
         is recorded under `harness_steps` with its exit status, its refusals and the host killer's kills it met, none
         of which the agent's first cell takes. Its only time limit is the backstop `timeout` in the container
         (`CAP_MARGIN_S` after `timeout_s`): the harness's timer, which would stop the agent's processes, is not started,
-        and no kill cause is read."""
+        and no kill cause is read. A step that backstop killed is `timed_out`, with `bound` naming it, as a cell of the
+        agent's is when its timer kills it; a step that exits 137 sooner, by itself, is not (O39, `bounds`).
+
+        A cell's limit is a hard deadline (deadline.py, O34): a process of the cell that outlives its kill has the
+        mount aborted from the sidecar (`_abort_mount`), or the sandbox stopped (`_stop_at_deadline`), and the run is
+        over: every later `exec` and the collection of a stopped run raise `InfraError("cell_unkillable")`."""
+        self._refuse_if_ended()
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
         self._enter(record)
@@ -839,6 +979,64 @@ class DockerSandbox:
                 )
             self._steps_running += 1
 
+    def settle_deadline(self) -> dict[str, Any] | None:
+        """Before anyone decides how the run ended (`launch`, `collect`): a cell still running has its deadline enforced
+        now, and one under way is waited for (`CellRunner.settle`, O34). The record of the deadline that ended the run,
+        or None. It never raises."""
+        return self._cells.settle() if self._cells is not None else None
+
+    def _refuse_if_ended(self, *, unless: tuple[str, ...] = ()) -> None:
+        """Raise `InfraError("cell_unkillable")` once a cell's deadline ended the run (O34), unless it ended as one of
+        `unless`: after an abort the mount is dead, and no later cell may read it as if it were an empty directory."""
+        if self._cells is None:
+            return
+        with self._meta_lock:
+            record = self._cells.ended
+        if record is not None and record["outcome"] not in unless:
+            raise kinds.run_ended_error(record)
+
+    def _abort_mount(self, timeout_s: float) -> dict[str, Any]:
+        """At a cell's deadline, when a process of the cell outlived its kill (O34): abort the run's FUSE connection from
+        the sidecar, which holds the mount and SYS_ADMIN (`containers.sidecar_abort_args`), nothing in the agent's
+        container, within `timeout_s`, what the deadline's margin has left. The connection is the device of the run's
+        mount in the host's table, read without touching the mount. `ok` is None when there is no mount to abort; once it
+        is True the mount is dead for the rest of the run."""
+        if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
+            return {"ok": None, "why": "the run has no FUSE mount"}
+        until = self._clock() + timeout_s
+        found = TD._fuse_at(self.host, TD.host_path(self.dir / "mount"), self.waits)
+        connections = sorted({n for m in found or [] if (n := TD._conn(m["dev"])) is not None})
+        if not connections:
+            return {"ok": None, "why": "the mount's FUSE connection is not in the host's mount table"}
+        failed = []
+        for n in connections:
+            left = min(self.waits.command_s, until - self._clock())
+            if left <= 0:
+                return {"ok": False, "connections": len(connections), "why": "the deadline's margin ran out"}
+            done = self.host.docker(*sidecar_abort_args(self.names, n), check=False, timeout=left)
+            if done.returncode != 0:
+                failed.append(done)
+        note: dict[str, Any] = {"ok": not failed, "connections": len(connections)}
+        if failed:
+            note.update(rc=failed[0].returncode, stderr=stderr_digest(failed[0].stderr))
+            log.error("the sidecar could not abort the mount's FUSE connection: %s", describe_stderr(failed[0].stderr))
+        else:
+            with self._meta_lock:
+                self._meta.setdefault("mount", {})["aborted"] = True  # dead for the rest of the run
+        return note
+
+    def _stop_at_deadline(self) -> dict[str, Any]:
+        """At a cell's deadline, when the abort could not end the cell (O34): stop the sandbox, from the timer's thread,
+        once the deadline's outcome is recorded and the run classified (`cells.CellRunner._stop_after`); the ordered
+        teardown has its own last resorts, and the driver's later stop finds it stopped. A stop that fails is recorded,
+        never raised here."""
+        try:
+            self.stop()
+        except SandboxError as e:
+            log.error("the sandbox could not be stopped at a cell's deadline: %s", describe_error(e))
+            return {"ok": False, "error": "the sandbox's teardown was incomplete"}
+        return {"ok": True}
+
     def _new_refusals(self) -> tuple[str, ...]:
         """The data gate's refusals since the last cell or step; an unreadable log stands for them, unknown never none."""
         lines = self._gate_log_lines()
@@ -859,6 +1057,7 @@ class DockerSandbox:
                 "exit_code": res.exit_code if res.status == RAN else None,
                 "duration_s": res.duration_s,
                 "timed_out": res.timed_out,
+                "bound": res.bound,
                 "gate_refusals": list(res.gate_refusals),
                 "earlyoom_kills": self._cells.step_earlyoom(),
             }
@@ -971,9 +1170,15 @@ class DockerSandbox:
         object named by its path and what it is, never a link's target, under `refused_output` in its result and in the
         metadata, for the study's scorers; the attempt's outcome is the loop's and the scorers'. A collection that fails
         for the harness's own reasons (a container that cannot be frozen, a copy command or the disk failing, a copy
-        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash)
+        that is not what was listed, a gate log that is not a plain file, a read-only input's copy that lost its hash,
+        a direct mount whose log shows a read that did not go to the storage, or cannot be read: O40)
         raises `InfraError` of kind `output_collection`, and the sandbox's disks are then kept when it stops: a source
-        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection."""
+        is never deleted after a failed copy. An agent that could not be shown stopped also fails the collection. A run a
+        cell's deadline stopped, or left with a process that outlived its kill, raises `InfraError("cell_unkillable")`
+        (O34); after the mount's abort alone the outputs are collected as usual. A cell still running has its deadline
+        settled first (`settle_deadline`), so none fires while the agent is frozen and its outputs are copied."""
+        self.settle_deadline()
+        self._refuse_if_ended(unless=(DL.MOUNT_ABORTED,))
         try:
             state = self._cells.quiesce("before collection")
             if not CellRunner.quiet(state):
@@ -1002,6 +1207,8 @@ class DockerSandbox:
         except SandboxError as failed:  # the copy command, the disk or the copy failed: the harness's own failure
             raise kinds.collection_error("the run's outputs", str(failed)) from None
         self._inputs_unchanged()
+        if self.spec.mode is DataPathMode.MOUNT and self.s.mount.io_mode == DIRECT:
+            self._direct_io_held()  # while the sidecar runs: its log is read in it
         self._meta["infra_check"] = check = self.infra_container_check()  # while everything runs
         result: dict[str, Any] = {"outputs": got, "deaths": check["deaths"]}
         if refused is not None:
@@ -1107,7 +1314,7 @@ class DockerSandbox:
         if self.spec.mode is not DataPathMode.MOUNT:
             return None
         r = self.host.docker(
-            "exec", self.names.sidecar, "cat", f"{self._log_dir}/oneclient.INFO", check=False, timeout=60
+            "exec", self.names.sidecar, "cat", f"{SIDECAR_LOG_DIR}/oneclient.INFO", check=False, timeout=60
         )
         if r.returncode != 0:
             return {"unavailable": "the oneclient log could not be read", "stderr": stderr_digest(r.stderr)}
@@ -1116,7 +1323,8 @@ class DockerSandbox:
 
     def metadata(self) -> dict[str, Any]:
         """The facts of the run for its record. Never a secret: tokens are not in it, and the sidecar's log is summarised."""
-        meta = json.loads(json.dumps(self._meta, default=str))
+        with self._meta_lock:  # a cell's deadline may be writing its record from its timer's thread (O34)
+            meta = json.loads(json.dumps(self._meta, default=str))
         if not self._stopped and self._cells is not None:
             meta["cells"] = len(self._cells.cells)
             meta["memory"] = {k: v for k, v in self.obs.memory_facts(self.names.agent).items() if k != "events"}
@@ -1141,7 +1349,10 @@ class DockerSandbox:
         One teardown at a time: the sampler's thread and the driver's `finally` may both stop; the second waits, then
         finds it stopped. A SIGTERM cannot cut it short (termination.py): that would leave what it exists to remove.
         A stop that ran while a start was still creating things does not count as the last: whatever was registered
-        after it began leaves the sandbox not stopped, and `force` runs the teardown again whatever is believed."""
+        after it began leaves the sandbox not stopped, and `force` runs the teardown again whatever is believed. A
+        cell's deadline under way is waited for first, at most its margin, so the teardown never races it (O34)."""
+        if self._cells is not None:
+            self._cells.wait_decided()
         with TERM.sigterm_deferred(), self._stop_lock:
             self._stop_locked(force)
 
@@ -1153,9 +1364,25 @@ class DockerSandbox:
             log.error("teardown step %s failed: %s", getattr(fn, "__name__", "step"), describe_error(e))
             errors.append(f"a teardown step failed ({type(e).__name__})")
 
+    def _step_token_files(self, errors: list[str]) -> None:
+        """The teardown's first step, `_remove_token_files`, with its own message kept in the error the teardown raises:
+        it names the path and kind of what is left (never a content), which an operator needs to find it."""
+        try:
+            self._remove_token_files()
+        except SandboxError as e:
+            log.error("teardown step _remove_token_files failed: %s", describe_error(e))
+            errors.append(str(e))
+        except Exception as e:
+            log.error("teardown step _remove_token_files failed: %s", describe_error(e))
+            errors.append(f"a teardown step failed ({type(e).__name__})")
+
     def _stop_locked(self, force: bool = False) -> None:
         if self._stopped and not force:
             return
+        if self._cells is not None and self._cells.ended is not None:
+            # a run a cell's deadline ended is set aside as infrastructure: its disks are kept, as a failed collection's
+            # are, whichever stop comes first, the deadline's own or the driver's (O34)
+            self.keep_evidence = True
         with self._created_lock:
             created = self._created
         errors: list[str] = []
@@ -1164,7 +1391,7 @@ class DockerSandbox:
         try:
             # first, on every path, a held sandbox's and a kept run's included: a secret is never evidence (O05), and a
             # step below that raises or hangs must find none left on disk
-            self._step(errors, self._remove_token_files)
+            self._step_token_files(errors)
             held: set[str] = set()
             if self.names.sidecar in self._containers:
                 # a oneclient sidecar was started (or tried), also after a failed start: the readers stop, the FUSE
@@ -1172,7 +1399,13 @@ class DockerSandbox:
                 log_path = self.s.work_root / TD.TEARDOWN_LOG_DIR / f"{self.sid}.jsonl"
                 agent = self.names.agent if self.names.agent in self._containers else None
                 res = TD.ordered_fuse_teardown(
-                    self.host, agent, self.names.sidecar, self.dir / "mount", waits=self.waits, log_path=log_path
+                    self.host,
+                    agent,
+                    self.names.sidecar,
+                    self.dir / "mount",
+                    waits=self.waits,
+                    log_path=log_path,
+                    agent_sleep=self._init_sleep,
                 )
                 self.teardown_log = res.log
                 errors.extend(res.errors)
@@ -1218,11 +1451,12 @@ class DockerSandbox:
             self._step(unmount_errors, self.host.unmount, m)
         errors.extend(unmount_errors)
         if self.keep_evidence:
-            self._meta["evidence_kept"] = {
-                "under": "sandbox.work_root",
-                "directory_id": self.sid.rsplit("-", 1)[-1],
-                "relocated": False,
-            }
+            with self._meta_lock:  # `metadata()` may be reading it from another thread
+                self._meta["evidence_kept"] = {
+                    "under": "sandbox.work_root",
+                    "directory_id": self.sid.rsplit("-", 1)[-1],
+                    "relocated": False,
+                }
         if self._mounts_may_be_live(unmount_errors):
             # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
@@ -1231,7 +1465,8 @@ class DockerSandbox:
             )
             return
         if self.keep_evidence and self._token_files_left():  # a secret is never evidence: the run stays where it is
-            self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
+            with self._meta_lock:
+                self._meta["evidence_kept"]["left_in_place"] = "a copy of the data-path token could not be removed"
             errors.append(
                 "the run directory is left where it is: a copy of the data-path token in it could not be removed, "
                 "so it is not kept as evidence"
@@ -1245,7 +1480,8 @@ class DockerSandbox:
             kept = self.s.work_root / "_kept_evidence"
             self._step(errors, lambda: self.host.run(["mkdir", "-p", str(kept)], 20, sudo=True))
             self._step(errors, lambda: self.host.run(["mv", str(self.dir), str(kept / self.sid)], 60, sudo=True))
-            self._meta["evidence_kept"]["relocated"] = True
+            with self._meta_lock:
+                self._meta["evidence_kept"]["relocated"] = True
             if self.dir.exists() or not (kept / self.sid).exists():
                 errors.append("the evidence could not be moved to the place it is kept")
         else:

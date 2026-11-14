@@ -6,11 +6,13 @@ import pytest
 from expcore_onedata.client import (
     MAX_KEPT_LINKS,
     MAX_SPACE_DEPTH,
+    ZONE_TIME_PATH,
     NotSent,
     OnezoneClient,
     OutOfScope,
     PlatformError,
     ScopeUnread,
+    TruncatingWrite,
 )
 from expcore_onedata.testing import DATA, PROVIDER, ROOT_ID, SPACE_NAME
 from expcore_onedata.testing.fake_federation import ZONE
@@ -516,6 +518,42 @@ def test_mutate_sends_query_parameters_and_a_raw_body(config, seeded, client):
     assert sent[0].body == b"\x00\x01"
 
 
+@pytest.mark.parametrize(
+    ("params", "path"),
+    [
+        (None, "/data/{id}/content"),
+        ({}, "/data/{id}/content"),
+        ({"limit": 1}, "/data/{id}/content"),
+        ({"offset": None}, "/data/{id}/content"),
+        ({"offset": -1}, "/data/{id}/content"),
+        ({"offset": True}, "/data/{id}/content"),
+        ({"offset": 1.0}, "/data/{id}/content"),
+        ({"offset": "0"}, "/data/{id}/content"),
+        (None, "/data/{id}/content/"),
+    ],
+)
+def test_o44_a_content_write_without_an_offset_is_refused_before_anything_is_read_or_sent(
+    config, seeded, client, params, path
+):
+    """O44: a write of content without the `offset` query truncates the file to 0 first (op-worker f118ed9,
+    file_content_rest_handler.erl:224-228), so the client refuses it, a whole offset of 0 or more being the only kind
+    it sends: nothing is read for its gate and nothing is sent, and the file keeps its bytes."""
+    file_id = seeded.id_of(PATH)
+    with pytest.raises(TruncatingWrite, match="offset"):
+        client.mutate("PUT", path.format(id=file_id), provider="alpha", params=params, content=b"x")
+    assert seeded.provider_calls == []
+    assert bytes(seeded.nodes[file_id].content) == DATA
+
+
+def test_o44_a_content_write_at_an_offset_and_an_empty_one_are_sent(config, seeded, client):
+    """O44: an offset of 0 or more passes, an empty body too (the write that extends a file's size, #107)."""
+    file_id = seeded.id_of(PATH)
+    client.mutate("PUT", f"/data/{file_id}/content", provider="alpha", params={"offset": 0}, content=b"y")
+    client.mutate("PUT", f"/data/{file_id}/content", provider="alpha", params={"offset": 8192}, content=b"")
+    assert [r.query for r in seeded.requests if r.method == "PUT"] == [{"offset": "0"}, {"offset": "8192"}]
+    assert len(seeded.nodes[file_id].content) == 8192
+
+
 def test_o09_a_raw_body_is_sent_as_an_octet_stream_and_nothing_else_is_marked_so(config):
     """O09: every mutation with a raw body says it is application/octet-stream, as Onedata 25.0 requires (415
     without), whether sent as the admin or as a token; a mutation without one, or with a JSON body, is not marked so."""
@@ -549,3 +587,26 @@ def test_get_sends_repeated_query_parameters(config):
 def test_the_content_of_a_range_read_is_the_files_own_bytes(config, seeded, client):
     file_id = seeded.id_of(PATH)
     assert client.read_range(f"/data/{file_id}/content", provider="beta", offset=2000, length=500) == DATA[2000:2500]
+
+
+def test_o32_an_anonymous_dated_read_sends_no_credential_and_only_to_a_public_path_of_onezone(config):
+    """O32: Onezone's current-time endpoint needs no privilege, so the dated read sends it with no credential header
+    when asked (`anonymous`), where a token's caveats could refuse a header; the answer comes back with its Date
+    header. No other path, and no provider's, is ever sent so: the call is refused, unsent, and the default read still
+    carries the admin credential."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"timeMillis": 5}, headers={"Date": "Thu, 01 Jan 1970 00:16:44 GMT"})
+
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert client.get_dated(ZONE_TIME_PATH, anonymous=True) == ({"timeMillis": 5}, "Thu, 01 Jan 1970 00:16:44 GMT")
+    assert seen[0].url.path == f"{ZONE}{ZONE_TIME_PATH}"
+    assert "x-auth-token" not in seen[0].headers
+    for path, provider in (("/spaces", None), (ZONE_TIME_PATH, "alpha")):
+        with pytest.raises(OutOfScope, match="only a public read"):
+            client.get_dated(path, provider=provider, anonymous=True)
+    assert len(seen) == 1  # nothing was sent for either refusal
+    client.get_dated(ZONE_TIME_PATH)
+    assert "x-auth-token" in seen[1].headers

@@ -19,7 +19,7 @@ from expcore_onedata.sandbox.provider import SandboxPlatform, SandboxProbe
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.testing import NOW
 from expcore_onedata.tokens import TokenRefused
-from expcore_onedata.users import GROUP, JOURNAL, SAFETY_MARGIN_S, TokenJournal
+from expcore_onedata.users import GROUP, JOURNAL, SAFETY_MARGIN_S, TokenJournal, group_of
 
 CEILING_S = 600.0
 KEY = "slot-a"  # the first slot of the platform document: the key a pool grants first
@@ -155,7 +155,7 @@ def test_o05_each_data_path_gets_a_read_only_token_of_its_own_interface_minted_b
     """O05: the leased slot's data-path user mints its own token, with the interface of the path it is for."""
     lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
     sandbox, _ = run_launch(stage, level, lease)
-    mint = [r for r in stage.fake.requests if r.path.endswith("/user/tokens/temporary")][-1]
+    mint = [r for r in stage.fake.requests if r.path.endswith("/user/tokens/temporary") and r.method == "POST"][-1]
     caveats = {c["type"]: c for c in json.loads(mint.body)["caveats"]}
     assert "data.readonly" in caveats
     assert caveats["interface"]["interface"] == interface
@@ -616,7 +616,7 @@ def test_c19_one_lease_key_per_run_serves_both_planes(stage, tmp_path):
         seen["metadata"] = sandbox.metadata()
 
     run_launch(stage, "via-gate", lease, body, ctx, condition="read")
-    assert stage.platform.lease_group(factors) == GROUP
+    assert stage.platform.lease_group(factors) == group_of(stage.config.condition("read").rights)  # O31
     assert seen["tools"] == "the run's tools"
     [started] = launcher.started
     assert seen["data"].subject == slot.data_path.user_id
@@ -627,9 +627,15 @@ def test_c19_one_lease_key_per_run_serves_both_planes(stage, tmp_path):
     )
     assert minted(stage) == [slot.data_path.user_id, slot.tool_server.user_id]
     lines = journal_lines(stage)
-    assert [(line["slot"], line.get("provisional", False)) for line in lines] == [(KEY, True), (KEY, False)]
+    assert [(line["slot"], line.get("provisional", False)) for line in lines] == [
+        (KEY, True),
+        (KEY, False),
+        (KEY, False),
+        (KEY, False),
+    ]
     assert lines[0]["mint"] == lines[1]["mint"]
-    assert seen["data"].expires_at == started.token.expires_at == stage.journal.latest_expiry(KEY)
+    assert seen["data"].expires_at == started.token.expires_at == lines[1]["expires_at"]
+    assert [line["plane"] for line in lines[2:]] == ["revoking", "revoked"]  # the run's end revoked both users' (C19)
     assert stage.journal.latest_expiry("slot-b") is None
     assert seen["metadata"]["tool_server_token"] == {"slot": 0, "expires_at": started.token.expires_at}
 
@@ -641,8 +647,9 @@ def test_c19_a_run_with_a_tool_server_and_no_data_path_leases_a_slot_and_mints_o
     no data-path token."""
     launcher = with_tools(stage)
     factors = {"data_path": "isolated", "tools": "read"}
-    assert stage.platform.lease_group(factors) == GROUP
-    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    group = stage.platform.lease_group(factors)
+    assert group == group_of(stage.config.condition("read").rights)  # the condition's group (O31)
+    lease = lease_pool(stage, tmp_path).acquire(group, run_key="run-1")
     slot = stage.slots.get(lease.key)
     ctx = RecordingContext()
 
@@ -686,7 +693,9 @@ def test_c19_a_run_with_a_tool_server_needs_a_leased_slot(stage):
 
 def test_c19_a_key_is_not_freed_while_its_sandbox_remains_or_a_token_of_its_slot_lives(stage, tmp_path):
     """C19: the platform's probe frees a key only when both halves hold: the sandbox is proven gone and the slot's
-    tokens have ended, by their journalled expiry plus the margin. Either alone keeps it quarantined."""
+    tokens have ended. Here the run's revocation was refused, so they end by their journalled expiry plus the margin.
+    Either half alone keeps it quarantined."""
+    stage.fake.revoke_status = 503
     pool = lease_pool(stage, tmp_path)
     lease = pool.acquire(GROUP, run_key="run-1")
     run_launch(stage, "via-gate", lease)
@@ -843,3 +852,178 @@ def test_o20_launch_refuses_an_input_it_was_not_declared_or_a_record_it_was_not_
         asyncio.run(go([item], None))
     assert not stage.host.containers
     assert not stage.host.networks
+
+
+# ------------------------------------------------------------------------------------- revocation at the run's end
+SETTLE_S = 330  # the default revocation_settle_s of [tokens]
+
+
+def revocation_lines(stage):
+    return [line for line in journal_lines(stage) if line.get("plane") == "revoked"]
+
+
+def test_c19_a_clean_run_revokes_its_slots_tokens_at_its_end_and_its_key_frees_after_the_settle(stage, tmp_path):
+    """C19: the launch's exit revokes the slot users' temporary tokens once the sandbox has stopped, confirms it and
+    journals the settle end; the lease the run finishes is quarantined only until then, about six minutes, and not
+    until its tokens' expiry plus the margin."""
+    pool = lease_pool(stage, tmp_path)
+    lease = pool.acquire(GROUP, run_key="run-1")
+    sandbox, ctx = run_launch(stage, "via-gate", lease)
+    assert ctx.events == [("enter", "sandbox_lifecycle"), ("exit", "sandbox_lifecycle")] * 2  # inside the stop's wait
+    [line] = revocation_lines(stage)
+    assert line["settle_until"] == NOW + SETTLE_S
+    record = sandbox.metadata()["token_revocation"]
+    assert record["revoked"] is True
+    assert record["settle_until"] == NOW + SETTLE_S
+    assert record["generations"] == {"data_path": [1, 2], "tool_server": [1, 2]}
+    assert pool.finish(lease) is False  # the settle has not passed
+    stage.now[0] = NOW + SETTLE_S
+    assert pool.settle_quarantines() == []
+    stage.now[0] = NOW + SETTLE_S + 1
+    assert pool.settle_quarantines() == [KEY]
+    assert stage.now[0] + SAFETY_MARGIN_S < journal_lines(stage)[1]["expires_at"]  # long before the expiry rule
+
+
+def test_c19_the_revocation_comes_after_the_sandbox_is_stopped(stage, tmp_path, monkeypatch):
+    """C19: the slot's tokens are revoked only once nothing of the sandbox runs any more."""
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    revoke_own, seen = stage.issuer.revoke_own, []
+
+    def watched(principal):
+        seen.append((bool(stage.host.containers), bool(stage.host.networks), bool(stage.host.mounts)))
+        return revoke_own(principal)
+
+    monkeypatch.setattr(stage.issuer, "revoke_own", watched)
+    run_launch(stage, "mounted", lease)
+    assert seen == [(False, False, False)] * 2
+
+
+def test_c19_a_tool_server_that_has_not_stopped_blocks_the_revocation(stage, tmp_path):
+    """C19: the tool server's teardown reads its plane again as its token, so the token must outlive it; a launch
+    left while its tool server is still open revokes nothing, and the expiry rule stands."""
+    with_tools(stage)
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    ctx, open_server = RecordingContext(), []
+
+    async def body(sandbox):
+        server = stage.platform.tool_server(ctx, sandbox, ceiling_s=CEILING_S)
+        await server.__aenter__()
+        open_server.append(server)
+
+    sandbox, _ = run_launch(stage, "via-gate", lease, body, ctx, condition="read")
+    assert revocation_lines(stage) == []
+    assert sandbox.metadata()["token_revocation"] == {
+        "revoked": False,
+        "reason": "the run's tool server has not stopped",
+    }
+    assert not [r for r in stage.fake.requests if r.method == "DELETE"]
+    asyncio.run(open_server[0].__aexit__(None, None, None))
+
+
+def test_c19_a_run_with_a_tool_server_revokes_after_the_server_stopped(stage, tmp_path):
+    launcher = with_tools(stage)
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    ctx = RecordingContext()
+
+    async def body(sandbox):
+        async with stage.platform.tool_server(ctx, sandbox, ceiling_s=CEILING_S):
+            pass
+        assert not [r for r in stage.fake.requests if r.method == "DELETE"]  # not while the run's body runs
+
+    run_launch(stage, "via-gate", lease, body, ctx, condition="read")
+    assert launcher.started
+    [line] = revocation_lines(stage)
+    assert line["verified"] == 2  # the data path's token and the tool server's both answered tokenRevoked
+
+
+def test_c19_a_start_thread_still_running_blocks_the_revocation(stage, tmp_path):
+    """C19: a mint or start thread of the key that outlived the launch could mint after the bump, at the new
+    generation, and its token would stay valid: nothing is revoked while one runs, and the expiry rule stands."""
+    stage.platform = SandboxPlatform(
+        stage.config,
+        stage.issuer,
+        stage.host,
+        slots=stage.slots,
+        journal=stage.journal,
+        events=stage.record_event,
+        clock=lambda: stage.now[0],
+        registry=stage.registry,
+        sandbox_options={"waits": FAST, "sample_period_s": None, "sleep": lambda seconds: None},
+        cancel_wait_s=0.05,
+    )
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    entered, release = block_the_agents_docker_run(stage)
+
+    async def go():
+        task, probe, _ = await cancel_mid_start(stage, lease, entered)
+        with pytest.raises(asyncio.CancelledError):
+            await task  # it gave up waiting for the start thread, which still runs
+        revoked = revocation_lines(stage)
+        release.set()
+        deadline = time.monotonic() + 20
+        while probe.resource_gone(lease.key, {}) is not True:
+            assert time.monotonic() < deadline, "the start thread never cleaned up after itself"
+            await asyncio.sleep(0.02)
+        return revoked
+
+    assert asyncio.run(go()) == []
+    assert not [r for r in stage.fake.requests if r.method == "DELETE"]
+
+
+def test_c19_a_sandbox_that_is_not_gone_stays_quarantined_after_its_tokens_are_revoked(stage, tmp_path):
+    """C19: revocation replaces the expiry rule, never the proof that the sandbox is gone."""
+    pool = lease_pool(stage, tmp_path)
+    lease = pool.acquire(GROUP, run_key="run-1")
+
+    async def body(sandbox):
+        stage.host.fail_remove.add(sandbox.names.gate)
+
+    with pytest.raises(InfraError):
+        run_launch(stage, "via-gate", lease, body)
+    assert len(revocation_lines(stage)) == 1  # the tokens were revoked all the same
+    stage.now[0] = NOW + SETTLE_S + 1
+    assert pool.finish(lease) is False  # the gate's container is left
+    stage.host.fail_remove.clear()
+    for name in list(stage.host.containers):
+        stage.host.docker("rm", "-f", name)
+    for name in list(stage.host.networks):
+        stage.host.docker("network", "rm", name)
+    stage.host.mounts.clear()
+    assert pool.settle_quarantines() == [KEY]
+
+
+def test_c19_a_revocation_that_fails_never_fails_the_run_and_leaves_the_expiry_rule(stage, tmp_path):
+    pool = lease_pool(stage, tmp_path)
+    lease = pool.acquire(GROUP, run_key="run-1")
+    stage.fake.revoke_status = 503
+    sandbox, _ = run_launch(stage, "via-gate", lease)
+    assert revocation_lines(stage) == []
+    record = sandbox.metadata()["token_revocation"]
+    assert record["revoked"] is False
+    assert "503" in record["reason"]
+    stage.now[0] = NOW + SETTLE_S + 1
+    assert pool.finish(lease) is False
+    tokens_ended(stage)
+    assert pool.settle_quarantines() == [KEY]
+
+
+def test_c19_a_run_without_a_lease_revokes_nothing(stage):
+    """C19: the fixed `[principals.data_path]` user is shared with day-0, health and the live checks: never revoked."""
+    run_launch(stage, "via-gate")
+    assert not [r for r in stage.fake.requests if r.method != "POST" and r.path.endswith("/user/tokens/temporary")]
+    assert journal_lines(stage) == []
+
+
+def test_c19_a_mint_that_failed_after_a_token_existed_still_revokes_the_slot(stage, tmp_path):
+    """C19: the tool-server user holds other rights than the condition's, so the mint fails after the data path's
+    token exists; the launch revokes the slot's tokens on its way out, so the slot is not held until that token's
+    expiry."""
+    with_tools(stage)
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    stage.fake.grant(stage.slots.get(KEY).tool_server.user_id, ["space_view", "space_read_data", "space_manage_qos"])
+    with pytest.raises(TokenRefused):
+        run_launch(stage, "via-gate", lease, condition="read")
+    assert len(stage.fake.issued) == 1
+    [line] = revocation_lines(stage)
+    assert line["verified"] == 0  # the dropped token was never handed back: the generations alone confirm it
+    assert stage.journal.latest_expiry(KEY) == NOW + SETTLE_S

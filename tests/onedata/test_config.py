@@ -26,6 +26,8 @@ def test_o12_a_good_file_loads_with_every_name_from_the_file(tmp_path, monkeypat
     assert config.condition("read").rights == tuple(sorted(BASELINE))
     assert config.condition("manage").writes
     assert not config.condition("read").writes
+    assert config.condition("manage").manages_qos  # the right `SpaceReset.run(qos_rights=)` is told (O33)
+    assert not config.condition("read").manages_qos
     assert config.condition("manage").allow == ("echo", "add", "fail")
     assert config.admin == SecretSource("env", ADMIN_ENV)
 
@@ -120,7 +122,35 @@ BAD_EDITS = {
         lambda d: d.update(tokens={"max_excess_s": 10, "mint_headroom_s": 20}),
         "mint_headroom_s",
     ),
+    "negative revocation settle": (lambda d: d.update(tokens={"revocation_settle_s": -1}), "revocation_settle_s"),
 }
+
+
+def test_c19_the_revocation_settle_is_330_seconds_unless_the_file_says_otherwise(tmp_path, monkeypatch):
+    """C19: a revoked slot is free once the revocation has had time to reach every provider: a pushed change in
+    seconds, and at most the provider's purge after a lost connection (300 s) plus a session's recheck (15 s)."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    assert load(tmp_path).tokens.revocation_settle_s == 330
+    assert load(tmp_path, lambda d: d.update(tokens={"revocation_settle_s": 600})).tokens.revocation_settle_s == 600
+
+
+@pytest.mark.parametrize("settle", [315, 330])
+def test_c19_a_revocation_settle_at_or_above_the_propagation_bound_is_accepted(tmp_path, monkeypatch, settle):
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    loaded = load(tmp_path, lambda d: d.update(tokens={"revocation_settle_s": settle}))
+    assert loaded.tokens.revocation_settle_s == settle
+
+
+@pytest.mark.parametrize("settle", [0, 314, 314.5, True])
+def test_c19_a_revocation_settle_below_the_propagation_bound_is_refused_naming_it(tmp_path, monkeypatch, settle):
+    """C19: a shorter settle could free a slot while a provider that lost its connection to Onezone still accepts a
+    revoked token from its cache (purged after 300 s) and an open session has not checked it again (every 15 s)."""
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    with pytest.raises(ConfigError, match="revocation_settle_s") as caught:
+        load(tmp_path, lambda d: d.update(tokens={"revocation_settle_s": settle}))
+    assert "at least 315 s" in str(caught.value)
+    assert "300 s" in str(caught.value)
+    assert "15 s" in str(caught.value)
 
 
 @pytest.mark.parametrize("name", sorted(BAD_EDITS))

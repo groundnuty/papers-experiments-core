@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign import reply_cap
+from expcore.campaign import liveness, reply_cap
 from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
@@ -77,6 +77,12 @@ def utc_now() -> dt.datetime:
 def iso(moment: dt.datetime) -> str:
     """Return a time the way the store writes timestamps: ISO 8601 UTC, whole seconds, Z suffix."""
     return moment.astimezone(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _attempt_state(store: Store, attempt_id: int) -> str | None:
+    """The state of an attempt's row in the store, or None when there is none (`liveness.register`)."""
+    rows = store.q("SELECT state FROM attempts WHERE id=?", (attempt_id,))
+    return rows[0]["state"] if rows else None
 
 
 @dataclass(frozen=True)
@@ -133,6 +139,13 @@ class Scheduler:
         missing = [m for m in self.plan_models if m not in self.endpoints]
         if missing:
             raise ValueError(f"the plan runs model(s) {', '.join(missing)} that have no admitted endpoint")
+        # The lease groups of the plan's runs, asked of the platform once, before the store is opened or a model probed:
+        # a platform that can name no group for a run (O31: no slot holds its condition's rights) refuses it here.
+        self.plan_groups: tuple[str, ...] = (
+            tuple(sorted({g for row in manifest.rows if (g := lease_group(row.key.factors)) is not None}))
+            if leases is not None
+            else ()
+        )
         self.settings.check_kinds(schema)
         exclusive = [name for name, value in schema.exclusive.items() if value]
         if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
@@ -141,6 +154,7 @@ class Scheduler:
                 "declares an exclusive run, but the platform gives the campaign no run admission to hold exclusively",
             )
         self.store: Store | None = None
+        self._campaign: str | None = None  # the store's key for the attempts' liveness (`liveness.register`)
         self.recovery: Recovery | None = None
         self.not_admitted: dict[str, str] = {}
         self.stop = threading.Event()
@@ -233,6 +247,7 @@ class Scheduler:
             )
             self.gate.load()
         self._sweep_leases()
+        self._campaign = liveness.register(lambda attempt_id: _attempt_state(store, attempt_id))
         self.runner = AttemptRunner(
             Parts(
                 store=store,
@@ -261,6 +276,7 @@ class Scheduler:
                 ledger=self.ledger,
                 reserved_capped=self._admitted_capped,
                 reply_cap_unheld=self._reply_cap_unheld,
+                campaign=self._campaign,
             )
         )
 
@@ -353,8 +369,7 @@ class Scheduler:
         assert self.store
         if self.leases is None:
             return
-        groups = {g for row in self.manifest.rows if (g := self.lease_group(row.key.factors)) is not None}
-        held_back = self.leases.sweep_dead_holders(groups)
+        held_back = self.leases.sweep_dead_holders(self.plan_groups)
         if held_back:
             self.store.event(
                 self.stamp(),
@@ -378,6 +393,9 @@ class Scheduler:
         gate = getattr(self, "gate", None)
         if gate is not None:
             gate.join()
+        if self._campaign is not None:  # before the store closes: its attempts read as ended from here
+            liveness.unregister(self._campaign)
+            self._campaign = None
         if self.store is not None:
             self.store.close()
             self.store = None

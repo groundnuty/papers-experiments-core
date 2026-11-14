@@ -1,7 +1,7 @@
 # Provenance: new
 """The space privileges a platform principal can hold, as Onezone names them, and which of them write."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 # The space privileges a platform principal can hold, as Onezone names them. The baseline is what the data path has,
 # and what every tool-server principal has beside any write right. The vocabulary is closed so that a typo in a
@@ -17,6 +17,27 @@ WRITE_RIGHTS = (
     "space_cancel_eviction",
 )
 KNOWN_RIGHTS = (*READ_RIGHTS, *WRITE_RIGHTS)
+# The right to add and remove QoS requirements, so to start a replication that creates no transfer document.
+MANAGE_QOS = "space_manage_qos"
+
+
+def declares_qos(rights: Iterable[str]) -> bool:
+    """Tell whether a set of rights holds the right to manage QoS requirements (O33): a run that holds it can leave a
+    replication landing with no requirement to see, so the reset's quiet check must run for the runs since the last
+    verified reset when any of them held it (`SpaceReset.run(qos_rights=)`)."""
+    return MANAGE_QOS in rights
+
+
+def rights_problem(rights: Sequence[str]) -> str | None:
+    """What is wrong with a declared set of rights, as the rest of a message about its key, or None when nothing is.
+
+    A condition's rights and a slot's tool-server user's are declared by the same rules: known rights, each once, the
+    baseline among them."""
+    if len(set(rights)) != len(rights) or any(right not in KNOWN_RIGHTS for right in rights):
+        return f"must list known rights, each once; known: {', '.join(KNOWN_RIGHTS)}"
+    if not all(right in rights for right in BASELINE_RIGHTS):
+        return f"must include {' and '.join(BASELINE_RIGHTS)}"
+    return None
 
 
 def declares_write(rights: Iterable[str]) -> bool:
