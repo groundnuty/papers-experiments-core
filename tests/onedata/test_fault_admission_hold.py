@@ -11,19 +11,21 @@ import threading
 import time
 
 import pytest
-from campaign_support import make_schema
+from campaign_support import keys_under, make_schema, planned_store
 from fault_support import LOCAL_TARGET, SERVICES, FakeServices, injector_for, write_faults
-from heal_support import TARGET, heal_injector, stale
+from heal_support import READER, TARGET, HealServices, heal_injector, stale
 from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings_for
 
 from expcore.campaign.attempts import is_charged
 from expcore.campaign.factors import FactorSchema
+from expcore.campaign.healthgate import DEFER, FOUND, HOLD, HealthGate
 from expcore.errors import InfraError, is_treatable, uncharged_kinds
-from expcore_onedata.admission import FederationBusy, FederationLock, run_admission
+from expcore_onedata.admission import OUTAGE_RUN, FederationBusy, FederationLock, run_admission
 from expcore_onedata.config import load_platform
+from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.faults import INJECTOR_FAILURE, PROVIDER_OUTAGE, load_faults
 
-HOLD = "federation_busy"
+BUSY = "federation_busy"
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
 OTHER_RUN = {"run_key": "task=task-b|model=m1|seed=1", "attempt": 1}
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
@@ -68,13 +70,13 @@ def test_o11_a_wait_for_the_federation_that_runs_out_is_a_hold_that_costs_no_att
         for exclusive in (False, True):
             with pytest.raises(FederationBusy) as caught:
                 lock.acquire(exclusive=exclusive, timeout_s=0.1)
-            assert caught.value.kind == HOLD
+            assert caught.value.kind == BUSY
             assert "past the bound of the wait" in caught.value.detail
     finally:
         holder.close()
-    assert HOLD in uncharged_kinds()
-    assert not is_charged(HOLD)
-    assert not is_treatable(HOLD)
+    assert BUSY in uncharged_kinds()
+    assert not is_charged(BUSY)
+    assert not is_treatable(BUSY)
     assert is_charged(INJECTOR_FAILURE)  # the injector's own failure is charged as before
 
 
@@ -89,7 +91,7 @@ def test_o11_an_injector_whose_own_wait_for_the_federation_runs_out_holds_and_ta
     try:
         with pytest.raises(InfraError) as caught:
             second.start(OTHER_RUN)
-        assert caught.value.kind == HOLD
+        assert caught.value.kind == BUSY
         assert services.running(SERVICES["alpha"]) is True  # its own target was never touched
         assert ("stop", SERVICES["alpha"]) not in services.calls
         assert second.snapshot()["injections"] == []
@@ -125,7 +127,7 @@ def test_o11_waits_for_the_federation_inside_attempts_cost_no_attempt_however_of
                 row["infra_kind"]
                 for row in scheduler.store.q("SELECT infra_kind FROM attempts WHERE run_key=?", (KEY,))
             }
-            assert kinds == {HOLD, None}
+            assert kinds == {BUSY, None}
             assert summary.statuses == {"done": 3}
     finally:
         holder.close()
@@ -218,8 +220,59 @@ def test_o11_a_run_waiting_behind_an_outage_runs_heal_holds_uncharged_and_starts
     thread.join(30)
     assert landed == [True]  # the heal mended every pair and the restore was verified
     assert len(refusals) >= 3
-    assert set(refusals) == {HOLD}
+    assert set(refusals) == {BUSY}
     assert len(unstarted) == len(refusals)
     assert all("no attempt used" in detail for detail in unstarted)
     assert summary.statuses == {"done": 1}
     assert started[0] >= released[0]  # it ran only once the outage run had let the federation go
+
+
+def test_o11_a_health_check_waiting_behind_a_heal_in_progress_defers_and_charges_no_one(tmp_path):
+    """O11, O35: a heal journals its marker (`clear_failed` with `healing`) before its first action, so while it runs
+    the injection reads as `clear_failed`. A health check whose wait runs out then waits behind a legitimate holder,
+    no restore having failed yet: it is deferred and charges no one. Once the heal has failed (a reader gave no
+    pong), the same wait finds the failed restore, as before."""
+    federation = tmp_path / "federation"
+    services = HealServices()
+    services.pong[READER] = False
+    injector, services = heal_injector(federation, services, heal="link", health_wait_s=0.1)
+    settings = load_faults(
+        federation / "platform.toml", load_platform(federation / "platform.toml", require_secrets=False)
+    )
+    readings = []
+    services.on_ping = lambda reader: readings.append(FaultGate(settings, FakeServices())())
+    injector.start(RUN)
+    assert injector.clear() is False  # the heal failed closed, and the injector still holds the federation
+    during, after = readings[0], FaultGate(settings, FakeServices())()
+    assert (during.ok, during.deferred, during.charge) == (False, True, False), during.detail
+    assert (after.ok, after.deferred) == (False, False), after.detail
+    assert TARGET in after.detail
+
+
+def test_o11_a_check_deferred_past_its_bound_behind_an_outage_run_closes_the_gate_and_charges_no_one(tmp_path):
+    """O11: an outage run with a heal can hold the federation longer than `max_defer_s`. A pre-run check deferred
+    past it closes the gate blocking, as for a holder that may never let go, but the run that found it is held, not
+    charged: the wait was contention, so the platform's deferral charges no one."""
+    platform = platform_in(tmp_path / "federation", health_wait_s=0.1)
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    store, schema, manifest = planned_store(campaign)
+    stamps = iter(f"2026-01-01T{hour:02d}:{minute:02d}:00Z" for hour in range(24) for minute in range(0, 60, 10))
+    gate = HealthGate(store, FaultGate(settings, FakeServices()), lambda: next(stamps), max_defer_s=1800)
+    gate.load()
+    key = keys_under(schema, manifest, "mount-read")[0]
+    outage = FederationLock(settings).acquire(exclusive=True, purpose=OUTAGE_RUN, target=TARGET)
+    try:
+        verdicts = [gate.before_run(key).verdict for _ in range(8)]
+    finally:
+        outage.close()
+    assert verdicts[0] == DEFER
+    assert FOUND not in verdicts
+    assert verdicts[-1] == HOLD
+    assert gate.closed
+    assert gate.blocking
+    assert store.q("SELECT COUNT(*) FROM attempts")[0][0] == 0
+    closing = [r["detail"] for r in store.q("SELECT detail FROM events") if "past max_defer_s" in r["detail"]]
+    assert closing
+    assert "no run is charged" in closing[0]
