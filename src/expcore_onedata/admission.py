@@ -25,6 +25,15 @@ that: every admission, shared or exclusive, first takes `federation.intent` excl
 then lets the turnstile go. An outage run waiting for the main lock holds the turnstile, so runs that arrive after it
 queue behind it, and it gets in once the runs that were on the federation at its arrival have finished.
 
+**The session drain (`expcore_onedata.fault_drain`).** An exclusive admission carries a `SessionDrain`. The fault
+injector arms it once a provider it took down is verified restored, and from then the admission's lock is let go only
+after `[faults] session_drain_s` has passed since the later of the run's mount disconnecting and its REST gate stopping
+(the sandbox reports both to it): a read of a file only the stopped provider holds leaves an on-demand sync job that a
+later read of the same file would join and hang on. The wait is the last release's (`Admission._release`), the lock held
+and the holder record in place, so it covers every way the federation is let go: the run's admission at the end of its
+attempt, the injector's own, the health gate's recovery. A shared admission, an exclusive run with no fault and an
+outage run whose provider never went down are armed by nobody and let go at once.
+
 The fault half of the platform's health check, which reads the holder record this module writes, is
 `expcore_onedata.fault_gate.FaultGate`. Whoever takes the federation exclusively (`OUTAGE_RUN`, `INJECTOR` or the
 gate's `RECOVERY`) first writes a holder record beside the lock, whole and fsynced (`fault_journal.HOLDER`): its pid and
@@ -51,6 +60,7 @@ from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.errors import InfraError
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
 from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
@@ -107,6 +117,7 @@ class Admission:
     journal: InjectionJournal | None = None
     record: Mapping[str, Any] | None = None
     shares: _Shares = field(default_factory=_Shares, compare=False, repr=False)
+    drain: SessionDrain | None = field(default=None, compare=False, repr=False)  # exclusive only (`fault_drain`)
 
     @property
     def held(self) -> bool:
@@ -150,11 +161,26 @@ class Admission:
         self._give_up()
 
     def _release(self) -> None:
-        """Let the lock go, its holder record first, so no record outlives a lock let go this way."""
-        if self.journal is not None and self.record is not None and self.held:
-            with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
-                self.journal.clear_holder(self.record["token"])
-        self.lock.close()
+        """Let the lock go, its holder record first, so no record outlives a lock let go this way. An armed drain is
+        waited out first, with the lock held and the record in place (`fault_drain`); whatever stops the wait, the lock
+        is let go, since a process that has been interrupted is about to drop it anyway."""
+        try:
+            if self.drain is not None and self.held:
+                self.drain.wait()
+        finally:
+            if self.journal is not None and self.record is not None and self.held:
+                with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
+                    self.journal.clear_holder(self.record["token"])
+            self.lock.close()
+
+
+async def _close_off_the_loop(admission: Admission) -> None:
+    """Give up the owner's share of an admission; one whose drain is armed waits it out in a worker thread, shielded, so
+    the event loop is never blocked for the drain and a cancellation leaves the lock held until the thread has ended."""
+    if admission.drain is not None and admission.drain.armed:
+        await asyncio.shield(asyncio.to_thread(admission.close))
+    else:
+        admission.close()
 
 
 def current_admission() -> Admission | None:
@@ -174,9 +200,19 @@ class FederationLock:
     """The reader-writer lock of one federation, on `federation.lock` in the fault journal's directory of `[faults]`;
     each admission it grants names that federation (`Federation`)."""
 
-    def __init__(self, settings: FaultSettings, *, poll_s: float = 0.05) -> None:
+    def __init__(
+        self,
+        settings: FaultSettings,
+        *,
+        poll_s: float = 0.05,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """`clock` and `sleep` are those of the session drain of the exclusive admissions it grants (the injector's own
+        replace them when it arms the drain); the waits for the lock itself always run on real time."""
         self.directory, self._poll_s = Path(settings.journal), poll_s
         self.federation = federation_of(settings)
+        self._drain_s, self._clock, self._sleep = settings.session_drain_s, clock, sleep
 
     def _try(self, name: str, mode: int) -> HeldLock | None:
         """Take one of the two lock files in `mode` without waiting; None when another holds it in a conflicting one."""
@@ -219,7 +255,8 @@ class FederationLock:
         except BaseException:
             main.close()
             raise
-        return Admission(True, main, self.federation, journal, record)
+        drain = SessionDrain(self._drain_s, clock=self._clock, sleep=self._sleep)
+        return Admission(True, main, self.federation, journal, record, drain=drain)
 
     def try_acquire(self, *, exclusive: bool, purpose: str = OUTAGE_RUN, target: str | None = None) -> Admission | None:
         """Pass the turnstile and take the lock without waiting; None when either is held against it. `purpose` and
@@ -313,7 +350,7 @@ class FederationLock:
             yield admission
         finally:
             _ADMISSION.reset(token)
-            admission.close()
+            await _close_off_the_loop(admission)
 
     def _require_settled(self) -> None:
         """Under the lock: refuse the run while the journal holds an unsettled injection, or cannot be read."""

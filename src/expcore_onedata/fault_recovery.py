@@ -92,6 +92,8 @@ class FaultDriver(Protocol):
 
 log = logging.getLogger(__name__)
 
+RESTORED = ("restored", "found_restored")  # how a settling ends when a provider that went down is verified back
+
 _WORD = re.compile(r"[A-Za-z_]{1,40}")  # how a settling ended, as a word: nothing else goes into a message
 _TRIED = re.compile(r"[A-Za-z_ ,()\[\]0-9]{1,2000}")  # the heal's actions: words and provider labels, nothing else
 
@@ -187,6 +189,7 @@ class Recovery(LinkSettling):
         self.unreadable = 0  # the readings of the latest `wait` that failed and counted as no answer
         self.links_detail: str | None = None  # why the latest restore's link check failed (O35), names labels only
         self.restore_record: dict[str, Any] = {}  # the latest settling's gate reading and heal record (O35)
+        self.restored = False  # whether the latest `recover` verified a provider back that an earlier run left down
         self._labels = dict(labels or {})
         self._deadline: float | None = None  # while a heal's container restart runs: the clock time it must end by
         self._quiet_until: float | None = None  # the end of the latest settle a heal held: no gate read or check before
@@ -211,6 +214,7 @@ class Recovery(LinkSettling):
         """
         step = on_step or (lambda *args, **kwargs: None)
         held: list[str] = []
+        self.restored = False
         # a heal's container restart of a reader first: while it is down, the injection it healed cannot pass its gate
         for entry in sorted(self.entries(), key=lambda entry: entry.get("heal") is not True):
             target = entry["target"]
@@ -225,6 +229,7 @@ class Recovery(LinkSettling):
                 done, how, after, ready_after_s = self.settle(entry, heal=heal)
             finally:
                 lock.close()
+            self.restored = self.restored or (done and how in RESTORED)  # the caller drains it (`fault_drain`)
             record = dict(self.restore_record)
             step(
                 "recovered",

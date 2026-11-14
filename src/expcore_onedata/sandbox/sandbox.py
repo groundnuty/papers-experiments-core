@@ -52,11 +52,13 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
+from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.sandbox import (
     copyout,
     directio,
@@ -173,6 +175,7 @@ class DockerSandbox:
         self._removed: set[str] = set()
         self._net_removed = False
         self._unmounted: set[Path] = set()
+        self._ends: dict[str, float] = {}  # when the mount and the gate were shown gone, on `time.monotonic`
         self._watched: dict[str, dict[str, Any]] = {}
         self._meta: dict[str, Any] = {
             "run_key": spec.run_key,
@@ -1305,6 +1308,7 @@ class DockerSandbox:
                 state = (hostops.inspect(self.host, self.names.gate) or {}).get("State", {})
                 if state.get("Running") is False:
                     note["exit_code"] = state.get("ExitCode")
+                    self._note_end(GATE)  # its connections to the provider are closed: its requests' processes die
                     break
                 self._sleep(0.1)
             logs = self.host.docker("logs", self.names.gate, check=False, timeout=30)
@@ -1364,6 +1368,27 @@ class DockerSandbox:
             self._cells.wait_decided()
         with TERM.sigterm_deferred(), self._stop_lock:
             self._stop_locked(force)
+
+    def session_kinds(self) -> tuple[str, ...]:
+        """The sessions this sandbox's data path holds on the provider, which a run's admission drains after (`fault_drain`):
+        its mount for a mount, its REST gate for REST, none for a run with no data path."""
+        return {DataPathMode.MOUNT: (MOUNT,), DataPathMode.REST: (GATE,)}.get(self.spec.mode, ())
+
+    def session_ends(self) -> dict[str, float]:
+        """When each session of `session_kinds` was shown ended, on `time.monotonic`: the gate when its stop was
+        confirmed (the collection stops it, else the removal of its container), the mount when the teardown had stopped
+        and removed the oneclient sidecar. A kind the sandbox could not show gone (a stop that failed, was cut, or left
+        the mount live) is absent, and unknown is never zero."""
+        with self._meta_lock:
+            return dict(self._ends)
+
+    def _note_end(self, kind: str) -> None:
+        """Record that a session of this kind is shown ended now; the first moment it was shown stands."""
+        with self._meta_lock:
+            if kind in self._ends:
+                return
+            self._ends[kind] = time.monotonic()
+            self._meta.setdefault("session_ends", {})[kind] = datetime.now(UTC).isoformat(timespec="seconds")
 
     def teardown_left(self) -> dict[str, Any]:
         """What a stop under way has not yet shown removed, for the record of one that was cut at its deadline (O42): the
@@ -1439,17 +1464,25 @@ class DockerSandbox:
                 self.teardown_log = res.log
                 self._removed.update(res.removed)
                 errors.extend(res.errors)
+                if res.fuse_safe and self.names.sidecar in res.removed:
+                    self._note_end(MOUNT)  # oneclient is gone, so its last connection to the provider has closed
                 if not res.fuse_safe:
                     held = {self.names.agent, self.names.sidecar}
             self._teardown_step = "containers"
             for c in reversed(self._containers):
                 if c not in held and self._step(errors, hostops.remove_container, self.host, c):
                     self._removed.add(c)
+                    if c == self.names.gate:
+                        self._note_end(GATE)  # a gate not stopped before (no collection) is gone with its container
             if held:  # the network and the mounts cannot go while those two live: all of it is left for a retry
                 errors.append("the sidecar and the agent are left running with a FUSE mount that could not be released")
             else:
                 self._remove_the_rest(errors)
             complete = not errors
+            if complete:  # a mount or a gate that was never started is nothing left connected
+                for kind, name in ((MOUNT, self.names.sidecar), (GATE, self.names.gate)):
+                    if kind in self.session_kinds() and name not in self._containers:
+                        self._note_end(kind)
         finally:
             with self._created_lock:  # and only if nothing was registered since this teardown began
                 self._stopped = complete and self._created == created

@@ -109,7 +109,8 @@ class FakeServices:
 
 
 def faults_table(**changes: Any) -> dict[str, Any]:
-    """The `[faults]` table of the fixture platform.toml: sanctioned, short waits, both providers' services."""
+    """The `[faults]` table of the fixture platform.toml: sanctioned, short waits (no session drain, which a test of the
+    drain declares), both providers' services."""
     table = {
         "sanctioned": True,
         "journal": "fault-journal",
@@ -120,6 +121,7 @@ def faults_table(**changes: Any) -> dict[str, Any]:
         "ready_timeout_s": 5,
         "clear_attempts": 2,
         "admission_timeout_s": 1,
+        "session_drain_s": 0,
         "services": dict(SERVICES),
     }
     table.update(changes)

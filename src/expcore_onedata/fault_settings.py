@@ -22,6 +22,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     heal = "off"                     # optional: "off", "all_links", "link_then_container" or "link"; see below
     heal_timeout_s = 4200            # optional, provisional: the longest the heal of a stuck link may take in all
     heal_settle_s = 180              # optional, provisional: the no-fetch wait after a heal's restarts
+    session_drain_s = 320            # optional: how long an outage run's admission outlives its sessions; see below
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
@@ -46,6 +47,18 @@ injection open and the federation's exclusive admission held, as a failed restor
 (`expcore_onedata.fault_sessions`): Onezone shows every provider of the probe space online, and a probe file made before
 the injection, its block map read through each peer, has no error entry for the restored provider. Its default, 240 s,
 is the 180 s cap of a peer's session renewal backoff (op-worker f118ed9) and a margin.
+
+`session_drain_s` is how long the federation's exclusive admission of an outage run is kept after the run's mount
+disconnected and its REST gate stopped, whichever is later (`expcore_onedata.fault_drain`). During an outage an agent's
+read of a file only the stopped provider holds leaves an on-demand sync job on the local provider that nothing calls
+back, and a later read of the same file and range, from any session, joins it and hangs. The job is cancelled when the
+run's callers end: a REST read's seconds after its client closes the connection, a mount's about 300 s after oneclient's
+last connection closes (op-worker's `fuse_session_grace_period_seconds`), plus about 15 s when the removal retries
+(`DEFAULT_SESSION_DRAIN_S`, 320 s; source-read of op-worker f118ed9, not measured). Eviction, a transfer cancel,
+deleting the file and a link restart do not cancel it. The wait is the remainder after whatever the restore already
+took, so it overlaps the heal's settle; times that are missing mean the whole drain from the restore's start, never
+zero. It applies only after an outage run: every other run is let go at once. `0` declares no drain, which only a
+federation whose agents never read a file a stopped provider alone holds may choose.
 
 `heal` says what the restore does when a link is stuck after it (`links_stuck`, O35; `expcore_onedata.fault_heal`):
 `"off"` (the default) fails the restore closed, as before. `"all_links"`, the primary mode, restarts the rtransfer link
@@ -90,6 +103,7 @@ DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48
 DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
 DEFAULT_HEAL_TIMEOUT_S = 4200.0  # provisional: four providers' all-links sequence and one container restart fit it
 DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measurement tunes it
+DEFAULT_SESSION_DRAIN_S = 320.0  # op-worker's 300 s mount-session grace, 15 s for a removal that retries, a margin
 HEAL_MODES = ("off", "all_links", "link_then_container", "link")
 _KEYS = (
     "sanctioned",
@@ -109,6 +123,7 @@ _KEYS = (
     "heal",
     "heal_timeout_s",
     "heal_settle_s",
+    "session_drain_s",
     "services",
 )
 
@@ -136,6 +151,7 @@ class FaultSettings:
     heal: str = "off"
     heal_timeout_s: float = DEFAULT_HEAL_TIMEOUT_S
     heal_settle_s: float = DEFAULT_HEAL_SETTLE_S
+    session_drain_s: float = DEFAULT_SESSION_DRAIN_S
     config_sha256: str = ""  # the digest of the platform.toml it was read from: part of the federation's identity
 
 
@@ -200,6 +216,7 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         heal=heal,
         heal_timeout_s=_number(table, "heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S, 0),
         heal_settle_s=_number(table, "heal_settle_s", DEFAULT_HEAL_SETTLE_S, 0),
+        session_drain_s=_number(table, "session_drain_s", DEFAULT_SESSION_DRAIN_S, 0),
         config_sha256=config.sha256,
     )
     uncovered = sorted(heal_participants(config) - set(settings.services))

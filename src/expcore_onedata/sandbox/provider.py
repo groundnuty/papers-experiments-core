@@ -71,10 +71,11 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
-from expcore_onedata.admission import require_admission, retain_admission
+from expcore_onedata.admission import current_admission, require_admission, retain_admission
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
+from expcore_onedata.fault_drain import SessionTicket
 from expcore_onedata.sandbox import gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.gatepolicy import PAGED
@@ -344,6 +345,7 @@ class SandboxPlatform:
         self._declared = {item for items in (read_only_inputs or {}).values() for item in items}
         self._planes: weakref.WeakKeyDictionary[DockerSandbox, _ToolPlane] = weakref.WeakKeyDictionary()
         self._revocable: weakref.WeakKeyDictionary[DockerSandbox, _Revocable] = weakref.WeakKeyDictionary()
+        self._sessions: weakref.WeakKeyDictionary[DockerSandbox, SessionTicket] = weakref.WeakKeyDictionary()
         self._serving: weakref.WeakSet[DockerSandbox] = weakref.WeakSet()  # sandboxes whose tool server runs
 
     def _slots_needed(self, what: str) -> Slots:
@@ -595,6 +597,7 @@ class SandboxPlatform:
                 sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
                 if revoking is not None:  # from here the sandbox's stop revokes them (`_stop`)
                     self._revocable[sandbox] = _Revocable(revoking, tokens)
+                self._begin_sessions(sandbox)  # its mount and gate are drained after, when the run is an outage's
                 ended = self._threads.began(lease.key if lease is not None else None)
                 share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
@@ -727,9 +730,27 @@ class SandboxPlatform:
                 else:
                     self._record_teardown(sandbox, "completed", began)
             finally:
+                self._report_sessions(sandbox)  # whatever the stop did: an end it could not show is not told
                 revocable = self._revocable.pop(sandbox, None)
                 if revocable is not None:
                     await _complete(asyncio.to_thread(self._revoke_now, revocable, sandbox))
+
+    def _begin_sessions(self, sandbox: DockerSandbox) -> None:
+        """Tell the drain of the exclusive admission the run holds which sessions this sandbox will end (its mount, its
+        gate, none), so that an end never reported is known to be missing and the drain waits in full for it
+        (`expcore_onedata.fault_drain`). A shared admission has no drain: nothing is told."""
+        admission = current_admission()
+        if admission is not None and admission.drain is not None:
+            self._sessions[sandbox] = admission.drain.begin(*sandbox.session_kinds())
+
+    def _report_sessions(self, sandbox: DockerSandbox) -> None:
+        """After the sandbox's stop, whatever it did: report to the drain each end the sandbox showed (a gate whose stop
+        was confirmed, a mount whose sidecar was shown gone). A stop that failed, was cut or left the mount live shows
+        none of what it did not, and that end stays unknown."""
+        ticket = self._sessions.pop(sandbox, None)
+        if ticket is not None:
+            for kind, at in sandbox.session_ends().items():
+                ticket.ended(kind, at)
 
     def _record_teardown(
         self, sandbox: DockerSandbox, outcome: str, began: float, left: Mapping[str, Any] | None = None

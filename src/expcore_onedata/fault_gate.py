@@ -24,7 +24,8 @@ too; only an acquisition of the lock, which proves it usable, clears it.
 """
 
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -79,9 +80,18 @@ def _unsettled(entries: list[dict[str, Any]]) -> Health:
 class FaultGate:
     """The fault half of the platform's standard health check, around the rest of it (see the module docstring)."""
 
-    def __init__(self, settings: FaultSettings, driver: FaultDriver, inner: HealthCheck | None = None) -> None:
-        self._lock = FederationLock(settings)
-        self._recovery = Recovery(settings, driver)
+    def __init__(
+        self,
+        settings: FaultSettings,
+        driver: FaultDriver,
+        inner: HealthCheck | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._clock, self._sleep, self._drain_s = clock, sleep, settings.session_drain_s
+        self._lock = FederationLock(settings, clock=clock, sleep=sleep)
+        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep)
         self._journal = self._recovery.journal
         self._may_recover = settings.sanctioned is True
         self._wait_s = settings.health_wait_s
@@ -96,9 +106,12 @@ class FaultGate:
             if self._recovery.entries() and self._may_recover:
                 exclusive = self._lock.try_acquire(exclusive=True, purpose=RECOVERY)
                 if exclusive is not None:  # no run is on the federation: settle what is left
+                    began = self._clock()
                     try:
                         self._recovery.recover()
-                    finally:
+                    finally:  # a provider it brought back went down in a run it knows nothing of: drain in full
+                        if self._recovery.restored and self._drain_s > 0 and exclusive.drain is not None:
+                            exclusive.drain.arm(began, clock=self._clock, sleep=self._sleep)
                         exclusive.close()
             try:
                 shared = self._lock.acquire(exclusive=False, timeout_s=self._wait_s)

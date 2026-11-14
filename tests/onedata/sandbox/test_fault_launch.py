@@ -12,15 +12,18 @@ import time
 
 import pytest
 from fake_host import FakeHost
-from fault_support import FakeServices, faults_table, injector_for
+from fault_support import OUTAGE_TARGET, FakeServices, faults_table, injector_for
 from sandbox_support import FAST, add_sandbox
 
 from expcore.campaign.lease import LeasePool
-from expcore_onedata.admission import AdmissionRefused, FederationLock
+from expcore.errors import InfraError
+from expcore_onedata.admission import OUTAGE_RUN, AdmissionRefused, FederationLock
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
+from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.provider import SandboxPlatform
 from expcore_onedata.sandbox.registry import Registry
+from expcore_onedata.sandbox.sandbox import DockerSandbox
 from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.users import GROUP, TokenJournal
 
@@ -34,7 +37,7 @@ def config(tmp_path, fake):
 
     def edit(data):
         add_sandbox(data)
-        data["faults"] = faults_table(admission_timeout_s=10)
+        data["faults"] = faults_table(admission_timeout_s=10, session_drain_s=320)
 
     return load_platform(write_platform(tmp_path, edit))
 
@@ -185,3 +188,78 @@ def test_o11_a_cancelled_launch_whose_start_thread_outlives_its_wait_keeps_the_f
 
     asyncio.run(go())
     assert seen == [True] * 5
+
+
+# --- the sandbox's sessions reported to the admission's drain (the session drain of an outage restore) -------------
+
+
+def draining_lock(config):
+    """The federation's lock whose exclusive admissions drain on the real clock but never really sleep: a test that
+    leaves an armed drain would otherwise wait out the 320 s."""
+    return FederationLock(load_faults(config.file, config), sleep=lambda seconds: None)
+
+
+def lease_for(built, tmp_path):
+    pool = LeasePool(tmp_path / "leases", built.lease_keys, built.probe(), clock=lambda: 0.0, sleep=lambda s: None)
+    return pool.acquire(GROUP, run_key="run-1")
+
+
+@pytest.mark.parametrize(("level", "kind"), [("via-gate", "gate_stop"), ("mounted", "mount_end")])
+def test_o11_a_launch_reports_its_sandboxs_session_end_to_the_exclusive_admissions_drain(
+    platform, config, tmp_path, level, kind
+):
+    """O11: the sandbox begins its mount or its gate with the drain of the exclusive admission the run holds, and the
+    launch's exit, once the stop has shown it gone, reports the time it ended: the drain then runs from it."""
+    built, host, _ = platform
+    lock = draining_lock(config)
+    lease = lease_for(built, tmp_path)
+    with lock.held(exclusive=True, purpose=OUTAGE_RUN, target=OUTAGE_TARGET) as admission:
+        admission.drain.arm(restore_started=time.monotonic())
+        assert admission.drain.plan().basis == "restore_start"  # nothing has ended: unknown
+        before = time.monotonic()
+        asyncio.run(launched(built, TimedContext(), level=level, lease=lease))
+        plan = admission.drain.plan()
+        assert plan.basis == "session_end"
+        assert before <= getattr(plan, kind) <= time.monotonic()
+    assert not host.containers
+
+
+def test_o11_a_launch_of_a_sandbox_with_no_data_path_leaves_no_session_to_drain(platform, config):
+    """O11: no mount and no gate: the sandbox begins no session, and the drain has nothing to wait for."""
+    built, _, _ = platform
+    lock = draining_lock(config)
+    with lock.held(exclusive=True, purpose=OUTAGE_RUN, target=OUTAGE_TARGET) as admission:
+        admission.drain.arm(restore_started=time.monotonic())
+        asyncio.run(launched(built, TimedContext(), level="isolated"))
+        assert admission.drain.plan().basis == "no_session"
+
+
+def test_o11_a_launch_under_a_shared_admission_reports_nothing_and_still_runs(platform, config, tmp_path):
+    """O11: a baseline run holds the federation shared, which has no drain: its sandbox starts and stops as before."""
+    built, host, _ = platform
+    lock = draining_lock(config)
+    with lock.held(exclusive=False) as admission:
+        assert admission.drain is None
+        asyncio.run(launched(built, TimedContext(), level="via-gate", lease=lease_for(built, tmp_path)))
+    assert not host.containers
+
+
+def test_o11_a_stop_that_fails_leaves_the_sessions_end_unknown_and_the_drain_in_full(
+    platform, config, tmp_path, monkeypatch
+):
+    """O11: a sandbox whose stop raised shows no end of its gate: the drain is unknown, not zero, and runs from the
+    restore's start."""
+    built, _, _ = platform
+    lock = draining_lock(config)
+
+    def failing(self, *, force=False):
+        raise SandboxError("the sandbox could not be removed")
+
+    monkeypatch.setattr(DockerSandbox, "stop", failing)
+    with lock.held(exclusive=True, purpose=OUTAGE_RUN, target=OUTAGE_TARGET) as admission:
+        admission.drain.arm(restore_started=time.monotonic())
+        with pytest.raises(InfraError):
+            asyncio.run(launched(built, TimedContext(), level="via-gate", lease=lease_for(built, tmp_path)))
+        plan = admission.drain.plan()
+        assert plan.basis == "restore_start"
+        assert "gate" in plan.why
