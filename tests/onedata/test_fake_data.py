@@ -80,6 +80,65 @@ def test_each_providers_block_map_follows_a_range_read_a_replication_and_an_evic
     assert fake.held("study/data.bin", ALPHA_ID) == [[0, len(DATA)]]
 
 
+def write(fake: FakeData, file_id: str, offset: int | None, body: bytes) -> httpx.Response:
+    params = {} if offset is None else {"offset": offset}
+    return call(fake, ALPHA_ID, "PUT", f"/data/{file_id}/content", params=params, content=body, headers=TYPED)
+
+
+def distribution(fake: FakeData, file_id: str, reader: str = ALPHA_ID) -> dict:
+    return call(fake, reader, "GET", f"/data/{file_id}/distribution").json()["distributionPerProvider"]
+
+
+def test_o44_an_empty_write_past_the_end_extends_the_size_and_writes_no_block():
+    """O44: as op-worker f118ed9 does (read_write_req.erl:58-86, fslogic_blocks.erl:125-126) and the 10 Nov facts
+    measured: an empty body at an offset sets the size to that offset, and every provider's block map keeps only what
+    was written, before the prefix is written and after; the file's physical size is the prefix's."""
+    fake = make_federation(clock=Ticker().clock)
+    file_id = make_on_alpha(fake)
+    assert write(fake, file_id, 8192, b"").status_code == 204
+    assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").json()["size"] == 8192
+    assert (blocks(fake, file_id, ALPHA_ID), blocks(fake, file_id, BETA_ID)) == ([], [])
+    write(fake, file_id, 0, DATA[:1000])
+    write(fake, file_id, 4096, b"")  # inside the size: nothing changes
+    per = distribution(fake, file_id)
+    assert per[ALPHA_ID]["virtualSize"] == 8192
+    assert per[ALPHA_ID]["distributionPerStorageBackend"]["storage-1"] == {"physicalSize": 1000, "blocks": [[0, 1000]]}
+    assert call(fake, ALPHA_ID, "GET", f"/data/{file_id}").json()["size"] == 8192
+
+
+def test_o44_an_unwritten_range_reads_as_zeros_and_places_no_block_anywhere():
+    """O44: no provider holds the gap, so a range read of it, through the holder or another provider, answers 206 with
+    zeros at the range's full length and fetches nothing (replica_finder.erl:53-89 keeps only blocks a remote provider
+    holds); a read across the prefix's end places on the reader only the part the holder has."""
+    fake = make_federation(clock=Ticker().clock)
+    file_id = make_on_alpha(fake)
+    write(fake, file_id, 8192, b"")
+    write(fake, file_id, 0, DATA[:1000])
+    for reader in (ALPHA_ID, BETA_ID):
+        read = call(fake, reader, "GET", f"/data/{file_id}/content", headers={"Range": "bytes=4096-8191"})
+        assert (read.status_code, read.content) == (206, bytes(4096))
+        assert read.headers["Content-Range"] == "bytes 4096-8191/8192"
+    assert (blocks(fake, file_id, ALPHA_ID), blocks(fake, file_id, BETA_ID)) == ([[0, 1000]], [])
+    across = call(fake, BETA_ID, "GET", f"/data/{file_id}/content", headers={"Range": "bytes=900-1099"})
+    assert across.content == DATA[900:1000] + bytes(100)
+    assert blocks(fake, file_id, BETA_ID) == [[900, 100]]
+    fake.onthefly_unit = 4096  # a 1 MiB-like window stops at the end of what a provider holds
+    call(fake, BETA_ID, "GET", f"/data/{file_id}/content", headers={"Range": "bytes=0-9"})
+    assert blocks(fake, file_id, BETA_ID) == [[0, 1000]]
+
+
+def test_o44_a_content_write_without_an_offset_truncates_the_file_first():
+    """O44: as the API describes and the source shows (file_content_rest_handler.erl:224-228), which is why the client
+    never sends one: the file's bytes and every provider's blocks are gone before the body is written at 0."""
+    fake = make_federation(clock=Ticker().clock)
+    file_id = make_on_alpha(fake)
+    write(fake, file_id, 8192, b"")
+    write(fake, file_id, 0, DATA[:1000])
+    write(fake, file_id, None, b"xy")
+    assert bytes(fake.nodes[file_id].content) == b"xy"
+    assert blocks(fake, file_id, ALPHA_ID) == [[0, 2]]
+
+
 def test_an_eviction_that_ends_without_removing_a_block_can_be_scripted():
     fake = make_federation(clock=Ticker().clock)
     file_id = fake.add_file("study/data.bin", DATA)

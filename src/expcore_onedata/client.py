@@ -137,8 +137,13 @@ after the gate's walk by parent links, with the reads that walk rests on and the
   which only the status and the `Content-Type` are read: the type it measures (`precampaign.py`),
   `application/octet-stream` for both, is confirmed by [L1]. `read_content` is a run of range reads, each streamed and
   hashed as it comes (O25).
-- A write of content without the `offset` query, which truncates the file first and which a restarted upload relies
-  on: only the provider's API description states it, and no source sends it; see `UNVERIFIED_ENDPOINTS`.
+- A write of content always names its `offset`: without one the provider truncates the file to 0 first (op-worker
+  f118ed9, file_content_rest_handler.erl:224-228), so `mutate` refuses it unsent
+  (`TruncatingWrite`, O44). An empty body at an offset past the file's end extends its size to that offset and writes
+  no block: measured on the Compose federation (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A
+  file at its final size with only a prefix written": a 204, the size read back, the block map the prefix alone), and
+  traced in op-worker f118ed9 (file_upload_utils.erl:136-150, read_write_req.erl:58-86, replica_updater.erl:187-192,
+  fslogic_blocks.erl:125-126, which drops the zero-size block). A preallocated ingest relies on it (#107).
 - `file_space_id`: `GET /data/{id}` with the query `attribute=parent_id`, answered `{"parent_id": <id>}`, and
   `{"parent_id": null}` for a space's root. Confirmed by [L1] (a file two levels down, its directory and the root, on
   each of the three providers), which also refuted the `path` attribute the gate read before: [S9], the earlier
@@ -186,9 +191,9 @@ or the range read is refused as not sent (`ScopeUnread`).
 A token ends with the lifetime it was minted with, which derives from the attempt's whole-time ceiling (O06), unless
 its user revokes it first: the one revocation this client sends is a slot user's own, of all its temporary tokens, at
 the end of a run that held the slot (C19). `UNVERIFIED_ENDPOINTS` lists what neither a source nor [L1] confirms: only
-the reset's QoS calls and its cancel, the truncation by a write of content without an offset, the reads of a user's
-Onezone admin privileges and of the clusters a token's user is a member of, Onezone's reading of the global clock, and
-the three calls of a run's revocation, since [L1] confirmed every other call and detail the layer relies on.
+the reset's QoS calls and its cancel, the reads of a user's Onezone admin privileges and of the clusters a token's user
+is a member of, Onezone's reading of the global clock, and the three calls of a run's revocation, since [L1] confirmed
+every other call and detail the layer relies on.
 Each entry, and each call [L1] confirmed, keeps its live contract test (`tests/live/test_contract.py`), which fails if a
 deployment answers otherwise.
 """
@@ -239,17 +244,10 @@ PUBLIC_READS: tuple[str, ...] = (ZONE_TIME_PATH,)
 # tests/live/test_contract.py marked `covers:` with its method and path; a unit test holds that none is missing there.
 # The entries [L1] confirmed left the list, and so did the `path` attribute it refuted, which the gate no longer reads;
 # their live tests stay, so a later release that answers otherwise fails. What is left are the reset's calls that no
-# live run has made yet, the truncating write of content an upload's restart relies on, and the reads of a writing
-# tool-server user's Onezone admin privileges and of the clusters its token's user is a member of, and Onezone's
-# reading of the global clock, which the transfer log and the reset's history place their window by.
+# live run has made yet, the reads of a writing tool-server user's Onezone admin privileges and of the clusters its
+# token's user is a member of, and Onezone's reading of the global clock, which the transfer log and the reset's
+# history place their window by.
 UNVERIFIED_ENDPOINTS: tuple[tuple[str, str, str], ...] = (
-    (
-        "PUT",
-        "/data/{id}/content",
-        "a provider call: a write without the offset query truncates the file to the bytes it sends, which a "
-        "restarted upload relies on; named only by the provider's API description (25.0), and every source sends an "
-        "offset [S8]",
-    ),
     (
         "DELETE",
         "/transfers/{id}",
@@ -410,6 +408,11 @@ class OutOfScope(NotSent):
     """A mutation's target is no study space, or a path leaves the API; the mutation was not sent."""
 
 
+class TruncatingWrite(OutOfScope):
+    """A write of content without a whole `offset` of 0 or more, which truncates the file to 0 before it writes
+    (op-worker f118ed9, file_content_rest_handler.erl:224-228); refused before anything is read or sent (O44)."""
+
+
 class ScopeUnread(NotSent):
     """A read the gate makes to find a request's target space failed, so the request was not sent (fail closed).
 
@@ -463,6 +466,20 @@ def _check_path(path: str) -> str:
     if not path.startswith("/") or path.startswith("//") or "://" in path or ".." in path.split("/") or "\\" in path:
         raise OutOfScope("the request path is not a plain path of the API")
     return path
+
+
+def _refuse_truncation(method: str, path: str, params: Mapping[str, Any] | None) -> None:
+    """Refuse a write of content (a PUT to a path that ends in `/content`) unless it names a whole offset of 0 or more:
+    without one, the provider truncates the file to 0 first, which would drop the blocks of a file that is still
+    arriving and of any baseline file (O44). An empty body at an offset is a write too, and is sent."""
+    if method != "PUT" or not path.rstrip("/").endswith("/content"):
+        return
+    offset = (params or {}).get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise TruncatingWrite(
+            "a write of content needs a whole offset of 0 or more: without one the provider truncates the file to 0 "
+            "first, so it is never sent"
+        )
 
 
 def _target_space_id(path: str) -> str:
@@ -1153,6 +1170,7 @@ class OnezoneClient:
         if method not in MUTATING:
             raise OutOfScope(f"{method} is not a mutating method; use get or query")
         path = _check_path(path)
+        _refuse_truncation(method, path, params)
         media = UPLOAD_CONTENT_TYPE if content_type is None else media_type(content_type)
         self._base(provider)  # an undeclared provider is refused before anything is read
         self._require_in_scope(self._target(method, path, provider, json, _GateReads(gate_retry)), space)
@@ -1234,9 +1252,11 @@ class OnezoneClient:
         clock: Callable[[], float] = time.monotonic,
         space: Space | None = None,
         gate_retry: ReadRetry = ONE_ATTEMPT,
+        stop: int | None = None,
     ) -> Digest:
         """Read a file of `size` bytes through a declared provider, range by range, hashing it as it comes; return the
-        size and the SHA-256 of what was read (O25).
+        size and the SHA-256 of what was read (O25). With `stop`, only the first `stop` bytes are read, each answer
+        still checked against the file's `size`: the prefix of a file at its final size (O44).
 
         Nothing holds the file: each range of at most `chunk_bytes` is a streamed GET whose pieces, as the connection
         delivers them, are hashed, handed to `sink` when one is given, and dropped. Each range passes the gate of
@@ -1261,6 +1281,9 @@ class OnezoneClient:
             raise OutOfScope("a content read is of /data/{id}/content only")
         if size < 0 or chunk_bytes < 1 or not deadline_s > 0:
             raise OutOfScope("a streamed read needs its bounds: a size of zero or more, a positive chunk and deadline")
+        end = size if stop is None else stop
+        if not 0 <= end <= size:
+            raise OutOfScope("a streamed read's stop lies within the file's size")
         path = _check_path(path)
         base, label = self._base(provider)
         hasher, began = hashlib.sha256(), clock()
@@ -1276,16 +1299,16 @@ class OnezoneClient:
             if clock() - began > deadline_s:
                 raise PlatformError(late)
 
-        if size == 0:
+        if end == 0:
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
-        for first in range(0, size, chunk_bytes):
+        for first in range(0, end, chunk_bytes):
             self._require_in_scope(self._target("GET", path, provider, None, gate), space)
             remaining = deadline_s - (clock() - began)
             if remaining <= 0:
                 raise PlatformError(late)
             wait = min(timeout_s if timeout_s is not None else self._timeout_s, remaining)
-            self._stream_range(base + path, label, (first, min(chunk_bytes, size - first), size), wait, consume)
-        return Digest(size, hasher.hexdigest())
+            self._stream_range(base + path, label, (first, min(chunk_bytes, end - first), size), wait, consume)
+        return Digest(end, hasher.hexdigest())
 
     def _stream_range(
         self, url: str, label: str, span: tuple[int, int, int], wait: float, consume: Callable[[bytes], None]
