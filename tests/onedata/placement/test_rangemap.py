@@ -1,13 +1,20 @@
 """The declared range map and the `[placement]` settings: validation names the file and the key, never the value."""
 
 import dataclasses
+import hashlib
+import json
+import logging
 
 import pytest
+from campaign_support import make_fingerprint, make_manifest, make_schema
 
+from expcore.campaign.reset_settings import CHANGED, META_KEY, canonical
+from expcore.campaign.resume import open_campaign
 from expcore.config.loading import ConfigError
 from expcore_onedata.config import load_platform
-from expcore_onedata.rangemap import PlacementSettings, RangeRow, load_placement, safe_path, trace_reads
-from expcore_onedata.testing import write_platform, write_with_placement
+from expcore_onedata.rangemap import PlacementSettings, RangeMap, RangeRow, load_placement, safe_path, trace_reads
+from expcore_onedata.spaces import ONE_SPACE_LABEL
+from expcore_onedata.testing import NOW, write_platform, write_with_placement
 
 ROWS = """
 [[placement.map]]
@@ -206,11 +213,11 @@ def test_o25_the_threshold_for_a_new_connection_can_be_set(tmp_path):
 def test_c35_the_settings_a_resume_compares_are_every_effective_value_of_the_table_but_the_providers_name(tmp_path):
     """C35: `PlacementSettings.reset_settings()` is what the platform gives the core to record and compare at a resume:
     each field after its default, under `placement.<name>`, numbers and text only. The data provider's name is left
-    out, since the record is shipped with a replication package, and so is the map."""
-    from expcore.campaign.reset_settings import canonical
-
+    out, since the record is shipped with a replication package. The map is `Placement.reset_settings()`'s, by its
+    digest."""
     placement = load(tmp_path, ROWS, qos_scan="summaries", concurrency=4)
     watched = placement.settings.reset_settings()
+    assert "placement.range_map_sha256" not in watched  # the settings alone: the map's digest is `Placement`'s
     fields = {field.name for field in dataclasses.fields(PlacementSettings)} - {"holder"}
     assert set(watched) == {f"placement.{name}" for name in fields}
     assert watched["placement.qos_scan"] == "summaries"
@@ -232,3 +239,116 @@ def test_c35_a_default_that_changes_under_a_file_that_does_not_declare_it_shows_
     assert declared["placement.qos_scan"] == "summaries"
     assert bare["placement.qos_scan"] == "listing"
     assert {key for key in bare if bare[key] != declared[key]} == {"placement.qos_scan"}
+
+
+def row(file="a/one.bin", provider="beta", ranges=((0, 10),), space=ONE_SPACE_LABEL) -> RangeRow:
+    return RangeRow(file, provider, ranges, space)
+
+
+def test_c35_the_range_map_has_one_canonical_form_and_its_digest_is_the_sha256_of_it():
+    """C35: `RangeMap.canonical()` is a JSON array of the rows sorted by space, file and provider, each an object of
+    `file`, `provider`, `ranges` (the merged `[offset, length]` pairs) and `space`, keys sorted and no spaces;
+    `digest()` is the SHA-256 of its UTF-8 bytes. The row order of the file is not part of it."""
+    one, two = row("a/one.bin", ranges=((0, 10), (20, 5))), row("b/two.bin", "beta", ((4, 4),), "zone")
+    text = json.dumps(
+        [
+            {"file": "a/one.bin", "provider": "beta", "ranges": [[0, 10], [20, 5]], "space": ONE_SPACE_LABEL},
+            {"file": "b/two.bin", "provider": "beta", "ranges": [[4, 4]], "space": "zone"},
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert RangeMap((one, two)).canonical() == text
+    assert RangeMap((two, one)).canonical() == text
+    assert RangeMap((one, two)).digest() == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert RangeMap((row(ranges=((5, 5), (0, 5))),)).canonical() == RangeMap((row(ranges=((0, 10),)),)).canonical()
+    assert RangeMap().canonical() == "[]"
+    assert len(RangeMap().digest()) == 64
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        row(ranges=((0, 11),)),
+        row(ranges=((1, 10),)),
+        row(ranges=((0, 10), (30, 1))),
+        row(file="a/two.bin"),
+        row(provider="gamma"),
+        row(space="other"),
+    ],
+)
+def test_c35_any_change_to_a_row_of_the_range_map_changes_its_digest(other):
+    """C35: a range, a file, the receiving provider or the space of a row decides which bytes a state places, so each
+    is in the digest."""
+    assert RangeMap((other,)).digest() != RangeMap((row(),)).digest()
+    assert RangeMap((row(), other)).digest() != RangeMap((row(),)).digest()
+
+
+def test_c35_the_placement_gives_the_digest_of_its_map_as_one_setting_and_never_the_map(tmp_path):
+    """C35: `Placement.reset_settings()` is the settings and `placement.range_map_sha256`, the digest of the map as
+    loaded: the same for a map written as unmerged ranges in another order of rows, in the file or inline, and no row
+    content (a path, a provider) is in what the core records."""
+    placement = load(tmp_path, ROWS)
+    watched = placement.reset_settings()
+    assert set(watched) == {*placement.settings.reset_settings(), "placement.range_map_sha256"}
+    assert watched["placement.range_map_sha256"] == placement.map.digest()
+    expected = [
+        {"file": "study/data.bin", "provider": "beta", "ranges": [[0, 15], [100, 50]], "space": ONE_SPACE_LABEL}
+    ]
+    text = json.dumps(expected, sort_keys=True, separators=(",", ":"))
+    assert watched["placement.range_map_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+    recorded = canonical(watched)
+    assert "study/data.bin" not in recorded
+    assert "beta" not in recorded
+    (tmp_path / "file").mkdir()
+    (tmp_path / "file" / "ranges.toml").write_text(
+        '[[map]]\nfile = "study/data.bin"\nprovider = "beta"\nranges = [[0, 15], [100, 50]]\n', encoding="utf-8"
+    )
+    from_file = load(tmp_path / "file", map="ranges.toml")  # a map file beside platform.toml, and no inline rows
+    assert from_file.reset_settings()["placement.range_map_sha256"] == watched["placement.range_map_sha256"]
+    nothing = load_in(tmp_path, "none")
+    assert nothing.reset_settings()["placement.range_map_sha256"] == RangeMap().digest()
+
+
+def load_in(tmp_path, name, rows="", **override):
+    """`load` in a new directory of its own."""
+    (tmp_path / name).mkdir()
+    return load(tmp_path / name, rows, **override)
+
+
+def start(tmp_path, placement, *, now=NOW):
+    schema = make_schema()
+    return open_campaign(
+        tmp_path / "campaign.db",
+        schema,
+        make_manifest(schema, 7),
+        make_fingerprint(schema),
+        now=now,
+        max_attempts=3,
+        reset_settings=placement.reset_settings(),
+    )[0]
+
+
+def test_c35_a_resume_after_the_range_map_changed_warns_with_both_digests_and_never_with_the_rows(tmp_path, caplog):
+    """C35: the map decides which bytes a state places, so a changed map across a resume is a change of
+    `placement.range_map_sha256` with its old and new digest in the warning, the event and the record, and the
+    map's rows (a path, a provider) are in none of them; the same map written afresh is quiet."""
+    first = load_in(tmp_path, "a", ROWS)
+    start(tmp_path, first).close()
+    again = load_in(tmp_path, "again", ROWS)
+    with caplog.at_level(logging.WARNING, logger="expcore.campaign.reset_settings"):
+        start(tmp_path, again).close()
+    assert caplog.records == []
+    other = load_in(tmp_path, "b", ROWS.replace("[100, 50]", "[100, 51]"))
+    old, new = first.map.digest(), other.map.digest()
+    assert old != new
+    with caplog.at_level(logging.WARNING, logger="expcore.campaign.reset_settings"):
+        store = start(tmp_path, other, now="2026-01-01T00:10:00Z")
+    [warning] = caplog.records
+    assert f'placement.range_map_sha256: "{old}" -> "{new}"' in warning.getMessage()
+    assert "placement.qos_scan" not in warning.getMessage()
+    [(detail,)] = [tuple(r) for r in store.q("SELECT detail FROM events WHERE kind=?", (CHANGED,))]
+    assert json.loads(detail)["changes"] == [{"key": "placement.range_map_sha256", "old": old, "new": new}]
+    kept = " ".join([warning.getMessage(), detail, store.get_meta(META_KEY) or ""])
+    assert "study/data.bin" not in kept
+    assert "beta" not in kept

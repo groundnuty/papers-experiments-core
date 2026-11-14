@@ -84,7 +84,7 @@ class StudyPlugin:
       listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
       fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
     - `reset_settings`: the platform's settings that change how it does its work and not what an agent sees, and so are
-      in no fingerprint, after its defaults (the Onedata layer's `PlacementSettings.reset_settings()`): a flat mapping
+      in no fingerprint, after its defaults (the Onedata layer's `Placement.reset_settings()`): a flat mapping
       of names to text, numbers, booleans or None, without a secret or a name that identifies a machine, since it
       travels with the export. The core records it at the first start and compares it at every resume; a resume
       under other values is never refused, and says which keys changed, with their old and new values, in the log,
