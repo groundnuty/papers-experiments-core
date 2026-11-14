@@ -10,6 +10,11 @@ are the same text: no clock, no path and no random number enters it.
   Holm decisions is refused, so no table or summary line can show an exploratory contrast as confirmatory. A
   preregistration with `exploratory_only = true` has no family: its report has no family table, shows every contrast
   in the exploratory one, and says in its summary and on the terminal that it makes no confirmatory claim (S12).
+- With several named Holm families (S16) each family has a table of its own, followed by its steps (each step's
+  level as alpha over the hypotheses left, its raw and adjusted p-value and its verdict), the exploratory heading
+  says "outside every Holm family", the equivalence table names each claim's Holm family, and the terminal line of a
+  member names its family. A result whose families and Holm decisions disagree is refused
+  (`report_families.check_families`). One flat family's report is the text it was before families were named.
 - A conclusion is never shown without its significance. Each row carries the raw p-value and the Holm-adjusted one
   (or the word "exploratory") beside the conclusion, and the preregistered equivalence margin with the interval at
   1 - 2 alpha that `equivalent` and `trivial_difference` rest on, and the conclusion words already encode the decision:
@@ -54,6 +59,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import condition_accounting
+from expcore.report_families import check_families, one_line, steps_lines
 from expcore.report_notes import (
     ARM_LOST_HEADINGS,
     ARM_RUNS_NOTES,
@@ -62,6 +68,7 @@ from expcore.report_notes import (
     COUNT_DEFINITIONS,
     DEPLOYMENT_NOTES,
     DESCRIPTIVE_NOTES,
+    FAMILY_NOTES,
     MDE_NOTES,
     MISSING_PAIRS,
     NO_CLAIM,
@@ -284,19 +291,24 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     family = [r for r in result.contrasts if not _exploratory(r, adjusted)]
     exploratory = [r for r in result.contrasts if _exploratory(r, adjusted)]
     with_mde = any(r.minimum_detectable_effect is not None for r in result.contrasts)
-    lines = [f"## Preregistered contrasts (Holm family of {len(family)}, alpha = {result.alpha:g})", ""]
     alpha = result.alpha
-    table = _contrast_table(family, adjusted, level, alpha, with_mde=with_mde) if family else []
-    lines += table or ["No contrast in the family."]
+    if result.holm_families:  # several named families (S16): a table and the steps for each
+        lines = _named_families(result, adjusted, level, with_mde)
+    else:
+        lines = [f"## Preregistered contrasts (Holm family of {len(family)}, alpha = {alpha:g})", ""]
+        table = _contrast_table(family, adjusted, level, alpha, with_mde=with_mde) if family else []
+        lines += table or ["No contrast in the family."]
     lines += ["", *contrast_notes(alpha)]
     if with_mde:
         lines += ["", *MDE_NOTES]
     if family:
-        lines += ["", *_pairs(family, "### Pairs of the family's contrasts")]
+        whose = "families'" if result.holm_families else "family's"
+        lines += ["", *_pairs(family, f"### Pairs of the {whose} contrasts")]
     lines += _equivalence_family(result)
+    outside = "every Holm family" if result.holm_families else "the Holm family"
     lines += [
         "",
-        "## Exploratory contrasts (outside the Holm family)",
+        f"## Exploratory contrasts (outside {outside})",
         "",
     ]
     if exploratory:
@@ -314,6 +326,25 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         *_arm_runs(result.contrasts),
         *_descriptives(result, level),
     ]
+
+
+def _named_families(
+    result: AnalysisResult, adjusted: Mapping[str, float], level: float | None, with_mde: bool
+) -> list[str]:
+    """Each named Holm family's contrasts in a table of their own, then its steps (S16), after the check that every
+    member's decision is its own family's."""
+    check_families(result)
+    by_name = {r.name: r for r in result.contrasts}
+    count = len(result.holm_families)
+    noun = "Holm family, adjusted" if count == 1 else "Holm families, each adjusted"
+    lines = [f"## Preregistered contrasts ({count} {noun} on its own at alpha = {result.alpha:g})", ""]
+    for family in result.holm_families:
+        members = [by_name[name] for name in family.members]
+        size = f"{len(members)} contrast{'' if len(members) == 1 else 's'}"
+        lines += [f"### Holm family {one_line(family.name)} ({size})", ""]
+        lines += _contrast_table(members, adjusted, level, result.alpha, with_mde=with_mde)
+        lines += ["", *steps_lines(family, _table, _p, _num), ""]
+    return [*lines, *FAMILY_NOTES]
 
 
 def _finish_rate(value: float) -> str:
@@ -373,17 +404,24 @@ def _equivalence_family(result: AnalysisResult) -> list[str]:
     members = [r for r in result.contrasts if r.in_equivalence_family]
     if not members:
         return []
+    family_of = check_families(result)  # several named families (S16): each claim is adjusted within its own
     rows = []
     for r in members:
         low, high = r.equivalence_interval_adjusted or (math.nan, math.nan)
         level = UNKNOWN if r.equivalence_level is None else percent(r.equivalence_level)
         interval = f"[{_num(low)}, {_num(high)}]"
-        rows.append(
-            [r.name, _margin(r), _p(r.tost_p), _p(r.tost_p_holm), level, interval, "yes" if r.equivalent else "no"]
-        )
-    header = ["Contrast", "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"]
-    heading = "### Equivalence family (Holm over two one-sided tests)"
-    return ["", heading, "", *_table(header, rows), "", *equivalence_family_notes(result.alpha)]
+        family = [family_of.get(r.name, UNKNOWN)] if family_of else []
+        rows.append([r.name, *family, _margin(r), _p(r.tost_p), _p(r.tost_p_holm), level, interval, _yes(r.equivalent)])
+    column = ["Holm family"] if family_of else []
+    header = ["Contrast", *column, "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval"]
+    within = ", within each Holm family" if family_of else ""
+    heading = f"### Equivalence family (Holm over two one-sided tests{within})"
+    notes = equivalence_family_notes(result.alpha, by_family=bool(family_of))
+    return ["", heading, "", *_table([*header, "Equivalent"], rows), "", *notes]
+
+
+def _yes(value: bool) -> str:
+    return "yes" if value else "no"
 
 
 def _pairs(results: Sequence[ContrastResult], heading: str) -> list[str]:
@@ -581,12 +619,15 @@ def summary_lines(result: AnalysisResult) -> list[str]:
     printed without the basis it rests on, and `untestable` is never printed for a contrast that used a pair, or
     any other word for one that used none."""
     _check_no_claim(result)
+    family_of = check_families(result)  # empty for one flat family, whose lines are as they were (S16)
     adjusted = {d.name: d.p_holm for d in result.holm}
     lines = [f"No confirmatory claim: {NO_CLAIM}."] if result.exploratory_only else []
     for r in result.contrasts:
         _check_conclusion(r)
         member = not _exploratory(r, adjusted)
         holm = _p(adjusted[r.name]) if member else EXPLORATORY
+        if member and family_of:
+            holm += f" (family {one_line(family_of[r.name])})"
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
         scale = "" if r.ratio is None else " (ln ratio)"  # a log ratio printed bare reads as a difference (S13)
         tost = f", Holm TOST p {_p(r.tost_p_holm)}" if r.in_equivalence_family else ""  # the basis of `equivalent`

@@ -56,10 +56,29 @@ def contrast_notes(alpha: float, family: bool = True) -> list[str]:
     ]
 
 
-def equivalence_family_notes(alpha: float) -> list[str]:
-    """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces."""
+FAMILY_NOTES = [  # beside the named Holm families' tables (S16)
+    "Each Holm family is adjusted on its own, at alpha. Its members' p-values are taken from the smallest up, and the",
+    "k-th of a family of m is compared with alpha / (m - k + 1), its step's Level; the first that misses its level",
+    "stops the family, so it and every later member are not rejected, whatever their raw p-values. Holm p is the",
+    "member's adjusted p-value within its own family, for reading; the decision compares each raw p with its step's",
+    "level. An untestable member counts as p = 1 and keeps its family's size. A contrast is in one family at most, and",
+    "no family's size or p-values move another's decisions.",
+]
+
+
+def equivalence_family_notes(alpha: float, by_family: bool = False) -> list[str]:
+    """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces.
+    `by_family` adds what several named Holm families change (S16): each claim is adjusted within its own."""
+    one = [
+        "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two"
+    ]
+    within = [
+        "The preregistration declares these contrasts' equivalence claims, and each is adjusted together with the",
+        "other claims of its own Holm family only (the Holm family column): that group is the family Holm TOST p,",
+        "Interval level and Equivalent are computed over. TOST p: the larger of the two",
+    ]
     return [
-        "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two",
+        *(within if by_family else one),
         "one-sided tests' p-values, for an effect above minus the margin and for one below the margin (for the",
         "Wilcoxon cluster bootstrap, t-tests of the mean cluster difference on clusters - 1 degrees of freedom; n/a",
         "with fewer than two clusters or no spread between them). Holm TOST p: Holm-adjusted over the family, for",

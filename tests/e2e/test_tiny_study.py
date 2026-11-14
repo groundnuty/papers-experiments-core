@@ -440,6 +440,42 @@ def test_s12_an_exploratory_only_preregistration_runs_through_analyze_and_report
     assert all(line.endswith("(exploratory)") for line in summary)
 
 
+NAMED_FAMILIES = '[holm_families]\nextended = ["extended-vs-baseline"]\nrelay = ["relay-vs-baseline"]'
+
+
+def test_s16_named_holm_families_run_through_analyze_and_report_each_adjusted_on_its_own(
+    resumed, tmp_path, clean_environment, capsys
+):
+    """S16: through the command line: the two confirmatory contrasts declared as two families of one, check, analyze
+    and report succeed; analysis.json gives each family its one step at alpha / 1, where the flat family of two
+    adjusted them together, and the report and the terminal show each family apart, the exploratory contrast outside
+    every family."""
+    copy = copy_campaign(resumed, tmp_path, "named-families")
+    edit_once(copy.root / "preregistration.toml", FAMILY, NAMED_FAMILIES)
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    analysis = copy.read("analysis.json")
+    assert [(f["name"], f["members"]) for f in analysis["holm_families"]] == [
+        ("extended", ["extended-vs-baseline"]),
+        ("relay", ["relay-vs-baseline"]),
+    ]
+    for family in analysis["holm_families"]:
+        [step] = family["steps"]
+        assert (step["step"], step["level"], step["p_holm"]) == (1, 0.05, step["p_value"])  # m = 1: unadjusted
+    flat = {d["name"]: d for d in resumed.read("analysis.json")["holm"]}
+    assert {d["level"] for d in flat.values()} == {0.05 / 2, 0.05}  # one flat family of two
+    assert {d["name"]: d["level"] for d in analysis["holm"]} == dict.fromkeys(flat, 0.05)
+    report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
+    assert "### Holm family extended (1 contrast)" in report
+    assert "Holm steps of relay:" in report
+    assert set(table(report, "## Exploratory contrasts (outside every Holm family)")) == {"tools-effect-on-rounds"}
+    capsys.readouterr()
+    assert main(["analyze", str(copy.root)]) == 0
+    summary = {line.split(":")[0]: line for line in capsys.readouterr().out.splitlines() if "estimate" in line}
+    assert "(family relay)" in summary["relay-vs-baseline"]
+
+
 def test_c25_a_budgeted_study_without_context_windows_still_analyses_reports_and_regenerates_but_does_not_run(
     resumed, tmp_path, clean_environment
 ):
