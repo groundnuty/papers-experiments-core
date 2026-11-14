@@ -973,11 +973,17 @@ class Provisioner:
         """
         self._verified()
         entry = self.resolve(path)
-        if entry.size < 1:
+        return self.replicate_file(entry.file_id, entry.size, to_provider)
+
+    def replicate_file(self, file_id: str, size: int, to_provider: str) -> dict[str, Any]:
+        """`replicate` for a file named by its id, whose size the caller knows: a progressive ingest's reset replicates
+        the file it completed, and never a file another entry now has at its path (O44)."""
+        self._verified()
+        if size < 1:
             raise ProvisionError(f"{self._where}an empty file has nothing to place")
-        wanted = {entry.file_id: [(0, entry.size)]}
+        wanted = {file_id: [(0, size)]}
         began = self._clock()
-        tid = self.schedule_transfer("replication", entry.file_id, to_provider)
+        tid = self.schedule_transfer("replication", file_id, to_provider)
         done = consistency.require_ended(
             consistency.wait_transfers(
                 self._client,

@@ -82,6 +82,7 @@ PROVISIONER_HELPERS: dict[str, str | None] = {
     "read_through": None,
     "schedule_transfer": None,
     "replicate": None,
+    "replicate_file": None,
     "evict": None,
     "teardown": None,
     "verify_space": None,

@@ -21,6 +21,8 @@ baseline = "complete"            # what the dataset holds between runs: "complet
 parts = 4                        # optional: written in this many parts, so it is partial for a while (1: whole)
 over_s = 60                      # with parts > 1: the last part is written this many seconds after the first
 prefix = 65536                   # the preallocated mode only, and required there: the bytes written at the start
+replicas = ["<provider>"]        # the preallocated mode only, optional: the providers other than the data provider
+                                 # that hold the file whole in the baseline (a mirror); none by default
 ```
 
 `baseline` is required, since it decides what the reset keeps: a "complete" file is part of the dataset that every
@@ -36,6 +38,12 @@ first at `prefix`, 0 in the arrival mode) and ending at byte `prefix + ceil((siz
 part writes at least one byte. `IngestPlan.steps` lists the parts of every file in the order they fall due, each with
 the SHA-256 of everything before its end, read from the staged source at load, as is the prefix's
 (`PlannedFile.prefix_sha256`).
+
+**A replica in the baseline** (`replicas`, the preallocated mode only). The start removes the complete file with every
+replica of it, so a provider that holds one between runs, a mirror an outage condition reads through, is declared, and
+the reset replicates the completed file to it again, verified by that provider's own block map. The start is refused,
+before anything is removed, when a declared provider does not hold the file whole or one the plan does not declare
+holds a byte of it. The arrival mode restores no replica and refuses the key.
 
 Every refusal is a `ConfigError` naming the plan's file and the key, never a value. The plan is part of the condition
 and of the campaign fingerprint (`fingerprint`): a resume after its schedule or a staged source changed is refused.
@@ -58,7 +66,7 @@ from expcore_onedata.spaces import LABEL
 BASELINES = ("complete", "absent")
 ARRIVAL, PREALLOCATED = "arrival", "preallocated"
 MODES = (ARRIVAL, PREALLOCATED)
-FILE_KEYS = ("label", "path", "source", "at_s", "baseline", "parts", "over_s", "prefix")
+FILE_KEYS = ("label", "path", "source", "at_s", "baseline", "parts", "over_s", "prefix", "replicas")
 _READ_BYTES = 1 << 20  # how much of a staged source is held at once while it is hashed
 
 
@@ -92,6 +100,7 @@ class PlannedFile:
     prefixes: tuple[tuple[int, str], ...]  # each part's end and the SHA-256 of the bytes before it
     prefix: int = 0  # the bytes written at the start in the preallocated mode; 0 in the arrival mode
     prefix_sha256: str = hashlib.sha256(b"").hexdigest()  # the SHA-256 of those bytes
+    replicas: tuple[str, ...] = ()  # the providers, other than the data provider, that hold it whole in the baseline
 
     def steps(self) -> tuple[Step, ...]:
         """The file's parts, each with its due time, the bytes it writes and its prefix's hash."""
@@ -203,7 +212,20 @@ def _prefix(section: Section, mode: str, size: int) -> int:
     return prefix
 
 
-def _planned(section: Section, staging: Path, mode: str) -> PlannedFile:
+def _replicas(section: Section, mode: str, support: tuple[str, ...]) -> tuple[str, ...]:
+    """The providers that hold a replica of the file in the baseline: the preallocated mode only, each a provider of
+    the space, named once. That none is the data provider is checked when the instrument is built, which knows it."""
+    if "replicas" not in section.data:
+        return ()
+    if mode == ARRIVAL:
+        raise section.fail("replicas", "is for the preallocated mode only: the arrival mode restores no replica")
+    names = section.strings("replicas")
+    if len(set(names)) != len(names) or any(n not in support for n in names):
+        raise section.fail("replicas", "must name providers that support the plan's space, each once")
+    return names
+
+
+def _planned(section: Section, staging: Path, mode: str, support: tuple[str, ...]) -> PlannedFile:
     section.reject_unknown(FILE_KEYS)
     label = section.string("label")
     if not LABEL.fullmatch(label):
@@ -221,6 +243,7 @@ def _planned(section: Section, staging: Path, mode: str) -> PlannedFile:
     source = _source(section, staging)
     size = source.stat().st_size
     prefix = _prefix(section, mode, size)
+    replicas = _replicas(section, mode, support)
     parts = section.optional_integer("parts")
     parts = 1 if parts is None else parts
     if parts < 1 or parts > max(size - prefix, 1):
@@ -237,7 +260,9 @@ def _planned(section: Section, staging: Path, mode: str) -> PlannedFile:
         raise section.fail("source", "changed size while it was read")
     at_s = _number(section, "at_s", None)
     prefixes = tuple(zip(stops, hashes[1:], strict=True))
-    return PlannedFile(label, path, source, size, whole, at_s, parts, over_s, baseline, prefixes, prefix, hashes[0])
+    return PlannedFile(
+        label, path, source, size, whole, at_s, parts, over_s, baseline, prefixes, prefix, hashes[0], replicas
+    )
 
 
 def _check_paths(files: list[PlannedFile], file: Path) -> None:
@@ -287,12 +312,16 @@ def load_ingest_plan(path: str | os.PathLike[str], config: PlatformConfig) -> In
     rows = table.data.get("files", [])
     if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
         raise table.fail("files", "must be an array of tables, [[ingest.files]]")
-    files = [_planned(Section(row, file, f"[[ingest.files]] row {n}"), staging, mode) for n, row in enumerate(rows, 1)]
+    support = tuple(space.support.providers)
+    files = [
+        _planned(Section(row, file, f"[[ingest.files]] row {n}"), staging, mode, support)
+        for n, row in enumerate(rows, 1)
+    ]
     _check_paths(files, file)
     # The mode and the prefixes enter the hash only in the preallocated mode, so an arrival plan keeps the hash it had
     # before they existed and a campaign that holds it resumes (C06).
     keys = ("label", "path", "size", "sha256", "at_s", "parts", "over_s", "baseline")
-    keys += ("prefix",) if mode == PREALLOCATED else ()
+    keys += ("prefix", "replicas") if mode == PREALLOCATED else ()
     content: dict[str, Any] = {
         "space": space.label,
         "visible_on": None if visible_on is None else list(visible_on),

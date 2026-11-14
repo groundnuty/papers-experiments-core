@@ -84,6 +84,8 @@ class SparseBaseline(Baseline):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.written: dict[str, int] = {}  # label -> the end of what the ingest has written and confirmed
+        if any(self.holder in planned.replicas for planned in self._plan.files):
+            raise ValueError("a planned file's replicas name the data provider, which holds the file itself")
 
     # -- the block maps ------------------------------------------------------------------------------------------------
     def layout(self, file_id: str, reader: str, *, retry: ReadRetry = ONE_ATTEMPT) -> Layout:
@@ -188,12 +190,38 @@ class SparseBaseline(Baseline):
         self.record_id(planned.label, "created", "start", old, file_id, action="preallocated")
         return file_id
 
+    def check_holdings(self, planned: PlannedFile, file_id: str) -> None:
+        """Before the start removes the complete file: every provider its `replicas` declare holds it whole, by that
+        provider's own block map, and no provider but the data provider and those holds a byte of it, as any provider
+        of the space shows it. The removal takes every replica with the file, and the reset brings back only the
+        declared ones, so anything else would leave the baseline's replicas wrong without a trace."""
+        whole = [(0, planned.size)]
+        for provider in planned.replicas:
+            if uncovered(self._p.blocks(file_id, provider, retry=self._p.retry), whole):
+                raise ProvisionError(
+                    f"{self._p.where}{planned.label}: {self._p.client.provider_label(provider)}, which its replicas "
+                    "declare, does not hold the complete file; nothing was removed"
+                )
+        kept = {self._p.provider_id(name) for name in (self.holder, *planned.replicas)}
+        for reader in self.providers:
+            for provider_id, blocks in self.layout(file_id, reader, retry=self._p.retry).blocks.items():
+                if provider_id not in kept and blocks:
+                    raise ProvisionError(
+                        f"{self._p.where}{planned.label}: {self._label(provider_id)} holds bytes of the complete file "
+                        "and its replicas do not declare it, so the reset would not bring them back; evict them or "
+                        "declare it; nothing was removed"
+                    )
+
     def start_state(self) -> dict[str, dict[str, Any]]:
         """Take each planned file from complete to its prefix at its final size, confirmed; return each file's old id,
-        new id and confirmed state by label."""
+        new id and confirmed state by label. Before the first removal each file's holdings are checked against its
+        declared replicas (`check_holdings`)."""
+        entries = {planned.label: self._p.resolve(planned.path) for planned in self._plan.files}
+        for planned in self._plan.files:
+            self.check_holdings(planned, entries[planned.label].file_id)
         states = {}
         for planned in self._plan.files:
-            found = self._p.resolve(planned.path)
+            found = entries[planned.label]
             self.remove(planned, found, "start")
             file_id = self._preallocate(planned, found.file_id)
             if planned.prefix:
@@ -233,8 +261,33 @@ class SparseBaseline(Baseline):
 
     # -- the reset -----------------------------------------------------------------------------------------------------
     def restore_file(self, planned: PlannedFile, phase: str) -> dict[str, Any]:
-        """Bring one file back to its complete baseline without removing it, verified; return what was done and its id.
-        A name a crashed start removed is written back once every provider answers the old id absent."""
+        """Bring one file back to its complete baseline, verified: whole at its path by its hash and the data
+        provider's block map (`_restore_whole`), then on each provider its replicas declare (`_restore_replicas`);
+        return what was done, its id and, for a file with replicas, each one's action by provider position."""
+        done = self._restore_whole(planned, phase)
+        if not planned.replicas:
+            return done
+        return {**done, "replicas": self._restore_replicas(planned, done["file_id"])}
+
+    def _restore_replicas(self, planned: PlannedFile, file_id: str) -> dict[str, str]:
+        """Replicate the completed file to each provider its replicas declare that does not hold it whole, and verify
+        each by that provider's own block map on consecutive polls; return `held` or `replicated` by position."""
+        done = {}
+        for provider in planned.replicas:
+            whole = {plain(file_id): [(0, planned.size)]}
+            if uncovered(self._p.blocks(file_id, provider, retry=self._p.retry), whole[file_id]):
+                self._p.replicate_file(file_id, planned.size, provider)  # NotPlaced unless the map then covers it
+                action = "replicated"
+            elif self._p.confirm_placed(provider, whole).placed:
+                action = "held"
+            else:
+                raise NotPlaced(f"{self._p.where}{planned.label}: a replica's block map does not stay whole")
+            done[self._p.client.provider_label(provider)] = action
+        return done
+
+    def _restore_whole(self, planned: PlannedFile, phase: str) -> dict[str, Any]:
+        """Bring one file back whole at its path without removing it, verified; return what was done and its id. A
+        name a crashed start removed is written back once every provider answers the old id absent."""
         before = self.entry(planned.path)
         pending = self._pending(planned.label)
         if before is None:

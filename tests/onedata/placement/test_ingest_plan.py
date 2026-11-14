@@ -230,6 +230,16 @@ def test_o44_the_fingerprint_follows_the_mode_and_the_prefix(tmp_path, platform)
     assert len({first, longer.sha256, load_ingest_plan(plan_file(tmp_path, arrival), platform).sha256}) == 3
 
 
+def test_o44_a_preallocated_file_declares_the_providers_that_hold_a_replica_of_it_in_the_baseline(tmp_path, platform):
+    """O44: `replicas` names the providers other than the data provider that hold the file whole between runs (a
+    mirror): none by default, and part of the plan's hash, so a resume after it changed is refused."""
+    staged(tmp_path)
+    plain = load_ingest_plan(plan_file(tmp_path, PREALLOCATED), platform)
+    mirrored = load_ingest_plan(plan_file(tmp_path, PREALLOCATED + 'replicas = ["beta"]\n'), platform)
+    assert (plain.files[0].replicas, mirrored.files[0].replicas) == ((), ("beta",))
+    assert plain.sha256 != mirrored.sha256
+
+
 def test_o44_an_empty_preallocated_plan_is_allowed(tmp_path, platform):
     """O44: a preallocated plan with no files loads, for a sham control, and has no steps."""
     staged(tmp_path)
@@ -250,12 +260,20 @@ def test_o44_an_empty_preallocated_plan_is_allowed(tmp_path, platform):
         (lambda t: t.replace('mode = "preallocated"\n', ""), "prefix"),  # a prefix in an arrival plan
         (lambda t: t.replace('baseline = "complete"', 'baseline = "absent"'), "baseline"),
         (lambda t: t.replace("parts = 3", "parts = 9217"), "parts"),
+        (lambda t: t + 'replicas = ["gamma"]\n', "replicas"),  # not a provider of the space
+        (lambda t: t + 'replicas = ["beta", "beta"]\n', "replicas"),
+        (lambda t: t + 'replicas = "beta"\n', "replicas"),
+        (
+            lambda t: t.replace('mode = "preallocated"\n', "").replace("prefix = 1024\n", "") + 'replicas = ["beta"]\n',
+            "replicas",
+        ),
     ],
 )
 def test_o44_a_preallocated_plan_that_cannot_be_carried_out_is_refused_naming_the_key(tmp_path, platform, edit, key):
     """O44: the mode is one of the two, a preallocated file declares a whole prefix below its size and belongs to the
-    baseline (the reset completes it and never removes it), an arrival file declares no prefix, and the parts fit in
-    the bytes after the prefix; each is refused at load, naming the plan's file and the key."""
+    baseline (the reset completes it and never removes it), an arrival file declares no prefix, the parts fit in the
+    bytes after the prefix, and `replicas` lists providers of the space, each once, in the preallocated mode only (the
+    arrival mode restores no replica); each is refused at load, naming the plan's file and the key."""
     staged(tmp_path)
     with pytest.raises(ConfigError, match=f"key '{key}'"):
         load_ingest_plan(plan_file(tmp_path, edit(PREALLOCATED)), platform)

@@ -29,7 +29,7 @@ PLUMBING = {
     ("provision.py", "Provisioner.read_file", "client.get"): ["self._retry"],  # the metadata read, with the deadline
     ("provision.py", "Provisioner.await_visible", "client.get"): ["self._retry"],
     ("provision.py", "Provisioner.await_visible", "consistency.wait_visible"): ["self._retry"],
-    ("provision.py", "Provisioner.replicate", "consistency.wait_transfers"): ["self._retry"],
+    ("provision.py", "Provisioner.replicate_file", "consistency.wait_transfers"): ["self._retry"],
     ("provision.py", "Provisioner.evict", "consistency.wait_transfers"): ["self._retry"],
     # the mutation gate's reads, and the gate of a range read and of a streamed read: the request itself is sent once
     ("provision.py", "Provisioner.mutate", "client.mutate"): ["self._retry"],
@@ -41,6 +41,8 @@ PLUMBING = {
     # the preallocated ingest (O44): its visibility wait, the block map before a part and the one its reset completes
     ("ingestsparse.py", "SparseBaseline.confirm_state", "consistency.wait_visible"): ["self._p.retry"],
     ("ingestsparse.py", "SparseBaseline._complete", "provisioner.blocks"): ["self._p.retry"],
+    ("ingestsparse.py", "SparseBaseline.check_holdings", "provisioner.blocks"): ["self._p.retry"],  # before a removal
+    ("ingestsparse.py", "SparseBaseline._restore_replicas", "provisioner.blocks"): ["self._p.retry"],
     ("reset.py", "SpaceReset._page", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._dated_page", "client.get_dated"): ["self._p.retry"],  # the history's, with its Date
     ("reset.py", "SpaceReset._zone_clock", "client.get_dated"): [
@@ -206,7 +208,12 @@ HELPER_USERS = {
         "provisioner.replicate",
     },
     "ingest.py": {"provisioner.verify_space"},
-    "ingestsparse.py": {"provisioner.resolve", "provisioner.read_file", "provisioner.mutate"},
+    "ingestsparse.py": {
+        "provisioner.resolve",
+        "provisioner.read_file",
+        "provisioner.mutate",
+        "provisioner.replicate_file",  # the reset's replica of a completed file
+    },
     "ingestbase.py": {
         "provisioner.resolve",
         "provisioner.mutate",
@@ -226,6 +233,7 @@ HELPER_USERS = {
         "provisioner.await_visible",
         "provisioner.fetch",
         "provisioner.schedule_transfer",
+        "provisioner.replicate_file",  # `replicate` by path, through the one by id
     },
     "ranges.py": {
         "provisioner.verify_space",
