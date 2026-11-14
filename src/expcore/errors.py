@@ -34,7 +34,9 @@ nothing sent. Such a kind is never treatable, and an attempt that ends in it cos
 
 A failure may name its target, what failed, by a position label from the platform's configuration (`providers[1]`,
 `TARGET_LABEL`). A condition whose manipulation takes one target down declares the kind with that target, and only a
-failure of that target, while the run's fault injector held it down, is its treatment (`Outcome.is_treatment`).
+failure of that target, while the run's fault injector held it down, is its treatment (`Outcome.is_treatment`). A kind
+that is a fault on one target is registered with `requires_target=True` (`targeted_kinds`): a condition cannot declare
+it without the target, and it is never scored as a treatment without one (C34).
 """
 
 from __future__ import annotations

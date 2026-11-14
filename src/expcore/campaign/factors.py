@@ -46,7 +46,10 @@ The target is a position label from the platform's configuration, never a config
 kind that names that target, while the run's fault injector held the target down in the attempt, is the condition's
 treatment; another target's failure, a failure that names none and an injection that did not happen are set aside
 (`Outcome.is_treatment`, record version 3). A plain name declares the kind with no target: any failure of the kind is
-the treatment, whatever it names. The targets are part of the schema too (`treatment_targets`).
+the treatment, whatever it names, except for a kind that is a fault on one target (`expcore.errors.targeted_kinds`,
+registered with `requires_target=True`, such as `provider_outage`). That kind is refused by its plain name, naming the
+file, the condition and the kind, so a schema cut to the kind names alone cannot be built for it and no other target's
+failure is ever scored as the manipulation (C34). The targets are part of the schema too (`treatment_targets`).
 
 A condition may run exclusive, with no fault of its own:
 

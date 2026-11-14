@@ -43,9 +43,10 @@ when this module is first imported. Five are the sandbox's and the ingest's, and
 This is the one module of the platform layer that registers kinds, so a study names it alone in `[study] platforms` to
 make every kind the layer raises known before its conditions are validated, and `check` imports it alone for a record
 that names one. The fault injector's two kinds are registered here too (`expcore_onedata.faults`):
-`provider_outage`, a provider of the federation that was unavailable, which a condition may declare with the target
-it takes down; and `injector_failure`, the injector's own failure to inject, clear or verify, which is not treatable,
-so a run whose fault was never verified is set aside and never scored as the outage (O10, O11, C01).
+`provider_outage`, a provider of the federation that was unavailable, which a condition declares with the target
+it takes down and never without it (`requires_target=True`, C34); and `injector_failure`, the injector's own failure to
+inject, clear or verify, which is not treatable, so a run whose fault was never verified is set aside and never scored
+as the outage (O10, O11, C01).
 """
 
 from collections.abc import Iterable, Mapping
