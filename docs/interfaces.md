@@ -980,16 +980,35 @@ zero_denominator = "exclude"   # or "continuity", with continuity_correction = c
 cluster = "group"              # the independent unit, as for every contrast
 estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group; ["group"], the default, pools them
 equivalence_margin = 0.2231    # optional: a natural-log ratio, here within a factor of 1.25 either way
+
+[contrasts.cost-per-success-adverse]  # each arm its own column: arm A at its upper bound, arm B at its lower
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator_a = "tokens_high"    # optional, as are numerator_b, denominator_a and denominator_b: each defaults to
+numerator_b = "tokens_low"     # the shared numerator or denominator
+denominator = "success"
+zero_denominator = "exclude"
+cluster = "group"
+estimation_unit = ["model", "group"]
 ```
 
 ```python
 @dataclass(frozen=True)
 class RatioForm:                # ContrastSpec.ratio, and ContrastResult.ratio (None for a contrast of one outcome)
-    numerator: str
-    denominator: str
+    numerator: str | None       # the column both arms read; None when the arms read their own
+    denominator: str | None
     zero_denominator: str       # "exclude" or "continuity" (ZERO_RULES)
     continuity_correction: float | None = None
-    label: str                  # a property, "numerator/denominator": the contrast's `outcome`
+    numerator_a: str | None = None    # arm A's own column, None when it reads the shared one; so for the other three
+    numerator_b: str | None = None
+    denominator_a: str | None = None
+    denominator_b: str | None = None
+    def columns(self, arm: int) -> tuple[str, str]  # (numerator, denominator) arm 0 (A) or 1 (B) reads
+    per_arm: bool               # a property: the arms read different columns for either role
+    label: str                  # a property, "numerator/denominator", or "na/da vs nb/db" per arm: the contrast's `outcome`
+ROLES = ("numerator", "denominator")
+ARM_SUFFIXES = ("a", "b")
+OMIT_NONE = "omit_none"         # field metadata: analysis.json leaves the field out while it is None
 
 def log_ratio(arm_a: Totals, arm_b: Totals, form: RatioForm) -> tuple[str | None, float]  # (cause, NaN) or (None, value)
 def aggregate(cells: Mapping[str, Sequence[tuple[Totals, Totals]]], form) -> tuple[PairedDifferences, Excluded, Excluded]
@@ -1032,7 +1051,14 @@ The cells of one value share its response to the treatment and are not independe
 
 **Two analyses on two columns.** Each ratio contrast names its own `numerator` and `denominator`, so a study that bounds an outcome declares one contrast per bound, for example the estimate on lower-bound token columns and the adverse assignment on upper-bound ones, each with its own name, seed, result and Holm membership. A run whose upper bound is None at a denominator of 0 is counted, or refuses the contrast if confirmatory, only in the contrast that reads that column.
 
-**In the outputs.** `analysis.json` gives every contrast `ratio` (the form, or null), its two units, `estimation_unit` (`["model", "group"]` for a contrast of one outcome, `["group"]` by default for a ratio contrast) and `independent_unit` (the cluster), and its cells, `n_cells` and `cells_lost` by cause (`no_pair`, then a ratio contrast's `zero_denominator` and `zero_numerator`, zeros included); a ratio contrast estimated per model's cell its `per_model`, and a ratio contrast's `pairs_missing` the three `RATIO_CAUSES` after the five others, zeros included; `n_pairs_missing` counts the None causes, `numerator_none_at_zero` among them. `report.md` shows a ratio contrast's outcome as `ln(numerator/denominator)`, adds a section "Ratio contrasts" (each one's two outcomes, its estimation unit, its independent unit, its cells used and lost by cause, its rule, and exp of its estimate and interval, then, for a contrast estimated per model's cell, "Ratio contrasts by model (exploratory)" with each model's estimate, ratio and interval) and the three causes as columns of the pairs tables, `-` in the row of a contrast of one outcome, and the terminal summary marks its estimate `(ln ratio)`. A report with no ratio contrast has none of these, byte for byte as before.
+**One analysis on a column per arm.** A contrast may give each arm a column of its own, `numerator_a` and `numerator_b` for arm A's and arm B's numerators, and `denominator_a` and `denominator_b` for their denominators, each defaulting to the shared `numerator` or `denominator`. An adverse sensitivity estimate that puts arm A at its upper-bound tokens and arm B at its lower-bound ones is then a declared contrast of its own beside the main one, with `numerator_a = "tokens_high"` and `numerator_b = "tokens_low"` (or `numerator = "tokens_low"` with `numerator_a = "tokens_high"`, the same contrast). In each cell N_A and D_A are summed from arm A's columns and N_B and D_B from arm B's, ln((sum X_A / sum D_A) / (sum Y_B / sum D_B)), and the rest is as for any ratio contrast. Per-arm keys override the shared one; mixing that leaves a column unread or an arm without one is refused, naming the key:
+- the shared key beside both per-arm keys of its role, when neither names it: no arm would read it;
+- one per-arm key with no shared key: the other arm has no column;
+- an arm whose numerator and denominator would be one column;
+- a per-arm key, or any other ratio key, beside an estimator of one outcome.
+A per-arm key that names the shared column declares nothing, and its contrast is the one without it, record for record. The form is held one way whichever way it is written: a role whose arms read one column holds it as `numerator` (or `denominator`) with the per-arm fields None, and a role whose arms differ holds both arms' columns with the shared field None. Each run is read in its own arm's columns, found from the run's own condition or level of the varying factor (`pairing._columns`), for its value, a failed run's None numerator and its arm's count alike, so no part of the analysis reads a run in the other arm's column: a run of arm B need not have arm A's column, a run of arm A without its own is refused naming the column, and a failed run whose numerator is None in its own arm's column refuses a confirmatory contrast (`RatioNumeratorRefused`, naming each arm's columns), while a None in the column only the other arm reads leaves the pair used.
+
+**In the outputs.** `analysis.json` gives every contrast `ratio` (the form, or null), its two units, `estimation_unit` (`["model", "group"]` for a contrast of one outcome, `["group"]` by default for a ratio contrast) and `independent_unit` (the cluster), and its cells, `n_cells` and `cells_lost` by cause (`no_pair`, then a ratio contrast's `zero_denominator` and `zero_numerator`, zeros included); a ratio contrast estimated per model's cell its `per_model`, and a ratio contrast's `pairs_missing` the three `RATIO_CAUSES` after the five others, zeros included; `n_pairs_missing` counts the None causes, `numerator_none_at_zero` among them. `report.md` shows a ratio contrast's outcome as `ln(numerator/denominator)`, adds a section "Ratio contrasts" (each one's two outcomes, its estimation unit, its independent unit, its cells used and lost by cause, its rule, and exp of its estimate and interval, then, for a contrast estimated per model's cell, "Ratio contrasts by model (exploratory)" with each model's estimate, ratio and interval) and the three causes as columns of the pairs tables, `-` in the row of a contrast of one outcome, and the terminal summary marks its estimate `(ln ratio)`. A report with no ratio contrast has none of these, byte for byte as before. A contrast whose arms read different columns has them in its `ratio`, `numerator_a` and `numerator_b` (or `denominator_a` and `denominator_b`) with `numerator` (or `denominator`) null, and its `outcome` is `"tokens_high/success vs tokens_low/success"`, arm A's ratio first; the per-arm fields of a form are left out of `analysis.json` while they are None (`OMIT_NONE`), so a contrast that declares none is written exactly as before they existed. The report's Numerator (or Denominator) cell then names each arm's column with its arm, `cond-a: tokens_high; cond-b: tokens_low`, its outcome cell is `ln(tokens_high/success vs tokens_low/success)`, and a note after the ratio notes, only in a report with such a contrast, says each arm reads its own columns.
 
 ### One-arm estimates and each arm's runs
 

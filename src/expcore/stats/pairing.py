@@ -46,6 +46,8 @@ the test. Its missing pairs have three more causes, `ratio.RATIO_CAUSES`, after 
   is 0, a failed run whose cost was not measured (an ordinary None otherwise is `outcome_none`);
 - `zero_denominator`, `zero_numerator`: the pair is in a cell the declared rule excludes for a zero sum.
 A contrast of one outcome counts the five causes alone, so its outputs are what they were before ratio contrasts.
+When the arms read different columns (`RatioForm.columns`), each run is read in its own arm's columns, found from the
+run's condition or level (`_columns`), whatever reads it: its value, a failed run's None numerator, its arm's count.
 
 Beside the pairs, each arm's own planned runs are counted (`Pairing.arm_runs`, S14): measured, or lost to a None
 outcome (on a treatment attempt or another run) or to having no analysed attempt (exhausted, unfinished, left out),
@@ -84,8 +86,9 @@ class ContrastSpec:
     "scored" (the scorer returns values for them), "excluded" (every pair with one is left out) or None (undeclared).
     `max_unscored_treatment` is how many pairs a "scored" member of the Holm family may still lose to a treatment
     attempt's None: 0 unless preregistered, for a rare genuine "could not be measured". `ratio` makes it a ratio
-    contrast (S13): it compares `ratio.numerator` per unit of `ratio.denominator`, its `outcome` is the label of the
-    two (`RatioForm.label`), and its margin is a natural-log ratio. `cluster` is the task attribute that clusters the
+    contrast (S13): it compares each arm's numerator per unit of its denominator (`RatioForm.columns`, one pair of
+    columns for both arms unless the arms declare their own), its `outcome` is the label of the two
+    (`RatioForm.label`), and its margin is a natural-log ratio. `cluster` is the task attribute that clusters the
     contrast, the independent unit its test, bootstrap and minimum detectable effect count. `estimation_unit` is the
     cell one value is computed in, nested in a cluster: `("model", cluster)` for a contrast of one outcome, which
     averages each model's pairs apart; for a ratio contrast `(cluster,)`, its sums pooling the models of a cluster
@@ -116,7 +119,7 @@ class ContrastSpec:
             if self.outcome != self.ratio.label:
                 raise ValueError(
                     f"contrast {self.name!r}: a ratio contrast's outcome must be {self.ratio.label!r}, its numerator "
-                    f"over its denominator, got {self.outcome!r}"
+                    f"over its denominator (each arm's, when the arms read different columns), got {self.outcome!r}"
                 )
         margin = self.equivalence_margin
         number = isinstance(margin, int | float) and not isinstance(margin, bool)
@@ -249,13 +252,24 @@ def _number(row: Row, spec: ContrastSpec, outcome: str) -> float | None:
     return float(value)
 
 
+def _columns(row: Row, spec: ContrastSpec, form: RatioForm) -> tuple[str, str]:
+    """The (numerator, denominator) columns a ratio contrast reads on this row: those of the row's own arm, found from
+    the row itself (its condition, or its level of the varying factor), so no caller can read a run in the other
+    arm's columns."""
+    arm = _arm(row, spec)
+    if arm is None:  # every row read here has passed `_arm`; one that has not is a caller's error
+        raise ValueError(f"contrast {spec.name!r}: {row.describe()} is in neither of its arms")
+    return form.columns(arm)
+
+
 def _value(row: Row, spec: ContrastSpec) -> Value | None:
     """Return the row's outcome, or None when it is missing: its one number, or for a ratio contrast its numerator and
-    denominator, None when either is, each refused when negative."""
+    denominator, in its own arm's columns, None when either is, each refused when negative."""
     if spec.ratio is None:
         return _number(row, spec, spec.outcome)
-    numerator, denominator = (_number(row, spec, name) for name in (spec.ratio.numerator, spec.ratio.denominator))
-    for name, part in ((spec.ratio.numerator, numerator), (spec.ratio.denominator, denominator)):
+    names = _columns(row, spec, spec.ratio)
+    numerator, denominator = (_number(row, spec, name) for name in names)
+    for name, part in zip(names, (numerator, denominator), strict=True):
         if part is not None and part < 0:
             raise ValueError(
                 f"contrast {spec.name!r}: outcome {name!r} of {row.describe()} is negative; a ratio contrast sums "
@@ -265,10 +279,12 @@ def _value(row: Row, spec: ContrastSpec) -> Value | None:
 
 
 def _failed_unmeasured(row: Row, spec: ContrastSpec) -> bool:
-    """A run of a ratio contrast whose denominator is 0 and whose numerator is None: a failed run's cost, unmeasured."""
+    """A run of a ratio contrast whose denominator is 0 and whose numerator is None, both in its own arm's columns: a
+    failed run's cost, unmeasured."""
     if spec.ratio is None:
         return False
-    return _number(row, spec, spec.ratio.numerator) is None and _number(row, spec, spec.ratio.denominator) == 0
+    numerator, denominator = _columns(row, spec, spec.ratio)
+    return _number(row, spec, numerator) is None and _number(row, spec, denominator) == 0
 
 
 def _absent_by_arm(
