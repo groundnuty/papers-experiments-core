@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Protocol
 from expcore_onedata.client import PlatformError
 
 if TYPE_CHECKING:  # the heal's module imports this one
-    from expcore_onedata.fault_heal import LinkMatrix
+    from expcore_onedata.fault_matrix import LinkMatrix
 
 # The fourth field is the container's health status, empty for a container with no health check.
 INSPECT_FORMAT = "{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}"
@@ -218,6 +218,12 @@ class ComposeDriver:
         space (`fault_sessions`); None when the probe has no session gate."""
         arm = getattr(self._probe, "arm", None)
         return None if arm is None else arm(service)
+
+    def active_transfers(self) -> int | None:
+        """How many transfer listings show a job not yet ended (`fault_sessions.SessionGate.active_transfers`); None
+        when the probe cannot tell."""
+        transfers = getattr(self._probe, "transfers", None)
+        return None if transfers is None else transfers()
 
     def sessions_ready(self, service: str, gate_probe: str | None) -> str | None:
         """One reading of the session gate for the provider behind a service: None when it passes, else why not."""

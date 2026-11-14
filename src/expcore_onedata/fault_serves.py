@@ -27,7 +27,7 @@ from collections.abc import Callable
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
-from expcore_onedata.fault_heal import LinkMatrix
+from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import SessionGate
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.linkcheck import check_links
@@ -100,6 +100,11 @@ class ServingProbe:
     def sessions(self, service: str, gate_probe: str | None) -> str | None:
         """One reading of the session gate for the provider behind a restored service (`SessionGate.sessions`)."""
         return self._gate.sessions(self._provider(service), gate_probe)
+
+    def transfers(self) -> int:
+        """How many transfer listings of the declared spaces and the probe space show a job not yet ended
+        (`SessionGate.active_transfers`), which the all-links heal waits on."""
+        return self._gate.active_transfers()
 
 
 def provider_serves(config: PlatformConfig, settings: FaultSettings, client: OnezoneClient) -> Callable[[str], bool]:

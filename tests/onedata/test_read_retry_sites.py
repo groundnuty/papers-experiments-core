@@ -109,6 +109,7 @@ ONE_ATTEMPT_SITES = {
     ("fault_sessions.py", "SessionGate.arm", "client.mutate"): ["ONE_ATTEMPT", "ONE_ATTEMPT"],
     ("fault_sessions.py", "SessionGate.arm", "consistency.wait_visible"): ["ONE_ATTEMPT"],
     ("fault_sessions.py", "SessionGate.sessions", "client.get"): ["ONE_ATTEMPT", "ONE_ATTEMPT"],
+    ("fault_sessions.py", "SessionGate.active_transfers", "client.get"): ["ONE_ATTEMPT"],
     # the link check (O35): its fetch is the measurement, and every read and write of setting its probe up is part of
     # the health gate's check, one attempt like the content-type check's
     ("linkcheck.py", "_Check._empty_on", "client.get"): ["ONE_ATTEMPT"],

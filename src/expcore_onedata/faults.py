@@ -53,8 +53,9 @@ fault gate, waits the same way, and its `recovered` reading carries `ready_after
 can leave a pair between two other providers stuck. Before it stops anything, `start` makes the session gate's probe
 file and journals it with the injection (`fault_sessions`); the restore then passes the session gate (`gate_timeout_s`,
 else `sessions_not_ready`) and checks every ordered pair (`links_stuck`), and with `[faults] heal` declared heals a stuck
-pair's readers, bounded and failing closed (`fault_heal`). Only the injector's own clear and start heal, under its
-exclusive admission; the snapshot gains the `gate` and `heal` steps.
+link, bounded and failing closed (`fault_heal`: `all_links` restarts every provider's link at once, then a stuck
+reader's container). Only the injector's own clear and start heal, while an exclusive admission is held; the snapshot
+gains the `gate` and `heal` steps.
 
 **A stop of unknown outcome (O11).** When the stop command raises, typically at its timeout (`command_timeout_s`), the
 CLI is killed but the Docker daemon goes on stopping the container for up to the provider's `stop_grace_period`; the

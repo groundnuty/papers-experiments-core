@@ -27,10 +27,16 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from expcore_onedata.compose import DriverError, Observation
-from expcore_onedata.fault_heal import LinkHeal, LinkMatrix
+from expcore_onedata.fault_heal import LinkHeal
 from expcore_onedata.fault_journal import InjectionJournal, holder
+from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import await_sessions
-from expcore_onedata.fault_settings import FaultSettings, heal_container_reserve, heal_link_reserve
+from expcore_onedata.fault_settings import (
+    FaultSettings,
+    heal_all_links_reserve,
+    heal_container_reserve,
+    heal_link_reserve,
+)
 
 log = logging.getLogger("expcore_onedata.fault_recovery")
 
@@ -114,12 +120,15 @@ class LinkSettling:
             restored=str(entry["target"]),
             bound_s=settings.heal_timeout_s,
             gate_s=settings.gate_timeout_s,
+            poll_s=settings.poll_s,
             command_s=settings.command_timeout_s,
             settle_s=settings.heal_settle_s,
             link_s=heal_link_reserve(settings),
+            all_links_s=heal_all_links_reserve(settings),
             container_s=heal_container_reserve(settings),
             matrix=lambda: self._matrix(service),
             gate=lambda reader, timeout_s: self._gate(reader, gate_probe, timeout_s),
+            transfers=self._active_transfers,
             restart_container=restart,
             clock=self._clock,
             sleep=self._sleep,
@@ -130,6 +139,11 @@ class LinkSettling:
             self.journal.append({**line, "id": child, **({} if result.healed else {"how": result.how})})
         self.links_detail = None if result.healed else str(result.record.get("why") or self.links_detail)
         return result.how
+
+    def _active_transfers(self) -> int | None:
+        """The driver's count of transfer listings with a job not yet ended; None for a driver that cannot tell."""
+        read = getattr(self._driver, "active_transfers", None)
+        return None if read is None else read()
 
     def _matrix(self, service: str) -> LinkMatrix:
         """A fresh link check of every pair, as a matrix; one that cannot be read raises."""

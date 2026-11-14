@@ -39,6 +39,7 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.provision import LISTING_ATTRIBUTES, LISTING_LIMIT, Entry, listing_entry, next_page_token
 from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.streamed import OCTET_STREAM
+from expcore_onedata.transferrecord import page_of
 
 GATE_PROBE_NAME = "expcore-session-probe"
 GATE_PROBE_BYTES = b"expcore session gate probe\n"
@@ -171,6 +172,29 @@ class SessionGate:
                 retry=ONE_ATTEMPT,
             )
         return file_id
+
+    def active_transfers(self) -> int:
+        """How many transfer listings show a job not yet ended, read once (one page, one job, read only) for the
+        waiting and the ongoing state of every declared space and of the probe space, through each provider that
+        supports it: 0 when none does. The all-links heal waits on it, since a replication could dial a link while the
+        links restart. Raise PlatformError when a listing cannot be read: the heal then fails closed."""
+        spaces = [(entry.space.id, tuple(entry.support.providers)) for entry in self._config.spaces]
+        if self._config.link_check is not None:
+            spaces.append((self._config.link_check.space.id, tuple(self._config.link_check.providers)))
+        active = 0
+        for space_id, providers in spaces:
+            for provider in providers:
+                for state in ("waiting", "ongoing"):
+                    page = self._client.get(
+                        f"/spaces/{space_id}/transfers",
+                        provider=provider,
+                        params={"state": state, "limit": 1},
+                        timeout_s=ZONE_TIMEOUT_S,
+                        retry=ONE_ATTEMPT,
+                    )
+                    ids, _ = page_of(page)
+                    active += 1 if ids else 0
+        return active
 
     def sessions(self, provider: str, gate_probe: str | None) -> str | None:
         """One reading of the gate for `provider`, restored: None when it passes, else why not, naming labels only.

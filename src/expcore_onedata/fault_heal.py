@@ -2,159 +2,75 @@
 """The bounded heal of a link a restore left stuck (O35), declared by `[faults] heal` and off by default.
 
 On the live slot of 14 Nov 2026 a provider that fetched from a stopped owner had its `rtransfer_link` crash and come
-back, and a reader whose link to it never reconnected failed every fetch from it, while every other pair transferred;
-the other study's federation showed the same pattern, every pair with the crashed provider as source failing but the
-one whose reader started after the crash, for 46 minutes and more, and a pair untested at the first check failing
-later. The stuck state is the readers' (their stale connections to the crashed source), so the heal acts on **readers,
-one at a time**, never on a source.
+back, and a reader whose link to it never reconnected failed every fetch from it, while every other pair transferred.
+Another study's federation then showed every pair with the crashed provider as source failing but the one whose reader
+started after the crash, and, after one reader's `restart_link`, that reader's pair healed while a pair with that reader
+as its source failed and stayed failed. The hypothesis that fits (provisional, being measured): when a provider's link
+restarts, every peer holding a recent connection to it is left stale, until the peer's own link restarts; a peer whose
+connection had idled out (over 9 minutes, under 31, live) dials afresh. op-worker sets no idle bound for the native
+link, and the link's code is private.
 
-**The matrix** (`LinkMatrix`) is the link check of every ordered pair (`linkcheck.check_links`), by label: each pair's
-reader, source, whether it passed and whether its fetch failed (a stuck link; a pair whose probe could not be made ready
-was not tested and fails too, but names no link to heal). The heal reads it **fresh before it chooses anything**, never
-from the restore's first check alone, and again after each action, and chooses each action from the latest reading.
+**`"all_links"`, the primary mode.** Between runs, under the injector's exclusive admission:
 
-**The order.** At most `ROUNDS` passes; each takes the readers of the latest matrix's stuck pairs in label order. A
-reader is skipped while it is the source of any failing pair, when no `[faults.services]` entry names its service, and
-once its pairs pass. For each reader:
+1. a fresh matrix of every pair (`LinkMatrix`); nothing more is done when it passes;
+2. `ping` every provider with a declared service, in label order (`ComposeDriver.ping`); one with no `pong` fails the
+   heal closed before any restart, since a partial sequence is what leaves pairs stale;
+3. no active transfer in the probe space or a study space (`ComposeDriver.active_transfers`: the waiting and ongoing
+   listings, read only), waited for at most `gate_timeout_s`, else closed (`transfers_active`): a replication could
+   dial a link mid-sequence;
+4. `restart_link` on **every** provider, the restored one and the crashed source included, one after another with no
+   fetch in between: a provider restarted earlier holds no connection when a later one restarts, so no peer is left
+   holding a stale one (`ComposeDriver.restart_link`; each result is a word, and a `badrpc_timeout` is never retried);
+5. one settle of `heal_settle_s` (180 s, provisional) with no probe, no fetch and no run, then no active transfer again
+   (as in 3), then the session gate of the restored provider, then every ordered pair, with fresh probes.
 
-1. `ping` its node (`ComposeDriver.ping`), then read the matrix again: a reader that is now the source of a failing
-   pair, or whose pairs now pass, is left alone. No `pong` goes straight to the container step when `heal` is
-   `"link_then_container"`, and fails the heal closed otherwise: the node, its name, cookie or epmd is not answering,
-   which a link restart cannot mend.
-2. `restart_link` (`ComposeDriver.restart_link`), then `[faults] heal_settle_s` (90 s) of settling with **no fetch at
-   all** (no probe, no check, and no run, the injector holding the federation exclusively), then the session gate for
-   that reader, then every pair again, with fresh probes. Its result is a word; a timeout (`badrpc_timeout`,
-   `command_timeout`) means the restart may still be running on the node, so it is **never issued again**: the matrix
-   decides, and the container step follows if its pairs still fail.
-3. With `"link_then_container"`, a reader whose pairs still fail has its **container** restarted by the injector's own
-   stop and start (`Recovery.restart_container`: journalled as an injection of its own before the stop, so a process
-   that dies midway leaves it for recovery to bring back, and cleared only when the heal ends with every pair passing),
-   then served, settled, gated and checked again. The restored provider's own container is never restarted here: that
-   is the outage again.
+If a pair still fails, the **container fallback**: the readers of the stuck pairs, one at a time in label order, each
+container restarted by the injector's own stop and start (`Recovery.restart_container`: journalled as an injection of
+its own before the stop, cleared only once every pair passes), then settled, gated and checked again; never a provider
+that is the source of a failing pair, and never the restored provider (that is the outage again).
 
-**Why the settle fetches nothing, and a pair an action disturbed.** A peer X sets up its link to R through a secret
-exchange: X's `get_connection_secret` asks R, and R's `generate_secret` registers the pair with
-`rtransfer_link:allow_connection(..., 60000)`, but when that fails, as it may while R's link restarts, R only logs
-"Failed to allow rtransfer connection from <X>" and returns the secret all the same (op-worker f118ed9,
-rtransfer_config.erl 188-198, 247-264). X then holds a secret R's link never allowed, and, inference from private code,
-the pair stays failing until X's own link restarts. Seen live: after R's link restart a pair with R as its source failed
-23 s later and still failed 6 minutes on. So nothing fetches through R while its link comes back, and a pair with R as
-its source that passed before R's action and fails after the settle is **disturbed**: wedged, healed by its own
-reader's `restart_link` (the reader then asks R afresh), followed by the same settle, within the bounds below, or the
-heal fails closed. The heal takes each pass's next reader from the latest matrix, so such a reader is healed in the
-same pass when it has not had its link restart yet.
+**The per-reader modes, kept:** `"link_then_container"` (and `"link"`, the same without containers) heal each stuck
+pair's reader in turn: `ping`, a fresh matrix (a reader that is now the source of a failing pair, or whose pairs pass,
+is left alone), `restart_link`, the settle, the gate, a fresh matrix; then the container step. Under the hypothesis
+above a reader's restart leaves its own peers stale, which the strict rule below then stops, closed.
 
 **Bounds.** At most one `restart_link` and one container restart per provider per restore: the restore journals that
 it heals before the first action, so neither a later clear nor another process's recovery heals the same injection
-again. At most `ROUNDS` passes, and `[faults] heal_timeout_s` in all: no action starts unless its declared bounds fit in
-what is left (`fault_settings.heal_link_reserve`, checked again after the ping, and `heal_container_reserve`, each with
-its settle), and each gate after an action waits at most what is left. The link check's own time is outside the
-reserve, so the heal can end one check's time past the bound.
+again. At most `ROUNDS` passes of per-reader steps, and `[faults] heal_timeout_s` (3,600 s, provisional) in all: no
+step starts unless its declared bounds fit in what is left (`fault_settings.heal_all_links_reserve`,
+`heal_link_reserve`, `heal_container_reserve`), and each wait for transfers or the gate is cut to what is left. The
+link check's own time is outside the reserve, so the heal can end one check's time past the bound.
 
-**Fail closed.** An action after which a pair that passed before it fails, and does not have the acted-on reader as
-its source, stops the heal at once (`heal_broke_pair`); that failure is never healed. A gate that does not pass after
-an action stops it (`sessions_not_ready`), and so does a container restart that is not verified
-(`heal_restart_failed`). A heal that ends with a pair still failing is `links_stuck`, as a restore with no heal is.
-Only a matrix with every pair passing is `healed`, and only then is the restore verified; until it is, the injector
-keeps the federation exclusively, so no run is admitted.
+**Fail closed.** A step after which a pair that passed before it fails stops the heal at once (`heal_broke_pair`). A
+gate that does not pass stops it (`sessions_not_ready`), and so does a transfer still active (`transfers_active`) and a
+container restart that is not verified (`heal_restart_failed`). A heal that ends with a pair failing is `links_stuck`.
+Only a matrix with every pair passing is `healed`, and only then is the restore verified; until then the injector holds
+the federation exclusively, so no run is admitted.
 
-**The record** (`HealResult.record`) holds the mode, the outcome, the matrix before the heal and after every action, by
-label, with the source every failing pair shares (`shared_source`: the crashed provider, when there is one), each
-action (the provider by label, the action, `ping`, `restart_link` or `container_restart`, its result word, its start
-and end in UTC, its settle, the gate's reading after it, the matrix after it, and the pairs it disturbed), and every
-disturbed pair again under `disturbed`, with the provider whose action disturbed it and how it ended (`healed` or
-`failing` in the last matrix). Nothing a command printed is kept.
+**The record** (`HealResult.record`) holds the mode, the outcome and why, the matrix before the heal and after it, the
+source every failing pair shares (`shared_source`: the crashed provider), the settle window's start and end, and every
+step: the provider by label (`all` for the transfer readings and the all-pairs check), the step (`ping`,
+`restart_link`, `transfers`, `check`, `container_restart`), its result word, its start and end in UTC, and, where it has
+them, the settle, the gate's reading and the matrix after it. Nothing a command printed is kept.
 """
 
-import re
-from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from expcore_onedata.compose import DriverError
+from expcore_onedata.fault_matrix import LinkMatrix, PairState, label_order, unreadable
+
+__all__ = ["ROUNDS", "HealResult", "LinkHeal", "LinkMatrix", "PairState", "unreadable"]
 
 ROUNDS = 2
-_LABEL = re.compile(r"providers\[(\d+)\]")
-
-
-def _order(label: str) -> tuple[int, str]:
-    found = _LABEL.fullmatch(label)
-    return (int(found.group(1)) if found else 1 << 30, label)
-
-
-@dataclass(frozen=True)
-class PairState:
-    """One ordered pair of the link check, by label: `reader` fetched from `source`. `stuck` is a failed fetch."""
-
-    reader: str
-    source: str
-    ok: bool
-    seconds: float | None = None
-    stuck: bool = False
-
-    def to_json(self) -> dict[str, Any]:
-        seconds = None if self.seconds is None else round(self.seconds, 3)
-        return {"reader": self.reader, "source": self.source, "ok": self.ok, "seconds": seconds, "stuck": self.stuck}
-
-
-@dataclass(frozen=True)
-class LinkMatrix:
-    """The link check of every ordered pair, as the heal reads it."""
-
-    ok: bool
-    detail: str
-    pairs: tuple[PairState, ...] = ()
-
-    @classmethod
-    def from_report(cls, report: Any) -> "LinkMatrix":
-        """From a `linkcheck.LinkReport`: a pair is stuck when its fetch failed (its result names the remedy)."""
-        pairs = tuple(
-            PairState(p.local, p.source, p.ok, p.seconds, not p.ok and p.remedy is not None) for p in report.pairs
-        )
-        return cls(bool(report.ok), str(report.detail), pairs)
-
-    def failing(self) -> list[PairState]:
-        return [pair for pair in self.pairs if not pair.ok]
-
-    def sources(self) -> set[str]:
-        """The sources of every failing pair: no heal acts on one."""
-        return {pair.source for pair in self.failing()}
-
-    def stuck_readers(self) -> list[str]:
-        """The readers of the stuck pairs, in label order."""
-        return sorted({pair.reader for pair in self.failing() if pair.stuck}, key=_order)
-
-    def shared_source(self) -> str | None:
-        """The source every failing pair shares, when they share one (the crashed provider of the pattern)."""
-        sources = self.sources()
-        return next(iter(sources)) if len(sources) == 1 else None
-
-    def broken_since(self, before: "LinkMatrix") -> list[tuple[str, str]]:
-        """The pairs that passed in `before` and do not pass here, or are missing here."""
-        now = {(pair.reader, pair.source): pair.ok for pair in self.pairs}
-        return [(p.reader, p.source) for p in before.pairs if p.ok and now.get((p.reader, p.source)) is not True]
-
-    def to_json(self) -> dict[str, Any]:
-        failing = Counter(pair.source for pair in self.failing())
-        return {
-            "ok": self.ok,
-            "pairs": [pair.to_json() for pair in self.pairs],
-            "failing_sources": dict(sorted(failing.items(), key=lambda item: _order(item[0]))),
-            "shared_source": self.shared_source(),
-        }
-
-
-def unreadable(error: BaseException) -> LinkMatrix:
-    """The matrix of a link check that could not run: failed, with no pair, so nothing passes and nothing is healed."""
-    return LinkMatrix(False, f"the link check raised {type(error).__name__}")
 
 
 @dataclass
 class HealResult:
-    """How a heal ended: `how` is `healed`, `links_stuck`, `heal_broke_pair`, `sessions_not_ready` or
-    `heal_restart_failed`; `record` goes into the injector's snapshot."""
+    """How a heal ended: `how` is `healed`, `links_stuck`, `heal_broke_pair`, `sessions_not_ready`,
+    `transfers_active` or `heal_restart_failed`; `record` goes into the injector's snapshot."""
 
     how: str
     record: dict[str, Any] = field(default_factory=dict)
@@ -168,14 +84,18 @@ def _utc() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
+Step = tuple[str | None, LinkMatrix, str]  # the word to stop with (None to go on), the matrix after it, and why
+
+
 class LinkHeal:
-    """One heal of a restore's stuck links (see the module docstring). `services` maps a provider's label to its
-    service; `restored` is the label of the provider the restore brought back. `matrix()` reads the link check of every
-    pair; `gate(service, timeout_s)` passes the session gate for a provider within `timeout_s` and returns its reading
-    (`ok` among its keys); `restart_container(label, service)` stops and starts a reader's container, verified, and
-    returns how (`ok`, `how`, `serves_after_s`). `command_s` is the bound of one driver command, `settle_s` the wait
-    after each action, and `link_s` and `container_s` the declared bounds of a ping with a link restart and of a
-    container restart (`fault_settings.heal_link_reserve`, `heal_container_reserve`)."""
+    """One heal of a restore's stuck links (see the module docstring).
+
+    `services` maps a provider's label to its service, and `restored` is the label of the provider the restore brought
+    back. `matrix()` reads every pair; `gate(service, timeout_s)` passes the session gate for a provider and returns its
+    reading (`ok` among its keys); `transfers()` counts the active transfer listings (None when it cannot know);
+    `restart_container(label, service)` restarts a reader's container, verified (`ok`, `how`, `serves_after_s`).
+    `command_s` bounds one driver command, `settle_s` is the settle, and `link_s`, `all_links_s` and `container_s` are
+    the declared bounds of a ping with a link restart, of the whole all-links sequence and of a container restart."""
 
     def __init__(
         self,
@@ -186,31 +106,34 @@ class LinkHeal:
         restored: str,
         bound_s: float,
         gate_s: float,
+        poll_s: float,
         command_s: float,
         settle_s: float,
         link_s: float,
+        all_links_s: float,
         container_s: float,
         matrix: Callable[[], LinkMatrix],
         gate: Callable[[str, float], dict[str, Any]],
+        transfers: Callable[[], int | None],
         restart_container: Callable[[str, str], dict[str, Any]],
         clock: Callable[[], float],
         sleep: Callable[[float], None],
         utc: Callable[[], str] = _utc,
     ) -> None:
         self._mode, self._driver, self._services, self._restored = mode, driver, dict(services), restored
-        self._bound_s, self._gate_s, self._settle_s = bound_s, gate_s, settle_s
-        self._link_cost = link_s  # the ping's lookup and command, the restart's lookup, its RPC and one settle
-        self._restart_cost = link_s - 2 * command_s  # what is left once the ping is done
-        self._container_cost = container_s
-        self._matrix, self._gate, self._restart = matrix, gate, restart_container
+        self._bound_s, self._gate_s, self._poll_s, self._settle_s = bound_s, gate_s, poll_s, settle_s
+        self._link_cost, self._restart_cost = link_s, link_s - 2 * command_s  # what is left once a ping is done
+        self._all_links_cost, self._container_cost = all_links_s, container_s
+        self._matrix, self._gate, self._transfers, self._restart = matrix, gate, transfers, restart_container
         self._clock, self._sleep, self._utc = clock, sleep, utc
         self._actions: list[dict[str, Any]] = []
         self._skipped: list[dict[str, str]] = []
+        self._window: dict[str, Any] | None = None
         self._linked: set[str] = set()  # providers whose link was restarted, or whose node gave no pong
-        self._restarted: set[str] = set()  # providers whose container was restarted
+        self._restarted: set[str] = set()  # providers whose container was restarted, or that may never be
         self._started = 0.0
 
-    # --- the readings -----------------------------------------------------------------------------------------------
+    # --- readings and records ---------------------------------------------------------------------------------------
 
     def _read(self) -> LinkMatrix:
         try:
@@ -218,28 +141,21 @@ class LinkHeal:
         except Exception as error:  # a check that cannot answer is a failed one, never a pass
             return unreadable(error)
 
+    def _left(self) -> float:
+        return self._bound_s - (self._clock() - self._started)
+
     def _fits(self, cost: float) -> bool:
-        """Whether an action whose declared bounds are `cost` seconds ends within `heal_timeout_s`."""
-        return self._clock() - self._started + cost <= self._bound_s
+        """Whether a step whose declared bounds are `cost` seconds ends within `heal_timeout_s`."""
+        return cost <= self._left()
 
     def _gate_within(self, service: str) -> dict[str, Any]:
-        """The gate after an action, waiting at most `gate_timeout_s` and never past `heal_timeout_s`."""
-        left = self._bound_s - (self._clock() - self._started)
-        return self._gate(service, max(0.0, min(self._gate_s, left)))
+        """The gate after a step, waiting at most `gate_timeout_s` and never past `heal_timeout_s`."""
+        return self._gate(service, max(0.0, min(self._gate_s, self._left())))
 
-    def _disturbed(self, current: LinkMatrix) -> list[dict[str, str]]:
-        """Every pair an action disturbed, with the provider whose action it was and how it ended: `healed` when it
-        passes in the last matrix, `failing` when it does not."""
-        passing = {(pair.reader, pair.source) for pair in current.pairs if pair.ok}
-        return [
-            {
-                **pair,
-                "by": action["provider"],
-                "ended": "healed" if (pair["reader"], pair["source"]) in passing else "failing",
-            }
-            for action in self._actions
-            for pair in action.get("disturbed") or []
-        ]
+    def _record(self, label: str, action: str, result: str, start: str, **extra: Any) -> None:
+        entry = {"provider": label, "action": action, "result": result, "start_utc": start, "end_utc": self._utc()}
+        after = extra.pop("after", None)
+        self._actions.append({**entry, **extra, **({} if after is None else {"matrix_after": after.to_json()})})
 
     def _end(self, how: str, current: LinkMatrix, before: LinkMatrix, why: str | None = None) -> HealResult:
         tried = ", ".join(f"{a['action']} on {a['provider']} ({a['result']})" for a in self._actions) or "nothing"
@@ -252,37 +168,14 @@ class LinkHeal:
             "before": before.to_json(),
             "after": current.to_json(),
             "shared_source": before.shared_source(),
+            "window": self._window,
             "actions": list(self._actions),
-            "disturbed": self._disturbed(current),
             "skipped": list(self._skipped),
             "tried": tried,
         }
         return HealResult(how, record)
 
-    # --- the actions ------------------------------------------------------------------------------------------------
-
-    def _record(
-        self,
-        label: str,
-        action: str,
-        result: str,
-        start: str,
-        gate: dict[str, Any] | None = None,
-        after: LinkMatrix | None = None,
-        **extra: Any,
-    ) -> None:
-        self._actions.append(
-            {
-                "provider": label,
-                "action": action,
-                "result": result,
-                "start_utc": start,
-                "end_utc": self._utc(),
-                "gate": gate,
-                "matrix_after": None if after is None else after.to_json(),
-                **extra,
-            }
-        )
+    # --- the steps --------------------------------------------------------------------------------------------------
 
     def _ping(self, label: str, service: str) -> bool:
         start = self._utc()
@@ -293,17 +186,56 @@ class LinkHeal:
         self._record(label, "ping", "pong" if pong else "no_pong", start)
         return pong
 
+    def _restart_link(self, label: str, service: str) -> str:
+        """One link restart, recorded by its result word; never issued twice to a provider in a restore."""
+        self._linked.add(label)
+        start = self._utc()
+        try:
+            result = str(self._driver.restart_link(service))
+        except DriverError:
+            result = "not_run"
+        self._record(label, "restart_link", result, start)
+        return result
+
+    def _no_transfers(self, phase: str) -> bool:
+        """Wait, polling every `poll_s` for at most `gate_timeout_s` (cut to what is left), until no transfer is
+        active in the probe space or a study space; record the reading; False when one stays active or the listings
+        cannot be read."""
+        start, began, bound = self._utc(), self._clock(), max(0.0, min(self._gate_s, self._left()))
+        while True:
+            try:
+                active = self._transfers()
+            except Exception:  # a listing that cannot be read shows no quiet: fail closed
+                active = -1
+            if active is None or active == 0 or self._clock() - began >= bound:
+                break
+            self._sleep(self._poll_s)
+        quiet = active is None or active == 0
+        result = "none" if active is None else ("quiet" if quiet else "active")
+        waited = round(self._clock() - began, 3)
+        self._record("all", "transfers", result, start, phase=phase, active=active, waited_s=waited)
+        return quiet
+
     def _settle(self) -> float:
-        """The wait after an action, before anything reads through what it restarted."""
+        """The settle after a restart: no probe, no fetch and no run touches any link meanwhile."""
         self._sleep(self._settle_s)
         return self._settle_s
 
-    def _act(self, label: str, service: str, action: str, before: LinkMatrix) -> tuple[str | None, LinkMatrix, str]:
-        """Run one action on a reader, then settle with no fetch at all, pass its gate and read every pair afresh
-        (`_classify`); return the word the heal must stop with (None to go on), the matrix after it and why."""
-        start = self._utc()
-        extra: dict[str, Any] = {}
+    def _checked(self, label: str, action: str, before: LinkMatrix, after: LinkMatrix) -> Step:
+        """The verdict on the matrix after a step: unreadable, a pair broken, or go on."""
+        if not after.pairs:
+            return "links_stuck", after, f"the link check after the {action} on {label} could not run"
+        broken = after.broken_since(before)
+        if broken:
+            shown = ", ".join(f"{source}->{reader}" for reader, source in broken)
+            return "heal_broke_pair", after, f"the {action} on {label} broke {shown}, which passed before it"
+        return None, after, ""
+
+    def _act(self, label: str, service: str, action: str, before: LinkMatrix) -> Step:
+        """One reader's link or container restart, then the settle, its gate and a fresh matrix."""
+        start, extra = self._utc(), {}
         if action == "restart_link":
+            self._linked.add(label)
             try:
                 result = str(self._driver.restart_link(service))
             except DriverError:
@@ -314,39 +246,49 @@ class LinkHeal:
             if done.get("ok") is not True:
                 self._record(label, action, result, start, **extra)
                 return "heal_restart_failed", before, f"the container of {label} was not restored ({result})"
-        settled = self._settle()  # no probe, fetch or run touches the reader meanwhile
+        settled = self._settle()
         gate = self._gate_within(service)
         if gate.get("ok") is not True:
-            self._record(label, action, result, start, gate, settle_s=settled, **extra)
+            self._record(label, action, result, start, settle_s=settled, gate=gate, **extra)
             return "sessions_not_ready", before, f"the session gate for {label} did not pass after its {action}"
         after = self._read()
-        stop, why, disturbed = self._classify(label, action, before, after)
-        self._record(label, action, result, start, gate, after, settle_s=settled, disturbed=disturbed, **extra)
-        return stop, after, why
+        self._record(label, action, result, start, settle_s=settled, gate=gate, after=after, **extra)
+        return self._checked(label, action, before, after)
 
-    @staticmethod
-    def _classify(
-        label: str, action: str, before: LinkMatrix, after: LinkMatrix
-    ) -> tuple[str | None, str, list[dict[str, str]]]:
-        """Judge the pairs that failed after an action's settle and passed before it. One whose source is the reader
-        acted on is disturbed: its reader's link asked that reader for a connection secret while the reader's link was
-        coming back, which the reader handed out without its link allowing the connection (op-worker f118ed9,
-        rtransfer_config.erl, `generate_secret`; the rest is inference), so it stays wedged until its own reader's link
-        restarts. It is a cascade the heal goes on to heal by that reader's `restart_link`, within the bounds, or fails
-        closed. Any other pair that fails is broken by the action, and the heal stops (`heal_broke_pair`). Return the
-        stop word, why, and the disturbed pairs."""
-        if not after.pairs:
-            return "links_stuck", f"the link check after the {action} on {label} could not run", []
-        broken = after.broken_since(before)
-        others = [(reader, source) for reader, source in broken if source != label]
-        disturbed = [{"reader": reader, "source": source} for reader, source in broken if source == label]
-        if others:
-            shown = ", ".join(f"{source}->{reader}" for reader, source in others)
-            return "heal_broke_pair", f"the {action} on {label} broke {shown}, which passed before it", disturbed
-        return None, "", disturbed
+    def _all_links(self, before: LinkMatrix) -> Step:
+        """Ping every provider, wait for no transfer, restart every link in quick succession, settle with no fetch,
+        wait for no transfer, pass the restored provider's gate and read every pair."""
+        labels = sorted(self._services, key=label_order)
+        if not self._fits(self._all_links_cost):
+            return "links_stuck", before, "heal_timeout_s leaves no time for the all-links sequence"
+        for label in labels:
+            if not self._ping(label, self._services[label]):
+                return "links_stuck", before, f"{label} answered no pong, so not every link can be restarted"
+        if not self._no_transfers("before"):
+            return "transfers_active", before, "a transfer stayed active before the all-links sequence"
+        pinged = len(labels) * (self._link_cost - self._restart_cost)  # the pings' share of the reserve, now spent
+        if not self._fits(self._all_links_cost - pinged):
+            return "links_stuck", before, "heal_timeout_s leaves no time for the all-links restarts"
+        opened = self._utc()
+        for label in labels:  # one after another, nothing fetched in between
+            self._restart_link(label, self._services[label])
+        settled = self._settle()
+        self._window = {"start_utc": opened, "end_utc": self._utc(), "settle_s": settled}
+        if not self._no_transfers("after"):
+            return "transfers_active", before, "a transfer was active at the end of the all-links window"
+        restored = self._services.get(self._restored)
+        gate = self._gate_within(restored) if restored is not None else {"ok": True, "how": "none"}
+        start = self._utc()
+        if gate.get("ok") is not True:
+            self._record("all", "check", "not_run", start, gate=gate)
+            return "sessions_not_ready", before, "the restored provider's session gate did not pass after the restarts"
+        after = self._read()
+        self._record("all", "check", "passed" if after.ok else "failing", start, gate=gate, after=after)
+        return self._checked("every provider", "all-links sequence", before, after)
 
-    def _heal_reader(self, label: str, current: LinkMatrix) -> tuple[str | None, LinkMatrix, str]:
-        """The steps for one reader: ping and link restart, then the container when declared and still failing."""
+    def _heal_reader(self, label: str, current: LinkMatrix) -> Step:
+        """The per-reader steps: ping and link restart (unless done), then the container when declared and still
+        failing."""
         service = self._services[label]
         if label not in self._linked:
             if not self._fits(self._link_cost):
@@ -364,10 +306,10 @@ class LinkHeal:
                 stop, current, why = self._act(label, service, "restart_link", current)
                 if stop is not None:
                     return stop, current, why
-            elif self._mode != "link_then_container":
+            elif self._mode == "link":
                 return "links_stuck", current, f"{label} answered no pong, so its link cannot be restarted"
         still = label in current.stuck_readers() and label not in current.sources()
-        if still and self._mode == "link_then_container" and label not in self._restarted:
+        if still and self._mode != "link" and label not in self._restarted:
             self._restarted.add(label)  # one container restart per provider per restore, or none
             if label == self._restored:
                 self._skipped.append({"provider": label, "why": "the restored provider's container is not restarted"})
@@ -377,15 +319,14 @@ class LinkHeal:
             return self._act(label, service, "container_restart", current)
         return None, current, ""
 
-    def run(self) -> HealResult:
-        """Heal what a fresh matrix shows stuck, reader by reader; return how it ended and its record."""
-        self._started = self._clock()
-        current = before = self._read()
+    def _readers(self, current: LinkMatrix, before: LinkMatrix) -> HealResult | LinkMatrix:
+        """At most `ROUNDS` passes of per-reader steps, each taking its next reader from the latest matrix; the end
+        when a step stops, else the matrix after the passes."""
         for _ in range(ROUNDS):
             if current.ok:
                 break
             seen: set[str] = set()  # the readers this pass has taken, each once
-            while True:  # the next reader of the latest matrix, so a cascade an action made is healed in this pass
+            while True:
                 sources = current.sources()  # never acted on: the source of a failing pair
                 waiting = [label for label in current.stuck_readers() if label not in seen and label not in sources]
                 if not waiting:
@@ -399,6 +340,21 @@ class LinkHeal:
                 stop, current, why = self._heal_reader(label, current)
                 if stop is not None:
                     return self._end(stop, current, before, why)
+        return current
+
+    def run(self) -> HealResult:
+        """Heal what a fresh matrix shows stuck; return how it ended and its record."""
+        self._started = self._clock()
+        current = before = self._read()
         if current.ok:
             return self._end("healed", current, before)
-        return self._end("links_stuck", current, before, "a pair still fails after every action the bounds allow")
+        if self._mode == "all_links":
+            stop, current, why = self._all_links(before)
+            if stop is not None:
+                return self._end(stop, current, before, why)
+        ended = self._readers(current, before)
+        if isinstance(ended, HealResult):
+            return ended
+        if ended.ok:
+            return self._end("healed", ended, before)
+        return self._end("links_stuck", ended, before, "a pair still fails after every step the bounds allow")

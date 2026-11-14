@@ -108,6 +108,7 @@ _WHY = {  # how a settling failed, in words, where the bare word would not say i
     ),
     "heal_broke_pair": "an action of the link heal broke a provider pair that passed before it (O35)",
     "heal_restart_failed": "the link heal restarted a reader's container, and that restore was not verified (O35)",
+    "transfers_active": "a transfer stayed active in a study or the probe space, so the link heal did not run (O35)",
 }
 
 

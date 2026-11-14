@@ -19,9 +19,9 @@ service entry, its position, never by a provider's or a service's name. The serv
     admission_timeout_s = 3600       # optional: the longest a run waits for the federation's lock
     health_wait_s = 30               # optional: the longest the health check waits for it; below health_timeout_s
     gate_timeout_s = 240             # optional: the longest a restored provider's peers may take to reach it; see below
-    heal = "off"                     # optional: "off", "link" or "link_then_container"; see below
-    heal_timeout_s = 900             # optional: the longest the heal of a stuck link may take, all its actions together
-    heal_settle_s = 90               # optional: the wait after each heal action before its pairs are checked again
+    heal = "off"                     # optional: "off", "all_links", "link_then_container" or "link"; see below
+    heal_timeout_s = 3600            # optional, provisional: the longest the heal of a stuck link may take in all
+    heal_settle_s = 180              # optional, provisional: the no-fetch wait after a heal's restarts
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
@@ -47,22 +47,22 @@ injection open and the federation's exclusive admission held, as a failed restor
 the injection, its block map read through each peer, has no error entry for the restored provider. Its default, 240 s,
 is the 180 s cap of a peer's session renewal backoff (op-worker f118ed9) and a margin.
 
-`heal` says what the restore does when a link is stuck after it (`links_stuck`, O35): `"off"` (the default) fails the
-restore closed, as before; `"link"` restarts the rtransfer link of each stuck pair's reader, one at a time, and checks
-again; `"link_then_container"` also restarts a reader's container when its link restart did not mend its pairs
-(`expcore_onedata.fault_heal`). A container restart is itself an outage of that provider, so declare it knowingly.
-`heal_settle_s` is the wait after each action, with no fetch at all, before the gate and the pairs are read again: a
-peer that fetches from a reader while the reader's link comes back can be handed a connection secret the link never
-allowed, which wedges that pair until the peer's own link restarts (seen live: a pair with the restarted reader as its
-source failed 23 s after the restart and still failed 6 minutes on; the mechanism is inferred from op-worker's
-`generate_secret`). A pair with the acted-on reader as its source that fails after the settle is healed by its own
-reader's link restart, within the bounds (`expcore_onedata.fault_heal`). `heal_timeout_s` bounds the
-heal: no action starts whose declared bounds would carry the heal past it, so a declared heal must leave room for one
-round of its own actions: a ping and a link restart (`heal_link_reserve`: three commands at `command_timeout_s`, the
-RPC's bound and its margin, and one settle), and for `"link_then_container"` a container restart too
-(`heal_container_reserve`: four commands, `settle_timeout_s` twice, `ready_timeout_s` and one settle). A smaller
-`heal_timeout_s` is refused at load, naming the key and the least it may be; with the other defaults that is 600 s for
-`"link"`, which the default 900 s covers, and 1,710 s for `"link_then_container"`, which must raise it.
+`heal` says what the restore does when a link is stuck after it (`links_stuck`, O35; `expcore_onedata.fault_heal`):
+`"off"` (the default) fails the restore closed, as before. `"all_links"`, the primary mode, restarts the rtransfer link
+of every provider in quick succession, settles with no fetch, checks every pair, and falls back to restarting a stuck
+pair's reader's container. `"link_then_container"` and `"link"` are the per-reader design, kept: each stuck pair's
+reader's link restarted in turn, then (in the first) its container. A container restart is itself an outage of that
+provider, so declare a mode that can make one knowingly. `heal_settle_s` is the wait after the restarts, with no
+probe, no fetch and no run. `heal_timeout_s` bounds the heal: no step starts whose declared bounds would carry the heal
+past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming the key and
+the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a ping and a
+link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one container
+restart
+(`heal_container_reserve`: four commands, `settle_timeout_s` twice, `ready_timeout_s` and one settle); for
+`"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one settle) and one container
+restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in `"all_links"` need 3,420 s, which
+the default 3,600 s covers; five need 3,930 s, which must raise it. **Both durations are provisional:** the settle and
+the idle period that leaves a peer's connection stale are being measured, and the defaults will be tuned from it.
 """
 
 import hashlib
@@ -87,9 +87,9 @@ SETTLE_MARGIN_S = 60.0  # what the default settle timeout adds to it, for the da
 DEFAULT_SETTLE_TIMEOUT_S = STOP_GRACE_S + SETTLE_MARGIN_S
 DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48 to 52 s after their restart (measured)
 DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
-DEFAULT_HEAL_TIMEOUT_S = 900.0
-DEFAULT_HEAL_SETTLE_S = 90.0  # peers' links redialled a restarted reader within about 23 to 38 s (seen live), and more
-HEAL_MODES = ("off", "link", "link_then_container")
+DEFAULT_HEAL_TIMEOUT_S = 3600.0  # provisional: four providers' all-links sequence and one container restart fit it
+DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measurement tunes it
+HEAL_MODES = ("off", "all_links", "link_then_container", "link")
 _KEYS = (
     "sanctioned",
     "journal",
@@ -227,11 +227,20 @@ def heal_container_reserve(settings: FaultSettings) -> float:
     )
 
 
+def heal_all_links_reserve(settings: FaultSettings) -> float:
+    """The declared bounds of the all-links sequence: a ping and a link restart for each provider of
+    `[faults.services]`, and one settle."""
+    each = heal_link_reserve(settings) - settings.heal_settle_s
+    return len(settings.services) * each + settings.heal_settle_s
+
+
 def heal_round_s(settings: FaultSettings) -> float:
-    """The least `heal_timeout_s` a declared heal needs: one link restart, and a container restart in
-    `link_then_container`; 0 with the heal off."""
+    """The least `heal_timeout_s` a declared heal needs for one round of its steps: the all-links sequence and one
+    container restart; one link restart and one container restart; one link restart; 0 with the heal off."""
     if settings.heal == "off":
         return 0.0
+    if settings.heal == "all_links":
+        return heal_all_links_reserve(settings) + heal_container_reserve(settings)
     container = heal_container_reserve(settings) if settings.heal == "link_then_container" else 0.0
     return heal_link_reserve(settings) + container
 

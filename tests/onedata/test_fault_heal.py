@@ -35,13 +35,20 @@ TARGET = RESTORED
 
 
 class HealServices(FakeServices):
-    """Four providers' services with a scripted link check, session gate, ping and link restart.
+    """Four providers' services with a scripted link check, session gate, ping, link restart and transfer listings.
 
     `stuck` holds the failing pairs as (reader, source) labels. `link_fixes[reader]` is what a link restart of that
     reader mends: by default its own stuck pairs and nothing else, the shape seen live (each stale reader of a crashed
     source is cleared by its own `restart_link` alone, never by the source's or another reader's); `()` mends nothing.
     `link_breaks[reader]` is the pairs it breaks, `container_fixes` the readers a container restart mends, and `grow`
     adds pairs to `stuck` before the given check.
+
+    With `stale_model`, the hypothesis that fits the live data (provisional): each passing fetch leaves its reader
+    holding a connection toward its source (`conns`); when a provider's link restarts, its own connections drop (it
+    dials afresh, so its own stale pairs clear), and every peer still holding a connection toward it is left stale,
+    failing every fetch from it, until that peer's own link restarts. A container restart only clears the restarted
+    reader (an assumption of the fake: its peers see the sockets close). `transfers` is the script of active-transfer
+    readings, 0 once it runs out.
     """
 
     def __init__(self, **knobs):
@@ -61,54 +68,40 @@ class HealServices(FakeServices):
         self.ping_s = 0.0  # seconds a ping takes on the clock
         self.on_ping = None  # called with the reader's label while it is pinged
         self.on_check = None  # called before each link check
-        # what a restart of a reader disturbs: pairs with it as their source, each failing for that many seconds of the
-        # clock after the restart (the peer's link redials it), or for good (None: a cascade)
-        self.disturbs: dict[str, dict[tuple[str, str], float | None]] = {}
-        self.disturbed: dict[tuple[str, str], float | None] = {}  # failing until that time, or for good
-        # the seconds a reader's link takes to come back after its restart: a fetch through it meanwhile (any link
-        # check) is handed a secret the link never allowed, which wedges every pair from it until that pair's reader's
-        # own link restarts (op-worker's `generate_secret`; the wedge is inference from private code)
-        self.up_s: dict[str, float] = {}
-        self.restarted_at: dict[str, float] = {}
+        self.stale_model = False
+        self.conns: set[tuple[str, str]] = set()  # (reader, source): the reader holds a connection toward the source
+        self.transfers: list[int] = []
         self.actions: list[tuple[str, str]] = []
         self.at: list[tuple[str, str, float]] = []  # each action with the clock's time
         self.checked_at: list[float] = []  # each link check's time
 
-    def _failing(self) -> set[tuple[str, str]]:
-        now = self.clock.now if self.clock is not None else 0.0
-        return self.stuck | {pair for pair, until in self.disturbed.items() if until is None or until > now}
+    def connected(self) -> "HealServices":
+        """Every passing pair holds a connection, as after the checks before the outage's restore."""
+        self.conns = {(r, s) for r in LABEL.values() for s in LABEL.values() if r != s} - self.stuck
+        self.stale_model = True
+        return self
 
     def _matrix(self) -> LinkMatrix:
-        labels, failing = list(LABEL.values()), self._failing()
+        labels = list(LABEL.values())
         pairs = tuple(
-            PairState(reader, source, (reader, source) not in failing, 0.1, (reader, source) in failing)
+            PairState(reader, source, (reader, source) not in self.stuck, 0.1, (reader, source) in self.stuck)
             for reader in labels
             for source in labels
             if reader != source
         )
-        shown = [f"{source}->{reader}" for reader, source in sorted(failing)]
-        return LinkMatrix(not failing, "stuck: " + ", ".join(shown) if shown else "every pair passed", pairs)
-
-    def _restarted(self, reader: str) -> None:
-        """A reader's link restarted: its own disturbed pairs clear, and it disturbs the pairs it is the source of."""
-        self.disturbed = {pair: until for pair, until in self.disturbed.items() if pair[0] != reader}
-        now = self.clock.now if self.clock is not None else 0.0
-        self.restarted_at[reader] = now
-        for pair, after in self.disturbs.get(reader, {}).items():
-            self.disturbed[pair] = None if after is None else now + after
-
-    def _fetch_through_coming_links(self) -> None:
-        """A link check fetches every pair: those from a reader whose link is still coming back wedge."""
-        now = self.clock.now if self.clock is not None else 0.0
-        for source, began in self.restarted_at.items():
-            if began <= now < began + self.up_s.get(source, 0.0):
-                for reader in LABEL.values():
-                    if reader != source:
-                        self.disturbed[(reader, source)] = None
+        shown = [f"{source}->{reader}" for reader, source in sorted(self.stuck)]
+        return LinkMatrix(not self.stuck, "stuck: " + ", ".join(shown) if shown else "every pair passed", pairs)
 
     def _note(self, verb: str, label: str) -> None:
         self.actions.append((verb, label))
         self.at.append((verb, label, self.clock.now if self.clock is not None else 0.0))
+
+    def _link_restarted(self, provider: str) -> None:
+        """The stale model's link restart: the provider's own connections drop and its stale pairs clear; every peer
+        still holding a connection toward it is left stale."""
+        self.stuck = {pair for pair in self.stuck if pair[0] != provider}
+        self.conns = {pair for pair in self.conns if pair[0] != provider}
+        self.stuck |= {(reader, source) for reader, source in self.conns if source == provider}
 
     def link_matrix(self, service):
         self.checks += 1
@@ -116,8 +109,13 @@ class HealServices(FakeServices):
         if self.on_check is not None:
             self.on_check()
         self.stuck |= self.grow.get(self.checks, set())
-        self._fetch_through_coming_links()
-        return self._matrix()
+        matrix = self._matrix()
+        if self.stale_model:  # every passing fetch holds its connection afterwards
+            self.conns |= {(pair.reader, pair.source) for pair in matrix.pairs if pair.ok}
+        return matrix
+
+    def active_transfers(self):
+        return self.transfers.pop(0) if self.transfers else 0
 
     def sessions_ready(self, service, gate_probe):
         if self.gate_after > 0:
@@ -138,11 +136,12 @@ class HealServices(FakeServices):
         self._note("restart_link", reader)
         if self.clock is not None:
             self.clock.sleep(self.link_s)
+        if self.stale_model:
+            self._link_restarted(reader)
+            return self.link_result.get(reader, "ok")
         fixes = self.link_fixes.get(reader)
         mended = {pair for pair in self.stuck if pair[0] == reader} if fixes is None else set(fixes)
         self.stuck = (self.stuck - mended) | set(self.link_breaks.get(reader, ()))
-        if fixes is None:
-            self._restarted(reader)
         return self.link_result.get(reader, "ok")
 
     def stop(self, service):
@@ -154,7 +153,7 @@ class HealServices(FakeServices):
         super().start(service)
         if LABEL[service] in self.container_fixes:
             self.stuck = {pair for pair in self.stuck if pair[0] != LABEL[service]}
-            self._restarted(LABEL[service])
+            self.conns = {pair for pair in self.conns if pair[0] != LABEL[service]}
 
 
 def four_providers(data, **faults):
@@ -190,32 +189,34 @@ def journal_lines(tmp_path):
 
 
 def test_o35_the_heal_is_off_by_default_and_its_bounds_default_to_the_designed_ones(tmp_path):
-    """O35: without `heal`, a stuck link fails the restore closed as before; the gate waits 240 s, the heal 900 s."""
+    """O35: without `heal`, a stuck link fails the restore closed as before; the gate waits 240 s, the heal at most
+    3,600 s, and its settle is 180 s (both provisional)."""
     platform = write_platform(tmp_path, four_providers)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
-    assert (settings.heal, settings.gate_timeout_s, settings.heal_timeout_s) == ("off", 240.0, 900.0)
-    assert (DEFAULT_GATE_TIMEOUT_S, DEFAULT_HEAL_TIMEOUT_S, DEFAULT_HEAL_SETTLE_S) == (240.0, 900.0, 90.0)
+    assert (settings.heal, settings.gate_timeout_s, settings.heal_timeout_s) == ("off", 240.0, 3600.0)
+    assert (DEFAULT_GATE_TIMEOUT_S, DEFAULT_HEAL_TIMEOUT_S, DEFAULT_HEAL_SETTLE_S) == (240.0, 3600.0, 180.0)
 
 
-def test_o35_a_heal_whose_bound_cannot_hold_one_round_of_its_actions_is_refused_at_load(tmp_path):
-    """O35: no action starts past `heal_timeout_s`, so a declared heal whose bound cannot hold one link restart (and,
-    in `link_then_container`, one container restart) at their declared bounds would never act: it is refused, naming
-    the key and the least it may be. With 120 s commands and a 90 s settle, `link` needs 600 s, which 900 s covers."""
-    slow = {"command_timeout_s": 120, "heal_settle_s": 90}
-    platform = write_platform(tmp_path, lambda data: four_providers(data, heal="link", **slow))
-    assert load_faults(platform, load_platform(platform, require_secrets=False)).heal_timeout_s == 900
-    platform = write_platform(tmp_path, lambda data: four_providers(data, heal="link_then_container", **slow))
-    with pytest.raises(ConfigError, match=r"heal_timeout_s.*at least 1185"):
+@pytest.mark.parametrize(
+    ("mode", "least"),
+    [("link", 600), ("link_then_container", 1185), ("all_links", 2715)],
+)
+def test_o35_a_heal_whose_bound_cannot_hold_one_round_of_its_steps_is_refused_at_load(tmp_path, mode, least):
+    """O35: no step starts past `heal_timeout_s`, so a declared heal whose bound cannot hold one round of its steps at
+    their declared bounds would never act: it is refused, naming the key and the least it may be. With 120 s commands
+    and a 90 s settle: one link restart, 600 s; with a container restart, 1,185 s; four providers' all-links sequence
+    with a container restart, 2,715 s."""
+    slow = {"command_timeout_s": 120, "heal_settle_s": 90, "heal": mode}
+    platform = write_platform(tmp_path, lambda data: four_providers(data, heal_timeout_s=least - 1, **slow))
+    with pytest.raises(ConfigError, match=rf"heal_timeout_s.*at least {least}\b"):
         load_faults(platform, load_platform(platform, require_secrets=False))
-    platform = write_platform(
-        tmp_path, lambda data: four_providers(data, heal="link_then_container", heal_timeout_s=1185, **slow)
-    )
-    assert load_faults(platform, load_platform(platform, require_secrets=False)).heal == "link_then_container"
+    platform = write_platform(tmp_path, lambda data: four_providers(data, heal_timeout_s=least, **slow))
+    assert load_faults(platform, load_platform(platform, require_secrets=False)).heal == mode
 
 
 @pytest.mark.parametrize("value", ["always", "", 1, True])
 def test_o35_a_heal_mode_that_is_not_declared_is_refused_naming_the_key(tmp_path, value):
-    """O35: `heal` is one of "off", "link" and "link_then_container"; anything else is refused at load."""
+    """O35: `heal` is one of "off", "all_links", "link_then_container" and "link"; anything else is refused."""
     platform = write_platform(tmp_path, lambda data: four_providers(data, heal=value))
     with pytest.raises(ConfigError, match="heal"):
         load_faults(platform, load_platform(platform, require_secrets=False))
@@ -363,7 +364,7 @@ def test_o35_no_pong_fails_closed_in_link_mode_and_goes_to_the_container_in_link
 def test_o35_the_source_of_a_failing_pair_is_never_acted_on(tmp_path):
     """O35: the crashed source's readers hold the stale state, so the source is never pinged or restarted while it is
     the source of a failing pair, whatever its own pairs show: here it also reads from the restored provider through a
-    stuck link, and is healed only once its readers' pairs pass (the second round)."""
+    stuck link, and is healed only once its readers' pairs pass."""
     services = HealServices()
     services.stuck = {(READER, CRASHED), (SECOND, CRASHED), (CRASHED, RESTORED)}
     injector_, services = injector(tmp_path / "a", services, heal="link_then_container")
@@ -576,15 +577,16 @@ def test_o35_link_mode_heals_every_stale_reader_of_a_crashed_source_one_at_a_tim
 def test_o35_a_reader_that_became_a_failing_source_during_its_ping_is_not_restarted(tmp_path):
     """O35: the matrix is read again after a ping, so a reader that became the source of a failing pair while it was
     pinged (another reader's pair from it failed meanwhile) is left alone, even with no pong and
-    `link_then_container`."""
+    `link_then_container`: its container is restarted only once that other pair passes."""
     services = HealServices()
     services.pong[READER] = False
+    services.container_fixes.add(READER)
     services.on_ping = lambda label: services.stuck.add((SECOND, READER)) if label == READER else None
     injector_, services = injector(tmp_path, services, heal="link_then_container")
     injector_.start(RUN)
-    assert injector_.clear() is False
-    assert ("stop", READER) not in services.actions
+    assert injector_.clear() is True
     assert ("restart_link", READER) not in services.actions
+    assert services.actions.index(("restart_link", SECOND)) < services.actions.index(("stop", READER))
 
 
 def test_o35_a_slow_ping_leaves_no_link_restart_past_the_heals_bound(tmp_path):
@@ -662,73 +664,169 @@ def test_o35_a_clear_after_the_runs_exclusive_admission_ended_never_heals(tmp_pa
     assert acted(services, "ping", "restart_link") == []
 
 
-# --- the settle after an action, and the pairs it disturbs (seen live) ---------------------------------------------
+# --- all_links: every link restarted at once, one settle, then every pair ------------------------------------------
 
 
-def test_o35_a_pair_an_action_disturbed_that_recovers_by_itself_after_the_settle_is_left_alone(tmp_path):
-    """O35: a link restart of a reader drops every connection into its link; a pair with that reader as its source
-    fails at the check after the settle and passes at the second, a settle later, with no action on it: it is
-    disturbed and recovered, recorded so, and the restore is verified."""
+def stale():
+    """The stale model after the live pattern: the crashed source's readers stale, the rest connected."""
     services = HealServices()
-    services.disturbs[READER] = {(SECOND, READER): 40.0}  # the peer's link redials READER 40 s after its restart
-    injector_, services = injector(tmp_path, services, heal="link")
+    services.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
+    return services.connected()
+
+
+def test_o35_under_the_stale_model_a_per_reader_link_restart_leaves_its_own_peers_stale_and_stops_closed(tmp_path):
+    """O35: the hypothesis that fits the live data: a provider's link restart leaves every peer holding a recent
+    connection to it stale. So healing one reader's link, as the per-reader design does, strands the pairs from that
+    reader (seen live), which the strict rule stops at once."""
+    injector_, services = injector(tmp_path, stale(), heal="link_then_container")
     injector_.start(RUN)
-    assert injector_.clear() is True
-    heal = step(injector_, "heal")
-    assert heal["disturbed"] == [{"reader": SECOND, "source": READER, "ended": "recovered", "by": READER}]
-    (restart,) = [a for a in heal["actions"] if a["action"] == "restart_link"]
-    assert restart["settle_s"] == [30, 30]
-    assert restart["matrix_first"]["failing_sources"] == {READER: 1}
-    assert restart["matrix_after"]["ok"] is True
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "heal_broke_pair"
     assert acted(services, "restart_link") == [("restart_link", READER)]
 
 
-def test_o35_a_disturbed_pair_still_failing_after_the_second_settle_is_a_cascade_healed_by_its_own_reader(tmp_path):
-    """O35: a disturbed pair that still fails a settle later is a cascade: a stuck pair whose reader the heal goes on
-    to restart, within the bounds, and the restore is then verified."""
-    services = HealServices()
-    services.disturbs[READER] = {(SECOND, READER): None}
-    injector_, services = injector(tmp_path, services, heal="link")
+def test_o35_all_links_heals_every_stale_pair_in_one_round(tmp_path):
+    """O35: every provider is pinged, then every link restarted in label order with nothing fetched in between, the
+    restored provider and the crashed source included: a provider restarted earlier holds no connection when a later
+    one restarts, so no peer is left stale. One settle, then every pair passes and the restore is verified, with every
+    step and the settle window recorded."""
+    injector_, services = injector(tmp_path, stale(), heal="all_links")
     injector_.start(RUN)
     assert injector_.clear() is True
+    labels = [CRASHED, RESTORED, READER, SECOND]
+    assert acted(services, "ping") == [("ping", label) for label in labels]
+    assert acted(services, "restart_link") == [("restart_link", label) for label in labels]
+    assert acted(services, "stop") == [("stop", RESTORED)]  # the injection's own: no container restarted
     heal = step(injector_, "heal")
-    assert heal["disturbed"] == [{"reader": SECOND, "source": READER, "ended": "cascade", "by": READER}]
-    assert acted(services, "restart_link") == [("restart_link", READER), ("restart_link", SECOND)]
+    assert (heal["outcome"], heal["shared_source"]) == ("healed", CRASHED)
+    assert heal["window"]["settle_s"] == 30
+    assert [a["action"] for a in heal["actions"]] == ["ping"] * 4 + ["transfers"] + ["restart_link"] * 4 + [
+        "transfers",
+        "check",
+    ]
+    assert heal["actions"][-1]["matrix_after"]["ok"] is True
 
 
-def test_o35_the_heal_never_acts_on_a_pair_it_disturbed_before_its_second_settle(tmp_path):
-    """O35: the cascade's reader is pinged only after both settles of the action that disturbed its pair."""
-    services = HealServices()
-    services.disturbs[READER] = {(SECOND, READER): None}
-    injector_, services = injector(tmp_path, services, heal="link")
+def test_o35_all_links_fetches_nothing_from_its_first_restart_to_the_end_of_its_settle(tmp_path):
+    """O35: no probe or check runs between the first link restart and the end of the settle."""
+    services = stale()
+    services.ping_s = 1.0  # the clock moves between the checks before the sequence and its restarts
+    injector_, services = injector(tmp_path, services, heal="all_links")
     injector_.start(RUN)
     assert injector_.clear() is True
-    restarted = next(at for verb, label, at in services.at if (verb, label) == ("restart_link", READER))
-    pinged = next(at for verb, label, at in services.at if (verb, label) == ("ping", SECOND))
-    assert pinged >= restarted + 2 * 30
+    first = min(at for verb, _, at in services.at if verb == "restart_link")
+    assert not [at for at in services.checked_at if first <= at < first + 30]
+    assert [at for at in services.checked_at if at >= first + 30]  # the check after the settle
 
 
-def test_o35_a_cascade_beyond_the_bounds_fails_closed(tmp_path):
-    """O35: a cascade whose reader already had its one link restart in this restore cannot be healed in `link`: the
-    restore fails closed, the cascade recorded."""
+def test_o35_all_links_waits_for_an_active_transfer_to_end_before_its_restarts(tmp_path):
+    """O35: a replication could dial a link mid-sequence, so the restarts wait, within the bound, for the transfer
+    listings of the study and probe spaces to show no active job."""
+    services = stale()
+    services.transfers = [2, 1]  # active at the first two readings, quiet from the third
+    injector_, services = injector(tmp_path, services, heal="all_links")
+    injector_.start(RUN)
+    assert injector_.clear() is True
+    readings = [a for a in step(injector_, "heal")["actions"] if a["action"] == "transfers"]
+    assert [(a["phase"], a["result"]) for a in readings] == [("before", "quiet"), ("after", "quiet")]
+    assert readings[0]["waited_s"] == 2
+
+
+def test_o35_all_links_fails_closed_on_a_transfer_that_stays_active(tmp_path):
+    """O35: a transfer still active past the bound fails the heal closed (`transfers_active`), before any restart."""
+    services = stale()
+    services.transfers = [1] * 1000
+    injector_, services = injector(tmp_path, services, heal="all_links", gate_timeout_s=10)
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "transfers_active"
+    assert acted(services, "restart_link") == []
+
+
+def test_o35_all_links_fails_closed_on_a_transfer_active_at_the_end_of_its_window(tmp_path):
+    """O35: a transfer active at the end of the settle, past the bound, fails it closed before any check."""
+    services = stale()
+    services.transfers = [0] + [1] * 1000
+    injector_, services = injector(tmp_path, services, heal="all_links", gate_timeout_s=10)
+    injector_.start(RUN)
+    checks = services.checks
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "transfers_active"
+    assert len(acted(services, "restart_link")) == 4
+    assert services.checks - checks == 2  # the restore's check and the heal's fresh one: none after the window
+
+
+def test_o35_all_links_restarts_nothing_when_a_provider_gives_no_pong(tmp_path):
+    """O35: a partial sequence is what leaves pairs stale, so one provider without a pong fails it before any
+    restart."""
+    services = stale()
+    services.pong[SECOND] = False
+    injector_, services = injector(tmp_path, services, heal="all_links")
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert acted(services, "restart_link") == []
+    assert "no pong" in step(injector_, "heal")["why"]
+
+
+def test_o35_after_all_links_a_pair_still_failing_falls_back_to_its_readers_container(tmp_path):
+    """O35: a pair the link restarts did not mend has its reader's container restarted, then the settle, its gate and
+    every pair again; never a second link restart."""
     services = HealServices()
-    services.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
-    services.disturbs[SECOND] = {(READER, SECOND): None}  # the second reader's restart strands the first again
-    injector_, services = injector(tmp_path, services, heal="link")
+    services.link_fixes = dict.fromkeys(SERVICE, ())  # no link restart mends anything
+    services.container_fixes.add(READER)
+    injector_, services = injector(tmp_path, services, heal="all_links")
+    injector_.start(RUN)
+    assert injector_.clear() is True
+    assert len(acted(services, "restart_link")) == 4
+    assert acted(services, "stop") == [("stop", RESTORED), ("stop", READER)]
+
+
+def test_o35_the_container_fallback_never_restarts_the_restored_provider_and_fails_closed(tmp_path):
+    """O35: a pair the restored provider reads that no link restart mends is never mended by restarting the restored
+    provider's container: the heal fails closed."""
+    services = HealServices()
+    services.stuck = {(RESTORED, CRASHED)}
+    services.link_fixes = dict.fromkeys(SERVICE, ())
+    injector_, services = injector(tmp_path, services, heal="all_links")
     injector_.start(RUN)
     assert injector_.clear() is False
     assert step(injector_, "cleared")["how"] == "links_stuck"
-    heal = step(injector_, "heal")
-    assert heal["disturbed"] == [{"reader": READER, "source": SECOND, "ended": "cascade", "by": SECOND}]
-    assert acted(services, "restart_link") == [("restart_link", READER), ("restart_link", SECOND)]
+    assert acted(services, "stop") == [("stop", RESTORED)]
+
+
+def test_o35_all_links_starts_no_restart_its_bound_cannot_cover(tmp_path):
+    """O35: once the pings are done the restarts must still fit in what is left of `heal_timeout_s`, or none
+    starts."""
+    services = stale()
+    services.ping_s = 200.0  # four pings take 800 s of a 1,000 s bound, leaving less than the restarts' 640 s
+    injector_, services = injector(tmp_path, services, heal="all_links", heal_timeout_s=1000)
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert acted(services, "restart_link") == []
+    assert "all-links restarts" in step(injector_, "heal")["why"]
+
+
+def test_o35_a_second_settling_never_runs_the_all_links_sequence_again(tmp_path):
+    """O35: the heal is journalled before it acts, so a fresh recovery of the same injection only checks: no
+    provider gets a second link restart in its restore."""
+    services = HealServices()
+    services.link_fixes = dict.fromkeys(SERVICE, ())
+    injector_, services = injector(tmp_path, services, heal="all_links")
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    platform = tmp_path / "platform.toml"
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    clock = FakeClock()
+    fresh = Recovery(settings, services, clock=clock, sleep=clock.sleep, labels=SERVICE)
+    (entry,) = [entry for entry in fresh.entries() if entry["target"] == RESTORED]  # and the reader's container's
+    assert fresh.settle(entry, heal=True).how == "links_stuck"
+    assert len(acted(services, "restart_link")) == 4
 
 
 def test_o35_no_run_is_admitted_before_the_final_all_pairs_check_passes(tmp_path):
-    """O35: the injector holds the federation exclusively through the whole heal, its settles and checks included, so
+    """O35: the injector holds the federation exclusively through the whole heal, its settle and checks included, so
     a run's shared admission is refused at every check until the restore is verified, and granted after."""
-    services = HealServices()
-    services.disturbs[READER] = {(SECOND, READER): None}
-    injector_, services = injector(tmp_path, services, heal="link")
+    injector_, services = injector(tmp_path, stale(), heal="all_links")
     platform = tmp_path / "platform.toml"
     lock = FederationLock(load_faults(platform, load_platform(platform, require_secrets=False)))
     refused: list[bool] = []
