@@ -521,6 +521,33 @@ def test_c34_a_schema_cut_to_the_kind_names_alone_loses_the_target_and_is_refuse
     assert FactorSchema(base.declared, base.order, base.conditions, treatment=kept).digest == schema.digest
 
 
+def test_c35_a_schema_rebuilt_from_its_parts_is_the_schema_and_holds_every_rule_again(registry):
+    """C35: `rebuilt` runs the constructor over the schema's own parts, so a schema is checked again against the
+    vocabulary in scope now and against the rules of the constructor, and a valid one is the schema it was: the same
+    digest, the same targets, the same tasks and exclusive conditions. One whose parts were edited after it was built
+    is refused as a schema built that way would be."""
+    errors.register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    base = chain_schema()
+    declared = {"api-none": ["endpoint", {"kind": "provider_down", "target": "providers[1]"}]}
+    schema = FactorSchema(
+        base.declared,
+        base.order,
+        base.conditions,
+        treatment=declared,
+        tasks={name: tasks for name, tasks in base.condition_tasks.items() if tasks is not None},
+        exclusive={"api-none": True},
+    )
+    again = schema.rebuilt()
+    assert again is not schema
+    assert again.digest == schema.digest
+    assert again.treatment_targets == schema.treatment_targets
+    assert again.condition_tasks == schema.condition_tasks
+    assert again.exclusive == schema.exclusive
+    schema.treatment_targets["api-none"] = {}  # edited after it was built: the targeted kind is now a plain name
+    with pytest.raises(ConfigError, match=r"\[conditions\.api-none\]: key 'infrastructure_is_treatment'.*no target"):
+        schema.rebuilt()
+
+
 def test_c34_a_study_s_own_kind_named_provider_outage_is_held_to_a_target_too(tmp_path, registry):
     """C34: in a process that never imported the platform, a study that declares a kind named `provider_outage` of its
     own in `[study.kinds]` is held to the same rule: its plain name is refused, and no outage is scored as its

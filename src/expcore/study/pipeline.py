@@ -5,14 +5,17 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 (`runs/<digest>/try<N>/`, one record and one outcome marker each), and what `analyse_study` writes (`export.json`,
 `scores.json`, `analysis.json`).
 
-- `run_study` opens or resumes the campaign and runs the scheduler. Its code identity is computed once, from the study
-  directory and the scope study.toml names, and every record carries it. Its environment (the distributions the
-  study's code imports, `provenance.environment`) goes into the campaign fingerprint, so a resume under another one
-  is refused (C06). Each hold is said on stderr once, as it begins, changes or ends, with when dispatch resumes, so a
-  run waiting out a pause is not silent. With a `shard` (#154) it runs that shard's part of the plan: the fingerprint
-  is still computed from the totals, of the whole plan, and only then are the caps and the budget replaced by the
-  shard's shares and the plugin's environment identity read, once. A shard says its environment on stderr as it
-  starts (`campaign.shard_run.environment_block`), so a host that differs from the others shows before it runs.
+- `run_study` loads a study directory and calls `run_built_study`, the one public way into a campaign, which a study
+  that builds its own `StudyConfig` (a smoke cut, a selection) calls too. It checks the config (`config.check_study`),
+  holds the study's own kinds in scope, then opens or resumes the campaign and runs the scheduler. The code identity
+  is computed once, from the study directory and the scope study.toml names, and every record carries it. The
+  environment (the distributions the study's code imports, `provenance.environment`) goes into the campaign
+  fingerprint, so a resume under another one is refused (C06). Each hold is said on stderr once, as it begins,
+  changes or ends, with when dispatch resumes, so a run waiting out a pause is not silent. With a `shard` (#154) it
+  runs that shard's part of the plan: the fingerprint is still computed from the totals, of the whole plan, and only
+  then are the caps and the budget replaced by the shard's shares and the plugin's environment identity read, once.
+  A shard says its environment on stderr as it starts (`campaign.shard_run.environment_block`), so a host that
+  differs from the others shows before it runs.
 - `check_batch` is the replay check over `out/runs`. The outcome markers are the campaign's own bookkeeping, not
   records: the check hashes them and does not replay them. It also copies the campaign store into the batch
   (`campaign-snapshot.sqlite`) and hashes the copy, so the analysis never has to read the live store; it refuses a
@@ -103,6 +106,7 @@ from expcore.study.config import (
     OUT_DIR,
     StudyConfig,
     StudyIdentity,
+    check_study,
     find_study_root,
     import_platforms,
     load_study,
@@ -215,7 +219,32 @@ def run_study(
     crash_hook: Callable[[str, str], None] | None = None,
     shard: ShardSpec | None = None,
 ) -> RunSummary:
-    """Open or resume the study's campaign and run the scheduler until nothing more can start.
+    """Load the study at `path` and run its campaign: `run_built_study` of what `load_study` returned.
+
+    Every argument but the path is `run_built_study`'s. A study that builds its own configuration, a smoke cut to
+    fewer conditions or a selection, has no directory to name and calls `run_built_study` with it.
+    """
+    return run_built_study(
+        load_study(path), allow_dirty=allow_dirty, code_root=code_root, crash_hook=crash_hook, shard=shard
+    )
+
+
+def run_built_study(
+    study: StudyConfig,
+    *,
+    allow_dirty: bool = False,
+    code_root: str | os.PathLike[str] | None = None,
+    crash_hook: Callable[[str, str], None] | None = None,
+    shard: ShardSpec | None = None,
+) -> RunSummary:
+    """Open or resume the campaign of a `StudyConfig` and run the scheduler until nothing more can start.
+
+    The one way into a campaign, for a study read from disk (`run_study` loads it and calls this) and for one that
+    built its configuration in code (`dataclasses.replace` of a loaded study's campaign or tasks: a smoke, a
+    selection). It first holds the config to what the loader holds a study to (`config.check_study`), refusing with a
+    `ConfigError` naming the key before any store, lease or code identity is touched, then holds the study's own kinds
+    in scope for the whole run (`errors.study_kinds`), so the attempts end in them and every thread the run starts,
+    the executor's included, sees them. Calling the private `_run_campaign` instead skips both.
 
     Refuses code that cannot be vouched for (unknown, stale, or dirty unless `allow_dirty`). The scheduler returns when
     no run is in flight and every pending run is held by something that will not end by itself (a budget, a stop):
@@ -224,8 +253,17 @@ def run_study(
     an attempt. With `shard` the campaign is that shard of N: its part of the plan, its shares of the caps and the
     budget, and the environment identity the plugin gives, kept in the store (`campaign.shard_run`); a shard that has
     no run, or whose share of a total is nothing, is refused before the store is touched.
+
+    The store is `<study.root>/out`, and the campaign fingerprint covers the plan (the schema, tasks, models and
+    seeds), so a cut config refuses to resume the store of the whole study (C06): run a smoke from a copy of the study
+    directory, or from one whose `out/` is not the real campaign's.
     """
-    study = load_study(path)
+    if not isinstance(study, StudyConfig):
+        raise TypeError(
+            f"run_built_study takes a StudyConfig, not {type(study).__name__}; run_study takes the path of a study "
+            "directory"
+        )
+    check_study(study)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
         return _run_campaign(study, allow_dirty, code_root, crash_hook, shard)
 
@@ -237,7 +275,12 @@ def _run_campaign(
     crash_hook: Callable[[str, str], None] | None,
     shard: ShardSpec | None = None,
 ) -> RunSummary:
-    """Run the campaign of a loaded study, with its own infrastructure kinds in scope."""
+    """Internal: the body of `run_built_study`, which is the one to call.
+
+    It runs the campaign of a study whose kinds are already in scope (`errors.study_kinds`) and whose configuration is
+    already checked (`config.check_study`), and does neither itself: a caller that reaches it directly gets a run
+    whose threads refuse the study's own `InfraError` kinds as unknown ones, and a config no one has checked.
+    """
     code = require_known("run", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     plugin = load_plugin(StudyContext(study, code))
     out = out_dir(study)

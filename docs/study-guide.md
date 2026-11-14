@@ -1265,6 +1265,36 @@ script_if_stub(StubAdapter([]), ["deep"])  # the rehearsal: the stub plays the s
 script_if_stub(object(), ["deep"])  # the real campaign: a backend without `use` is left to answer
 ```
 
+### A smoke built in code
+
+A smoke runs a cut of the plan (one model, a few seeds) before the whole campaign, to see that the executor, the tools and the scorers hold on the real platform. The cut is a `StudyConfig` the study builds from the loaded one with `dataclasses.replace`, so there is no directory for `run` to name: `expcore.study.pipeline.run_built_study(study)` runs it, and `run STUDY` is that call on what `load_study` returns. Call it, never the pipeline's private `_run_campaign`: that skips the study's own infrastructure kinds, so an `InfraError` of a kind the study declares in `[study.kinds]` is refused as unknown in the executor's thread and stops the campaign as an unexpected error.
+
+`run_built_study` first holds the config to what `load_study` holds a study to, and refuses it with a `ConfigError` naming the key before it touches a store: a model the model table lacks, a task a condition still names after the cut dropped it, a schema edited so that a condition's treatment names an unknown kind or a kind that is a fault on one target with no target, a task without the attribute a contrast clusters by. It does not import `[study] platforms` again, so build the cut from a study that was loaded in this process, which imported them.
+
+The store is `<study.root>/out` and the campaign fingerprint covers the plan, so a cut run in the real directory is a different experiment from the whole campaign: the real `run` would refuse to resume it, and it would refuse the whole campaign's store. Run the smoke from a copy of the study directory, as the rehearsal is, and give `code_root` the real directory, so the smoke's records carry the real study's code identity (the commit and the hash of the files `[study] code` names), which must be clean as for any run.
+
+```python
+import dataclasses
+
+from expcore.study.pipeline import run_built_study
+
+smoke_dir = Path("smoke-study")
+shutil.copytree("my-study", smoke_dir, ignore=shutil.ignore_patterns("out"))
+whole = load_study(smoke_dir)
+smoke = dataclasses.replace(whole, campaign=dataclasses.replace(whole.campaign, models=("alpha-stub",)))
+summary = run_built_study(smoke, code_root="my-study")  # the same call, and the same checks, as `run`
+assert summary.statuses == {"done": len(smoke.manifest.rows)}
+assert (smoke_dir / "out" / "state.sqlite").is_file()  # the smoke has a store of its own
+
+unknown = dataclasses.replace(whole.campaign, models=("alpha-stub", "gamma-stub"))
+try:
+    run_built_study(dataclasses.replace(whole, campaign=unknown), code_root="my-study")
+    raise AssertionError("a cut that names a model the table lacks was accepted")
+except ConfigError as error:
+    assert "models.toml does not define" in str(error)
+shutil.rmtree(smoke_dir)
+```
+
 ## 8. Ship a replication package
 
 `package.toml` lists what the package holds; anything it does not list is left out. The example lists its configuration and code, the records with the replay check (`out/runs`), and the four outputs.

@@ -177,6 +177,26 @@ class FactorSchema:
         self.exclusive: dict[str, bool] = self._check_exclusive(exclusive or {})
         self._by_levels = {tuple(c[f] for f in self.declared): name for name, c in self.conditions.items()}
 
+    def rebuilt(self) -> "FactorSchema":
+        """Return a schema built again from this one's own parts, so every rule of the constructor holds once more.
+
+        A schema checks itself once, when it is built, against the kinds known at that moment, and its attributes are
+        plain dicts. A study that builds its configuration in code (a smoke cut, a selection) hands over a schema
+        built earlier, perhaps outside the scope of its own kinds, perhaps edited since; this is the check that the
+        schema it hands over holds against the vocabulary in scope now, including that a kind that is a fault on one
+        target still names it (C34). The result is equal to the schema when it passes; a failure is the constructor's
+        own, naming the file and the key.
+        """
+        return FactorSchema(
+            self.declared,
+            self.order,
+            self.conditions,
+            treatment={name: self._treatment_json(name) for name in self.treatment_kinds},
+            tasks={name: listed for name, listed in self.condition_tasks.items() if listed is not None},
+            exclusive=self.exclusive,
+            file=self.file,
+        )
+
     # --- validation ---------------------------------------------------------------------------------------------
 
     def _check_factors(self) -> None:

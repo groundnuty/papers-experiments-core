@@ -328,24 +328,71 @@ def load_study(path: str | os.PathLike[str]) -> StudyConfig:
         models = load_models(root / MODELS_FILE)
         campaign = load_campaign(root / CAMPAIGN_FILE)
         _check_scheduler_kinds(campaign)
-        unknown = [m for m in campaign.models if m not in models]
-        if unknown:
-            raise ConfigError(
-                f"{campaign.source}: key 'models' names {unknown[0]!r}{close_match(unknown[0], models)}, which "
-                f"{MODELS_FILE} does not define; it defines: {', '.join(models)}"
-            )
+        _check_models(campaign, models)
         loaded = prereg.load(root / PREREG_FILE, schema)
         _check_clusters(name, tasks, loaded)
     hashes = {file: hashlib.sha256(_hashed_bytes(root, file)).hexdigest() for file in CONFIG_FILES}
     study = StudyConfig(
         root, name, schema, tasks, models, campaign, loaded, plugin_file, scope, hashes, kinds, requires, side_files
     )
+    _check_shard_budgets(study)
+    return study
+
+
+def check_study(study: StudyConfig) -> None:
+    """Check a study that was built in code as `load_study` checks one it read; raise ConfigError naming the key.
+
+    A study that cuts a loaded one to a smoke or a selection (`dataclasses.replace` of its campaign, its tasks) hands
+    the pipeline a `StudyConfig` no loader has seen. This holds it to what the loader holds a study to, in the scope
+    of the study's own kinds (`errors.study_kinds`), and touches nothing on disk:
+
+    - each kind in `kinds` is one a study may declare (a core kind, a platform's or a malformed name is refused);
+    - the factor schema is built again from its parts (`FactorSchema.rebuilt`), so every rule of its constructor
+      holds against the vocabulary of that scope, a treatment kind that is a fault on one target still names its
+      target (C34), and a kind unknown to the config is refused;
+    - the `[scheduler]` health and identity kinds are known, every model of the campaign is in the model table, each
+      contrast's cluster is an attribute of every task, a campaign that shards by model and has a budget shares it;
+    - the plan expands: no list is empty or repeats, and a task a condition names is a task of the plan, so a cut of
+      the tasks that leaves a condition naming one it dropped is refused here and not at the first run.
+
+    Not repeated: importing `[study] platforms`, which `load_study` does for the process, since a config names a
+    platform's kind only in a process that has imported the platform; and the preregistration against the schema,
+    which the analysis checks when it loads the study from its files, since a cut of the plan is a cut of the
+    campaign, not of the analysis it was preregistered with.
+    """
+    declared = Section({}, study.root / STUDY_FILE, f"[study.{KINDS_KEY}]")
+    for kind, entry in study.kinds.items():
+        try:
+            check_study_kind(kind, entry.description)
+        except ValueError as error:
+            raise declared.fail(kind, f"cannot be declared: {error}") from None
+    with study_kinds(study.kinds):
+        study.schema.rebuilt()
+        _check_scheduler_kinds(study.campaign)
+        _check_models(study.campaign, study.models)
+        _check_clusters(study.name, study.tasks, study.prereg)
+        study.schema.expand(study.tasks, study.campaign.models, study.campaign.seeds)
+    _check_shard_budgets(study)
+
+
+def _check_models(campaign: CampaignConfig, models: ModelTable) -> None:
+    """Refuse a campaign that names a model the model table does not define, naming both files."""
+    unknown = [m for m in campaign.models if m not in models]
+    if unknown:
+        raise ConfigError(
+            f"{campaign.source}: key 'models' names {unknown[0]!r}{close_match(unknown[0], models)}, which "
+            f"{MODELS_FILE} does not define; it defines: {', '.join(models)}"
+        )
+
+
+def _check_shard_budgets(study: StudyConfig) -> None:
+    """Refuse a campaign that shards by model and has a budget its shards cannot share."""
+    campaign = study.campaign
     if campaign.shards is not None and campaign.scheduler.budget is not None:
         try:
             shard_budgets_of(study)
         except ShardError as error:
             raise ConfigError(f"{campaign.source}: [shards] per_model with [budget]: {error}") from None
-    return study
 
 
 def shard_budgets_of(study: StudyConfig) -> dict[int, dict[str, Any]]:
