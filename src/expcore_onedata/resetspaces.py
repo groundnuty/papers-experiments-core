@@ -62,6 +62,7 @@ from typing import Any
 from expcore_onedata import consistency, resetheld
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, SpaceReset
+from expcore_onedata.resetplan import Holdings, given_scan
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class ResetPlan:
     qos_baseline: Collection[str] = ()
     qos_rights: bool | None = None
     never_holds: Collection[str] = ()
+    planned: Holdings | None = None  # a planner's reading (`resetplan.plan_scan`): its scan is the qos stage's first
 
 
 class _Space:
@@ -114,6 +116,9 @@ class _Space:
             "qos_rights": rights,
             "files": {},  # the ids of the regular files each provider's listing showed the QoS scan (O46)
             "never_holds": frozenset(never_holds),
+            # a planner's scan, the qos stage's first, and when its listing began (None: the stage scans itself)
+            "scan": None if plan.planned is None else given_scan(reset, plan.planned),
+            "scan_at": None if plan.planned is None else plan.planned.read_at,
         }
         self.plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (plan.evict or {}).items()}
         self.allowed = dict(plan.allowed or {})

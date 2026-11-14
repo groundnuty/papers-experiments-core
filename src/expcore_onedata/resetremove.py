@@ -156,17 +156,19 @@ def barrier(p: Provisioner, providers: Sequence[str], entries: dict[str, str]) -
 
 
 def remove(
-    p: Provisioner, providers: Sequence[str], baseline: Iterable[str]
+    p: Provisioner, providers: Sequence[str], baseline: Iterable[str], found: resetqos.Found | None = None
 ) -> tuple[dict[str, Any], dict[str, int], int, dict[str, frozenset[str]]]:
     """Find every requirement, and remove each one not in `baseline`: wait until it is fulfilled on every provider,
     delete it through the gate, wait until every provider has processed the deletion, and show by a second scan that
     none is left but the baseline's. Return the stage's facts, the affected files (those the removed requirements
     applied to, each with its depth), the depth of the deepest regular file of the space and the ids of the regular
-    files each provider's listing showed, from the first scan."""
+    files each provider's listing showed, from the first scan. `found`, when given, is the first scan, made by the
+    caller (a planner's, `resetplan.py`) on the same space and providers; the second scan is always made here."""
     kept = frozenset(baseline)
-    found = resetqos.scan(p, providers)
+    scanned = found is not None
+    found = found if found is not None else resetqos.scan(p, providers)
     added = {qid: where for qid, where in found.where.items() if qid not in kept}
-    facts: dict[str, Any] = {"scan": p.settings.qos_scan, "found": len(found.where)}
+    facts: dict[str, Any] = {"scan": "given" if scanned else p.settings.qos_scan, "found": len(found.where)}
     facts["kept"] = len(found.where) - len(added)
     affected = {file_id: depth for qid in added for file_id, depth in found.files[qid].items()}
     waits: dict[str, Any] = {"fulfil_s": 0.0, "fulfil_polls": 0, "impossible": 0, "barrier_s": 0.0, "barrier_polls": 0}

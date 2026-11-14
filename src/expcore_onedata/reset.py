@@ -156,6 +156,7 @@ from expcore_onedata import consistency, occupancy, resetheld, resetqos, resetre
 from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError
 from expcore_onedata.eviction import evict_ids, evict_tree, sum_counts
 from expcore_onedata.provision import Provisioner, ProvisionError
+from expcore_onedata.resetplan import Holdings, plan_scan
 from expcore_onedata.transferlog import PAGE_LIMIT
 from expcore_onedata.transferorder import (
     EARLIER,
@@ -242,6 +243,7 @@ class SpaceReset:
         qos_baseline: Collection[str] = (),
         qos_rights: bool | None = None,
         never_holds: Collection[str] = (),
+        planned: Holdings | None = None,
     ) -> dict[str, Any]:
         """Check the plan, verify the space, run the stages in order and return the record; raise ResetFailed at the
         first stage that fails. It is `resetspaces.SpacesReset` with this space alone, so its stages, and the
@@ -264,13 +266,25 @@ class SpaceReset:
         over every run since the last verified reset (O33). `never_holds` names the providers the caller declares can
         never hold the space's bytes: the occupancy reads every regular file's block map at every other provider but
         the data provider, whatever the space root's counter says, and skips one of these only while its counter reads
-        0 (`occupancy.py`, O46); none by default."""
+        0 (`occupancy.py`, O46); none by default. `planned`, a planner's reading of this space (`plan_scan`), makes
+        its scan the qos stage's first, so the space is listed once (`resetplan.py`); by default the stage scans."""
         from expcore_onedata.resetspaces import ResetPlan, SpacesReset  # the driver builds on this module
 
         plan = ResetPlan(
-            evict, allowed, since=since, qos_baseline=qos_baseline, qos_rights=qos_rights, never_holds=never_holds
+            evict,
+            allowed,
+            since=since,
+            qos_baseline=qos_baseline,
+            qos_rights=qos_rights,
+            never_holds=never_holds,
+            planned=planned,
         )
         return SpacesReset([self], concurrency=1).run_one(plan)
+
+    def plan_scan(self, *, never_holds: Collection[str] = ()) -> Holdings:
+        """A planner's reading of the space: one recursive listing, the QoS scan the reset makes, and each regular
+        file's block map at every provider that can hold the space's bytes (`resetplan.plan_scan`, `Holdings`)."""
+        return plan_scan(self, never_holds=never_holds)
 
     # -- 1. QoS requirements, and 1a. their files settled (`resetqos.py`) -------------------
     def qos_requirements(self) -> frozenset[str]:
@@ -281,9 +295,12 @@ class SpaceReset:
     def _qos(self, baseline: Collection[str], run: dict[str, Any]) -> dict[str, Any]:
         """Remove every requirement not in the baseline, each fulfilled first and its deletion processed everywhere
         after (`resetremove.py`), and show them gone; keep the files they applied to."""
-        facts, run["affected"], run["deepest"], run["files"] = resetremove.remove(self._p, self._providers, baseline)
+        given = run["scan"]  # a planner's scan stands for the first: how old it is as the stage begins is recorded
+        age = None if given is None else round(self._p.clock() - run["scan_at"], 3)
+        removed = resetremove.remove(self._p, self._providers, baseline, given)
+        facts, run["affected"], run["deepest"], run["files"] = removed
         run["why"] = resetheld.quiet_reason(facts["removed"], run["qos_rights"])
-        return facts
+        return facts if age is None else {**facts, "scan_age_s": age}
 
     def _qos_settle(self, run: dict[str, Any]) -> dict[str, Any]:
         """Wait for the affected files' block maps to stay the same, within the bound; keep what they ended on."""
