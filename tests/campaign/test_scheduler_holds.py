@@ -1,18 +1,24 @@
 """A start the platform holds back costs no attempt, before the attempt or at its start, and the campaign holds and
 asks again instead of spinning (C33)."""
 
+import collections
 import itertools
 import json
 import time
 
 import pytest
 from campaign_support import make_schema
+from loop_support import FakeProvider
+from record_support import CODE, make_config
 from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings_for
 
 from expcore import errors
+from expcore.campaign.executor import record_run
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.healthgate import META as HEALTH_META
 from expcore.campaign.healthgate import Health, alarms, fact, parse, read_health
+from expcore.errors import InfraError
+from expcore.records.instruments import finish_instruments
 
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 SCHEMA = make_schema()
@@ -100,6 +106,57 @@ def test_c33_a_post_run_check_that_charges_no_one_sets_its_attempt_aside_uncharg
         ]
         texts = [r["detail"] for r in scheduler.store.q("SELECT detail FROM events WHERE kind='post_run_check_failed'")]
         assert sum("uncharged" in text for text in texts) == 2
+
+
+class HeldAtTheStart:
+    """An instrument whose start its platform held back, and whose post-run check refuses with that hold, though an
+    executor that swallowed the start's error ran the loop all the same."""
+
+    namespace = "baseline"
+
+    def __init__(self, kind):
+        self.kind = kind
+
+    def start(self, identity):
+        pass
+
+    def finish(self):
+        return {"held": True}
+
+    def check(self):
+        raise InfraError(self.kind, "the start was held back")
+
+
+def test_c33_a_hold_an_instrument_refused_with_decides_over_a_charged_post_run_failure(tmp_path, held_kind):
+    """C33: the record carries an instrument's refusal of a hold kind, and the post-run check fails for a reason that
+    charges, with the gate open: the hold decides, so the attempt is set aside uncharged as the hold, not charged as
+    the health check's kind."""
+    executor = FakeExecutor()
+
+    async def swallowed(request):
+        request.backend.use([])
+        record = await record_run(
+            request,
+            [FakeProvider({"look": lambda arguments: "ok"})],
+            "be brief",
+            "do the task",
+            make_config(),
+            code=dict(CODE),
+            core_version="0.1.0",
+        )
+        return finish_instruments(record, [HeldAtTheStart(held_kind)])
+
+    executor.behaviours = {ONE_KEY: collections.deque([swallowed])}
+    check = Answers(Health(True, "fine"), Health(False, "the federation failed after the run"))
+    with build(tmp_path, schema=ONE, executor=executor, plan=SMALL, health=check) as scheduler:
+        scheduler.run()
+        rows = scheduler.store.q(
+            "SELECT state, charged, attempt, infra_kind FROM attempts WHERE run_key=? ORDER BY id", (ONE_KEY,)
+        )
+        assert [(r["state"], r["charged"], r["attempt"], r["infra_kind"]) for r in rows] == [
+            ("infra_fail", 0, 1, held_kind),
+            ("done", 0, 1, None),
+        ]
 
 
 def test_c33_the_reading_keeps_whether_a_failure_charges_and_a_flag_that_is_not_a_boolean_is_a_failed_check():

@@ -11,6 +11,7 @@ import pytest
 
 from expcore.campaign import liveness
 from expcore.campaign.healthgate import read_health
+from expcore_onedata import ingesthealth
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import boot_id
@@ -334,3 +335,46 @@ def test_o45_a_failed_baseline_wins_over_a_held_one(tmp_path, campaign, gone):
         health = baseline_health([journal])
     assert (health.ok, health.deferred) == (False, False)
     assert health.detail.startswith("spaces[1]: ")
+
+
+def test_o45_an_attempts_own_failure_wins_over_one_another_attempt_left(tmp_path, campaign):
+    """O45: another attempt left spaces[0] unhealthy and this attempt left spaces[1] so: its own post-run check names
+    its own failure and charges it, whichever space comes first, so its own failure is never spared."""
+    key, rows = campaign
+    rows.update({5: "running", 6: "running"})
+    lines = [
+        {"space": "spaces[0]", "entry": "baseline", "state": "unhealthy", "phase": "restore", "owner": owned(key, 5)},
+        {"space": "spaces[1]", "entry": "baseline", "state": "unhealthy", "phase": "restore", "owner": owned(key, 6)},
+    ]
+    journal = tmp_path / "two.jsonl"
+    journal.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    with liveness.running(key, 6):
+        health = baseline_health([journal])
+    assert (health.ok, health.charge) == (False, True)
+    assert health.detail.startswith("spaces[1]: ")
+    elsewhere = baseline_health([journal])
+    assert (elsewhere.charge, elsewhere.detail.split(":")[0]) == (False, "spaces[0]")
+
+
+@pytest.fixture
+def other_owner():
+    """The owner of a run in progress elsewhere: an attempt of another process that still runs."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    yield owned("elsewhere", 3, f"pid:{child.pid}")
+    child.kill()
+    child.wait()
+
+
+def test_o45_a_hold_that_cannot_be_read_refuses_a_recovery_and_holds_starts_back(tmp_path, monkeypatch, other_owner):
+    """O45: the hold of an open mark another live process owns cannot be read (its file cannot be opened here): no run
+    is shown over, so a recovery is refused rather than write into a run that may still be on it, while a start is held
+    back and the check fails, as on an orphaned baseline."""
+    plan = "a" * 64
+    journal = journal_of(tmp_path, {"state": "open", "phase": "run", "plan": plan, "owner": other_owner})
+    monkeypatch.setattr(ingesthealth, "hold_taken", lambda journal, space: None)
+    mark, held = read_mark(journal, "spaces[0]")
+    assert held is None
+    assert "cannot be read" in recovery_refusal(mark, plan, held)
+    assert "not whole" in start_refusal(mark, held)
+    health = baseline_health([journal])
+    assert (health.ok, health.deferred) == (False, False)
