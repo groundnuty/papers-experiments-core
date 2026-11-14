@@ -42,6 +42,18 @@ def option_env_names(names: Iterable[str]) -> list[str]:
     return sorted(out)
 
 
+def _unquoted(value: str) -> str:
+    """A value without the one pair of double quotes that surrounds it, if it has one."""
+    return value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value
+
+
+def logged_settings(log_text: str) -> dict[str, str]:
+    """The start lines of oneclient's INFO log by name (`oneclient_start.start_settings`), with a quoted value read as
+    what it quotes: oneclient 25.0 logs the mountpoint as `Mountpoint: "/mnt/oneclient"` while the argv gives it bare,
+    which made every start line compare as a difference on the 14 Nov slot, the mountpoint's alone."""
+    return {name: _unquoted(value) for name, value in start.start_settings(log_text).items()}
+
+
 def effective_facts(host: HostOps, sidecar: str, settings: SandboxSettings, provider_host: str) -> dict[str, Any]:
     """What the running sidecar's oneclient says it runs with against what the sandbox's argv sets, and which variables
     of its environment it reads an option from. Words and counts only: the names of the lines that differ, never their
@@ -52,7 +64,7 @@ def effective_facts(host: HostOps, sidecar: str, settings: SandboxSettings, prov
     )
     log = host.docker("exec", "-u", "0", sidecar, "cat", f"{SIDECAR_LOG_DIR}/oneclient.INFO", check=False, timeout=60)
     if log.returncode == 0:
-        found = start.start_settings(log.stdout)
+        found = logged_settings(log.stdout)
         problems = start.differences(found, expected)
         names = [problem.split(":", 1)[0] for problem in problems]
         private = {start.PROVIDER, start.MOUNTPOINT}  # a host and a path: their lines say that they differ, not how

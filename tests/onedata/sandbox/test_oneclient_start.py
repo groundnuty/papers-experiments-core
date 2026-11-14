@@ -1,7 +1,7 @@
 """O36: oneclient's start-up lines against what the sandbox's argv says they must be."""
 
 import pytest
-from mount_effective import option_env_names
+from mount_effective import logged_settings, option_env_names
 
 from expcore_onedata.sandbox import oneclient_start as start
 
@@ -38,6 +38,35 @@ def test_o36_the_start_lines_are_read_by_name_from_the_logging_file_and_the_firs
     assert found["Mountpoint"] == "/mnt/oneclient"
     assert found["Oneclient version"] == "25.0.0"
     assert len(found) == 12
+
+
+QUOTED_LOG = LOG.replace("Mountpoint: /mnt/oneclient", 'Mountpoint: "/mnt/oneclient"')
+
+
+def test_o36_a_quoted_value_is_read_as_what_it_quotes_and_a_log_that_quotes_the_mountpoint_has_no_difference():
+    """O36: oneclient 25.0 logs `Mountpoint: "/mnt/oneclient"`, quoted, on the 14 Nov slot, and the live check
+    reported the mountpoint as a difference on the quotes alone. The live check reads the lines with the quotes off."""
+    assert 'Mountpoint: "/mnt/oneclient"' in QUOTED_LOG
+    assert start.start_settings(QUOTED_LOG)["Mountpoint"] == '"/mnt/oneclient"'  # the log's own text, quotes and all
+    found = logged_settings(QUOTED_LOG)
+    assert found["Mountpoint"] == "/mnt/oneclient"
+    assert start.differences(found, expected()) == []
+    assert start.differences(start.start_settings(QUOTED_LOG), expected()) == [
+        "Mountpoint: logged '\"/mnt/oneclient\"', expected '/mnt/oneclient'"
+    ]  # what the unquoted comparison got wrong
+
+
+def test_o36_unquoting_never_hides_a_mountpoint_that_differs_or_changes_a_value_that_is_not_quoted():
+    """O36: only one pair of quotes around a whole value is removed: a quoted value of another path is still a
+    difference, and a value with a quote inside it, or one quote only, is left as logged."""
+    other = LOG.replace("Mountpoint: /mnt/oneclient", 'Mountpoint: "/mnt/elsewhere"')
+    assert start.differences(logged_settings(other), expected()) == [
+        "Mountpoint: logged '/mnt/elsewhere', expected '/mnt/oneclient'"
+    ]
+    for logged in ('"/mnt/one"client', '"/mnt/oneclient', '/mnt/oneclient"', '"', '""'):
+        found = logged_settings(LOG.replace("Mountpoint: /mnt/oneclient", f"Mountpoint: {logged}"))
+        assert found["Mountpoint"] == ("" if logged == '""' else logged)
+    assert logged_settings(LOG) == start.start_settings(LOG)  # a log with nothing quoted is read as it is
 
 
 def test_o36_a_log_that_is_what_the_argv_says_has_no_difference():

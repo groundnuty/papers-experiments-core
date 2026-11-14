@@ -611,6 +611,8 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
 # the dated facts file and leaves nothing behind: its requirement is removed and the scratch files are torn down.
 
 QOS_SEEN_S = 120.0  # the longest a requirement added through one provider is waited for through another
+MIRROR_KNOWS_S = 60.0  # the longest a mirror is waited for to know a file written through the data provider (dbsync)
+SCRATCH_BYTES = 1024  # each scratch file's size: bytes(range(256)) * 4
 
 
 def scratch_requirement(provisioner, provider, file_id):
@@ -645,11 +647,15 @@ def test_the_recursive_listing_takes_include_directories_and_marks_a_requirement
 @MUTATE
 def test_a_requirement_added_through_one_provider_is_found_by_the_listing_through_another(scratch):
     """O33: a requirement put on a scratch file through the receiver is found by the listing scan on the data
-    provider once dbsync settles, within `QOS_SEEN_S`, and applies to that file; the seconds it took are printed."""
+    provider once dbsync settles, within `QOS_SEEN_S`, and applies to that file; the seconds it took are printed. The
+    requirement is posted only once the receiver knows the file (within `MIRROR_KNOWS_S`): one posted through a mirror
+    right after the file was created through the data provider was refused `OutOfScope` on the 14 Nov slot, the file
+    not having reached the mirror yet, which is dbsync's lag and not what this test measures."""
     from expcore_onedata import resetqos
 
     provisioner, receiver, _, ids = scratch
     holder = provisioner.settings.holder
+    consistency.wait_visible(provisioner.client, receiver, ids[0], size=SCRATCH_BYTES, timeout_s=MIRROR_KNOWS_S)
     qid = scratch_requirement(provisioner, receiver, ids[0])
     try:
         began = time.monotonic()
