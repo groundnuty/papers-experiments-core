@@ -135,14 +135,43 @@ The injection's own entry holds `target`, `injected`, `cleared`, `verified` and,
 schema)`, with the study's factor schema), which admits each run to the federation before anything starts (exclusive
 when its condition declares `provider_outage` or `exclusive = true`) and keeps it until after the post-run check, and
 the platform's half of the fingerprint (`platform=config.fingerprint()`), which holds the injector's sanction and
-targets. The executor, already admitted, starts the sandbox and
-the tool server, builds the injector for the target its condition declares and runs the agent inside `running`:
+targets. The executor, already admitted, builds the injector for the target its condition declares and runs the run's
+sandbox and tool server, with the agent inside them, inside `running`, so both have stopped when its exit restores
+(see "The token's window"):
 
     injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
                              driver=compose_driver(settings, probe=provider_serves(config, settings, client)))
     async with injector.running(dataclasses.asdict(request.identity)):
-        record = await record_run(request, ...)
+        async with platform.launch(ctx, run_key=..., level=..., ceiling_s=..., lease=..., condition=...) as sandbox:
+            async with platform.tool_server(ctx, sandbox, ceiling_s=...) as tools:
+                record = await record_run(request, ...)
     record = await asyncio.to_thread(finish_instruments, record, [injector])
+
+The injector's start, its recovery of what an earlier run left included, then comes before the run's tokens are
+minted, and the sandbox and the tool server start with the target already down (their starts are lifecycle waits,
+never the agent's time). The sandbox's start reaches the agent's local provider (its mount, or its REST endpoint), so an
+outage of that provider keeps the earlier order, the launches outside `running`, with the long token margin declared.
+
+**The token's window (O35, O06).** A heal may take `heal_timeout_s` (4,200 s by default), and the run's token outlives
+its whole-time ceiling by `[tokens] margin_s` only (900 s by default). The tool server's stop re-verifies the tool plane
+and examines the run's token, failing the run as `tool_plane_integrity` once it has expired (`toolserver._recheck`),
+so a heal must never begin while a step of the run that uses its tokens has not ended. The tool server's launch (to the
+end of that re-verification) and the sandbox's (from its mint to the end of its stop) count themselves on the run's
+admission while they run (`admission.token_step`), and the injector reads the count wherever a heal could begin, when
+a heal is declared and the federation is held exclusively for it:
+
+- at the start of its restore (`running`'s exit, `finish`, `clear`, or the clear a failed `start` makes): with a step
+  still running, the restore is not started and fails closed. The target stays down, its injection open and pending,
+  journalled `clear_failed` with `run_not_stopped`, so the health gate refuses it, and the snapshot says the restore is
+  not verified (`how` `run_not_stopped`, the `cleared` step naming the steps), so the run is set aside as
+  `injector_failure`, never scored. A later restore that finds every step ended starts as any other;
+- at its start's recovery of what an earlier run left: with a step already running, the recovery restores without
+  healing (the `heal_withheld` step names the steps), so a link that stays stuck fails the start closed.
+
+A study that declares the long margin, `[tokens] margin_s` of at least `fault_settings.heal_token_margin_s` (900 s
+plus two heals of `heal_timeout_s`, 9,300 s with the default), heals as before whatever still runs; a heal that is off
+asks nothing. Steps that no launch counts (a tool server or sandbox of the study's own) are not seen: such a study
+stops them before `running`'s exit, or declares the long margin.
 
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
 so on cancellation it waits for it (shielded, bounded), clears however the block ends and raises the cancellation again.
@@ -493,6 +522,10 @@ class FaultInjector:
         refuse to score, and `check` refuses it as well. When the body raised, no record exists to carry it, so the
         restore failure is raised from the body's exception as `session` does; a cancellation or any other
         `BaseException` is raised as it was, with the failure in its notes.
+
+        Run the sandbox's and the tool server's launches inside the block, so both have ended when the exit restores:
+        a restore that would begin while one still runs is not started, unless the long token margin is declared (see
+        the module docstring, "The token's window").
         """
         bound = self.cancel_wait_s if cancel_wait_s is None else cancel_wait_s
         self._cancel = threading.Event()
