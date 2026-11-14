@@ -182,6 +182,7 @@ def test_the_log_is_sequenced_from_its_nonce_and_closed_by_its_end_line(run):
     assert lines[0]["event"] == "start"
     assert lines[0]["nonce"] == NONCE
     assert lines[0]["format"] == "hpcop-egress/1"
+    assert lines[0]["uid"] == os.getuid()
     assert [line["seq"] for line in lines] == list(range(len(lines)))
     assert lines[-1]["event"] == "end"
     assert lines[-1]["records"] == len(lines) - 2
@@ -237,3 +238,21 @@ def test_the_collector_refuses_a_log_it_did_not_create_or_a_socket_directory_oth
     assert done.returncode == 2
     assert READY not in done.stdout
     assert (b"already exists" if problem == "log_exists" else b"0700") in done.stderr
+
+
+@needs_gcc
+@needs_unix
+def test_the_cores_reader_reads_the_real_collectors_log_as_intact_and_classifies_it(run):
+    """The core's `expcore.egress` reads what this collector wrote: the probe's listener declared as the gate, its UDP
+    receivers are loopback, TEST-NET-1 is outside."""
+    from expcore.egress import EgressLog, declaration
+
+    class Source:
+        def egress_log(self) -> bytes:
+            return run["log"].read_bytes()
+
+    gate = declaration([("127.0.0.1", int(run["out"]["listener"]))])
+    snap = EgressLog(Source(), gate, NONCE).finish()
+    assert (snap["log"], snap["unknown"]) == ("intact", [])
+    assert snap["counts"] == {"gate": 1, "loopback": 2, "outside": 1}
+    assert [(d["address"], d["port"]) for d in snap["outside"]] == [("192.0.2.1", 9)]

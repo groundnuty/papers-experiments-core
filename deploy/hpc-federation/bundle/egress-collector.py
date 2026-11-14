@@ -8,7 +8,7 @@ read-only into the cell at /hpcop-egress, and writes every datagram it receives 
 is listening. On SIGTERM or SIGINT it reads what is still queued, writes its end line, removes the socket and exits 0.
 
 The log is JSON lines, each with `seq` (0, 1, 2, ... with no gap), `wall` (time.time()) and `mono` (time.monotonic()):
-  {"event": "start", "format": "hpcop-egress/1", "nonce": <the launcher's>, "pid": <the collector's>, ...}
+  {"event": "start", "format": "hpcop-egress/1", "nonce": <the launcher's>, "pid", "uid": <the collector's>, ...}
   {"event": "record", "peer": {"pid", "uid"}, "rec": {"op", "pid", "fd", "time", "type", "family", "address", "port",
    "result", "dropped"}, ...}
   {"event": "malformed", "peer": {...}, "bytes": <length>, "sha256": <of the datagram>, ...}
@@ -168,7 +168,7 @@ def main(argv):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     sock.bind(where)
     counts = {"written": 0, "records": 0, "malformed": 0, "unwritten": 0}
-    log.write("start", format=FORMAT, nonce=nonce, pid=os.getpid())
+    log.write("start", format=FORMAT, nonce=nonce, pid=os.getpid(), uid=os.getuid())
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     print("egress collector ready", flush=True)
