@@ -23,12 +23,14 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
 - **up** checks that the host's available memory holds the services' limits together (before a first start), makes
   the root, the CA, one web certificate per service and the secrets, starts the zone, signs in as its admin, makes the
   admin's access token and the declared users, writes one registration token per provider, starts the providers, waits
-  until each is online, makes the spaces, has each supported by exactly its owner and its mirrors, makes the users
+  until each is online, makes the spaces, has each supported by exactly its owner and its mirrors (a provider's panel
+  reads, which can answer 500 for a while after its start, are tried again up to five times with a wait of 1, 2, 4 and
+  8 s; a write never is), makes the users
   members of their spaces with exactly their privileges, writes the baseline files into every space that keeps them (all
   but those declared `baseline = false`), and writes `facts.json` and, from the layout's platform template,
   `platform.toml`. Last, it runs the platform layer's link check through that `platform.toml` (`fedlinks.py`, #221):
-  each (local, source) pair must fetch a probe from the layout's `probe_space` within the bound, or up fails naming the
-  pair and the remedy; the report is written as `link-check.json` beside `facts.json`. Run on a federation that is up,
+  each ordered (reading provider, source) pair of providers sharing a space must fetch a probe, a file of its own, from
+  the layout's `probe_space` within the bound, or up fails naming the pair and the remedy; the report is written as `link-check.json` beside `facts.json`. Run on a federation that is up,
   it starts what is stopped and checks every step again, the links included, and writes no baseline file (see "The
   baseline" for changing a space's `baseline` key).
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes

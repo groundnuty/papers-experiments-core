@@ -26,7 +26,11 @@ condition that declares one, and the scheduler refuses a campaign whose health o
 
 `budget_hold` is no failure of anything outside the agent either, but the campaign's own decision: a request the token
 cap cannot account for would have taken the campaign past its budget, so it was not sent (`BudgetHold`, C26). It is
-set aside like infrastructure, never treatable, and costs the run no attempt.
+set aside like infrastructure, never treatable, and costs the run no attempt. A platform registers a kind of the same
+sort, a **hold**, with `register_infra_kind(kind, description, treatable=False, charged=False)`: a start the platform
+held back because what the run needs is held by another live attempt, or was left unfit by an earlier one, with
+nothing sent. Such a kind is never treatable, and an attempt that ends in it costs its run no attempt
+(`uncharged_kinds`, read by `expcore.campaign.attempts.classify`).
 
 A failure may name its target, what failed, by a position label from the platform's configuration (`providers[1]`,
 `TARGET_LABEL`). A condition whose manipulation takes one target down declares the kind with that target, and only a
@@ -77,6 +81,7 @@ _KIND_RE = re.compile(r"[a-z][a-z0-9_]*")
 TARGET_LABEL = re.compile(r"[a-z][a-z0-9_]*\[(0|[1-9][0-9]*)\]")
 _platform_kinds: dict[str, str] = {}  # process-wide: a platform registers its kinds once, when its module is imported
 _platform_untreatable: dict[str, str] = {}
+_platform_uncharged: dict[str, str] = {}  # a platform's holds: kinds that cost a run no attempt (`charged=False`)
 
 
 class StudyKind(NamedTuple):
@@ -194,7 +199,7 @@ def _leave_scope(declared: Mapping[str, StudyKind]) -> None:
         _study_kinds = held
 
 
-def register_infra_kind(kind: str, description: str, *, treatable: bool = True) -> None:
+def register_infra_kind(kind: str, description: str, *, treatable: bool = True, charged: bool = True) -> None:
     """Add a platform's infrastructure kind to the vocabulary, for the whole process; doing so again is harmless.
 
     A platform calls it once, when its module is imported. A study that declares one of the kinds as a treatment lists
@@ -202,22 +207,42 @@ def register_infra_kind(kind: str, description: str, *, treatable: bool = True) 
 
     A kind registered with `treatable=False` can never be a condition's treatment: the factor schema refuses a
     declaration of it. Registering a kind again with the other answer is refused, so it cannot be made treatable.
-    A kind of the study in scope (`study_kinds`) is refused: the two would be one kind with two owners.
+    A kind registered with `charged=False` is a hold: an attempt that ends in it is set aside and costs its run no
+    attempt, as `budget_hold` does (`uncharged_kinds`); it must be untreatable, since a held start is never a
+    manipulation, and it cannot be made charged, or uncharged, by registering it again. A kind of the study in scope
+    (`study_kinds`) is refused: the two would be one kind with two owners.
     """
     _check_name(kind, description)
+    if not charged and treatable:
+        raise ValueError(f"infrastructure kind {kind!r} costs no attempt, so it must be registered treatable=False")
     with _scope_lock:
         if kind in _study_kinds:
             raise ValueError(f"infrastructure kind {kind!r} is declared by the study in scope ([study.kinds])")
         if kind in _platform_kinds and (kind in _platform_untreatable) == treatable:
             held = "not treatable" if kind in _platform_untreatable else "treatable"
             raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
+        if kind in _platform_kinds and (kind in _platform_uncharged) == charged:
+            held = "costing no attempt" if kind in _platform_uncharged else "charged"
+            raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
         if kind not in _platform_kinds:
-            # whether it is treatable is written first, so a reader without the lock never sees the kind without it
+            # whether it is treatable, and whether it is charged, are written first, so a reader without the lock never
+            # sees the kind without them
             if treatable:
                 _platform_untreatable.pop(kind, None)
             else:
                 _platform_untreatable[kind] = description
+            if charged:
+                _platform_uncharged.pop(kind, None)
+            else:
+                _platform_uncharged[kind] = description
             _platform_kinds[kind] = description
+
+
+def uncharged_kinds() -> frozenset[str]:
+    """Return the platforms' holds: the registered kinds an attempt may end in without costing its run an attempt
+    (`register_infra_kind(..., charged=False)`). The core's own are `expcore.campaign.attempts.UNCHARGED_KINDS`."""
+    with _scope_lock:
+        return frozenset(k for k in _platform_uncharged if k in _platform_kinds)
 
 
 class _View(NamedTuple):
@@ -344,7 +369,8 @@ class CallTimedOut(InfraError):
     It is its own class so that a caller that bounds a call itself, as the day-0 outage check does, can tell the bound's
     expiry from a server that closed or failed, and so that the loop can tell it from a failure it has no other
     explanation for: inside the loop the bound is the agent's time left, so an expiry that arrives with the agent's
-    time used up is the loop's own cut and is judged as one (`Watcher`). `tool` and `bound_s` are what the detail says.
+    time used up is the loop's own cut and is judged as one (`Watcher`), unless the study declared a per-call bound
+    (L17) and it is the shorter, which is then the call's own failure. `tool` and `bound_s` are what the detail says.
     """
 
     def __init__(self, tool: str, bound_s: float):

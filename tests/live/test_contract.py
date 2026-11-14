@@ -605,8 +605,8 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
 
 
 # -- the reset's QoS listing and the occupancy's lag (issue #209, O33) -----------------------------------------------
-# `[placement] qos_scan = "listing"` rests on two facts the source states and no live run has shown: the first two
-# tests check them, and "summaries" stays the default until both pass. The third measures how long the space root's
+# `[placement] qos_scan = "listing"`, the default, rests on two facts the source states: the first two tests check
+# them (the 14 Nov 2026 slot showed the first, and the second by hand). The third measures how long the space root's
 # physical size lags a placement, which the reset's quiet wait assumes from the source. Each prints its figures for
 # the dated facts file and leaves nothing behind: its requirement is removed and the scratch files are torn down.
 
@@ -690,6 +690,39 @@ def test_the_space_roots_occupancy_follows_a_placement_within_the_sources_bound(
     lag = time.monotonic() - placed
     print(f"the space root's physical size showed the placement after {lag:.2f} s")
     assert lag <= resetqos.occupancy_lag_s(2) + 1.0
+
+
+@MUTATE
+def test_the_space_roots_occupancy_follows_an_eviction_within_the_resets_wait(scratch):
+    """O46: a scratch file one directory below the root is replicated to the receiver and, once the root's physical
+    size there shows it, evicted from there; the size is then read every quarter second until it has dropped back. The
+    drop must come within the occupancy stage's wait for that depth counted from the eviction's verified end
+    (`resetqos.occupancy_wait_s(2)`), the reading the reset takes; the seconds from the scheduling and from the end are
+    printed beside the lag the reset assumes, which the 14 Nov slot could not split."""
+    from expcore_onedata import resetqos
+    from expcore_onedata.occupancy import physical_sizes
+
+    provisioner, receiver, directory, _ = scratch
+    providers = list(provisioner.space.support.providers)
+    path, size = f"{directory}/part-1.bin", 1024  # the scratch files are 1024 bytes each
+    before = physical_sizes(provisioner, providers)[receiver]
+    provisioner.replicate(path, receiver)
+    placed = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] < before + size:
+        assert time.monotonic() - placed < resetqos.quiet_wait_s(2), "the root's physical size never showed the file"
+        time.sleep(0.25)
+    scheduled = time.monotonic()
+    provisioner.evict(path, receiver)  # returns once the receiver's block map shows the file empty
+    ended = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] > before:
+        assert time.monotonic() - ended < resetqos.occupancy_wait_s(2), "the root's size never dropped within the wait"
+        time.sleep(0.25)
+    dropped = time.monotonic()
+    print(
+        f"the space root's physical size showed the eviction {dropped - scheduled:.2f} s after its scheduling and "
+        f"{dropped - ended:.2f} s after its verified end (the job took {ended - scheduled:.2f} s; the reset assumes "
+        f"up to {resetqos.occupancy_lag_s(2):.0f} s from the end)"
+    )
 
 
 # -- large files (issue #127) -----------------------------------------------------------------------------------------

@@ -10,7 +10,8 @@ declares it.
   providers, register and support, add the fixed users, write the baseline files (into every space but those the layout
   declares `baseline = false`), and write facts.json (and platform.toml, from the layout's platform template). Last, it
   runs the link check through that platform.toml (fedlinks.py, #221) and fails, naming the pair and the remedy, unless
-  every (local, source) pair transfers. On a federation that is already up it starts what is stopped and checks every
+  every ordered (reader, source) pair of providers sharing a space transfers. On a federation that is already up it
+  starts what is stopped and checks every
   step again, the links included, and leaves the files as they are.
 - reset --clean: start whatever is stopped, check every step again, and bring every space's content back to the
   baseline, removing whatever was ingested; a space declared `baseline = false` is left empty. The ids of the

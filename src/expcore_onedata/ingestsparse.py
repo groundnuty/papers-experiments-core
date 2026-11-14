@@ -46,11 +46,15 @@ and refused otherwise, but for an empty file at a path whose journal ends with t
 creation whose answer was lost, or whose change-log line a crash cut, which holds nothing, so it is removed and the
 file written back whole. A name removed by a crashed start is written back from the staged source once every provider
 answers the old id absent. The completed file is then replicated to each provider its `replicas` name, verified by that
-provider's block map.
+provider's block map. The mirror runs that replication from its own dbsync copy of the owner's map, which lags the
+reset's write while the block map read through the mirror already shows the owner whole, so a replication that
+completed short is scheduled again within the settle bound (`Provisioner.replicate_file`), each try recorded.
 
 **The baseline's marks** (`ingesthealth.py`): the start marks the baseline open before it changes anything, a failure
-after that marks it unhealthy, and a restore that verifies every file marks it whole. A start is refused unless the last
-mark is whole, so a crash at any point leaves the federation unhealthy until a recovery ends with the complete file.
+after that marks it unhealthy, and a restore that verifies every file marks it whole. A start is held back
+(`BaselineNotWhole`, which the instrument raises as `ingest_held`) unless the last mark is whole, so a crash at any
+point, or an attempt that ends without its reset, leaves the federation unhealthy until a recovery ends with the
+complete file.
 """
 
 import json
@@ -60,7 +64,7 @@ from typing import Any
 from expcore_onedata import consistency
 from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.ingestbase import FAILURES, Baseline, plain
-from expcore_onedata.ingesthealth import OPEN, Marks, Unreadable, recovery_refusal, start_refusal
+from expcore_onedata.ingesthealth import OPEN, RECOVER, Marks, Unreadable, recovery_refusal, start_refusal
 from expcore_onedata.ingestplan import PlannedFile, Step
 from expcore_onedata.placement import Range, merged, provider_blocks, uncovered
 from expcore_onedata.provision import Entry, NotPlaced, ProvisionError
@@ -190,33 +194,44 @@ class SparseBaseline(Baseline):
             raise ProvisionError(f"{self._p.where}{planned.label}: the bytes written do not have the plan's hash")
 
     # -- the baseline's marks (`ingesthealth.py`) ---------------------------------------------------------------------
-    def _last_mark(self) -> dict[str, Any] | None:
+    def _current(self) -> tuple[dict[str, Any] | None, bool | None]:
+        """The space's last mark and whether a live run holds it; a journal that cannot be read refuses."""
         try:
-            return self.marks.last()
-        except Unreadable as error:
-            raise ProvisionError(f"{self._p.where}{error}") from None
+            return self.marks.current()
+        except (OSError, Unreadable) as error:
+            why = str(error) if isinstance(error, Unreadable) else "the ingest's journal could not be read"
+            raise ProvisionError(f"{self._p.where}{why}") from None
 
     def _refuse_start(self) -> None:
-        refusal = start_refusal(self._last_mark())
+        refusal = start_refusal(*self._current())
         if refusal is not None:
             raise BaselineNotWhole(f"{self._p.where}{refusal}")
 
     def admit_start(self) -> None:
         """Refuse a start on a baseline whose last mark is not `whole`; check every staged copy; then, under the
-        journal's admission lock, read the mark again and mark the baseline open, pushed to disk before the start's
-        restore or its first removal changes anything. So a start admitted meanwhile refuses this one."""
+        journal's admission lock, read the mark again, take the baseline's hold (`ingesthold`) and mark the baseline
+        open, pushed to disk before the start's restore or its first removal changes anything. So a start admitted
+        meanwhile refuses this one, and a reader that finds the mark open finds the hold taken."""
         self._refuse_start()
         self.check_sources()
         with self.marks.locked():
             self._refuse_start()
+            if not self.marks.hold.take():
+                raise BaselineNotWhole(
+                    f"{self._p.where}its baseline's hold is kept by a run's ingest that never let it go, though its "
+                    f"mark says otherwise; {RECOVER}"
+                )
             self.marks.mark(OPEN, "start")
 
     def admit_recovery(self) -> None:
-        """Refuse a recovery with another plan than the one whose run left the baseline not whole, and one while
-        another process that still runs holds the baseline open: a run in progress. The caller holds the lock."""
-        refusal = recovery_refusal(self._last_mark(), self._plan.sha256)
+        """Refuse a recovery with another plan than the one whose run left the baseline not whole, and one while a
+        live run holds the baseline open, unless this process took it outside any attempt; then let go of any hold this
+        process keeps on the space, which no live run of it holds. The caller holds the lock."""
+        mark, held = self._current()
+        refusal = recovery_refusal(mark, self._plan.sha256, held)
         if refusal is not None:
             raise BaselineNotWhole(f"{self._p.where}{refusal}")
+        self.marks.release_stale()
 
     def mark_failed(self, phase: str, error: str, text: str) -> None:
         """Mark the baseline unhealthy: what failed and in which phase, with the file and step the start state was at
@@ -327,24 +342,30 @@ class SparseBaseline(Baseline):
         done = self._restore_whole(planned, phase)
         if not planned.replicas:
             return done
-        return {**done, "replicas": self._restore_replicas(planned, done["file_id"])}
+        actions, replications = self._restore_replicas(planned, done["file_id"])
+        return {**done, "replicas": actions, **({"replications": replications} if replications else {})}
 
-    def _restore_replicas(self, planned: PlannedFile, file_id: str) -> dict[str, str]:
+    def _restore_replicas(self, planned: PlannedFile, file_id: str) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
         """Replicate the completed file to each provider its replicas declare that does not hold it whole, and verify
-        each by that provider's own block map on consecutive polls; return `held` or `replicated` by position."""
-        done = {}
+        each by that provider's own block map on consecutive polls; return `held` or `replicated` by position, and for
+        each provider replicated to the tries it took, their transfer ids and the seconds until its map covered the
+        file. The mirror runs the replication from its own lagging copy of the owner's map, so one scheduled right
+        after the reset's write can complete short and is scheduled again (`Provisioner.replicate_file`)."""
+        done, replications = {}, {}
         for provider in planned.replicas:
             whole = {plain(file_id): [(0, planned.size)]}
+            label = self._p.client.provider_label(provider)
             self._p.await_visible(provider, [file_id])  # `visible_on` may leave the mirror out of the restore's wait
             if uncovered(self._p.blocks(file_id, provider, retry=self._p.retry), whole[file_id]):
-                self._p.replicate_file(file_id, planned.size, provider)  # NotPlaced unless the map then covers it
+                record = self._p.replicate_file(file_id, planned.size, provider)  # NotPlaced unless the map covers it
+                replications[label] = {key: record[key] for key in ("tries", "transfer_ids", "converged_s")}
                 action = "replicated"
             elif self._p.confirm_placed(provider, whole).placed:
                 action = "held"
             else:
                 raise NotPlaced(f"{self._p.where}{planned.label}: a replica's block map does not stay whole")
-            done[self._p.client.provider_label(provider)] = action
-        return done
+            done[label] = action
+        return done, replications
 
     def _restore_whole(self, planned: PlannedFile, phase: str) -> dict[str, Any]:
         """Bring one file back whole at its path without removing it, verified; return what was done and its id. A
