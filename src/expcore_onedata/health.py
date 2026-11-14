@@ -44,7 +44,7 @@ lets every call answer as the space check does. With no REST data path nothing i
 `precampaign.PreCampaignHealth`, built here, so a study that uses this check cannot leave the measurement out.
 
 **So is the link check (O35, `linkcheck.py`), after the content type and the space, with no opt-out.** At the first
-call every (local, source) pair a run can fetch through must fetch its probe from the `[link_check]` probe space within
+call every ordered (reader, source) pair a run can fetch through must fetch its probe from the `[link_check]` probe space within
 the bound; a pair that cannot, or that could not be tested, fails the call, named in the detail with its remedy. Unlike
 the content type its verdict is not kept: a stuck link is remedied while the campaign waits, so the check runs again at
 every call after a failure, and whenever its last run is older than `[link_check] every_s` (600 s by default). A failure

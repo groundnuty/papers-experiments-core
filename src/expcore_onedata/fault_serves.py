@@ -15,9 +15,10 @@ a provider that accepts connections and never answers costs one bounded read per
 declared for raises ConfigError, naming the file and the table, never the service.
 
 **A restored provider's links are checked too (O35).** Once it serves, the recovery asks `ServingProbe.links` (through
-`ComposeDriver.restored_links`) for the link check of every pair the provider is in, and a pair that does not pass
-fails the restore (`links_stuck`): the injection stays open and the fault gate fails, as for a restore that never
-served, until a later clear finds every link transferring.
+`ComposeDriver.restored_links`) for the link check of every ordered pair of providers, not the provider's own alone
+(an outage can leave another pair stuck), and a pair that does not pass fails the restore (`links_stuck`): the
+injection stays open and the fault gate fails, as for a restore that never served, until a later clear finds every link
+transferring.
 """
 
 from collections.abc import Callable
@@ -67,13 +68,18 @@ class ServingProbe:
         return True
 
     def links(self, service: str) -> str | None:
-        """The link check (`linkcheck.check_links`) of every pair the restored provider is in, after its restore: None
-        when each passed, else the failure, which names the pair and the remedy. A restarted provider's rtransfer link
-        to a peer can come back stuck, with nothing logged, and the next run's reads through it would hang. Without a
-        `[link_check]` nothing is checked: a federation with pairs and none is refused at its campaign's start."""
+        """The link check (`linkcheck.check_links`) of every ordered pair, after a restore: None when each passed, else
+        the failure, which names the pair and the remedy. Not the restored provider's pairs alone: a restarted
+        provider's rtransfer link to a peer can come back stuck, with nothing logged, and so can the link between two
+        other providers, which broke while the third was down (on the live slot of 14 Nov 2026 a mirror's link to the
+        local provider stayed stuck after a third provider's outage, a pair the restored provider was in neither side
+        of, while every pair the local provider reads through transferred). A read through any stuck pair would hang.
+        `service` must be one a provider is declared for. Without a `[link_check]` nothing is checked:
+        a federation with pairs and none is refused at its campaign's start."""
+        self._provider(service)
         if self._config.link_check is None:
             return None
-        report = check_links(self._config, self._client, involving=self._provider(service))
+        report = check_links(self._config, self._client)
         return None if report.ok else report.detail
 
 

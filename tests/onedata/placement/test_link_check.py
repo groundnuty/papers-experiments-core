@@ -1,36 +1,37 @@
-"""The pre-campaign link check (O35, #221): every (local, source) pair fetches a probe from the probe space within its
-bound before any run, or the campaign is refused naming the pair."""
+"""The pre-campaign link check (O35, #221): every ordered (reading provider, source) pair fetches a probe from the probe
+space within its bound before any run, or the campaign is refused naming the pair. The pairs of the local provider are
+read here; `test_link_check_pairs.py` holds the other readers'."""
 
 import json
 
 import pytest
+from link_support import (
+    ALPHA_ID,
+    BETA_ID,
+    BOUND_S,
+    CONFIGURED,
+    DELTA_ID,
+    GAMMA_ID,
+    OMEGA_ID,
+    add_providers,
+    held,
+    markers_of,
+    pair_of,
+    probe_of,
+    probes_of,
+    reads_through,
+    run,
+    three_providers,
+)
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, OutOfScope
 from expcore_onedata.config import load_platform
 from expcore_onedata.health import PlatformHealth
-from expcore_onedata.linkcheck import PROBE_PREFIX, check_links, probe_content, probe_name
-from expcore_onedata.linkprobe import RETIRED_PREFIX, generation_of
-from expcore_onedata.testing import ALPHA_ID, BETA_ID, SPACE_NAME, with_placement, write_platform
-from expcore_onedata.testing.world import PROBE_SPACE_ID, PROBE_SPACE_NAME, with_link_check
+from expcore_onedata.linkcheck import PROBE_PREFIX, probe_content, probe_name
+from expcore_onedata.testing import SPACE_NAME, with_placement, write_platform
+from expcore_onedata.testing.world import PROBE_SPACE_ID, PROBE_SPACE_NAME
 from expcore_onedata.tokens import TokenIssuer
-
-GAMMA_ID = "pr-gamma"
-DELTA_ID = "pr-delta"  # declared, supports the probe space and no study space, and is not in [link_check].providers
-OMEGA_ID = "pr-omega"  # supports the probe space and is not in platform.toml at all
-BOUND_S = 5.0
-CONFIGURED = (PROBE_SPACE_NAME, PROBE_SPACE_ID, "alpha", "beta", "gamma", "delta", "omega", SPACE_NAME, ".test")
-
-
-def three_providers(data, *, link_check=True, **override):
-    """The study space supported by alpha (local), beta and gamma; the probe space by all three, and by delta, which is
-    declared and left out of `[link_check].providers`, and by omega, which platform.toml does not declare."""
-    with_placement(data)
-    data["providers"]["gamma"] = {"url": "https://gamma.test", "id": GAMMA_ID}
-    data["providers"]["delta"] = {"url": "https://delta.test", "id": DELTA_ID}
-    data["support"] = {"providers": ["alpha", "beta", "gamma"], "local": "alpha"}
-    if link_check:
-        with_link_check(data, ["alpha", "beta", "gamma"], timeout_s=BOUND_S, **override)
 
 
 @pytest.fixture
@@ -40,60 +41,26 @@ def platform_file(tmp_path):
 
 @pytest.fixture
 def fake(fake):
-    fake.supports[BETA_ID] = {"readonly": False}
-    fake.add_provider(GAMMA_ID, "gamma.test")
-    fake.add_provider(DELTA_ID, "delta.test", supports=False)
-    fake.add_provider(OMEGA_ID, "omega.test", supports=False)
-    fake.add_data_space(PROBE_SPACE_ID, PROBE_SPACE_NAME, [ALPHA_ID, BETA_ID, GAMMA_ID, DELTA_ID, OMEGA_ID])
-    return fake
-
-
-def run(config, client, ticker):
-    """One check on the test's clock, its fetches one at a time so that a hang's wait moves no other pair's clock."""
-    return check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, now=ticker.clock, workers=1)
-
-
-def probes_of(fake, provider_id):
-    """The probe files of a source in the probe space's tree, by generation."""
-    root = fake.space_roots[PROBE_SPACE_ID]
-    found = {generation_of(n.name, provider_id): n.file_id for n in fake.nodes.values() if n.parent == root}
-    found.pop(None, None)
-    return found
-
-
-def markers_of(fake):
-    """The names of the retirement markers in the probe space's tree: the durable record of the retired files."""
-    root = fake.space_roots[PROBE_SPACE_ID]
-    return sorted(n.name for n in fake.nodes.values() if n.parent == root and n.name.startswith(RETIRED_PREFIX))
-
-
-def probe_of(fake, provider_id):
-    """The probe file of a source: the one probe it has, found by its name in the probe space's tree."""
-    found = probes_of(fake, provider_id)
-    assert len(found) == 1, "each source has exactly one probe once a check has passed"
-    return next(iter(found.values()))
+    return add_providers(fake)
 
 
 def alpha_reads(fake, start=0):
     """The ids of the files whose content the local provider was asked for, in order, from the `start`th call on."""
-    calls = fake.provider_calls[start:]
-    return [c[2].split("/")[2] for c in calls if c[0] == ALPHA_ID and c[1] == "GET" and c[2].endswith("/content")]
-
-
-def held(fake, file_id, provider_id):
-    return sum(n for _, n in fake.blocks.get((file_id, provider_id), []))
+    return reads_through(fake, ALPHA_ID, start)
 
 
 def test_o35_every_pair_is_checked_and_recorded_with_its_seconds_and_bytes(fake, config, client, ticker):
-    """O35: Every pair is checked and recorded with its seconds and bytes."""
+    """O35: Every pair is checked and recorded with its seconds and bytes; those read through the local provider are
+    the first two, and carry the check's original probe files, named for their source alone."""
     report = run(config, client, ticker)
     assert report.ok, report.detail
-    assert [(p.local, p.source) for p in report.pairs] == [
+    assert len(report.pairs) == 6
+    assert [(p.local, p.source) for p in report.pairs[:2]] == [
         ("providers[0]", "providers[1]"),
         ("providers[0]", "providers[2]"),
     ]
     size = config.link_check.probe_bytes
-    for pair, source in zip(report.pairs, (BETA_ID, GAMMA_ID), strict=True):
+    for pair, source in zip(report.pairs[:2], (BETA_ID, GAMMA_ID), strict=True):
         assert pair.ok
         assert pair.bytes == size
         assert pair.seconds is not None
@@ -107,10 +74,11 @@ def test_o35_every_pair_is_checked_and_recorded_with_its_seconds_and_bytes(fake,
     record = json.loads(json.dumps(report.to_json()))
     assert record["version"] == 1
     assert record["ok"] is True
-    assert [(p["local"], p["source"], p["bytes"]) for p in record["pairs"]] == [
+    assert [(p["local"], p["source"], p["bytes"]) for p in record["pairs"][:2]] == [
         ("providers[0]", "providers[1]", size),
         ("providers[0]", "providers[2]", size),
     ]
+    assert len(record["pairs"]) == 6
     assert record["window"]["start_epoch_s"] <= record["window"]["end_epoch_s"]
     assert not any(value in json.dumps(record) for value in CONFIGURED)
 
@@ -119,7 +87,7 @@ def test_o35_the_probe_is_evicted_from_the_local_provider_afterwards(fake, confi
     """O35: The probe is evicted from the local provider afterwards."""
     report = run(config, client, ticker)
     assert report.ok
-    for pair, source in zip(report.pairs, (BETA_ID, GAMMA_ID), strict=True):
+    for pair, source in zip(report.pairs[:2], (BETA_ID, GAMMA_ID), strict=True):
         probe = probe_of(fake, source)
         assert pair.evicted is True
         assert pair.evictions
@@ -136,13 +104,14 @@ def test_o35_a_hanging_pair_fails_within_the_bound_and_is_named(fake, config, cl
     fake.hang_hook = ticker.sleep  # the read's wait runs out on the test's clock
     report = run(config, client, ticker)
     assert not report.ok
-    stuck, other = report.pairs
+    stuck, other = pair_of(report, "alpha", "beta"), pair_of(report, "alpha", "gamma")
     assert not stuck.ok
     assert stuck.seconds <= BOUND_S + 0.001
     assert stuck.reason.startswith(f"no transfer from providers[1] to providers[0] within {BOUND_S:g} s")
     assert "providers[1] to providers[0]" in report.detail
     assert "providers[2]" not in report.detail
     assert other.ok  # every other pair still transferred
+    assert [p.ok for p in report.pairs].count(False) == 1
     assert fake.hang_hook is not None
     assert BOUND_S in ticker.slept
     assert stuck.evicted is None
@@ -155,7 +124,7 @@ def test_o35_a_link_that_fails_fails_the_check_naming_the_pair(fake, config, cli
     fake.links[(ALPHA_ID, GAMMA_ID)] = "fail"
     report = run(config, client, ticker)
     assert not report.ok
-    assert [p.ok for p in report.pairs] == [True, False]
+    assert [p.ok for p in report.pairs] == [True, False, True, True, True, True]
     assert report.pairs[1].reason.startswith("no transfer from providers[2] to providers[0]")
 
 
@@ -165,7 +134,7 @@ def test_o35_a_probe_left_on_the_local_provider_never_hides_a_stuck_link(fake, c
     fake.evictions_remove_blocks = False
     first = run(config, client, ticker)
     assert first.ok
-    assert [p.evicted for p in first.pairs] == [False, False]
+    assert [p.evicted for p in first.pairs] == [False] * 6
     probe = probe_of(fake, BETA_ID)
     assert held(fake, probe, ALPHA_ID) > 0
     fake.evictions_remove_blocks = True
@@ -189,7 +158,7 @@ def test_o35_a_probe_is_written_once_and_written_again_when_it_is_gone(fake, con
     fake._delete(probe_of(fake, GAMMA_ID))  # the probe space emptied, as reset --clean does
     third = run(config, client, ticker)
     assert third.ok
-    assert [p.provisioned for p in third.pairs] == [False, True]
+    assert [p.provisioned for p in third.pairs] == [False, True, False, False, False, False]
 
 
 def test_o44_a_probe_with_other_bytes_is_written_again_at_offset_0_and_a_longer_one_gives_way(
@@ -204,13 +173,13 @@ def test_o44_a_probe_with_other_bytes_is_written_again_at_offset_0_and_a_longer_
     fake.nodes[first].content[0] ^= 0xFF
     rewritten = run(config, client, ticker)
     assert rewritten.ok
-    assert [p.provisioned for p in rewritten.pairs] == [False, True]
+    assert [p.provisioned for p in rewritten.pairs] == [False, True, False, False, False, False]
     assert probe_of(fake, GAMMA_ID) == first
     assert bytes(fake.nodes[first].content) == probe_content(GAMMA_ID, size)
     fake.nodes[first].content.extend(b"tail")
     replaced = run(config, client, ticker)
     assert replaced.ok
-    assert [p.provisioned for p in replaced.pairs] == [False, True]
+    assert [p.provisioned for p in replaced.pairs] == [False, True, False, False, False, False]
     assert list(probes_of(fake, GAMMA_ID)) == [1]
     assert bytes(fake.nodes[probes_of(fake, GAMMA_ID)[1]].content) == probe_content(GAMMA_ID, size)
     assert all("offset" in r.query for r in fake.requests if r.method == "PUT" and r.path.endswith("/content"))
@@ -221,7 +190,7 @@ def test_o35_pairs_and_no_probe_space_refuse_and_no_pairs_pass_without_one(tmp_p
     unprobed = load_platform(write_platform(tmp_path, lambda d: three_providers(d, link_check=False)))
     report = run(unprobed, client, ticker)
     assert not report.ok
-    assert "2 provider pair(s)" in report.detail
+    assert "6 provider pair(s)" in report.detail
     assert "[link_check]" in report.detail
     alone = load_platform(write_platform(tmp_path, with_placement))  # alpha alone supports the study space
     assert run(alone, client, ticker).ok
@@ -257,7 +226,7 @@ def test_o35_platform_health_passes_and_answers_as_the_space_check_once_every_li
     verdict = health()
     assert verdict.ok, verdict.detail
     assert health.links.ok
-    assert len(health.links.pairs) == 2
+    assert len(health.links.pairs) == 6
 
 
 def test_o35_only_a_request_bound_to_the_probe_space_reaches_it(fake, config, client, ticker):
@@ -306,7 +275,7 @@ def test_o35_a_failed_pair_names_the_remedy_and_records_that_it_needs_one(fake, 
     """O35: A failed pair names the remedy and records that it needs one."""
     fake.links[(ALPHA_ID, BETA_ID)] = "fail"
     report = run(config, client, ticker)
-    stuck, other = report.pairs
+    stuck, other = pair_of(report, "alpha", "beta"), pair_of(report, "alpha", "gamma")
     assert "rtransfer_config:restart_link() in its op-worker" in stuck.reason
     assert "never a compose down" in stuck.reason
     assert stuck.remedy is not None
@@ -331,14 +300,6 @@ def test_o35_every_probe_read_and_every_eviction_is_of_a_file_in_the_probe_space
     assert touched
     assert {root_of(i) for i in touched} == {probe_root}
     assert {root_of(t.file_id) for t in fake.transfers.values()} == {probe_root}
-
-
-def test_o35_after_a_restore_only_the_pairs_the_provider_is_in_are_checked(fake, config, client, ticker):
-    """O35: After a restore only the pairs the provider is in are checked."""
-    source = check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, workers=1, involving="gamma")
-    assert [(p.local, p.source) for p in source.pairs] == [("providers[0]", "providers[2]")]
-    local = check_links(config, client, clock=ticker.clock, sleep=ticker.sleep, workers=1, involving="alpha")
-    assert len(local.pairs) == 2
 
 
 def test_o35_the_health_gate_checks_the_links_again_every_every_s_and_a_stuck_link_closes_it(
@@ -393,7 +354,7 @@ def test_o35_another_holder_the_check_cannot_evict_fails_the_pair_instead_of_ser
     calls = len(fake.provider_calls)
     report = run(config, client, ticker)
     assert not report.ok
-    failed, other = report.pairs
+    failed, other = pair_of(report, "alpha", "beta"), pair_of(report, "alpha", "gamma")
     assert not failed.ok
     assert failed.seconds is None  # not tested: nothing was fetched, so the delta's copy never served the read
     assert label in failed.reason
@@ -417,7 +378,7 @@ def test_o35_a_second_holder_the_check_can_evict_is_evicted_and_the_stuck_link_i
     hold(fake, probe, DELTA_ID)
     stuck_beta(fake, ticker)
     report = run(config, client, ticker)
-    stuck = report.pairs[0]
+    stuck = pair_of(report, "alpha", "beta")
     assert held(fake, probe, DELTA_ID) == 0
     assert {fake.transfers[t].provider_id for t in stuck.cooled} == {DELTA_ID}
     assert not stuck.ok
@@ -438,7 +399,7 @@ def test_o35_a_holding_that_cannot_be_read_fails_the_pair_and_is_never_dropped(
     calls = len(fake.provider_calls)
     report = run(config, client, ticker)
     assert not report.ok
-    failed, other = report.pairs
+    failed, other = pair_of(report, "alpha", "beta"), pair_of(report, "alpha", "gamma")
     assert failed.seconds is None
     assert label in failed.reason
     assert "readable" in failed.reason
@@ -484,14 +445,14 @@ def test_o35_a_probe_that_failed_is_replaced_whatever_the_failure_was(fake, conf
     """O35: an answered error is retired the same as a timeout, and the passing check keeps the fresh probe."""
     fake.links[(ALPHA_ID, GAMMA_ID)] = "fail"
     first = run(config, client, ticker)
-    assert [p.retired for p in first.pairs] == [None, True]
+    assert [p.retired for p in first.pairs] == [None, True, None, None, None, None]
     old = probes_of(fake, GAMMA_ID)
     assert set(old) == {1}
     del fake.links[(ALPHA_ID, GAMMA_ID)]
     second = run(config, client, ticker)
     assert second.ok
     assert set(probes_of(fake, GAMMA_ID)) == {1}  # kept, not written again
-    assert [p.provisioned for p in second.pairs] == [False, False]
+    assert [p.provisioned for p in second.pairs] == [False] * 6
     assert second.pairs[0].retired is None
 
 
@@ -544,7 +505,7 @@ def test_o35_when_the_successor_and_the_deletion_both_fail_the_failed_file_is_st
     fake.hang_hook = ticker.sleep
     calls = len(fake.provider_calls)
     second = run(config, client, ticker)
-    stuck, other = second.pairs
+    stuck, other = pair_of(second, "alpha", "beta"), pair_of(second, "alpha", "gamma")
     assert not second.ok
     assert stuck.reason.startswith("no fresh probe for providers[1] to providers[0]: creation failed")
     assert stuck.seconds is None  # nothing was fetched
