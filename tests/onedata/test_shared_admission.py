@@ -18,7 +18,7 @@ from datetime import datetime
 
 import pytest
 from fault_support import OUTAGE_TARGET, SERVICES, write_faults
-from shared_support import hold_and_die
+from shared_support import hold_and_die, hold_fork_and_unwind
 
 from expcore.campaign import liveness
 from expcore.errors import InfraError
@@ -366,6 +366,16 @@ def test_o48_a_torn_last_line_of_the_record_is_ignored_and_cut_by_the_next_hold(
     assert [hold["reason"] for hold in holds_of(settings)] == [REASON, "after the tear"]
 
 
+def test_o48_an_end_that_names_no_time_makes_the_record_unreadable(tmp_path):
+    """O48: an end that does not say when and how the hold ended is no end: the record is refused, not read as open."""
+    _, settings, _ = federation(tmp_path)
+    records = SharedHolds(settings.journal)
+    token = records.begin(REASON)
+    InjectionJournal(settings.journal).append_to(HOLDS, {"event": "shared_released", "id": token})
+    with pytest.raises(ValueError, match="not a hold event"):
+        records.holds()
+
+
 # --- a dead tool's hold is released ---------------------------------------------------------------------------------
 
 
@@ -428,6 +438,61 @@ def test_o48_an_outage_run_that_waits_in_vain_names_the_tools_that_hold_the_fede
         lock.acquire(exclusive=True, timeout_s=PROBE_S, target=OUTAGE_TARGET)
     assert "1 tool outside a campaign holds it shared since " in caught.value.detail
     assert "first space" not in caught.value.detail
+
+
+def test_o48_a_task_that_reuses_the_hold_keeps_the_federation_held_when_the_owner_leaves(tmp_path):
+    """O48: a task inherits its parent's context, and so its admission: when it enters the hold it takes a share, so the
+    parent's exit, or its cancellation, does not let an outage run in while the task is still inside its own body."""
+    config, settings, lock = federation(tmp_path)
+
+    async def drive():
+        inside, leave = asyncio.Event(), asyncio.Event()
+
+        async def child():
+            async with shared_admission_async(config, reason="the child") as admission:
+                assert admission is not None
+                inside.set()
+                await leave.wait()
+
+        async with shared_admission_async(config, reason=REASON):
+            task = asyncio.ensure_future(child())
+            await inside.wait()
+        assert await asyncio.to_thread(refused, lock, True)  # the owner has left, the child has not
+        assert [hold["until_utc"] for hold in holds_of(settings)] == [None]
+        leave.set()
+        await task
+        assert not await asyncio.to_thread(refused, lock, True)
+
+    asyncio.run(drive())
+    (hold,) = holds_of(settings)
+    assert hold["until_utc"] is not None
+
+
+def test_o48_an_interrupt_while_a_record_ends_still_lets_the_lock_go(tmp_path):
+    """O48: an ending that is interrupted (a KeyboardInterrupt is no Exception) must not strand the lock: it goes in a
+    `finally`, or an outage run would wait for a share nobody can give up again."""
+    _, _, lock = federation(tmp_path)
+    admission = lock.acquire(exclusive=False, timeout_s=PROBE_S)
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    admission.endings.append(interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        admission.close()
+    assert not refused(lock, exclusive=True)
+
+
+def test_o48_a_forked_child_that_gives_up_its_copy_of_the_hold_ends_nothing_of_its_parents(tmp_path):
+    """O48: the fork hook closes the lock descriptors a child inherits, so its copy of the admission holds nothing; it
+    must not end the parent's record either, or the journal would say the parent let go while it still holds it."""
+    platform = write_faults(tmp_path)
+    result = tmp_path / "result.json"
+    child = multiprocessing.get_context("spawn").Process(target=hold_fork_and_unwind, args=(str(platform), str(result)))
+    child.start()
+    child.join(120)
+    assert child.exitcode == 0
+    assert json.loads(result.read_text(encoding="utf-8")) == {"refused": True, "open": ["a tool that forks"]}
 
 
 # --- the async form ------------------------------------------------------------------------------------------------

@@ -33,9 +33,11 @@ The hold covers the body of the `with`, and the tool's whole use of the federati
 a forked child or a subprocess that goes on after the body has ended is not held back from an outage. A worker that
 must outlive the body takes a share first (`expcore_onedata.admission.retain_admission`, which the sandbox's start
 threads do) and gives it up when it ends; the lock, and the record's end, wait for it. A `with` inside a hold of the
-same federation, shared (a warm-up that a smoke driver calls), uses that hold and records nothing more; inside an
-exclusive one, or one of another federation, it is `AdmissionRefused`. A platform without `[faults]` has no injector
-and no lock: the tool is admitted with no admission (`None`), its ingest journals still checked.
+same federation, shared (a warm-up that a smoke driver calls), uses that hold and records nothing more, taking a
+share of it for as long as it lasts, so a task that inherited the owner's context and outlives the owner keeps the
+federation held; inside an exclusive one, or one of another federation, it is `AdmissionRefused`. A platform without
+`[faults]` has no injector and no lock: the tool is admitted with no admission (`None`), its ingest journals still
+checked.
 
 `shared_admission_async` is the form for a driver that runs in an event loop: the wait runs off the loop and stops on
 cancellation, and `waits` (a timer or a call context) marks it a `lease_queue` wait as for a run.
@@ -43,12 +45,18 @@ cancellation, and `waits` (a timer or a call context) marks it a `lease_queue` w
 
 import contextlib
 import math
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from expcore_onedata.admission import Admission, FederationLock, current_admission, fault_settings_of
+from expcore_onedata.admission import (
+    Admission,
+    AdmissionRefused,
+    FederationLock,
+    current_admission,
+    fault_settings_of,
+)
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings
@@ -92,13 +100,18 @@ def _require_baselines(plan: _Plan) -> None:
         raise failure(verdict.detail)
 
 
-def _reusable(plan: _Plan, lock: FederationLock) -> Admission | None:
-    """The shared admission of this federation the running context holds already, if it holds one."""
+def _reusable(plan: _Plan, lock: FederationLock) -> tuple[Admission, Callable[[], None]] | None:
+    """The shared admission of this federation the running context holds already, if it holds one, with the share this
+    use of it takes: the context may be a task or thread that outlives the owner (a task inherits its parent's
+    context), so the use keeps the admission held until it has given the share up."""
     held = current_admission()
-    if held is not None and not held.exclusive and held.federation == lock.federation:
-        _require_baselines(plan)
-        return held
-    return None
+    if held is None or held.exclusive or held.federation != lock.federation:
+        return None
+    _require_baselines(plan)
+    share = held.try_retain()
+    if share is None:
+        raise AdmissionRefused("the admission this context holds is being given up: no tool may start under it")
+    return held, share
 
 
 def _begin(plan: _Plan, settings: FaultSettings, admission: Admission) -> None:
@@ -141,7 +154,11 @@ def shared_admission(
     lock = FederationLock(settings)
     reused = _reusable(plan, lock)
     if reused is not None:
-        yield reused
+        admission, share = reused
+        try:
+            yield admission
+        finally:
+            share()
         return
     with lock.held(exclusive=False, timeout_s=plan.timeout_s) as admission:
         _begin(plan, settings, admission)
@@ -168,7 +185,11 @@ async def shared_admission_async(
     lock = FederationLock(settings)
     reused = _reusable(plan, lock)
     if reused is not None:
-        yield reused
+        admission, share = reused
+        try:
+            yield admission
+        finally:
+            share()
         return
     async with lock.admitted(exclusive=False, waits=waits, timeout_s=plan.timeout_s) as admission:
         _begin(plan, settings, admission)

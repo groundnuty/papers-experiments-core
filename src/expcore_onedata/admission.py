@@ -128,9 +128,14 @@ class Admission:
     def retain(self) -> Callable[[], None]:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
         counts). A share of an admission no longer held is nothing to give up."""
+        return self.try_retain() or (lambda: None)
+
+    def try_retain(self) -> Callable[[], None] | None:
+        """`retain`, or None when the admission is no longer held or its last share is being given up: a caller that
+        must not go on without the federation held (a tool reusing it) refuses then."""
         with self.shares.lock:
             if not self.held or self.shares.count == 0:
-                return lambda: None
+                return None
             self.shares.count += 1
         given_up = threading.Event()
 
@@ -163,16 +168,22 @@ class Admission:
         self._give_up()
 
     def _release(self) -> None:
-        """Let the lock go, its holder record first, so no record outlives a lock let go this way."""
-        for ending in reversed(self.endings):
-            try:
-                ending()
-            except Exception:  # the lock goes all the same: the record of a hold only says who held it
-                log.exception("the end of a hold could not be recorded")
-        if self.journal is not None and self.record is not None and self.held:
-            with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
-                self.journal.clear_holder(self.record["token"])
-        self.lock.close()
+        """Let the lock go, its records first, so no record outlives a lock let go this way, and the lock goes whatever
+        a record's end does, an interrupt included. A forked child's copy of the admission holds nothing (the fork hook
+        closed its descriptor), so it ends and clears nothing of its parent's."""
+        owned = self.held
+        try:
+            if owned:
+                for ending in reversed(self.endings):
+                    try:
+                        ending()
+                    except Exception:  # the record of a hold only says who held it
+                        log.exception("the end of a hold could not be recorded")
+                if self.journal is not None and self.record is not None:
+                    with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
+                        self.journal.clear_holder(self.record["token"])
+        finally:
+            self.lock.close()
 
 
 def current_admission() -> Admission | None:

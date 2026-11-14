@@ -50,6 +50,11 @@ def _now() -> str:
 _FIELDS = ("id", "reason", "holder", "owner", "since_utc")
 
 
+def _is_end(line: Mapping[str, Any]) -> bool:
+    """Whether a `shared_released` line says when and how the hold ended."""
+    return isinstance(line.get("until_utc"), str) and isinstance(line.get("how"), str)
+
+
 def _is_hold(line: Mapping[str, Any]) -> bool:
     """Whether a `shared_held` line has what a reader needs: a reason, a start and an owner that names a process."""
     owner = line.get("owner")
@@ -104,9 +109,9 @@ class SharedHolds:
                 raise ValueError(f"{where} is not a hold event")
             if line["event"] == HELD and _is_hold(line):
                 records[key] = {**{field: line[field] for field in _FIELDS}, "until_utc": None, "how": None}
-            elif line["event"] == RELEASED and key in records:
+            elif line["event"] == RELEASED and key in records and _is_end(line):
                 if records[key]["until_utc"] is None:  # the first end stands: a settler may have raced the tool's own
-                    records[key].update(until_utc=line.get("until_utc"), how=line.get("how"))
+                    records[key].update(until_utc=line["until_utc"], how=line["how"])
             else:
                 raise ValueError(f"{where} is not a hold event")
         return list(records.values())
