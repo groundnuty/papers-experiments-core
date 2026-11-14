@@ -1,7 +1,6 @@
 """A start the platform holds back costs no attempt, before the attempt or at its start, and the campaign holds and
 asks again instead of spinning (C33)."""
 
-import collections
 import itertools
 import json
 import time
@@ -108,32 +107,27 @@ def test_c33_a_post_run_check_that_charges_no_one_sets_its_attempt_aside_uncharg
         assert sum("uncharged" in text for text in texts) == 2
 
 
-class HeldAtTheStart:
-    """An instrument whose start its platform held back, and whose post-run check refuses with that hold, though an
-    executor that swallowed the start's error ran the loop all the same."""
+class Refusing:
+    """An instrument whose post-run check refuses with a kind: with a hold kind, one whose start its platform held
+    back, though an executor that swallowed the start's error ran the loop all the same."""
 
-    namespace = "baseline"
-
-    def __init__(self, kind):
-        self.kind = kind
+    def __init__(self, kind, namespace="baseline"):
+        self.kind, self.namespace = kind, namespace
 
     def start(self, identity):
         pass
 
     def finish(self):
-        return {"held": True}
+        return {"refuses": self.kind}
 
     def check(self):
-        raise InfraError(self.kind, "the start was held back")
+        raise InfraError(self.kind, "refused after the run")
 
 
-def test_c33_a_hold_an_instrument_refused_with_decides_over_a_charged_post_run_failure(tmp_path, held_kind):
-    """C33: the record carries an instrument's refusal of a hold kind, and the post-run check fails for a reason that
-    charges, with the gate open: the hold decides, so the attempt is set aside uncharged as the hold, not charged as
-    the health check's kind."""
-    executor = FakeExecutor()
+def swallowing(*instruments):
+    """An executor behaviour: the loop runs, then the instruments finish and are checked into the record."""
 
-    async def swallowed(request):
+    async def behave(request):
         request.backend.use([])
         record = await record_run(
             request,
@@ -144,18 +138,39 @@ def test_c33_a_hold_an_instrument_refused_with_decides_over_a_charged_post_run_f
             code=dict(CODE),
             core_version="0.1.0",
         )
-        return finish_instruments(record, [HeldAtTheStart(held_kind)])
+        return finish_instruments(record, list(instruments))
 
-    executor.behaviours = {ONE_KEY: collections.deque([swallowed])}
+    return behave
+
+
+def attempt_rows(store, key):
+    rows = store.q("SELECT state, charged, attempt, infra_kind FROM attempts WHERE run_key=? ORDER BY id", (key,))
+    return [(r["state"], r["charged"], r["attempt"], r["infra_kind"]) for r in rows]
+
+
+def test_c33_a_hold_an_instrument_refused_with_decides_over_a_charged_post_run_failure(tmp_path, held_kind):
+    """C33: the record carries an instrument's refusal of a hold kind, and the post-run check fails for a reason that
+    charges, with the gate open: the hold decides, so the attempt is set aside uncharged as the hold, not charged as
+    the health check's kind."""
+    executor = FakeExecutor({ONE_KEY: [swallowing(Refusing(held_kind))]})
     check = Answers(Health(True, "fine"), Health(False, "the federation failed after the run"))
     with build(tmp_path, schema=ONE, executor=executor, plan=SMALL, health=check) as scheduler:
         scheduler.run()
-        rows = scheduler.store.q(
-            "SELECT state, charged, attempt, infra_kind FROM attempts WHERE run_key=? ORDER BY id", (ONE_KEY,)
-        )
-        assert [(r["state"], r["charged"], r["attempt"], r["infra_kind"]) for r in rows] == [
+        assert attempt_rows(scheduler.store, ONE_KEY) == [("infra_fail", 0, 1, held_kind), ("done", 0, 1, None)]
+
+
+def test_c33_a_hold_wins_over_a_charged_refusal_of_an_instrument_checked_before_it(tmp_path, held_kind):
+    """C33: an instrument checked first refuses with a charged kind and a later one with a hold: the later check still
+    runs, the hold is the record's refusal, and the attempt costs no attempt; with no hold the first refusal stands,
+    charged, as before."""
+    first, held = Refusing("tool_plane_integrity", "integrity"), Refusing(held_kind)
+    executor = FakeExecutor({ONE_KEY: [swallowing(first, held), swallowing(first, Refusing("tool_plane_integrity"))]})
+    with build(tmp_path, schema=ONE, executor=executor, plan=SMALL) as scheduler:
+        scheduler.run()
+        assert attempt_rows(scheduler.store, ONE_KEY) == [
             ("infra_fail", 0, 1, held_kind),
-            ("done", 0, 1, None),
+            ("infra_fail", 1, 1, "tool_plane_integrity"),
+            ("done", 0, 2, None),
         ]
 
 
