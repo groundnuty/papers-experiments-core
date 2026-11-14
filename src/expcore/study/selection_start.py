@@ -92,6 +92,7 @@ def selection_start(
             environment=environment,
             plan=study.manifest,
             pricing=pricing,
+            budget=budget is not None,
         )
         caps = dict(sorted(settings.unit_caps.items()))
         parts, how = None, ""

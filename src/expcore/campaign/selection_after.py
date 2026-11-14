@@ -84,13 +84,15 @@ def earlier_selections(
     environment: Mapping[str, str],
     plan: Manifest,
     pricing: Pricing,
+    budget: bool,
 ) -> list[ShardFacts]:
-    """The earlier selections `paths` name, verified (see the module docstring), in the order they ran."""
+    """The earlier selections `paths` name, verified (see the module docstring), in the order they ran; `budget`
+    says the campaign has one, so each one's spend must be known."""
     found: list[ShardFacts] = []
     with tempfile.TemporaryDirectory(prefix="expcore-after-") as scratch:
         for n, path in enumerate(paths):
             facts = _read(Path(path), Path(scratch) / f"after-{n}.sqlite", pricing)
-            _check_one(Path(path), facts, selection, fingerprint, environment, plan)
+            _check_one(Path(path), facts, selection, fingerprint, environment, plan, budget)
             found.append(facts)
     labels = [facts.spec.label for facts in found]
     for facts in found:
@@ -134,8 +136,10 @@ def _check_one(
     fingerprint: Mapping[str, Any],
     environment: Mapping[str, str],
     plan: Manifest,
+    budget: bool,
 ) -> None:
-    """One earlier selection: sequential, of this campaign and environment, disjoint from this one, spend known."""
+    """One earlier selection: sequential, of this campaign and environment, disjoint from this one, and with a budget
+    its spend known."""
     spec = facts.spec
     if not isinstance(spec, SelectionSpec) or not spec.sequential:
         raise ShardError(f"--after {path}: not a selection run with --sequential ({facts.name})")
@@ -149,16 +153,17 @@ def _check_one(
         raise ShardError(
             f"--after {path}: {spec.name} also selects run {both.key.text}: the selections of a campaign are disjoint"
         )
-    if facts.spend is None or facts.spend.total is None or None in facts.spend.per_model.values():
+    known = facts.spend is not None and facts.spend.total is not None and None not in facts.spend.per_model.values()
+    if budget and not known:
         raise ShardError(f"--after {path}: what {spec.name} spent is unknown (an attempt of a model without a price)")
 
 
 def spent_before(earlier: Sequence[ShardFacts]) -> tuple[float, dict[str, float]]:
-    """What the earlier selections spent together: in total and per model."""
+    """What the earlier selections spent together, in total and per model; each spend was checked known."""
     total, per_model = 0.0, {}
     for facts in earlier:
-        assert facts.spend is not None  # checked by `earlier_selections`
-        assert facts.spend.total is not None
+        if facts.spend is None or facts.spend.total is None or None in facts.spend.per_model.values():
+            raise ShardError(f"what {facts.spec.name} spent is unknown (an attempt of a model without a price)")
         total += facts.spend.total
         for model, usd in facts.spend.per_model.items():
             per_model[model] = per_model.get(model, 0.0) + (usd or 0.0)
