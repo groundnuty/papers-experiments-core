@@ -9,6 +9,7 @@ study_space = "alpha-space"      # the space the core studies; its owner is the 
 memory_limit = "6g"              # per service, unless a service sets its own
 support_bytes = 10737418240      # each supporting provider's support of each space (10 GiB), unless a space sets its own
 platform_template = "platform.toml.template"  # relative to this file; up renders it into the root as platform.toml
+probe_space = "link-probes"      # the link check's probes (#221): a space no agent may reach, on every provider
 
 [zone]
 port = 29443                     # every port is published on 127.0.0.1 only
@@ -29,6 +30,12 @@ mirrors = ["birch", "cedar"]     # other providers supporting it; reset --replic
 [spaces.beta-space]              # outside the study's prefix: a mutation must never reach it
 owner = "birch"
 mirrors = ["cedar"]
+
+[spaces.link-probes]             # the probe space: each source writes its own probe, the local provider fetches it
+owner = "pine"
+mirrors = ["birch", "cedar"]
+agent_visible = false            # no user of the agent is a member: its probes are where no agent can see them
+baseline = false                 # up writes nothing into it; reset --clean empties it and the next check writes again
 
 [principals.alpha-reader]        # the data path's user; a member of the study space unless spaces = [...] says otherwise
 privileges = ["space_view", "space_read_data"]

@@ -290,6 +290,13 @@ class SandboxPlatform:
     `token_expiry_beyond_request` through it (`users.SlotTokens`). `tool_condition` tells from a run's factors the
     tool-server condition it has, or None; `tool_server` starts that server (`toolserver.ToolServerLauncher`) when a
     run has one.
+
+    A lease-less platform (O38) is built with neither `slots` nor `journal`, for a run that takes no lease, a one-off
+    check of the data path say: it leases nothing, mints a data-path token as the fixed `[principals.data_path]` user,
+    and never uses a slot's users or tokens. The two come together or not at all (a ValueError names the one missing),
+    and everything that needs them (`lease_keys`, `condition_group`, `probe`, a tool-server condition, a `launch` with a
+    lease) is refused with a `ConfigError` that says so, before anything is minted or created. `lease_group` is None
+    for every run that needs no tool server. A platform built with them is unchanged.
     """
 
     def __init__(
@@ -298,9 +305,9 @@ class SandboxPlatform:
         issuer: TokenIssuer,
         host: HostOps,
         *,
-        slots: Slots,
-        journal: TokenJournal,
         events: EventSink,
+        slots: Slots | None = None,
+        journal: TokenJournal | None = None,
         tool_condition: Callable[[Mapping[str, Any]], str | None] = lambda factors: None,
         tool_server: ToolServerLauncher | None = None,
         registry: Registry = DEFAULT,
@@ -317,9 +324,19 @@ class SandboxPlatform:
         self._teardown_s = teardown_deadline_s
         if config.sandbox is None:
             raise ValueError(f"{config.file}: has no [sandbox] section")
+        if (slots is None) != (journal is None):
+            missing = "journal" if journal is None else "slots"
+            raise ValueError(
+                f"{config.file}: the platform was given one of `slots` and `journal` but not `{missing}`: slots mint "
+                "tokens whose expiry the journal records, so give both, or neither for a lease-less platform"
+            )
         self._config, self._s, self._issuer, self._host = config, config.sandbox, issuer, host
         self._slots, self._journal, self._clock = slots, journal, clock
-        self._tokens = SlotTokens(issuer, config, slots, journal, events=events, clock=clock)
+        self._tokens = (
+            SlotTokens(issuer, config, slots, journal, events=events, clock=clock)
+            if slots is not None and journal is not None
+            else None
+        )
         self._tool_condition, self._launcher = tool_condition, tool_server
         self._registry, self._options = registry, dict(sandbox_options or {})
         self._cancel_wait_s = cancel_wait_s
@@ -328,6 +345,16 @@ class SandboxPlatform:
         self._planes: weakref.WeakKeyDictionary[DockerSandbox, _ToolPlane] = weakref.WeakKeyDictionary()
         self._revocable: weakref.WeakKeyDictionary[DockerSandbox, _Revocable] = weakref.WeakKeyDictionary()
         self._serving: weakref.WeakSet[DockerSandbox] = weakref.WeakSet()  # sandboxes whose tool server runs
+
+    def _slots_needed(self, what: str) -> Slots:
+        """The platform's slots, or a ConfigError that says what is missing, for a lease-less platform (O38)."""
+        if self._slots is None:
+            raise ConfigError(
+                f"{self._config.file}: the platform was built without `slots` and `journal` (a lease-less platform), "
+                f"so it cannot {what}: build it with the slots of platform.toml (`users.load_slots`) and a "
+                "`TokenJournal` beside the leases"
+            )
+        return self._slots
 
     # ------------------------------------------------------------------------------------------------ the plugin's hooks
     def mode(self, factors: Mapping[str, Any]) -> DataPathMode:
@@ -343,15 +370,16 @@ class SandboxPlatform:
         condition = self._tool_condition(factors)
         if condition is not None:
             return self.condition_group(condition)
-        return GROUP if mode is not DataPathMode.NONE else None
+        return GROUP if mode is not DataPathMode.NONE and self._slots is not None else None
 
     def condition_group(self, condition: str) -> str:
         """The lease group of a tool-server condition: the slots whose tool-server user declares its rights. Raise
         ConfigError, naming the condition by its position and the rights, when it is not declared or no slot declares
-        its rights."""
+        its rights. A lease-less platform has no slots: ConfigError (`_slots_needed`)."""
+        slots = self._slots_needed("give a tool-server condition a lease group")
         rights = self._config.condition(condition).rights
         try:
-            return self._slots.group_for(rights)
+            return slots.group_for(rights)
         except ValueError:
             raise ConfigError(
                 f"{self._config.file}: [slots]: no slot's tool-server user declares the rights of [toolserver] "
@@ -360,8 +388,8 @@ class SandboxPlatform:
 
     def lease_keys(self, group: str) -> Sequence[str]:
         """The keys of a lease group: every slot of `[slots]` for `GROUP`, those of one set of tool-server rights for its
-        group; a group the slots do not declare is refused."""
-        return self._slots.keys_of(group)
+        group; a group the slots do not declare is refused. A lease-less platform has no slots: ConfigError."""
+        return self._slots_needed("name the keys of a lease group").keys_of(group)
 
     def sandbox_probe(self) -> SandboxProbe:
         """The probe that proves a key's sandbox gone: no container, network or mount of it is left."""
@@ -369,7 +397,9 @@ class SandboxPlatform:
 
     def probe(self) -> SlotProbe:
         """The `ResourceProbe` for the plugin: a key is free once its sandbox is proven gone and its tokens have ended,
-        by their expiry or by a revocation that has settled."""
+        by their expiry or by a revocation that has settled. A lease-less platform has no journal, and no key to free:
+        ConfigError, never a probe that frees nothing or everything."""
+        self._slots_needed("probe the keys of a pool")
         return SlotProbe(self._journal, sandbox_gone=self.sandbox_probe().resource_gone, clock=self._clock)
 
     @staticmethod
@@ -500,6 +530,10 @@ class SandboxPlatform:
         proved read-only from inside the agent, and recorded by its hash in the sandbox's metadata and, through
         `inputs_record` (`inputs.InputsRecord`), in the run's record itself (`sandbox.inputs`, O20).
 
+        A platform built without `slots` and `journal` (O38) takes no lease and starts no tool server: a `lease` or a
+        `condition` is a ConfigError, raised before anything is minted or created, and a data-path run mints as the
+        fixed `[principals.data_path]` user.
+
         A run with a lease has its tokens minted through its slot (`users.SlotTokens`): the data path's, and the tool
         server's when `condition` names the run's tool-server condition, which `tool_server` then starts the server
         with. A run with a tool server needs a lease; one without a lease (a live check) mints its data-path token as
@@ -536,6 +570,10 @@ class SandboxPlatform:
         it mints a token or enters a wait (O11). An injector's own admission, taken when its run holds none, is not
         the run's: the run must be admitted before it launches.
         """
+        if lease is not None:  # a lease-less platform has no slot for it (O38): refused before anything else
+            self._slots_needed("take a lease")
+        if condition is not None:
+            self._slots_needed("start a tool server, whose user is a slot's")
         require_admission(self._config)  # first: a refused run mints, journals and starts nothing (O11)
         mode = self._s.mode_of(level)
         if any(item not in self._declared for item in inputs):

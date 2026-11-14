@@ -8,6 +8,7 @@ certificate verification on. Nothing here prints a token or a password.
 
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,6 +18,8 @@ from fedrest import PANEL_API, PANEL_USER, PROVIDER_API, ZONE_API, Rest, RestErr
 from fedspec import ADMIN, Service
 
 INVITE_LIFETIME_S = 900
+PANEL_READ_TRIES = 5  # tries of a panel read that could not be answered yet: four waits, 1 + 2 + 4 + 8 = 15 s at most
+PANEL_READ_BACKOFF_CAP_S = 10.0  # no wait is longer than this, however many tries a later change allows
 
 
 @dataclass
@@ -31,6 +34,8 @@ class Ids:
 
 class Bootstrap:
     """The steps of up and the resets that talk to the federation."""
+
+    _sleep: Callable[[float], None] = staticmethod(time.sleep)  # the wait between tries of a panel read; a test's own
 
     def __init__(self, rest: Rest, layout: Layout) -> None:
         self.rest = rest
@@ -75,11 +80,24 @@ class Bootstrap:
         return self.rest.json(method, url, label=f"{service.name} {label}", headers=sent, **options)
 
     def panel(self, service: Service, method: str, path: str, label: str, **options: Any) -> Any:
-        """Call a provider's panel, through its 443, as the admin's token (the admin owns every provider cluster)."""
+        """Call a provider's panel, through its 443, as the admin's token (the admin owns every provider cluster).
+
+        A **read** (GET) the panel could not answer yet, with a server error or no answer at all, is tried again, at
+        most `PANEL_READ_TRIES` times in all, after waits of 1, 2, 4 s and so on that stop growing at
+        `PANEL_READ_BACKOFF_CAP_S`: a panel answers 500 for a while after its provider's start (the first up of a live
+        slot failed on one such read). The last error is raised when the tries are spent, and a refusal (a status below
+        500) at once. **A write is never tried again**: one that failed with a server error may have been received."""
         url = service.url + PANEL_API + path
-        return self.rest.json(
-            method, url, label=f"{service.name} panel {label}", headers=bearer(self.admin_token()), **options
-        )
+        headers = bearer(self.admin_token())
+        tries = PANEL_READ_TRIES if method == "GET" else 1
+        for attempt in range(1, tries + 1):
+            try:
+                return self.rest.json(method, url, label=f"{service.name} panel {label}", headers=headers, **options)
+            except RestError as error:
+                if attempt == tries or not (error.status is None or error.status >= 500):
+                    raise
+            self._sleep(min(float(2 ** (attempt - 1)), PANEL_READ_BACKOFF_CAP_S))
+        raise AssertionError("unreachable: the last try returns or raises")  # pragma: no cover
 
     # -- the zone ------------------------------------------------------------------------------------------------------
 

@@ -173,3 +173,31 @@ def test_l04_the_ceiling_is_part_of_the_configuration_hash():
 def test_caps_that_cannot_work_are_refused(change):
     with pytest.raises(ValueError, match="agent configuration"):
         AgentConfig(dataclasses.replace(LIMITS, **change))
+
+
+def test_l17_a_configuration_that_declares_no_tool_call_bound_is_what_it_was_before_the_bound_existed():
+    """L17: the bound is optional. Undeclared, it is not a key of the configuration as the record keeps it, so the
+    configuration hash, the record's `agent_config` and the campaign's caps are the bytes they were before the field
+    existed, and a run is bounded by the agent's time left alone."""
+    config = AgentConfig(LIMITS)
+    assert config.tool_call_bound_s is None
+    assert "tool_call_bound_s" not in config.as_dict()
+    assert config.config_sha256() == "b8d080adb0c952566ba2988bafe817e6f81d4ca75cb11ad1ca2cdf3b1b6dd229"
+
+
+def test_l17_a_declared_tool_call_bound_is_in_the_record_and_changes_the_configuration_hash():
+    """L17: a declared bound changes what a run does, so it is a value of the configuration as the record keeps it and
+    part of its hash, and a copy of the configuration keeps it."""
+    config = AgentConfig(LIMITS, tool_call_bound_s=60.0)
+    assert config.as_dict()["tool_call_bound_s"] == 60.0
+    assert config.config_sha256() != AgentConfig(LIMITS).config_sha256()
+    assert config.config_sha256() != AgentConfig(LIMITS, tool_call_bound_s=61.0).config_sha256()
+    assert dataclasses.replace(config, malformed_policy="end").tool_call_bound_s == 60.0
+    assert AgentConfig(LIMITS, tool_call_bound_s=5000.0).tool_call_bound_s == 5000.0  # above the cap: the cap decides
+
+
+@pytest.mark.parametrize("seconds", [0.0, -1.0, float("nan"), float("inf"), True, "60"])
+def test_l17_a_tool_call_bound_that_is_not_a_positive_finite_number_of_seconds_is_refused(seconds):
+    """L17: refused at construction, naming the field, as the other fields of the configuration are."""
+    with pytest.raises(ValueError, match="tool_call_bound_s"):
+        AgentConfig(LIMITS, tool_call_bound_s=seconds)

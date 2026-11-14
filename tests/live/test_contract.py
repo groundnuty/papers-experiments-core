@@ -605,12 +605,14 @@ def test_a_whole_reset_removes_a_requirement_cancels_a_job_evicts_and_records_th
 
 
 # -- the reset's QoS listing and the occupancy's lag (issue #209, O33) -----------------------------------------------
-# `[placement] qos_scan = "listing"` rests on two facts the source states and no live run has shown: the first two
-# tests check them, and "summaries" stays the default until both pass. The third measures how long the space root's
+# `[placement] qos_scan = "listing"`, the default, rests on two facts the source states: the first two tests check
+# them (the 14 Nov 2026 slot showed the first, and the second by hand). The third measures how long the space root's
 # physical size lags a placement, which the reset's quiet wait assumes from the source. Each prints its figures for
 # the dated facts file and leaves nothing behind: its requirement is removed and the scratch files are torn down.
 
 QOS_SEEN_S = 120.0  # the longest a requirement added through one provider is waited for through another
+MIRROR_KNOWS_S = 60.0  # the longest a mirror is waited for to know a file written through the data provider (dbsync)
+SCRATCH_BYTES = 1024  # each scratch file's size: bytes(range(256)) * 4
 
 
 def scratch_requirement(provisioner, provider, file_id):
@@ -645,11 +647,15 @@ def test_the_recursive_listing_takes_include_directories_and_marks_a_requirement
 @MUTATE
 def test_a_requirement_added_through_one_provider_is_found_by_the_listing_through_another(scratch):
     """O33: a requirement put on a scratch file through the receiver is found by the listing scan on the data
-    provider once dbsync settles, within `QOS_SEEN_S`, and applies to that file; the seconds it took are printed."""
+    provider once dbsync settles, within `QOS_SEEN_S`, and applies to that file; the seconds it took are printed. The
+    requirement is posted only once the receiver knows the file (within `MIRROR_KNOWS_S`): one posted through a mirror
+    right after the file was created through the data provider was refused `OutOfScope` on the 14 Nov slot, the file
+    not having reached the mirror yet, which is dbsync's lag and not what this test measures."""
     from expcore_onedata import resetqos
 
     provisioner, receiver, _, ids = scratch
     holder = provisioner.settings.holder
+    consistency.wait_visible(provisioner.client, receiver, ids[0], size=SCRATCH_BYTES, timeout_s=MIRROR_KNOWS_S)
     qid = scratch_requirement(provisioner, receiver, ids[0])
     try:
         began = time.monotonic()
@@ -684,6 +690,39 @@ def test_the_space_roots_occupancy_follows_a_placement_within_the_sources_bound(
     lag = time.monotonic() - placed
     print(f"the space root's physical size showed the placement after {lag:.2f} s")
     assert lag <= resetqos.occupancy_lag_s(2) + 1.0
+
+
+@MUTATE
+def test_the_space_roots_occupancy_follows_an_eviction_within_the_resets_wait(scratch):
+    """O46: a scratch file one directory below the root is replicated to the receiver and, once the root's physical
+    size there shows it, evicted from there; the size is then read every quarter second until it has dropped back. The
+    drop must come within the occupancy stage's wait for that depth counted from the eviction's verified end
+    (`resetqos.occupancy_wait_s(2)`), the reading the reset takes; the seconds from the scheduling and from the end are
+    printed beside the lag the reset assumes, which the 14 Nov slot could not split."""
+    from expcore_onedata import resetqos
+    from expcore_onedata.occupancy import physical_sizes
+
+    provisioner, receiver, directory, _ = scratch
+    providers = list(provisioner.space.support.providers)
+    path, size = f"{directory}/part-1.bin", 1024  # the scratch files are 1024 bytes each
+    before = physical_sizes(provisioner, providers)[receiver]
+    provisioner.replicate(path, receiver)
+    placed = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] < before + size:
+        assert time.monotonic() - placed < resetqos.quiet_wait_s(2), "the root's physical size never showed the file"
+        time.sleep(0.25)
+    scheduled = time.monotonic()
+    provisioner.evict(path, receiver)  # returns once the receiver's block map shows the file empty
+    ended = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] > before:
+        assert time.monotonic() - ended < resetqos.occupancy_wait_s(2), "the root's size never dropped within the wait"
+        time.sleep(0.25)
+    dropped = time.monotonic()
+    print(
+        f"the space root's physical size showed the eviction {dropped - scheduled:.2f} s after its scheduling and "
+        f"{dropped - ended:.2f} s after its verified end (the job took {ended - scheduled:.2f} s; the reset assumes "
+        f"up to {resetqos.occupancy_lag_s(2):.0f} s from the end)"
+    )
 
 
 # -- large files (issue #127) -----------------------------------------------------------------------------------------
@@ -723,19 +762,19 @@ def copy_prefix(source, dest, size):
 
 
 @MUTATE
-def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_back_by_its_hash(
+def test_a_large_file_resumes_by_offset_writes_refuses_a_shorter_one_and_reads_back_by_its_hash(
     config, client, tmp_path
 ):
-    """O25: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
-    nothing, a shorter file over the longer target is written again from a write without an offset (which must
-    truncate it), and the streamed read gives each file's SHA-256. Everything is under a fresh scratch directory and
-    torn down; skipped without a [placement] table."""
+    """O25, O44: on the real deployment, a prefix uploaded first is resumed by offset writes, an upload run again sends
+    nothing, a shorter file over the longer target is refused with nothing written (only a write without an offset,
+    which truncates and is never sent, could shorten it), and the streamed read gives each file's SHA-256.
+    Everything is under a fresh scratch directory and torn down; skipped without a [placement] table."""
     # covers: PUT /data/{id}/content
     import dataclasses
     import secrets
 
     from expcore.config.loading import ConfigError
-    from expcore_onedata.provision import Provisioner, resolve_provider_ids
+    from expcore_onedata.provision import Provisioner, ProvisionError, resolve_provider_ids
     from expcore_onedata.rangemap import load_placement
 
     try:
@@ -752,17 +791,18 @@ def test_a_large_file_resumes_by_offset_writes_restarts_by_truncation_and_reads_
     prefix_sha = copy_prefix(whole, prefix, cut)
     path = f"expcore-live-{secrets.token_hex(6)}/large.bin"
     try:
-        assert provisioner.upload(path, prefix).action == "created"
+        created = provisioner.upload(path, prefix)
+        assert (created.action, created.digest.sha256) == ("created", prefix_sha)
         resumed = provisioner.upload(path, whole)
         assert (resumed.action, resumed.sent_bytes) == ("resumed", LARGE_FILE_BYTES - cut)
         assert (resumed.digest.size, resumed.digest.sha256) == (LARGE_FILE_BYTES, whole_sha)
         assert provisioner.upload(path, whole).action == "skipped"
-        restarted = provisioner.upload(path, prefix)  # the target is longer, so only a truncating write fits it
-        assert (restarted.action, restarted.digest.sha256) == ("restarted", prefix_sha)
+        with pytest.raises(ProvisionError, match="longer"):  # only a truncating write could fit it, never sent
+            provisioner.upload(path, prefix)
         back = tmp_path / "back.bin"
-        found = provisioner.read_file(restarted.file_id, dest=back)
-        assert (found.size, found.sha256) == (cut, prefix_sha)
-        assert back.stat().st_size == cut
+        found = provisioner.read_file(resumed.file_id, dest=back)
+        assert (found.size, found.sha256) == (LARGE_FILE_BYTES, whole_sha)
+        assert back.stat().st_size == LARGE_FILE_BYTES
     finally:
         report = provisioner.teardown()
     assert report.ok, report.left

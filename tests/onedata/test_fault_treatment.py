@@ -11,7 +11,7 @@ import pytest
 from campaign_support import LATER, NOW, keys_under, make_manifest, make_schema, open_store
 from fault_support import OUTAGE_TARGET, FakeServices, injector_for, write_faults
 from loop_support import FakeProvider
-from record_support import record_run
+from record_support import hand_made, record_run
 
 from expcore.campaign.executor import result_from_record
 from expcore.campaign.factors import FactorSchema
@@ -98,3 +98,36 @@ def test_c01_a_run_that_failed_before_its_first_model_turn_is_set_aside(campaign
         False,
     )
     assert row == ("infra_fail", 0, PROVIDER_OUTAGE)
+
+
+class Reading:
+    """An instrument that records whether the manipulated provider's service runs at the moment it finishes."""
+
+    namespace = "reading"
+
+    def __init__(self, services):
+        self.services = services
+
+    def start(self, identity):
+        pass
+
+    def finish(self):
+        return {"target_running": self.services.running("store-two")}
+
+
+@pytest.mark.parametrize(("probe_first", "read_target_running"), [(False, False), (True, True)])
+def test_c31_a_probe_listed_after_the_injector_finishes_before_the_target_is_restored(
+    tmp_path, probe_first, read_target_running
+):
+    """C31: the injector's `finish` restores the provider, so an instrument listed after it finishes first and reads
+    the provider down, and one listed before it finishes after the restore and reads it back. Either way the injector
+    restored the provider and says so."""
+    services = FakeServices()
+    injector, probe = injector_for(write_faults(tmp_path), services), Reading(services)
+    instruments = [probe, injector] if probe_first else [injector, probe]
+    start_instruments(instruments, {"run_key": "run-1", "attempt": 1})
+    assert not services.running("store-two")  # injected before the run
+    record = finish_instruments(hand_made(), instruments)
+    assert record.instruments["reading"] == {"target_running": read_target_running}
+    assert record.instruments["fault_injector"]["ok"] is True
+    assert services.running("store-two")
