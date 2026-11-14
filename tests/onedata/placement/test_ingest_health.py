@@ -7,12 +7,13 @@ import sys
 
 import pytest
 
+from expcore.campaign import liveness
 from expcore.campaign.healthgate import read_health
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import boot_id
 from expcore_onedata.health import PlatformHealth
-from expcore_onedata.ingesthealth import baseline_health, last_marks, recovery_refusal, start_refusal
+from expcore_onedata.ingesthealth import baseline_health, last_marks, mark_fields, recovery_refusal, start_refusal
 from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.tokens import TokenIssuer
 
@@ -57,13 +58,15 @@ def test_o44_an_unhealthy_mark_fails_the_check_until_a_whole_one_follows_it(tmp_
 
 def test_o44_an_open_mark_fails_the_check_when_its_holder_is_gone_or_unnamed(tmp_path, gone):
     """O44: an open baseline whose holder no longer runs is a run that died with its baseline sparse or missing; one
-    whose holder the mark does not name cannot be told from it. Both fail; a live holder is a run in progress."""
+    whose holder the mark does not name cannot be told from it. Both fail; a live holder is a run in progress, which
+    a check outside any attempt defers (O45)."""
     assert (
         "stopped during its run"
         in baseline_health([journal_of(tmp_path, {"state": "open", "phase": "run", "holder": gone})]).detail
     )
     assert not baseline_health([journal_of(tmp_path, {"state": "open", "phase": "run"})]).ok
-    assert baseline_health([journal_of(tmp_path, {"state": "open", "phase": "run", "holder": here()})]).ok
+    live = baseline_health([journal_of(tmp_path, {"state": "open", "phase": "run", "holder": here()})])
+    assert (live.ok, live.deferred) == (False, True)
 
 
 def test_o44_a_start_is_refused_on_any_baseline_that_is_not_whole_whoever_holds_it(tmp_path, gone):
@@ -85,7 +88,7 @@ def test_o44_a_recovery_is_refused_for_another_plan_or_a_baseline_another_live_p
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         held = {"state": "open", "phase": "run", "plan": plan, "holder": {"pid": other.pid, "boot_id": boot_id()}}
-        assert "another process" in recovery_refusal(held, plan)
+        assert "a run in progress" in recovery_refusal(held, plan)
     finally:
         other.kill()
         other.wait()
@@ -128,3 +131,104 @@ def test_o44_the_platforms_health_check_fails_on_an_unhealthy_baseline_before_it
     assert len(fake.requests) == asked
     journal_of(tmp_path, failed, {"state": "whole", "phase": "recover", "holder": here()})
     assert read_health(health).ok
+
+
+# -- O45: an open mark is held while a live attempt owns it, and orphaned the moment none does ------------------------
+
+
+@pytest.fixture
+def campaign():
+    """A campaign registered in this process: its store's attempt rows, by id, as a dict the test sets."""
+    rows: dict[int, str] = {}
+    key = liveness.register(rows.get)
+    yield key, rows
+    liveness.unregister(key)
+
+
+def owned(key, attempt_id, process=None):
+    return {"process": process or liveness.this_process(), "campaign": key, "attempt_id": attempt_id}
+
+
+def test_o45_a_mark_names_the_attempt_that_wrote_it_and_this_process_outside_one():
+    """O45: a mark's owner is the attempt the context runs, by its campaign and the store's id of its row, and the
+    process as the lease pool names a holder; outside an attempt it is the process alone."""
+    assert mark_fields("open", "start")["owner"] == {"process": liveness.this_process()}
+    key = liveness.register(lambda attempt_id: "running")
+    try:
+        with liveness.running(key, 4):
+            assert mark_fields("open", "start")["owner"] == owned(key, 4)
+    finally:
+        liveness.unregister(key)
+
+
+def test_o45_an_open_mark_whose_attempt_has_ended_reads_unhealthy_at_once(tmp_path, campaign):
+    """O45: the moment the campaign's store holds the owning attempt's result, finished or set aside, its open mark is
+    orphaned, though the process that wrote it still runs and the run's ceiling is far off: the check fails, charging
+    no run, a start is held back as on a baseline not whole, and a recovery may bring it back."""
+    key, rows = campaign
+    rows[5] = "running"
+    mark = {"state": "open", "phase": "run", "plan": "a" * 64, "holder": here(), "owner": owned(key, 5)}
+    journal = journal_of(tmp_path, mark)
+    assert baseline_health([journal]).deferred  # a run in progress, while its attempt runs
+    for ended in ("done", "infra_fail", "outage_discarded", "interrupted"):
+        rows[5] = ended
+        health = baseline_health([journal])
+        assert (health.ok, health.deferred, health.charge) == (False, False, False)
+        assert "its attempt has ended" in health.detail
+        assert "not whole" in start_refusal(mark)
+        assert recovery_refusal(mark, "a" * 64) is None
+    liveness.unregister(key)  # the campaign closed: its attempts are over
+    rows[5] = "running"
+    assert not baseline_health([journal]).ok
+
+
+def test_o45_an_open_mark_whose_process_died_reads_unhealthy(tmp_path, gone):
+    """O45: an owner whose process is gone (named by boot id, pid and start time, so a reused pid is not mistaken for
+    it) leaves its baseline orphaned, whether or not it ran in an attempt."""
+    dead = f"{boot_id()}:{gone['pid']}:0"
+    for owner in ({"process": dead}, owned("another", 2, process=dead)):
+        mark = {"state": "open", "phase": "start", "holder": gone, "owner": owner}
+        health = baseline_health([journal_of(tmp_path, mark)])
+        assert (health.ok, health.deferred, health.charge) == (False, False, False)
+        assert "not whole" in start_refusal(mark)
+
+
+def test_o45_an_open_mark_owned_by_a_live_attempt_holds_its_starts_and_defers_only_checks_outside_an_attempt(
+    tmp_path, campaign
+):
+    """O45: a run in progress: a start waits for its reset (no recovery is asked for, and none may run); the pre-run
+    check and the dispatcher's own, outside any attempt, are deferred and charge no run, so the campaign holds its
+    runs; another attempt's post-run check reads it healthy, and the owning attempt's own fails, its ingest having
+    ended without its reset."""
+    key, rows = campaign
+    rows.update({5: "running", 6: "running"})
+    plan = "a" * 64
+    mark = {"state": "open", "phase": "run", "plan": plan, "holder": here(), "owner": owned(key, 5)}
+    journal = journal_of(tmp_path, mark)
+    assert "held open by a live attempt" in start_refusal(mark)
+    assert "recover()" not in start_refusal(mark)
+    assert "a run in progress" in recovery_refusal(mark, plan)
+    outside = baseline_health([journal])
+    assert (outside.ok, outside.deferred, outside.charge) == (False, True, False)
+    with liveness.running(key, 6):
+        assert baseline_health([journal]).ok
+    with liveness.running(key, 5):
+        own = baseline_health([journal])
+        assert (own.ok, own.deferred) == (False, False)
+        assert "ended without its reset" in own.detail
+
+
+def test_o45_a_failed_baseline_wins_over_a_held_one(tmp_path, campaign, gone):
+    """O45: one space held by a run in progress and another left unhealthy: the check fails, naming the unhealthy one,
+    rather than defer, so the gate closes and a recovery is asked for."""
+    key, rows = campaign
+    rows[5] = "running"
+    lines = [
+        {"space": "spaces[0]", "entry": "baseline", "state": "open", "phase": "run", "owner": owned(key, 5)},
+        {"space": "spaces[1]", "entry": "baseline", "state": "unhealthy", "phase": "restore", "holder": gone},
+    ]
+    journal = tmp_path / "two.jsonl"
+    journal.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    health = baseline_health([journal])
+    assert (health.ok, health.deferred) == (False, False)
+    assert health.detail.startswith("spaces[1]: ")

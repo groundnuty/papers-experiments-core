@@ -17,7 +17,7 @@ from expcore_onedata.fault_journal import boot_id
 from expcore_onedata.ingest import ProgressiveIngest
 from expcore_onedata.ingesthealth import baseline_health, last_marks
 from expcore_onedata.ingestplan import load_ingest_plan
-from expcore_onedata.sandbox.kinds import INGEST_FAILURE
+from expcore_onedata.sandbox.kinds import INGEST_FAILURE, INGEST_HELD
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, with_placement, write_platform
 
 DAY = bytes((i * 31 + i // 97) % 256 for i in range(10240))
@@ -290,6 +290,13 @@ def dead_holder():
     return {"pid": child.pid, "boot_id": boot_id()}
 
 
+def write_as(patch, dead_holder):
+    """Write the marks as the process `dead_holder` names: its holder, and its owner by boot id, pid and a start time
+    no live process has (O45)."""
+    patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+    patch.setattr(ingesthealth, "owner", lambda: {"process": f"{boot_id()}:{dead_holder['pid']}:0"})
+
+
 def mark_of(tmp_path):
     return last_marks(tmp_path / "journal.jsonl")["spaces[0]"]
 
@@ -301,7 +308,7 @@ def assert_recovered(make, fake, tmp_path):
     refused = make(MIRRORED)
     with pytest.raises(InfraError, match="not whole") as error:
         refused.start({})
-    assert error.value.kind == INGEST_FAILURE
+    assert error.value.kind == INGEST_HELD  # a hold, which costs the run no attempt (O45)
     refused.finish()  # its reset brings nothing back: it changed nothing, and a refused start never recovers
     assert changes(fake, since) == []
     assert baseline_health([tmp_path / "journal.jsonl"]).ok is False
@@ -329,7 +336,7 @@ def test_o44_a_run_that_dies_at_any_step_leaves_its_baseline_open_and_every_star
     fault = Fault(provisioner)
     ingest = make(MIRRORED)
     with monkeypatch.context() as patch:
-        patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+        write_as(patch, dead_holder)
         if step == "reset":
             ingest.start({})
             ingest.at_first_turn({"clock_s": 0.0})
@@ -409,17 +416,20 @@ def test_o44_a_failed_start_whose_own_recovery_verifies_the_baseline_leaves_it_w
 
 def test_o44_a_recovery_is_refused_while_another_live_process_holds_the_baseline(make, fake, tmp_path, monkeypatch):
     """O44: the open mark's holder is another process that still runs, a run in progress: the recovery would write
-    into its files, so it is refused with nothing sent, and the health check reads the run as in progress."""
+    into its files, so it is refused with nothing sent, and the health check reads the run as in progress, which a
+    check outside any attempt defers (O45)."""
     alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         with monkeypatch.context() as patch:
             patch.setattr(ingesthealth, "holder", lambda: {"pid": alive.pid, "boot_id": boot_id()})
+            patch.setattr(ingesthealth, "owner", lambda: {"process": f"pid:{alive.pid}"})
             make(ROW).start({})
         since = len(fake.provider_calls)
-        with pytest.raises(InfraError, match="another process"):
+        with pytest.raises(InfraError, match="a run in progress"):
             make(ROW).recover()
         assert changes(fake, since) == []
-        assert baseline_health([tmp_path / "journal.jsonl"]).ok
+        health = baseline_health([tmp_path / "journal.jsonl"])
+        assert (health.ok, health.deferred) == (False, True)
     finally:
         alive.kill()
         alive.wait()
@@ -476,7 +486,7 @@ def test_o44_a_recovery_with_another_plan_than_the_runs_is_refused_and_clears_no
     the baseline stays marked; the run's own plan recovers it, the mirror's replica included."""
     fault = Fault(provisioner)
     with monkeypatch.context() as patch:
-        patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+        write_as(patch, dead_holder)
         fault.arm("prefix", "dies")
         with pytest.raises(Died):
             make(MIRRORED).start({})
