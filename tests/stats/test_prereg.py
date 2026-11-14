@@ -7,6 +7,7 @@ import pytest
 
 from expcore.campaign.factors import FactorSchema
 from expcore.config.loading import ConfigError
+from expcore.stats import estimators
 from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import ContrastSpec
 from expcore.stats.power import PowerSettings
@@ -479,6 +480,74 @@ def test_the_target_power_is_a_setting_with_a_default(tmp_path):
     assert prereg.power.target_power == 0.9
     with pytest.raises(ConfigError, match="key 'target_power' must be strictly between 0 and 1"):
         load(write(tmp_path, edited("sd_grid = [0.1, 0.2]", "sd_grid = [0.1, 0.2]\ntarget_power = 1.0")))
+
+
+# --- an equivalence family: Holm over the two one-sided tests of its members (S15) -----------------------------------
+
+
+def with_margins(text=BASE):
+    """The base text with a margin on both contrasts."""
+    text = edited('cluster = "group"\n\n[contrasts.gate-effect]', 'cluster = "group"\nequivalence_margin = 0.1\n\n'
+                  "[contrasts.gate-effect]", text)  # fmt: skip
+    return text + "equivalence_margin = 0.2\n"
+
+
+def family_of(*names, text=None):
+    """A preregistration declaring an equivalence family of the given contrasts."""
+    text = with_margins() if text is None else text
+    listed = ", ".join(f'"{name}"' for name in names)
+    return edited('holm_family = ["a-vs-b", "gate-effect"]', f'holm_family = ["a-vs-b", "gate-effect"]\n'
+                  f"equivalence_family = [{listed}]", text)  # fmt: skip
+
+
+def test_s15_an_equivalence_family_loads_in_its_declared_order(tmp_path):
+    """S15: its members, as written; a preregistration without one has none."""
+    assert load(write(tmp_path, family_of("gate-effect", "a-vs-b"))).equivalence_family == ("gate-effect", "a-vs-b")
+    assert load(write(tmp_path)).equivalence_family == ()
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [
+        (("nope",), "names 'nope', which is not a declared contrast"),
+        (("a-vs-b", "a-vs-b"), "names a contrast twice"),
+        ((), "is empty"),
+    ],
+)
+def test_s15_an_equivalence_family_that_names_no_declared_contrast_once_is_refused(tmp_path, names, message):
+    """S15: each member a declared contrast, once."""
+    with pytest.raises(ConfigError, match=f"key 'equivalence_family' {message}"):
+        load(write(tmp_path, family_of(*names)))
+
+
+def test_s15_a_member_without_a_margin_is_refused(tmp_path):
+    """S15: equivalence is within a margin, so a member must declare one."""
+    with pytest.raises(ConfigError, match="names 'a-vs-b', which declares no equivalence_margin"):
+        load(write(tmp_path, family_of("a-vs-b", text=BASE + "equivalence_margin = 0.2\n")))
+
+
+def test_s15_a_member_outside_the_holm_family_is_refused(tmp_path):
+    """S15: an equivalence claim the family controls is confirmatory, so its contrast is not shown as exploratory."""
+    text = edited('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["a-vs-b"]', family_of("gate-effect"))
+    with pytest.raises(ConfigError, match="names 'gate-effect', which is not in holm_family"):
+        load(write(tmp_path, text))
+
+
+def test_s15_an_equivalence_family_beside_exploratory_only_is_refused(tmp_path):
+    """S15, S12: a preregistration that makes no confirmatory claim makes no confirmatory equivalence claim either."""
+    flag = 'exploratory_only = true\nequivalence_family = ["a-vs-b"]'
+    text = edited('holm_family = ["a-vs-b", "gate-effect"]', flag, with_margins())
+    with pytest.raises(ConfigError, match="key 'equivalence_family' is given with exploratory_only = true"):
+        load(write(tmp_path, text))
+
+
+def test_s15_a_member_whose_estimator_has_no_tost_p_is_refused(tmp_path, monkeypatch):
+    """S15: the family's decision is Holm over TOST p-values, which such an estimator cannot give."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    estimators.register("no_tost")(lambda paired, settings: None)
+    text = edited('estimator = "wilcoxon_cluster_bootstrap"', 'estimator = "no_tost"', family_of("a-vs-b"))
+    with pytest.raises(ConfigError, match="names 'a-vs-b', whose estimator 'no_tost' registers no TOST p-value"):
+        load(write(tmp_path, text))
 
 
 # --- one-arm estimates: [descriptives.<name>] ------------------------------------------------------------------------

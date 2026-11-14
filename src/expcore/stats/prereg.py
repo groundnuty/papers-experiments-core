@@ -13,6 +13,8 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     alpha = 0.05
     holm_family = ["a-vs-b"]   # the confirmatory contrasts; a preregistration that makes no confirmatory claim (a
                                # pilot) leaves it out and says `exploratory_only = true` instead
+    equivalence_family = ["a-vs-b"]  # optional (S15): members of holm_family with a margin, whose equivalence
+                               # claims are decided by Holm over their two one-sided tests' p-values
 
     [bootstrap]
     replicates = 2000
@@ -81,6 +83,7 @@ _TOP_KEYS = (
     "alpha",
     "holm_family",
     "exploratory_only",
+    "equivalence_family",
     "bootstrap",
     "power",
     "estimators",
@@ -143,15 +146,20 @@ class Preregistration:
     estimator_params: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
     schema_digest: str | None = None  # the factor schema the contrasts were validated against
     exploratory_only: bool = False  # no confirmatory claim: no Holm family, every contrast exploratory (S12)
+    equivalence_family: tuple[str, ...] = ()  # contrasts whose equivalence claims Holm adjusts together (S15)
     descriptives: Mapping[str, DescriptiveSpec] = dataclasses.field(default_factory=dict)  # one-arm estimates (S14)
 
     def __post_init__(self) -> None:
-        """Deep-freeze the contrasts, the family, the estimator parameters and the one-arm estimates into fresh
-        read-only containers; refuse a family beside `exploratory_only`, and neither of them (S12)."""
-        for name in ("contrasts", "holm_family", "estimator_params", "descriptives"):
+        """Deep-freeze the contrasts, the families, the estimator parameters and the one-arm estimates into fresh
+        read-only containers; refuse a family beside `exploratory_only`, and neither of them (S12); and an
+        equivalence family that is not of members of the Holm family with a margin (S15)."""
+        for name in ("contrasts", "holm_family", "estimator_params", "equivalence_family", "descriptives"):
             object.__setattr__(self, name, freeze(getattr(self, name)))
         if self.exploratory_only and self.holm_family:
             raise ValueError("a preregistration with exploratory_only has no Holm family, and this one names one")
+        for name in self.equivalence_family:
+            if name not in self.holm_family or self.contrasts[name].equivalence_margin is None:
+                raise ValueError(f"equivalence family member {name!r} must be in the Holm family and have a margin")
         if not self.exploratory_only and not self.holm_family:
             raise ValueError("a preregistration needs a Holm family, or exploratory_only to make no confirmatory claim")
 
@@ -236,6 +244,7 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
     exploratory_only = _flag(root, "exploratory_only")
     family = () if exploratory_only else _family(root, contrasts)
     _check_family_claims(root, contrasts, family, exploratory_only)
+    equivalence = _equivalence_family(root, contrasts, family, exploratory_only)
     power = _power(_table_section(root, "power")) if "power" in raw else None
     params = {name: _estimator_params(source, name, table) for name, table in _tables(root, "estimators").items()}
     descriptives = {
@@ -253,8 +262,47 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
         params,
         schema.digest,
         exploratory_only,
+        equivalence,
         descriptives,
     )
+
+
+def _equivalence_family(
+    root: Section, contrasts: Mapping[str, ContrastSpec], family: tuple[str, ...], exploratory_only: bool
+) -> tuple[str, ...]:
+    """Read the optional equivalence_family (S15): declared contrasts, each once, each in the Holm family, with an
+    equivalence margin and an estimator that registers a TOST p-value; none beside exploratory_only."""
+    key = "equivalence_family"
+    if key not in root.data:
+        return ()
+    if exploratory_only:
+        raise root.fail(
+            key, "is given with exploratory_only = true, which makes no confirmatory claim, of equivalence or other"
+        )
+    names = root.strings(key)
+    if not names:
+        raise root.fail(
+            key, "is empty: name the contrasts whose equivalence claims Holm adjusts together, or leave it out"
+        )
+    if len(set(names)) != len(names):
+        raise root.fail(key, "names a contrast twice")
+    for name in names:
+        if name not in contrasts:
+            raise root.fail(key, f"names {name!r}, which is not a declared contrast; declared: {', '.join(contrasts)}")
+        spec = contrasts[name]
+        if spec.equivalence_margin is None:
+            raise root.fail(key, f"names {name!r}, which declares no equivalence_margin to be equivalent within")
+        if name not in family:
+            raise root.fail(
+                key,
+                f"names {name!r}, which is not in holm_family: an equivalence claim the family controls is "
+                "confirmatory, so its contrast must be too",
+            )
+        if estimators.tost_function(spec.estimator) is None:
+            raise root.fail(
+                key, f"names {name!r}, whose estimator {spec.estimator!r} registers no TOST p-value (`tost`)"
+            )
+    return names
 
 
 def _descriptive(

@@ -687,6 +687,67 @@ def test_c26_a_campaign_without_a_budget_hold_has_a_row_of_zeros_for_every_condi
         assert f"| {name} | model-a | 0 |" in holds
 
 
+# --- an equivalence family (S15) --------------------------------------------------------------------------------------
+
+
+def member(name, equivalent, tost, holm, level, interval):
+    """A member of the equivalence family as the analysis gives one."""
+    return contrast(
+        name,
+        "equivalent" if equivalent else "not_detected",
+        p_value=0.4,
+        significant=False,
+        equivalence_margin=0.2,
+        equivalence_interval=(-0.05, 0.06),
+        in_equivalence_family=True,
+        tost_p=tost,
+        tost_p_holm=holm,
+        equivalence_level=level,
+        equivalence_interval_adjusted=interval,
+    )
+
+
+def equivalence_analysis():
+    """Two members: one equivalent at the first step, one not, though its raw TOST p is below alpha."""
+    results = (
+        member("same-a", True, 0.002, 0.004, 0.95, (-0.08, 0.09)),
+        member("same-b", False, 0.04, 0.04, 0.9, (-0.1, 0.12)),
+    )
+    holm = tuple(HolmDecision(r.name, 0.4, 0.4, 0.05, False) for r in results)
+    eq = (HolmDecision("same-a", 0.002, 0.004, 0.025, True), HolmDecision("same-b", 0.04, 0.04, 0.05, True))
+    return AnalysisResult(results, holm, 0.05, dict(MANIFEST), equivalence_holm=eq)
+
+
+def test_s15_the_equivalence_family_has_a_table_with_each_members_tost_p_its_holm_p_and_its_adjusted_interval():
+    """S15: the decision a member's `equivalent` rests on, beside the interval at the level Holm compared it with."""
+    report = render(equivalence_analysis())
+    table = table_of(report, "### Equivalence family (Holm over two one-sided tests)")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Margin",
+        "TOST p",
+        "Holm TOST p",
+        "Interval level",
+        "Adjusted interval",
+        "Equivalent",
+    ]
+    assert table["same-a"][1:] == ["0.2", "0.0020", "0.0040", "95%", "[-0.08, 0.09]", "yes"]
+    assert table["same-b"][1:] == ["0.2", "0.0400", "0.0400", "90%", "[-0.1, 0.12]", "no"]
+    assert "not the 90% equivalence interval" in report.split("### Equivalence family", 1)[1]
+
+
+def test_s15_a_report_without_an_equivalence_family_has_no_such_section():
+    """S15: nothing declared, nothing shown."""
+    assert "Equivalence family" not in render(analysis(contrast("primary", "difference")))
+
+
+def test_s15_the_terminal_summary_gives_a_members_holm_tost_p():
+    """S15: the basis of `equivalent` for a member is never printed apart from it."""
+    lines = summary_lines(equivalence_analysis())
+    assert lines[0] == "same-a: estimate 0.25, p 0.4000, Holm p 0.4000, equivalent, Holm TOST p 0.0040"
+    assert summary_lines(analysis(contrast("primary", "difference")))[0].endswith(", difference")
+
+
 # --- each arm's runs, and the one-arm estimates -----------------------------------------------------------------------
 
 
