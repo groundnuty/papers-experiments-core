@@ -905,7 +905,7 @@ class ReadOutcome: # status: int, content_range: str | None, body_bytes: int; to
 
 ## Estimator
 
-`expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers one, `wilcoxon_cluster_bootstrap`.
+`expcore.stats.estimators`. A contrast names its estimator in `preregistration.toml` (`estimator = "..."`), with the estimator's parameters in `[estimators.<name>]`. The core registers two, `wilcoxon_cluster_bootstrap` and `ratio` ([below](#a-ratio-contrast)).
 
 ```python
 class Estimator(Protocol):
@@ -916,6 +916,7 @@ class PairedDifferences:
     clusters: tuple[str, ...]  # the rows: the clusters with at least one paired cell, sorted
     models: tuple[str, ...]    # the columns: the models with at least one paired cell, sorted
     matrix: np.ndarray         # clusters x models, the mean difference A - B of each cell; NaN where it has no pair
+    pooled: bool = False       # each cluster pools its models in the one column POOLED (a ratio contrast's default unit)
     cluster_differences: np.ndarray  # a property: per cluster, the equal-weight mean over its models with a cell
 
 @dataclass(frozen=True)
@@ -935,7 +936,8 @@ class EstimatorResult:
     per_model: tuple[ModelEstimate, ...] = ()  # ModelEstimate(model, estimate, ci_low, ci_high, n_undefined_replicates)
     counts: Mapping[str, int] = field(default_factory=dict)  # the estimator's own counts, such as zero_dropped
 
-def register(name: str, *, check_params=None, p_values=None)  # a decorator: @register("name") above the function
+def register(name: str, *, check_params=None, p_values=None, form="difference")  # a decorator above the function
+def form(name: str) -> str     # the form of contrast an estimator reads: "difference" or "ratio" (FORMS)
 ```
 
 How pairs become the matrix's cells is in [the study guide's section 5](study-guide.md#how-pairs-become-a-contrasts-input).
@@ -945,6 +947,8 @@ Core guarantees:
 - `check_params(params)`, given at registration, is called when the preregistration is loaded, so a bad parameter is refused naming `[estimators.<name>]`; without one, any parameter is refused.
 - For a contrast with an `equivalence_margin` the analysis calls the estimator a second time with `level` at 1 - 2 alpha and the same seed. A NaN p-value counts as p = 1 in the Holm family.
 - `p_values`, given at registration, is used to simulate the minimum detectable effect with the contrast's own parameters (S06, S09). Without it the contrast's minimum detectable effect is NaN (`null` in `analysis.json`).
+- A row of the matrix is a cluster, the independent unit, and a column a model. A cluster's value is the equal-weight mean of its models' cells (`cluster_differences`), and the core's estimators test those values and resample rows with all their cells, so neither a cell nor a run is a unit of the test, however many models run a cluster. A contrast of one outcome's cell is the mean of its tasks' means, each the mean of its seeds' differences, so each task weighs the same within a model and each model the same within a cluster.
+- An estimator reads one form of contrast, `form` at registration, "difference" unless given. A contrast of one outcome needs an estimator of the difference form, a ratio contrast one of the ratio form; the loader refuses any other pairing, naming the key, and `run_contrast` refuses a spec built past the loader.
 - `tost`, given at registration as `tost=Tost(p, interval, p_values)`, is the estimator's two one-sided tests for equivalence within plus or minus a margin (S15), in three forms that must agree: `p(paired, settings, margin)` its p-value, `interval(paired, settings, level)` its dual interval at 1 - 2 x level (inside the margin exactly when p <= level), and `p_values(studies, margin, params)` its p-value of every row of a studies x clusters array, which the feasibility simulation judges each study by. Only an estimator with one can be a member of an `equivalence_family`. `estimators.tost_function(name)` returns it, or None.
 
 **An equivalence family (S15, #140).** `equivalence_family = ["name", ...]` names members of `holm_family` that declare an `equivalence_margin`, each once; it is refused beside `exploratory_only = true`. The Wilcoxon cluster bootstrap's TOST is Schuirmann's two one-sided t-tests of the mean cluster difference, its estimate (`contrasts.tost_t`): with the n cluster differences (after float noise is snapped), their mean m and standard error se = sd / sqrt(n), the p-values of theta > -margin and theta < margin are the t distribution's tails on n - 1 degrees of freedom beyond (m + margin) / se and (m - margin) / se, and the TOST p is the larger. It assumes independent clusters whose differences are roughly normal, which a few dozen clusters make robust. Fewer than two clusters, or no spread between them, give NaN: no evidence, never certainty. Its interval at 1 - 2L is m plus or minus the t quantile at 1 - L times se (`tost_t_interval`), so TOST p <= L exactly when it lies within the margin. Holm over the family's TOST p-values decides (`AnalysisResult.equivalence_holm`): a member is `equivalent` only when Holm rejects its two one-sided nulls at its step's level L, an untestable member, or one with a NaN TOST p, counting as p = 1 and never equivalent. It carries `tost_p`, `tost_p_holm`, `equivalence_level` = 1 - 2L and `equivalence_interval_adjusted`, the t interval at that level; `equivalence_interval` stays the 1 - 2 alpha bootstrap interval, which no longer decides for it. `run_contrast` called alone judges a member's raw TOST p at alpha. A contrast with a margin outside the family keeps the bootstrap interval rule at 1 - 2 alpha, whose percentile interval cannot be wider than its clusters: with one or two clusters it can lie inside a margin that no evidence supports, which is why a confirmatory equivalence claim belongs in a family.
@@ -956,7 +960,75 @@ Implementer must guarantee:
 - `p_values(studies, params)` returns, for each row of a studies x clusters array of cluster differences, exactly the p-value the estimator reports for that row.
 - The name is lower-case letters, digits and underscores, registered once: a second registration of a name is refused.
 
-**Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
+**Where a study's estimator is registered.** The preregistration is validated when the study is loaded, before its plugin is imported, so a name only the plugin registers is unknown at that point and the contrast is refused (`unknown estimator 'name'; registered: wilcoxon_cluster_bootstrap, ratio`). A study cannot register its estimator through its plugin. It registers it at the top level of a module that `[study] platforms` names, which the loader imports before it validates anything, as it does for a platform's infrastructure kinds. That module must be importable, so it is installed code, not a file of the study directory, which is not on the module search path: a distribution of the study's own, named in `[study] requires`, so it is part of the campaign's environment and the replication package vendors its wheel. Its version speaks for its code, so change the version when the estimator changes. Once registered, the estimator stays registered for the rest of the process.
+
+### A ratio contrast
+
+`expcore.stats.ratio` (S13, #138). A contrast of an outcome per unit of another, such as tokens per correct result, names an estimator of the ratio form and two outcomes in place of `outcome`:
+
+```toml
+[contrasts.cost-per-success]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "tokens"
+denominator = "success"
+zero_denominator = "exclude"   # or "continuity", with continuity_correction = c > 0 (required with it, refused without)
+cluster = "group"              # the independent unit, as for every contrast
+estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group; ["group"], the default, pools them
+equivalence_margin = 0.2231    # optional: a natural-log ratio, here within a factor of 1.25 either way
+```
+
+```python
+@dataclass(frozen=True)
+class RatioForm:                # ContrastSpec.ratio, and ContrastResult.ratio (None for a contrast of one outcome)
+    numerator: str
+    denominator: str
+    zero_denominator: str       # "exclude" or "continuity" (ZERO_RULES)
+    continuity_correction: float | None = None
+    label: str                  # a property, "numerator/denominator": the contrast's `outcome`
+
+def log_ratio(arm_a: Totals, arm_b: Totals, form: RatioForm) -> tuple[str | None, float]  # (cause, NaN) or (None, value)
+def aggregate(cells: Mapping[str, Sequence[tuple[Totals, Totals]]], form) -> tuple[PairedDifferences, Excluded, Excluded]
+def aggregate_by_model(cells: Mapping[tuple[str, str], Sequence[...]], form) -> tuple[PairedDifferences, Excluded, Excluded]
+Excluded = dict[str, int]       # the pairs, then the cells, the zero rule excluded, by each of ZERO_CAUSES
+ZERO_CAUSES = ("zero_denominator", "zero_numerator")
+RATIO_CAUSES = ("numerator_none_at_zero", "zero_denominator", "zero_numerator")
+POOLED = "pooled"               # the one column of a ratio contrast's input when its cells pool a cluster's models
+
+# expcore.stats.pairing
+ContrastSpec.cluster: str                      # the task attribute that clusters the contrast: the independent unit
+ContrastSpec.estimation_unit: tuple[str, ...]  # the cell a value is computed in: ("model", cluster) for a contrast of
+                                               # one outcome; (cluster,), the default, or ("model", cluster) for a ratio
+ContrastSpec.by_model: bool                    # a property: the estimation unit names the model
+Pairing.n_cells: int                           # cells of the estimation unit with a value
+Pairing.cells_lost: Mapping[str, int]          # cells seen in either arm and left without a value, by cause
+MODEL_KEY = "model"
+CELL_CAUSES = ("no_pair",)                     # why a cell has no value; a ratio contrast adds ZERO_CAUSES
+# expcore.stats.analysis
+ContrastResult.estimation_unit: tuple[str, ...] | None  # the spec's; None only in a result built by hand
+ContrastResult.independent_unit: str | None             # the cluster; None only in a result built by hand
+ContrastResult.n_cells: int | None
+ContrastResult.cells_lost: Mapping[str, int]
+```
+
+**Two units.** Every contrast has two. Its `cluster`, one task attribute, is the independent unit: the signed-rank test, the cluster bootstrap and the minimum detectable effect count its values, and `n_clusters` is their number. Its estimation unit is the cell one value is computed in, nested in a cluster. A contrast of one outcome always estimates per model's cell, `("model", cluster)`, and averages a cluster's cells with equal weight per model ([above](#estimator)). A ratio contrast declares its estimation unit, `estimation_unit`, an array (or one string) of the cluster and, beside it, `"model"`, in either order and held as `("model", cluster)`; the two are two estimands:
+- the cluster alone, the default (`["group"]`): a cell is a value of the attribute, and its sums run over every task, model and seed of it, so its models are pooled. A model with no correct result in the value still adds its cost there, and the models that spend the most weigh the most in its ratio.
+- the model and the cluster (`["model", "group"]`): a cell is one model's part of a value, its sums run over that model's tasks and seeds alone, and the value's log ratio is the mean of its cells' log ratios, each model weighing the same, as a contrast of one outcome averages its models. This is the nested design of a power analysis that estimates per (model, instance) cell and infers over instances: 150 instances and four models are 600 cells and 150 units of the test.
+The cells of one value share its response to the treatment and are not independent of one another, so no declaration makes them units of the test, on a confirmatory contrast or an exploratory one: `cluster` is a string, and an array there is refused, one that names the model with that reason and the declaration above (`cluster = "group"` with `estimation_unit = ["model", "group"]`). `estimation_unit` beside an estimator of one outcome is refused with the other ratio keys, and so is any unit but the two (another attribute, a field of the run key, none, or a field written twice). Both runs of a pair share the model, which is part of every pairing key, and the check that each task has one cluster stays on the attribute, so a task run by several models is in one value and in several cells.
+
+**The estimand.** A cell's value is ln((N_A / D_A) / (N_B / D_B)), where N_a and D_a are the sums of the numerator and of the denominator over the cell's runs of arm a that belong to a used pair, every task and seed of the cell together. It is a ratio of sums, not a mean of per-run ratios: a run whose denominator is 0, a failed run, has no ratio of its own and still adds its numerator. A cluster's value is its one cell's, or the equal-weight mean of its models' cells, and theta is the mean over clusters of their values; exp(theta) is a geometric mean over clusters of arm A's ratio over arm B's, so "x2" and "x1/2" are symmetric on this scale. Within a cell the sums weigh runs, not tasks, nor models when the cell pools them (a contrast of one outcome weighs each task and each model alike). The value is computed in exact rational arithmetic up to the logarithm, so arms with one ratio give 0.0, never float noise, and no ratio of sums can overflow.
+
+**The inference.** The input is a `PairedDifferences` with one row per cluster: when a cell is the cluster, in one column, `POOLED`, the input marked `pooled`; when a cell is a model's, one column per model, not marked `pooled` whatever the models are called, each cell's log ratio in its cluster's row and its model's column, NaN where the cell is lost. The `ratio` estimator is the kernel's on that input, as the difference estimator is on differences: a cluster's value is the equal-weight mean over its models with a cell, the estimate the mean of the clusters' values, the p-value the two-sided Wilcoxon signed-rank test of those values (float noise snapped, zeros dropped and counted as `zero_dropped`, all zeros p = 1; it tests their centre of symmetry), and the interval the cluster bootstrap's percentile interval at the contrast's seed, each draw a sample of clusters with all their cells. Its parameters are the Wilcoxon cluster bootstrap's (`[estimators.ratio]`, `snap_decimals` and `method`), and it registers the same p-value function, so the minimum detectable effect is simulated with the test it reports, from the SD of the clusters' values at their count. Pooled, it has no estimate by model (`per_model` is empty); by cell, `per_model` holds each model's mean log ratio over its own cells with its interval from the same draws of the clusters (S04), an exploratory breakdown with no test of its own. The estimate, both intervals, the margin and the minimum detectable effect are natural-log ratios; the Holm family and the conclusion words take it as any contrast.
+
+**A zero sum.** A cell whose numerator or denominator sums to 0 in either arm has an undefined or infinite log ratio, and the preregistration's `zero_denominator` decides; it has no default. The rule applies to each cell, so with the model in the estimation unit a model with no correct result in one arm of a value loses that cell alone, and the value keeps its other cells:
+- `"exclude"`: the cell leaves the contrast; each of its pairs is counted under `zero_denominator` (a denominator sum of 0 in either arm, 0 / 0 included) or else `zero_numerator`, not in `n_pairs`, and the cell under the same cause in `cells_lost`. A cluster is dropped, and counted in `n_clusters_dropped`, only when every cell of it is lost; a contrast left with no cluster is `untestable`.
+- `"continuity"`: `continuity_correction` c is added to all four sums of every cell, a zero or not, in each outcome's own units, so every cell stays. It defines a corrected estimand: c moves each cell's log ratio, most where its sums are small, and not always toward 0 (arms of one ratio, 100 / 10 and 10 / 1, give 0.31 with c = 0.5).
+
+**A failed run's missing numerator.** A pair whose run has a None numerator and a denominator of 0 is counted under `numerator_none_at_zero` (after a treatment attempt's None, before any other None, which is `outcome_none`): leaving a failed run's cost out makes the ratio one over successful runs. A member of the Holm family is refused (`analysis.RatioNumeratorRefused`, naming the contrast, the count and the fix) when any pair both arms analysed holds an ordinary run whose numerator is None at a denominator of 0, whatever single cause the pair is counted under (`Pairing.n_unmeasured_failures`), so a preregistered `max_unscored_treatment` that excuses the treatment attempt beside it does not excuse it; an exploratory contrast reports the count of its cause. `TreatmentOutcomesRefused` and `RatioNumeratorRefused` are both `analysis.ContrastRefused`, which `analyze` reports as a refusal. A negative numerator or denominator is refused naming the run and the outcome.
+
+**Two analyses on two columns.** Each ratio contrast names its own `numerator` and `denominator`, so a study that bounds an outcome declares one contrast per bound, for example the estimate on lower-bound token columns and the adverse assignment on upper-bound ones, each with its own name, seed, result and Holm membership. A run whose upper bound is None at a denominator of 0 is counted, or refuses the contrast if confirmatory, only in the contrast that reads that column.
+
+**In the outputs.** `analysis.json` gives every contrast `ratio` (the form, or null), its two units, `estimation_unit` (`["model", "group"]` for a contrast of one outcome, `["group"]` by default for a ratio contrast) and `independent_unit` (the cluster), and its cells, `n_cells` and `cells_lost` by cause (`no_pair`, then a ratio contrast's `zero_denominator` and `zero_numerator`, zeros included); a ratio contrast estimated per model's cell its `per_model`, and a ratio contrast's `pairs_missing` the three `RATIO_CAUSES` after the five others, zeros included; `n_pairs_missing` counts the None causes, `numerator_none_at_zero` among them. `report.md` shows a ratio contrast's outcome as `ln(numerator/denominator)`, adds a section "Ratio contrasts" (each one's two outcomes, its estimation unit, its independent unit, its cells used and lost by cause, its rule, and exp of its estimate and interval, then, for a contrast estimated per model's cell, "Ratio contrasts by model (exploratory)" with each model's estimate, ratio and interval) and the three causes as columns of the pairs tables, `-` in the row of a contrast of one outcome, and the terminal summary marks its estimate `(ln ratio)`. A report with no ratio contrast has none of these, byte for byte as before.
 
 ### One-arm estimates and each arm's runs
 

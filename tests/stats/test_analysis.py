@@ -1,19 +1,22 @@
 """A preregistration run end to end: simulated rows with planted effects, estimators by name, Holm over the family."""
 
 import dataclasses
+import json
 import math
 import tomllib
 
 import numpy as np
 import pytest
 from scipy import stats
-from stats_support import both_arms, make_row
+from stats_support import both_arms, make_row, ratio_arms, ratio_row, ratio_spec
 
 from expcore.campaign.factors import FactorSchema
 from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
 from expcore.stats.analysis import (
     CONCLUSIONS,
+    ContrastRefused,
+    RatioNumeratorRefused,
     TreatmentOutcomesRefused,
     analyse,
     conclude,
@@ -27,6 +30,7 @@ from expcore.stats.pairing import ContrastSpec, pair_rows
 from expcore.stats.prereg import name_digest, parse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.stats.sim import OutcomeSpec, SimSpec, simulate
+from expcore.study.pipeline import _json_text
 
 TEXT = """\
 alpha = 0.05
@@ -1051,6 +1055,367 @@ def test_s11_untestable_overrides_whatever_the_test_and_the_margin_say():
         for equivalent in (True, False):
             assert conclude(significant=significant, equivalent=equivalent, untestable=True) == "untestable"
     assert conclude(significant=False, equivalent=False) == "not_detected"
+
+
+# --- a ratio contrast through the analysis ----------------------------------------------------------------------------
+
+RATIO_TEXT = """\
+alpha = 0.05
+holm_family = ["spend-per-win"]
+
+[bootstrap]
+replicates = 300
+seed = 9
+
+[power]
+seed = 2
+n_simulations = 30
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[contrasts.spend-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+equivalence_margin = 0.2
+
+[contrasts.spend-per-win-side]
+conditions = ["cond-x", "cond-y"]
+estimator = "ratio"
+numerator = "spend"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+"""
+RATIOS = (6.0, 2.0, 3.0, 1.5, 4.0, 5.0, 2.5, 3.5)  # the ratio of ratios planted in each of eight clusters
+
+
+def ratio_prereg():
+    """A preregistration with a confirmatory and an exploratory ratio contrast."""
+    return parse(tomllib.loads(RATIO_TEXT), "inline", "d" * 64, ARMS)
+
+
+def planted_ratio_rows():
+    """Per cluster two tasks; A's spend per win is RATIOS[i] times B's, with one failed run of A on each task."""
+    rows = []
+    for i, ratio in enumerate(RATIOS):
+        for task in (f"t{i}a", f"t{i}b"):
+            rows += ratio_arms(task, "model-a", 1, (40.0 * ratio, 1.0), (20.0, 1.0), cluster=f"c{i}")
+            rows += ratio_arms(task, "model-a", 2, (40.0 * ratio, 0.0), (20.0, 1.0), cluster=f"c{i}")
+    return rows  # per cluster, A: 160 r over 2 wins, B: 80 over 4, so each cluster's log ratio is ln(4 r)
+
+
+def test_s13_a_ratio_contrast_runs_through_the_analysis_with_its_estimand_on_the_log_scale():
+    """S13: the estimate is the mean over clusters of ln(4 r); the failed runs' spend is in it, and Holm decides."""
+    result = analyse(planted_ratio_rows(), ratio_prereg())
+    contrast = result.contrast("spend-per-win")
+    expected = np.mean([math.log(4.0 * r) for r in RATIOS])
+    assert contrast.estimate == pytest.approx(expected)
+    assert contrast.ci_low < expected < contrast.ci_high
+    assert contrast.p_value == pytest.approx(2 / 2**8)  # eight positive cluster log ratios, exact
+    assert (contrast.outcome, contrast.estimator, contrast.n_pairs, contrast.n_clusters) == (
+        "spend/wins",
+        "ratio",
+        32,
+        8,
+    )
+    assert contrast.ratio.zero_denominator == "exclude"
+    assert (contrast.conclusion, contrast.in_family) == ("difference", True)
+    assert contrast.equivalence_interval is not None  # the margin is read on the same log scale
+    assert contrast.minimum_detectable_effect is not None
+    assert [d.name for d in result.holm] == ["spend-per-win"]
+
+
+def test_s13_a_contrast_whose_every_cluster_the_zero_rule_excludes_is_untestable_with_its_cause():
+    """S13, S11: no cluster left is no evidence; the row gives the pairs the rule took out, and the family keeps it."""
+    rows = []
+    for i in range(3):
+        rows += ratio_arms(f"t{i}", "model-a", 1, (50.0, 1.0), (20.0, 0.0), cluster=f"c{i}")
+    result = analyse(rows, ratio_prereg())
+    contrast = result.contrast("spend-per-win")
+    assert contrast.conclusion == "untestable"
+    assert contrast.pairs_missing["zero_denominator"] == 3
+    assert (contrast.n_pairs, contrast.n_clusters_dropped) == (0, 3)
+    assert math.isnan(contrast.estimate)
+    assert not result.holm[0].reject
+
+
+def test_s13_a_confirmatory_ratio_contrast_that_loses_a_failed_runs_numerator_is_refused():
+    """S13: a failed run's spend left None would make the cost per win a cost per win among successes alone."""
+    rows = planted_ratio_rows()
+    rows += ratio_arms("t9", "model-a", 1, (None, 0.0), (20.0, 1.0), cluster="c0")
+    with pytest.raises(RatioNumeratorRefused) as caught:
+        analyse(rows, ratio_prereg())
+    message = str(caught.value)
+    assert "confirmatory ratio contrast 'spend-per-win' drops 1 pair(s)" in message
+    assert "numerator 'spend' is None while its denominator 'wins' is 0" in message
+    assert "Make the scorer return 'spend' for every run" in message
+    assert isinstance(caught.value, ContrastRefused)
+    assert issubclass(TreatmentOutcomesRefused, ContrastRefused)  # the pipeline catches both as one
+
+
+def test_s13_a_treatment_tolerance_does_not_excuse_an_ordinary_failed_runs_missing_numerator():
+    """S13: the pair is counted once, as a treatment loss, and the tolerance covers that; the ordinary run in it whose
+    spend is None at 0 wins is still a failed run's cost left out, and refuses the contrast."""
+    text = RATIO_TEXT.replace(
+        "equivalence_margin = 0.2\n",
+        'equivalence_margin = 0.2\ntreatment_outcomes = "scored"\nmax_unscored_treatment = 1\n',
+    )
+    prereg = parse(tomllib.loads(text), "inline", "d" * 64, ARMS)
+    rows = planted_ratio_rows()
+    rows += [  # a treatment attempt that was measured, so the tolerance may apply
+        ratio_row("t8", "model-a", 1, 40.0, 1.0, condition="cond-a", cluster="c0", treatment=True),
+        ratio_row("t8", "model-a", 1, 20.0, 1.0, condition="cond-b", cluster="c0"),
+    ]
+    not_a_failure = [  # A's wins are unknown, not 0: an ordinary None the tolerance's pair holds, which may go
+        ratio_row("t9", "model-a", 1, 20.0, None, condition="cond-a", cluster="c0"),
+        ratio_row("t9", "model-a", 1, None, 1.0, condition="cond-b", cluster="c0", treatment=True),
+    ]
+    tolerated = analyse([*rows, *not_a_failure], prereg)
+    assert tolerated.contrast("spend-per-win").pairs_missing["treatment_outcome_none"] == 1
+    rows += [
+        ratio_row("t9", "model-a", 1, None, 0.0, condition="cond-a", cluster="c0"),
+        ratio_row("t9", "model-a", 1, None, 1.0, condition="cond-b", cluster="c0", treatment=True),
+    ]
+    with pytest.raises(RatioNumeratorRefused, match="drops 1 pair"):
+        analyse(rows, prereg)
+
+
+def test_s13_an_exploratory_ratio_contrast_reports_a_failed_runs_missing_numerator_and_goes_on():
+    """S13: outside the family the loss is counted beside the result, as a treatment attempt's None is (S10)."""
+    side = [(f"s{i}", (30.0, 1.0), f"c{i}") for i in range(4)] + [("s9", (None, 0.0), "c0")]
+    rows = [
+        dataclasses.replace(row, condition={"cond-a": "cond-x", "cond-b": "cond-y"}[row.condition])
+        for task, arm_a, cluster in side
+        for row in ratio_arms(task, "model-a", 1, arm_a, (20.0, 1.0), cluster=cluster)
+    ]
+    result = analyse(planted_ratio_rows() + rows, ratio_prereg())
+    contrast = result.contrast("spend-per-win-side")
+    assert contrast.exploratory
+    assert contrast.pairs_missing["numerator_none_at_zero"] == 1
+    assert contrast.n_pairs == 4
+
+
+def test_s13_a_ratio_estimator_on_a_contrast_of_one_outcome_or_the_other_way_round_is_refused_at_run_time(prereg):
+    """S13: a spec built in code, past the loader, cannot hand an estimator the other form's input."""
+    rows = ratio_arms("t0", "model-a", 1, (40.0, 1.0), (20.0, 1.0))
+    with pytest.raises(ValueError, match=r"estimator 'wilcoxon_cluster_bootstrap' reads a difference.*a ratio"):
+        run_contrast(rows, ratio_spec(estimator="wilcoxon_cluster_bootstrap"), prereg)
+    spec = ContrastSpec("x", "score", "ratio", "group", conditions=("cond-a", "cond-b"))
+    with pytest.raises(ValueError, match="estimator 'ratio' reads a ratio"):
+        run_contrast(both_arms("task-a", "model-a", 1, 0.9, 0.5), spec, prereg)
+
+
+def test_s13_a_ratio_contrasts_pilot_power_reads_its_cluster_log_ratios():
+    """S13: the pilot SD of a ratio contrast is the SD of its cluster log ratios, the scale its test sees."""
+    result = pilot_power(planted_ratio_rows(), ratio_prereg(), names=["spend-per-win"])
+    assert result.rows[0]["sd"] == pytest.approx(np.std([math.log(4.0 * r) for r in RATIOS], ddof=1))
+
+
+# --- a ratio contrast's declared estimation unit: estimated per (model, group) cell, tested over groups ------------
+
+CELL_RATIOS = {"model-a": (6.0, 2.0, 3.0, 1.5), "model-b": (4.0, 5.0, 2.5, 3.5)}  # the planted ratio of each cell
+
+
+def cell_rows(ratios=CELL_RATIOS):
+    """Per (model, group) cell one task: A spends 40 r for 1 win and 40 r for 0 (a failed run), B 20 for 1 twice, so
+    the cell's log ratio is ln((80 r / 1) / (40 / 2)) = ln(4 r)."""
+    rows = []
+    for model, planted in ratios.items():
+        for i, ratio in enumerate(planted):
+            rows += ratio_arms(f"t{i}", model, 1, (40.0 * ratio, 1.0), (20.0, 1.0), cluster=f"c{i}")
+            rows += ratio_arms(f"t{i}", model, 2, (40.0 * ratio, 0.0), (20.0, 1.0), cluster=f"c{i}")
+    return rows
+
+
+def cell_prereg(unit='["model", "group"]'):
+    """The ratio preregistration with its confirmatory contrast's estimation unit as given (None: not declared)."""
+    declared = "" if unit is None else f"estimation_unit = {unit}\n"
+    text = RATIO_TEXT.replace(
+        'cluster = "group"\nequivalence_margin', f'cluster = "group"\n{declared}equivalence_margin'
+    )
+    return parse(tomllib.loads(text), "inline", "d" * 64, ARMS)
+
+
+def test_s13_a_cell_estimation_unit_estimates_per_cell_and_tests_over_groups_hand_computed():
+    """S13: each group's value is the equal-weight mean of its two cells' ln(4 r), the estimate the mean of the four
+    groups' values, and the exact p-value of four positive group values 2 / 2**4: four independent units, not the
+    eight cells (whose p-value would be 2 / 2**8). Each model's estimate is the mean of its own four cells."""
+    contrast = analyse(cell_rows(), cell_prereg()).contrast("spend-per-win")
+    groups = [np.mean([math.log(4.0 * CELL_RATIOS[m][i]) for m in CELL_RATIOS]) for i in range(4)]
+    assert contrast.estimate == pytest.approx(np.mean(groups))
+    assert contrast.p_value == pytest.approx(2 / 2**4)
+    assert (contrast.n_clusters, contrast.n_cells, contrast.n_pairs) == (4, 8, 16)
+    assert (contrast.estimation_unit, contrast.independent_unit) == (("model", "group"), "group")
+    assert [(m.model, m.estimate) for m in contrast.per_model] == [
+        (model, pytest.approx(np.mean([math.log(4.0 * r) for r in ratios]))) for model, ratios in CELL_RATIOS.items()
+    ]
+
+
+def test_s13_perfectly_correlated_cells_of_a_group_give_the_inference_of_one_cell_per_group():
+    """S13: when model-b's cells repeat model-a's in every group, the second model adds no independent evidence, so
+    the estimate, the p-value, both intervals, the minimum detectable effect and the clusters counted are those of
+    model-a alone: the test, the bootstrap and the power count groups, not cells. Eight groups, so the test can
+    reject at all and the minimum detectable effect is a number."""
+    planted = RATIOS
+    twice = analyse(cell_rows({"model-a": planted, "model-b": planted}), cell_prereg()).contrast("spend-per-win")
+    once = analyse(cell_rows({"model-a": planted}), cell_prereg()).contrast("spend-per-win")
+    fields = ("estimate", "p_value", "ci_low", "ci_high", "equivalence_interval", "minimum_detectable_effect")
+    assert [getattr(twice, f) for f in fields] == [getattr(once, f) for f in fields]
+    assert (twice.n_clusters, once.n_clusters, twice.n_cells, once.n_cells) == (8, 8, 16, 8)
+    assert math.isfinite(twice.minimum_detectable_effect)
+
+
+PLAIN_TEXT = """\
+alpha = 0.05
+holm_family = ["score-gain"]
+
+[bootstrap]
+replicates = 300
+seed = 9
+
+[power]
+seed = 2
+n_simulations = 30
+target_clusters = 20
+target_difference = 0.1
+sd_grid = [0.1]
+
+[contrasts.score-gain]
+conditions = ["cond-a", "cond-b"]
+outcome = "score"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "group"
+equivalence_margin = 0.2
+"""
+
+
+def test_difference_contrasts_take_the_group_as_the_independent_unit_however_many_models_run_it():
+    """A difference contrast already estimates per (model, group) cell and tests over groups: a second model whose
+    differences repeat the first's in every group leaves the estimate, the p-value, both intervals, the minimum
+    detectable effect and the clusters counted as they are with one model."""
+    prereg = parse(tomllib.loads(PLAIN_TEXT), "inline", "d" * 64, ARMS)
+
+    def rows(models):
+        return [
+            row
+            for i, delta in enumerate((0.3, 0.1, 0.25, -0.05, 0.2, 0.15, 0.35, 0.4))
+            for model in models
+            for row in both_arms(f"t{i}", model, 1, 0.5 + delta, 0.5, cluster=f"c{i}")
+        ]
+
+    twice = analyse(rows(("model-a", "model-b")), prereg).contrast("score-gain")
+    once = analyse(rows(("model-a",)), prereg).contrast("score-gain")
+    fields = ("estimate", "p_value", "ci_low", "ci_high", "equivalence_interval", "minimum_detectable_effect")
+    assert [getattr(twice, f) for f in fields] == [getattr(once, f) for f in fields]
+    assert (twice.n_clusters, once.n_clusters, twice.n_cells, once.n_cells) == (8, 8, 16, 8)
+    assert (twice.estimation_unit, twice.independent_unit) == (("model", "group"), "group")
+    assert math.isfinite(twice.minimum_detectable_effect)
+
+
+def test_s13_the_record_names_the_estimation_unit_and_the_independent_unit_of_each_contrast():
+    """S13: analysis.json gives every contrast the cell it estimates in and the unit its test and bootstrap count,
+    with its cells used and lost by cause."""
+    result = analyse(cell_rows(), cell_prereg())
+    written = {c["name"]: c for c in json.loads(_json_text({"contrasts": result.contrasts}))["contrasts"]}
+    confirmatory, side = written["spend-per-win"], written["spend-per-win-side"]
+    assert (confirmatory["estimation_unit"], confirmatory["independent_unit"]) == (["model", "group"], "group")
+    assert (side["estimation_unit"], side["independent_unit"]) == (["group"], "group")
+    assert (confirmatory["n_cells"], confirmatory["n_clusters"]) == (8, 4)
+    assert confirmatory["cells_lost"] == {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0}
+    assert "cluster_key" not in confirmatory
+    assert [m["model"] for m in confirmatory["per_model"]] == ["model-a", "model-b"]
+
+
+def test_s13_the_group_estimation_unit_declared_gives_the_numbers_of_the_default_exactly():
+    """S13: `estimation_unit = ["group"]` is the default, so its result is the one an undeclared unit gives, field for
+    field: four groups, each pooling its two models, and no estimate by model."""
+    listed = analyse(cell_rows(), cell_prereg('["group"]')).contrast("spend-per-win")
+    default = analyse(cell_rows(), cell_prereg(None)).contrast("spend-per-win")
+    assert _json_text(listed) == _json_text(default)  # NaN is null there, so an undefined number compares too
+    assert (default.n_clusters, default.estimation_unit, default.per_model) == (4, ("group",), ())
+
+
+TWO_BOUNDS = """\
+alpha = 0.05
+holm_family = ["low-per-win"]
+
+[bootstrap]
+replicates = 300
+seed = 9
+
+[contrasts.low-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend_low"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+estimation_unit = ["model", "group"]
+
+[contrasts.high-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend_high"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+estimation_unit = ["model", "group"]
+"""
+
+
+def bound_rows():
+    """Per group one pair: A's lower bound is 40 r and its upper 120 r for 1 win, B's both 20 for 1."""
+    rows = []
+    for i, ratio in enumerate(RATIOS):
+        for condition, low, high in (("cond-a", 40.0 * ratio, 120.0 * ratio), ("cond-b", 20.0, 20.0)):
+            extra = {"spend_low": low, "spend_high": high}
+            rows.append(ratio_row(f"t{i}", "model-a", 1, None, 1.0, condition=condition, cluster=f"c{i}", extra=extra))
+    return rows
+
+
+def test_s13_two_analyses_on_two_numerator_columns_give_each_its_own_result():
+    """S13: the estimate on the lower-bound column is the mean of ln(2 r), on the upper-bound one the mean of
+    ln(6 r), each contrast naming its own numerator; neither reads the other's column."""
+    result = analyse(bound_rows(), parse(tomllib.loads(TWO_BOUNDS), "inline", "d" * 64, ARMS))
+    low, high = result.contrast("low-per-win"), result.contrast("high-per-win")
+    assert low.estimate == pytest.approx(np.mean([math.log(2.0 * r) for r in RATIOS]))
+    assert high.estimate == pytest.approx(np.mean([math.log(6.0 * r) for r in RATIOS]))
+    assert (low.ratio.numerator, high.ratio.numerator) == ("spend_low", "spend_high")
+    assert (low.outcome, high.outcome) == ("spend_low/wins", "spend_high/wins")
+
+
+def test_s13_a_none_in_one_numerator_column_refuses_only_the_confirmatory_contrast_that_reads_it():
+    """S13: a failed run whose upper bound is None counts its lower bound in the lower-bound contrast and is counted
+    in the exploratory upper-bound one; declared confirmatory, the upper-bound contrast is refused."""
+    rows = bound_rows()
+    failed = {"spend_low": 40.0, "spend_high": None}
+    rows.append(ratio_row("t9", "model-a", 1, None, 0.0, condition="cond-a", cluster="c0", extra=failed))
+    partner = {"spend_low": 20.0, "spend_high": 20.0}
+    rows.append(ratio_row("t9", "model-a", 1, None, 1.0, condition="cond-b", cluster="c0", extra=partner))
+    result = analyse(rows, parse(tomllib.loads(TWO_BOUNDS), "inline", "d" * 64, ARMS))
+    assert result.contrast("low-per-win").n_pairs == 9
+    assert result.contrast("high-per-win").pairs_missing["numerator_none_at_zero"] == 1
+    confirmatory = TWO_BOUNDS.replace('holm_family = ["low-per-win"]', 'holm_family = ["low-per-win", "high-per-win"]')
+    with pytest.raises(RatioNumeratorRefused, match=r"'high-per-win' drops 1 pair.*numerator 'spend_high' is None"):
+        analyse(rows, parse(tomllib.loads(confirmatory), "inline", "d" * 64, ARMS))
+
+
+def test_s13_the_one_model_a_cell_key_leaves_keeps_its_estimate_whatever_its_name():
+    """S13: model-b's every cell has no win in B and is excluded, so the model called `pooled` is the only one left;
+    its estimate by model is still reported."""
+    rows = []
+    for i, ratio in enumerate(RATIOS[:4]):
+        rows += ratio_arms(f"t{i}", "pooled", 1, (40.0 * ratio, 1.0), (20.0, 1.0), cluster=f"c{i}")
+        rows += ratio_arms(f"t{i}", "model-b", 1, (40.0, 1.0), (20.0, 0.0), cluster=f"c{i}")
+    contrast = analyse(rows, cell_prereg()).contrast("spend-per-win")
+    assert (contrast.n_clusters, contrast.pairs_missing["zero_denominator"]) == (4, 4)
+    assert [m.model for m in contrast.per_model] == ["pooled"]
+    assert contrast.per_model[0].estimate == pytest.approx(contrast.estimate)
 
 
 # --- an equivalence family: Holm over the two one-sided tests (S15) ---------------------------------------------------
