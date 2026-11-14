@@ -1082,10 +1082,12 @@ def test_s16_the_terminal_summary_gives_the_decision_beside_the_signed_estimate(
 
 def test_s16_a_report_with_no_smallest_effect_has_no_section_and_no_summary_text_of_one():
     """S16: nothing declared, nothing shown, with a family or without one."""
-    plain = analysis(contrast("primary", "difference"), ratio_contrast())
-    assert "mallest effect" not in render(plain)
+    plain = analysis(contrast("primary", "difference", minimum_detectable_effect=0.2), ratio_contrast())
+    for report in (render(plain), render(exploratory_only("first", "second"))):
+        assert SMALLEST not in report
+        assert "Detects it" not in report
+        assert "opposite_direction" not in report
     assert all("smallest" not in line for line in summary_lines(plain))
-    assert "mallest effect" not in render(exploratory_only("first", "second"))
 
 
 def test_s16_an_exploratory_only_report_shows_its_smallest_effects_too():
