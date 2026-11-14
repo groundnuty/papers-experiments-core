@@ -112,8 +112,9 @@ def test_c31_an_instrument_listed_after_another_starts_after_it_and_finishes_bef
 
 
 def test_c31_the_record_keeps_the_instruments_in_the_order_they_are_listed_whatever_order_they_finish_in():
-    """C31: only the calls are reversed. The snapshots are put into the record in list order, so a study's record
-    has the same key order, and the same bytes, as one whose instruments finished in list order."""
+    """C31: only the calls are reversed. The snapshots are put into the record in list order, so for snapshots that do
+    not depend on the order a record has the key order, and the bytes, that one whose instruments finished in list
+    order had."""
     out = run([Logged("a", []), Logged("b", []), Logged("c", [])])
     assert list(out.instruments) == ["a", "b", "c"]
     expected = hand_made()

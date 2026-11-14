@@ -152,7 +152,8 @@ def finish_instruments(record: RunRecord, instruments: Sequence[Instrument]) -> 
 
     The instruments finish in the reverse of their list order: the last listed first, the first listed last (C31).
     A `finish` that raises is recorded as failed and the instruments listed before it still finish. The record gets
-    the snapshots in list order, so its bytes do not depend on the order of the calls.
+    the snapshots in list order, so the keys of `instruments` keep the order the list gives them. What an instrument
+    reads can differ with the order of the calls, which is the point of the order.
 
     Each snapshot is added through `RunRecord.with_instrument`, which derives the treatment flag again: a fault
     injector's snapshot decides whether a declared target was held down in this attempt (record version 3).
