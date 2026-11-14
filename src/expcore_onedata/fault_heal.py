@@ -36,7 +36,7 @@ above a reader's restart leaves its own peers stale, which the strict rule below
 
 **Bounds.** At most one `restart_link` and one container restart per provider per restore: the restore journals that
 it heals before the first action, so neither a later clear nor another process's recovery heals the same injection
-again. At most `ROUNDS` passes of per-reader steps, and `[faults] heal_timeout_s` (3,600 s, provisional) in all: no
+again. At most `ROUNDS` passes of per-reader steps, and `[faults] heal_timeout_s` (4,200 s, provisional) in all: no
 step starts unless its declared bounds fit in what is left (`fault_settings.heal_all_links_reserve`,
 `heal_link_reserve`, `heal_container_reserve`), and each wait for transfers or the gate is cut to what is left. The
 link check's own time is outside the reserve, so the heal can end one check's time past the bound.
@@ -93,7 +93,8 @@ class LinkHeal:
     `services` maps a provider's label to its service, and `restored` is the label of the provider the restore brought
     back. `matrix()` reads every pair; `gate(service, timeout_s)` passes the session gate for a provider and returns its
     reading (`ok` among its keys); `transfers()` counts the active transfer listings (None when it cannot know);
-    `restart_container(label, service)` restarts a reader's container, verified (`ok`, `how`, `serves_after_s`).
+    `restart_container(label, service, budget_s)` restarts a reader's container, verified, its waits ending within
+    `budget_s` (`ok`, `how`, `serves_after_s`).
     `command_s` bounds one driver command, `settle_s` is the settle, and `link_s`, `all_links_s` and `container_s` are
     the declared bounds of a ping with a link restart, of the whole all-links sequence and of a container restart."""
 
@@ -115,7 +116,7 @@ class LinkHeal:
         matrix: Callable[[], LinkMatrix],
         gate: Callable[[str, float], dict[str, Any]],
         transfers: Callable[[], int | None],
-        restart_container: Callable[[str, str], dict[str, Any]],
+        restart_container: Callable[[str, str, float], dict[str, Any]],
         clock: Callable[[], float],
         sleep: Callable[[float], None],
         utc: Callable[[], str] = _utc,
@@ -124,6 +125,7 @@ class LinkHeal:
         self._bound_s, self._gate_s, self._poll_s, self._settle_s = bound_s, gate_s, poll_s, settle_s
         self._link_cost, self._restart_cost = link_s, link_s - 2 * command_s  # what is left once a ping is done
         self._all_links_cost, self._container_cost = all_links_s, container_s
+        self._margin_s = 3 * command_s  # past a container restart's budget: a start in flight and one reading
         self._matrix, self._gate, self._transfers, self._restart = matrix, gate, transfers, restart_container
         self._clock, self._sleep, self._utc = clock, sleep, utc
         self._actions: list[dict[str, Any]] = []
@@ -209,9 +211,10 @@ class LinkHeal:
                 active = -1
             if active is None or active == 0 or self._clock() - began >= bound:
                 break
-            self._sleep(self._poll_s)
-        quiet = active is None or active == 0
-        result = "none" if active is None else ("quiet" if quiet else "active")
+            self._sleep(max(0.0, min(self._poll_s, bound - (self._clock() - began))))
+        # a driver that cannot tell (None) shows no quiet, and neither does a quiet reading seen past the bound
+        quiet = active == 0 and self._clock() - began <= bound
+        result = "unknown" if active is None else ("quiet" if quiet else "active")
         waited = round(self._clock() - began, 3)
         self._record("all", "transfers", result, start, phase=phase, active=active, waited_s=waited)
         return quiet
@@ -240,8 +243,9 @@ class LinkHeal:
                 result = str(self._driver.restart_link(service))
             except DriverError:
                 result = "not_run"
-        else:
-            done = self._restart(label, service)
+        else:  # its waits end by what its reserve leaves after the margin and the settle: never past the bound
+            budget = max(0.0, self._left() - self._margin_s - self._settle_s)
+            done = self._restart(label, service, budget)
             result, extra = str(done.get("how")), {"serves_after_s": done.get("serves_after_s")}
             if done.get("ok") is not True:
                 self._record(label, action, result, start, **extra)
@@ -259,6 +263,11 @@ class LinkHeal:
         """Ping every provider, wait for no transfer, restart every link in quick succession, settle with no fetch,
         wait for no transfer, pass the restored provider's gate and read every pair."""
         labels = sorted(self._services, key=label_order)
+        paired = {provider for pair in before.pairs for provider in (pair.reader, pair.source)}
+        uncovered = sorted(paired - set(labels), key=label_order)
+        if uncovered:  # a partial sequence leaves pairs stale: every provider of a pair must be restartable
+            shown = ", ".join(uncovered)
+            return "links_stuck", before, f"no service is declared for {shown}, so not every link can be restarted"
         if not self._fits(self._all_links_cost):
             return "links_stuck", before, "heal_timeout_s leaves no time for the all-links sequence"
         for label in labels:

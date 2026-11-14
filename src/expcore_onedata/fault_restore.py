@@ -55,6 +55,7 @@ class LinkSettling:
     _sleep: Callable[[float], None]
     _labels: dict[str, str]
     _healed: set[str]
+    _deadline: float | None
     journal: InjectionJournal
     links_detail: str | None
     restore_record: dict[str, Any]
@@ -107,8 +108,8 @@ class LinkSettling:
         """Run the heal, record it, and clear or fail the container restarts it made; return how it ended."""
         settings, children = self._settings, []
 
-        def restart(label: str, reader: str) -> dict[str, Any]:
-            done = self.restart_container(label, reader, gate_probe)
+        def restart(label: str, reader: str, budget_s: float) -> dict[str, Any]:
+            done = self.restart_container(label, reader, gate_probe, budget_s)
             if done.get("entry") is not None:
                 children.append(done["entry"])
             return done
@@ -167,14 +168,19 @@ class LinkSettling:
         except Exception as error:  # a check that cannot answer is a failed one, never a pass
             return f"the link check raised {type(error).__name__}", None
 
-    def restart_container(self, label: str, service: str, gate_probe: str | None = None) -> dict[str, Any]:
+    def restart_container(
+        self, label: str, service: str, gate_probe: str | None = None, budget_s: float | None = None
+    ) -> dict[str, Any]:
         """Restart a reader's container for the heal, as an injection of its own: journalled before the stop with the
         healed injection's gate probe, under the reader's lock, restored and waited for as any injection is, but not
-        cleared: the heal clears it once every pair passes. Return `ok`, `how`, `serves_after_s` and its journal
-        `entry` (None when nothing was journalled)."""
+        cleared: the heal clears it once every pair passes. With `budget_s`, every wait and start attempt after the
+        first start ends once that many seconds have passed (the start itself is always sent, so the reader is never
+        left stopped by the bound), and a restart cut short is unverified, its entry left open for recovery. Return
+        `ok`, `how`, `serves_after_s` and its journal `entry` (None when nothing was journalled)."""
         lock = self.journal.try_lock(label)
         if lock is None:
             return {"ok": False, "how": "lock_held", "serves_after_s": None, "entry": None}
+        self._deadline = None if budget_s is None else self._clock() + budget_s
         try:
             try:
                 seen = self._driver.observe(service)
@@ -201,6 +207,7 @@ class LinkSettling:
                 self.journal.append({"event": "cleared", "id": entry, "how": how})
                 entry = None
         finally:
+            self._deadline = None
             lock.close()
         verified = done and how in ("restored", "found_restored")
         return {"ok": verified, "how": how, "serves_after_s": ready_after_s, "entry": entry}

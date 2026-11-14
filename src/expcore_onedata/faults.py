@@ -182,6 +182,7 @@ from expcore_onedata.admission import (
     FederationLock,
     current_admission,
     require_same_federation,
+    retain_admission,
 )
 from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
@@ -303,12 +304,15 @@ class FaultInjector:
         names so the treatment rule counts the injection for this attempt only.
         """
         with self._mutex:
+            give_up = retain_admission()  # the run's admission stays held until this start ends, whatever its task does
             try:
                 self._start(identity)
             except BaseException:
                 if self._pending is None:  # nothing is down: the federation goes back to the other runs
                     self._release_admission()
                 raise
+            finally:
+                give_up()
 
     def _start(self, identity: Mapping[str, Any]) -> None:
         self._require_sanction()
@@ -622,7 +626,13 @@ class FaultInjector:
         with its restore still unverified lets the lock go when it is collected, so recovery can settle it.
         """
         with self._mutex:
-            return self._clear()
+            # a share of the run's admission for the whole clear: a cancelled run whose context lets its admission go
+            # while this worker still restores or heals keeps the federation held until the clear has ended (O35)
+            give_up = retain_admission()
+            try:
+                return self._clear()
+            finally:
+                give_up()
 
     def _clear(self) -> bool:
         if self._pending is None:

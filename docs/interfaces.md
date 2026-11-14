@@ -583,11 +583,11 @@ A pair that then does not pass is `links_stuck`, and `[faults] heal` says what f
 
 - It never restarts the container of a provider that is the source of a failing pair, and never the restored provider's container: that would be the outage again.
 - It does at most one link restart and one container restart per provider per restore, in at most 2 passes of per-reader steps.
-- It runs within `heal_timeout_s`, 3,600 s by default and provisional. No step starts unless its declared bounds fit in what is left, and each wait for transfers or the gate is cut to what is left; the link check's own time is outside that reserve. The bounds are counted as follows:
+- It runs within `heal_timeout_s`, 4,200 s by default and provisional. No step starts unless its declared bounds fit in what is left, and each wait for transfers or the gate is cut to what is left; the link check's own time is outside that reserve. The bounds are counted as follows:
   - `fault_settings.heal_all_links_reserve`: per provider, a ping and a link restart (three commands at `command_timeout_s`, plus the RPC's 150 s), plus one settle.
   - `heal_link_reserve`: one provider's ping and link restart, plus one settle.
-  - `heal_container_reserve`: a container restart (four commands, `settle_timeout_s` twice, `ready_timeout_s`), plus one settle.
-- A declared heal whose `heal_timeout_s` cannot hold one round of its steps is refused at load, naming the least it may be. With the other defaults, four providers in `"all_links"` need 3,420 s and five need 3,930 s.
+  - `heal_container_reserve`: a container restart (four commands, `settle_timeout_s` twice, `ready_timeout_s`), a margin of three commands, and one settle. The restart's own waits and start attempts end by what its reserve leaves (the start is always sent, so no reader is left stopped by the bound); one cut short is unverified, its entry left open for recovery.
+- A declared heal whose `heal_timeout_s` cannot hold one round of its steps is refused at load, naming the least it may be. With the other defaults, four providers in `"all_links"` need 3,780 s and five need 4,290 s.
 - It fails closed:
   - a step after which a pair that passed before it fails stops it at once (`heal_broke_pair`);
   - so does a gate that does not pass (`sessions_not_ready`), a transfer that stays active (`transfers_active`), and a container restart that is not verified (`heal_restart_failed`);

@@ -20,7 +20,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     health_wait_s = 30               # optional: the longest the health check waits for it; below health_timeout_s
     gate_timeout_s = 240             # optional: the longest a restored provider's peers may take to reach it; see below
     heal = "off"                     # optional: "off", "all_links", "link_then_container" or "link"; see below
-    heal_timeout_s = 3600            # optional, provisional: the longest the heal of a stuck link may take in all
+    heal_timeout_s = 4200            # optional, provisional: the longest the heal of a stuck link may take in all
     heal_settle_s = 180              # optional, provisional: the no-fetch wait after a heal's restarts
 
     [faults.services]
@@ -57,12 +57,12 @@ probe, no fetch and no run. `heal_timeout_s` bounds the heal: no step starts who
 past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming the key and
 the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a ping and a
 link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one container
-restart
-(`heal_container_reserve`: four commands, `settle_timeout_s` twice, `ready_timeout_s` and one settle); for
-`"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one settle) and one container
-restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in `"all_links"` need 3,420 s, which
-the default 3,600 s covers; five need 3,930 s, which must raise it. **Both durations are provisional:** the settle and
-the idle period that leaves a peer's connection stale are being measured, and the defaults will be tuned from it.
+restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice, `ready_timeout_s`
+and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one
+settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in
+`"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it. **Both
+durations are provisional:** the settle and the idle period that leaves a peer's connection stale are being measured,
+and the defaults will be tuned from it.
 """
 
 import hashlib
@@ -87,7 +87,7 @@ SETTLE_MARGIN_S = 60.0  # what the default settle timeout adds to it, for the da
 DEFAULT_SETTLE_TIMEOUT_S = STOP_GRACE_S + SETTLE_MARGIN_S
 DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48 to 52 s after their restart (measured)
 DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
-DEFAULT_HEAL_TIMEOUT_S = 3600.0  # provisional: four providers' all-links sequence and one container restart fit it
+DEFAULT_HEAL_TIMEOUT_S = 4200.0  # provisional: four providers' all-links sequence and one container restart fit it
 DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measurement tunes it
 HEAL_MODES = ("off", "all_links", "link_then_container", "link")
 _KEYS = (
@@ -201,6 +201,10 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         heal_settle_s=_number(table, "heal_settle_s", DEFAULT_HEAL_SETTLE_S, 0),
         config_sha256=config.sha256,
     )
+    uncovered = sorted(heal_participants(config) - set(settings.services))
+    if heal == "all_links" and uncovered:  # a partial sequence is what leaves pairs stale
+        shown = config.provider_labels(uncovered)
+        raise table.fail("heal", f'"all_links" restarts every provider\'s link, and no service is declared for {shown}')
     least = heal_round_s(settings)
     if settings.heal_timeout_s < least:
         raise table.fail(
@@ -218,13 +222,23 @@ def heal_link_reserve(settings: FaultSettings) -> float:
 
 def heal_container_reserve(settings: FaultSettings) -> float:
     """The declared bounds of a reader's container restart: its lookup and inspection, its stop and its start, the
-    waits for it to go down and to come back, the wait for it to serve, and one settle."""
+    waits for it to go down and to come back, the wait for it to serve, a margin of three commands (a start in flight
+    and one reading past the restart's own deadline, `Recovery.restart_container`), and one settle."""
     return (
-        4 * settings.command_timeout_s
+        7 * settings.command_timeout_s
         + 2 * settings.settle_timeout_s
         + settings.ready_timeout_s
         + (settings.heal_settle_s)
     )
+
+
+def heal_participants(config: PlatformConfig) -> set[str]:
+    """The providers whose links the link check tests: those of `[link_check]` and of every declared space's support.
+    `all_links` restarts every one of them, so each needs a service in `[faults.services]`."""
+    found = set(config.link_check.providers) if config.link_check is not None else set()
+    for entry in config.spaces:
+        found |= set(entry.support.providers)
+    return found
 
 
 def heal_all_links_reserve(settings: FaultSettings) -> float:

@@ -71,6 +71,7 @@ class HealServices(FakeServices):
         self.stale_model = False
         self.conns: set[tuple[str, str]] = set()  # (reader, source): the reader holds a connection toward the source
         self.transfers: list[int] = []
+        self.never_serving: set[str] = set()  # providers whose container, restarted, never serves
         self.actions: list[tuple[str, str]] = []
         self.at: list[tuple[str, str, float]] = []  # each action with the clock's time
         self.checked_at: list[float] = []  # each link check's time
@@ -117,6 +118,12 @@ class HealServices(FakeServices):
     def active_transfers(self):
         return self.transfers.pop(0) if self.transfers else 0
 
+    def serves(self, service):
+        if LABEL[service] in self.never_serving:
+            self.calls.append(("serves", service))
+            return False
+        return super().serves(service)
+
     def sessions_ready(self, service, gate_probe):
         if self.gate_after > 0:
             self.gate_after -= 1
@@ -160,7 +167,7 @@ def four_providers(data, **faults):
     """Four providers, each with a service; short commands and settles, so a declared heal fits its default bound."""
     for name, index in (("gamma", 3), ("delta", 4)):
         data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
-    data["faults"] = faults_table(services=dict(STORES), **{"command_timeout_s": 10, "heal_settle_s": 30, **faults})
+    data["faults"] = faults_table(**{"services": dict(STORES), "command_timeout_s": 10, "heal_settle_s": 30, **faults})
 
 
 def injector(tmp_path, services=None, **faults):
@@ -190,22 +197,22 @@ def journal_lines(tmp_path):
 
 def test_o35_the_heal_is_off_by_default_and_its_bounds_default_to_the_designed_ones(tmp_path):
     """O35: without `heal`, a stuck link fails the restore closed as before; the gate waits 240 s, the heal at most
-    3,600 s, and its settle is 180 s (both provisional)."""
+    4,200 s, and its settle is 180 s (both provisional)."""
     platform = write_platform(tmp_path, four_providers)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
-    assert (settings.heal, settings.gate_timeout_s, settings.heal_timeout_s) == ("off", 240.0, 3600.0)
-    assert (DEFAULT_GATE_TIMEOUT_S, DEFAULT_HEAL_TIMEOUT_S, DEFAULT_HEAL_SETTLE_S) == (240.0, 3600.0, 180.0)
+    assert (settings.heal, settings.gate_timeout_s, settings.heal_timeout_s) == ("off", 240.0, 4200.0)
+    assert (DEFAULT_GATE_TIMEOUT_S, DEFAULT_HEAL_TIMEOUT_S, DEFAULT_HEAL_SETTLE_S) == (240.0, 4200.0, 180.0)
 
 
 @pytest.mark.parametrize(
     ("mode", "least"),
-    [("link", 600), ("link_then_container", 1185), ("all_links", 2715)],
+    [("link", 600), ("link_then_container", 1545), ("all_links", 3075)],
 )
 def test_o35_a_heal_whose_bound_cannot_hold_one_round_of_its_steps_is_refused_at_load(tmp_path, mode, least):
     """O35: no step starts past `heal_timeout_s`, so a declared heal whose bound cannot hold one round of its steps at
     their declared bounds would never act: it is refused, naming the key and the least it may be. With 120 s commands
-    and a 90 s settle: one link restart, 600 s; with a container restart, 1,185 s; four providers' all-links sequence
-    with a container restart, 2,715 s."""
+    and a 90 s settle: one link restart, 600 s; with a container restart (seven commands with its margin), 1,545 s;
+    four providers' all-links sequence with a container restart, 3,075 s."""
     slow = {"command_timeout_s": 120, "heal_settle_s": 90, "heal": mode}
     platform = write_platform(tmp_path, lambda data: four_providers(data, heal_timeout_s=least - 1, **slow))
     with pytest.raises(ConfigError, match=rf"heal_timeout_s.*at least {least}\b"):
@@ -845,3 +852,90 @@ def test_o35_no_run_is_admitted_before_the_final_all_pairs_check_passes(tmp_path
     admission = lock.try_acquire(exclusive=False)
     assert admission is not None
     admission.close()
+
+
+# --- the second review round ----------------------------------------------------------------------------------------
+
+
+def test_o35_all_links_is_refused_at_load_when_a_provider_of_a_pair_has_no_service(tmp_path):
+    """O35: a partial sequence is what leaves pairs stale, so `all_links` needs a service for every provider whose
+    links are checked; one missing is refused at load, named by its label."""
+    services = {"beta": STORES["beta"]}  # alpha supports the study space and has none
+    platform = write_platform(tmp_path, lambda data: four_providers(data, heal="all_links", services=services))
+    with pytest.raises(ConfigError, match=r"heal.*providers\[0\]"):
+        load_faults(platform, load_platform(platform, require_secrets=False))
+
+
+def test_o35_all_links_fails_closed_when_the_driver_cannot_tell_whether_a_transfer_is_active(tmp_path):
+    """O35: a driver that cannot read the transfer listings shows no quiet: no link is restarted."""
+    services = stale()
+    services.active_transfers = lambda: None
+    injector_, services = injector(tmp_path, services, heal="all_links")
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "transfers_active"
+    assert acted(services, "restart_link") == []
+
+
+def test_o35_a_quiet_transfer_reading_seen_only_after_its_bound_is_no_quiet(tmp_path):
+    """O35: a reading of the listings that ends past the wait's bound passes nothing, however it ends."""
+    services = stale()
+
+    def slow():
+        services.clock.sleep(20)
+        return 0
+
+    services.active_transfers = slow
+    injector_, services = injector(tmp_path, services, heal="all_links", gate_timeout_s=5)
+    injector_.start(RUN)
+    assert injector_.clear() is False
+    assert step(injector_, "cleared")["how"] == "transfers_active"
+    assert acted(services, "restart_link") == []
+
+
+def test_o35_a_clear_keeps_the_runs_admission_held_when_the_run_lets_it_go_midway(tmp_path):
+    """O35: a cancelled run may let its admission go while the clear still restores or heals in its worker; the clear
+    holds a share of it until it ends, so no run is admitted meanwhile and the heal still runs under the hold."""
+    platform_dir = tmp_path
+    injector_, services = injector(platform_dir, stale(), heal="all_links")
+    platform = platform_dir / "platform.toml"
+    lock = FederationLock(load_faults(platform, load_platform(platform, require_secrets=False)))
+    refused: list[bool] = []
+    with lock.held(exclusive=True, timeout_s=5) as admission:
+        injector_.start(RUN)
+
+        def let_go_then_try_a_run():
+            admission.close()  # the run's context lets its admission go, as a cancellation that outlasts its wait does
+            other = lock.try_acquire(exclusive=False)
+            refused.append(other is None)
+            if other is not None:
+                other.close()
+
+        services.on_check = let_go_then_try_a_run
+        assert injector_.clear() is True
+    assert refused
+    assert all(refused)
+    assert len(acted(services, "restart_link")) == 4  # the heal ran under the hold it kept
+    other = lock.try_acquire(exclusive=False)
+    assert other is not None
+    other.close()
+
+
+def test_o35_a_heals_container_restart_ends_its_waits_at_its_budget_with_the_start_sent(tmp_path):
+    """O35: the heal gives a reader's container restart what is left of its bound; its waits end there, the start is
+    sent all the same, so the reader is never left stopped, and a restart cut short is unverified with its entry open
+    for recovery."""
+    services = HealServices()
+    services.never_serving = {READER}
+    platform = write_platform(tmp_path, lambda data: four_providers(data, ready_timeout_s=60))
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    clock = FakeClock()
+    services.clock = clock
+    recovery = Recovery(settings, services, clock=clock, sleep=clock.sleep, labels=SERVICE)
+    began = clock.now
+    done = recovery.restart_container(READER, SERVICE[READER], None, 3.0)
+    assert (done["ok"], done["how"]) == (False, "not_serving")
+    assert clock.now - began <= 3.0 + 1.0  # one poll past the budget at most, far below the 60 s ready bound
+    assert acted(services, "stop", "start") == [("stop", READER), ("start", READER)]
+    (open_,) = recovery.entries()
+    assert open_["target"] == READER

@@ -188,6 +188,7 @@ class Recovery(LinkSettling):
         self.links_detail: str | None = None  # why the latest restore's link check failed (O35), names labels only
         self.restore_record: dict[str, Any] = {}  # the latest settling's gate reading and heal record (O35)
         self._labels = dict(labels or {})
+        self._deadline: float | None = None  # while a heal's container restart runs: the clock time it must end by
         self._healed: set[str] = set()  # the injections this recovery healed once already: never twice
 
     def entries(self, target: str | None = None) -> list[dict[str, Any]]:
@@ -328,9 +329,14 @@ class Recovery(LinkSettling):
                 served = False
             if served:
                 return self._clock() - started
-            if self._clock() - started >= timeout_s:
+            if self._clock() - started >= timeout_s or self._past_deadline():
                 break
         return None
+
+    def _past_deadline(self) -> bool:
+        """Whether a heal's container restart has used the time its heal gave it (`restart_container`); its waits and
+        start attempts end then, and the restart is unverified, journalled open for recovery."""
+        return self._deadline is not None and self._clock() >= self._deadline
 
     def _await_down(self, service: str, before: str) -> tuple[Observation | None, bool]:
         """After a stop of unknown outcome: read the service until it shows not running, or running with another
@@ -354,6 +360,8 @@ class Recovery(LinkSettling):
         times; return whether it did, the new identity's digest, and why not."""
         reason = "not_running"
         for attempt in range(self._settings.clear_attempts):
+            if attempt and self._past_deadline():
+                break
             if attempt:
                 self._sleep(self._settings.poll_s)
             try:
@@ -397,6 +405,6 @@ class Recovery(LinkSettling):
             else:
                 if done(self.last):
                     return self.last
-            if self._clock() - started >= self._settings.settle_timeout_s:
+            if self._clock() - started >= self._settings.settle_timeout_s or self._past_deadline():
                 break
         return None
