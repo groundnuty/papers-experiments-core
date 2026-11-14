@@ -17,8 +17,8 @@ from expcore_onedata.fault_journal import boot_id
 from expcore_onedata.ingest import ProgressiveIngest
 from expcore_onedata.ingesthealth import baseline_health, last_marks
 from expcore_onedata.ingestplan import load_ingest_plan
-from expcore_onedata.sandbox.kinds import INGEST_FAILURE
-from expcore_onedata.testing import ALPHA_ID, BETA_ID, with_placement, write_platform
+from expcore_onedata.sandbox.kinds import INGEST_FAILURE, INGEST_HELD
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, SETTINGS, with_placement, write_platform
 
 DAY = bytes((i * 31 + i // 97) % 256 for i in range(10240))
 KEPT = b"an earlier day, never touched\n" * 20
@@ -170,6 +170,71 @@ def test_o44_a_reset_whose_replication_places_nothing_on_the_mirror_fails(make, 
     assert (content(mirrored, DAY_PATH), mirrored.held(DAY_PATH, BETA_ID)) == (DAY, [])
 
 
+def test_o44_a_mirror_whose_copy_of_the_owners_map_lags_gets_the_whole_day_on_the_second_try(make, mirrored, ticker):
+    """O44: the 14 Nov live failure. The reset completes the day at the owner and replicates it to the mirror at once,
+    while the mirror's own copy of the owner's map, which dbsync brings, still shows the prefix alone: that replication
+    copies the prefix and reports completed, and the mirror's block map is short. The provisioner schedules it again
+    after a pause, and the second copies the rest: the mirror holds the day whole, the restore's record names both
+    tries and their ids, and the post-run check passes."""
+    mirrored.replication_view_lag_s = 8.0
+    ingest = make(MIRRORED)
+    ingest.start({})
+    ticker.sleep(30.0)  # before the first turn: the prefix reaches the mirror's copy, and nothing falls due
+    ingest.at_first_turn({"clock_s": 0.0})
+    snapshot = ingest.finish()
+    ingest.check()
+    made = mirrored.id_of(DAY_PATH)
+    jobs = [(tid, job) for tid, job in mirrored.transfers.items() if job.file_id == made and job.kind == "replication"]
+    assert [job.bytes_replicated for _, job in jobs] == [PREFIX, len(DAY) - PREFIX]
+    assert (content(mirrored, DAY_PATH), mirrored.held(DAY_PATH, BETA_ID)) == (DAY, [[0, len(DAY)]])
+    done = snapshot["restore"]["files"]["day-13"]
+    assert done["replicas"] == {"providers[1]": "replicated"}
+    tries = done["replications"]["providers[1]"]
+    assert (tries["tries"], tries["transfer_ids"]) == (2, [tid for tid, _ in jobs])
+    assert tries["converged_s"] > 0
+
+
+def test_o44_a_mirror_whose_copy_never_catches_up_fails_the_reset_closed_within_the_bound(
+    make, mirrored, ticker, tmp_path
+):
+    """O44: the mirror's copy of the owner's map never catches up, so every replication copies nothing new and reports
+    completed. The provisioner tries again within the settle bound and then refuses: the reset fails, naming the tries,
+    the baseline is marked unhealthy, the post-run check refuses the attempt, and the reset ends within the bound."""
+    mirrored.replication_view_lag_s = 10.0**6
+    ingest = make(MIRRORED)
+    ingest.start({})
+    ingest.at_first_turn({"clock_s": 0.0})
+    began = ticker.now
+    snapshot = ingest.finish()
+    made = mirrored.id_of(DAY_PATH)
+    tries = [job for job in mirrored.transfers.values() if job.file_id == made and job.kind == "replication"]
+    assert len(tries) >= 2  # the replication was scheduled again before the reset gave up
+    assert all(job.ended for job in tries)
+    failed = snapshot["restore"]["files"]["day-13"]
+    assert (snapshot["restore"]["ok"], failed["ok"], failed["error"]) == (False, False, "NotPlaced")
+    assert f"{len(tries)} tries" in failed["detail"]
+    with pytest.raises(InfraError, match="restore"):
+        ingest.check()
+    assert (mark_of(tmp_path)["state"], mark_of(tmp_path)["phase"]) == ("unhealthy", "restore")
+    assert (content(mirrored, DAY_PATH), mirrored.held(DAY_PATH, BETA_ID)) == (DAY, [])
+    # the settle bound, from the first try's end, and the reset's other polls before it (each under ten)
+    assert ticker.now - began <= SETTINGS["settle_timeout_s"] + 10 * SETTINGS["poll_s"]
+
+
+def test_o44_the_start_with_a_lagging_mirror_schedules_no_replication_and_keeps_its_record(make, mirrored):
+    """O44: the start's restore finds the mirror's replica held and the start state replicates nothing, so the lag
+    changes nothing there: no transfer is scheduled, and the start's record of the file is the one it was."""
+    mirrored.replication_view_lag_s = 8.0
+    ingest = make(MIRRORED)
+    ingest.start({})
+    assert [c for c in mirrored.provider_calls if c[1:] == ("POST", "/transfers")] == []
+    assert (mirrored.held(DAY_PATH, ALPHA_ID), mirrored.held(DAY_PATH, BETA_ID)) == ([[0, PREFIX]], [])
+    ingest.at_first_turn({"clock_s": 0.0})
+    start = ingest.finish()["start"]["restore"]["day-13"]
+    assert set(start) == {"ok", "action", "file_id", "replicas"}
+    assert start["replicas"] == {"providers[1]": "held"}
+
+
 def test_o44_a_replica_the_plan_does_not_declare_refuses_the_start_before_anything_is_removed(make, mirrored):
     """O44: the mirror holds the day but the plan declares no replica: the start would remove it and the reset would
     not bring it back, so the start is refused with nothing removed, the mirror's replica kept."""
@@ -290,6 +355,13 @@ def dead_holder():
     return {"pid": child.pid, "boot_id": boot_id()}
 
 
+def write_as(patch, dead_holder):
+    """Write the marks as the process `dead_holder` names: its holder, and its owner by boot id, pid and a start time
+    no live process has (O45)."""
+    patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+    patch.setattr(ingesthealth, "owner", lambda: {"process": f"{boot_id()}:{dead_holder['pid']}:0"})
+
+
 def mark_of(tmp_path):
     return last_marks(tmp_path / "journal.jsonl")["spaces[0]"]
 
@@ -301,7 +373,7 @@ def assert_recovered(make, fake, tmp_path):
     refused = make(MIRRORED)
     with pytest.raises(InfraError, match="not whole") as error:
         refused.start({})
-    assert error.value.kind == INGEST_FAILURE
+    assert error.value.kind == INGEST_HELD  # a hold, which costs the run no attempt (O45)
     refused.finish()  # its reset brings nothing back: it changed nothing, and a refused start never recovers
     assert changes(fake, since) == []
     assert baseline_health([tmp_path / "journal.jsonl"]).ok is False
@@ -329,7 +401,7 @@ def test_o44_a_run_that_dies_at_any_step_leaves_its_baseline_open_and_every_star
     fault = Fault(provisioner)
     ingest = make(MIRRORED)
     with monkeypatch.context() as patch:
-        patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+        write_as(patch, dead_holder)
         if step == "reset":
             ingest.start({})
             ingest.at_first_turn({"clock_s": 0.0})
@@ -409,17 +481,20 @@ def test_o44_a_failed_start_whose_own_recovery_verifies_the_baseline_leaves_it_w
 
 def test_o44_a_recovery_is_refused_while_another_live_process_holds_the_baseline(make, fake, tmp_path, monkeypatch):
     """O44: the open mark's holder is another process that still runs, a run in progress: the recovery would write
-    into its files, so it is refused with nothing sent, and the health check reads the run as in progress."""
+    into its files, so it is refused with nothing sent, and the health check reads the run as in progress, which a
+    check outside any attempt defers (O45)."""
     alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         with monkeypatch.context() as patch:
             patch.setattr(ingesthealth, "holder", lambda: {"pid": alive.pid, "boot_id": boot_id()})
+            patch.setattr(ingesthealth, "owner", lambda: {"process": f"pid:{alive.pid}"})
             make(ROW).start({})
         since = len(fake.provider_calls)
-        with pytest.raises(InfraError, match="another process"):
+        with pytest.raises(InfraError, match="a run in progress"):
             make(ROW).recover()
         assert changes(fake, since) == []
-        assert baseline_health([tmp_path / "journal.jsonl"]).ok
+        health = baseline_health([tmp_path / "journal.jsonl"])
+        assert (health.ok, health.deferred) == (False, True)
     finally:
         alive.kill()
         alive.wait()
@@ -476,7 +551,7 @@ def test_o44_a_recovery_with_another_plan_than_the_runs_is_refused_and_clears_no
     the baseline stays marked; the run's own plan recovers it, the mirror's replica included."""
     fault = Fault(provisioner)
     with monkeypatch.context() as patch:
-        patch.setattr(ingesthealth, "holder", lambda: dead_holder)
+        write_as(patch, dead_holder)
         fault.arm("prefix", "dies")
         with pytest.raises(Died):
             make(MIRRORED).start({})

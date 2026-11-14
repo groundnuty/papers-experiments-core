@@ -166,6 +166,10 @@ class Instrument(Protocol):
     reading fails records the failure (`"ok": False`) and never a guessed value (O08). It runs outside the agent's
     time, before the loop starts and after it ends, so none of its waits is a wait kind.
 
+    Instruments nest. `start_instruments` starts them in list order and `finish_instruments` finishes them in the
+    reverse of it, so an instrument listed earlier finishes later: list an instrument whose `finish` undoes something
+    (a fault injector's restore, a progressive ingest's) before the probes that must read the state before the undo.
+
     Two more methods are optional, and an instrument that has neither is called as it always was (C31):
 
     - `at_first_turn(moment: Mapping[str, Any]) -> None`, called once by the executor after its last step of its own
@@ -178,6 +182,9 @@ class Instrument(Protocol):
       attempt is then set aside and run again like any other infrastructure failure. The same holds for
       `at_first_turn`. Any other exception, and an `InfraError` of a kind a condition may declare, is a defect of the
       instrument.
+
+    Neither method is part of the nest: the hook is one moment and the checks are a verdict taken once every snapshot
+    is in, so both run in list order, and the first listed instrument that refuses is the refusal the record keeps.
     """
 
     namespace: str

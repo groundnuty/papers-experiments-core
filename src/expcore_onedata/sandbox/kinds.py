@@ -11,7 +11,7 @@ never from an exit code. Their categories map to the core's vocabulary of infras
   `unattributed_kill`, retried within the attempt limit.
 
 Both kinds are in the core's own vocabulary (`expcore.errors.CORE_KINDS`). The platform's own kinds are registered here,
-when this module is first imported. Four are the sandbox's and the ingest's, and none is treatable:
+when this module is first imported. Five are the sandbox's and the ingest's, and none is treatable:
 
 - `data_gate_integrity`: the data gate's refusal of an answer it cannot pass to the agent (a redirect, an encoded body,
   its token in a header or a body, an answer larger than it checks whole, a complete listing larger than it serves
@@ -30,6 +30,10 @@ when this module is first imported. Four are the sandbox's and the ingest's, and
   state, write or confirm an arrival, or restore the dataset's baseline after the run (O27). Data missing or partial
   because the plan has not finished is the condition's manipulation and the agent's outcome, never this kind; an
   ingest that fails on its own says nothing about the agent, so the run is set aside and no condition may declare it.
+- `ingest_held`: a preallocated ingest's start held back by its baseline's mark, before it read or sent anything
+  (`expcore_onedata.ingesthealth`, O44): the baseline is held open by another live attempt, or an earlier attempt left
+  it not whole. A hold, never a failure of this run: set aside, never treatable, and it costs the run no attempt
+  (`register_infra_kind(..., charged=False)`), so a campaign that meets a held baseline loses no run to its limit.
 - `cell_unkillable`: a process of a cell outlived its kill at the cell's deadline (a read waiting in the kernel on the
   FUSE mount, as one of a file only a stopped provider holds does), so the sandbox aborted the mount or stopped
   (`deadline.py`, O34). The harness could not bound the cell, and the run's mount or sandbox is gone: the run says
@@ -79,6 +83,16 @@ register_infra_kind(
     "of the dataset's baseline): data the plan had not delivered yet is the manipulation, but a plan the harness could "
     "not carry out says nothing about the agent",
     treatable=False,
+)
+
+INGEST_HELD = "ingest_held"
+register_infra_kind(
+    INGEST_HELD,
+    "a progressive ingest held its start back, with nothing read or sent: its space's baseline was held open by "
+    "another live attempt, or left not whole by an earlier one, which a recovery must bring back; the run costs no "
+    "attempt and is tried again",
+    treatable=False,
+    charged=False,
 )
 
 CELL_UNKILLABLE = "cell_unkillable"

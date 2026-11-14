@@ -121,6 +121,7 @@ class Transfer:
     processed: int | None = None  # the files the record counts processed, when not the one file (a directory's)
     evicted: int | None = None  # the files an eviction record counts evicted, when not decided by `noop`
     deleted: bool = False  # the file was deleted when the job was scheduled: it ended at once, with no file processed
+    copies: list[list[int]] | None = None  # what a replication copies, by its target's lagging view; None: all of it
 
     @property
     def replicates(self) -> bool:
@@ -174,6 +175,19 @@ def _merge(blocks: list[list[int]]) -> list[list[int]]:
     return merged
 
 
+def _cut(offset: int, length: int, start: int, size: int) -> list[list[int]]:
+    """The parts of the block [offset, offset + length) outside [start, start + size)."""
+    end, stop = offset + length, start + size
+    parts = [[offset, min(end, start) - offset], [max(offset, stop), end - max(offset, stop)]]
+    return [part for part in parts if part[1] > 0]
+
+
+def _overlap(offset: int, length: int, start: int, size: int) -> list[list[int]]:
+    """The part of the block [offset, offset + length) inside [start, start + size), if any."""
+    first, last = max(offset, start), min(offset + length, start + size)
+    return [[first, last - first]] if last > first else []
+
+
 class FakeData(FakeQos, FakeFederation):
     """Onezone plus the data API of every provider it reports, with files, block maps and transfers.
 
@@ -220,6 +234,21 @@ class FakeData(FakeQos, FakeFederation):
     the bytes fetches them there, on the fly, and they show in its map after `fetch_lag` polls of the map. A
     replication places the whole file on its target, and an eviction removes all of the evicting provider's blocks of
     the file (a migration does both); no provider's map changes another's.
+
+    **A replication's lagging view** (`replication_view_lag_s`; None, the default, models none). As op-worker f118ed9
+    has it, a replication runs on its target from the target's own copy of the other providers' file locations, which
+    dbsync brings it (`fslogic_cache:get_all_locations()`, replica_synchronizer.erl:1370-1372, then
+    `replica_finder:get_blocks_for_sync`), while the block map read through any provider gathers each provider's map
+    from that provider (data_distribution.erl:184-199, provider_rpc.erl:88-104, provider_reg_distribution.erl:31-38).
+    With a lag set, a replication or a migration copies, of the bytes its target lacks, only those the other
+    providers held `replication_view_lag_s` seconds of `clock` before the job was scheduled, and reports `completed`
+    with that many bytes; a range no provider was seen to hold, the unwritten range of a sparse file among them, is
+    copied from nowhere. The block map, through any reader, shows every provider's current blocks at once, so nothing
+    the REST API answers shows the lag. Seen live on 14 Nov
+    (`deploy/compose-federation/day0/2026-11-14-federation-facts-replication-lag.md`): a replication scheduled right
+    after the owner completed a file reported `completed` with the mirror holding only the earlier prefix. Not
+    modelled under the lag: a range read on the fly, a QoS landing and a job made by `add_transfer`, each of which
+    places as without it, and a job that starts later than it was scheduled.
 
     **Sparse files** (#107, O44), as op-worker f118ed9's source has them and the Compose federation measured
     (`deploy/compose-federation/day0/2026-11-10-federation-facts.md`, "A file at its final size with only a prefix
@@ -377,7 +406,8 @@ class FakeData(FakeQos, FakeFederation):
     holds counts it, and differs from the core there.
 
     Does not model: a transfer's duration (it ends after `transfer_flip_after` polls of its record, or when a test ends
-    it), partial replication (a replication places the whole file, as Onedata's does), QoS beyond the above, file
+    it), partial replication other than by a lagging view (a replication places the whole file unless
+    `replication_view_lag_s` is set), QoS beyond the above, file
     metadata other than the id, name, type, size and parent, storage backends beyond one per provider, concurrent
     writers, quotas, symbolic links, a token's space or interface caveats (only the read-only caveat is enforced, and
     `enforce_readonly=False` turns that off), a delete that other providers show late (unless `delete_delay_s` is set),
@@ -394,6 +424,9 @@ class FakeData(FakeQos, FakeFederation):
     - `fetch_lag`: polls of the file's block map before bytes fetched by a range read or a replication show in it;
     - `onthefly_places`: False makes a range read answer without ever adding a block (a provider that does not cache);
     - `transfers_place_blocks`: False makes a replication end as `completed` with no block placed;
+    - `replication_view_lag_s`: seconds of `clock` a replication's target lags in its copy of the other providers'
+      block maps, so a replication copies only what they held that long before it was scheduled (None: the whole
+      file, no lag modelled; "A replication's lagging view");
     - `evictions_remove_blocks`: False makes an eviction end as `completed` and leave the blocks;
       `evictions_noop_first` does that, with `filesEvicted` 0, for the next N evictions only;
     - `qos_covered`: `(file id, provider id)` pairs whose eviction is cancelled per file, as op-worker's is for a file
@@ -516,6 +549,10 @@ class FakeData(FakeQos, FakeFederation):
         self.fetch_lag = 0
         self.onthefly_places = True
         self.transfers_place_blocks = True
+        # Seconds of `clock` a replication's target lags in its copy of the other providers' block maps (None: none)
+        self.replication_view_lag_s: float | None = None
+        # (file id, provider id) -> each state of that provider's blocks of the file, with the `clock` it began at
+        self._block_history: dict[tuple[str, str], list[tuple[float, list[list[int]]]]] = {}
         self.evictions_remove_blocks = True
         self.evictions_noop_first = 0  # the next N evictions complete with filesEvicted 0 and remove nothing, as 25.0's
         # do when scheduled right after a provider fetched the bytes on the fly
@@ -616,6 +653,7 @@ class FakeData(FakeQos, FakeFederation):
             self.nodes[file_id].content = bytearray(content)
             if content:
                 self.blocks[(file_id, holder)] = [[0, len(content)]]
+                self._note_blocks((file_id, holder))
         return file_id
 
     def id_of(self, path: str) -> str:
@@ -845,7 +883,7 @@ class FakeData(FakeQos, FakeFederation):
         self.tombstones[file_id] = _Tombstone(self._attributes(self.nodes[file_id]), self.clock())
         self._deleting.pop(file_id, None)
         del self.nodes[file_id]
-        for table in (self.blocks, self.pending):
+        for table in (self.blocks, self.pending, self._block_history):
             for key in [k for k in table if k[0] == file_id]:
                 del table[key]
 
@@ -1253,6 +1291,7 @@ class FakeData(FakeQos, FakeFederation):
             for table in (self.blocks, self.pending):
                 for key in [k for k in table if k[0] == node.file_id]:
                     del table[key]
+                    self._note_blocks(key)
         body = request.content
         if self.corrupt_writes and body:
             body = bytes([body[0] ^ 0xFF]) + body[1:]
@@ -1267,6 +1306,7 @@ class FakeData(FakeQos, FakeFederation):
             held = self.blocks.setdefault((node.file_id, provider), [])
             held.append([offset, len(body)])
             self.blocks[(node.file_id, provider)] = _merge(held)
+            self._note_blocks((node.file_id, provider))
         return httpx.Response(204)
 
     def _read(self, node: Node, provider: str, header: str | None, request: httpx.Request) -> httpx.Response:
@@ -1338,6 +1378,32 @@ class FakeData(FakeQos, FakeFederation):
             held = self.blocks.setdefault((file_id, provider), [])
             held.extend([o, n] for o, n, _ in due)
             self.blocks[(file_id, provider)] = _merge(held)
+            self._note_blocks((file_id, provider))
+
+    def _note_blocks(self, key: tuple[str, str]) -> None:
+        """Keep a provider's blocks of a file as they are now, from `clock`: the states a lagging view reads."""
+        self._block_history.setdefault(key, []).append((self.clock(), [list(b) for b in self.blocks.get(key, [])]))
+
+    def _seen(self, key: tuple[str, str], at: float) -> list[list[int]]:
+        """A provider's blocks of a file as they stood at `at`: none before their first state kept, and as they are
+        when none was ever kept (blocks set before the history, or by a path that keeps none)."""
+        history = self._block_history.get(key)
+        if history is None:
+            return [list(b) for b in self.blocks.get(key, [])]
+        states = [blocks for moment, blocks in history if moment <= at]
+        return [list(b) for b in states[-1]] if states else []
+
+    def _view_copies(self, file_id: str, target: str) -> list[list[int]]:
+        """What a replication scheduled now copies to `target` (`replication_view_lag_s`): the ranges the other
+        providers held a lag ago, as the target's copy of their maps shows them, less what the target holds, within the
+        file."""
+        at = self.clock() - (self.replication_view_lag_s or 0.0)
+        shown = _merge([b for p in self.providers if p != target for b in self._seen((file_id, p), at)])
+        size = len(self.nodes[file_id].content)
+        missing = [[0, size]]
+        for offset, length in _merge([list(b) for b in self.blocks.get((file_id, target), [])]):
+            missing = [part for o, n in missing for part in _cut(o, n, offset, length)]
+        return [part for o, n in missing for s, k in shown for part in _overlap(o, n, s, k)]
 
     def _distribution(self, node: Node) -> dict:
         per: dict = {}
@@ -1383,6 +1449,10 @@ class FakeData(FakeQos, FakeFederation):
         self.transfers[tid] = Transfer(
             kind, sent["fileId"], provider, source_id=source, scheduled=now, started=now, deleted=gone
         )
+        if self.replication_view_lag_s is not None and kind != "eviction" and not gone:
+            copies = self._view_copies(sent["fileId"], provider)  # the target's view, as the job starts
+            self.transfers[tid].copies = copies
+            self.transfers[tid].bytes_replicated = sum(length for _, length in copies)
         if gone:
             self.end_transfer(tid)
         return httpx.Response(201, json={"transferId": tid})
@@ -1482,7 +1552,8 @@ class FakeData(FakeQos, FakeFederation):
         key = (transfer.file_id, transfer.provider_id)
         if transfer.replicates and self.transfers_place_blocks and transfer.file_id in self.nodes:
             size = len(self.nodes[transfer.file_id].content)
-            self.pending.setdefault(key, []).append([0, size, self.fetch_lag])
+            for offset, length in [[0, size]] if transfer.copies is None else transfer.copies:
+                self.pending.setdefault(key, []).append([offset, length, self.fetch_lag])
             self._promote(*key)
         evicted = (transfer.file_id, transfer.source_id) if transfer.kind == "migration" else key
         if transfer.kind == "eviction" and self.evictions_noop_first > 0:  # completed, and nothing evicted
@@ -1495,6 +1566,7 @@ class FakeData(FakeQos, FakeFederation):
         if transfer.kind != "replication" and self.evictions_remove_blocks:
             self.blocks.pop(evicted, None)
             self.pending.pop(evicted, None)
+            self._note_blocks(evicted)
 
 
 __all__ = ["ERRORS_25_0", "ERRORS_LEGACY", "ERROR_SHAPES", "PROVIDER", "ROOT_ID", "FakeData", "Node", "Transfer"]

@@ -41,8 +41,8 @@ def blocks(fake: FakeData, file_id: str, provider: str) -> list[list[int]]:
     return answer["distributionPerProvider"][provider]["distributionPerStorageBackend"]["storage-1"]["blocks"]
 
 
-def run_job(fake: FakeData, provider: str, kind: str, file_id: str) -> None:
-    """Post a replication or an eviction for a provider and read its record until it has ended."""
+def run_job(fake: FakeData, provider: str, kind: str, file_id: str) -> dict:
+    """Post a replication or an eviction for a provider, read its record until it has ended and return the record."""
     field = "evictingProviderId" if kind == "eviction" else "replicatingProviderId"
     made = call(fake, ALPHA_ID, "POST", "/transfers", json={"type": kind, field: provider, "fileId": file_id})
     assert made.status_code == 201
@@ -50,6 +50,7 @@ def run_job(fake: FakeData, provider: str, kind: str, file_id: str) -> None:
     for _ in range(fake.transfer_flip_after + 1):
         record = call(fake, ALPHA_ID, "GET", f"/transfers/{job}").json()
     assert record.get("replicationStatus", record.get("evictionStatus")) == "completed"
+    return record
 
 
 def children(fake: FakeData, provider: str, directory: str = ROOT_ID) -> list[str]:
@@ -137,6 +138,30 @@ def test_o44_a_content_write_without_an_offset_truncates_the_file_first():
     write(fake, file_id, None, b"xy")
     assert bytes(fake.nodes[file_id].content) == b"xy"
     assert blocks(fake, file_id, ALPHA_ID) == [[0, 2]]
+
+
+def test_o44_a_replication_copies_only_what_its_targets_lagging_view_of_the_source_showed():
+    """O44: with `replication_view_lag_s` a replication's target sees the other providers' blocks as they stood that
+    many seconds of `clock` before the job was scheduled, as op-worker f118ed9's synchronizer reads its dbsync copy of
+    their file locations (replica_synchronizer.erl:1370-1372). One scheduled before that copy holds the last write
+    copies only the prefix and still reports completed, with the prefix's bytes; one scheduled once the lag has passed
+    copies the rest. The block map, read through either provider, shows the source's current blocks at once, since each
+    provider answers for its own (data_distribution.erl:184-199), so it shows nothing of the lag."""
+    ticker = Ticker()
+    fake = make_federation(clock=ticker.clock)
+    fake.replication_view_lag_s = 8.0
+    file_id = make_on_alpha(fake)
+    write(fake, file_id, 8192, b"")
+    write(fake, file_id, 0, DATA[:1000])
+    ticker.sleep(30.0)  # the prefix is in every provider's copy
+    write(fake, file_id, 1000, bytes(7192))
+    shown = distribution(fake, file_id, BETA_ID)[ALPHA_ID]["distributionPerStorageBackend"]["storage-1"]["blocks"]
+    assert shown == [[0, 8192]]
+    record = run_job(fake, BETA_ID, "replication", file_id)
+    assert (record["bytesReplicated"], blocks(fake, file_id, BETA_ID)) == (1000, [[0, 1000]])
+    ticker.sleep(8.0)
+    record = run_job(fake, BETA_ID, "replication", file_id)
+    assert (record["bytesReplicated"], blocks(fake, file_id, BETA_ID)) == (7192, [[0, 8192]])
 
 
 def test_an_eviction_that_ends_without_removing_a_block_can_be_scripted():
