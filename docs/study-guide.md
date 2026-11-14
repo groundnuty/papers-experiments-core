@@ -150,33 +150,45 @@ assert relay.accepted_fingerprints == ("fp-northern-deploy", "fp-southern-deploy
 assert study.models.resolve("alpha-stub").accepted_fingerprints == ()  # checked against a baseline, as before
 ```
 
-### Bounding one tool call
+### Bounding a tool server's call
 
-A tool call's only bound in the loop is the agent's time left. A tool server that hangs mid-run therefore waits out the whole cap, and the run is scored as the agent's time cap. If your conditions differ in how many tools they call, such hangs fall on them unevenly and bias the comparison. `[agent] tool_call_bound_s` in `campaign.toml` declares a bound on one call, in seconds: positive and finite, and optional.
+A tool call's only bound in the loop is the agent's time left. A tool server that hangs mid-run therefore waits out the whole cap, and the run is scored as the agent's time cap. If your conditions differ in how many tools they call, such hangs fall on them unevenly and bias the comparison. `[agent] tool_server_call_bound_s` in `campaign.toml` declares a bound on one call to a tool server, in seconds: positive and finite, and optional.
 
-- Each call runs under the shorter of the bound and the agent's time left. A call that outlasts the bound first ends as infrastructure of kind `knowledge` (the tool server did not answer, the message naming the tool and the bound): the attempt is set aside, like any other infrastructure ending, and the agent is not charged. A call that outlasts the time left first is the agent's time cap as before, unless the bound had already passed when the loop cut it: that call hung first, and is `knowledge` infrastructure too.
+- It is for tool servers only. The bound reaches the calls of a provider that is a tool server (an MCP server, `McpToolProvider`), and no other call. A code cell, and any tool that is not a tool server's, is handed the agent's time left whatever you declare: the bound never caps what the agent's code may run for, and the model is told what it is told without the key when a cell runs long. The record's `agent_config.tool_server_tools` lists the tools the bound reached, so you can check that your code tool is not among them.
+- Each call to a tool server runs under the shorter of the bound and the agent's time left. A call that outlasts the bound first ends as infrastructure of kind `knowledge` (the tool server did not answer, the message naming the tool and the bound): the attempt is set aside, like any other infrastructure ending, and the agent is not charged. A call that outlasts the time left first is the agent's time cap as before, unless the bound had already passed when the loop cut it: that call hung first, and is `knowledge` infrastructure too.
 - Pick the bound well above the slowest call that is not a hang, and below the time cap, or it never decides anything. A bound at or above the time cap leaves every call as it was, though it still changes the caps in the fingerprint.
-- It is a bound on wall time, and it reaches the provider as its `timeout_s`. `McpToolProvider` honours it; a function you wrote as a tool must bound itself with the `timeout_s` it is handed, or only the time left will cut it.
+- It is a bound on wall time, and it reaches the tool server as its `timeout_s`. `McpToolProvider` honours it. A tool server of your own that is not an `McpToolProvider` must say `tool_server = True` and bound itself with the `timeout_s` it is handed, or only the time left will cut it.
 - Each call's record has `elapsed_s`, the seconds it took, so you can count hangs and what they cost per condition. A condition that declares `knowledge` as its treatment kind scores such an attempt as a treatment outcome, since the failure is of that kind.
 - Declare it before the campaign starts. The bound is one of the campaign's caps, which are in its fingerprint, and `campaign.toml`'s hash is in it too, so a store that started without the key is not resumed with it: start a new store. A study that never declares it keeps its fingerprint, its configuration and its behaviour.
+- The key was first called `tool_call_bound_s`, and capped every tool call, a code cell too. That key is refused now, with a message naming the new one: drop it, or declare `tool_server_call_bound_s` if a tool server's hang is what you want classified.
 
 ```python
 import shutil
 from pathlib import Path
 
 from expcore.campaign.config import load_campaign
+from expcore.config.loading import ConfigError
 
-assert study.campaign.agent.tool_call_bound_s is None  # the example declares none
-assert "tool_call_bound_s" not in study.campaign.caps()["agent"]  # so its caps are what they were
+assert study.campaign.agent.tool_server_call_bound_s is None  # the example declares none
+assert "tool_server_call_bound_s" not in study.campaign.caps()["agent"]  # so its caps are what they were
 
 bounded = Path("bounded-study")
 shutil.copytree("my-study", bounded)
 toml = bounded / "campaign.toml"
-toml.write_text(toml.read_text().replace("[agent]\n", "[agent]\ntool_call_bound_s = 300\n", 1))
+original = toml.read_text()
+toml.write_text(original.replace("[agent]\n", "[agent]\ntool_server_call_bound_s = 300\n", 1))
 declared = load_campaign(toml)
-assert declared.agent.tool_call_bound_s == 300.0
-assert declared.caps()["agent"]["tool_call_bound_s"] == 300.0
+assert declared.agent.tool_server_call_bound_s == 300.0
+assert declared.caps()["agent"]["tool_server_call_bound_s"] == 300.0
 assert declared.caps() != study.campaign.caps()  # another fingerprint: a store without the bound is not resumed with it
+
+toml.write_text(original.replace("[agent]\n", "[agent]\ntool_call_bound_s = 300\n", 1))
+try:
+    load_campaign(toml)
+except ConfigError as refused:
+    assert "tool_server_call_bound_s" in str(refused)  # the old key is refused, naming the new one
+else:
+    raise AssertionError("the old key was read")
 shutil.rmtree(bounded)
 ```
 
