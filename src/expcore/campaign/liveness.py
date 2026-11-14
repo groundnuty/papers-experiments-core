@@ -19,21 +19,37 @@ answers for a token:
   cannot read, or names no attempt (a hold taken outside a campaign) and its process still runs;
 - None: the process's liveness cannot be read.
 
-The scheduler registers its store when it opens (`register`) and takes it back when it closes (`unregister`).
+The scheduler registers its store when it opens (`register`) and takes it back when it closes (`unregister`). A hold
+taken inside an attempt may ask to be let go when the attempt ends (`on_end`), so a hold its taker dropped does not
+outlive the attempt, in this process or for a reader in another.
 """
 
 import contextlib
+import logging
 import os
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.campaign.lease import process_gone, process_owner
 
+log = logging.getLogger(__name__)
+
 LIVE, ENDED = "live", "ended"
-_CURRENT: ContextVar[dict[str, Any] | None] = ContextVar("expcore_attempt", default=None)
+
+
+@dataclass
+class _Attempt:
+    """The attempt a context runs: its token, and what to do when it ends."""
+
+    token: dict[str, Any]
+    endings: list[Callable[[], Any]] = field(default_factory=list)
+
+
+_CURRENT: ContextVar[_Attempt | None] = ContextVar("expcore_attempt", default=None)
 _LOCK = threading.Lock()
 _CAMPAIGNS: dict[str, Callable[[int], str | None]] = {}  # campaign key -> the state of an attempt row, by its id
 _OWNER: tuple[int, str] | None = None  # (pid, process_owner()) of this process, read once per pid
@@ -65,20 +81,35 @@ def unregister(key: str) -> None:
 
 @contextlib.contextmanager
 def running(campaign: str, attempt_id: int) -> Iterator[dict[str, Any]]:
-    """Run the body as the attempt with this row id in the campaign registered under `campaign`."""
-    token = {"process": this_process(), "campaign": campaign, "attempt_id": attempt_id}
-    reset = _CURRENT.set(token)
+    """Run the body as the attempt with this row id in the campaign registered under `campaign`; once it ends, call
+    what `on_end` was given inside it, last first. A call that raises is logged and the others still run."""
+    attempt = _Attempt({"process": this_process(), "campaign": campaign, "attempt_id": attempt_id})
+    reset = _CURRENT.set(attempt)
     try:
-        yield token
+        yield dict(attempt.token)
     finally:
         _CURRENT.reset(reset)
+        for ending in reversed(attempt.endings):
+            try:
+                ending()
+            except Exception:  # one hold that cannot be let go must not keep the others
+                log.exception("letting go of a hold at the end of attempt %s", attempt_id)
+
+
+def on_end(ending: Callable[[], Any]) -> bool:
+    """Call `ending` when the attempt this context runs ends; False, and nothing is kept, outside an attempt."""
+    attempt = _CURRENT.get()
+    if attempt is None:
+        return False
+    attempt.endings.append(ending)
+    return True
 
 
 def current() -> dict[str, Any] | None:
     """The token of the attempt this context runs, or None outside an attempt (a pre-run check, the dispatcher's own
     check, a script beside the campaign)."""
-    token = _CURRENT.get()
-    return dict(token) if token is not None else None
+    attempt = _CURRENT.get()
+    return dict(attempt.token) if attempt is not None else None
 
 
 def owner() -> dict[str, Any]:
@@ -119,4 +150,4 @@ def state(token: Any) -> str | None:
     return LIVE if gone is False else None
 
 
-__all__ = ["ENDED", "LIVE", "current", "owner", "register", "running", "state", "this_process", "unregister"]
+__all__ = ["ENDED", "LIVE", "current", "on_end", "owner", "register", "running", "state", "this_process", "unregister"]

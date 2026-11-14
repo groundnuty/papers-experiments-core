@@ -376,6 +376,10 @@ class AttemptRunner:
             elif not health.ok and outage is not None:
                 result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
                 p.health.note_discard(outage, result.input_tokens, result.output_tokens)
+            elif not health.ok and not health.charge:  # a failure another attempt left: overlapped, never charged
+                result = dataclasses.replace(result, outage_kind=p.settings.health_kind)
+                text = f"{key}: {health.detail}; set aside as overlapped by a failure another attempt left, uncharged"
+                p.store.event(p.stamp(), "post_run_check_failed", model, text)
             elif not health.ok and not result.outcome.set_aside:
                 text = f"post-run health check failed: {health.detail}"
                 result = dataclasses.replace(

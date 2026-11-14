@@ -46,12 +46,13 @@ that exits when blocked stops instead of waiting on a holder that may never let 
 by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
 
 **A failure an earlier attempt left charges no one.** A platform answers `Health(False, detail, charge=False)` for a
-failure it knows an earlier attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
+failure it knows another attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
 that ended without its reset, left not whole): the pre-run check that finds it closes the gate as any failure does, so
 every run is held until a check passes, but it holds its own run too (`hold`) instead of charging it the outage's one
 attempt, and the outage's record says `"charged": false`. The flag rides on a deferral as well: a deferral past its
-bound then closes the gate blocking without charging the run that found it. A post-run check is judged as before,
-whatever the flag.
+bound then closes the gate blocking without charging the run that found it. A post-run check that fails so sets the
+attempt aside as one an outage overlapped (`outage_discarded`, never charged), since the failure is not its own; a
+platform answers `charge=True` for a failure the judged attempt left itself.
 
 **Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
 admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after

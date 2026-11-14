@@ -67,7 +67,7 @@ from typing import Any
 
 from expcore.errors import InfraError
 from expcore_onedata.ingestbase import FAILURES, Baseline, RestoreFailed, detail
-from expcore_onedata.ingesthealth import OPEN, WHOLE
+from expcore_onedata.ingesthealth import OPEN
 from expcore_onedata.ingestplan import PREALLOCATED, IngestPlan, Step
 from expcore_onedata.ingestsparse import BaselineNotWhole, SparseBaseline
 from expcore_onedata.provision import Provisioner, ProvisionError
@@ -268,7 +268,7 @@ class ProgressiveIngest:
             files = error.files if isinstance(error, RestoreFailed) else None
             return {"ok": False, "error": type(error).__name__, "detail": detail(error), "files": files}
         if self._marks is not None:
-            self._marks.marks.mark(WHOLE, "start")
+            self._marks.marks.whole("start")
         return {"ok": True, "files": files}
 
     # -- the schedule --------------------------------------------------------------------------------------------------
@@ -394,7 +394,7 @@ class ProgressiveIngest:
             ) from None
         self._restore = {"ok": True, "seconds": round(self._p.clock() - began, 3), "files": self._restored(files)}
         if self._marks is not None:
-            self._marks.marks.mark(WHOLE, "restore")
+            self._marks.marks.whole("restore")
         return self._restore
 
     def recover(self) -> dict[str, Any]:
@@ -432,7 +432,7 @@ class ProgressiveIngest:
                 f"{self._p.where}the progressive ingest could not recover the baseline: {detail(error)}"[:600],
             ) from None
         if self._marks is not None:
-            self._marks.marks.mark(WHOLE, "recover")
+            self._marks.marks.whole("recover")
         return files, round(self._p.clock() - began, 3)
 
     def _restored(self, files: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
