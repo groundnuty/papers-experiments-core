@@ -516,6 +516,33 @@ def test_o44_the_journal_and_its_directories_are_made_durable_when_the_first_lin
     assert synced[first + 1] == journal.parent  # the new journal's own entry, before anything is removed
     ingest.at_first_turn({"clock_s": 0.0})
     ingest.finish()
-    later = synced[first + 2 :]
-    assert later.count(journal.parent) == 0  # no later line creates anything
+    assert synced.count(journal.parent) == 1  # no later line syncs it again
     assert last_marks(journal)["spaces[0]"]["state"] == "whole"
+
+
+def test_o44_an_instruments_first_line_makes_the_journals_whole_path_durable_even_when_the_journal_exists(
+    provisioner, config, fake, tmp_path, monkeypatch
+):
+    """O44: a writer killed after it pushed its first line to disk, and before it synced the journal's directory, left
+    a journal whose entry may still be lost in a host crash, and one killed in the middle of creating the directories
+    left them so too. Each instrument's first line therefore syncs the journal's directory and every one above it,
+    before the step it announces, whether or not the journal existed; its later lines sync no directory."""
+    journal = tmp_path / "left" / "journal.jsonl"
+    journal.parent.mkdir()
+    journal.write_text("", encoding="utf-8")  # what the killed writer left: the file, its entry perhaps not durable
+    synced = []
+    real = os.fsync
+
+    def fsync(descriptor):
+        synced.append(Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    plan = load_ingest_plan(write_plan(tmp_path, [ROW]), config)
+    ingest = ProgressiveIngest(provisioner, plan, journal=journal, max_wait_s=0.001)
+    ingest.start({})
+    first = synced.index(journal)
+    assert synced[first + 1 : first + 4] == [journal.parent, tmp_path, tmp_path.parent]
+    assert synced[-1] == journal  # the run's own lines sync the journal alone
+    assert journal.parent not in synced[first + 2 :]
+    ingest.stop()

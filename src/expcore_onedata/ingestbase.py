@@ -115,6 +115,7 @@ class Baseline:
         self.lock = threading.Lock()  # the schedule's thread and the caller's both record
         self.ids: list[dict[str, Any]] = []
         self.last_id: dict[str, str] = {}  # label -> the id its file had last, removed or not
+        self._path_durable = False  # this baseline's first line synced the journal's path (`journal`)
 
     # -- the record ------------------------------------------------------------------------------------------------
     def stamp(self) -> dict[str, Any]:
@@ -124,18 +125,21 @@ class Baseline:
     def journal(self, **fields: Any) -> None:
         """Append one line to the journal and push it to disk: an id change must outlive a crash. A last line a crash
         cut short is cut off first, so the new line is never glued to it (readers skip a torn last line, and a mark
-        glued to one would be skipped with it)."""
+        glued to one would be skipped with it). This baseline's first line also syncs the journal's directory and every
+        one above it, whether or not it made them: a writer killed before it synced them, or in the middle of making
+        them, left entries a host crash can still lose, with the journal and its marks."""
         with self.lock:
             make_directories(self._journal.parent)  # each one it makes is durable in its parent
-            created = not self._journal.exists()
             with open(self._journal, "a+b") as handle:
                 _cut_torn_tail(handle)
                 line = json.dumps({"space": self._p.space.position, **fields}, sort_keys=True) + "\n"
                 handle.write(line.encode("utf-8"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            if created:  # the new file's entry too, or a host crash could lose the journal with its marks
-                fsync_directory(self._journal.parent)
+            if not self._path_durable:  # the journal's entry and every directory's above it, whoever made them
+                for directory in (self._journal.parent, *self._journal.parent.parents):
+                    fsync_directory(directory)
+                self._path_durable = True
 
     def read_journal(self) -> None:
         """Take each planned file's last id from the journal, a crashed run's included. A torn last line, which a

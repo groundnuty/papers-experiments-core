@@ -5,9 +5,9 @@ A preallocated start removes each planned file and makes it again with only its 
 first removal and the reset's verified completion the dataset's baseline is not whole: by design while a run is on it,
 and by accident when a start or a reset fails or the process running it dies. The journal says which, as the fault
 injector's journal says whether a provider is down (`fault_journal.py`): a **baseline mark** is a line of the ingest's
-journal, pushed to disk before the step it announces (a new journal's entry, and its directories', included), with the
-space's position, a `state`, the `phase` that wrote it, the plan's hash (`plan`) and the writer (`holder`: its pid and
-boot id, `fault_journal.holder`).
+journal, pushed to disk before the step it announces (with the journal's path, by each instrument's first line), with
+the space's position, a `state`, the `phase` that wrote it, the plan's hash (`plan`) and the writer (`holder`: its pid
+and boot id, `fault_journal.holder`).
 
 - `open`: a start is about to change the baseline (journalled before its first removal, and before the restore it runs
   first), or a run is on it (`phase` `run`). It stays until the reset verifies every file whole.
