@@ -297,19 +297,21 @@ def test_o47_a_redirect_is_never_followed_whatever_the_client_it_was_given_does(
     """O47: a client the caller made follows redirects, but a request of the layer does not: httpx follows one inside
     its send, where a redirect that failed halfway leaves its answers in their cycles with the body of a write, and a
     request that is sent on to another host takes the credential header with it (httpx drops `Authorization` alone). The
-    redirect is the answer, and nothing is sent a second time."""
+    redirect is the answer, which is refused as no result (`test_http_redirects.py`), and nothing is sent a second
+    time."""
     moved = {"Location": "https://elsewhere.test/api/v3/onezone/spaces"}
     client = answering_client(config, lambda request: httpx.Response(307, headers=moved), seen, follow_redirects=True)
     statuses = []
 
     def writes():
         for _ in range(3):
-            statuses.append(
-                client._request("PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE)).status_code
-            )
+            try:
+                client._request("PUT", "/spaces", provider=None, headers={}, content=bytes(SIZE))
+            except PlatformError as refused:
+                statuses.append((refused.status, refused.transport))
 
     held, lingering = measured(None, seen, writes)
-    assert statuses == [307] * 3
+    assert statuses == [(307, False)] * 3
     assert lingering == 0
     assert len(seen) == 6  # three writes, each sent once
     assert held < SLACK

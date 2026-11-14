@@ -78,7 +78,12 @@ send, a redirect it cannot parse or a hook that raises, is found in the frames t
 (`_release_stranded`). No error holds the httpx error or the answer that caused it: a transport failure is raised after
 its handler has ended, so the `PlatformError` has no `__context__`. The client keeps no answer, request or body, and
 follows no redirect, whatever the HTTP client it was given does: httpx follows one inside its send, and takes the
-`X-Auth-Token` header along to another host (it drops `Authorization` alone); a 3xx answer is the answer.
+`X-Auth-Token` header along to another host (it drops `Authorization` alone). A 3xx answer is therefore the answer the
+client gets, and it is never a result: a bodyless one would decode to `{}`, an empty success, a false pass for a write
+as much as for a read. Every 3xx, on every path (`_request` through `_checked`, `_stream_range` and `content_answer`
+through `_streamed`), is a `PlatformError` that names the status and whether a `Location` came, never its value
+(`_refuse_redirect`). It is raised after the answer is released, as an answer, not a transport failure, so it is
+retried by no policy: the GET retry takes only a timeout, which raises, and a probe retries only `transport`.
 
 What none of this reaches is an HTTP client the caller injected whose hooks, authentication flow or transport keep a
 reference of their own to an answer or a request, and a cycle inside httpx or httpcore that no answer the client holds
@@ -478,7 +483,8 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
     and leaves it in its cycle with the request and the body sent. So the request is built and sent here, streamed, and
     its body read in the open. A redirect is never followed, whatever the client was built to do: httpx follows one
     inside `send`, and a redirect that failed halfway leaves its answers in their cycles out of reach, and a request of
-    the layer goes where its configuration says and nowhere else, with the credential header it carries (O09)."""
+    the layer goes where its configuration says and nowhere else, with the credential header it carries (O09). A 3xx
+    answer is returned like any other, released, and refused by `_checked` (`_refuse_redirect`)."""
     request = http.build_request(method, url, **options)
     sent = int(request.headers.get("Content-Length") or 0)
     try:
@@ -498,13 +504,15 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
 
 @contextmanager
 def _streamed(
-    http: httpx.Client, budget: CollectBudget, url: str, *, headers: Mapping[str, str], timeout: float
+    http: httpx.Client, budget: CollectBudget, url: str, *, headers: Mapping[str, str], timeout: float, label: str
 ) -> Iterator[httpx.Response]:
     """Stream a GET as `http.stream` does, release the answer however the block ends, an error in it included, so that
     an answer never read to its end is freed as soon as one that was, and count the bytes it delivered (#259, O47).
 
     The request is sent here, as `_exchange` sends one, so that an answer httpx fails on inside its send can be found
-    and released, which `http.stream` leaves to its caller who never holds it."""
+    and released, which `http.stream` leaves to its caller who never holds it. A 3xx answer is refused here, before
+    the block is entered, so that no caller of a streamed answer can take one for a result, and it is released as any
+    other (`_refuse_redirect`); its body, which is never read, may name a credential or a host."""
     request = http.build_request("GET", url, headers=headers, timeout=timeout)
     try:
         response = http.send(request, stream=True, follow_redirects=False)
@@ -512,6 +520,7 @@ def _streamed(
         budget.spent(_release_stranded(error, request))
         raise
     try:
+        _refuse_redirect(response, "GET", label)
         yield response
     finally:
         try:
@@ -585,8 +594,27 @@ def _answered(label: str, method: str, status: int, code: str | None, errno: str
     return f"{label}: {method} answered {status}" + (f" ({shown})" if shown else "")
 
 
+def _refuse_redirect(response: httpx.Response, method: str, label: str) -> None:
+    """Raise the PlatformError of a 3xx answer, whatever its status, and return for any other.
+
+    The client follows no redirect, so a 3xx is the answer it gets, and a bodyless one decodes to `{}`: an empty
+    success, a false pass for a write as much as for a read. None is taken for a result, a 304 included, since the
+    client sends no validator that would earn one. The error names the status, and says whether the answer names a
+    `Location`, never what it names or what its body holds, which may carry a host or a credential. It is an answer, not
+    a transport failure, so a caller that retries on a timeout, or on `transport`, does not retry it."""
+    status = response.status_code
+    if 300 <= status < 400:
+        named = " (it names a Location)" if "location" in response.headers else ""
+        raise PlatformError(
+            f"{label}: {method} answered {status}, which is neither followed nor taken for a result{named}",
+            status=status,
+        )
+
+
 def _checked(response: httpx.Response, method: str, label: str) -> httpx.Response:
-    """Return an answer whose status is below 400, and raise the PlatformError of one that is not."""
+    """Return an answer whose status is below 300, and raise the PlatformError of one that is a 3xx
+    (`_refuse_redirect`) or a 400 or more."""
+    _refuse_redirect(response, method, label)
     if response.status_code >= 400:
         code, errno = _error_fields(response)
         raise PlatformError(
@@ -810,12 +838,13 @@ class OnezoneClient:
         deadline_s: float | None = None,
         fresh: bool = False,
     ) -> httpx.Response:
-        """Send one request and return the answer; a transport failure or a status of 400 or more is a PlatformError.
+        """Send one request and return the answer; a transport failure or a status of 300 or more is a PlatformError.
 
         A transport failure (a reset, a refusal, a timeout) has `transport` set and a real answer has its status, so
-        a caller that retries can tell the two apart (O08). Only a GET under a policy of more than one attempt is
-        retried, and only when it timed out (`readretry.py`); anything else is sent once. With `fresh` the request,
-        sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
+        a caller that retries can tell the two apart (O08). A 3xx is a real answer, refused with its status as a 400 or
+        more is: the client follows no redirect, and one is no result (`_refuse_redirect`). Only a GET under a policy of
+        more than one attempt is retried, and only when it timed out (`readretry.py`); anything else is sent once. With
+        `fresh` the request, sent once, goes on a connection of its own, as a retry does, when the client owns its pool.
         """
         base, label = self._base(provider)
         url = base + _check_path(path)
@@ -1520,7 +1549,12 @@ class OnezoneClient:
         self._budget.before_exchange()
         try:
             with _streamed(
-                self._http, self._budget, url, headers={**self._admin, "Range": f"bytes={first}-{last}"}, timeout=wait
+                self._http,
+                self._budget,
+                url,
+                headers={**self._admin, "Range": f"bytes={first}-{last}"},
+                timeout=wait,
+                label=label,
             ) as response:
                 status = response.status_code
                 if status >= 400:
@@ -1557,7 +1591,7 @@ class OnezoneClient:
         The body is never read: the answer is closed once its head has arrived, so a large file costs nothing. It passes
         the same gate as `read_range`, since a read through a provider that lacks the bytes fetches them: the path must
         be `/data/{id}/content` and the file's space must have a configured prefix, or nothing is sent. A transport
-        failure or a status of 400 or more is a `PlatformError`. The pre-campaign check is its caller (O05).
+        failure, a 3xx or a status of 400 or more is a `PlatformError`. The pre-campaign check is its caller (O05).
         """
         parts = _plain(path)
         if len(parts) != 4 or parts[1] != "data" or parts[3] != "content":
@@ -1574,6 +1608,7 @@ class OnezoneClient:
                 base + path,
                 headers=headers,
                 timeout=timeout_s if timeout_s is not None else self._timeout_s,
+                label=label,
             ) as response:
                 status, content_type = response.status_code, response.headers.get("Content-Type")
                 code, errno = (None, None)
