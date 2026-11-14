@@ -8,6 +8,7 @@ tool-server hangs must not also cap every cell at it, or change what the model i
 
 from loop_support import FakeProvider, hangs_until_its_bound, slow, stalls
 
+from expcore.loop.toolbox import ToolBox
 from expcore.models.adapters import StubAdapter
 
 
@@ -108,3 +109,29 @@ def test_l17_the_record_names_the_tools_the_bound_applies_to_only_when_a_bound_i
     assert declared.config_sha256 != plain.config_sha256
     nobody = run(StubAdapter(["done"]), [code], time_cap_s=300, tool_server_call_bound_s=60)
     assert nobody.config["tool_server_tools"] == []
+
+
+def test_l17_only_a_true_marker_makes_a_provider_a_tool_server(clock):
+    """L17: the marker is read as exactly `True`, so a provider whose `tool_server` is a truthy string, a number or None
+    is no tool server: the bound is never handed to a tool on a loose reading."""
+    for marker in ("yes", 1, None, [True]):
+        provider = FakeProvider({"lookup": slow(clock, 1)})
+        provider.tool_server = marker
+        box = ToolBox([provider], cap_chars=100)
+        assert (box.is_tool_server("lookup"), box.tool_server_names) == (False, [])
+    server = FakeProvider({"lookup": slow(clock, 1)}, tool_server=True)
+    assert ToolBox([server], cap_chars=100).tool_server_names == ["lookup"]
+
+
+def test_l17_a_box_given_the_tool_servers_takes_them_over_its_providers_and_ignores_names_it_lacks():
+    """L17: a replay's box is told by the record which tools were a tool server's, whatever its one provider says, and a
+    name that is no tool of the box is not made one (the record's list then differs from the replay's and diverges)."""
+    server = FakeProvider({"lookup": lambda a: "x"}, tool_server=True)
+    code = FakeProvider({"python": lambda a: "x"})
+    told = ToolBox([server, code], cap_chars=100, tool_servers=["python", "ghost"])
+    assert told.tool_server_names == ["python"]
+    assert told.is_tool_server("python") is True
+    assert told.is_tool_server("lookup") is False
+    assert told.is_tool_server("ghost") is False
+    assert ToolBox([server, code], cap_chars=100, tool_servers=()).tool_server_names == []
+    assert ToolBox([server, code], cap_chars=100).tool_server_names == ["lookup"]
