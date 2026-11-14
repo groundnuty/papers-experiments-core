@@ -183,6 +183,9 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
         )
     except RecordError as exc:
         raise ReplayDivergence("transcript", str(exc)) from None
+    if not any("elapsed_s" in c for c in rec.tool_calls):  # a record written before the field: not filled in (L17)
+        for entry in replayed.tool_calls:
+            entry.pop("elapsed_s", None)
     for entry in replayed.tool_calls:  # the replay's own copy: a call served as recorded stays marked as such
         if entry["call_id"] in {c["call_id"] for c in rec.tool_calls if not c.get("rendering_verified", True)}:
             entry["rendering_verified"] = False

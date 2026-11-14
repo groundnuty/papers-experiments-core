@@ -344,7 +344,8 @@ class CallTimedOut(InfraError):
     It is its own class so that a caller that bounds a call itself, as the day-0 outage check does, can tell the bound's
     expiry from a server that closed or failed, and so that the loop can tell it from a failure it has no other
     explanation for: inside the loop the bound is the agent's time left, so an expiry that arrives with the agent's
-    time used up is the loop's own cut and is judged as one (`Watcher`). `tool` and `bound_s` are what the detail says.
+    time used up is the loop's own cut and is judged as one (`Watcher`), unless the study declared a per-call bound
+    (L17) and it is the shorter, which is then the call's own failure. `tool` and `bound_s` are what the detail says.
     """
 
     def __init__(self, tool: str, bound_s: float):
