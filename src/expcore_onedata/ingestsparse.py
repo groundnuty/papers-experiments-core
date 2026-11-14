@@ -328,6 +328,7 @@ class SparseBaseline(Baseline):
         done = {}
         for provider in planned.replicas:
             whole = {plain(file_id): [(0, planned.size)]}
+            self._p.await_visible(provider, [file_id])  # `visible_on` may leave the mirror out of the restore's wait
             if uncovered(self._p.blocks(file_id, provider, retry=self._p.retry), whole[file_id]):
                 self._p.replicate_file(file_id, planned.size, provider)  # NotPlaced unless the map then covers it
                 action = "replicated"

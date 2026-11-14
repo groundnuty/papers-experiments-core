@@ -421,3 +421,24 @@ def test_o44_a_recovery_is_refused_while_another_live_process_holds_the_baseline
     finally:
         alive.kill()
         alive.wait()
+
+
+def test_o44_a_journal_line_a_crash_cut_short_is_cut_off_before_the_next_line_is_written(make, fake, tmp_path, ticker):
+    """O44: a crash in the middle of a journal write leaves a torn last line. The next line written cuts it off first,
+    so no mark is ever glued to it: the journal stays readable, line by line, and its last mark is the one written."""
+    first = make(ROW)
+    first.start({})
+    first.at_first_turn({"clock_s": 0.0})
+    first.finish()
+    journal = tmp_path / "journal.jsonl"
+    with open(journal, "a", encoding="utf-8") as handle:
+        handle.write('{"space": "spaces[0]", "entry": "id", "lab')  # the process died while writing this
+    again = make(ROW)
+    again.start({})
+    lines = journal.read_text(encoding="utf-8").splitlines()
+    assert all(isinstance(json.loads(line), dict) for line in lines)
+    assert (mark_of(tmp_path)["state"], mark_of(tmp_path)["phase"]) == ("open", "run")
+    again.at_first_turn({"clock_s": 0.0})
+    again.finish()
+    again.check()
+    assert mark_of(tmp_path)["state"] == "whole"

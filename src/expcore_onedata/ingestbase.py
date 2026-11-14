@@ -18,10 +18,10 @@ provider answers its old entry absent. 25.0 was measured to delete a directory a
 when a name is deleted and recreated at once (#29); the wait is applied to every removed file as a precaution.
 
 **Every id change is recorded** (`Baseline.ids`) and journalled: a JSON-lines file kept across runs, each line pushed to
-disk before the next step, so the ids of a run whose record was lost can still be mapped to files. An id event holds
-the file's label, what happened (`removed`, `created`, `restored`), the phase, the old and the new id, the clock and the
-file's mtime and ctime as the data provider gives them (None when it gives none; `attributes_ok` false when they could
-not be read).
+disk before the next step (a last line a crash cut short is cut off before the next is written), so the ids of a run
+whose record was lost can still be mapped to files. An id event holds the file's label, what happened (`removed`,
+`created`, `restored`), the phase, the old and the new id, the clock and the file's mtime and ctime as the data provider
+gives them (None when it gives none; `attributes_ok` false when they could not be read).
 """
 
 import hashlib
@@ -69,6 +69,22 @@ def plain(file_id: str) -> str:
     return file_id
 
 
+def _cut_torn_tail(handle: Any) -> None:
+    """Cut off a last line without its newline, which a crash in the middle of an append leaves, and push the cut to
+    disk; the handle is the journal opened for appending and reading, in bytes."""
+    end = handle.seek(0, os.SEEK_END)
+    if end == 0:
+        return
+    handle.seek(end - 1)
+    if handle.read(1) == b"\n":
+        return
+    handle.seek(0)
+    kept = handle.read().rfind(b"\n") + 1
+    handle.truncate(kept)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 class RestoreFailed(ProvisionError):
     """Some planned files could not be brought back to their baseline; every other one was. `files` holds each file's
     result by label, a failed one as `{"ok": False, "error", "detail"}`."""
@@ -96,10 +112,14 @@ class Baseline:
         return {"clock": round(self._p.clock(), 3), "utc": utc(self._now())}
 
     def journal(self, **fields: Any) -> None:
-        """Append one line to the journal and push it to disk: an id change must outlive a crash."""
+        """Append one line to the journal and push it to disk: an id change must outlive a crash. A last line a crash
+        cut short is cut off first, so the new line is never glued to it (readers skip a torn last line, and a mark
+        glued to one would be skipped with it)."""
         self._journal.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock, open(self._journal, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"space": self._p.space.position, **fields}, sort_keys=True) + "\n")
+        with self.lock, open(self._journal, "a+b") as handle:
+            _cut_torn_tail(handle)
+            line = json.dumps({"space": self._p.space.position, **fields}, sort_keys=True) + "\n"
+            handle.write(line.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
 

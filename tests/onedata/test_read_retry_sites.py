@@ -213,6 +213,7 @@ HELPER_USERS = {
         "provisioner.read_file",
         "provisioner.mutate",
         "provisioner.replicate_file",  # the reset's replica of a completed file
+        "provisioner.await_visible",  # the mirror sees the completed file before its block map is read
     },
     "ingestbase.py": {
         "provisioner.resolve",
