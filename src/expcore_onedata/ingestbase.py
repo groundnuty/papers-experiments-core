@@ -137,7 +137,8 @@ class Baseline:
                 handle.flush()
                 os.fsync(handle.fileno())
             if not self._path_durable:  # the journal's entry and every directory's above it, whoever made them
-                for directory in (self._journal.parent, *self._journal.parent.parents):
+                here = self._journal.parent.resolve()  # a relative journal's working directory and its parents too
+                for directory in (here, *here.parents):
                     fsync_directory(directory)
                 self._path_durable = True
 

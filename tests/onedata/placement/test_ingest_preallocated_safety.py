@@ -546,3 +546,28 @@ def test_o44_an_instruments_first_line_makes_the_journals_whole_path_durable_eve
     assert synced[-1] == journal  # the run's own lines sync the journal alone
     assert journal.parent not in synced[first + 2 :]
     ingest.stop()
+
+
+def test_o44_a_relative_journal_path_is_resolved_before_its_directories_are_synced(
+    provisioner, config, fake, tmp_path, monkeypatch
+):
+    """O44: a journal named relative to the working directory: its path is resolved before the directories above it
+    are walked, so the working directory and every one above it are synced too, not only the relative path's parts."""
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    synced = []
+    real = os.fsync
+
+    def fsync(descriptor):
+        synced.append(Path(os.readlink(f"/proc/self/fd/{descriptor}")))
+        real(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    plan = load_ingest_plan(write_plan(tmp_path, [ROW]), config)
+    ingest = ProgressiveIngest(provisioner, plan, journal="state/journal.jsonl", max_wait_s=0.001)
+    ingest.start({})
+    journal = work / "state" / "journal.jsonl"
+    first = synced.index(journal)
+    assert synced[first + 1 : first + 5] == [work / "state", work, tmp_path, tmp_path.parent]
+    ingest.stop()
