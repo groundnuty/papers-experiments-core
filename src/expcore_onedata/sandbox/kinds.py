@@ -73,7 +73,7 @@ register_infra_kind(
     treatable=False,
 )
 PROVIDER_OUTAGE = "provider_outage"
-register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable")
+register_infra_kind(PROVIDER_OUTAGE, "a provider of the federation was unavailable", requires_target=True)
 register_infra_kind(INJECTOR_FAILURE, "the fault injector could not inject, clear or verify its fault", treatable=False)
 
 INGEST_FAILURE = "ingest_failure"

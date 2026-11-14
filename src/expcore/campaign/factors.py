@@ -85,7 +85,7 @@ from typing import Any
 from urllib.parse import quote
 
 from expcore.config.loading import Section, load_toml
-from expcore.errors import TARGET_LABEL, vocabulary
+from expcore.errors import TARGET_LABEL, treatment_vocabulary
 
 BUILTIN_FACTORS = ("task", "model", "seed")
 TREATMENT_KEY = "infrastructure_is_treatment"
@@ -239,7 +239,8 @@ class FactorSchema:
         A table entry's target goes into `treatment_targets`, by condition and kind.
         """
         out: dict[str, tuple[str, ...]] = dict.fromkeys(self.conditions, ())
-        known, untreatable = vocabulary()  # one view for the whole schema: a scope leaving cannot split two reads
+        # one view for the whole schema: a scope leaving cannot split two reads
+        known, untreatable, targeted = treatment_vocabulary()
         for name, entries in declared.items():
             if name not in self.conditions:
                 raise Section({}, self.file, "[conditions]").fail(name, f"declares {TREATMENT_KEY} but is no condition")
@@ -262,6 +263,15 @@ class FactorSchema:
             repeated = sorted({k for k in kinds if kinds.count(k) > 1})
             if repeated:
                 raise where.fail(TREATMENT_KEY, f"repeats {', '.join(map(repr, repeated))}")
+            for kind in kinds:
+                if kind in targeted and kind not in targets:
+                    raise where.fail(
+                        TREATMENT_KEY,
+                        f"declares infrastructure kind {kind!r} with no target; a condition whose treatment is "
+                        f"{kind!r} must say which target it manipulates, or any target's failure would be scored as "
+                        f'its treatment: write {{ kind = "{kind}", target = "providers[1]" }}, the position label of '
+                        "that target in the platform's configuration",
+                    )
             out[name] = tuple(sorted(kinds))
             self.treatment_targets[name] = dict(sorted(targets.items()))
         return out

@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.config.models import Limits
-from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable
+from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable, targeted_kinds
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
@@ -526,6 +526,21 @@ def _check_treatment_kinds(kinds: Any) -> None:
         raise RecordError("treatment_kinds: the kinds are written sorted, each once")
 
 
+def check_required_targets(kinds: Collection[str], targets: Mapping[str, Any]) -> None:
+    """Refuse treatment kinds that are a fault on one target (`expcore.errors.targeted_kinds`) with no declared target.
+
+    Such a condition's treatment is the failure of its target while the injector held it down; with none declared the
+    plain kind would score any target's failure as the manipulation, so the record that carries it is refused, when it
+    is built and when it is read back, and never left to `Outcome.is_treatment` alone."""
+    held = targeted_kinds()
+    missing = [kind for kind in kinds if kind in held and kind not in targets]
+    if missing:
+        raise RecordError(
+            f"treatment_kinds: {missing[0]!r} is declared with no target; a condition names the target it manipulates "
+            "in treatment_targets, or any target's failure would be scored as its treatment"
+        )
+
+
 def _check_treatment_targets(targets: Any, kinds: list[str]) -> None:
     """Check the declared targets: each names a declared treatment kind and a position label, written sorted by kind.
 
@@ -637,6 +652,7 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     _check_treatment_kinds(body["treatment_kinds"])
     if "treatment_targets" in body:  # optional, from version 3: absent when the condition declares no target
         _check_treatment_targets(body["treatment_targets"], body["treatment_kinds"])
+    check_required_targets(body["treatment_kinds"], body.get("treatment_targets", {}))
     check_section("outcome", body["outcome"], version, "outcome", schemas)
     for place in ("instruments", "scores"):
         held = body.get(place, {})  # absent from a record of a version that predates it

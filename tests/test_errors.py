@@ -27,6 +27,7 @@ def _isolated_registry(monkeypatch):
     monkeypatch.setattr(errors, "_platform_kinds", {})
     monkeypatch.setattr(errors, "_platform_untreatable", {})
     monkeypatch.setattr(errors, "_platform_uncharged", {})
+    monkeypatch.setattr(errors, "_platform_targeted", {})
     monkeypatch.setattr(errors, "_study_kinds", {})
 
 
@@ -164,6 +165,28 @@ def test_c33_a_platform_kind_registered_as_costing_no_attempt_is_a_hold_that_is_
         register_infra_kind("provider_tampered", "free now", treatable=False, charged=False)
     assert errors.uncharged_kinds() == frozenset({"baseline_held"})
     assert "free_fault" not in infra_kinds()
+
+
+def test_c34_a_platform_kind_registered_as_requiring_a_target_is_listed_and_is_never_made_targetless():
+    """C34: a platform's kind that is a fault on one target (`requires_target=True`) is listed by `targeted_kinds`; a
+    condition that declares it as its treatment must name the target. It cannot be made targetless, or a plain kind
+    targeted, by registering it again, and a kind that is never a treatment names no target to require."""
+    assert errors.targeted_kinds() == frozenset()
+    register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    register_infra_kind("provider_down", "again", requires_target=True)
+    register_infra_kind("relay_flap", "the relay restarted")
+    assert errors.targeted_kinds() == frozenset({"provider_down"})
+    assert is_treatable("provider_down") is True
+    with pytest.raises(ValueError, match="already registered as requiring a target"):
+        register_infra_kind("provider_down", "targetless now")
+    with pytest.raises(ValueError, match="already registered as not requiring a target"):
+        register_infra_kind("relay_flap", "targeted now", requires_target=True)
+    with pytest.raises(ValueError, match="never a treatment, so it names no target"):
+        register_infra_kind(
+            "provider_tampered", "a provider whose state was changed", treatable=False, requires_target=True
+        )
+    assert errors.targeted_kinds() == frozenset({"provider_down"})
+    assert "provider_tampered" not in infra_kinds()
 
 
 def test_c02_a_study_s_own_kinds_hold_only_for_its_scope_however_the_scope_ends():
