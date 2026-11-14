@@ -1210,3 +1210,31 @@ def test_o35_a_links_stuck_recovery_names_the_reading_provider_of_each_failed_pa
     assert f"{RESTORED} reading" not in why
     assert f"{CRASHED} reading" not in why
     assert "on the local provider" not in why
+
+
+def test_o35_a_heal_whose_check_could_not_answer_still_names_the_reading_provider_of_each_failed_pair(tmp_path):
+    """O35: a heal whose own checks raise (the link check could not run) ends `links_stuck` with no pair it read; the
+    recovery's failure still names the reader of each pair the last check that answered found failing, so the remedy
+    it gives always has a provider to name."""
+    services = HealServices()
+    services.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
+
+    def the_heals_checks_raise():
+        if services.checks > 1:  # the restore's own check answers; every one the heal makes raises
+            raise RuntimeError("the probe space cannot be read")
+
+    services.on_check = the_heals_checks_raise
+    injector_, services = injector(tmp_path, services, heal="link")
+    injector_.start(RUN)
+    injector_._unlock()  # the run's process ends with the injection open: the kernel drops its lock on the target
+    platform = tmp_path / "platform.toml"
+    settings = load_faults(platform, load_platform(platform, require_secrets=False))
+    clock = services.clock
+    recovery = Recovery(settings, services, clock=clock, sleep=clock.sleep, labels=SERVICE, wall=clock)
+    with pytest.raises(InfraError) as caught:
+        recovery.recover(heal=True)
+    _, _, why = caught.value.detail.partition("was not cleared (")
+    assert "restart the rtransfer link on the reading provider each failed pair names" in why
+    assert f"{CRASHED}->{READER}" in why  # the last answer, the restore's own check, source -> reader
+    assert f"{CRASHED}->{SECOND}" in why
+    assert services.checks > 1  # the heal did check, and could not read

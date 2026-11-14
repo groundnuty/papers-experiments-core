@@ -46,19 +46,35 @@ def digest(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def unhealed_detail(record: Mapping[str, Any], before: str | None) -> str:
-    """Why a heal left the links stuck, for the restore's failure: the heal's own why (else the check's detail before
-    it), then each pair the heal's last check found failing, named by its reading provider, the one whose link the
-    remedy restarts, and its source, by label (O35, O12)."""
-    why = str(record.get("why") or before)
-    after = record.get("after")
-    pairs = after.get("pairs") if isinstance(after, Mapping) else None
-    failing = [
+def _failing(matrix: Any) -> list[str]:
+    """The failing pairs of a matrix's record (`LinkMatrix.to_json`), each by its reading provider and its source."""
+    pairs = matrix.get("pairs") if isinstance(matrix, Mapping) else None
+    return [
         f"{pair['reader']} reading from {pair['source']}"
         for pair in pairs or ()
         if isinstance(pair, Mapping) and pair.get("ok") is not True
     ]
-    return f"{why}; failing after the heal, by reading provider: {', '.join(failing)}" if failing else why
+
+
+def unhealed_detail(record: Mapping[str, Any], before: str | None) -> str:
+    """Why a heal left the links stuck, for the restore's failure: the heal's own why (else the check's detail before
+    it), then each failing pair, named by its reading provider, the one whose link the remedy restarts, and its source,
+    by label (O35, O12). The pairs are those of the heal's last check; when that check could not run (a matrix with no
+    pair), those of the latest check the heal made that answered, and when none did, the check's detail before the
+    heal, so the failure always names the readers the last answer found failing."""
+    why = str(record.get("why") or before)
+    failing = _failing(record.get("after"))
+    if failing:
+        return f"{why}; failing after the heal, by reading provider: {', '.join(failing)}"
+    actions = record.get("actions")
+    earlier = [action.get("matrix_after") for action in reversed(actions or ()) if isinstance(action, Mapping)]
+    for matrix in (*earlier, record.get("before")):
+        failing = _failing(matrix)
+        if failing:  # the last check the heal made could not run: the latest that answered
+            return f"{why}; failing at the heal's last check that answered, by reading provider: {', '.join(failing)}"
+    if before and before != why:  # no check of the heal answered: what the restore's own check found
+        return f"{why}; the last check that answered, before the heal, found: {before}"
+    return why
 
 
 class LinkSettling:
