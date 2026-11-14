@@ -45,6 +45,7 @@ import contextlib
 import hashlib
 import logging
 import math
+import re
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple, Protocol
@@ -80,6 +81,8 @@ class FaultDriver(Protocol):
 
 log = logging.getLogger(__name__)
 
+_WORD = re.compile(r"[A-Za-z_]{1,40}")  # how a settling ended, as a word: nothing else goes into a message
+
 _WHY = {  # how a settling failed, in words, where the bare word would not say it
     "serves_unconfigured": "its service has no provider declared in [faults.services], so no read can show it serving",
     "links_stuck": (
@@ -107,6 +110,38 @@ def digest(identity: str) -> str:
 def failure(detail: str, target: str | None = None) -> InfraError:
     """The injector's own failure, which no condition may declare as its treatment."""
     return InfraError(INJECTOR_FAILURE, detail, target=target)
+
+
+class RestoreNotVerified(InfraError):
+    """A provider the injector took down was not shown restored: its identity did not change to a running one, or it
+    did not serve within the bound, so the injection stays open in the journal and the federation is not in its
+    baseline state (O11). An `InfraError` of the injector's own, untreatable kind `injector_failure`, naming the
+    provider by its label (O12).
+
+    `how` is the word the settling ended with (`not_serving`, `identity_unchanged`, `start_failed`, ...), and
+    `identity_changed` and `serving` are what was checked: whether the provider runs with an identity other than the
+    one read before the injection, and whether it then served. `still_open` is whether the injection is still open in
+    the journal, which makes the health gate and the next start refuse the provider until a later clear verifies it.
+    The detail holds these and the label, never a service name, a path or a token.
+    """
+
+    def __init__(
+        self, target: str, how: str, *, identity_changed: bool, serving: bool, still_open: bool = True
+    ) -> None:
+        self.how = how if _WORD.fullmatch(how) else "failed"
+        self.identity_changed, self.serving, self.still_open = identity_changed, serving, still_open
+        checked = (
+            f"its identity {'changed' if identity_changed else 'did not change to a running one'} and it "
+            f"{'served' if serving else 'did not serve'}"
+        )
+        left = (
+            "the injection stays open in the journal, so the health gate and the next start refuse it until a later "
+            "clear, finish or start verifies it"
+            if still_open
+            else "the injection is closed in the journal"
+        )
+        detail = f"the restore of {target} is not verified ({self.how}): {checked}; {left}"
+        super().__init__(INJECTOR_FAILURE, detail, target=target)
 
 
 class Recovery:
