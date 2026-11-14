@@ -82,6 +82,26 @@ def test_c33_a_pre_run_check_that_charges_no_one_closes_the_gate_and_holds_every
         assert "no run is charged, this one included" in closed
 
 
+def test_c33_a_post_run_check_that_charges_no_one_sets_its_attempt_aside_uncharged(tmp_path, held_kind):
+    """C33: the run's post-run check fails for a failure another attempt left (`charge=False`): its attempt, a held
+    start or a finished run alike, is set aside as one an outage overlapped and never charged, and the run goes again;
+    a post-run failure that charges, the attempt's own, is charged as before."""
+    left = Health(False, "a baseline another attempt left not whole", charge=False)
+    own = Health(False, "this attempt's own reset failed")
+    check = Answers(Health(True, "fine"), left, Health(True, "fine"), left, Health(True, "fine"), own)
+    executor = FakeExecutor({ONE_KEY: [("raise_infra", held_kind), "finish", "finish"]})
+    settings = settings_for(max_attempts=3)
+    with build(tmp_path, schema=ONE, executor=executor, plan=SMALL, health=check, settings=settings) as scheduler:
+        scheduler.run()
+        assert attempts_of(scheduler.store, ONE_KEY)[:3] == [
+            ("outage_discarded", 0, 1),
+            ("outage_discarded", 0, 1),
+            ("infra_fail", 1, 1),
+        ]
+        texts = [r["detail"] for r in scheduler.store.q("SELECT detail FROM events WHERE kind='post_run_check_failed'")]
+        assert sum("uncharged" in text for text in texts) == 2
+
+
 def test_c33_the_reading_keeps_whether_a_failure_charges_and_a_flag_that_is_not_a_boolean_is_a_failed_check():
     """C33: `charge` is kept through the reading, a plain failure charges as before, and a reading whose flag is not a
     boolean is no reading at all: a failed check, which charges as any does."""

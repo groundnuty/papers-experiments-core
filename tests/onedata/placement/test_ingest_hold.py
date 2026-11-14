@@ -2,6 +2,7 @@
 spinning; a mark no live attempt owns is unhealthy at once, until a recovery (O45). Through the real scheduler, its
 store and the ingest's health check, over the fake federation."""
 
+import gc
 import itertools
 import json
 import subprocess
@@ -85,6 +86,7 @@ def make(provisioner, config, tmp_path, journal):
         built.append(ingest)
         return ingest
 
+    build_one.plan = plan  # for an instrument a test builds, and drops, itself
     yield build_one
     for ingest in built:
         ingest.stop()
@@ -249,3 +251,23 @@ def test_o45_an_attempt_that_ends_without_its_reset_leaves_the_baseline_unhealth
         assert (outage["charged"], outage["how"]) == (False, "check_passed")
     assert last_marks(journal)["spaces[0]"]["state"] == "whole"
     assert fake.held(DAY_PATH, ALPHA_ID) == [[0, len(DAY)]]  # the second run's reset left the day whole
+
+
+def test_o45_an_instrument_dropped_outside_any_attempt_leaves_its_baseline_orphaned_once_collected(
+    provisioner, make, journal
+):
+    """O45: an instrument started outside any campaign attempt keeps the baseline held while it lives, a run in
+    progress; dropped without its reset and collected, its hold is let go, so the baseline reads orphaned though its
+    process runs on, and a recovery brings it back for the next start."""
+    dropped = ProgressiveIngest(provisioner, make.plan, journal=journal, max_wait_s=0.001)
+    dropped.start({})
+    assert baseline_health([journal]).deferred
+    dropped.stop()
+    del dropped
+    gc.collect()
+    health = baseline_health([journal])
+    assert (health.ok, health.deferred, health.charge) == (False, False, False)
+    assert "let its hold go" in health.detail
+    assert make().recover()["ok"]
+    assert baseline_health([journal]).ok
+    make().start({})

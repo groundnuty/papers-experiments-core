@@ -85,6 +85,34 @@ def test_c33_a_token_whose_process_is_gone_reads_ended_and_one_of_another_live_p
         liveness.unregister(campaign)
 
 
+def test_c33_what_an_attempt_was_given_to_do_at_its_end_runs_as_it_ends_and_one_that_raises_keeps_no_other(caplog):
+    """C33: a hold taken inside an attempt is let go as the attempt ends: what `on_end` was given there runs once the
+    body is left, last first, after a failure of the body too, and one that raises is logged while the rest still run;
+    outside an attempt `on_end` keeps nothing."""
+    done: list[str] = []
+    assert liveness.on_end(lambda: done.append("outside")) is False
+
+    def cannot_let_go():
+        raise OSError("cannot let go")
+
+    def body():
+        with liveness.running(campaign, 1):
+            assert liveness.on_end(lambda: done.append("first")) is True
+            assert liveness.on_end(cannot_let_go) is True
+            assert liveness.on_end(lambda: done.append("last")) is True
+            assert done == []
+            raise RuntimeError("the body failed")
+
+    campaign = liveness.register(lambda attempt_id: "running")
+    try:
+        with pytest.raises(RuntimeError, match="the body failed"):
+            body()
+    finally:
+        liveness.unregister(campaign)
+    assert done == ["last", "first"]
+    assert "letting go of a hold" in caplog.text
+
+
 def test_c33_the_executor_and_the_post_run_check_run_inside_the_attempt_and_the_pre_run_check_does_not(tmp_path):
     """C33: the attempt is live from its 'running' row to the store's record of its result: its executor and its
     post-run check see its token, naming its row, and the pre-run check sees none; once the result is stored the token
