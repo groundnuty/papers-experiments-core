@@ -1,4 +1,4 @@
-"""The link check at the end of up (#221): every (local, source) pair transfers before the federation is reported ready.
+"""The link check at the end of up (#221): every ordered (reader, source) pair transfers before the federation is ready.
 
 A provider's rtransfer link to a peer can come up stuck, with nothing logged, and then every read through it hangs.
 Up runs the platform layer's own check (`expcore_onedata.linkcheck.check_links`) through the platform.toml it has just

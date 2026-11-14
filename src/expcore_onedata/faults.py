@@ -145,6 +145,12 @@ await `asyncio.to_thread(injector.start, ...)` bare: cancelled, it leaves the th
 code meant to clear it never runs. `start` and `clear` hold the injector's own lock, so a clear waits for a start still
 running in its thread. `finish_instruments` puts the snapshot into the record and derives its treatment flag again from it.
 
+**Order (C31).** `finish` is the restore, and `finish_instruments` finishes the instruments in the reverse of their
+list. Probes listed after the injector therefore finish before the restore and read the state the outage left; probes
+listed before it finish after the restore. `running` clears when its block exits, so a `finish_instruments` called
+after the block runs after the restore the block's exit made, whatever the order (a restore that was not verified is
+tried again by `finish`, and then the order decides again): call it inside the block for the probes to read first.
+
 **Names (O12).** Outside the driver and the journal the provider is known only by its label: in the snapshot, in every
 message and in every failure. Identities are recorded as SHA-256 digests. The settings are `[faults]` of
 platform.toml (`expcore_onedata.fault_settings`).
@@ -159,7 +165,7 @@ from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any
 
 from expcore.config.loading import ConfigError
-from expcore.errors import InfraError
+from expcore.errors import InfraError, uncharged_kinds
 from expcore.records.injections import FAULT_NAMESPACE
 from expcore_onedata.admission import (
     INJECTOR,
@@ -507,12 +513,16 @@ class FaultInjector:
 
     def _raise_unrestored(self, error: BaseException) -> None:
         """Called after a clear, while `error` is being raised: raise the failure of a restore not verified from
-        `error`, or, when `error` is no `Exception`, attach it as a note and return so that `error` is raised as it was."""
+        `error`, or, when `error` is no `Exception` or is a platform's hold (an `InfraError` of a kind that costs no
+        attempt, C33: an ingest's start its baseline's mark held back), attach it as a note and return so that `error`
+        is raised as it was. A held start costs its run no attempt whatever failed after it; the restore's failure is
+        still in the journal (`clear_failed`), so the health gate fails for it and no run starts on it."""
         with self._mutex:
             failure = self._unrestored()
         if failure is None:
             return
-        if isinstance(error, Exception):
+        held = isinstance(error, InfraError) and error.kind in uncharged_kinds()
+        if isinstance(error, Exception) and not held:
             raise failure from error
         error.add_note(str(failure))
 

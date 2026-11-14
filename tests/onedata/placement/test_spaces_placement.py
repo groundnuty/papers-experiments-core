@@ -255,4 +255,7 @@ def test_o05_the_content_type_check_reads_its_file_in_the_first_space_the_data_p
     health = PlatformHealth(config, client, issuer, clock=ticker.clock, monotonic=ticker.clock, sleep=ticker.sleep)
     assert health().ok
     assert health.links.ok
-    assert [(p.local, p.source) for p in health.links.pairs] == [("providers[0]", "providers[1]")]
+    assert [(p.local, p.source) for p in health.links.pairs] == [
+        ("providers[0]", "providers[1]"),
+        ("providers[1]", "providers[0]"),
+    ]

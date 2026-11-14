@@ -2,11 +2,13 @@
 
     EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_PLATFORM=<root>/platform.toml uv run pytest tests/live/test_link_check.py
 
-It writes one probe per source into the `[link_check]` probe space of platform.toml, a space no agent can see, keeps it
-there, and evicts the local provider's fetched copy afterwards (`EXPCORE_LIVE_MUTATE`); nothing of a study space is
-read or changed. `EXPCORE_LIVE_FACTS_OUT` names a file each check's record is written to, as JSON: pairs by position,
+It writes one probe per ordered pair (a reading provider and a source) into the `[link_check]` probe space of
+platform.toml, a space no agent can see, keeps it there, and evicts the reading provider's fetched copy afterwards
+(`EXPCORE_LIVE_MUTATE`); nothing of a study space is read or changed. Every ordered pair of providers sharing a space is
+checked, not only the local provider's: with three providers that is six probes. `EXPCORE_LIVE_FACTS_OUT` names a file
+each check's record is written to, as JSON: pairs by position,
 seconds, bytes and transfer ids, never a name or a value of the federation. Without the variables nothing is built or
-contacted. It shows what the fake can only assume: that a probe written through a source is fetched through the local
+contacted. It shows what the fake can only assume: that a probe written through a source is fetched through each other
 provider within the bound, that the eviction afterwards and the cold check before the next fetch hold on 25.0, and how
 long each step takes there.
 """

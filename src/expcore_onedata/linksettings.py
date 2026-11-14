@@ -14,9 +14,11 @@ evict_timeout_s = 60            # optional: the bound of an eviction of the prob
 every_s = 600                   # optional: how often the health gate checks the links again during a campaign
 ```
 
-**The pairs** (`link_pairs`) are the local provider and every source a run can fetch from: each provider that
-supports a declared space, other than the local one, which is the same in every space (O03). The link between two
-providers is theirs, whichever space a file lies in, so one probe space tests every pair.
+**The pairs** (`link_pairs`) are every ordered (reading provider, source) pair of two providers that support a declared
+space in common: n·(n-1) of them for n providers sharing a space, 6 for 3 and 20 for 5. The agent's local provider (the
+same in every space, O03) is one reader among them, and a mirror that replicates from another supporter is another:
+a link between two providers that are not the local one carries a study's reads too. The link between two providers is
+theirs, whichever space a file lies in, so one probe space tests every pair.
 
 **The probe space is never a study space.** Its probe files must be where no agent can see them: a space whose id or
 name is a declared space's (`[space]`, or any `[[spaces]]` entry) is refused, since the agent's tokens are scoped to
@@ -25,9 +27,10 @@ the declared spaces. It is a space such as a federation's day-0 space, which no 
 request is bound to it (`OnezoneClient.mutate`'s `space`), and a name that a study space's prefix admits is refused,
 so no study mutation can reach it. The check's transfers stay out of every study space's transfer listing.
 
-**Every pair must be testable.** A probe space that the local provider, or a source, does not support is refused at
-load, naming the provider by its position and the pair it leaves untested. Each refusal names the file and the key,
-never a value (O12).
+**Every pair must be testable.** A probe space that a provider of any pair does not support is refused at load, naming
+the provider by its position and the pair it leaves untested. Every provider of a declared space shares it with the
+local provider, so each is in a pair; one that supports no declared space is in none and may be left out. Each refusal
+names the file and the key, never a value (O12).
 """
 
 import math
@@ -66,13 +69,19 @@ class LinkCheckSettings:
 
 
 def link_pairs(spaces: Sequence[StudySpace], order: Sequence[str]) -> tuple[tuple[str, str], ...]:
-    """Every (local provider, source provider) pair a run can fetch through: the local provider, the same in every
-    space, and each other provider that supports a declared space, once, in the order of `[providers]`."""
-    if not spaces:
-        return ()
-    local = spaces[0].support.local
-    sources = {name for entry in spaces for name in entry.support.providers if name != local}
-    return tuple((local, name) for name in order if name in sources)
+    """Every ordered (reading provider, source provider) pair whose link can carry a read of a declared space: two
+    different providers that support one space in common, each as the reader of the other, in the order of
+    `[providers]` (readers first, then sources). The agent's local provider reads from every other provider that
+    supports a declared space, and a provider that mirrors a space reads from the others of it: replication moves data
+    between any two supporters, so a link between two providers that are not the local one carries a study's reads
+    too (the live slot of 14 Nov 2026, where such a pair stayed stuck unseen)."""
+    return tuple(
+        (reader, source)
+        for reader in order
+        for source in order
+        if reader != source
+        and any(reader in entry.support.providers and source in entry.support.providers for entry in spaces)
+    )
 
 
 def _label(order: Sequence[str], name: str) -> str:
@@ -119,22 +128,22 @@ def _not_a_declared_space(section: Section, space: Space, spaces: Sequence[Study
 def _every_pair_testable(
     section: Section, providers: tuple[str, ...], spaces: Sequence[StudySpace], order: Sequence[str]
 ) -> None:
-    pairs = link_pairs(spaces, order)
     local = spaces[0].support.local
     if local not in providers:
         raise section.fail(
             "providers",
-            f"leaves out the local provider {_label(order, local)}, through which every pair is read: the probe space "
-            "must be supported by it",
+            f"leaves out the local provider {_label(order, local)}, which every pair it is in is read through: the "
+            "probe space must be supported by it",
         )
-    for _, source in pairs:
-        if source not in providers:
-            where = next(e.position for e in spaces if source in e.support.providers)
-            raise section.fail(
-                "providers",
-                f"leaves out {_label(order, source)}, a source of {where}, so the pair {_label(order, local)} <- "
-                f"{_label(order, source)} cannot be tested: the probe space must be supported by it",
-            )
+    for reader, source in link_pairs(spaces, order):
+        for name in (reader, source):
+            if name not in providers:
+                where = next(e.position for e in spaces if name in e.support.providers)
+                raise section.fail(
+                    "providers",
+                    f"leaves out {_label(order, name)}, a supporter of {where}, so the pair {_label(order, reader)} <- "
+                    f"{_label(order, source)} cannot be tested: the probe space must be supported by it",
+                )
 
 
 def load_link_check(
