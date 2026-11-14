@@ -39,9 +39,10 @@ class AfterRestore:
 
     async def after_restore(self, went_down: bool) -> None:
         """Check the restore: cleared and verified by the injector, the target answering, and the reads returning
-        what was written. A provider never seen down needs only to be found as it was (`never_down`). A start whose
-        recovery of an earlier injection failed or left it open (`earlier_injection_open`) is a failure that names
-        the provider by its position, and `outage.provider_outage` runs no later space after it."""
+        what was written. A provider never seen down needs only to be found as it was (`never_down`). A recovery of an
+        earlier injection that failed or left it open (`earlier_injection_open`, before anything was prepared) or a
+        start that did is a failure that names the provider by its position, and `outage.provider_outage` runs no
+        later space after it."""
         restore = self.facts["restore"]
         if restore["how"] == "not_injected":
             return
@@ -50,8 +51,8 @@ class AfterRestore:
                 f"{row['target'] or 'the injection journal'} ({row['how']})" for row in restore["left_open"]
             )
             self.problems.append(
-                "the injector's start could not settle an injection an earlier run left open, so no provider was "
-                f"taken down and one may still be down: {left}"
+                "the injector could not settle an injection an earlier run left open, so nothing was prepared, no "
+                f"provider was taken down and one may still be down: {left}"
             )
             return
         if not restore["cleared"]:
@@ -83,11 +84,24 @@ class AfterRestore:
             "listing": self.reread(lambda: self.cells.listing(self.directory_id, self.expected)),
         }
         if self.plane.mount_path is not None:
-            after["mount_owner_only"] = self.reread(
-                lambda: self.mount_cells("mount", listing=False)["owner_only"] or {"outcome": None},
-                tokens="the re-read through the mount",
-            )
+            after.update(self.mount_rereads())
         return after
+
+    def mount_rereads(self) -> dict[str, Any]:
+        """The mount's two files again after the restore, from one cell per try, until both are served or the settle
+        timeout (`mount_owner_only`, `mount_replicated`). The cell reads both, and each must return what was written: a
+        replicated file that differs or fails after the restore fails the check, as the owner-only one does (#178)."""
+        latest: dict[str, dict[str, Any]] = {}
+
+        def both() -> dict[str, Any]:
+            cells = self.mount_cells("mount", listing=False)
+            latest.update({kind: cells[kind] or {"outcome": None} for kind in KINDS})
+            return next((row for row in latest.values() if row["outcome"] != "served"), latest["owner_only"])
+
+        row = self.reread(both, tokens="the re-read through the mount")
+        if row.get("tokens_ended"):  # neither was read: the tokens' end is the check's own failure
+            return {"mount_owner_only": row, "mount_replicated": row}
+        return {f"mount_{kind}": {**latest[kind], "attempts": row["attempts"]} for kind in KINDS}
 
     def wait_for_target(self) -> bool:
         """Poll the target's REST until it answers, within the settle timeout; record how long it took."""

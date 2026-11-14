@@ -13,6 +13,8 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     alpha = 0.05
     holm_family = ["a-vs-b"]   # the confirmatory contrasts; a preregistration that makes no confirmatory claim (a
                                # pilot) leaves it out and says `exploratory_only = true` instead
+    equivalence_family = ["a-vs-b"]  # optional (S15): members of holm_family with a margin, whose equivalence
+                               # claims are decided by Holm over their two one-sided tests' p-values
 
     [bootstrap]
     replicates = 2000
@@ -48,6 +50,20 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     outcome = "score"
     estimator = "wilcoxon_cluster_bootstrap"
     cluster = "group"
+
+    [contrasts.cost-per-success]   # a ratio contrast (S13): an estimator of the ratio form, two outcomes, a zero rule
+    conditions = ["cond-a", "cond-b"]
+    estimator = "ratio"
+    numerator = "tokens"       # in place of `outcome`
+    denominator = "success"
+    zero_denominator = "exclude"   # or "continuity", with `continuity_correction = 0.5` (required with it, only with it)
+    cluster = "group"              # the independent unit, as for every contrast
+    estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group, the group their mean (S13)
+
+    [descriptives.waited-in-a] # optional, S14: a one-arm estimate, descriptive, never in the Holm family
+    conditions = ["cond-a"]    # one condition or a set of them, pooled
+    outcome = "waited"         # a rate or share; or `numerator` and `denominator` for a ratio of totals
+    cluster = "group"
 """
 
 from __future__ import annotations
@@ -65,13 +81,28 @@ from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
 from expcore.stats import estimators
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
-from expcore.stats.pairing import TREATMENT_OUTCOMES, ContrastSpec
+from expcore.stats.onearm import DescriptiveSpec
+from expcore.stats.pairing import MODEL_KEY, TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
+from expcore.stats.ratio import ZERO_RULES, RatioForm
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
 DEFAULT_TARGET_POWER = 0.8
-_TOP_KEYS = ("alpha", "holm_family", "exploratory_only", "bootstrap", "power", "estimators", "contrasts")
+_TOP_KEYS = (
+    "alpha",
+    "holm_family",
+    "exploratory_only",
+    "equivalence_family",
+    "bootstrap",
+    "power",
+    "estimators",
+    "contrasts",
+    "descriptives",
+)
+_DESCRIPTIVE_KEYS = ("conditions", "cluster", "outcome", "numerator", "denominator")
+# a ratio contrast's keys (S13)
+_RATIO_KEYS = ("numerator", "denominator", "zero_denominator", "continuity_correction", "estimation_unit")
 _CONTRAST_KEYS = (
     "conditions",
     "factor",
@@ -82,6 +113,7 @@ _CONTRAST_KEYS = (
     "equivalence_margin",
     "treatment_outcomes",
     "max_unscored_treatment",
+    *_RATIO_KEYS,
 )
 
 
@@ -127,14 +159,20 @@ class Preregistration:
     estimator_params: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
     schema_digest: str | None = None  # the factor schema the contrasts were validated against
     exploratory_only: bool = False  # no confirmatory claim: no Holm family, every contrast exploratory (S12)
+    equivalence_family: tuple[str, ...] = ()  # contrasts whose equivalence claims Holm adjusts together (S15)
+    descriptives: Mapping[str, DescriptiveSpec] = dataclasses.field(default_factory=dict)  # one-arm estimates (S14)
 
     def __post_init__(self) -> None:
-        """Deep-freeze the contrasts, the family and the estimator parameters into fresh read-only containers; refuse a
-        family beside `exploratory_only`, and neither of them (S12)."""
-        for name in ("contrasts", "holm_family", "estimator_params"):
+        """Deep-freeze the contrasts, the families, the estimator parameters and the one-arm estimates into fresh
+        read-only containers; refuse a family beside `exploratory_only`, and neither of them (S12); and an
+        equivalence family that is not of members of the Holm family with a margin (S15)."""
+        for name in ("contrasts", "holm_family", "estimator_params", "equivalence_family", "descriptives"):
             object.__setattr__(self, name, freeze(getattr(self, name)))
         if self.exploratory_only and self.holm_family:
             raise ValueError("a preregistration with exploratory_only has no Holm family, and this one names one")
+        for name in self.equivalence_family:
+            if name not in self.holm_family or self.contrasts[name].equivalence_margin is None:
+                raise ValueError(f"equivalence family member {name!r} must be in the Holm family and have a margin")
         if not self.exploratory_only and not self.holm_family:
             raise ValueError("a preregistration needs a Holm family, or exploratory_only to make no confirmatory claim")
 
@@ -171,6 +209,14 @@ class Preregistration:
             level=self.bootstrap.ci_level,
             seed=(self.bootstrap.seed, name_digest(spec.name)),
             params=dict(self.estimator_params.get(spec.estimator, {})),
+        )
+
+    def descriptive_settings(self, spec: DescriptiveSpec) -> EstimatorSettings:
+        """The bootstrap a one-arm estimate draws (S14): the contrasts' replicates and level, its own name's seed."""
+        return EstimatorSettings(
+            replicates=self.bootstrap.replicates,
+            level=self.bootstrap.ci_level,
+            seed=(self.bootstrap.seed, name_digest(spec.name)),
         )
 
 
@@ -211,11 +257,102 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
     exploratory_only = _flag(root, "exploratory_only")
     family = () if exploratory_only else _family(root, contrasts)
     _check_family_claims(root, contrasts, family, exploratory_only)
+    equivalence = _equivalence_family(root, contrasts, family, exploratory_only)
     power = _power(_table_section(root, "power")) if "power" in raw else None
     params = {name: _estimator_params(source, name, table) for name, table in _tables(root, "estimators").items()}
+    descriptives = {
+        name: _descriptive(source, name, table, schema, contrasts)
+        for name, table in _tables(root, "descriptives").items()
+    }
     return Preregistration(
-        source, sha256, alpha, bootstrap, contrasts, family, power, params, schema.digest, exploratory_only
+        source,
+        sha256,
+        alpha,
+        bootstrap,
+        contrasts,
+        family,
+        power,
+        params,
+        schema.digest,
+        exploratory_only,
+        equivalence,
+        descriptives,
     )
+
+
+def _equivalence_family(
+    root: Section, contrasts: Mapping[str, ContrastSpec], family: tuple[str, ...], exploratory_only: bool
+) -> tuple[str, ...]:
+    """Read the optional equivalence_family (S15): declared contrasts, each once, each in the Holm family, with an
+    equivalence margin and an estimator that registers a TOST p-value; none beside exploratory_only."""
+    key = "equivalence_family"
+    if key not in root.data:
+        return ()
+    if exploratory_only:
+        raise root.fail(
+            key, "is given with exploratory_only = true, which makes no confirmatory claim, of equivalence or other"
+        )
+    names = root.strings(key)
+    if not names:
+        raise root.fail(
+            key, "is empty: name the contrasts whose equivalence claims Holm adjusts together, or leave it out"
+        )
+    if len(set(names)) != len(names):
+        raise root.fail(key, "names a contrast twice")
+    for name in names:
+        if name not in contrasts:
+            raise root.fail(key, f"names {name!r}, which is not a declared contrast; declared: {', '.join(contrasts)}")
+        spec = contrasts[name]
+        if spec.equivalence_margin is None:
+            raise root.fail(key, f"names {name!r}, which declares no equivalence_margin to be equivalent within")
+        if name not in family:
+            raise root.fail(
+                key,
+                f"names {name!r}, which is not in holm_family: an equivalence claim the family controls is "
+                "confirmatory, so its contrast must be too",
+            )
+        if estimators.tost_function(spec.estimator) is None:
+            raise root.fail(
+                key, f"names {name!r}, whose estimator {spec.estimator!r} registers no TOST p-value (`tost`)"
+            )
+    return names
+
+
+def _descriptive(
+    source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, contrasts: Mapping[str, ContrastSpec]
+) -> DescriptiveSpec:
+    """Read one [descriptives.<name>] table (S14): its conditions, cluster, and an outcome or a numerator and a
+    denominator. Its name may not be a contrast's, which would share its seed and its place in the tables."""
+    section = Section(table, source, f"[descriptives.{name}]")
+    section.reject_unknown(_DESCRIPTIVE_KEYS)
+    if name in contrasts:
+        raise section.fail(None, f"{name!r} is also a contrast's name; a one-arm estimate needs a name of its own")
+    conditions = section.strings("conditions")
+    if not conditions:
+        raise section.fail("conditions", "must name one condition or more")
+    if len(set(conditions)) != len(conditions):
+        raise section.fail("conditions", "must name each condition once")
+    for condition in conditions:
+        if condition not in schema.conditions:
+            raise section.fail(
+                "conditions",
+                f"names unknown condition {condition!r}; the conditions of {schema.file} are: "
+                f"{', '.join(schema.conditions)}",
+            )
+    cluster = section.string("cluster")
+    ratio = [key for key in ("numerator", "denominator") if key in table]
+    if "outcome" in table:
+        if ratio:
+            raise section.fail(
+                ratio[0], "is given with an outcome: give an outcome, or a numerator and a denominator, not both"
+            )
+        return DescriptiveSpec(name, conditions, cluster, outcome=section.string("outcome"))
+    if not ratio:
+        raise section.fail("outcome", "is required: give an outcome, or a numerator and a denominator")
+    numerator, denominator = section.string("numerator"), section.string("denominator")
+    if numerator == denominator:
+        raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+    return DescriptiveSpec(name, conditions, cluster, numerator=numerator, denominator=denominator)
 
 
 def _flag(section: Section, key: str) -> bool:
@@ -364,20 +501,115 @@ def _max_unscored(section: Section, treatment: str | None) -> int:
     return value
 
 
+def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
+    """Read a ratio contrast's numerator, denominator and zero rule (S13); refuse them beside an estimator of one
+    outcome, and an outcome beside an estimator of the ratio form."""
+    if estimators.form(estimator) != "ratio":
+        for key in _RATIO_KEYS:
+            if key in section.data:
+                raise section.fail(
+                    key, f"belongs to a ratio contrast, and estimator {estimator!r} reads one outcome, its `outcome`"
+                )
+        return None
+    if "outcome" in section.data:
+        raise section.fail(
+            "outcome", f"is not read by estimator {estimator!r}, a ratio: name its numerator and denominator instead"
+        )
+    numerator, denominator = section.string("numerator"), section.string("denominator")
+    if numerator == denominator:
+        raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+    rule = section.data.get("zero_denominator")
+    if rule is None:
+        raise section.fail(
+            "zero_denominator",
+            f"is required: a ratio contrast declares what a cluster with a zero sum does, one of "
+            f"{', '.join(map(repr, ZERO_RULES))}",
+        )
+    if rule not in ZERO_RULES:
+        raise section.fail("zero_denominator", f"must be one of {', '.join(map(repr, ZERO_RULES))}, got {rule!r}")
+    correction = None
+    if rule == "continuity":
+        correction = _number(section, "continuity_correction")
+        if correction <= 0:
+            raise section.fail("continuity_correction", f"must be a positive number, got {correction}")
+    elif "continuity_correction" in section.data:
+        raise section.fail("continuity_correction", 'is only for zero_denominator = "continuity"')
+    return RatioForm(numerator, denominator, rule, correction)
+
+
+def _cluster(section: Section) -> str:
+    """Read `cluster`: one task attribute, the independent unit of the contrast. An array is refused, and one that
+    names the model is refused for the reason that matters: the cells of a cluster are not independent (S13)."""
+    value = section.data.get("cluster")
+    if not isinstance(value, list):
+        return section.string("cluster")
+    named = [field for field in value if isinstance(field, str) and field != MODEL_KEY]
+    attribute = named[0] if len(named) == 1 else "<attribute>"
+    reason = (
+        f". The (model, {attribute}) cells of one {attribute} share its response to the treatment, so they are not "
+        "independent of one another, and a test or a bootstrap over them would claim an n the data do not have. A "
+        f'ratio contrast estimated per model\'s cell declares cluster = "{attribute}" with '
+        f'estimation_unit = ["model", "{attribute}"], and is tested over the values of {attribute}; a contrast of one '
+        "outcome already estimates per model's cell and averages the models"
+        if MODEL_KEY in value
+        else ""
+    )
+    raise section.fail(
+        "cluster",
+        "must name one task attribute, the independent unit whose values the test, the bootstrap and the minimum "
+        f"detectable effect count; got an array, {value!r}{reason}",
+    )
+
+
+def _estimation_unit(section: Section, cluster: str, ratio: bool) -> tuple[str, ...] | None:
+    """Read a ratio contrast's `estimation_unit` (S13): the cluster alone, its models pooled in the sums (the default),
+    or "model" beside it, the sums per model's cell; held as (cluster,) or ("model", cluster). None when it is not
+    declared, which is the form's default; the key beside an estimator of one outcome is refused with the ratio keys."""
+    if not ratio or "estimation_unit" not in section.data:
+        return None
+    value = section.data["estimation_unit"]
+    if isinstance(value, str):
+        fields: tuple[str, ...] = (value,)
+    elif isinstance(value, list):
+        fields = section.strings("estimation_unit")
+    else:
+        raise section.fail(
+            "estimation_unit", f'must be an array of the cluster and, beside it, "model", got a {type(value).__name__}'
+        )
+    if len(set(fields)) != len(fields):
+        raise section.fail("estimation_unit", f"names a field twice: {list(fields)}")
+    if set(fields) == {cluster}:
+        return (cluster,)
+    if set(fields) == {MODEL_KEY, cluster}:
+        return (MODEL_KEY, cluster)
+    raise section.fail(
+        "estimation_unit",
+        f'must be ["{cluster}"] or ["model", "{cluster}"]: the cell a ratio\'s sums run over nests in the contrast\'s '
+        f"cluster {cluster!r}, the independent unit, alone (its models pooled) or as each model's cell of it; got "
+        f"{list(fields)}",
+    )
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
     section.reject_unknown(_CONTRAST_KEYS)
-    outcome, estimator, cluster = section.string("outcome"), section.string("estimator"), section.string("cluster")
+    estimator = section.string("estimator")
     try:
         estimators.get(estimator)
     except UnknownEstimator as error:
         raise section.fail("estimator", str(error)) from None
+    form = _ratio_form(section, estimator)
+    cluster = _cluster(section)
+    unit = _estimation_unit(section, cluster, form is not None)
+    outcome = section.string("outcome") if form is None else form.label
     treatment = _treatment_outcomes(section)
     declared = {
         "equivalence_margin": _margin(section, alpha),
         "treatment_outcomes": treatment,
         "max_unscored_treatment": _max_unscored(section, treatment),
+        "ratio": form,
+        "estimation_unit": unit,
     }
     if "conditions" in table:
         for extra in ("factor", "levels"):

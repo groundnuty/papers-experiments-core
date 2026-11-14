@@ -150,33 +150,45 @@ assert relay.accepted_fingerprints == ("fp-northern-deploy", "fp-southern-deploy
 assert study.models.resolve("alpha-stub").accepted_fingerprints == ()  # checked against a baseline, as before
 ```
 
-### Bounding one tool call
+### Bounding a tool server's call
 
-A tool call's only bound in the loop is the agent's time left. A tool server that hangs mid-run therefore waits out the whole cap, and the run is scored as the agent's time cap. If your conditions differ in how many tools they call, such hangs fall on them unevenly and bias the comparison. `[agent] tool_call_bound_s` in `campaign.toml` declares a bound on one call, in seconds: positive and finite, and optional.
+A tool call's only bound in the loop is the agent's time left. A tool server that hangs mid-run therefore waits out the whole cap, and the run is scored as the agent's time cap. If your conditions differ in how many tools they call, such hangs fall on them unevenly and bias the comparison. `[agent] tool_server_call_bound_s` in `campaign.toml` declares a bound on one call to a tool server, in seconds: positive and finite, and optional.
 
-- Each call runs under the shorter of the bound and the agent's time left. A call that outlasts the bound first ends as infrastructure of kind `knowledge` (the tool server did not answer, the message naming the tool and the bound): the attempt is set aside, like any other infrastructure ending, and the agent is not charged. A call that outlasts the time left first is the agent's time cap as before, unless the bound had already passed when the loop cut it: that call hung first, and is `knowledge` infrastructure too.
+- It is for tool servers only. The bound reaches the calls of a provider that is a tool server (an MCP server, `McpToolProvider`), and no other call. A code cell, and any tool that is not a tool server's, is handed the agent's time left whatever you declare: the bound never caps what the agent's code may run for, and the model is told what it is told without the key when a cell runs long. The record's `agent_config.tool_server_tools` lists the tools the bound reached, so you can check that your code tool is not among them.
+- Each call to a tool server runs under the shorter of the bound and the agent's time left. A call that outlasts the bound first ends as infrastructure of kind `knowledge` (the tool server did not answer, the message naming the tool and the bound): the attempt is set aside, like any other infrastructure ending, and the agent is not charged. A call that outlasts the time left first is the agent's time cap as before, unless the bound had already passed when the loop cut it: that call hung first, and is `knowledge` infrastructure too.
 - Pick the bound well above the slowest call that is not a hang, and below the time cap, or it never decides anything. A bound at or above the time cap leaves every call as it was, though it still changes the caps in the fingerprint.
-- It is a bound on wall time, and it reaches the provider as its `timeout_s`. `McpToolProvider` honours it; a function you wrote as a tool must bound itself with the `timeout_s` it is handed, or only the time left will cut it.
+- It is a bound on wall time, and it reaches the tool server as its `timeout_s`. `McpToolProvider` honours it. A tool server of your own that is not an `McpToolProvider` must say `tool_server = True` and bound itself with the `timeout_s` it is handed, or only the time left will cut it.
 - Each call's record has `elapsed_s`, the seconds it took, so you can count hangs and what they cost per condition. A condition that declares `knowledge` as its treatment kind scores such an attempt as a treatment outcome, since the failure is of that kind.
 - Declare it before the campaign starts. The bound is one of the campaign's caps, which are in its fingerprint, and `campaign.toml`'s hash is in it too, so a store that started without the key is not resumed with it: start a new store. A study that never declares it keeps its fingerprint, its configuration and its behaviour.
+- The key was first called `tool_call_bound_s`, and capped every tool call, a code cell too. That key is refused now, with a message naming the new one: drop it, or declare `tool_server_call_bound_s` if a tool server's hang is what you want classified.
 
 ```python
 import shutil
 from pathlib import Path
 
 from expcore.campaign.config import load_campaign
+from expcore.config.loading import ConfigError
 
-assert study.campaign.agent.tool_call_bound_s is None  # the example declares none
-assert "tool_call_bound_s" not in study.campaign.caps()["agent"]  # so its caps are what they were
+assert study.campaign.agent.tool_server_call_bound_s is None  # the example declares none
+assert "tool_server_call_bound_s" not in study.campaign.caps()["agent"]  # so its caps are what they were
 
 bounded = Path("bounded-study")
 shutil.copytree("my-study", bounded)
 toml = bounded / "campaign.toml"
-toml.write_text(toml.read_text().replace("[agent]\n", "[agent]\ntool_call_bound_s = 300\n", 1))
+original = toml.read_text()
+toml.write_text(original.replace("[agent]\n", "[agent]\ntool_server_call_bound_s = 300\n", 1))
 declared = load_campaign(toml)
-assert declared.agent.tool_call_bound_s == 300.0
-assert declared.caps()["agent"]["tool_call_bound_s"] == 300.0
+assert declared.agent.tool_server_call_bound_s == 300.0
+assert declared.caps()["agent"]["tool_server_call_bound_s"] == 300.0
 assert declared.caps() != study.campaign.caps()  # another fingerprint: a store without the bound is not resumed with it
+
+toml.write_text(original.replace("[agent]\n", "[agent]\ntool_call_bound_s = 300\n", 1))
+try:
+    load_campaign(toml)
+except ConfigError as refused:
+    assert "tool_server_call_bound_s" in str(refused)  # the old key is refused, naming the new one
+else:
+    raise AssertionError("the old key was read")
 shutil.rmtree(bounded)
 ```
 
@@ -728,6 +740,12 @@ assert list(cells.cluster_differences) == [0.5, 0.5]  # south: beta-stub has no 
 assert relay["n_clusters"] == len({task.attributes["region"] for task in study.tasks.values()}) == 2
 ```
 
+**An outcome per unit of another.** "Tokens per correct result" is a ratio of sums, not a mean of per-run ratios: a failed run has no ratio of its own, and its tokens still count. A contrast of it names `estimator = "ratio"`, `numerator = "tokens"` and `denominator = "success"` in place of `outcome`, and must declare what a cluster with no correct result does: `zero_denominator = "exclude"` (the cluster leaves the contrast, and its pairs are counted as such in the report) or `zero_denominator = "continuity"` with `continuity_correction = 0.5` (added to both sums of both arms in every cluster). Its pairs are those of any contrast, but they are not averaged: in each cluster, each arm's numerator and denominator are summed over every task, model and seed, so within a cluster each run weighs the same and the models are pooled, and the cluster's value is the natural log of A's ratio over B's. The estimate is the mean of those log ratios, tested and resampled as above; exp of it is how many times A's cost per success is B's, as a geometric mean over clusters.
+
+Pooling the models is a choice of estimand: the pooled ratio leans toward the models that spend the most, and a cluster loses its value only when all its models together have no correct result. A study whose power analysis estimated per (model, instance) cell and inferred over instances declares that estimation unit, and keeps the instance as its cluster: `cluster = "region"` with `estimation_unit = ["model", "region"]`. Each model's cell of a region is then summed over that model's runs alone, the zero rule excludes a cell and counts it with its pairs, and the region's value is the mean of its cells' log ratios, each model weighing the same, as a contrast of one outcome averages its models. The region stays the independent unit: the test, the bootstrap and the minimum detectable effect count regions, a region drops only when every cell of it is lost, and four models on 150 instances are 150 units, not 600. The cells of one region share its response to the treatment, so they are never counted as independent: `cluster = ["model", "region"]` is refused, saying so. `analysis.json` (`estimation_unit`, `independent_unit`, `n_cells`, `cells_lost`) and the report name both units and count the cells, and the report adds each model's estimate over its own cells, an exploratory breakdown. To bound an outcome, declare one ratio contrast per bound, each naming its own `numerator` column (the estimate on the lower-bound tokens, the adverse assignment on the upper-bound ones); each has its own result, and a missing value in one column touches only the contrast that reads it. Its scorer must return the numerator for every run, a failed run's included: a confirmatory ratio contrast that loses a pair because a run's numerator is `None` while its denominator is 0 is refused, since its ratio would then count the cost of the successful runs alone. [The interfaces](interfaces.md#a-ratio-contrast) give the estimand, the zero rule and the outputs in full.
+
+**A rate within one arm.** A descriptive hypothesis, such as "agents rarely wait", needs no contrast: declare a one-arm estimate in `[descriptives.<name>]` with the `conditions` it is over (one, or several pooled), the `cluster`, and an `outcome`, whose mean over the arm's runs is aggregated to clusters as a contrast's differences are; or a `numerator` and a `denominator` for a ratio of their totals, such as queries per placement. It gets an interval from the same cluster bootstrap, and no test: it is in no Holm family and the report shows it apart, as descriptive. Beside every contrast the report also gives each arm's finish rate and the runs it lost by cause, so a comparison made on the runs that finished shows how many of each arm's planned runs that is. [The interfaces](interfaces.md#one-arm-estimates-and-each-arms-runs) give the estimands and the intervals.
+
 ### Unknown platform estimates are data
 
 A study on the Onedata platform reads the run-end platform probes from each record's instruments (`platform_probes`). Per tracked provider, keyed by its position in `platform.toml` (`providers[i]`, never its name, since records are published), they give `gained_bytes` (placement gained: the bytes of the blocks the provider's block map shows at run end that it did not show at run start; what it showed at the start and no longer does is `lost_bytes`, kept apart, so it is not a net change, and it is not bytes on the wire), `transfer_bytes_in` (what the transfers in the run window moved into it), and `on_demand_lower_bound`, which is `None` whenever one of its inputs is not established, with each reason in `unknown` (`transfer_not_ended`, `transfer_carried_over`, `listing_not_settled`, ...).
@@ -1161,6 +1179,10 @@ Every contrast ends in one of five words, `difference`, `trivial_difference`, `e
 A contrast outside the preregistered Holm family is exploratory. It is judged by its raw p-value, nothing controls its multiplicity, and every table and report shows it apart, labelled exploratory, never as confirmatory. Only the Holm family carries the study's confirmatory claims.
 
 A preregistration that makes no confirmatory claim, such as a pilot's, says so with `exploratory_only = true` in place of `holm_family`. Every contrast is then exploratory: `analysis.json` has `"exploratory_only": true` and no Holm decision, the report has one table, of exploratory contrasts, and its summary and `analyze`'s terminal output say that no confirmatory claim is made. An empty `holm_family = []` is refused, because it is more likely a family never filled in than a choice; the flag is the way to make that choice. The flag is in the file, so in the preregistration's hash, and a pilot's runs analysed under it never enter a confirmatory test.
+
+A ratio contrast's numbers are natural-log ratios, its margin included: `equivalence_margin = 0.2231` is ln 1.25, so equivalence means A's ratio is within a factor of 1.25 of B's (at most a quarter above it, a fifth below it), and "x2" and "x1/2" are 0.6931 and -0.6931. The report gives its estimate and interval as ratios beside them.
+
+Several "no difference" hypotheses, one per primary outcome, are several chances of a false `equivalent`. List them in `equivalence_family = [...]` (each a member of `holm_family` with a margin): each gets the two one-sided t-tests' p-value of its mean cluster difference, Holm adjusts them together, and a member is `equivalent` only when Holm rejects, which the report's "Equivalence family" table shows beside the test's interval at the level Holm used. One cluster, or clusters that do not differ at all, give no p-value and are never equivalent. Before the campaign, `expcore.stats.analysis.equivalence_feasibility(prereg)` says, for each such claim, how often it would be reached at your planned clusters, at a true difference of 0 and of half the margin, from your `[power]` SDs or from pilot rows; preregister an equivalence hypothesis only if it is reachable, and say so if it is not. [The interfaces](interfaces.md#estimator) give the rule.
 
 A contrast that declares `treatment_outcomes = "excluded"` compares its arms without the runs the outage ended, so its conclusion says nothing about the outage itself, and `not_detected` there is not the absence of an outage effect. The report puts `excluded` and the pairs it left out in the contrast's own row, beside its conclusion.
 

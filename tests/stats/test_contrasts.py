@@ -19,6 +19,9 @@ from expcore.stats.contrasts import (
     resample,
     snap,
     supports,
+    tost_t,
+    tost_t_interval,
+    tost_t_studies,
     wilcoxon_input,
     wilcoxon_p,
     wilcoxon_p_studies,
@@ -295,3 +298,74 @@ def test_s06_the_level_is_multiplied_first():
     """S06: alpha * weight / total in that order, the one expression for every level."""
     assert level(0.05, 3, 7) == 0.05 * 3 / 7
     assert level(0.05, 1, 3) == 0.05 / 3
+
+
+# --- two one-sided t-tests of the mean cluster difference (S15) -------------------------------------------------------
+
+FIVE = [0.1, -0.1, 0.05, -0.05, 0.0]  # mean 0, SD sqrt(0.025 / 4), so the standard error is 0.0790569 / sqrt(5)
+
+
+def test_s15_the_tost_p_is_the_larger_of_the_two_one_sided_t_tests_by_hand():
+    """S15, hand-computed: mean 0 and standard error 0.0353553, so with margin 0.1 both t-statistics are 2.828427 on
+    4 degrees of freedom (2 sqrt 2) and the TOST p is the t distribution's tail beyond it, 0.0237103."""
+    se = math.sqrt(0.025 / 4) / math.sqrt(5)
+    assert se == pytest.approx(0.0353553, abs=1e-7)
+    assert tost_t(FIVE, 0.1) == pytest.approx(stats.t.sf(2 * math.sqrt(2), 4))
+    assert tost_t(FIVE, 0.1) == pytest.approx(0.0237103, abs=1e-7)
+
+
+def test_s15_the_tost_p_is_scipys_two_one_sided_t_tests():
+    """S15: the larger of scipy's one-sample t-tests of mean > -margin and of mean < margin, on mixed data."""
+    rng = np.random.default_rng(8)
+    for n, shift, margin in ((6, 0.02, 0.1), (12, -0.05, 0.08), (30, 0.0, 0.03), (4, 0.09, 0.1)):
+        d = rng.normal(shift, 0.05, n)
+        lower = stats.ttest_1samp(d, -margin, alternative="greater").pvalue
+        upper = stats.ttest_1samp(d, margin, alternative="less").pvalue
+        assert tost_t(d, margin) == pytest.approx(max(lower, upper), rel=1e-9)
+
+
+def test_s15_fewer_than_two_clusters_give_no_tost_p():
+    """S15: one cluster has no spread to estimate, so nothing is tested; it can never be called equivalent."""
+    assert math.isnan(tost_t([0.01], 0.2))
+    assert math.isnan(tost_t([], 0.2))
+    assert math.isnan(tost_t([math.nan, 0.01], 0.2))  # an undefined cluster is no cluster
+
+
+def test_s15_clusters_with_no_spread_give_no_tost_p():
+    """S15: equal differences have a standard error of 0, and a t-test of them is no number, never certainty."""
+    assert math.isnan(tost_t([0.0, 0.0, 0.0], 0.2))
+    assert math.isnan(tost_t([0.1 + 0.2, 0.3, 0.3], 0.2))  # equal in arithmetic, after the float noise is snapped
+    assert math.isnan(tost_t([0.1, 0.1, 0.1], 0.2))  # their float mean is not 0.1, so their float SD is not 0
+    assert all(math.isnan(v) for v in tost_t_interval([0.1, 0.1, 0.1], 0.05))
+
+
+@pytest.mark.parametrize("margin", [0.0, -1.0, math.inf, math.nan, True])
+def test_s15_a_margin_that_is_not_positive_and_finite_is_refused(margin):
+    """S15: an equivalence margin is a positive finite distance."""
+    with pytest.raises(ValueError, match="positive finite"):
+        tost_t(FIVE, margin)
+
+
+def test_s15_the_tost_p_is_at_most_a_level_exactly_when_its_interval_at_twice_it_lies_inside_the_margin():
+    """S15: the interval at 1 - 2L, mean plus or minus the t quantile at 1 - L times the standard error, is the test's
+    dual: TOST p <= L when, and only when, it lies within plus or minus the margin."""
+    rng = np.random.default_rng(5)
+    for _ in range(200):
+        d = rng.normal(rng.uniform(-0.1, 0.1), 0.05, int(rng.integers(3, 20)))
+        margin, a = float(rng.uniform(0.02, 0.15)), float(rng.choice([0.05, 0.025, 0.0125]))
+        low, high = tost_t_interval(d, a)
+        assert (tost_t(d, margin) <= a) == (-margin <= low and high <= margin)
+
+
+def test_s15_the_interval_is_nan_where_the_test_is_undefined():
+    """S15: no spread or one cluster, no interval."""
+    assert all(math.isnan(v) for v in tost_t_interval([0.01], 0.05))
+    assert all(math.isnan(v) for v in tost_t_interval([0.2, 0.2], 0.05))
+
+
+def test_s15_the_tost_p_of_many_studies_is_the_tost_p_of_each():
+    """S15: the vectorised form the feasibility simulation calls is, row by row, exactly the function itself."""
+    studies = np.random.default_rng(2).normal(0.01, 0.05, (50, 8))
+    studies[3] = 0.0  # no spread
+    expected = [tost_t(row, 0.1) for row in studies]
+    assert np.array_equal(tost_t_studies(studies, 0.1), expected, equal_nan=True)

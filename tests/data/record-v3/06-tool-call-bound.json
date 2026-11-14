@@ -77,10 +77,13 @@
   "min_call_s": 1.0,
   "ceiling_factor": 3.0,
   "cleanup_deadline_s": 10.0,
-  "tool_call_bound_s": 60.0,
-  "terminal_tools": []
+  "tool_server_call_bound_s": 60.0,
+  "terminal_tools": [],
+  "tool_server_tools": [
+   "search"
+  ]
  },
- "agent_config_sha256": "8a5b79c4edf0e15e1d49a878b3cec497d6dd6d7a064b51cd30310419826c426d",
+ "agent_config_sha256": "c12ca04eb848c75d3a79bdeaa2c73aa5d2a2ccbeb0bd11dba595f2858e8bf278",
  "code": {
   "commit": "cccccccccccccccccccccccccccccccccccccccc",
   "dirty": false,

@@ -11,10 +11,10 @@ only costs another reading; a limit is never passed unseen, because the agent's 
 A call that finishes first returns its result, whatever the clock says after the fact. The exception is a call that
 ended by the expiry of its own bound, `CallTimedOut`, at the bound it was handed when that was the agent's time left
 (L05): that expiry and this watch's cut are one moment, so it is judged as the cut when a reading shows a limit passed
-(L16). An expiry of a shorter bound, the study's declared per-call bound (L17), is not that moment, and is the call's
-own failure. A call that is cut is cancelled and awaited, and the time that takes is cleanup, which the timer keeps
-apart from the agent's time. The same cleanup runs when the whole run is cancelled from outside, and then the
-cancellation goes on to the caller.
+(L16). An expiry of a shorter bound, the study's declared per-call bound of a call to a tool server (L17), is not
+that moment, and is the call's own failure. A call that is cut is cancelled and awaited, and the time that takes is
+cleanup, which the timer keeps apart from the agent's time. The same cleanup runs when the whole run is cancelled from
+outside, and then the cancellation goes on to the caller.
 
 Stopping a call may take for ever (a cleanup that waits on something that never comes), and a cancellation must always
 end. So the wait for a cancelled call has a deadline; past it the call is given up on and left pending, the timer
@@ -130,13 +130,13 @@ class Watcher:
 def _ended_at_the_bound_it_was_given(job: asyncio.Future, tick: Tick) -> bool:
     """Tell whether a finished call ended by the expiry of a bound as long as the agent's time it was handed (L16).
 
-    A provider that bounds its own call is handed the agent's time left (L05), or the study's declared per-call bound
-    when that is shorter (L17). When it is handed the time left, its expiry and this watch's cut are one moment, and
-    which of the two the event loop runs first is chance. The ending must not be: a call that outlasted the agent's
-    time or the ceiling was cut by it, whoever noticed first, so the watch judges such an expiry as a cut when a reading
-    shows a limit passed. An expiry of a shorter bound (the declared per-call bound, or a provider's own, tighter one)
-    is the provider's failure, and takes no reading, so a replay, which raises the recorded failure, reads the clock as
-    the run did.
+    A provider that bounds its own call is handed the agent's time left (L05), or, for a tool server under a declared
+    per-call bound, that bound when it is shorter (L17). When it is handed the time left, its expiry and this watch's
+    cut are one moment, and which of the two the event loop runs first is chance. The ending must not be: a call that
+    outlasted the agent's time or the ceiling was cut by it, whoever noticed first, so the watch judges such an expiry
+    as a cut when a reading shows a limit passed. An expiry of a shorter bound (the declared per-call bound, or a
+    provider's own, tighter one) is the provider's failure, and takes no reading, so a replay, which raises the
+    recorded failure, reads the clock as the run did.
 
     One case reads the clock in a run and not in its replay: an expiry of a bound as long as the call's whole time that
     a reading then shows inside both limits. A provider that marks no wait cannot produce it, since its call's wall

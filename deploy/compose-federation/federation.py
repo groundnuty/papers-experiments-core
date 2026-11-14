@@ -297,6 +297,8 @@ def down(layout: Layout) -> str:
 
     Compose runs only over a root that exists and carries the mark naming this project: with the root gone, a compose
     down under the project's name could only remove what another federation of that name left, its network included.
+    With the root gone, a volume labelled with the project still fails the call (an earlier down left it): the project
+    is down only when no container, network or volume of it remains.
     """
     timer = Timer()
     project = layout.spec.project
@@ -307,6 +309,16 @@ def down(layout: Layout) -> str:
             raise RuntimeError(
                 f"the root is missing while {len(containers)} container(s) and {len(networks)} network(s) of the "
                 f"project {project} name it; nothing stopped, since compose runs only over a marked root"
+            )
+        # A first `down` that removed the root and then found a volume it could not remove raised, and its retry finds
+        # no root: that is no federation that is down while the volume remains. Compose still runs only over a marked
+        # root, so the volumes are named and left to the operator.
+        volumes = project_volumes(project)
+        if volumes:
+            raise RuntimeError(
+                f"the root is gone but {len(volumes)} volume(s) labelled with the project {project} remain "
+                f"({', '.join(volumes)}); an earlier down left them, docker compose down --volumes cannot run without "
+                "the root, and nothing else removes them: remove them with docker volume rm"
             )
         return timer.summary("down (already down)")
     if not layout.owned:

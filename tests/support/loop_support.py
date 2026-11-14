@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from expcore.errors import CallTimedOut
 from expcore.models.adapters import ModelTurn, StubAdapter, ToolCall
 from expcore.plugin import NO_WAITS, ToolOutput, ToolSpec
 
@@ -63,11 +64,23 @@ def _takes_ctx(handler: Callable[..., Any]) -> bool:
 
 
 class FakeProvider:
-    """A tool provider with scripted handlers. Records every call with the timeout it was given."""
+    """A tool provider with scripted handlers. Records every call with the timeout it was given.
 
-    def __init__(self, handlers: dict[str, Callable[..., Any]], *, terminal: tuple[str, ...] = (), schemas=None):
+    With `tool_server` it stands for a tool server (an MCP server), the one kind of provider the study's per-call bound
+    reaches (L17); without it, for an in-process tool such as the code tool, which the bound never touches.
+    """
+
+    def __init__(
+        self,
+        handlers: dict[str, Callable[..., Any]],
+        *,
+        terminal: tuple[str, ...] = (),
+        schemas=None,
+        tool_server: bool = False,
+    ):
         self.handlers = handlers
         self.terminal = terminal
+        self.tool_server = tool_server
         self.schemas = schemas or {}
         self.calls: list[tuple[str, dict, float]] = []
 
@@ -90,6 +103,45 @@ class FakeProvider:
         if asyncio.iscoroutine(result):
             result = await result
         return result if isinstance(result, ToolOutput) else ToolOutput(str(result))
+
+
+def slow(clock, seconds, *, wait=0.0, text="done"):
+    """A tool handler that takes `seconds` on the fake clock, the first `wait` of them in a wait on infrastructure."""
+
+    async def handler(args, ctx):
+        if wait:
+            async with ctx.infrastructure_wait("lease_queue"):
+                clock.advance(wait)
+        clock.advance(seconds - wait)
+        return text
+
+    return handler
+
+
+def stalls(clock, seconds, *, cleanup=0.0):
+    """A tool handler that runs `seconds` on the fake clock and then never returns; stopping it takes `cleanup`."""
+
+    async def handler(args):
+        clock.advance(seconds)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            clock.advance(cleanup)
+            raise
+
+    return handler
+
+
+def hangs_until_its_bound(clock, provider, tool):
+    """A tool handler for a provider that honours the `timeout_s` it is handed: the call hangs until that bound has
+    passed on the fake clock and then raises the expiry of that bound, as `McpToolProvider` does (L16)."""
+
+    async def handler(args):
+        handed = provider.calls[-1][2]
+        clock.advance(handed)
+        raise CallTimedOut(tool, handed)
+
+    return handler
 
 
 class ScriptedBackend(StubAdapter):
