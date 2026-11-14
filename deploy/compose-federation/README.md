@@ -18,7 +18,9 @@ uv run python deploy/compose-federation/federation.py compose  # the Compose fil
 ```
 
 Each takes `--layout PATH` for a layout other than the default; give every command of one federation the same layout.
-Run them outside any sandbox: they drive Docker, and they reach the services on the host's loopback.
+Run them outside any sandbox: they drive Docker, and they reach the services on the host's loopback. A layout with a
+read-only import also needs the environment variable that names its dataset set for every command that runs Docker
+Compose (`up`, `reset --replicas` and `down`; see "An imported space").
 
 - **up** checks that the host's available memory holds the services' limits together (before a first start), makes
   the root, the CA, one web certificate per service and the secrets, starts the zone, signs in as its admin, makes the
@@ -36,7 +38,8 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
   everything in every space, ingested datasets included, and writes the baseline files again into the spaces that keep
   them; a space declared `baseline = false` is left empty. The providers, spaces and users keep their ids, so
-  `platform.toml` stays valid. A fault-injection journal left behind is emptied.
+  `platform.toml` stays valid. A fault-injection journal left behind is emptied. A layout with an imported space is
+  refused before anything is touched: run `down`, then `up` (see "An imported space").
 - **reset --replicas** is the reset between runs: it starts what is stopped and checks every step again, then keeps
   every owner's data and evicts only what the mirrors hold (`fedreplicas.py`). A space is supported by exactly its
   owner and its mirrors, so every non-owner that can hold a replica, the agent's local provider included, is a
@@ -56,13 +59,17 @@ Run them outside any sandbox: they drive Docker, and they reach the services on 
   checks that no container, network, Docker volume labelled with the project (`com.docker.compose.project`) or file
   of the project is left; a volume left fails the command, naming it. It runs Compose only over a root that exists and
   carries the project's mark: with the root gone and nothing of the project left it does nothing, and with the root
-  gone while containers or networks of the project remain it refuses.
+  gone while containers or networks of the project remain it refuses. It refuses the same way, naming them, when the
+  root is gone and a volume labelled with the project remains, as on the retry of a `down` that failed on one: it does
+  not run Compose without the root, so the volume is removed with `docker volume rm`.
 
 ## Declaring a layout
 
 A layout is a TOML file; `federation.toml` is the default and the reference, and `layouts/five-providers.toml` is an
 example with five providers and four spaces the agent may reach, one provider mirroring a second owner's space, beside
-its probe space. Its generated Compose file is `layouts/five-providers.compose.yaml`.
+its probe space. Its generated Compose file is `layouts/five-providers.compose.yaml`. `layouts/storage-import.toml`
+declares one imported space and one uploaded space for the storage-import slot (see "An imported space"), with its
+generated `layouts/storage-import.compose.yaml` and `layouts/storage-import.platform.toml.template`.
 
 | Key | Holds |
 |---|---|
@@ -76,6 +83,7 @@ its probe space. Its generated Compose file is `layouts/five-providers.compose.y
 | `[zone] port`, `[providers.<name>] port` | each service's port on `127.0.0.1` |
 | `[spaces.<name>] owner`, `mirrors` | the provider the space's data is written through and kept on, and the other providers that support it |
 | `[spaces.<name>] baseline` | `false` for a space that up leaves empty and `reset --clean` empties, the study space included (default `true`: the baseline files, see "The baseline") |
+| `[spaces.<name>] import` | a table `{ readonly, source_env }` for a space its owner holds on an imported POSIX storage: `readonly` says whether the platform may write to it, `source_env` names the environment variable that holds the host directory of the dataset, never a path; the space must declare `baseline = false` (see "An imported space") |
 | `[spaces.<name>] agent_visible` | `false` for a space the day-0 checks alone use: no user of the agent may be a member, and it is never the study space |
 | `[principals.<user>] privileges`, `spaces` | a fixed user's exact privileges, in the study space unless `spaces` names others |
 | `[principals.<user>] agent` | `false` for a user the agent's tokens are never minted for (the harness's or the day-0 checks'); only such a user may join a space with `agent_visible = false` |
@@ -130,7 +138,8 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   exceed the host's available memory, so the federation never starves the host. `memory` reads each service's current
   use and its peak since the container started from the container's own cgroup, and down prints the peaks before it
   stops anything; the day-0 report records them.
-- **Disk:** the root, `EXPCORE_FED_ROOT` (mode 0700), and nothing outside it. The root must lie in the allowed parent,
+- **Disk:** the root, `EXPCORE_FED_ROOT` (mode 0700), and nothing outside it (a read-only import's dataset is bound
+  read-only, never written; see "An imported space"). The root must lie in the allowed parent,
   `EXPCORE_FED_ROOT_PARENT` (default `/mnt/volume2/expcore-federation`), which must be absolute and not `/`, with no
   symbolic link from it down to the root. Under the default parent the root defaults to the parent itself. A study
   confined to a directory of its own names that directory as the parent; it must then exist, and `EXPCORE_FED_ROOT`
@@ -149,6 +158,7 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   | `secrets/` (0700, every file 0600) | the CA's key, the services' keys, the panels' passphrases and env files, the registration tokens, `admin.token`, and `users/<user>.pass` |
   | `<service>/persistence` | each service's state; up seeds the certificates and the CA into it before the first start |
   | `<provider>/storage` | each provider's POSIX storage |
+  | `<owner>/import/<space>` | a writable import's copy of its dataset, made by up once (see "An imported space") |
   | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are; no secret |
   | `platform.toml` (0600) | rendered from the layout's template, next to the CA and the secrets it names by relative path |
   | `fault-journal/` | the fault injector's journal, when the fault test runs |
@@ -202,6 +212,95 @@ file the space does not hold, so set that variable only where the study space ke
 `tokens` read no file of the space, and `read_only` and `round_trip` work on a scratch file of their own: all four are
 the same on any space. There is no setting to point one check at another space; a pass that needs the baseline files
 runs against a layout whose study space keeps them.
+
+## An imported space
+
+A space declared with an `import` table is held by its owner on an imported POSIX storage (Onedata 25.0's storage
+import): its files already lie in a host directory, and the platform finds them by a scan instead of receiving them
+through its REST interface. A study uses it to compare a dataset that was imported with the same dataset uploaded.
+
+```toml
+[spaces.alpha-import]
+owner = "pine"
+mirrors = ["birch", "cedar"]     # a mirror keeps its regular storage and fetches what the owner holds
+baseline = false                 # required: up would write the baseline files into the dataset
+import = { readonly = true, source_env = "EXPCORE_FED_IMPORT_ALPHA" }
+```
+
+**The key.** `readonly` (true or false, required) says whether the platform may write to the storage. `source_env` is
+the name of an environment variable, matching `EXPCORE_FED_IMPORT_[A-Z0-9_]{1,48}`, that holds the absolute path of the
+host directory with the dataset. A layout never holds that path, since the repository is public. A space with an
+`import` that does not declare `baseline = false` is refused, naming `spaces.<name>.import`. Two writable imports may
+not name the same variable, since each would copy and write into one source; read-only imports may share one. Only the
+owner holds the space on the imported storage.
+
+**The variable.** It must name an existing directory by an absolute path with no `..` step and no symbolic link on the
+way, which is not the root, lies outside it and does not hold it, since down empties the root. A refusal names the
+variable and never says what it held. The generated Compose file binds a read-only import's directory by that
+variable, so every command that runs Docker Compose for a layout with a read-only import (`up`, `reset --replicas` and
+`down`) needs it set, and refuses before running anything when it is not. A writable import reads its variable only at
+the first `up`, which makes the copy.
+
+**The two modes.**
+
+| | `readonly = true` | `readonly = false` |
+|---|---|---|
+| bound into the owner's service at `/volumes/import/<space>` | the dataset's own directory, read-only | `<root>/<owner>/import/<space>`, read-write |
+| what up does | checks the variable; copies nothing | checks the variable and the tree, then copies it once (`fedimport.py`) |
+| what down does | nothing to the dataset: it lies outside the root | removes the copy with the root |
+
+A writable copy is made only when its directory does not exist, and never twice: a later `up` leaves it, and what the
+platform wrote into it, as it is, whatever the source has become. Before it copies anything, up walks the source and
+refuses, with a count and no path, any entry that is not a regular file or a directory, a symbolic link included, since
+op-worker's import skips such entries without a word (its CHANGELOG, VFS-9118) and the space would quietly be short of
+files. The copy keeps bytes alone (no times, no modes): files are 0664 and directories 0775, which is what uploaded
+files and directories get in op-worker, so an import and an upload look alike to the platform. It is made beside its
+directory and renamed into place, so one that stopped midway is never taken for a finished one.
+
+**The storage.** On the owner's panel up creates a storage named `import-<space>` with `type` `posix`, `mountPoint`
+`/volumes/import/<space>`, `importedStorage` true and `readonly` as declared. A storage found by that name must already
+be exactly that: one that differs is refused, naming what differs and never changed, since Onezone refuses to change
+`importedStorage` once the storage supports a space (oz-worker, `ERR_STORAGE_IN_USE`). Run `down`, then `up`, to make it
+anew.
+
+**The support.** Every support is now made on the storage it is named for, never on the first one the panel lists,
+which is arbitrary once a provider has two: the owner of an imported space uses `import-<space>`, every other support
+the batch-mode `posix` storage. The owner's support of an imported space adds `storageImport` with `mode` `auto` and an
+`autoStorageImportConfig` whose `continuousScan`, `detectModifications` and `detectDeletions` are all false: one initial
+scan when the space is supported and none after it, and a forced scan would only add new files.
+
+**The wait.** After the members, `wait_import` polls each owner's panel (`GET /provider/spaces/<id>/storage-import/auto/info`)
+until the scan's `status` is `completed`, for up to 30 minutes in all. A scan that `failed` or was `aborted`, or that
+reports `failedFiles` above 0, is refused naming the space, so a federation short of files never counts as up. The
+scan's record (`status`, `start`, `stop`, `createdFiles`, `modifiedFiles`, `deletedFiles`, `unmodifiedFiles`,
+`failedFiles`, `totalScans`) goes into `facts.json`.
+
+**What it leaves alone.** The content writer never clears, writes or replicates in an imported space, up's first
+baseline write included. `reset --clean` is refused for a layout that has one, before anything is touched: a REST delete
+in an imported space unlinks the file from the import directory on a writable storage, and on a read-only one leaves the
+file there, so a later scan imports it again under a new id. Run `down`, then `up`. `reset --replicas` is unchanged: it
+evicts from the mirrors only, whose storage is regular.
+
+**The facts.** Each space's entry in `facts.json` has `import`, `null` or `{ readonly, source_env, storage, scan }`: the
+variable's name, never the directory it names. `describe` adds `; imported (read-only) from $NAME` (or `(writable)`) to
+the space's row.
+
+**The slot.** `layouts/storage-import.toml` declares `alpha-import` (imported, read-only, from
+`EXPCORE_FED_IMPORT_ALPHA`) and `alpha-upload` (an ordinary space, the study space), both owned by `pine` and mirrored by
+`birch` and `cedar`. Its platform template uses the `[[spaces]]` form with an `imported` and an `uploaded` entry; the
+imported one carries `import = { readonly = true }`, a key only a core that reads it accepts. A dataset to import is made
+by `make_import_tree.py`, which imports nothing of this repository and writes a deterministic invented tree into a
+directory that does not exist or is empty:
+
+```sh
+uv run python deploy/compose-federation/make_import_tree.py /mnt/volume2/expcore-import-data --small 1000 --dirs 10 \
+  --large-bytes 1073741824          # prints the file count and the bytes; --large-bytes 0 (the default) makes no large.bin
+EXPCORE_FED_IMPORT_ALPHA=/mnt/volume2/expcore-import-data \
+  uv run python deploy/compose-federation/federation.py --layout deploy/compose-federation/layouts/storage-import.toml up
+```
+
+The small files are `d00/file-000000.bin` and so on, of 1 to 65536 bytes each; `large.bin` is written in 16 MiB pieces,
+never held whole. Files are 0664 and directories 0775.
 
 ## Running the core against it
 

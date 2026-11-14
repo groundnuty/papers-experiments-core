@@ -242,18 +242,18 @@ def test_o29_a_reading_post_is_never_retried(config, fake, ticker):
 
 
 def test_o29_only_a_read_and_the_gate_of_a_mutation_or_a_range_read_can_be_handed_a_policy():
-    """O29: by construction: `get`, the dated read `get_dated` and the reads that find a target's space
-    (`space_name`, `file_space_id`, `file_space_name`) take `retry`; `mutate`, `read_range` and `read_content` take
-    `gate_retry`, the policy of their gate's reads alone; and no other call does, so a PUT, a POST (reading POSTs
-    included), a PATCH, a DELETE, a range read, a streamed read and the head of a content read cannot be retried by a
-    caller that is later added."""
+    """O29: by construction: `get`, the dated read `get_dated`, the Onepanel read `panel_get` and the reads that find a
+    target's space (`space_name`, `file_space_id`, `file_space_name`) take `retry`; `mutate`, `read_range`,
+    `read_content` and the gated forced scan `force_scan` take `gate_retry`, the policy of their gate's reads alone; and
+    no other call does, so a PUT, a POST (reading POSTs included), a PATCH, a DELETE, a range read, a streamed read and
+    the head of a content read cannot be retried by a caller that is later added."""
     public = {name: f for name, f in inspect.getmembers(OnezoneClient, inspect.isfunction) if not name.startswith("_")}
 
     def taking(parameter):
         return sorted(name for name, f in public.items() if parameter in inspect.signature(f).parameters)
 
-    assert taking("retry") == ["file_space_id", "file_space_name", "get", "get_dated", "space_name"]
-    assert taking("gate_retry") == ["mutate", "read_content", "read_range"]
+    assert taking("retry") == ["file_space_id", "file_space_name", "get", "get_dated", "panel_get", "space_name"]
+    assert taking("gate_retry") == ["force_scan", "mutate", "read_content", "read_range"]
 
 
 class Gate:

@@ -32,6 +32,19 @@ user, shared with day-0, health and the live checks) revokes nothing.
 tool-server launcher records through, so that the slots' minting can record `token_expiry_beyond_request`
 (`users.py`). It has no default, because a silent no-op would lose the event.
 
+**The teardown has a deadline (O42).** The platform waits for `DockerSandbox.stop` at most `teardown_deadline_s`
+(`TEARDOWN_DEADLINE_S`, 600 s, unless the platform is built with another), and records how it ended in the sandbox's
+metadata under `teardown`: `outcome` `completed`, `failed` (it raised, which is the run's `InfraError("sandbox")` as
+before) or `cut`, with `deadline_s` and `elapsed_s`, and for the last two what the stop had left (`left`:
+`sandbox.teardown_left()`). A teardown still running at its deadline, wedged on a FUSE mount whose provider is gone
+say, is not waited for any more: the run is `InfraError("sandbox")`, which is infrastructure and never the agent's
+doing (unless its body had raised, which stands). A thread cannot be made to stop, so the teardown goes on in a daemon
+thread of its own, which never holds a normal exit of the process (a SIGTERM's stopper, `termination.py`, calls
+`stop()` too and waits for it behind the same lock, as it always waited for a teardown); the lease's probe keeps the
+key quarantined until the sandbox is shown gone. The slot's tokens are revoked after the cut as after any stop, though
+the stop is still running: the revocation checks no stop thread, only the mint and start threads, and a revoked token
+can only free what holds it.
+
 Waits. Start and teardown (the token mint, the image checks, the containers, the stop) are each inside
 `ctx.infrastructure_wait("sandbox_lifecycle")`. What the agent's code does in the sandbox and its reads of data are the
 agent's own time and are never waits (see `codetool.py`).
@@ -80,6 +93,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 WAIT_KIND = "sandbox_lifecycle"
+TEARDOWN_DEADLINE_S = 600.0  # how long the platform waits for a sandbox's stop, whatever it is doing (O42)
 CANCEL_WAIT_S = 120.0  # how long a cancelled launch waits for its start thread to notice and clean up, before it stops
 DATA_PATH_FACTOR = "data_path"  # the study's factor whose levels [sandbox.data_paths] maps
 
@@ -301,7 +315,13 @@ class SandboxPlatform:
         cancel_wait_s: float = CANCEL_WAIT_S,
         clock: Callable[[], float] = time.time,
         read_only_inputs: Mapping[str, Sequence[ReadOnlyInput]] | None = None,
+        teardown_deadline_s: float = TEARDOWN_DEADLINE_S,
     ) -> None:
+        if isinstance(teardown_deadline_s, bool) or not isinstance(teardown_deadline_s, int | float):
+            raise ValueError("teardown_deadline_s must be a number of seconds")
+        if not 0 < teardown_deadline_s < float("inf"):
+            raise ValueError("teardown_deadline_s must be a positive, finite number of seconds")
+        self._teardown_s = teardown_deadline_s
         if config.sandbox is None:
             raise ValueError(f"{config.file}: has no [sandbox] section")
         if (slots is None) != (journal is None):
@@ -672,20 +692,58 @@ class SandboxPlatform:
         await _wait_through_cancellation(started, self._cancel_wait_s)
 
     async def _stop(self, ctx: CallContext, sandbox: DockerSandbox, *, quiet: bool) -> None:
-        """Stop the sandbox, verified, and then, in the same wait and whatever the stop did, revoke its run's slot's
-        tokens when the launch registered them (`_revoke_now`)."""
+        """Stop the sandbox, verified, within the teardown's deadline, and then, in the same wait and whatever the stop
+        did, revoke its run's slot's tokens when the launch registered them (`_revoke_now`). How it ended is recorded in
+        the sandbox's metadata (`teardown`, O42): a stop that ends in time is `completed`, one that raised `failed`, and
+        one still running at the deadline `cut` with what it had left: it is not waited for any more, and the run is
+        `InfraError("sandbox")` unless `quiet` (the body's own error stands). A cancellation pending at the cut is kept."""
         async with ctx.infrastructure_wait(WAIT_KIND):
+            began = time.monotonic()
             try:
                 try:
-                    await _complete(asyncio.to_thread(sandbox.stop))
+                    await _complete(_in_daemon_thread(sandbox.stop), within=self._teardown_s)
                 except SandboxError as error:
+                    self._record_teardown(sandbox, "failed", began)
                     if not quiet:
                         raise InfraError("sandbox", f"the sandbox could not be torn down: {error}"[:600]) from None
                     log.error("the sandbox of an ended run could not be torn down: %s", error)
+                except TeardownCut as cut:
+                    left = sandbox.teardown_left()
+                    self._record_teardown(sandbox, "cut", began, left)
+                    message = (
+                        f"the sandbox's teardown was cut at its deadline of {self._teardown_s:g} s, still in "
+                        f"{left['step']} with {left['containers']} container(s), {left['mounts']} mount(s) and "
+                        f"{'a' if left['network'] else 'no'} network left, and goes on in its thread: the key stays "
+                        "quarantined until the sandbox is shown gone"
+                    )
+                    log.error("%s", message)
+                    if cut.cancelled:
+                        raise asyncio.CancelledError from None
+                    if not quiet:
+                        raise InfraError("sandbox", message) from None
+                except asyncio.CancelledError:  # the stop ended, with a cancellation waiting: nothing is left to report
+                    self._record_teardown(sandbox, "completed", began)
+                    raise
+                else:
+                    self._record_teardown(sandbox, "completed", began)
             finally:
                 revocable = self._revocable.pop(sandbox, None)
                 if revocable is not None:
                     await _complete(asyncio.to_thread(self._revoke_now, revocable, sandbox))
+
+    def _record_teardown(
+        self, sandbox: DockerSandbox, outcome: str, began: float, left: Mapping[str, Any] | None = None
+    ) -> None:
+        """Put how the sandbox's stop ended in its metadata (O42): `outcome`, the deadline, the seconds it took, and for
+        a stop that did not complete what it had left. It touches no host: a wedged one must not hold the record."""
+        record: dict[str, Any] = {
+            "outcome": outcome,
+            "deadline_s": self._teardown_s,
+            "elapsed_s": round(time.monotonic() - began, 3),
+        }
+        if left is not None:
+            record["left"] = dict(left)
+        sandbox.record(teardown=record)
 
     async def _revoke_unstarted(
         self,
@@ -756,14 +814,56 @@ async def _wait_through_cancellation(future: asyncio.Future[Any], seconds: float
     return future.done()
 
 
-async def _complete(work: Any) -> None:
-    """Run `work` (a coroutine) to its end even if this task is cancelled meanwhile, then raise the cancellation: a
-    teardown that is cut short leaves what it exists to remove. An error of the work is raised in preference."""
+class TeardownCut(Exception):
+    """A teardown still running at its deadline: nobody waits for it any more, and it goes on in its thread (O42).
+    `cancelled` is whether a cancellation of the waiting task was pending when it was cut."""
+
+    def __init__(self, deadline_s: float, *, cancelled: bool = False) -> None:
+        super().__init__(f"the teardown was cut at its deadline of {deadline_s:g} s")
+        self.cancelled = cancelled
+
+
+def _in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future[Any]:
+    """Run a blocking `fn` in a daemon thread of its own and return the future of its result (O42). A thread cannot be
+    stopped, and a teardown wedged on the host may never end: in a daemon thread it never holds the process's exit, as a
+    worker of the default executor, which is joined at exit, would. A result that comes after its loop has gone is
+    dropped."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+
+    def deliver(result: Any, error: BaseException | None) -> None:
+        if future.cancelled():
+            return
+        future.set_result(result) if error is None else future.set_exception(error)
+
+    def work() -> None:
+        try:
+            result, error = fn(), None
+        except BaseException as raised:  # delivered to whoever waits, as `asyncio.to_thread` delivers it
+            result, error = None, raised
+        with contextlib.suppress(RuntimeError):  # the loop closed: nobody is waiting for it
+            loop.call_soon_threadsafe(deliver, result, error)
+
+    threading.Thread(target=work, daemon=True, name="sandbox-stop").start()
+    return future
+
+
+async def _complete(work: Any, *, within: float | None = None) -> None:
+    """Run `work` (a coroutine or a future) to its end even if this task is cancelled meanwhile, then raise the
+    cancellation: a teardown that is cut short leaves what it exists to remove. An error of the work is raised in
+    preference. With `within`, the wait ends after that many seconds whatever the work is doing: `TeardownCut` is raised,
+    and the work is left to go on (O42)."""
     task = asyncio.ensure_future(work)
+    loop = asyncio.get_running_loop()
+    stop_at = None if within is None else loop.time() + within
     cancelled = False
     while not task.done():
+        remaining = None if stop_at is None else stop_at - loop.time()
+        if remaining is not None and remaining <= 0:
+            task.add_done_callback(lambda f: f.cancelled() or f.exception())  # its late failure is no one's to report
+            raise TeardownCut(within or 0.0, cancelled=cancelled)
         try:
-            await asyncio.wait({task})
+            await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError:
             cancelled = True
     task.result()

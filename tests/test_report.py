@@ -7,6 +7,10 @@ import pytest
 
 from expcore.report import render_report, summary_lines
 from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision
+from expcore.stats.armruns import LOST_CAUSES, ArmRuns
+from expcore.stats.estimators import ModelEstimate
+from expcore.stats.onearm import DescriptiveResult
+from expcore.stats.ratio import RatioForm
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
 MANIFEST = {"preregistration_sha256": "e" * 64, "factor_schema_sha256": "f" * 64}
@@ -683,3 +687,298 @@ def test_c26_a_campaign_without_a_budget_hold_has_a_row_of_zeros_for_every_condi
     holds = render(analysis(contrast("primary", "difference")), data).split("### Budget holds by condition", 1)[1]
     for name in ("cond-a", "cond-b", "cond-c"):
         assert f"| {name} | model-a | 0 |" in holds
+
+
+# --- a ratio contrast in the report -----------------------------------------------------------------------------------
+
+NO_CELL_LOST = {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0}
+RATIO_MISSING = {
+    **NO_PAIR,
+    "exhausted": 0,
+    "unpaired_or_left_out": 0,
+    "numerator_none_at_zero": 1,
+    "zero_denominator": 3,
+    "zero_numerator": 0,
+}
+
+
+EXCLUDE = RatioForm("spend", "wins", "exclude")
+
+
+def ratio_contrast(name="spend-per-win", form=EXCLUDE, conclusion="difference", **changes) -> ContrastResult:
+    """A ratio contrast's result: its estimate ln 2 with the interval [ln 1.5, ln 3], and the pairs its rule took."""
+    numbers = {"estimate": math.log(2.0), "ci_low": math.log(1.5), "ci_high": math.log(3.0), "n_pairs": 20}
+    units = {"estimation_unit": ("group",), "independent_unit": "group", "n_cells": 12, "cells_lost": NO_CELL_LOST}
+    base = {"outcome": form.label, "estimator": "ratio", "ratio": form, "pairs_missing": RATIO_MISSING, **numbers}
+    base |= units
+    return contrast(name, conclusion, **{**base, **changes})
+
+
+def test_s13_a_ratio_contrasts_row_names_its_outcome_on_the_log_scale():
+    """S13: the estimate and its interval are natural-log ratios, and the outcome cell says so."""
+    cells = row(render(analysis(ratio_contrast())), "spend-per-win")
+    assert cells[2:5] == ["ln(spend/wins)", "0.6931", "[0.4055, 1.099]"]
+
+
+def test_s13_the_ratio_contrasts_table_gives_the_rule_and_the_ratio_itself():
+    """S13: each ratio contrast's two outcomes, its declared zero rule, and exp of the estimate and of its interval."""
+    continuity = ratio_contrast("spend-per-win-c", RatioForm("spend", "wins", "continuity", 0.5))
+    report = render(analysis(ratio_contrast(), continuity))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Numerator",
+        "Denominator",
+        "Estimation unit",
+        "Independent unit",
+        "Cells",
+        "Zero total",
+        "Ratio (A / B)",
+        "Ratio interval",
+    ]
+    assert table["spend-per-win"][1:] == ["spend", "wins", "group", "group", "12", "exclude", "2", "[1.5, 3]"]
+    assert table["spend-per-win-c"][6] == "continuity correction 0.5"
+    assert "the cell is excluded from the contrast" in report.split("## Ratio contrasts")[1]
+
+
+def test_s13_the_terminal_summary_says_a_ratio_contrasts_estimate_is_a_log_ratio():
+    """S13: a log ratio printed bare could be read as a difference of ratios."""
+    line = next(line for line in summary_lines(analysis(ratio_contrast())) if line.startswith("spend-per-win:"))
+    assert line.startswith("spend-per-win: estimate 0.6931 (ln ratio), p ")
+    assert summary_lines(analysis(contrast("plain", "difference")))[0].startswith("plain: estimate 0.25, p ")
+
+
+def test_s13_the_pairs_table_shows_the_ratio_causes_when_a_ratio_contrast_is_in_it():
+    """S13: the ratio contrast's counts under its three causes; a difference contrast beside it has none of them."""
+    report = render(analysis(ratio_contrast(), contrast("plain", "difference")))
+    table = table_of(report, "### Pairs of the family's contrasts")
+    assert table["Contrast"][-3:] == ["Numerator None at denominator 0", "Zero denominator", "Zero numerator"]
+    assert table["spend-per-win"][-3:] == ["1", "3", "0"]
+    assert table["plain"][-3:] == ["-", "-", "-"]
+    assert "*Zero denominator*" in report.split("## Missing pairs by cause")[1]
+
+
+def test_s13_a_report_with_no_ratio_contrast_has_none_of_its_columns_notes_or_sections():
+    """S13, C29: a study without a ratio contrast gets the report it got before ratio contrasts existed."""
+    report = render(analysis(contrast("plain", "difference")))
+    assert not [word for word in ("Ratio", "Zero denominator", "Numerator None", "ln(") if word in report]
+    assert table_of(report, "### Pairs of the family's contrasts")["Contrast"][-1] == "Outcome None (other)"
+
+
+def test_s13_an_untestable_ratio_contrast_names_the_rule_that_took_its_pairs():
+    """S13, S11: every cell excluded is untestable, and the row says the zero rule took the pairs."""
+    nothing = {"estimate": math.nan, "p_value": math.nan, "ci_low": math.nan, "ci_high": math.nan, "n_clusters": 0}
+    dry = ratio_contrast(conclusion="untestable", n_pairs=0, **nothing)
+    report = render(analysis(dry))
+    assert row(report, "spend-per-win")[11] == "0 (missing: numerator None at denominator 0 1, zero denominator 3)"
+    assert table_of(report, "## Ratio contrasts")["spend-per-win"][7:] == ["n/a", "[n/a, n/a]"]
+
+
+BY_MODEL = (
+    ModelEstimate("model-a", math.log(4.0), math.log(2.0), math.log(8.0), 0),
+    ModelEstimate("model-b", math.log(1.25), math.log(0.8), math.log(2.0), 3),
+)
+
+
+def by_model_contrast(name="spend-per-win") -> ContrastResult:
+    """A ratio contrast estimated per (model, group) cell and tested over groups, with each model's estimate from the
+    same draws of the groups; one cell lost to a zero denominator."""
+    lost = {**NO_CELL_LOST, "zero_denominator": 1}
+    return ratio_contrast(name, estimation_unit=("model", "group"), per_model=BY_MODEL, n_cells=23, cells_lost=lost)
+
+
+def test_s13_the_ratio_contrasts_table_names_each_contrasts_estimation_and_independent_units():
+    """S13: the estimation unit decides the estimand and the independent unit what Clusters, the test and the
+    resampling count, so the report names both, with the cells used and lost."""
+    report = render(analysis(by_model_contrast(), ratio_contrast("pooled-per-win")))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["spend-per-win"][3:6] == ["model, group", "group", "23 (lost: zero denominator 1)"]
+    assert table["pooled-per-win"][3:6] == ["group", "group", "12"]
+    notes = report.split("## Ratio contrasts")[1]
+    assert "never counted as independent" in notes
+    assert "each model weighing the same" in notes
+
+
+def test_s13_a_ratio_contrast_by_model_shows_each_models_ratio_as_an_exploratory_breakdown():
+    """S13: each model's log ratio, its ratio and its interval, under a heading that says it is no test."""
+    report = render(analysis(by_model_contrast()))
+    table = table_of(report, "### Ratio contrasts by model (exploratory)")
+    assert table["Contrast"] == ["Contrast", "Model", "Estimate", "Ratio (A / B)", "Ratio interval"]
+    lines = report.split("### Ratio contrasts by model (exploratory)")[1].splitlines()
+    first, second = ([cell.strip() for cell in line.strip("|").split(" | ")] for line in lines if "| spend" in line)
+    assert first == ["spend-per-win", "model-a", "1.386", "4", "[2, 8]"]
+    assert second[1:3] == ["model-b", "0.2231"]
+    assert "no test of its own" in report.split("### Ratio contrasts by model (exploratory)")[1]
+
+
+def test_s13_a_report_whose_ratio_contrasts_pool_the_models_has_no_breakdown_by_model():
+    """S13: a pooled key has no estimate by model, so the report has no section for one."""
+    report = render(analysis(ratio_contrast()))
+    assert "## Ratio contrasts" in report
+    assert "### Ratio contrasts by model" not in report
+
+
+# --- an equivalence family (S15) --------------------------------------------------------------------------------------
+
+
+def member(name, equivalent, tost, holm, level, interval):
+    """A member of the equivalence family as the analysis gives one."""
+    return contrast(
+        name,
+        "equivalent" if equivalent else "not_detected",
+        p_value=0.4,
+        significant=False,
+        equivalence_margin=0.2,
+        equivalence_interval=(-0.05, 0.06),
+        in_equivalence_family=True,
+        tost_p=tost,
+        tost_p_holm=holm,
+        equivalence_level=level,
+        equivalence_interval_adjusted=interval,
+    )
+
+
+def equivalence_analysis():
+    """Two members: one equivalent at the first step, one not, though its raw TOST p is below alpha."""
+    results = (
+        member("same-a", True, 0.002, 0.004, 0.95, (-0.08, 0.09)),
+        member("same-b", False, 0.04, 0.04, 0.9, (-0.1, 0.12)),
+    )
+    holm = tuple(HolmDecision(r.name, 0.4, 0.4, 0.05, False) for r in results)
+    eq = (HolmDecision("same-a", 0.002, 0.004, 0.025, True), HolmDecision("same-b", 0.04, 0.04, 0.05, True))
+    return AnalysisResult(results, holm, 0.05, dict(MANIFEST), equivalence_holm=eq)
+
+
+def test_s15_the_equivalence_family_has_a_table_with_each_members_tost_p_its_holm_p_and_its_adjusted_interval():
+    """S15: the decision a member's `equivalent` rests on, beside the interval at the level Holm compared it with."""
+    report = render(equivalence_analysis())
+    table = table_of(report, "### Equivalence family (Holm over two one-sided tests)")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Margin",
+        "TOST p",
+        "Holm TOST p",
+        "Interval level",
+        "Adjusted interval",
+        "Equivalent",
+    ]
+    assert table["same-a"][1:] == ["0.2", "0.0020", "0.0040", "95%", "[-0.08, 0.09]", "yes"]
+    assert table["same-b"][1:] == ["0.2", "0.0400", "0.0400", "90%", "[-0.1, 0.12]", "no"]
+    assert "not the 90% equivalence interval" in report.split("### Equivalence family", 1)[1]
+
+
+def test_s15_a_report_without_an_equivalence_family_has_no_such_section():
+    """S15: nothing declared, nothing shown."""
+    assert "Equivalence family" not in render(analysis(contrast("primary", "difference")))
+
+
+def test_s15_the_terminal_summary_gives_a_members_holm_tost_p():
+    """S15: the basis of `equivalent` for a member is never printed apart from it."""
+    lines = summary_lines(equivalence_analysis())
+    assert lines[0] == "same-a: estimate 0.25, p 0.4000, Holm p 0.4000, equivalent, Holm TOST p 0.0040"
+    assert summary_lines(analysis(contrast("primary", "difference")))[0].endswith(", difference")
+
+
+# --- each arm's runs, and the one-arm estimates -----------------------------------------------------------------------
+
+
+def arm(name, planned, measured, **lost):
+    """One arm's planned runs; the causes not given are 0, and the finished runs are the measured and the None ones."""
+    causes = {cause: lost.get(cause, 0) for cause in LOST_CAUSES}
+    finished = measured + causes["treatment_outcome_none"] + causes["outcome_none"]
+    return ArmRuns(name, planned, finished, measured, causes)
+
+
+def test_s14_each_contrast_shows_each_arms_finish_rate_and_its_runs_lost_by_cause():
+    """S14: beside the outcome defined over finished runs, how many of each arm's planned runs finished, and why the
+    others are missing, so a loss in one arm is not hidden in a count of pairs."""
+    runs = (arm("cond-a", 10, 6, outcome_none=1, exhausted=3), arm("cond-b", 10, 10))
+    report = render(analysis(contrast("primary", "difference", arm_runs=runs)))
+    table = table_of(report, "### Runs of each arm")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Arm",
+        "Planned",
+        "Finished",
+        "Finish rate",
+        "Measured",
+        "Treatment outcome None",
+        "Outcome None",
+        "Exhausted",
+        "Unfinished",
+        "Left out",
+    ]
+    section = report.split("### Runs of each arm", 1)[1].splitlines()
+    first, second = (line for line in section if line.startswith("| primary | cond-"))
+    assert first == "| primary | cond-a | 10 | 7 | 70% | 6 | 0 | 1 | 3 | 0 | 0 |"
+    assert second == "| primary | cond-b | 10 | 10 | 100% | 10 | 0 | 0 | 0 | 0 | 0 |"
+
+
+def test_s14_an_arm_with_no_planned_run_has_a_finish_rate_of_n_a():
+    """S14: 0 of 0 is not 0%."""
+    report = render(analysis(contrast("primary", "difference", arm_runs=(arm("cond-a", 0, 0), arm("cond-b", 0, 0)))))
+    assert "| primary | cond-a | 0 | 0 | n/a | 0 |" in report
+
+
+def described(name="waited-in-a", kind="rate", **changes):
+    """A one-arm estimate as the analysis gives one."""
+    base = {
+        "name": name,
+        "kind": kind,
+        "outcome": "waited",
+        "conditions": ("cond-a",),
+        "cluster": "group",
+        "estimate": 0.25,
+        "ci_low": 0.1,
+        "ci_high": 0.4,
+        "n_clusters": 12,
+        "n_runs": 40,
+        "n_undefined_replicates": 0,
+        "runs": arm("cond-a", 44, 40, outcome_none=1, unfinished=3),
+        "per_model": (),
+    }
+    return DescriptiveResult(**{**base, **changes})
+
+
+def test_s14_the_one_arm_estimates_have_a_section_of_their_own_that_says_they_are_descriptive():
+    """S14: each with its arm, estimate, interval, clusters, runs used, finish rate and undefined replicates; no p-value
+    and no conclusion, and the section says nothing adjusts or tests them."""
+    ratio = described(
+        "queries-per-placement",
+        "ratio_of_totals",
+        outcome="queries/placements",
+        conditions=("cond-a", "cond-b"),
+        n_undefined_replicates=7,
+    )
+    result = dataclasses.replace(analysis(contrast("primary", "difference")), descriptives=(described(), ratio))
+    report = render(result, interval_level=0.95)
+    section = report.split("## One-arm estimates (descriptive)", 1)[1]
+    table = table_of(report, "## One-arm estimates (descriptive)")
+    assert table["Estimate"] == [
+        "Estimate",
+        "Kind",
+        "Arm",
+        "Outcome",
+        "Value",
+        "95% interval",
+        "Clusters",
+        "Runs used",
+        "Finish rate",
+        "Undefined replicates",
+    ]
+    assert table["waited-in-a"][1:] == ["rate", "cond-a", "waited", "0.25", "[0.1, 0.4]", "12", "40", "93.18%", "0"]
+    assert table["queries-per-placement"][2] == "cond-a + cond-b"
+    assert table["queries-per-placement"][-1] == "7"
+    assert "no test" in section
+    assert "Holm" in section
+
+
+def test_s14_a_report_without_one_arm_estimates_has_no_such_section():
+    """S14: nothing declared, nothing shown."""
+    assert "One-arm estimates" not in render(analysis(contrast("primary", "difference")))
+
+
+def test_s14_the_terminal_summary_gives_each_one_arm_estimate_as_descriptive():
+    """S14: an estimate with no test is never printed as a contrast is."""
+    result = dataclasses.replace(analysis(contrast("primary", "difference")), descriptives=(described(),))
+    assert summary_lines(result)[-1] == "waited-in-a (descriptive, rate of waited in cond-a): 0.25 [0.1, 0.4]"

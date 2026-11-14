@@ -82,7 +82,6 @@ class PlacementSettings:
     consecutive_polls: int = 2
     request_timeout_s: float = 900.0
     chunk_bytes: int = DEFAULT_CHUNK_BYTES
-    fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
     probe_attempts: int = 3
     probe_backoff_s: float = 1.0
     transfer_settle_s: float = 30.0  # at least the lag of a provider's transfer listing behind a new job
@@ -91,6 +90,9 @@ class PlacementSettings:
     concurrency: int = 16  # the named bound on a bulk operation's requests in flight (eviction, block maps, reset)
     qos_scan: str = DEFAULT_QOS_SCAN  # how the reset finds QoS requirements (`resetqos.py`); see QOS_SCANS
     qos_fulfil_timeout_s: float = 120.0  # the reset's wait for a requirement to be fulfilled (`resetremove.py`)
+    # Last, so a caller that passes the settings positionally keeps the order it had before #196 (O25): every field
+    # added later goes at the end of the class.
+    fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
 
 
 @dataclass(frozen=True)

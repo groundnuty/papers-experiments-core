@@ -1,14 +1,17 @@
 """Pairing: named-condition and factor contrasts, aggregation per cluster, and what is dropped and counted."""
 
 import dataclasses
+import functools
 import math
 import random
 
 import numpy as np
 import pytest
-from stats_support import both_arms, by_factor, make_row, named
+from stats_support import both_arms, by_factor, make_row, named, ratio_arms, ratio_row, ratio_spec
 
-from expcore.stats.pairing import ContrastSpec, pair_rows
+from expcore.stats.estimators import WILCOXON
+from expcore.stats.pairing import MISSING_CAUSES, ContrastSpec, pair_rows
+from expcore.stats.ratio import POOLED, RATIO_CAUSES, RatioForm
 from expcore.stats.rows import AbsentRun, Row
 
 
@@ -415,3 +418,290 @@ def test_c23_an_absent_run_with_an_unknown_reason_or_a_run_key_an_analysed_row_h
     rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
     with pytest.raises(ValueError, match="two runs of 'cond-a' share one run key"):
         pair_rows(rows, named(), absent=[absent("task-a", "cond-a", "exhausted")])
+
+
+# --- the ratio form: sums per cluster, and what the zero rule and a failed run's missing numerator cost ----------
+
+
+def ratio_rows():
+    """grp-a: model-a's A spends 100 + 200 for 1 + 0 wins, its B 50 + 50 for 1 + 1 (ln 6); grp-b: equal ratios (0)."""
+    rows = []
+    rows += ratio_arms("task-a", "model-a", 1, (100.0, 1.0), (50.0, 1.0))
+    rows += ratio_arms("task-b", "model-a", 1, (200.0, 0.0), (50.0, 1.0))  # a failed run of A: its spend counts
+    rows += ratio_arms("task-c", "model-a", 1, (100.0, 2.0), (50.0, 1.0), cluster="grp-b")
+    return rows
+
+
+def test_s13_a_ratio_contrast_sums_its_pairs_per_cluster_into_log_ratios():
+    """S13: the sums run over every paired run of the cluster, tasks and seeds together, the failed run included."""
+    pairing = pair_rows(ratio_rows(), ratio_spec())
+    assert pairing.differences.clusters == ("grp-a", "grp-b")
+    assert pairing.differences.models == (POOLED,)
+    assert pairing.differences.matrix[:, 0] == pytest.approx([math.log(6.0), 0.0])
+    assert pairing.n_pairs == 3
+    assert pairing.n_pairs_missing == 0
+
+
+def test_s13_a_ratio_contrast_pools_the_models_of_a_cluster_so_one_models_failures_are_not_excluded():
+    """S13: model-b never wins in A, and pooled with model-a's runs its spend still counts: A 300 / 1, B 100 / 2. By
+    model, model-b would have no ratio, and dropping it would leave a cost conditional on success."""
+    rows = ratio_arms("task-a", "model-a", 1, (100.0, 1.0), (50.0, 1.0))
+    rows += ratio_arms("task-a", "model-b", 1, (200.0, 0.0), (50.0, 1.0))
+    pairing = pair_rows(rows, ratio_spec())
+    assert pairing.differences.matrix[0, 0] == pytest.approx(math.log(6.0))
+    assert (pairing.n_pairs, pairing.missing["zero_denominator"]) == (2, 0)
+
+
+def test_s13_a_ratio_contrast_counts_the_ratio_causes_and_a_difference_contrast_does_not():
+    """S13: a ratio contrast's missing pairs hold its three causes beside the others, zeros included; a difference
+    contrast's hold exactly the causes they always held, so its outputs are what they were."""
+    ratio = pair_rows(ratio_rows(), ratio_spec())
+    assert tuple(ratio.missing) == MISSING_CAUSES + RATIO_CAUSES
+    assert all(count == 0 for count in ratio.missing.values())
+    assert tuple(pair_rows(both_arms("task-a", "model-a", 1, 0.9, 0.5), named()).missing) == MISSING_CAUSES
+
+
+def test_s13_a_failed_run_whose_numerator_is_none_is_counted_apart_from_any_other_none():
+    """S13: a run with 0 wins and spend None would make the ratio a ratio over successes only, so its pair is counted
+    under its own cause; spend None on a run that won, and wins None, are ordinary missing outcomes."""
+    rows = ratio_rows()
+    rows += ratio_arms("task-d", "model-a", 1, (None, 0.0), (50.0, 1.0))
+    rows += ratio_arms("task-e", "model-a", 1, (None, 1.0), (50.0, 1.0))
+    rows += ratio_arms("task-f", "model-a", 1, (90.0, None), (50.0, 1.0))
+    rows += ratio_arms("task-g", "model-a", 1, (90.0, 1.0), (None, 0.0))  # on either arm
+    pairing = pair_rows(rows, ratio_spec())
+    assert pairing.missing["numerator_none_at_zero"] == 2
+    assert pairing.missing["outcome_none"] == 2
+    assert pairing.n_pairs_missing == 4
+    assert pairing.n_pairs == 3
+    assert pairing.differences.matrix[:, 0] == pytest.approx([math.log(6.0), 0.0])  # the lost pairs left the sums
+
+
+def test_s13_a_treatment_attempt_with_no_numerator_is_counted_as_a_treatment_loss_first():
+    """S13, S10: the treatment cause comes first, so the manipulation's loss is never hidden under the ratio's."""
+    rows = ratio_rows()
+    rows.append(ratio_row("task-d", "model-a", 1, None, 0.0, condition="cond-a", treatment=True))
+    rows.append(ratio_row("task-d", "model-a", 1, 50.0, 1.0, condition="cond-b"))
+    pairing = pair_rows(rows, ratio_spec())
+    assert pairing.missing["treatment_outcome_none"] == 1
+    assert pairing.missing["numerator_none_at_zero"] == 0
+
+
+def test_s13_a_cluster_the_zero_rule_excludes_counts_its_pairs_and_is_dropped():
+    """S13: grp-b's B has no win, so its two pairs are counted under zero_denominator, not used, and it is dropped."""
+    rows = ratio_rows()[:4]
+    rows += ratio_arms("task-c", "model-a", 1, (100.0, 2.0), (50.0, 0.0), cluster="grp-b")
+    rows += ratio_arms("task-c", "model-a", 2, (100.0, 2.0), (50.0, 0.0), cluster="grp-b")
+    pairing = pair_rows(rows, ratio_spec())
+    assert pairing.differences.clusters == ("grp-a",)
+    assert pairing.missing["zero_denominator"] == 2
+    assert pairing.n_pairs == 2
+    assert pairing.n_pairs_missing == 0  # nothing was None: the pairs are out by the declared rule
+    assert pairing.n_clusters_dropped == 1
+
+
+def test_s13_under_a_continuity_correction_no_cluster_is_excluded():
+    """S13: the same rows under a declared correction keep grp-b, with the corrected log ratio."""
+    rows = ratio_rows()[:4]
+    rows += ratio_arms("task-c", "model-a", 1, (100.0, 2.0), (50.0, 0.0), cluster="grp-b")
+    pairing = pair_rows(rows, ratio_spec(zero="continuity", correction=0.5))
+    assert pairing.differences.clusters == ("grp-a", "grp-b")
+    assert pairing.differences.matrix[1, 0] == pytest.approx(math.log((100.5 / 2.5) / (50.5 / 0.5)))
+    assert pairing.missing["zero_denominator"] == 0
+
+
+@pytest.mark.parametrize("outcome", ["spend", "wins"])
+def test_s13_a_negative_numerator_or_denominator_is_refused_naming_the_run_and_the_outcome(outcome):
+    """S13: a total of costs or counts cannot be negative, and a log ratio of one is no number."""
+    rows = ratio_arms("task-a", "model-a", 1, (100.0, 1.0), (50.0, 1.0))
+    rows[1].outcomes[outcome] = -1.0  # past the row's own checks, as an edit could leave it
+    with pytest.raises(ValueError, match=f"outcome {outcome!r} of run .* is negative"):
+        pair_rows(rows, ratio_spec())
+
+
+def test_a_ratio_contrast_needs_both_of_its_outcomes_on_every_row():
+    """A row without the denominator is refused naming the outcome, as a row without a contrast's outcome is."""
+    rows = ratio_arms("task-a", "model-a", 1, (100.0, 1.0), (50.0, 1.0))
+    del rows[0].outcomes["wins"]
+    with pytest.raises(ValueError, match="has no outcome 'wins'"):
+        pair_rows(rows, ratio_spec())
+
+
+def test_a_ratio_contrast_spec_labels_its_outcome_with_its_two_outcomes():
+    """The outcome of a ratio contrast is its label, numerator over denominator, so it cannot name a third outcome."""
+    form = RatioForm("spend", "wins", "exclude")
+    with pytest.raises(ValueError, match="outcome must be 'spend/wins'"):
+        ContrastSpec("x", "spend", "ratio", "group", conditions=("cond-a", "cond-b"), ratio=form)
+
+
+# --- the difference form's units: estimated per (model, group) cell, the group the independent unit ----------------
+
+
+def test_a_difference_contrast_estimates_per_model_cell_and_takes_the_group_as_its_independent_unit():
+    """Two models in one group, model-a with three tasks and four runs and model-b with one task: each model's cell is
+    the mean of its tasks' means, and the group, one row, is the equal-weight mean of its two cells, (0.2 + 0.6) / 2 =
+    0.4, not the mean over its five runs (0.28) nor over its four tasks (0.3). The group is the one cluster counted."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)  # 0.4
+    rows += both_arms("task-a", "model-a", 2, 0.5, 0.5)  # 0.0: task-a's mean is 0.2
+    rows += both_arms("task-b", "model-a", 1, 0.5, 0.5)  # 0.0
+    rows += both_arms("task-c", "model-a", 1, 0.9, 0.5)  # 0.4: model-a's cell is (0.2 + 0.0 + 0.4) / 3 = 0.2
+    rows += both_arms("task-d", "model-b", 1, 0.8, 0.2)  # 0.6: model-b's cell
+    pairing = pair_rows(rows, named())
+    assert named().estimation_unit == ("model", "group")
+    assert (pairing.differences.clusters, pairing.differences.models) == (("grp-a",), ("model-a", "model-b"))
+    assert pairing.differences.matrix.ravel().tolist() == pytest.approx([0.2, 0.6])
+    assert list(pairing.differences.cluster_differences) == pytest.approx([0.4])
+    assert (pairing.n_cells, pairing.cells_lost) == (2, {"no_pair": 0})
+
+
+def test_a_difference_contrast_counts_a_cell_left_without_a_pair():
+    """model-b ran grp-a in arm A only, so its cell is seen and lost for want of a pair; the group keeps model-a's."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows.append(make_row("task-a", "model-b", 1, 0.9, condition="cond-a"))
+    pairing = pair_rows(rows, named())
+    assert (pairing.n_cells, pairing.cells_lost, pairing.n_clusters_dropped) == (1, {"no_pair": 1}, 0)
+
+
+# --- the ratio form's estimation unit: the models of a group pooled, or one cell per model of it ----------------------
+
+BY_MODEL = ("model", "group")
+
+
+def by_model_rows():
+    """ratio_rows (model-a: ln 6 in grp-a, 0 in grp-b), and model-b: in grp-a A 60 for 1 win, B 20 for 1 (ln 3); in
+    grp-b A 40 for 1, B 20 for 0 wins, a cell with no correct result in B."""
+    rows = ratio_rows()
+    rows += ratio_arms("task-a", "model-b", 1, (60.0, 1.0), (20.0, 1.0))
+    rows += ratio_arms("task-c", "model-b", 1, (40.0, 1.0), (20.0, 0.0), cluster="grp-b")
+    return rows
+
+
+def test_s13_a_cell_estimation_unit_gives_each_group_its_cells_log_ratios_and_excludes_by_cell():
+    """S13, hand-computed nested: grp-a holds model-a's ln 6 and model-b's ln(60 / 20) = ln 3, so its value is their
+    equal-weight mean; model-b's grp-b cell has no win in B, so that cell alone is excluded, its one pair counted under
+    zero_denominator and the cell under the same cause, and grp-b keeps model-a's 0. No group is dropped."""
+    pairing = pair_rows(by_model_rows(), ratio_spec(estimation_unit=BY_MODEL))
+    assert (pairing.differences.clusters, pairing.differences.models) == (("grp-a", "grp-b"), ("model-a", "model-b"))
+    assert list(pairing.differences.cluster_differences) == pytest.approx([(math.log(6.0) + math.log(3.0)) / 2, 0.0])
+    assert (pairing.n_pairs, pairing.missing["zero_denominator"], pairing.n_clusters_dropped) == (4, 1, 0)
+    assert pairing.n_cells == 3
+    assert pairing.cells_lost == {"no_pair": 0, "zero_denominator": 1, "zero_numerator": 0}
+
+
+def test_s13_a_group_whose_every_cell_is_lost_is_dropped_and_counted_and_a_cell_with_no_pair_is_counted():
+    """S13: in grp-c neither model ever wins in B, so both its cells are excluded and the group is dropped, counted in
+    n_clusters_dropped; model-a ran grp-d in arm A only, a cell with no pair, so grp-d is dropped too."""
+    rows = by_model_rows()
+    rows += ratio_arms("task-e", "model-a", 1, (10.0, 1.0), (10.0, 0.0), cluster="grp-c")
+    rows += ratio_arms("task-e", "model-b", 1, (10.0, 1.0), (10.0, 0.0), cluster="grp-c")
+    rows.append(ratio_row("task-f", "model-a", 1, 10.0, 1.0, condition="cond-a", cluster="grp-d"))
+    pairing = pair_rows(rows, ratio_spec(estimation_unit=BY_MODEL))
+    assert pairing.differences.clusters == ("grp-a", "grp-b")
+    assert pairing.n_clusters_dropped == 2
+    assert pairing.cells_lost == {"no_pair": 1, "zero_denominator": 3, "zero_numerator": 0}
+    assert pairing.missing["zero_denominator"] == 3
+
+
+def test_s13_the_estimation_unit_changes_the_estimand_the_pooled_sums_weigh_the_models_that_spend_most():
+    """S13: on the same rows, pooling the models of a group sums A's 360 for 2 wins against B's 120 for 3 in grp-a,
+    ln 4.5, and A's 140 for 3 against B's 70 for 1 in grp-b, ln(2 / 3): model-b's zero is absorbed, not excluded.
+    Each group is its own one cell."""
+    pairing = pair_rows(by_model_rows(), ratio_spec())
+    assert pairing.differences.models == (POOLED,)
+    assert pairing.differences.matrix[:, 0] == pytest.approx([math.log(4.5), math.log(2.0 / 3.0)])
+    assert (pairing.n_pairs, pairing.missing["zero_denominator"], pairing.n_clusters_dropped) == (5, 0, 0)
+    assert (pairing.n_cells, pairing.cells_lost) == (2, {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0})
+
+
+def test_s13_the_cluster_attribute_alone_is_the_default_estimation_unit_and_gives_the_pooled_numbers_exactly():
+    """S13: an estimation unit of the attribute alone is the ratio form's default, and pairs exactly as a contrast
+    that declares none."""
+    default = pair_rows(by_model_rows(), ratio_spec())
+    declared = pair_rows(by_model_rows(), ratio_spec(estimation_unit=("group",)))
+    assert ratio_spec().estimation_unit == ("group",)
+    assert default.differences.clusters == declared.differences.clusters
+    assert default.differences.models == declared.differences.models
+    assert np.array_equal(default.differences.matrix, declared.differences.matrix)
+    assert dataclasses.replace(default, differences=None) == dataclasses.replace(declared, differences=None)
+
+
+def test_a_cell_estimation_unit_puts_a_task_run_by_two_models_in_one_group_and_two_cells():
+    """The task's cluster is checked on the attribute: a task run by two models is in one group, in two cells."""
+    rows = ratio_arms("task-a", "model-a", 1, (10.0, 1.0), (10.0, 1.0))
+    rows += ratio_arms("task-a", "model-b", 1, (10.0, 1.0), (10.0, 1.0))
+    differences = pair_rows(rows, ratio_spec(estimation_unit=BY_MODEL)).differences
+    assert (differences.clusters, differences.models) == (("grp-a",), ("model-a", "model-b"))
+
+
+@pytest.mark.parametrize(
+    ("unit", "ratio", "message"),
+    [
+        (("group",), False, "a contrast of one outcome estimates per model's cell"),
+        (("region",), True, "estimation_unit must be"),
+        (("group", "model"), True, "estimation_unit must be"),
+        (("model",), True, "estimation_unit must be"),
+        (("model", "region"), True, "estimation_unit must be"),
+        (("model", "group", "seed"), True, "estimation_unit must be"),
+    ],
+)
+def test_an_estimation_unit_that_is_not_the_attribute_or_the_model_and_the_attribute_is_refused(unit, ratio, message):
+    """A spec built in code holds the canonical unit: for a ratio contrast the attribute alone or the model then the
+    attribute, for a contrast of one outcome the model then the attribute, the cell it already averages within."""
+    build = (
+        ratio_spec if ratio else functools.partial(ContrastSpec, "x", "score", WILCOXON, "group", ("cond-a", "cond-b"))
+    )
+    with pytest.raises(ValueError, match=message):
+        build(estimation_unit=unit)
+
+
+# --- what became of each arm's own planned runs -----------------------------------------------------------------------
+
+
+def test_s14_each_arm_counts_its_own_planned_runs_by_what_became_of_them():
+    """S14: one pair lost to A's None is one A run lost; B's exhausted run and A's unfinished one count in their arm."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows += both_arms("task-b", "model-a", 1, None, 0.5)
+    rows += treated("task-e", "model-a", 1, None, 0.4)
+    rows.append(make_row("task-c", "model-a", 1, 0.7, condition="cond-a"))
+    rows.append(make_row("task-d", "model-a", 1, 0.3, condition="cond-b"))
+    gone = [absent("task-c", "cond-b", "exhausted"), absent("task-d", "cond-a", "unfinished")]
+    first, second = pair_rows(rows, named(), absent=gone).arm_runs
+    assert (first.arm, first.planned, first.finished, first.measured) == ("cond-a", 5, 4, 2)
+    assert first.lost == {
+        "treatment_outcome_none": 1,
+        "outcome_none": 1,
+        "exhausted": 0,
+        "unfinished": 1,
+        "excluded": 0,
+    }
+    assert (second.arm, second.planned, second.finished, second.measured) == ("cond-b", 5, 4, 4)
+    assert second.lost["exhausted"] == 1
+
+
+def test_s14_a_run_on_a_task_the_other_arm_never_plans_is_outside_both_arms_counts():
+    """S14: a chain design's arm runs tasks the other does not; those runs are not the contrast's, lost or not."""
+    rows = both_arms("task-a", "model-a", 1, 0.9, 0.5)
+    rows.append(make_row("task-z", "model-a", 1, None, condition="cond-a"))
+    first, second = pair_rows(rows, named(), absent=[absent("task-y", "cond-b", "unfinished")]).arm_runs
+    assert (first.planned, first.measured, second.planned, second.measured) == (1, 1, 1, 1)
+
+
+def test_s14_a_factor_contrasts_run_whose_other_factors_no_run_of_the_other_level_shares_is_outside_both_arms():
+    """S14: mode y's open run has no shut run to pair with, so it is no run of the contrast's pairs."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.9, condition="open-x", gate="open", mode="x"),
+        make_row("task-a", "model-a", 1, 0.5, condition="shut-x", gate="shut", mode="x"),
+        make_row("task-a", "model-a", 1, 0.8, condition="open-y", gate="open", mode="y"),
+    ]
+    first, second = pair_rows(rows, by_factor()).arm_runs
+    assert (first.planned, second.planned) == (1, 1)
+
+
+def test_s14_a_factor_contrasts_arms_are_its_levels():
+    """S14: the arms are named by the levels of the varying factor, each counting every run of its level."""
+    rows = [
+        make_row("task-a", "model-a", 1, 0.9, condition="open-x", gate="open"),
+        make_row("task-a", "model-a", 1, 0.5, condition="shut-x", gate="shut"),
+    ]
+    first, second = pair_rows(rows, by_factor()).arm_runs
+    assert (first.arm, first.planned, second.arm, second.planned) == ("open", 1, "shut", 1)

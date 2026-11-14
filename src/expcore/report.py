@@ -36,6 +36,12 @@ are the same text: no clock, no path and no random number enters it.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
+- A ratio contrast (S13) shows its outcome as `ln(numerator/denominator)`, since its numbers are natural-log ratios,
+  and a section "Ratio contrasts" gives each one's two outcomes, its estimation unit and its independent unit, its
+  cells used and lost, its preregistered rule for a zero sum and exp of its estimate and interval, then, for a
+  contrast estimated per model's cell, each model's estimate as an exploratory breakdown. Its pairs table has three
+  more causes, `-` for a contrast of one outcome. A report with no ratio contrast has none of this, so it is the text
+  it was before ratio contrasts existed.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
   the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
@@ -49,31 +55,44 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.report_notes import (
+    ARM_LOST_HEADINGS,
+    ARM_RUNS_NOTES,
     BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
     COUNT_DEFINITIONS,
     DEPLOYMENT_NOTES,
+    DESCRIPTIVE_NOTES,
     MDE_NOTES,
     MISSING_PAIRS,
     NO_CLAIM,
     NO_KIND,
+    RATIO_BY_MODEL_NOTES,
+    RATIO_MISSING_PAIRS,
+    RATIO_NOTES,
     UNKNOWN,
     contrast_notes,
+    equivalence_family_notes,
     equivalence_header,
     percent,
 )
 from expcore.report_shards import shard_lines
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
+from expcore.stats.armruns import LOST_CAUSES
 from expcore.stats.pairing import MISSING_CAUSES
+from expcore.stats.ratio import RATIO_CAUSES, RatioForm
 
 EXPLORATORY = "exploratory"
 NO_MARGIN = "-"  # the margin and the equivalence interval of a contrast that preregistered no margin
+NOT_APPLICABLE = "-"  # a ratio contrast's cause in the row of a contrast of one outcome
 CAUSE_HEADINGS = {
     "treatment_outcome_none": "Treatment outcome None",
     "treatment_excluded": "Treatment excluded",
     "exhausted": "Exhausted run",
     "unpaired_or_left_out": "Unpaired or left out",
     "outcome_none": "Outcome None (other)",
+    "numerator_none_at_zero": "Numerator None at denominator 0",
+    "zero_denominator": "Zero denominator",
+    "zero_numerator": "Zero numerator",
 }
 
 
@@ -113,6 +132,16 @@ def _exploratory(result: ContrastResult, adjusted: Mapping[str, float]) -> bool:
             f"Holm decision {'present' if result.name in adjusted else 'absent'}; the flags must agree"
         )
     return result.exploratory
+
+
+def _outcome(result: ContrastResult) -> str:
+    """The outcome cell: a ratio contrast's is the natural log of its numerator over its denominator (S13)."""
+    return result.outcome if result.ratio is None else f"ln({result.ratio.label})"
+
+
+def _causes(results: Sequence[ContrastResult]) -> tuple[str, ...]:
+    """The causes the pairs tables show: a ratio contrast's three after the others, only when one is there (S13)."""
+    return MISSING_CAUSES + (RATIO_CAUSES if any(r.ratio is not None for r in results) else ())
 
 
 def _arms(result: ContrastResult) -> str:
@@ -173,7 +202,7 @@ def _contrast_table(
         row = [
             r.name,
             _arms(r),
-            r.outcome,
+            _outcome(r),
             _num(r.estimate),
             f"[{_num(r.ci_low)}, {_num(r.ci_high)}]",
             _margin(r),
@@ -196,7 +225,7 @@ def _pairs_used(result: ContrastResult) -> str:
         return str(result.n_pairs)
     causes = [
         f"{CAUSE_HEADINGS[cause][0].lower()}{CAUSE_HEADINGS[cause][1:]} {result.pairs_missing[cause]}"
-        for cause in MISSING_CAUSES
+        for cause in _causes([result])
         if result.pairs_missing[cause]
     ]
     return f"0 (missing: {', '.join(causes)})" if causes else "0 (no pair planned)"
@@ -234,7 +263,15 @@ def _exploratory_only(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *MDE_NOTES]
     if contrasts:
         lines += ["", *_pairs(contrasts, "### Pairs of the exploratory contrasts")]
-    return [*lines, "", *MISSING_PAIRS, ""]
+    return [
+        *lines,
+        "",
+        *_ratios(contrasts),
+        *_missing_pairs(contrasts),
+        "",
+        *_arm_runs(contrasts),
+        *_descriptives(result, level),
+    ]
 
 
 def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
@@ -256,6 +293,7 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *MDE_NOTES]
     if family:
         lines += ["", *_pairs(family, "### Pairs of the family's contrasts")]
+    lines += _equivalence_family(result)
     lines += [
         "",
         "## Exploratory contrasts (outside the Holm family)",
@@ -267,14 +305,191 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
         lines += ["", *_pairs(exploratory, "### Pairs of the exploratory contrasts")]
     else:
         lines += ["None declared."]
-    return [*lines, "", *MISSING_PAIRS, ""]
+    return [
+        *lines,
+        "",
+        *_ratios(result.contrasts),
+        *_missing_pairs(result.contrasts),
+        "",
+        *_arm_runs(result.contrasts),
+        *_descriptives(result, level),
+    ]
+
+
+def _finish_rate(value: float) -> str:
+    """A share of planned runs as a percentage; n/a for an arm with no planned run, never 0%."""
+    return _share(value) if math.isfinite(value) else UNKNOWN
+
+
+def _arm_runs(results: Sequence[ContrastResult]) -> list[str]:
+    """What became of each arm's own planned runs, per contrast (S14); nothing for a result that carries none."""
+    rows = [
+        [
+            r.name,
+            a.arm,
+            a.planned,
+            a.finished,
+            _finish_rate(a.finish_rate),
+            a.measured,
+            *(a.lost[c] for c in LOST_CAUSES),
+        ]
+        for r in results
+        for a in r.arm_runs
+    ]
+    if not rows:
+        return []
+    header = ["Contrast", "Arm", "Planned", "Finished", "Finish rate", "Measured", *ARM_LOST_HEADINGS]
+    return ["### Runs of each arm", "", *ARM_RUNS_NOTES, "", *_table(header, rows), ""]
+
+
+def _descriptives(result: AnalysisResult, level: float | None) -> list[str]:
+    """The one-arm estimates (S14), descriptive, with no test; nothing when none is declared."""
+    if not result.descriptives:
+        return []
+    interval = "Interval" if level is None else f"{percent(level)} interval"
+    header = ["Estimate", "Kind", "Arm", "Outcome", "Value", interval, "Clusters", "Runs used", "Finish rate"]
+    rows = [
+        [
+            d.name,
+            d.kind,
+            " + ".join(d.conditions),
+            d.outcome,
+            _num(d.estimate),
+            f"[{_num(d.ci_low)}, {_num(d.ci_high)}]",
+            d.n_clusters,
+            d.n_runs,
+            _finish_rate(d.runs.finish_rate),
+            d.n_undefined_replicates,
+        ]
+        for d in result.descriptives
+    ]
+    lines = ["## One-arm estimates (descriptive)", "", *DESCRIPTIVE_NOTES, ""]
+    return [*lines, *_table([*header, "Undefined replicates"], rows), ""]
+
+
+def _equivalence_family(result: AnalysisResult) -> list[str]:
+    """The equivalence family's members (S15): each one's TOST p-value, its Holm-adjusted one, and the interval at the
+    level Holm compared it with; nothing when the preregistration declares no equivalence family."""
+    members = [r for r in result.contrasts if r.in_equivalence_family]
+    if not members:
+        return []
+    rows = []
+    for r in members:
+        low, high = r.equivalence_interval_adjusted or (math.nan, math.nan)
+        level = UNKNOWN if r.equivalence_level is None else percent(r.equivalence_level)
+        interval = f"[{_num(low)}, {_num(high)}]"
+        rows.append(
+            [r.name, _margin(r), _p(r.tost_p), _p(r.tost_p_holm), level, interval, "yes" if r.equivalent else "no"]
+        )
+    header = ["Contrast", "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"]
+    heading = "### Equivalence family (Holm over two one-sided tests)"
+    return ["", heading, "", *_table(header, rows), "", *equivalence_family_notes(result.alpha)]
 
 
 def _pairs(results: Sequence[ContrastResult], heading: str) -> list[str]:
-    """The pairs each contrast used and missed, by each cause, zeros included."""
-    rows = [[r.name, r.n_pairs, *(r.pairs_missing[cause] for cause in MISSING_CAUSES)] for r in results]
-    header = ["Contrast", "Pairs used", *(CAUSE_HEADINGS[cause] for cause in MISSING_CAUSES)]
+    """The pairs each contrast used and missed, by each cause, zeros included; `-` for a ratio contrast's cause in the
+    row of a contrast of one outcome."""
+    causes = _causes(results)
+    rows = [
+        [
+            r.name,
+            r.n_pairs,
+            *(
+                r.pairs_missing[cause] if r.ratio is not None or cause in MISSING_CAUSES else NOT_APPLICABLE
+                for cause in causes
+            ),
+        ]
+        for r in results
+    ]
+    header = ["Contrast", "Pairs used", *(CAUSE_HEADINGS[cause] for cause in causes)]
     return [heading, "", *_table(header, rows)]
+
+
+def _missing_pairs(results: Sequence[ContrastResult]) -> list[str]:
+    """What each cause counts; a ratio contrast's three only in a report with one (S13)."""
+    return [*MISSING_PAIRS, *(RATIO_MISSING_PAIRS if any(r.ratio is not None for r in results) else [])]
+
+
+def _exp(value: float) -> float:
+    """exp of a log ratio; NaN stays NaN, and a ratio past the float range is infinite (shown as n/a, never 0)."""
+    try:
+        return math.exp(value)
+    except OverflowError:
+        return math.inf
+
+
+def _zero_rule(form: RatioForm) -> str:
+    """The preregistered rule for a zero sum, as the ratio table shows it."""
+    if form.zero_denominator == "continuity":
+        return f"continuity correction {_num(form.continuity_correction)}"
+    return form.zero_denominator
+
+
+def _estimation_unit(result: ContrastResult) -> str:
+    """The cell one value is computed in, as the ratio table shows it: the attribute, or the model and the attribute."""
+    return ", ".join(result.estimation_unit or (result.cluster,))
+
+
+def _cells(result: ContrastResult) -> str:
+    """The cells with a value, and those lost by cause when any is; `-` in a result that does not count them."""
+    if result.n_cells is None:
+        return NOT_APPLICABLE
+    lost = [f"{cause.replace('_', ' ')} {count}" for cause, count in result.cells_lost.items() if count]
+    return f"{result.n_cells} (lost: {', '.join(lost)})" if lost else str(result.n_cells)
+
+
+def _by_model(ratios: Sequence[ContrastResult]) -> list[str]:
+    """Each model's estimate of a ratio contrast estimated per model's cell, as a ratio (S13); nothing when none has
+    one. Exploratory: from the same draws of the groups as the contrast's, with no test of its own."""
+    rows = [
+        [
+            r.name,
+            m.model,
+            _num(m.estimate),
+            _num(_exp(m.estimate)),
+            f"[{_num(_exp(m.ci_low))}, {_num(_exp(m.ci_high))}]",
+        ]
+        for r in ratios
+        for m in r.per_model
+    ]
+    if not rows:
+        return []
+    header = ["Contrast", "Model", "Estimate", "Ratio (A / B)", "Ratio interval"]
+    return ["### Ratio contrasts by model (exploratory)", "", *_table(header, rows), "", *RATIO_BY_MODEL_NOTES, ""]
+
+
+def _ratios(results: Sequence[ContrastResult]) -> list[str]:
+    """Each ratio contrast's two outcomes, its two units, its cells, its zero rule, and its estimate and interval as
+    ratios (S13), then each model's where it is estimated per model's cell; nothing when there is no ratio contrast."""
+    ratios = [r for r in results if r.ratio is not None]
+    if not ratios:
+        return []
+    rows = [
+        [
+            r.name,
+            r.ratio.numerator,
+            r.ratio.denominator,
+            _estimation_unit(r),
+            r.independent_unit or r.cluster,
+            _cells(r),
+            _zero_rule(r.ratio),
+            _num(_exp(r.estimate)),
+            f"[{_num(_exp(r.ci_low))}, {_num(_exp(r.ci_high))}]",
+        ]
+        for r in ratios
+    ]
+    header = [
+        "Contrast",
+        "Numerator",
+        "Denominator",
+        "Estimation unit",
+        "Independent unit",
+        "Cells",
+        "Zero total",
+        "Ratio (A / B)",
+        "Ratio interval",
+    ]
+    return ["## Ratio contrasts", "", *_table(header, rows), "", *RATIO_NOTES, "", *_by_model(ratios)]
 
 
 def _conditions(export: Mapping[str, Any]) -> list[str]:
@@ -373,7 +588,13 @@ def summary_lines(result: AnalysisResult) -> list[str]:
         member = not _exploratory(r, adjusted)
         holm = _p(adjusted[r.name]) if member else EXPLORATORY
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
-        lines.append(f"{r.name}: estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}, {word}")
+        scale = "" if r.ratio is None else " (ln ratio)"  # a log ratio printed bare reads as a difference (S13)
+        tost = f", Holm TOST p {_p(r.tost_p_holm)}" if r.in_equivalence_family else ""  # the basis of `equivalent`
+        lines.append(f"{r.name}: estimate {_num(r.estimate)}{scale}, p {_p(r.p_value)}, Holm p {holm}, {word}{tost}")
+    for d in result.descriptives:  # no test and no word: a one-arm estimate is descriptive (S14)
+        kind, arm = d.kind.replace("_", " "), " + ".join(d.conditions)
+        interval = f"[{_num(d.ci_low)}, {_num(d.ci_high)}]"
+        lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
     return lines
 
 

@@ -118,6 +118,7 @@ def test_ensure_support_survives_a_transient_storages_read_and_sends_each_suppor
     script = {
         ("GET", "/providers"): [{"providers": []}],
         STORAGES: [error(500), error(500), {"ids": ["storage-1"]}],
+        ("GET", "/provider/storages/storage-1"): [{"name": "posix"}],  # a storage is found by its name (O41)
         ("POST", "/user/tokens/temporary"): [{"token": "invite"}],
         SUPPORT: [{}],
     }
@@ -135,6 +136,7 @@ def test_ensure_support_does_not_send_a_support_call_again_when_it_failed(fed, r
     script = {
         ("GET", "/providers"): [{"providers": []}],
         STORAGES: [{"ids": ["storage-1"]}],
+        ("GET", "/provider/storages/storage-1"): [{"name": "posix"}],  # a storage is found by its name (O41)
         ("POST", "/user/tokens/temporary"): [{"token": "invite"}],
         SUPPORT: [error(500)],
     }
