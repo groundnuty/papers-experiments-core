@@ -26,6 +26,7 @@ def _isolated_registry(monkeypatch):
     """Every test starts with only the core's kinds and leaves no platform or study kind behind."""
     monkeypatch.setattr(errors, "_platform_kinds", {})
     monkeypatch.setattr(errors, "_platform_untreatable", {})
+    monkeypatch.setattr(errors, "_platform_uncharged", {})
     monkeypatch.setattr(errors, "_study_kinds", {})
 
 
@@ -143,6 +144,26 @@ def test_o05_a_registered_kind_cannot_be_made_treatable_or_untreatable_by_regist
         register_infra_kind("provider_down", "stronger", treatable=False)
     assert is_treatable("provider_tampered") is False
     assert is_treatable("provider_down") is True
+
+
+def test_c33_a_platform_kind_registered_as_costing_no_attempt_is_a_hold_that_is_never_treatable():
+    """C33: a platform's hold (`charged=False`), a start held back with nothing sent, is listed by `uncharged_kinds`,
+    must be untreatable, and cannot be made charged by registering it again, nor a charged kind made a hold; the same
+    answer again is harmless, and a refused registration adds nothing."""
+    assert errors.uncharged_kinds() == frozenset()
+    register_infra_kind("baseline_held", "a start held back, nothing sent", treatable=False, charged=False)
+    register_infra_kind("baseline_held", "again", treatable=False, charged=False)
+    assert errors.uncharged_kinds() == frozenset({"baseline_held"})
+    assert is_treatable("baseline_held") is False
+    with pytest.raises(ValueError, match="must be registered treatable=False"):
+        register_infra_kind("free_fault", "a fault a condition could declare", charged=False)
+    with pytest.raises(ValueError, match="already registered as costing no attempt"):
+        register_infra_kind("baseline_held", "charged now", treatable=False)
+    register_infra_kind("provider_tampered", "a provider whose state was changed", treatable=False)
+    with pytest.raises(ValueError, match="already registered as charged"):
+        register_infra_kind("provider_tampered", "free now", treatable=False, charged=False)
+    assert errors.uncharged_kinds() == frozenset({"baseline_held"})
+    assert "free_fault" not in infra_kinds()
 
 
 def test_c02_a_study_s_own_kinds_hold_only_for_its_scope_however_the_scope_ends():

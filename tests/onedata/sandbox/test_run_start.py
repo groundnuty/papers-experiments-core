@@ -121,6 +121,7 @@ def test_o24_a_harness_step_runs_as_the_agent_and_is_recorded_apart_from_the_age
             "status": "ran",
             "exit_code": 3,
             "timed_out": False,
+            "bound": None,
             "gate_refusals": ["redirect"],
             "earlyoom_kills": [],
         }

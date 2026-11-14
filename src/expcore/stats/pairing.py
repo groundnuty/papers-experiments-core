@@ -28,6 +28,10 @@ zeros included (S10, C23). A pair is every pairing key that a run of either arm 
   partial analysis, or not in the plan (a task one arm does not run).
 The absent runs come from the export (`AbsentRun`); without them every pair with one run analysed is
 `unpaired_or_left_out` and a pair with neither is not seen.
+
+Beside the pairs, each arm's own planned runs are counted (`Pairing.arm_runs`, S14): measured, or lost to a None
+outcome (on a treatment attempt or another run) or to having no analysed attempt (exhausted, unfinished, left out),
+whatever became of their partners, so a reader sees which arm lost the runs a pair count leaves unattributed.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from expcore.stats.armruns import ArmRuns, count_arm
 from expcore.stats.estimators import PairedDifferences
 from expcore.stats.rows import AbsentRun, Row
 
@@ -112,6 +117,7 @@ class Pairing:
     n_clusters_dropped: int  # clusters seen in either arm that were left without a pair
     missing: Mapping[str, int]  # the pairs missing, by each cause of MISSING_CAUSES, zeros included
     tasks_dropped: tuple[str, ...] = ()  # tasks with runs in one arm only, sorted
+    arm_runs: tuple[ArmRuns, ...] = ()  # arm A's and arm B's own planned runs, measured or lost by cause (S14)
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -278,4 +284,26 @@ def pair_rows(rows: Iterable[Row], spec: ContrastSpec, absent: Iterable[AbsentRu
         n_clusters_dropped=len(seen) - len(differences.clusters),
         missing=missing,
         tasks_dropped=tuple(sorted({r.task for r in first.values()} ^ {r.task for r in second.values()})),
+        arm_runs=_arm_runs(arms, reasons, spec),
+    )
+
+
+def _arm_runs(
+    arms: tuple[dict[tuple, Row], dict[tuple, Row]],
+    reasons: tuple[dict[tuple, str], dict[tuple, str]],
+    spec: ContrastSpec,
+) -> tuple[ArmRuns, ...]:
+    """Each arm's planned runs whose pairing key the other arm plans too (analysed or absent), by what became of them
+    (S14): the runs of the contrast's planned pairs. A run with no planned partner (a task the other arm never runs,
+    or a factor contrast's run whose other factors no run of the other level shares) is outside every pair, and is
+    neither counted nor read."""
+    planned = [set(arms[side]) | set(reasons[side]) for side in (0, 1)]
+    shared = planned[0] & planned[1]
+    return tuple(
+        count_arm(
+            spec.arms[side],
+            ((row.treatment, _value(row, spec) is not None) for key, row in arms[side].items() if key in shared),
+            (reason for key, reason in reasons[side].items() if key in shared),
+        )
+        for side in (0, 1)
     )

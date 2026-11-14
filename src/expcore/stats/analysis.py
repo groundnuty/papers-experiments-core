@@ -43,6 +43,10 @@ A preregistration may declare an equivalence family (S15): members of the Holm f
 claims are decided together. Each member's TOST p-value comes from its estimator's own resamples, Holm adjusts them
 over the family, and a member is equivalent only when Holm rejects; the interval at 1 - 2 times its Holm level is
 reported with it. `equivalence_feasibility` simulates, before the campaign, how often each claim would be reached.
+
+Each contrast's result carries what became of each arm's own planned runs (`arm_runs`, S14), and the analysis carries
+every preregistered one-arm estimate (`descriptives`, `expcore.stats.onearm`), which is descriptive: no test, no
+conclusion and no place in the Holm family.
 """
 
 from __future__ import annotations
@@ -56,7 +60,9 @@ import numpy as np
 
 from expcore.stats import contrasts as kernel
 from expcore.stats import estimators, power
+from expcore.stats.armruns import ArmRuns
 from expcore.stats.estimators import ModelEstimate, PairedDifferences
+from expcore.stats.onearm import DescriptiveResult, describe
 from expcore.stats.pairing import ContrastSpec, Pairing, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
 from expcore.stats.rejection import rejects
@@ -113,6 +119,7 @@ class ContrastResult:
     tost_p_holm: float | None = None  # Holm-adjusted over the equivalence family, for reports; NaN when untestable
     equivalence_level: float | None = None  # 1 - 2 x the member's Holm level
     equivalence_interval_adjusted: tuple[float, float] | None = None  # the interval at equivalence_level
+    arm_runs: tuple[ArmRuns, ...] = ()  # arm A's and arm B's planned runs, measured or lost by cause (S14)
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -145,6 +152,7 @@ class AnalysisResult:
     manifest: Mapping[str, str]
     exploratory_only: bool = False
     equivalence_holm: tuple[HolmDecision, ...] = ()  # Holm over the equivalence family's TOST p-values (S15)
+    descriptives: tuple[DescriptiveResult, ...] = ()  # the one-arm estimates, in declared order (S14)
 
     def contrast(self, name: str) -> ContrastResult:
         """Return the result of the contrast with this name."""
@@ -356,6 +364,7 @@ def _run_contrast(
         minimum_detectable_effect=mde,
         in_equivalence_family=member,
         tost_p=tost,
+        arm_runs=pairing.arm_runs,
     )
     return result, pairing
 
@@ -426,7 +435,18 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
     )
     pairings = {name: pairing for name, (_, pairing) in runs.items()}
     decided, equivalence = _equivalence_family(decided, pairings, prereg)
-    return AnalysisResult(decided, decisions, prereg.alpha, prereg.manifest(), prereg.exploratory_only, equivalence)
+    described = tuple(
+        describe(rows, spec, prereg.descriptive_settings(spec), absent) for spec in prereg.descriptives.values()
+    )
+    return AnalysisResult(
+        decided,
+        decisions,
+        prereg.alpha,
+        prereg.manifest(),
+        prereg.exploratory_only,
+        equivalence_holm=equivalence,
+        descriptives=described,
+    )
 
 
 @dataclasses.dataclass(frozen=True)

@@ -45,9 +45,19 @@ does, charging the run that found it, and the outage is `blocking`, a hold that 
 that exits when blocked stops instead of waiting on a holder that may never let go. A gate already closed is checked
 by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
 
+**A failure an earlier attempt left charges no one.** A platform answers `Health(False, detail, charge=False)` for a
+failure it knows another attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
+that ended without its reset, left not whole): the pre-run check that finds it closes the gate as any failure does, so
+every run is held until a check passes, but it holds its own run too (`hold`) instead of charging it the outage's one
+attempt, and the outage's record says `"charged": false`. The flag rides on a deferral as well: a deferral past its
+bound then closes the gate blocking without charging the run that found it. A post-run check that fails so sets the
+attempt aside as one an outage overlapped (`outage_discarded`, never charged), since the failure is not its own; a
+platform answers `charge=True` for a failure the judged attempt left itself.
+
 **Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
 admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
-its post-run check), can see that the run still holds it.
+its post-run check), can see that the run still holds it, and that it runs inside its attempt
+(`expcore.campaign.liveness`), which the pre-run check and the dispatcher's own check do not.
 """
 
 import contextlib
@@ -70,12 +80,15 @@ UNREADABLE_DETAIL = "the stored outage record was unreadable"
 
 
 class Health(NamedTuple):
-    """One reading of the platform: whether it is healthy, in what words, and whether the reading was deferred (the
-    platform is held on purpose and could not be looked at now; never ok, see the module docstring)."""
+    """One reading of the platform: whether it is healthy, in what words, whether the reading was deferred (the
+    platform is held on purpose and could not be looked at now; never ok, see the module docstring), and whether a
+    pre-run check that fails on it charges the run that found it (False: an earlier attempt left the failure, so the
+    gate closes and charges no one)."""
 
     ok: bool
     detail: str
     deferred: bool = False
+    charge: bool = True
 
 
 class HealthCheck(Protocol):
@@ -94,8 +107,13 @@ def read_health(check: Callable[[], Any]) -> Health:
         answer = check()
     except Exception as error:
         return Health(False, f"health check raised {type(error).__name__}")
-    if isinstance(answer, Health) and isinstance(answer.ok, bool) and isinstance(answer.deferred, bool):
-        return Health(answer.ok and not answer.deferred, str(answer.detail), answer.deferred)
+    if (
+        isinstance(answer, Health)
+        and isinstance(answer.ok, bool)
+        and isinstance(answer.deferred, bool)
+        and isinstance(answer.charge, bool)
+    ):
+        return Health(answer.ok and not answer.deferred, str(answer.detail), answer.deferred, answer.charge)
     if isinstance(answer, tuple | list) and len(answer) == 2 and isinstance(answer[0], bool):
         return Health(answer[0], str(answer[1]))
     return Health(False, f"health check answered {str(answer)[:80]!r}, not (ok, detail)")
@@ -152,19 +170,24 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
     if outage is None:
         return deferral_alarms(state.get("deferral"))
     last = outage.get("last_detail") or outage.get("first_detail") or "no detail"
+    charged = (
+        "no attempt was charged: an earlier attempt left it"
+        if outage.get("charged") is False
+        else "one attempt was charged, to the run that found it"
+    )
     return [
         f"HEALTH GATE CLOSED since {outage['start_utc']}: no run starts; the dispatcher re-checks every {every_s:g} s "
         f"and resumes by itself on the first pass ({outage.get('checks', 0)} check(s) so far, last "
-        f"{outage.get('last_check_utc') or 'not yet'}: {str(last)[:160]}); one attempt was charged, to the run that "
-        "found it"
+        f"{outage.get('last_check_utc') or 'not yet'}: {str(last)[:160]}); {charged}"
     ]
 
 
 @dataclass(frozen=True)
 class PreRun:
-    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing), `defer` (the check was
-    deferred: stay pending, charge nothing, try again after `recheck_s`, the gate left open) or `found` (this run found a
-    new outage and is charged its one attempt)."""
+    """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing: the gate is closed, by a new
+    outage this run found included when its check charges no one), `defer` (the check was deferred: stay pending,
+    charge nothing, try again after `recheck_s`, the gate left open) or `found` (this run found a new outage and is
+    charged its one attempt)."""
 
     verdict: str
     detail: str
@@ -250,9 +273,10 @@ class HealthGate:
                 "checked at once; no attempt is charged for the restart",
             )
 
-    def _close(self, run_key: str, detail: str, *, blocking: bool = False) -> bool:
-        """Close the gate for a failed check. True: this run found the outage and is its one attempt. A `blocking`
-        outage, a deferral past its bound, is a hold that does not end by itself."""
+    def _close(self, run_key: str, detail: str, *, blocking: bool = False, charge: bool = True) -> bool:
+        """Close the gate for a failed check. True: this run found the outage, and is its one attempt unless `charge`
+        is False (an earlier attempt left the failure). A `blocking` outage, a deferral past its bound, is a hold that
+        does not end by itself."""
         with self._lock:
             if self._open is not None:
                 return False
@@ -269,15 +293,22 @@ class HealthGate:
             }
             if blocking:
                 record["blocking"] = True
+            if not charge:
+                record["charged"] = False
             self._open = record
             self._outages.append(record)
             self.store.put_meta(META, dump(self._outages), now)
+            who = (
+                "this run is charged one attempt, no other is"
+                if charge
+                else "no run is charged, this one included: an earlier attempt left the failure"
+            )
             self.store.event(
                 now,
                 "health_gate_closed",
                 None,
                 f"{run_key}: the pre-run health check failed ({detail[:200]}): no run starts until the dispatcher's own "
-                f"check passes (every {self.recheck_s:g} s); this run is charged one attempt, no other is",
+                f"check passes (every {self.recheck_s:g} s); {who}",
             )
         self._wake.set()
         return True
@@ -331,7 +362,8 @@ class HealthGate:
     def before_run(self, run_key: str) -> PreRun:
         """Check before an attempt. A closed gate holds the run without a check; a passing check lets it go unless the
         gate closed while the check was out; a deferred check defers the run and leaves the gate as it is; a failing
-        check closes the gate and charges this run, or, if another run closed it first, holds this one."""
+        check closes the gate and charges this run, or holds it when the check charges no one (`Health.charge`) or
+        another run closed the gate first."""
         if self._open is not None:
             return PreRun(HOLD, "the gate is closed")
         if self._stop is not None and self._stop.is_set():
@@ -353,9 +385,9 @@ class HealthGate:
                 return PreRun(DEFER, health.detail)  # a wait, not a failure: nothing is closed or charged
             blocking = True  # a wait past its bound: the holder may never let go
             detail = f"{detail} (deferred for {age:.0f} s, past max_defer_s of {self.max_defer_s:g} s)"
-        if not self._close(run_key, detail, blocking=blocking):
+        if not self._close(run_key, detail, blocking=blocking, charge=health.charge):
             return PreRun(HOLD, "another run's failed check closed the gate first")
-        return PreRun(FOUND, detail)
+        return PreRun(FOUND, detail) if health.charge else PreRun(HOLD, detail)
 
     def after_run(self) -> tuple[Health, dict[str, Any] | None]:
         """Check after an attempt: the health, and the outage record if the gate was closed when the check returned. A
