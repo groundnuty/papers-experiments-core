@@ -97,6 +97,19 @@ def test_o51_a_planners_reading_of_another_space_is_refused_by_the_spaces_id_bef
     assert len(fake.provider_calls) == calls_before
 
 
+def test_o51_a_planners_reading_whose_names_stand_for_other_providers_is_refused(listing, fake, ticker):
+    """O51: the scan's tables are keyed by provider names, so a reading made where `alpha` and `beta` stood for each
+    other's providers, the same ids under other names, would read one provider's files at the other: refused."""
+    holdings = SpaceReset(listing, now=ticker.clock).plan_scan()
+    swapped = tuple(
+        (name, ident)
+        for (name, _), (_, ident) in zip(holdings.scan.providers, holdings.scan.providers[::-1], strict=True)
+    )
+    crossed = dataclasses.replace(holdings, scan=dataclasses.replace(holdings.scan, providers=swapped))
+    with pytest.raises(ValueError, match="providers the reset reads"):
+        SpaceReset(listing, now=ticker.clock).run(planned=crossed)
+
+
 def test_o09_a_planners_reading_of_another_space_or_providers_is_refused_before_any_stage(listing, fake, ticker):
     """O51: a reading made through a reset of other providers stands for no scan of this reset; it is refused before
     anything is sent."""

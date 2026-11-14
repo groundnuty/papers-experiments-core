@@ -164,13 +164,14 @@ class Found:
     deepest: int = 0
     regular: dict[str, frozenset[str]] = field(default_factory=dict)
     space: str = ""  # the space's Onezone id
-    providers: tuple[str, ...] = ()  # the Onezone ids of the providers read, in order
+    providers: tuple[tuple[str, str], ...] = ()  # each provider read, (name, Onezone id), in order
     paths: dict[str, str] = field(default_factory=dict)
 
 
-def _ids(p: Provisioner, providers: Sequence[str]) -> tuple[str, ...]:
-    """The Onezone ids of the providers a scan read, which bind it to them whatever a configuration calls them."""
-    return tuple(p.provider_id(provider) for provider in providers)
+def _ids(p: Provisioner, providers: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    """Each provider a scan read as `(name, Onezone id)`: the scan's tables are keyed by the names, so a reset takes it
+    only where every name stands for the same provider."""
+    return tuple((provider, p.provider_id(provider)) for provider in providers)
 
 
 def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:

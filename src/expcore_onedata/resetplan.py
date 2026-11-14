@@ -98,7 +98,8 @@ def given_scan(reset: "SpaceReset", holdings: Holdings) -> resetqos.Found:
     scan, p = holdings.scan, reset.provisioner
     if scan.space != p.space_id or "listings" not in scan.reads:  # the space's Onezone id, never its position
         raise ValueError("a planner's reading given to a reset is of its own space, made by the recursive listing")
-    if set(scan.providers) != {p.provider_id(provider) for provider in reset.providers}:
+    # the scan's tables are keyed by provider names: each name must stand for the same provider, by its Onezone id
+    if set(scan.providers) != {(provider, p.provider_id(provider)) for provider in reset.providers}:
         raise ValueError("a planner's reading given to a reset lists the providers the reset reads, no others")
     return scan
 
