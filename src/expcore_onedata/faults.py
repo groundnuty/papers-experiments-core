@@ -148,7 +148,8 @@ running in its thread. `finish_instruments` puts the snapshot into the record an
 **Order (C31).** `finish` is the restore, and `finish_instruments` finishes the instruments in the reverse of their
 list. Probes listed after the injector therefore finish before the restore and read the state the outage left; probes
 listed before it finish after the restore. `running` clears when its block exits, so a `finish_instruments` called
-after the block runs after the restore, whatever the order: call it inside the block for the probes to read first.
+after the block runs after the restore the block's exit made, whatever the order (a restore that was not verified is
+tried again by `finish`, and then the order decides again): call it inside the block for the probes to read first.
 
 **Names (O12).** Outside the driver and the journal the provider is known only by its label: in the snapshot, in every
 message and in every failure. Identities are recorded as SHA-256 digests. The settings are `[faults]` of

@@ -910,7 +910,7 @@ An instrument that must finish first, one that stamps the end of the run before 
 
 What stays in list order: the snapshots in the record, so its `instruments` keep the list's key order, though what an instrument reads can differ with the order of the calls; `at_first_turn`, which is one moment, not a nest; and `check`, which runs once every `finish` has run. The first listed instrument that refuses is the one the record keeps, so a refusal of the injector or the ingest, the cause, wins over a refusal of a probe listed after it. A `finish` that raises is recorded as failed and the instruments listed before it still finish.
 
-The fault injector's `running` clears the provider when its block exits. Call `finish_instruments` inside the block for the probes to read before the restore; called after the block, it runs after the restore whatever the order.
+The fault injector's `running` clears the provider when its block exits. Call `finish_instruments` inside the block for the probes to read before the restore; called after the block, it runs after the restore the block's exit made, whatever the order. A restore that was not verified at the exit is tried again by the injector's `finish`, and for that retry the order decides again.
 
 ### An instrument that refuses an attempt
 
