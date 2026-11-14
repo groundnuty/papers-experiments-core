@@ -67,7 +67,7 @@ def test_o33_with_no_requirement_and_no_qos_rights_the_settle_and_the_quiet_chec
     assert record["stages"]["qos_settle"]["polls"] == 0
     quiet = record["stages"]["quiet"]
     assert (quiet["ran"], quiet["why"], quiet["waited_s"]) == (False, None, 0.0)
-    assert WAIT_S not in ticker.slept
+    assert ticker.slept.count(WAIT_S) == 1  # the occupancy stage's wait for the eviction (O45), and no other
 
 
 def test_o33_a_run_with_qos_rights_runs_the_quiet_check_with_no_requirement_left(scanned, fake, ticker):
@@ -85,7 +85,7 @@ def test_o33_a_run_with_qos_rights_runs_the_quiet_check_with_no_requirement_left
     assert quiet["waited_s"] == WAIT_S
     assert quiet["seconds"] >= WAIT_S
     assert quiet["physical_bytes"]["providers[1]"] == 0
-    assert WAIT_S in ticker.slept
+    assert ticker.slept.count(WAIT_S) == 2  # the occupancy stage's (O45), then the quiet stage's
 
 
 def test_o33_a_caller_that_does_not_say_gets_the_quiet_check_and_the_record_says_the_default(scanned, fake, ticker):
@@ -126,7 +126,7 @@ def test_o33_a_requirement_added_and_removed_by_the_agent_fails_the_reset_when_i
         SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=True)
     assert caught.value.record["stages"]["qos"]["removed"] == 0
     assert list(caught.value.record["stages"]) == list(STAGES[:-1])
-    assert WAIT_S not in ticker.slept  # failed at T
+    assert ticker.slept.count(WAIT_S) == 1  # the occupancy stage's (O45): the quiet stage failed at T, unwaited
 
 
 def test_o33_a_late_replication_of_a_file_beta_did_not_hold_is_caught_by_the_occupancy(

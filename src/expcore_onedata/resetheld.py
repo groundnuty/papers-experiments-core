@@ -40,7 +40,10 @@ certified: it may not show in the occupancy yet, and no map is read again.
 space, which the QoS scan already saw and costs no read of its own, since a replication nothing names could reach any
 file; or, for a caller that knows no run could have set a requirement (`qos_rights=False`), the deepest file a removed
 requirement applied to. The wait is 15 s for files directly under the root, 20 s one directory down, and 5 s more for
-each further level.
+each further level. **The figure it holds the occupancy to is read after a wait of its own** (O45): the occupancy
+stage waits the same lag and margin from the eviction stage's end, for the deepest regular file of the space whatever
+`qos_rights` says, since an eviction's change lags as a placement's does (`resetqos`, the 14 Nov live slot). Without
+it the figure could still count bytes already evicted, and a growth up to their size would pass here.
 """
 
 from collections.abc import Iterable, Mapping

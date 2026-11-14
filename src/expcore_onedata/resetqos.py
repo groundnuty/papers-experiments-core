@@ -46,8 +46,9 @@ removed requirement's entry are the affected files.
 **Settled, then quiet.** A QoS replication has no transfer to wait for, and a cancel can still place the blocks it had
 in flight. So after the removal the affected files' block maps, on every provider, must stay the same for
 `SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND_S`, or the reset fails. After the eviction and the
-occupancy the quiet stage reads, at one instant T, the block maps of the files the eviction plan evicted, on the
-providers it evicted them from, and of the files a removed requirement applied to, on every provider. Each may hold no
+occupancy, read once every eviction's change can show (below), the quiet stage reads, at one instant T, the block maps
+of the files the eviction plan evicted, on the providers it evicted them from, and of the files a removed requirement
+applied to, on every provider. Each may hold no
 more than it should: nothing where the eviction verified it empty, what the settle saw elsewhere. Then it waits
 `quiet_wait_s` from T and reads the occupancy: no provider other than the data provider may hold more of the space than
 at the occupancy stage. That check does not wait for a requirement to be found: an agent can add one and remove it
@@ -73,15 +74,27 @@ placement:
 - each directory above the parent gets it when the parent's collector flushes, 5 s after its first unflushed change
   (`FLUSH_INTERVAL_MILLIS`, `dir_stats_collector.erl:168,905-918,1037-1057`);
 - so the space root's physical size reflects a placement at most 10 + 5 x (L - 1) s later, L being the levels from the
-  file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`). An eviction flushes at once
-  (`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level above the parent.
+  file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`).
 
-The quiet wait is that lag for the deepest file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest
-regular file of the space, as the scan saw it, since a replication nothing names could reach any file, or the deepest
-affected file when the caller knows the run could set no requirement. So the occupancy is read when every placement
-that landed by T shows in it. Another study measured 9.5 s for a directory after a placement and 0.05 s after an
-eviction, which this fits. A space with directory statistics off answers no physical size at all, and the occupancy
-stage already fails on it.
+**An eviction lags as long (O45).** The source suggests an eviction's change skips the location's flush
+(`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level, and another study measured 0.05 s; the 14 Nov
+live slot (`deploy/compose-federation/day0/2026-11-14-federation-facts-slot.md`, item 4, op-worker f118ed9) saw a
+mirror's root size drop 20.03 s after an eviction at depth 3 was scheduled, the eviction job's own run included, where
+it grew 15.91 s after a placement at that depth (bound 20 s) and 10.76 s at depth 2 (bound 15 s). The slot cannot say
+how much of the 20.03 s was the job's run, so the reset takes **the conservative reading:** an eviction's change lags
+by the placement's bound, 10 + 5 x (L - 1) s, counted from when the reset knows every eviction had finished, the
+eviction stage's end, at or after each eviction job's finish and its block-map verification. Counted from the
+scheduling instead, the measured 20.03 s is past the bound alone and within the bound and margin, 25 s.
+
+So two reads of the occupancy wait. The occupancy stage waits `occupancy_wait_s` from the eviction stage's end, the
+lag for the deepest regular file of the space plus `QUIET_MARGIN_S`: every eviction and every transfer had ended by
+then, the reset's and an earlier run's, at any depth, so its figure shows them all, and the quiet stage holds the
+occupancy to a figure that no longer counts bytes already evicted. Read sooner, that figure still held them, and the
+quiet stage passed a growth up to their size: a false certification. The quiet wait is the same lag for the deepest
+file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest regular file of the space, as the scan saw it,
+since a replication nothing names could reach any file, or the deepest affected file when the caller knows the run
+could set no requirement. So the occupancy is read when every placement that landed by T shows in it. A space with
+directory statistics off answers no physical size at all, and the occupancy stage already fails on it.
 """
 
 import re
@@ -117,6 +130,12 @@ def occupancy_lag_s(depth: int) -> float:
 def quiet_wait_s(depth: int) -> float:
     """The quiet stage's wait from T to the occupancy read, for files at most `depth` path parts below the root: the
     lag, by which every placement that landed by T shows, and `QUIET_MARGIN_S`."""
+    return occupancy_lag_s(depth) + QUIET_MARGIN_S
+
+
+def occupancy_wait_s(depth: int) -> float:
+    """The occupancy stage's wait from the eviction stage's end to its read, for files at most `depth` path parts below
+    the root: the same lag, which an eviction's change has too (O45), and `QUIET_MARGIN_S`."""
     return occupancy_lag_s(depth) + QUIET_MARGIN_S
 
 
@@ -414,6 +433,7 @@ __all__ = [
     "SETTLE_STABLE_S",
     "Found",
     "occupancy_lag_s",
+    "occupancy_wait_s",
     "plain_id",
     "quiet",
     "quiet_wait_s",

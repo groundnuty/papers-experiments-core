@@ -686,6 +686,39 @@ def test_the_space_roots_occupancy_follows_a_placement_within_the_sources_bound(
     assert lag <= resetqos.occupancy_lag_s(2) + 1.0
 
 
+@MUTATE
+def test_the_space_roots_occupancy_follows_an_eviction_within_the_resets_wait(scratch):
+    """O45: a scratch file one directory below the root is replicated to the receiver and, once the root's physical
+    size there shows it, evicted from there; the size is then read every quarter second until it has dropped back. The
+    drop must come within the occupancy stage's wait for that depth counted from the eviction's verified end
+    (`resetqos.occupancy_wait_s(2)`), the reading the reset takes; the seconds from the scheduling and from the end are
+    printed beside the lag the reset assumes, which the 14 Nov slot could not split."""
+    from expcore_onedata import resetqos
+    from expcore_onedata.occupancy import physical_sizes
+
+    provisioner, receiver, directory, _ = scratch
+    providers = list(provisioner.space.support.providers)
+    path, size = f"{directory}/part-1.bin", 1024  # the scratch files are 1024 bytes each
+    before = physical_sizes(provisioner, providers)[receiver]
+    provisioner.replicate(path, receiver)
+    placed = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] < before + size:
+        assert time.monotonic() - placed < resetqos.quiet_wait_s(2), "the root's physical size never showed the file"
+        time.sleep(0.25)
+    scheduled = time.monotonic()
+    provisioner.evict(path, receiver)  # returns once the receiver's block map shows the file empty
+    ended = time.monotonic()
+    while physical_sizes(provisioner, providers)[receiver] > before:
+        assert time.monotonic() - ended < resetqos.occupancy_wait_s(2), "the root's size never dropped within the wait"
+        time.sleep(0.25)
+    dropped = time.monotonic()
+    print(
+        f"the space root's physical size showed the eviction {dropped - scheduled:.2f} s after its scheduling and "
+        f"{dropped - ended:.2f} s after its verified end (the job took {ended - scheduled:.2f} s; the reset assumes "
+        f"up to {resetqos.occupancy_lag_s(2):.0f} s from the end)"
+    )
+
+
 # -- large files (issue #127) -----------------------------------------------------------------------------------------
 
 LARGE_FILE_BYTES = 40 << 20  # tens of MB: ten chunks of the size below, quick to move
