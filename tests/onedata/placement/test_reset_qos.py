@@ -193,8 +193,8 @@ def test_o33_the_scan_setting_is_one_of_the_two_and_listing_by_default(config, p
 
 def test_o33_a_study_that_declares_no_scan_has_the_fingerprint_of_one_that_declares_either(tmp_path, fake):
     """O33: `qos_scan` is a way to find requirements and changes none of what the reset removes, so it is in no
-    fingerprint: the platform's half is the same without the key, with `summaries` and with `listing`, and a store
-    started under the old default resumes under the new one."""
+    fingerprint: the platform's half, which a resume compares, is the same without the key, with `summaries` and with
+    `listing`."""
     fingerprints = []
     for name, extra in (("none", {}), ("summaries", {"qos_scan": "summaries"}), ("listing", {"qos_scan": "listing"})):
         (tmp_path / name).mkdir()
@@ -205,7 +205,7 @@ def test_o33_a_study_that_declares_no_scan_has_the_fingerprint_of_one_that_decla
 
 def test_o33_a_reset_on_the_default_settings_finds_the_requirements_by_the_listing(provisioner, fake, ticker):
     """O33: a provisioner built from a file that does not declare `qos_scan` finds the requirements by the recursive
-    listing of each provider's space root, with a summary read only where an entry is marked and not one per leaf;
+    listing of each provider's space root, with fewer summary reads than one per leaf (the summaries scan's);
     the reset's stage records the scan."""
     assert provisioner.settings.qos_scan == "listing"
     kept = fake.add_qos(FILES[0])
