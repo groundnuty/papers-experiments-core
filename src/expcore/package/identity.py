@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from expcore.campaign.export import EXPORT_FINGERPRINT, export_text, fingerprint_entry
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, ShardFacts, facts_of_bytes, merge_document, merge_text, read_merge
 from expcore.campaign.merged import snapshot_rel
@@ -62,7 +63,7 @@ from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.redact import Redactor
 from expcore.records.record import RunRecord, decode
 from expcore.replay.check import CHECK_FILE, inputs_sha256, recorded_side_files, verify_batch, write_check
-from expcore.study.pipeline import OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
+from expcore.study.pipeline import EXPORT_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
 
 PREFIX_DIGITS = 12
 SHORTEST_ID = 7  # a commit written short, as provenance headers write the ones they merge from
@@ -250,9 +251,24 @@ def _anonymised_check(
     return (batch / CHECK_FILE).read_bytes()
 
 
+def _export_without_sources(text: bytes) -> bytes:
+    """The author's export as it reads once the snapshot's fingerprint has lost the environment's sources (C35): the
+    export holds the fingerprint, which the anonymised snapshot holds without them, and the hash of it that changes with
+    them. An export without the key (from before it, or of a store that records none) is as it is."""
+    data = json.loads(text)
+    if EXPORT_FINGERPRINT not in data:
+        return text
+    fingerprint = dict(data[EXPORT_FINGERPRINT]["fingerprint"])
+    if "environment" in fingerprint:
+        fingerprint["environment"] = without_sources(fingerprint["environment"])
+    data[EXPORT_FINGERPRINT] = fingerprint_entry(fingerprint)
+    return export_text(data).encode("utf-8")
+
+
 def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path, swaps: Mapping[str, str]) -> None:
     """Derive the outputs from the rewritten batch; refuse any that is not the author's with the commit replaced,
-    and each old snapshot hash of `swaps` (a merged batch's export lists them) with its new one."""
+    each old snapshot hash of `swaps` (a merged batch's export lists them) with its new one and, in the export, the
+    campaign fingerprint without the environment's sources, with its hash."""
     lay_out(stage, files)
     try:
         made = output_bytes(analyse_study(stage, stamped=True))
@@ -263,6 +279,8 @@ def _outputs(files: dict[str, bytes], commit: str, pseudo: str, stage: Path, swa
         expected = files[path].replace(commit.encode(), pseudo.encode())
         for old, new in swaps.items():
             expected = expected.replace(old.encode(), new.encode())
+        if name == EXPORT_FILE:
+            expected = _export_without_sources(expected)
         if expected != made[name]:
             raise PackageError(f"{path}: differs from what the records give")
         files[path] = made[name]

@@ -59,11 +59,25 @@ A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campa
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
 export has no such key, and every byte of it is what it was before shards existed.
+
+**The campaign fingerprint (#243, C35).** An export of a store that records a campaign fingerprint has one more key,
+`campaign_fingerprint` (`EXPORT_FINGERPRINT`), after every other and before `shard`: `{"sha256", "fingerprint"}`, the
+fingerprint exactly as the store keeps it (never one computed again) and the SHA-256 of its canonical JSON
+(`manifest.fingerprint_sha256`, the hash merge.json names for a merged batch). A report can then read a setting that
+holds for the whole campaign (a level's declared `io_mode`, the bound on a tool server's calls) from the export, without
+opening the store, and check which campaign it reads: `verify_export_fingerprint` compares the export's hash with the
+hash of the store or snapshot (`stored_fingerprint_sha256`) or of merge.json. The fingerprint holds digests, never a
+path, a name or a secret (O12); what is in the snapshot a package ships is in it. The key is not required: a store
+that records none (it was never started as a campaign) exports without it, an export from before the key reads as it
+did, and `verify_export_fingerprint` says of such an export `fingerprint not recorded` instead of refusing it. A shard
+of a merged batch exports the fingerprint every shard shares, and the join (`export_join`) carries it once and refuses
+shards that disagree.
 """
 
 import collections
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from collections.abc import Collection, Iterable, Mapping
@@ -73,10 +87,17 @@ from typing import Any, Protocol
 
 from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
+from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
 from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
 FORMAT = "campaign-export-1"
+EXPORT_FINGERPRINT = "campaign_fingerprint"
+"""The export's key for the campaign fingerprint and its hash (C35)."""
+NOT_RECORDED = "fingerprint not recorded"
+"""What `verify_export_fingerprint` says of an export that carries no campaign fingerprint."""
+_FINGERPRINT_META = "fingerprint"  # the store's meta key (`campaign.resume.FINGERPRINT_KEY`)
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 RUN_LISTS = ("exhausted_runs", "unfinished_runs", "analysed_attempts")
 REQUIRED_KEYS = (
     "format",
@@ -136,6 +157,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
             attempts[attempt["run_key"]].append(attempt)
         identities = {run["run_key"]: _identity(store, run) for run in runs}
         declared = store.q("SELECT value FROM meta WHERE key=?", (ACCEPTED_META,))
+        fingerprint = stored_fingerprint(store)
         shard = _shard_facts(store)
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
@@ -207,9 +229,82 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
+    if fingerprint is not None:  # only a store that records one has the key (C35)
+        data[EXPORT_FINGERPRINT] = fingerprint_entry(fingerprint)
     if shard is not None:
         data[EXPORT_KEY] = shard
     return data
+
+
+def stored_fingerprint(store: RunState) -> dict[str, Any] | None:
+    """The campaign fingerprint the store (or the snapshot of one) records, as it keeps it; None when it records none.
+
+    A row that is there but is no JSON object is a damaged store, not one that records nothing, and is refused.
+    """
+    rows = store.q("SELECT value FROM meta WHERE key=?", (_FINGERPRINT_META,))
+    if not rows:
+        return None
+    try:
+        value = json.loads(rows[0]["value"])
+    except (TypeError, ValueError):
+        value = None
+    if not isinstance(value, dict):
+        raise ExportError("the store's campaign fingerprint is not a JSON object, so it cannot be exported")
+    return value
+
+
+def stored_fingerprint_sha256(store: RunState) -> str | None:
+    """The hash an export of this store carries for its campaign fingerprint; None when the store records none."""
+    fingerprint = stored_fingerprint(store)
+    return None if fingerprint is None else fingerprint_entry(fingerprint)["sha256"]
+
+
+def fingerprint_entry(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
+    """The export's `campaign_fingerprint` entry for a fingerprint: its hash and the fingerprint itself."""
+    try:
+        return {"sha256": fingerprint_sha256(fingerprint), "fingerprint": dict(fingerprint)}
+    except ValueError:
+        raise ExportError("the store's campaign fingerprint holds a number that is not finite") from None
+
+
+def _checked_entry(entry: object) -> dict[str, Any]:
+    """The `campaign_fingerprint` entry of an export, refused unless it is `{sha256, fingerprint}` and the hash is that
+    of the fingerprint beside it: an entry edited, or built from another campaign's parts, does not pass."""
+    if not isinstance(entry, dict) or set(entry) != {"sha256", "fingerprint"}:
+        raise ExportError(f"{EXPORT_FINGERPRINT} must be an object with exactly 'sha256' and 'fingerprint'")
+    if not isinstance(entry["sha256"], str) or not _SHA256.fullmatch(entry["sha256"]):
+        raise ExportError(f"{EXPORT_FINGERPRINT}.sha256 must be a 64-character lower-case hex digest")
+    if not isinstance(entry["fingerprint"], dict):
+        raise ExportError(f"{EXPORT_FINGERPRINT}.fingerprint must be an object")
+    computed = fingerprint_entry(entry["fingerprint"])["sha256"]
+    if computed != entry["sha256"]:
+        raise ExportError(
+            f"the campaign fingerprint's hash {entry['sha256']} is not the SHA-256 of the fingerprint it holds "
+            f"({computed})"
+        )
+    return entry
+
+
+def verify_export_fingerprint(data: Mapping[str, Any], expected_sha256: str | None = None) -> str:
+    """Say which campaign an export is of, and refuse it when it is not the campaign it is read with (C35).
+
+    `expected_sha256` is the hash of the store's or snapshot's fingerprint (`stored_fingerprint_sha256`), or the
+    `fingerprint` of a merged batch's merge.json. Returns a line for the person reading: the hash the export carries,
+    or `NOT_RECORDED` for an export without the key (one from before it, or of a store that records none), which is
+    read as it was and not refused. Raises `ExportError` for an entry that is malformed or whose hash is not that of
+    its fingerprint, and for a hash that is not `expected_sha256`.
+    """
+    if EXPORT_FINGERPRINT not in data:
+        return NOT_RECORDED
+    held = _checked_entry(data[EXPORT_FINGERPRINT])["sha256"]
+    if expected_sha256 is None:
+        return f"campaign fingerprint {held}"
+    if held != expected_sha256:
+        raise ExportError(
+            f"the export is of another campaign: its campaign fingerprint hash is {held}, but the one it is read "
+            f"with is {expected_sha256}"
+        )
+    return f"campaign fingerprint {held}, the one it is read with"
 
 
 def _shard_facts(store: RunState) -> dict[str, Any] | None:
@@ -458,4 +553,9 @@ def read_export(path: Path) -> dict[str, Any]:
     listed = sum(len(data[name]) for name in RUN_LISTS) + len(data.get("excluded_attempts", ()))
     if listed != data["planned_runs"]:
         raise ExportError(f"{path}: lists {listed} runs but the plan held {data['planned_runs']}")
+    if EXPORT_FINGERPRINT in data:  # optional (C35): an export without it reads as it did
+        try:
+            _checked_entry(data[EXPORT_FINGERPRINT])
+        except ExportError as error:
+            raise ExportError(f"{path}: {error}") from None
     return data

@@ -834,6 +834,20 @@ assert all(len(modes) == 1 for modes in held.values())  # each condition ran und
 assert held == dict.fromkeys(held, {"none"})  # the example study has no run admission
 ```
 
+A setting that holds for the whole campaign (a mount level's declared `io_mode`, the bound on a tool server's calls, the caps) is in the campaign fingerprint, and `export.json` carries it as `campaign_fingerprint`, with its SHA-256, exactly as the store records it. A report reads it from there and need not open `state.sqlite`. Before it trusts the export, it checks which campaign it is of, against the hash of the snapshot the check made (or `merge.json`'s `fingerprint`, for a merged batch). An export of another campaign is refused naming both hashes; an export from before the key says `fingerprint not recorded` and is not refused, so a report that must have the fingerprint tests for that line:
+
+```python
+from expcore.campaign.export import NOT_RECORDED, read_export, stored_fingerprint_sha256, verify_export_fingerprint
+from expcore.campaign.snapshot import StoreSnapshot
+
+snapshot = StoreSnapshot(Path("my-study/out/runs/campaign-snapshot.sqlite").read_bytes(), load_study("my-study").schema)
+saved = read_export(Path("my-study/out/export.json"))
+assert verify_export_fingerprint(saved, stored_fingerprint_sha256(snapshot)) != NOT_RECORDED
+fingerprint = saved["campaign_fingerprint"]["fingerprint"]
+assert set(fingerprint["caps"]) and fingerprint["environment"]["distributions"]  # what the report may read from it
+snapshot.close()
+```
+
 ### Testing a study's instruments and scorers
 
 A study's own instruments (the ones that induce a state, the probes), its scorers and its plugin can be tested against the platform without a live federation. `expcore_onedata.testing`, installed with the platform layer, holds the fakes the core's own tests use: an in-process Onezone with every provider's data API (`FakeData`), a default `platform.toml` that matches it, and a clock that moves only when something sleeps (`Ticker`). Each fake's docstring says what it models and what it does not, and [`interfaces.md`](interfaces.md#the-platform-layers-testing-module) lists the names. Nothing at runtime imports the module and it imports no pytest, so a fixture is your own thin wrapper around it.

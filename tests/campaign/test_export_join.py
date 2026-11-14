@@ -6,8 +6,9 @@ import json
 import pytest
 
 from expcore.campaign.deployments import deployment_shares
-from expcore.campaign.export import FORMAT, ExportError
-from expcore.campaign.export_join import join_exports
+from expcore.campaign.export import EXPORT_FINGERPRINT, FORMAT, ExportError
+from expcore.campaign.export_join import SHARD_RETRIES_KEY, SHARDS_KEY, join_exports
+from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.merge import MergeRefused, read_merge
 from expcore.campaign.shard import EXPORT_KEY, MERGE_SCHEMA, RULE
 from expcore.errors import CORE_KINDS
@@ -342,3 +343,46 @@ def test_b18_c32_shards_none_of_which_export_deployment_shares_join_into_an_expo
     """B18, C32: a campaign whose models declare no set has no `deployment_shares`, merged or not."""
     joined = join_exports({1: export(analysed=[entry("a")]), 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS)
     assert "deployment_shares" not in joined
+
+
+def campaign(**changes) -> dict:
+    """The `campaign_fingerprint` entry of an export of an invented campaign, as `export_run_state` makes it."""
+    fingerprint = {"seeds": [1, 2], "caps": {"attempt_limit": 3}, **changes}
+    return {"sha256": fingerprint_sha256(fingerprint), "fingerprint": fingerprint}
+
+
+def test_c35_shards_that_share_a_fingerprint_give_the_merged_export_that_one_where_the_shards_put_it():
+    """C35: every shard of a campaign exports the campaign's fingerprint, so the merged export carries it once, as
+    the shards have it, after their other keys and before the merge's own `shard_retries_by_kind` and `shards`."""
+    shared = campaign()
+    one = {**export(analysed=[entry("a")]), EXPORT_FINGERPRINT: shared}
+    two = {**export(analysed=[entry("b")]), EXPORT_FINGERPRINT: copy.deepcopy(shared)}
+    joined = join_exports({1: one, 2: two}, plan("a", "b"), SHARDS)
+    assert joined[EXPORT_FINGERPRINT] == shared
+    assert list(joined)[-3:] == [EXPORT_FINGERPRINT, SHARD_RETRIES_KEY, SHARDS_KEY]
+
+
+def test_c35_shards_of_other_campaigns_are_refused_naming_both_fingerprints():
+    """C35: the merge refuses differing fingerprints (C29); the join refuses them too, so an export built from shards
+    whose merge.json was not checked is not one campaign's."""
+    one = {**export(analysed=[entry("a")]), EXPORT_FINGERPRINT: campaign()}
+    two = {**export(analysed=[entry("b")]), EXPORT_FINGERPRINT: campaign(seeds=[1, 2, 3])}
+    with pytest.raises(ExportError, match="campaign fingerprint") as refused:
+        join_exports({1: one, 2: two}, plan("a", "b"), SHARDS)
+    for held in (one, two):
+        assert held[EXPORT_FINGERPRINT]["sha256"] in str(refused.value)
+
+
+def test_c35_a_shard_whose_export_lacks_the_fingerprint_is_refused_not_skipped():
+    """C35: a merged export would otherwise name a campaign only some of its shards were part of."""
+    one = {**export(analysed=[entry("a")]), EXPORT_FINGERPRINT: campaign()}
+    two = export(analysed=[entry("b")])
+    for exports in ({1: one, 2: two}, {1: two, 2: one}):
+        with pytest.raises(ExportError, match=EXPORT_FINGERPRINT):
+            join_exports(exports, plan("a", "b"), SHARDS)
+
+
+def test_c35_shards_none_of_which_export_a_fingerprint_join_into_an_export_without_one():
+    """C35: shards of an export made before the key give a merged export without it, as they did."""
+    joined = join_exports({1: export(analysed=[entry("a")]), 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS)
+    assert EXPORT_FINGERPRINT not in joined

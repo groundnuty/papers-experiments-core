@@ -32,7 +32,14 @@ from shard_support import (
 )
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, table
 
-from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.export import (
+    EXPORT_FINGERPRINT,
+    ExportError,
+    export_run_state,
+    export_text,
+    stored_fingerprint_sha256,
+    verify_export_fingerprint,
+)
 from expcore.campaign.merge import SHARDS_DIR
 from expcore.campaign.shard import (
     MERGE_FILE,
@@ -229,6 +236,31 @@ def test_c29_the_merged_export_tags_every_run_with_its_shard_and_lists_the_shard
     }
     assert all(e["shard"] == owner[e["run_key"]] for e in export["analysed_attempts"])
     assert export["planned_runs"] == sum(shard["runs"] for shard in export["shards"])
+
+
+def test_c35_the_merged_export_carries_the_one_fingerprint_every_shard_records_and_merge_json_names(
+    merged, shard1, shard2
+):
+    """C35: the merged export's `campaign_fingerprint` is the fingerprint each shard's store holds, which is the one
+    merge.json hashes, and the export verifies against merge.json's hash and each shard snapshot's."""
+    export = read(merged, "export.json")
+    merge = json.loads((merged.root / "out" / MERGE_FILE).read_text(encoding="utf-8"))
+    entry = export[EXPORT_FINGERPRINT]
+    for shard in (shard1, shard2):
+        assert json.loads(meta_of(shard)["fingerprint"]) == entry["fingerprint"]
+    assert entry["sha256"] == merge["fingerprint"]
+    assert verify_export_fingerprint(export, merge["fingerprint"])
+    for index in (1, 2):
+        snapshot = merged.root / "out" / SHARDS_DIR / str(index) / SNAPSHOT_FILE
+        held = StoreSnapshot(snapshot.read_bytes(), load_study(merged.root).schema)
+        assert verify_export_fingerprint(export, stored_fingerprint_sha256(held))
+    assert list(export)[-3:] == [EXPORT_FINGERPRINT, "shard_retries_by_kind", "shards"]
+
+
+def test_c35_a_merged_batchs_export_is_refused_against_the_hash_of_another_campaign(merged):
+    """C35: an analysis that reads the merged export with another campaign's hash is refused."""
+    with pytest.raises(ExportError, match="another campaign"):
+        verify_export_fingerprint(read(merged, "export.json"), hashlib.sha256(b"another campaign").hexdigest())
 
 
 def test_c29_the_merged_export_carries_each_runs_wall_time_and_turn_latency_and_each_shards_set_asides(
