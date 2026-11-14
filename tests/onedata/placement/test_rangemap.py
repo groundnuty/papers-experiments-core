@@ -1,5 +1,7 @@
 """The declared range map and the `[placement]` settings: validation names the file and the key, never the value."""
 
+import dataclasses
+
 import pytest
 
 from expcore.config.loading import ConfigError
@@ -174,6 +176,26 @@ def test_o25_the_default_chunk_is_16_mib_and_every_full_default_chunk_goes_on_a_
     for settings in (PlacementSettings(holder="alpha"), loaded):
         assert (settings.chunk_bytes, settings.fresh_connection_bytes) == (16777216, 16777216)
     assert loaded.chunk_bytes >= loaded.fresh_connection_bytes
+
+
+def test_o25_a_positional_construction_from_before_the_connection_threshold_still_means_what_it_did():
+    """O25: `fresh_connection_bytes` (#196) was inserted before `probe_attempts`, so a caller passing the settings
+    positionally had every later argument shift one field, `probe_attempts` become a float and a probe fail with a
+    TypeError. The earlier order is restored and the new field comes last."""
+    settings = PlacementSettings("data", 2.5, 3600.0, 300.0, 2, 900.0, 16 << 20, 3, 1.5, 30.0, 4, 5.0, 16)
+    assert (settings.holder, settings.poll_s, settings.transfer_timeout_s, settings.settle_timeout_s) == (
+        "data",
+        2.5,
+        3600.0,
+        300.0,
+    )
+    assert (settings.consecutive_polls, settings.request_timeout_s, settings.chunk_bytes) == (2, 900.0, 16 << 20)
+    assert (settings.probe_attempts, settings.probe_backoff_s) == (3, 1.5)
+    assert (settings.transfer_settle_s, settings.transfer_settle_polls) == (30.0, 4)
+    assert (settings.clock_skew_allowance_s, settings.concurrency) == (5.0, 16)
+    assert settings.fresh_connection_bytes == 16 << 20  # not given: the default
+    assert isinstance(settings.probe_attempts, int)
+    assert dataclasses.fields(PlacementSettings)[-1].name == "fresh_connection_bytes"
 
 
 def test_o25_the_threshold_for_a_new_connection_can_be_set(tmp_path):

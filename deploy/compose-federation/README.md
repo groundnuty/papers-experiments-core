@@ -59,7 +59,9 @@ Compose (`up`, `reset --replicas` and `down`; see "An imported space").
   checks that no container, network, Docker volume labelled with the project (`com.docker.compose.project`) or file
   of the project is left; a volume left fails the command, naming it. It runs Compose only over a root that exists and
   carries the project's mark: with the root gone and nothing of the project left it does nothing, and with the root
-  gone while containers or networks of the project remain it refuses.
+  gone while containers or networks of the project remain it refuses. It refuses the same way, naming them, when the
+  root is gone and a volume labelled with the project remains, as on the retry of a `down` that failed on one: it does
+  not run Compose without the root, so the volume is removed with `docker volume rm`.
 
 ## Declaring a layout
 
