@@ -301,6 +301,22 @@ def test_r15_check_removes_nothing_while_a_dispatcher_holds_the_campaign_lock_an
     assert stray.exists()
 
 
+def test_r15_check_removes_nothing_in_a_batch_that_is_not_the_study_s_own(copy, clean_environment, tmp_path):
+    """R15: the campaign's lock protects the batch under the study's `out/`; a batch named elsewhere with `--study` may
+    belong to a campaign that is running, so no temporary file is removed there, though a rename a record names is
+    finished."""
+    elsewhere = tmp_path / "elsewhere" / "runs"
+    shutil.copytree(copy.runs, elsewhere)
+    placed = side_files(elsewhere)[0]
+    stray = temporary_of(records_without_side_file(elsewhere)[0].parent / SIDE)  # before `placed` joins that list
+    placed.rename(temporary_of(placed))
+    stray.write_bytes(b"an attempt of another campaign that is staging its file")
+    assert check(clean_environment, elsewhere, "--study", str(copy.root)) == 0
+    assert placed.is_file()
+    assert not temporary_of(placed).exists()
+    assert stray.exists()
+
+
 def test_r15_check_never_puts_a_file_in_place_that_is_not_the_one_its_record_names(copy, clean_environment):
     """R15: a temporary file whose bytes are not the ones the record names is removed, never renamed, and the record's
     hash with no file beside it fails the check, as it must."""

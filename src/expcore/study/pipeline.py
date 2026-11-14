@@ -439,16 +439,19 @@ def _check_batch_of(
 def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
     """Finish or remove what a kill left of the placement of a declared side file in the batch (R15), and say so.
 
-    A temporary file no record names is removed only while this process holds the campaign's lock: with no dispatcher
-    alive no attempt can be staging a file of its own, and none can start before the lock is released. A lock that
-    cannot be taken (a campaign runs, or the file system refuses `flock`) leaves such a file where it is; a rename
-    that a record names is finished either way. A study that declares no side file is not touched at all.
+    A temporary file no record names is removed only while this process holds the lock of the campaign the batch
+    belongs to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with
+    no dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released.
+    A lock that cannot be taken (a campaign runs, or the file system refuses `flock`), or a batch that is not the
+    study's own, leaves such a file where it is; a rename that a record names is finished either way. A study that
+    declares no side file is not touched at all.
     """
     if not study.side_files:
         return
     lock = DispatchLock(out_dir(study))
-    with contextlib.suppress(CampaignLocked):  # a dispatcher is alive: only what the records name is finished
-        lock.acquire()
+    if Path(batch).resolve().is_relative_to(out_dir(study).resolve()):
+        with contextlib.suppress(CampaignLocked):  # a dispatcher is alive: only what the records name is finished
+            lock.acquire()
     try:
         for settled in settle_side_files(batch, study.side_files, remove_unnamed=lock.held):
             print(f"check: {settled}", file=sys.stderr)
