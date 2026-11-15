@@ -64,7 +64,7 @@ from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.fault_journal import InjectionJournal, holder_alive
-from expcore_onedata.fault_restore import LinkSettling, digest
+from expcore_onedata.fault_restore import LinkSettling, RestoreSettling, digest
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE  # the platform layer's one module of kinds registers it
 
@@ -183,11 +183,18 @@ class Recovery(LinkSettling):
         sleep: Callable[[float], None] = time.sleep,
         labels: Mapping[str, str] | None = None,
         wall: Callable[[], float] = time.time,
+        heal_skip: Callable[[], Mapping[str, Any] | None] | None = None,
+        hold_for: Callable[[float], None] | None = None,
     ) -> None:
         """`labels` maps each provider's label to its service, which the heal needs to act on a reader by its label;
-        `wall` is the clock a settle is journalled on, which every process shares."""
+        `wall` is the clock a settle is journalled on, which every process shares; `heal_skip`, asked at a heal's start,
+        says why the heal must be skipped (`FaultInjector._heal_skipped`: a step of the run that uses its tokens still
+        runs), or None to let it run; `hold_for(seconds)`, when given, closes the federation to every admission for
+        that long (`FederationLock.hold_for`), which a recovered container restart's settle does before it is
+        journalled (`LinkSettling._settle_child`)."""
         self._settings, self._driver, self._clock, self._sleep = settings, driver, clock, sleep
-        self._wall = wall
+        self._wall, self._heal_skip, self._hold_for = wall, heal_skip, hold_for
+        self._defer = False  # inside `recover(defer=True)`: a held settle is never slept out (`RestoreSettling`)
         self.journal = InjectionJournal(settings.journal)
         self.last: Observation | None = None  # the latest reading `wait` took
         self.unreadable = 0  # the readings of the latest `wait` that failed and counted as no answer
@@ -214,6 +221,7 @@ class Recovery(LinkSettling):
         *,
         heal: bool = False,
         before: Callable[[list[dict[str, Any]]], None] | None = None,
+        defer: bool = False,
     ) -> list[str]:
         """Settle every open injection whose target's lock is free; raise InfraError of kind `injector_failure` when one
         cannot be settled or its lock is stuck. Return the targets of those live injectors hold, sorted. `heal` lets a
@@ -223,7 +231,21 @@ class Recovery(LinkSettling):
         the seconds the restored service took to serve (`ready_after_s`) and the gate's and the heal's records.
         `before(entries)` is called once with the open injections it has just read, when there are any, and before it
         settles one: whatever must be done before something is restored is done for exactly what it will settle.
+        With `defer` (the fault gate's check, which may not wait) a held settle is never slept out: the settling stops
+        before any gate read or link check, its entry open, and `RestoreSettling` names its target.
         """
+        self._defer = defer  # one recovery at a time: its caller holds the federation exclusively
+        try:
+            return self._recover(on_step, heal, before)
+        finally:
+            self._defer = False
+
+    def _recover(
+        self,
+        on_step: Callable[..., None] | None,
+        heal: bool,
+        before: Callable[[list[dict[str, Any]]], None] | None,
+    ) -> list[str]:
         step = on_step or (lambda *args, **kwargs: None)
         held: list[str] = []
         # a heal's container restart of a reader first: while it is down, the injection it healed cannot pass its gate
@@ -241,6 +263,8 @@ class Recovery(LinkSettling):
                 continue
             try:
                 done, how, after, ready_after_s = self.settle(entry, heal=heal)
+            except RestoreSettling as settling:  # nothing read: a later recovery reads once the settle has passed
+                raise RestoreSettling(settling.left_s, target) from None
             finally:
                 lock.close()
             record = dict(self.restore_record)
@@ -283,6 +307,8 @@ class Recovery(LinkSettling):
             self.restore_record = {}
         try:
             settled = self._settle(entry, heal=heal, links=links, clear=clear)
+        except RestoreSettling:  # a held settle, not a failure: the entry's latest line stays the settle's own
+            raise
         except Exception as error:
             self._clear_failed(entry, type(error).__name__)
             raise
@@ -297,6 +323,12 @@ class Recovery(LinkSettling):
     def _settle(self, entry: Mapping[str, Any], *, heal: bool, links: bool, clear: bool) -> Settled:
         before, injected = entry["identity_sha256"], entry["injected"]
         asked, unrecorded = bool(entry.get("stop_unknown")), bool(entry.get("stop_unrecorded"))
+        child = links and entry.get("heal") is True  # a heal's container restart that its heal left open
+        if child:  # every hold of its heal has passed first (`_await_quiet`; the fault gate's heal held the drain
+            # record, which every admission waits for), each covering the stop's grace twice: a stop it sent has ended,
+            # and one reading decides, so a reader the heal never stopped is `never_down` instead of `stop_unsettled`
+            self._await_quiet()
+            asked = unrecorded = False
         seen: Observation | None
         if asked or unrecorded:  # the daemon may still be stopping it: a reading now proves nothing
             seen, steady = self._await_down(entry["service"], before)
@@ -335,7 +367,11 @@ class Recovery(LinkSettling):
                 return Settled(False, "serves_unconfigured", after)
             if ready_after_s is None:
                 return Settled(False, "not_serving", after)  # fail closed: the injection stays open, the identity known
-            stuck = self._links_settled(entry, heal) if links else None
+            if child:  # its gate (and pairs) only after a settle held on its entry
+                self._settle_child(entry, how)
+                stuck = self._child_settled(entry, heal)
+            else:
+                stuck = self._links_settled(entry, heal) if links else None
             if stuck is not None:  # it serves, and its peers or a link do not: not restored yet (O35)
                 return Settled(False, stuck, after, ready_after_s)
         if clear:

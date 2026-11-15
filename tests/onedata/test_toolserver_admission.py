@@ -22,7 +22,8 @@ from fault_support import faults_table
 from mcp import StdioServerParameters
 
 from expcore.tools.manifest import FrozenManifest, live_manifest
-from expcore_onedata.admission import FederationLock
+from expcore_onedata import toolserver
+from expcore_onedata.admission import TOOL_SERVER_STEP, FederationLock, TokenStepRefused
 from expcore_onedata.admission_share import to_thread_holding_admission
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
@@ -83,7 +84,7 @@ class World:
     def __init__(self, tmp_path, fake, frozen):
         shutil.copy(frozen / "read.manifest.json", tmp_path / "read.manifest.json")  # kept by `write_platform`
         platform = write_platform(tmp_path, lambda data: data.update(faults=faults_table()))
-        config = load_platform(platform)
+        self.config = config = load_platform(platform)
         self.issuer = GatedIssuer(OnezoneClient(config, http=fake.client_http()), config, clock=lambda: NOW)
         self.lock = FederationLock(load_faults(platform, config))
         self.launcher = ToolServerLauncher(config, self.issuer, events=lambda kind, detail: None)
@@ -221,6 +222,66 @@ def test_o11_a_check_thread_that_never_began_gives_up_its_share_when_its_task_is
                 await blocker
                 pool.shutdown(wait=True)
         assert not world.held_by_another()
+
+    asyncio.run(go())
+    assert ran == []
+
+
+@CHECKS
+def test_o11_a_check_thread_keeps_its_step_counted_and_its_share_for_its_whole_life(world, which):
+    """O11, O35: a check thread is counted as the tool server's step and holds a share of the run's admission from
+    before it starts until it ends: once its launch is cancelled, the launch's own span has ended, yet the thread's
+    count and share stay while it reads Onezone, and both go when it ends."""
+
+    async def go():
+        async with world.lock.admitted(exclusive=False) as admission:
+            world.issuer.arm(park_on=which)
+            task = asyncio.ensure_future(world.launch())
+            assert await asyncio.to_thread(world.issuer.entered.wait, BOUND_S), "the check never began"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            try:
+                assert admission.open_steps() == (TOOL_SERVER_STEP,)  # the thread's count, not the launch's
+                assert admission.shares.count == 2  # the owner's and the thread's
+            finally:
+                world.issuer.release.set()
+            deadline = time.monotonic() + BOUND_S
+            while admission.shares.count != 1 or admission.open_steps():
+                assert time.monotonic() < deadline, "the ended thread kept its count or its share"
+                await asyncio.sleep(0.01)
+        assert not world.held_by_another()
+
+    asyncio.run(go())
+
+
+def test_o11_a_check_on_an_admission_its_section_sealed_is_refused_holding_nothing(world):
+    """O11, O35: a check whose share cannot be taken (the run's shortcut section has sealed the admission) is refused
+    before its thread starts, like one without the run's admission: nothing runs, and no count or share is left."""
+    ran = []
+
+    async def go():
+        async with world.lock.admitted(exclusive=False) as admission:
+            assert admission.seal()
+            try:
+                with pytest.raises(TokenStepRefused, match="the check under test"):
+                    await toolserver._in_counted_thread(world.config, "the check under test", ran.append, "ran")
+                assert (admission.open_steps(), admission.shares.count) == ((), 1)
+            finally:
+                admission.unseal()
+
+    asyncio.run(go())
+    assert ran == []
+
+
+def test_o11_a_check_without_the_runs_admission_is_refused_before_its_thread_starts(world):
+    """O35, O11: on a platform with `[faults]` a check with no run's admission held is refused before its thread
+    starts, so it neither runs uncounted nor without a share of an admission."""
+    ran = []
+
+    async def go():
+        with pytest.raises(TokenStepRefused):
+            await toolserver._in_counted_thread(world.config, "the check under test", ran.append, "ran")
 
     asyncio.run(go())
     assert ran == []

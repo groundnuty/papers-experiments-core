@@ -172,7 +172,7 @@ def test_o11_a_run_that_cannot_be_cancelled_mid_clear_is_waited_for_through_the_
     for name in ("a", "b"):
         (tmp_path / name).mkdir()
     short = injector_for(write_faults(tmp_path / "a", ready_timeout_s=5), FakeServices())
-    long = injector_for(write_faults(tmp_path / "b", ready_timeout_s=500), FakeServices())
+    long = injector_for(write_faults(tmp_path / "b", ready_timeout_s=500, margin_s=1800), FakeServices())
     assert long.cancel_wait_s - short.cancel_wait_s == pytest.approx(2 * (500 - 5))
 
 
