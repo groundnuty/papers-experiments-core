@@ -785,6 +785,7 @@ def test_o35_o11_an_injection_handed_to_recovery_is_restored_by_nothing_of_its_r
         with pytest.raises(InfraError) as caught:
             injector.start({"run_key": "the-run", "attempt": 2})
         assert caught.value.kind == INJECTOR_FAILURE
+        assert injector.clear() is False  # the failed start settled nothing: still down
         assert [call for call in services.calls if call[0] in ("start", "serves")] == acted_before
     (entry,) = injector._journal.open_entries()
     assert entry["clear_failed"] == "not_serving"
@@ -795,6 +796,35 @@ def test_o35_o11_an_injection_handed_to_recovery_is_restored_by_nothing_of_its_r
         assert following.clear() is True
     assert (recovered["ok"], recovered["how"]) == (True, "found_restored")
     assert injector._journal.open_entries() == []
+
+
+def test_o35_o11_an_injection_handed_to_recovery_has_its_lock_let_go_with_the_admission_whatever_another_end_raises(
+    tmp_path,
+):
+    """O35, O11: the target's lock of an injection handed to recovery goes when the run's admission lets the federation
+    go, even when another of the admission's endings, registered after it, is interrupted: every ending runs and the
+    interrupt is raised after, so recovery can take the target and no provider is left down for want of its lock."""
+    services = FakeServices()
+    platform = write_faults(tmp_path)
+    injector = injector_for(platform, services)
+    lock = FederationLock(load_faults(platform, load_platform(platform, require_secrets=False)))
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    def run():
+        with lock.held(exclusive=True, timeout_s=5) as admission, token_step(TOOL_SERVER_STEP):
+            injector.start({"run_key": "the-run", "attempt": 1})
+            services.knobs["never_serves"] = True
+            assert injector.clear() is False
+            assert injector.clear() is False  # handed to recovery
+            admission.endings.append(interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        run()
+    taken = injector._journal.try_lock(OUTAGE_TARGET)
+    assert taken is not None  # the target's lock went with the admission
+    taken.close()
 
 
 def test_o35_the_least_margin_counts_one_restore_since_none_is_retried_inside_the_window(tmp_path):

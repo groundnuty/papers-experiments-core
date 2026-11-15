@@ -320,8 +320,9 @@ class Admission:
         it; when it cannot be written the drain is waited out here, the lock held. When that fails too (an interrupt of
         the wait, or anything else) the lock is not let go: it is kept for as long as this process lives (`_STRANDED`),
         with its holder record, and the failure is raised. The federation then stays closed until the process ends,
-        which is the kernel's to settle, instead of opening inside the drain. Past the drain, the endings and the holder
-        record go first, and the locks go whatever they do, an interrupt included: the reset lock (shared only), in
+        which is the kernel's to settle, instead of opening inside the drain. Past the drain, the endings (every one,
+        an interrupt of one raised after the rest, `_run_endings`) and the holder record go first, and the locks go
+        whatever they do, an interrupt included: the reset lock (shared only), in
         whatever mode it is held, then the main lock, the reverse of the order they were taken in. A forked child's copy
         of the admission holds nothing (the fork hook closed its descriptors), so it ends and clears nothing of its
         parent's."""
@@ -334,11 +335,7 @@ class Admission:
         owned = self.held
         try:
             if owned:
-                for ending in reversed(self.endings):
-                    try:
-                        ending()
-                    except Exception:  # the record of a hold only says who held it
-                        log.exception("the end of a hold could not be recorded")
+                _run_endings(self.endings)
                 if self.journal is not None and self.record is not None:
                     with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
                         self.journal.clear_holder(self.record["token"])
@@ -348,6 +345,23 @@ class Admission:
                     self.reset.close(record=owned)
             finally:
                 self.lock.close()
+
+
+def _run_endings(endings: list[Callable[[], None]]) -> None:
+    """Call an admission's endings, last first, every one of them: an `Exception` is logged (the record of a hold only
+    says who held it), and an interrupt (any other `BaseException`) is kept and raised once the rest have run, so no
+    ending is skipped, a fault injector's lock on a target it handed to recovery among them
+    (`FaultInjector._hand_over`)."""
+    interrupted: BaseException | None = None
+    for ending in reversed(endings):
+        try:
+            ending()
+        except Exception:
+            log.exception("the end of a hold could not be recorded")
+        except BaseException as error:
+            interrupted = interrupted or error
+    if interrupted is not None:
+        raise interrupted
 
 
 async def _close_off_the_loop(admission: Admission) -> None:

@@ -402,13 +402,14 @@ class FaultInjector:
         run_key, attempt = identity.get("run_key"), identity.get("attempt")
         if not isinstance(run_key, str) or isinstance(attempt, bool) or not isinstance(attempt, int):
             raise FaultRefused("a fault injector is started with the run's identity: its run_key and attempt")
-        self._origin, self._steps, self._injection, self._left_open = self._clock(), [], None, False
+        self._origin, self._steps, self._injection = self._clock(), [], None
         self._run = {"run_key": run_key, "attempt": attempt}
         self._admit()
         self._step("sanctioned", True)
         unsettled = self._recover(heal=self._holds_exclusive())  # under the exclusive admission just taken
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
             raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
+        self._left_open = False  # one this injector handed to recovery is settled now: the recovery found none open
         self._wait_owed()  # a recovery's drain is satisfied before this run takes anything down
         self._await_drain()  # the record is read after the journal was: see `_await_drain`
         self._lock = self._journal.try_lock(self.target)
