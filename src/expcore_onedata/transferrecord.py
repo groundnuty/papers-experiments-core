@@ -12,6 +12,16 @@ provider's API description and a mocked client test; against Onedata 25.0 the li
 replication and a direct read for an eviction, with the times in epoch seconds (`[L1]` in `client.py`), and the test
 stays to pin them.
 
+**A record's state is read per kind (O32).** Every record carries both halves, `replicationStatus` and
+`evictionStatus`, beside its summary `transferStatus` (op-worker f118ed9, the federation's build,
+`transfer_rest_translator.erl:119-121`), and the half a job does not do reads `skipped`: a replication that ended
+reads `completed`, `completed` and `skipped` (the first federation study's 1,080 answers of its 20 replications, all
+so). A replication's state is its replication half's, an eviction's its eviction half's, and a migration's that of the
+half it is in, final only once both are; `skipped` on the half a job does not do contradicts nothing, and fields that
+do contradict each other read `CONFLICTING`, never final (`_state`). Read as a set of fields that must all agree, every
+ended replication and eviction read `CONFLICTING`, so no poll of one ever saw it end, the transfer log carried every
+earlier one into the window, and the ended listing's walk never stopped.
+
 **Fail closed.** A page not in that shape, and a record without a readable `scheduleTime`, a `type` of replication,
 eviction or migration, or (for a job that replicates) its `replicatingProviderId` and `bytesReplicated`, raise
 `Unreadable`; the transfer log then records the whole listing as `probe_ok` false with the reason and no records.
@@ -19,7 +29,7 @@ eviction or migration, or (for a job that replicates) its `replicatingProviderId
 
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +38,15 @@ REPLICATING = ("replication", "migration")
 STATES = ("waiting", "ongoing", "ended")  # the order the lists are read in: the order a job moves through them
 UNDECLARED = "undeclared"  # the label of a provider id that no declared provider has
 _ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a transfer id: one plain path segment
-_STATE_KEYS = ("transferStatus", "transferState", "replicationStatus", "evictionStatus")
+_REPLICATION, _EVICTION = "replicationStatus", "evictionStatus"  # the record's two halves
+_SUMMARIES = (
+    "transferStatus",
+    "transferState",
+)  # the record's reading of both halves; `transferState` is no 25.0 field
+_STATE_KEYS = (*_SUMMARIES, _REPLICATION, _EVICTION)
+SKIPPED = "skipped"  # a half the job does not do, from its creation on (op-worker f118ed9, `transfer.erl:157-166`)
+_HALF_ENDED = frozenset({"completed", "failed", "cancelled", SKIPPED})  # a half that ended: `transfer.erl:443-455`
+_HALF_WAITING = frozenset({"scheduled", "enqueued", "active"})  # an eviction a migration's summary reads `evicting`
 
 
 class Unreadable(ValueError):
@@ -63,24 +81,87 @@ class Job:
         return (*what, self.listed_as, self.state, *counters)
 
 
-CONFLICTING = "conflicting"  # the state of a record whose status fields disagree: never a final one
+CONFLICTING = "conflicting"  # the state of a record whose status fields contradict each other: never a final one
+
+
+def _agreed(values: Collection[str]) -> str | None:
+    """What every one of the values says, `CONFLICTING` when they disagree, or None when there is none."""
+    distinct = set(values)
+    if not distinct:
+        return None
+    return next(iter(distinct)) if len(distinct) == 1 else CONFLICTING
+
+
+def _halves(kind: str, replication: str | None, eviction: str | None) -> str:
+    """The state of a job of `kind` from its record's halves (None for a half the record does not carry).
+
+    On op-worker f118ed9 the half a job does not do is `skipped` from the job's creation (`transfer.erl:157-166`), no
+    status is ever marked over an ended one (`replication_status.erl:198-282`, `replica_eviction_status.erl:202-269`),
+    and a job has ended once both halves have (`transfer.erl:437-455`). So a replication reads its replication half and
+    an eviction its eviction half, beside the other one absent or `skipped`; any other value there, or `skipped` on the
+    half the job does, is a contradiction. A migration does both, replication first: it reads its replication half
+    until that ends, and its eviction half once the replication completed, so it is final only once both halves are.
+    A replication that aborts, fails or is cancelled marks a migration's eviction alike
+    (`replication_status.erl:206-282`), so a migration whose replication ended otherwise than completed must have its
+    eviction ended the same way: one whose replication failed and whose eviction completed is a contradiction, never
+    a final state. One whose replication completed and whose eviction then failed is `failed`, as op-worker's own
+    summary reads it (`transfer.erl:475-485`). A half a migration's state rests on that the record does not carry
+    leaves it unread, never final."""
+    if kind != "migration":
+        own, other = (replication, eviction) if kind == "replication" else (eviction, replication)
+        return own if own is not None and own != SKIPPED and other in (None, SKIPPED) else CONFLICTING
+    if replication is None or SKIPPED in (replication, eviction):
+        return CONFLICTING
+    if replication not in _HALF_ENDED:  # still replicating: its eviction has not begun
+        return replication if eviction not in _HALF_ENDED else CONFLICTING
+    if replication == "completed":
+        return CONFLICTING if eviction is None else eviction
+    return replication if eviction == replication else CONFLICTING
+
+
+def _summary(kind: str, replication: str | None, eviction: str | None) -> str | None:
+    """The `transferStatus` op-worker gives a job with these halves (`transfer:status/1`, `transfer.erl:474-495`): the
+    status of the half it is in, `active` read as `replicating` or `evicting`, and a migration's eviction not ended yet
+    read as `evicting` once its replication completed."""
+    if kind == "migration" and replication == "completed":
+        return "evicting" if eviction in _HALF_WAITING else eviction
+    if kind == "eviction":
+        return "evicting" if eviction == "active" else eviction
+    return "replicating" if replication == "active" else replication
 
 
 def _state(body: Mapping[str, Any]) -> str | None:
-    """The record's state: what every status field it carries says, `CONFLICTING` when they disagree (a migration
-    whose replication completed and whose eviction is still active, say) or one cannot be read, or None when it
-    carries none."""
-    present = [body[k] for k in _STATE_KEYS if k in body and body[k] is not None]
-    if any(not isinstance(value, str) for value in present):  # a status field that cannot be read is no state
+    """The record's state, read per kind: the state of the half its job is in (`_halves`), `CONFLICTING` when its
+    status fields contradict each other or one cannot be read, or None when it carries none.
+
+    The record's summary, `transferStatus` (and `transferState`, which 25.0 does not give), is op-worker's own reading
+    of the halves, so a summary other than the one the halves give is a contradiction (`_summary`). A record that
+    carries no half is read from its summary alone. A record whose `type` is none of the three has no half its job does
+    not do, so every status field it carries must say the same; `job_of` refuses such a record anyway.
+
+    `effectiveJobStatus` is not read: it is the summary of the newest job in the record's chain of reruns
+    (`transfer_rest_translator.erl:78-88,123`; `transfer.erl:303-318`), another job, with its own id, record and
+    counters, once this one was rerun, and this one's own `transferStatus` until then."""
+    present = {key: body[key] for key in _STATE_KEYS if body.get(key) is not None}
+    if any(not isinstance(value, str) for value in present.values()):  # a status field that cannot be read
         return CONFLICTING
-    states = set(present)
-    if not states:
-        return None
-    return next(iter(states)) if len(states) == 1 else CONFLICTING
+    kind = body.get("type")
+    if kind not in TYPES:
+        return _agreed(present.values())
+    replication, eviction = present.get(_REPLICATION), present.get(_EVICTION)
+    summaries = [present[key] for key in _SUMMARIES if key in present]
+    if replication is None and eviction is None:
+        return _agreed(summaries)
+    state = _halves(kind, replication, eviction)
+    if state != CONFLICTING and any(summary != _summary(kind, replication, eviction) for summary in summaries):
+        return CONFLICTING
+    return state
 
 
 def state_of(body: Any) -> str | None:
-    """A record's state as `job_of` reads it; None for a record that is not an object or carries no state."""
+    """A record's state as `job_of` reads it; None for a record that is not an object or carries no state. Every
+    reader of a transfer's state in the platform layer reads it here: the transfer log and its window, the waits for a
+    transfer's end (`consistency.transfer_state`) and the probes' records of the harness's transfers."""
     return _state(body) if isinstance(body, dict) else None
 
 

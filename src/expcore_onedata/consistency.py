@@ -38,10 +38,10 @@ from typing import Any
 
 from expcore_onedata.client import OnezoneClient, PlatformError, answered_absent
 from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
+from expcore_onedata.transferrecord import state_of
 
 # The states in which a transfer has ended: the earlier study's working code stopped polling at these four.
 ENDED_STATES = ("completed", "failed", "cancelled", "skipped")
-STATE_FIELDS = ("transferStatus", "replicationStatus", "evictionStatus")
 # A file or a transfer that is not there (yet) is told by `client.answered_absent`, the one rule for it: a 404, or
 # exactly Onedata 25.0's 400 posix enoent. Any other answer, another 400 among them, is never "not there yet".
 
@@ -230,13 +230,17 @@ def converge_each[K, T](
 
 
 def transfer_state(record: Any) -> str:
-    """Return the state a transfer record reports, or "unknown" when it names none of the known fields."""
-    if isinstance(record, dict):
-        for name in STATE_FIELDS:
-            state = record.get(name)
-            if isinstance(state, str) and state:
-                return state
-    return "unknown"
+    """Return the state a transfer record reports, read as the transfer log reads it (`transferrecord.state_of`, O32),
+    or "unknown" when it names none of the known fields.
+
+    A job's state is that of the half it does, so a replication that ended reads `completed` beside its
+    `evictionStatus: skipped`, and an eviction beside its `replicationStatus: skipped`. A record whose status fields
+    contradict each other reads `conflicting`, which is not an ended state, so a wait on it runs to its bound and says
+    so, never taking it for done. The first field present used to win: on 25.0's records that is `transferStatus`,
+    op-worker's own summary of the halves, which ends exactly when they do; on a record without it, an eviction's
+    `replicationStatus: skipped` read as ended while the eviction was still active."""
+    state = state_of(record)
+    return state if isinstance(state, str) and state else "unknown"
 
 
 @dataclass(frozen=True)

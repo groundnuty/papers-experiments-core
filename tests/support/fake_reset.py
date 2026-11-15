@@ -53,7 +53,7 @@ from collections.abc import Callable
 
 import httpx
 
-from expcore_onedata.testing.fake_data import ROOT_ID, FakeData, Node, Transfer
+from expcore_onedata.testing.fake_data import ROOT_ID, FakeData, Node, Transfer, status_fields, summarised
 
 
 def _held(blocks: list[list[int]] | None) -> int:
@@ -235,7 +235,10 @@ class FakeReset(FakeData):
         if "spaceId" not in self.transfer_omit:
             body["spaceId"] = self.space_of(transfer.file_id)
         if getattr(transfer, "cancelled", False):
-            body["evictionStatus" if transfer.kind == "eviction" else "replicationStatus"] = "cancelled"
+            cancelled = summarised(
+                {**body, **status_fields(transfer.kind, "cancelled")}, kept=self._view(tid, provider)
+            )
+            body = {k: v for k, v in cancelled.items() if k not in self.transfer_omit}
             body.update(bytesReplicated=0, filesReplicated=0, filesEvicted=0, filesProcessed=0)
         return httpx.Response(200, json=body)
 

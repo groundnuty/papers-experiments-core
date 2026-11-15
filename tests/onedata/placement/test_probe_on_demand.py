@@ -1,6 +1,7 @@
 """The probes split a provider's gained bytes into transfer bytes and a lower bound on bytes fetched on demand (O08)."""
 
 import pytest
+from transfer_shapes import EVICTION_ENDED, LIVE_REPLICATION, statuses
 
 from expcore_onedata.probes import PlatformProbes
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
@@ -359,3 +360,74 @@ def test_o08_a_record_with_a_status_field_that_cannot_be_read_is_not_final(probe
     snapshot = probes.finish()
     assert snapshot["on_demand"]["providers[1]"]["on_demand_lower_bound"] is None
     assert "transfer_not_ended" in snapshot["on_demand"]["providers[1]"]["unknown"]
+
+
+def live_shaped(fake, fields: dict, *tids: str) -> None:
+    """Every tracked provider answers these jobs' records with the live records' status fields."""
+    for tid in tids:
+        for provider in (ALPHA_ID, BETA_ID):
+            fake.provider_view[(tid, provider)] = dict(fields)
+
+
+def test_o32_live_shaped_records_of_a_replication_only_run_leave_its_bound_known(probes, client, seeded, ticker):
+    """O32: the live case. A replication into beta that ended before the run and the agent's replication into beta
+    during it both answer the live record's status fields, `evictionStatus: skipped` beside `replicationStatus:
+    completed`. The earlier one ended, so the walk stops at it and nothing is carried over; the run's is final; and
+    beta's 4096 transfer bytes are exactly its 4096 gained, so its bound is known, 0."""
+    start = ticker.now
+    earlier = seeded.add_transfer("replication", OTHER, BETA_ID, scheduled=start - 60, finished=start - 50)
+    probes.start({})
+    ticker.sleep(INSIDE_S)
+    tid = tool_plane_replicates(seeded, client, MORE, BETA_ID)
+    seeded.end_transfer(tid)
+    live_shaped(seeded, statuses(LIVE_REPLICATION), earlier, tid)
+    ticker.sleep(INSIDE_S)
+    snapshot = probes.finish()
+    section = snapshot["space_transfers"]
+    assert section["probe_ok"] is True, section["error"]
+    assert section["carried_over"] == 0
+    assert [(r["transfer_id"], r["state"]) for r in section["records"]] == [(tid, "completed")]
+    assert snapshot["on_demand"]["providers[1]"] == {
+        "gained_bytes": len(DATA),
+        "transfer_bytes_in": len(DATA),
+        "difference": 0,
+        "on_demand_lower_bound": 0,
+        "unknown": None,
+    }
+
+
+def test_o32_live_shaped_records_of_an_eviction_only_run_leave_its_bounds_known(client, provisioner, seeded, ticker):
+    """O32: five evictions of an untracked file from beta that ended before the run and one in it, each record in the
+    live shape (`replicationStatus: skipped` beside `evictionStatus: completed`), with a bound of two jobs. The walk
+    stops at the newest earlier one, which says it ended, so the reading holds the run's eviction alone, nothing is
+    carried over, and both bounds are known; read as conflicting, all six were kept, past the bound."""
+    seeded.clock = ticker.clock
+    seeded.add_file(MORE, DATA)
+    seeded.add_file(OTHER, DATA)
+    start = ticker.now
+    earlier = [
+        seeded.add_transfer("eviction", OTHER, BETA_ID, scheduled=start - 60 + i, finished=start - 50 + i)
+        for i in range(5)
+    ]
+    probes = PlatformProbes(
+        client,
+        provisioner,
+        {"data": PATH, "more": MORE},
+        ["alpha", "beta"],
+        sleep=ticker.sleep,
+        now=ticker.clock,
+        max_listed=2,
+    )
+    probes.start({})
+    ticker.sleep(INSIDE_S)
+    tid = seeded.add_transfer("eviction", OTHER, BETA_ID, scheduled=ticker.now)
+    live_shaped(seeded, statuses(EVICTION_ENDED), *earlier, tid)
+    ticker.sleep(INSIDE_S)
+    snapshot = probes.finish()
+    section = snapshot["space_transfers"]
+    assert section["probe_ok"] is True, section["error"]
+    assert (section["listed"], section["carried_over"]) == (1, 0)
+    assert [(r["transfer_id"], r["state"]) for r in section["records"]] == [(tid, "completed")]
+    for provider in ("providers[0]", "providers[1]"):
+        assert snapshot["on_demand"][provider]["on_demand_lower_bound"] == 0
+        assert snapshot["on_demand"][provider]["unknown"] is None

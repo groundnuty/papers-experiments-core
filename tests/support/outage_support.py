@@ -43,6 +43,7 @@ from expcore_onedata.day0.outage_tools import KNOWLEDGE_TOOLS
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.registry import Registry
 from expcore_onedata.testing import BASELINE, CREDENTIALS_DIR, FakeData, Ticker
+from expcore_onedata.testing.fake_data import status_fields, summarised
 
 GAMMA_ID, GAMMA_HOST = "pr-gamma", "gamma.test"
 SERVICE = "svc-alpha"
@@ -78,7 +79,7 @@ class OutageWorld:
             return httpx.Response(500, json={"error": {"id": "internalServerError", "details": {}}})
         record = re.fullmatch(r".*/oneprovider/transfers/([^/]+)", path)
         if record and self.down and request.method == "GET" and self.stalled(record.group(1)):
-            return httpx.Response(200, json={"replicationStatus": "active", "type": "replication", "scheduleTime": 1})
+            return httpx.Response(200, json=self.stalled_record(record.group(1)))
         self.calls.append((host, path))
         answer = self.fake.respond(request)
         if self.down and request.method == "GET" and path.endswith("/children") and answer.status_code == 200:
@@ -101,6 +102,19 @@ class OutageWorld:
     def stalled(self, transfer_id: str) -> bool:
         transfer = self.fake.transfers.get(transfer_id)
         return bool(transfer and transfer.replicates and not self.holders_up(transfer.file_id))
+
+    def stalled_record(self, transfer_id: str) -> dict[str, Any]:
+        """The record of a replication that cannot fetch its bytes: still active, in the shape op-worker gives it."""
+        transfer = self.fake.transfers[transfer_id]
+        return summarised(
+            {
+                "type": "replication",
+                **status_fields("replication", "active"),
+                "replicatingProviderId": transfer.provider_id,
+                "evictingProviderId": None,
+                "scheduleTime": 1,
+            }
+        )
 
     def cannot_fetch(self, request: httpx.Request) -> httpx.Response:
         if self.reads_while_down == "refuse":
