@@ -280,11 +280,11 @@ NOT_THE_PROVISIONERS = {
     ("ingestbase.py", "Baseline._write_back", "self"),
     ("transferlog.py", "_placement", "edges"),  # a window of transfer edges, not a block map
     ("transferwindow.py", "Edges.bears_on", "self"),
-    ("shared_holds.py", "SharedHolds.open_holds", "self"),  # the record of the holds, not a block map
     # the agent's tool `schedule_file_replication` through the tool server (MCP), which reaches no Onezone read of ours
     ("day0/outage_run.py", "Run.agent_baseline", "self.tools"),
     ("day0/outage_run.py", "Run.during", "tools"),
     ("shared_holds.py", "SharedHolds.open_holds", "self"),  # the record of the tools' shared holds (O48)
+    ("resetgrant.py", "_settled", "holds"),  # the record of the reset lock's holds (O11), not a block map
 }
 
 # Modules whose every read measures: no site in them may ever name another policy, or call a helper that retries.
