@@ -391,6 +391,7 @@ def test_an_unsharded_export_has_no_shard_key_and_the_keys_it_always_had(tmp_pat
         "infrastructure_by_condition",
         "budget_holds",
         "kinds",
+        "campaign_fingerprint",  # since C36: the store records the plan's fingerprint
     ]
     assert EXPORT_KEY not in export_run_state(store, excluded={})
 

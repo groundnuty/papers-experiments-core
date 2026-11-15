@@ -227,8 +227,9 @@ def test_c35_settings_that_are_not_plain_flat_data_are_refused_before_the_store_
 
 
 def test_c35_the_export_lists_each_change_and_each_unknown_earlier_start_for_the_report(tmp_path):
-    """C35: `reset_settings` of the export, last before the partial-analysis keys: each change with when it was seen
-    and both values (a value that was absent has no entry), and each start whose earlier settings were unknown."""
+    """C35: `reset_settings` of the export, last before the partial-analysis keys and the campaign fingerprint (C36):
+    each change with when it was seen and both values (a value that was absent has no entry), and each start whose
+    earlier settings were unknown."""
     old, _ = start(tmp_path)
     old.close()
     start(tmp_path, SETTINGS, now=LATER)[0].close()
@@ -241,8 +242,10 @@ def test_c35_the_export_lists_each_change_and_each_unknown_earlier_start_for_the
         ],
         "unknown_before": [{"at": LATER}],
     }
-    assert list(exported)[-1] == EXPORT_KEY
-    assert list(exported).index(EXPORT_KEY) == list(exported).index("kinds") + 1
+    keys = list(exported)
+    # the documented order of the optional keys: deployment_shares, operator_holds, reset_settings, then the campaign
+    # fingerprint last (C36); this store has neither of the first two, and no other key may follow `kinds`
+    assert keys[keys.index("kinds") + 1 :] == [EXPORT_KEY, "campaign_fingerprint"]
 
 
 def test_c35_an_export_of_settings_that_never_changed_says_so_with_empty_lists(tmp_path):
