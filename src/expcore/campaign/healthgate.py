@@ -53,7 +53,11 @@ A platform whose own waits are bounded declares the longest (`max_deferral_s`, a
 by itself (a repair it runs) is never cut off by that bound: a campaign whose `max_defer_s` is shorter is refused at
 its start, before its store is opened (`deferral_bound`, `SchedulerConfig.check_deferral_bound`). The bound is the
 platform's own seconds and the core's waits its wait includes: between two checks (`recheck_s`, `poll_interval_s`)
-and a check's own time (`health_timeout_s`), which only the core's settings give, each named in the refusal.
+and a check's own time (`health_timeout_s`), which only the core's settings give, each named in the refusal. **The
+platform declares it twice**, so a study's own check around the platform's, which hides the method, cannot hold the
+campaign to nothing: its run admission may also declare it (`declared_deferral_s`, the same `DeferralBound`, read from
+the platform's settings), and a health check that exposes no `max_deferral_s`, or a smaller bound than the platform's
+declared one, refuses the campaign at its start (`SchedulerConfig.check_declared_deferral`).
 
 **A failure an earlier attempt left charges no one.** A platform answers `Health(False, detail, charge=False)` for a
 failure it knows another attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
@@ -107,7 +111,9 @@ class HealthCheck(Protocol):
     """What the platform supplies: a quick look at whether runs can start. It may raise; that reads as unhealthy.
 
     A check may also declare the longest it can stay deferred, with a method `max_deferral_s()` answering a
-    `DeferralBound` or None (`deferral_bound`); the protocol leaves it out, so a check without it is still one."""
+    `DeferralBound` or None (`deferral_bound`); the protocol leaves it out, so a check without it is still one. A check
+    that wraps the platform's passes the method on: where the platform declares a deferral of its own, a check without
+    it, or with a smaller bound, is refused when the scheduler is built (`SchedulerConfig.check_declared_deferral`)."""
 
     def __call__(self) -> Health:
         """Return the platform's health."""
@@ -132,18 +138,27 @@ class DeferralBound(NamedTuple):
 
 
 DEFERRAL_HOOK = "max_deferral_s"
+DECLARED_HOOK = "declared_deferral_s"  # the platform's own declaration, on its run admission (`StudyPlugin.admission`)
+HEALTH_OWNER = "the platform's health check"
+ADMISSION_OWNER = "the platform's run admission"
 
 
-def deferral_bound(check: Any) -> DeferralBound | None:
-    """The longest deferral a health check declares through its optional `max_deferral_s()`; None for a check without
+def exposes_deferral(check: Any) -> bool:
+    """Whether a health check has the optional `max_deferral_s`, whatever it answers."""
+    return getattr(check, DEFERRAL_HOOK, None) is not None
+
+
+def deferral_bound(check: Any, hook: str = DEFERRAL_HOOK, owner: str = HEALTH_OWNER) -> DeferralBound | None:
+    """The longest deferral a health check declares through its optional `max_deferral_s()` (or, with `hook` and
+    `owner`, what the platform's run admission declares through `declared_deferral_s()`); None for an object without
     the hook, or one that declares none. Raise ConfigError for a hook that is not callable, or that answers anything
     but None or a `DeferralBound` of a finite, non-negative number of seconds and a detail."""
-    hook = getattr(check, DEFERRAL_HOOK, None)
-    if hook is None:
+    method = getattr(check, hook, None)
+    if method is None:
         return None
-    if not callable(hook):
-        raise ConfigError(f"the platform's health check has a {DEFERRAL_HOOK} that is not a method")
-    answer = hook()
+    if not callable(method):
+        raise ConfigError(f"{owner} has a {hook} that is not a method")
+    answer = method()
     if answer is None:
         return None
     seconds = answer.seconds if isinstance(answer, DeferralBound) else None
@@ -156,7 +171,7 @@ def deferral_bound(check: Any) -> DeferralBound | None:
         or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:])
     ):
         raise ConfigError(
-            f"the platform's health check answered {DEFERRAL_HOOK}() with {answer!r:.120}, not None or a "
+            f"{owner} answered {hook}() with {answer!r:.120}, not None or a "
             "DeferralBound of a finite, non-negative number of seconds, a detail and non-negative whole counts of "
             "the core's own waits"
         )

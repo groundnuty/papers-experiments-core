@@ -11,6 +11,10 @@ The bound also holds the waits between those, which are the core's own settings:
 `recheck_s` and the check that makes the link check afresh (`health_timeout_s`), which a call meeting it waits for,
 uncharged (the last deferred answer before the heal ends is followed by a check one recheck later). The platform
 declares how many of each (`DeferralBound.rechecks`, `checks`) and the core adds its own figures.
+
+The platform declares the bound twice: its health check (`max_deferral_s`) and its run admission
+(`declared_deferral_s`, from the same `[faults]`), so a study's check around the platform's that hides the method, or
+declares less, is refused at the start instead of holding the campaign to nothing.
 """
 
 from functools import partial
@@ -20,7 +24,7 @@ from fault_support import FakeServices, faults_table
 from scheduler_support import build, settings_for
 
 from expcore.config.loading import ConfigError
-from expcore_onedata.admission import fault_settings_of
+from expcore_onedata.admission import fault_settings_of, run_admission
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.health import PlatformHealth
@@ -215,3 +219,129 @@ def test_o35_every_figure_the_study_guide_tabulates_is_the_total_the_refusal_pri
         settings = settings_for(health_timeout_s=health_timeout_s, **POLL)
         with pytest.raises(ConfigError, match=f"up to {needed:g} s"):
             build(tmp_path / f"campaign-{health_timeout_s:g}", health=health, settings=settings, plan=SMALL)
+
+
+def wrapped(check):
+    """A study's own health check around the platform's: a closure that calls it and has no `max_deferral_s`."""
+
+    def health():
+        return check()
+
+    return health
+
+
+class Passing:
+    """A study's own health check around the platform's that passes `max_deferral_s` on."""
+
+    def __init__(self, check):
+        self.check = check
+
+    def __call__(self):
+        return self.check()
+
+    def max_deferral_s(self):
+        return self.check.max_deferral_s()
+
+
+def declared_by_the_platform(tmp_path, fake, edit):
+    """The platform's health check and its run admission over one platform.toml, and that file's configuration."""
+    health, _ = platform_check(tmp_path, fake, edit)
+    config = load_platform(tmp_path / "platform.toml")
+    return health, run_admission(config), config
+
+
+def test_o35_the_platforms_run_admission_declares_the_deferral_its_health_check_does(tmp_path, fake):
+    """O35: the run admission reads the longest deferral from the same `[faults]` settings as the health check, with no
+    health object between: the same `DeferralBound` for a declared heal, with a drain and without one, and none with
+    the heal off."""
+    for name, edit in (
+        ("drained", partial(five_providers, heal="all_links")),
+        ("undrained", partial(five_providers, heal="all_links", session_drain_s=0)),
+        ("off", partial(five_providers, heal="off")),
+    ):
+        health, admission, _ = declared_by_the_platform(tmp_path / name, fake, edit)
+        assert admission.declared_deferral_s() == health.max_deferral_s(), name
+    assert admission.declared_deferral_s() is None
+    _, admit, _ = declared_by_the_platform(tmp_path / "again", fake, partial(five_providers, heal="all_links"))
+    assert (admit.declared_deferral_s().seconds, admit.declared_deferral_s().rechecks) == (4790.0, 2)
+    assert callable(admit)  # still what the core enters around every attempt
+
+
+def test_o35_a_study_check_that_wraps_the_platforms_and_hides_the_method_is_refused_at_the_start(tmp_path, fake):
+    """O35: a study's plugin wraps the platform's health check in a closure of its own, so the object the scheduler
+    receives has no `max_deferral_s`. The platform's admission still declares the heal's deferral, so the campaign is
+    refused when it is built, naming the missing method and the figure, before the lock is taken or the store opened,
+    even with a `max_defer_s` that would cover the bound."""
+    health, admission, _ = declared_by_the_platform(
+        tmp_path / "platform", fake, partial(five_providers, heal="all_links")
+    )
+    assert health.max_deferral_s() is not None
+    assert not hasattr(wrapped(health), "max_deferral_s")
+    covers = settings_for(max_defer_s=4972.0, **POLL)
+    with pytest.raises(ConfigError) as refused:
+        build(tmp_path / "campaign", health=wrapped(health), admission=admission, settings=covers, plan=SMALL)
+    text = str(refused.value)
+    for part in (
+        "the health check passed to the scheduler doesn't expose max_deferral_s",
+        "the platform declares a deferral of 4972 s",
+        'heal = "all_links"',
+        "pass the method on",
+    ):
+        assert part in text, text
+    assert [path.name for path in (tmp_path / "campaign").iterdir()] == ["state.sqlite"]  # no campaign.lock
+
+
+def test_o35_a_study_check_that_passes_the_method_on_starts_under_a_max_defer_s_that_covers_the_bound(tmp_path, fake):
+    """O35: the same wrapper with `max_deferral_s` passed on carries the declaration, so the campaign starts when its
+    `max_defer_s` covers the bound (4,972 s for five providers) and is refused by that bound otherwise."""
+    health, admission, _ = declared_by_the_platform(
+        tmp_path / "platform", fake, partial(five_providers, heal="all_links")
+    )
+    with build(
+        tmp_path / "fits",
+        health=Passing(health),
+        admission=admission,
+        settings=settings_for(max_defer_s=4972.0, **POLL),
+        plan=SMALL,
+    ):
+        pass
+    with pytest.raises(ConfigError, match="raise max_defer_s to at least 4972"):
+        build(tmp_path / "short", health=Passing(health), admission=admission, settings=CORE, plan=SMALL)
+
+
+def test_o35_a_platform_without_a_declared_heal_is_unaffected_by_a_wrapped_check(tmp_path, fake):
+    """O35: with `heal = "off"`, or without `[faults]`, the platform declares no deferral, so a study's check that hides
+    `max_deferral_s` is held to nothing, as before: any positive `max_defer_s` starts."""
+    health, admission, _ = declared_by_the_platform(tmp_path / "off", fake, partial(five_providers, heal="off"))
+    with build(
+        tmp_path / "campaign-off",
+        health=wrapped(health),
+        admission=admission,
+        settings=settings_for(max_defer_s=1.0),
+        plan=SMALL,
+    ):
+        pass
+    plain, none, _ = declared_by_the_platform(tmp_path / "plain", fake, lambda data: None)
+    assert none is None  # no `[faults]`, no admission
+    with build(tmp_path / "campaign-plain", health=wrapped(plain), settings=settings_for(max_defer_s=1.0), plan=SMALL):
+        pass
+
+
+def test_o35_a_study_check_built_from_other_settings_declares_less_and_is_refused_naming_both(tmp_path, fake):
+    """O35: a health check made from a platform.toml with no session drain, where the admission was made from one with
+    the drain, declares a smaller bound than the platform does: the campaign is refused, naming both figures."""
+    _, admission, _ = declared_by_the_platform(tmp_path / "long", fake, partial(five_providers, heal="all_links"))
+    undrained = partial(five_providers, heal="all_links", session_drain_s=0)
+    quick, _, _ = declared_by_the_platform(tmp_path / "short", fake, undrained)
+    assert quick.max_deferral_s().seconds < admission.declared_deferral_s().seconds
+    with pytest.raises(ConfigError) as refused:
+        build(
+            tmp_path / "campaign",
+            health=Passing(quick),
+            admission=admission,
+            settings=settings_for(max_defer_s=9999.0, **POLL),
+            plan=SMALL,
+        )
+    text = str(refused.value)
+    for part in ("declares a deferral of 4561 s through max_deferral_s", "the platform declares a deferral of 4972 s"):
+        assert part in text, text
