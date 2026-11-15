@@ -490,11 +490,14 @@ class Scheduler:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
             return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+        reason = None if self.gate is None else self.gate.operator_reason  # what only an operator can end, said first
+        said = "" if reason is None else f": {reason}"
         if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
-            why = "the health gate is closed: the platform's check stayed deferred past max_defer_s"
+            why = f"the health gate is closed: the platform's check stayed deferred past max_defer_s{said}"
             return Hold("health_gate", why, temporary=False)
         if self.gate is not None and self.gate.closed:
-            return Hold("health_gate", "the health gate is closed: no run starts until a check passes", temporary=True)
+            why = f"the health gate is closed: no run starts until a check passes{said}"
+            return Hold("health_gate", why, temporary=True)
         return None
 
     def _model_hold(self, model: str, stopped: frozenset[str], budget: Any) -> Hold | None:

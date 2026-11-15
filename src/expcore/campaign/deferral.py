@@ -83,9 +83,17 @@ class Deferral:
 
 
 def deferral_alarms(record: dict[str, Any] | None) -> list[str]:
-    """The status alarm for a check deferred now."""
+    """The status alarm for a check deferred now. One that leads with a reason only an operator can end
+    (`operator_reason`) says so first, and does not say a run holds the platform."""
     if record is None:
         return []
+    reason = operator_reason(record.get("last_detail"))
+    if reason is not None:
+        return [
+            f"HEALTH CHECK DEFERRED since {record['since_utc']}: {reason} ({record.get('checks', 0)} deferred "
+            f"check(s), last {record.get('last_utc')}: {str(record.get('last_detail'))[:160]}); no run holds the "
+            "platform, and past max_defer_s the gate fails and blocks dispatch until an operator has mended it"
+        ]
     return [
         f"HEALTH CHECK DEFERRED since {record['since_utc']}: runs wait for the platform, which a run holds on purpose "
         f"({record.get('checks', 0)} deferred check(s), last {record.get('last_utc')}: "

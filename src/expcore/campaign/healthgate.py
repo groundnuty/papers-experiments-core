@@ -75,7 +75,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
-from expcore.campaign.deferral import Deferral, deferral_alarms, parse_deferral
+from expcore.campaign.deferral import Deferral, deferral_alarms, operator_reason, parse_deferral
 from expcore.campaign.store import Store
 from expcore.config.loading import ConfigError
 
@@ -234,6 +234,13 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
         if outage.get("charged") is False
         else "one attempt was charged, to the run that found it"
     )
+    reason = operator_reason(last)
+    if reason is not None:  # only an operator ends it: the dispatcher's checks pass once what it left is mended
+        return [
+            f"HEALTH GATE CLOSED since {outage['start_utc']}: {reason}; no run starts; the dispatcher re-checks every "
+            f"{every_s:g} s, but a check passes only once an operator has mended it ({outage.get('checks', 0)} "
+            f"check(s) so far, last {outage.get('last_check_utc') or 'not yet'}: {str(last)[:160]}); {charged}"
+        ]
     return [
         f"HEALTH GATE CLOSED since {outage['start_utc']}: no run starts; the dispatcher re-checks every {every_s:g} s "
         f"and resumes by itself on the first pass ({outage.get('checks', 0)} check(s) so far, last "
@@ -295,6 +302,13 @@ class HealthGate:
         healthy again, and that answer must not be thrown away by a campaign that exits as blocked."""
         outage = self._open
         return outage is not None and bool(outage.get("blocking")) and not self._restored.is_set()
+
+    @property
+    def operator_reason(self) -> str | None:
+        """The reason the open outage's latest answer leads with when only an operator can end it
+        (`deferral.operator_reason`); None when the gate is open or it says none."""
+        outage = self._open
+        return None if outage is None else operator_reason(outage.get("last_detail") or outage.get("first_detail"))
 
     def load(self) -> None:
         """Restore the outage list at a start. A gate closed when the last process ended is closed again and checked at
