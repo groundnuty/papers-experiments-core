@@ -123,9 +123,9 @@ def test_o35_the_bound_names_every_term_and_the_refusal_gives_each_its_value(tmp
         "poll_interval_s",
     ):
         assert part in bound.detail, bound.detail
-    assert bound.detail.count("health_timeout_s") == 2, (
-        bound.detail
-    )  # the check that starts the heal and the one after it
+    for part in ("the check that starts the heal (its health_timeout_s)", "after the heal (its health_timeout_s)"):
+        assert part in bound.detail, bound.detail  # a check of the core's `health_timeout_s` each, twice
+    assert "assumed to end within its health_timeout_s" in bound.detail, bound.detail
     with pytest.raises(ConfigError) as refused:
         build(tmp_path / "campaign", health=health, settings=CORE, plan=SMALL)
     text = str(refused.value)
@@ -134,7 +134,8 @@ def test_o35_the_bound_names_every_term_and_the_refusal_gives_each_its_value(tmp
     quick, _ = platform_check(tmp_path / "quick", fake, partial(five_providers, heal="all_links", session_drain_s=0))
     undrained = quick.max_deferral_s()
     assert (undrained.rechecks, undrained.checks) == (0, 1)
-    assert undrained.detail.count("health_timeout_s") == 1, undrained.detail  # only the check after the heal
+    assert "the check that starts the heal (its health_timeout_s)" not in undrained.detail, undrained.detail
+    assert "after the heal (its health_timeout_s)" in undrained.detail, undrained.detail  # only the check after it
 
 
 @pytest.mark.parametrize("drain_s", [320, 0], ids=["with-a-drain", "no-drain"])

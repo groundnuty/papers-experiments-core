@@ -109,8 +109,11 @@ waits it includes, and the core, which alone knows its own settings, adds them: 
 least that total, or it is refused at its start. With the defaults that is 4,700 s and 151 s, 4,851 s, for four
 providers, and 4,790 s and 151 s, 4,941 s, for five at the 4,290 s they need; with `session_drain_s = 0` the first
 deferral is the check that starts the heal, and only the check after the heal is added (the 4,470 s of five providers
-and 60 s, 4,530 s). A deferral that began before the drain (an outage run still running, and another worker's check
-deferred on it) counts from its first answer, so its age holds that run's remaining time, which no setting here bounds.
+and 60 s, 4,530 s). The figure assumes every check ends within `health_timeout_s`, as a check must (the link check too:
+keep it above `visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but its
+thread runs on and can still start the heal later than the figure counts. A deferral that began before the drain (an
+outage run still running, and another worker's check deferred on it) or for another reason (a run on an ingest
+baseline) counts from its first answer, so its age holds that wait too, which no setting here bounds.
 """
 
 import hashlib

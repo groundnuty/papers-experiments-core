@@ -175,8 +175,15 @@ class FaultGate:
         the link check afresh after it, which a call that meets it waits for, uncharged (`PlatformHealth._regular`).
         The platform's own seconds are the drain and the heal's bound (`heal_deferral_s`); the other waits are the
         core's settings, which it adds (`DeferralBound.rechecks`, `checks`). With no drain the first deferral is the
-        check that starts the heal, and only the check after the heal is added. A deferral that began before that (an
-        outage run still running, another worker's check waiting on it) is not included: it is as long as the run."""
+        check that starts the heal, and only the check after the heal is added.
+
+        **What it assumes.** Every check ends within the campaign's `health_timeout_s`, the check's own contract
+        (`docs/interfaces.md`, HealthCheck), and the link check is bounded by it too (`linkcheck`: keep it above
+        `visible_timeout_s + timeout_s + evict_timeout_s`). The core gives up on a check that outlives it, reads it as
+        down and throws its answer away, but the check's thread runs on and can still start the heal, later than the
+        bound counts. And a deferral that began before the drain (an outage run still running, another worker's check
+        deferred on it) or for another reason (a run on an ingest baseline, `PlatformHealth`'s first answer) counts
+        from its first answer, so its age holds that wait too; neither is included."""
         settings = self._settings
         if settings.heal == "off":
             return None
@@ -191,7 +198,8 @@ class FaultGate:
         detail = (
             f'[faults] heal = "{settings.heal}": {first}heal_timeout_s ({settings.heal_timeout_s:g} s) and '
             f"heal_settle_s ({settings.heal_settle_s:g} s), then the check that makes the link check afresh after the "
-            'heal (its health_timeout_s); lower heal_timeout_s or session_drain_s, or set heal = "off", to shorten it'
+            "heal (its health_timeout_s), each check assumed to end within its health_timeout_s; lower "
+            'heal_timeout_s or session_drain_s, or set heal = "off", to shorten it'
         )
         return DeferralBound(heal_deferral_s(settings), detail, rechecks=int(drained), checks=2 if drained else 1)
 
