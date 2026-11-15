@@ -12,11 +12,25 @@ import contextvars
 import datetime as dt
 import threading
 
-from campaign_support import planned_store, treatment_schema
-from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key_of, settings_for
+import pytest
+from campaign_support import make_schema, planned_store, treatment_schema
+from scheduler_support import FakeExecutor, attempts_of, build, event_kinds, key_of, seed_store, settings_for
 
 from expcore.campaign.deferral import DEFERRAL_META
-from expcore.campaign.healthgate import DEFER, FOUND, GO, META, Health, HealthGate, alarms, fact, parse, read_health
+from expcore.campaign.healthgate import (
+    DEFER,
+    FOUND,
+    GO,
+    META,
+    DeferralBound,
+    Health,
+    HealthGate,
+    alarms,
+    fact,
+    parse,
+    read_health,
+)
+from expcore.config.loading import ConfigError
 from expcore.errors import is_treatable
 
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
@@ -304,3 +318,75 @@ def test_c11_a_passing_post_run_check_ends_the_deferral_so_a_later_one_counts_fr
     assert (health.ok, outage) == (True, None)
     assert store.get_meta(DEFERRAL_META) in (None, "null")
     assert gate.before_run("run-a").verdict == DEFER  # 00:59: a new deferral, not 58 minutes old
+
+
+# --- the platform's longest deferral, held to max_defer_s at the start ------------------------------------------------
+
+
+class Bounded:
+    """A health check that passes and declares the longest it may stay deferred (`max_deferral_s`)."""
+
+    def __init__(self, bound):
+        self.bound = bound
+
+    def __call__(self):
+        return Health(True, "fine")
+
+    def max_deferral_s(self):
+        return self.bound
+
+
+LONG = DeferralBound(5000.0, "the platform's repair: lower its bound or switch it off")
+
+
+def test_c11_a_max_defer_s_shorter_than_the_platforms_longest_deferral_is_refused_before_the_store_opens(tmp_path):
+    """C11: past `max_defer_s` a deferral closes the gate blocking, so a campaign that exits when blocked would stop on
+    a wait the platform says ends by itself. A check that declares its longest deferral (`max_deferral_s`) longer than
+    `max_defer_s` refuses the campaign when the scheduler is built, naming both figures, the platform's words and the
+    fix, before the lock is taken or the store opened."""
+    root = tmp_path / "campaign"
+    seed_store(root, make_schema())
+    seeded = (root / "state.sqlite").read_bytes()
+    with pytest.raises(ConfigError) as refused:
+        build(root, health=Bounded(LONG), plan=SMALL)
+    text = str(refused.value)
+    figures = ("[scheduler] max_defer_s is 3600 s", "up to 5000 s", "raise max_defer_s to at least 5000")
+    for part in (*figures, LONG.detail):
+        assert part in text, text
+    assert [path.name for path in root.iterdir()] == ["state.sqlite"]  # no lock file
+    assert (root / "state.sqlite").read_bytes() == seeded  # the store was never opened
+
+
+def test_c11_a_max_defer_s_at_the_platforms_longest_deferral_starts(tmp_path):
+    """C11: the gate fails a deferral only once its age is past `max_defer_s`, so a bound equal to the platform's
+    longest deferral starts the campaign."""
+    with build(tmp_path, health=Bounded(LONG), settings=settings_for(max_defer_s=LONG.seconds), plan=SMALL):
+        pass
+
+
+@pytest.mark.parametrize("check", [Answers(), Bounded(None)], ids=["no-hook", "declares-none"])
+def test_c11_a_check_that_declares_no_longest_deferral_holds_max_defer_s_to_nothing(tmp_path, check):
+    """C11: a platform whose check has no `max_deferral_s`, or one that answers None, is unaffected: any positive
+    `max_defer_s` starts."""
+    with build(tmp_path, health=check, settings=settings_for(max_defer_s=1.0), plan=SMALL):
+        pass
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        5000.0,
+        "an hour",
+        DeferralBound(-1.0, "a repair"),
+        DeferralBound(float("nan"), "a repair"),
+        DeferralBound(float("inf"), "a repair"),
+        DeferralBound(True, "a repair"),
+        DeferralBound(5.0, None),
+    ],
+    ids=["number", "text", "negative", "nan", "infinite", "boolean", "no-detail"],
+)
+def test_c11_a_longest_deferral_that_is_not_one_refuses_the_start(tmp_path, answer):
+    """C11: what the hook answers crosses into the core, so anything but None or a `DeferralBound` of a finite,
+    non-negative number of seconds and a detail is refused at the start, naming the hook."""
+    with pytest.raises(ConfigError, match="max_deferral_s"):
+        build(tmp_path, health=Bounded(answer), plan=SMALL)

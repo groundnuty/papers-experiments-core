@@ -75,7 +75,7 @@ import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from expcore.campaign.healthgate import Health, HealthCheck
+from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck
 from expcore.config.loading import ConfigError
 from expcore_onedata.admission import fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
@@ -223,6 +223,12 @@ class PlatformHealth:
         """The record of the latest heal of stuck pairs the fault gate ran (`fault_gate_heal`), None before one or
         without `[faults]`."""
         return None if self._faults is None else self._faults.last_heal
+
+    def max_deferral_s(self) -> DeferralBound | None:
+        """The longest this check may stay deferred, which the core holds the campaign's `max_defer_s` to at its start
+        (`healthgate.deferral_bound`): the fault gate's (`FaultGate.max_deferral_s`), None without `[faults]`. A study
+        that wraps this check in its own passes the method on, or the campaign is held to nothing."""
+        return None if self._faults is None else self._faults.max_deferral_s()
 
     def wait_for_gate_heal(self, timeout_s: float | None = None) -> bool:
         """Wait, at most `timeout_s`, for a heal the fault gate runs in the background to end; whether none runs now

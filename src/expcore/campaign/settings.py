@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.gate import Budget
 from expcore.campaign.harness_stop import HarnessStopConfig
+from expcore.campaign.healthgate import DeferralBound
+from expcore.config.loading import ConfigError
 from expcore.errors import infra_kinds, untreatable_kinds
 
 
@@ -24,7 +26,8 @@ class SchedulerConfig:
       treatment, because a run that never started, or that the wrong endpoint served, must not be scored as its fault.
     - `recheck_s`, `health_timeout_s`: how often the closed gate is checked (and how long a run whose check was
       deferred waits before it is tried again), and how long a check may take. `max_defer_s`: how long the platform's
-      check may stay deferred (a run holds the platform on purpose) before the gate fails and blocks dispatch (C11).
+      check may stay deferred (a run holds the platform on purpose) before the gate fails and blocks dispatch (C11); at
+      least the longest deferral the platform's check declares, or the campaign is refused (`check_deferral_bound`).
     - `lease_timeout_s`: how long a run waits for a lease before it is left unstarted; None: for ever.
     - `harness_stop`, `budget`: the harness-error stops (C10) and the budget gate (C12); no budget runs without one.
     - `exit_when_blocked`: `run` returns, instead of waiting, when nothing is in flight and every pending run is
@@ -73,6 +76,20 @@ class SchedulerConfig:
     def kind_roles(self) -> dict[str, str]:
         """The kinds this campaign charges its own failures to, by the key of `[scheduler]` that names each."""
         return {"health_kind": self.health_kind, "identity_kind": self.identity_kind}
+
+    def check_deferral_bound(self, bound: DeferralBound | None) -> None:
+        """Refuse a `max_defer_s` shorter than the longest the platform's check may stay deferred (`bound`, from
+        `healthgate.deferral_bound`; None: the platform declares none). Past `max_defer_s` a deferral closes the gate
+        blocking, so a campaign that exits when blocked would stop on a wait the platform ends by itself. The gate fails
+        a deferral only once its age is past `max_defer_s`, so a bound equal to it starts."""
+        if bound is None or bound.seconds <= self.max_defer_s:
+            return
+        raise ConfigError(
+            f"campaign.toml [scheduler] max_defer_s is {self.max_defer_s:g} s, but the platform's health check may "
+            f"stay deferred for up to {bound.seconds:g} s ({bound.detail}); a deferral past max_defer_s closes the "
+            "health gate as blocking, so a campaign that exits when blocked would stop on a wait it should have waited "
+            f"out: raise max_defer_s to at least {bound.seconds:g}, or shorten the platform's wait"
+        )
 
     def check_kinds(self, schema: FactorSchema) -> None:
         """Refuse a health or identity kind that is unknown or that a condition declares as its treatment.

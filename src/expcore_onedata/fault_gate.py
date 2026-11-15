@@ -34,7 +34,9 @@ closed, uncharged, as the hold `federation_busy` when either outlasts it, and ha
 with no provider restored, **in the background** (`_heal_on`). The check that began it, and every check while it runs,
 answers the uncharged deferral (`Health(..., deferred=True, charge=False)`) at once, so a heal longer than the
 campaign's `health_timeout_s` never reads as down and a pair it mends charges no run; past the heal's own bound
-(`heal_timeout_s` and `heal_settle_s` since it began) a heal still running closes the gate, uncharged. A check that
+(`heal_timeout_s` and `heal_settle_s` since it began) a heal still running closes the gate, uncharged. That bound, after
+a session drain, is the longest the gate declares it may defer (`max_deferral_s`), and the core refuses a campaign whose
+`max_defer_s` is shorter at its start, so a heal never turns into a blocking hold that stops the campaign. A check that
 found the pair too and meets a heal under way (this gate's, or another check's holding the federation) waits the same
 way, never taking the latch the heal set for a closed episode, and so does another process's check that meets a heal's
 container restart journalled `clear_failed` during its settle. Whatever the heal did, the next check makes the link
@@ -53,7 +55,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from expcore.campaign.healthgate import Health, HealthCheck, read_health
+from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck, read_health
 from expcore.errors import TARGET_LABEL, InfraError
 from expcore_onedata.admission import (
     EXCLUSIVE_RUN,
@@ -70,7 +72,7 @@ from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_recovery import FaultDriver, Recovery
-from expcore_onedata.fault_settings import FaultSettings
+from expcore_onedata.fault_settings import FaultSettings, heal_deferral_s, heal_wait_s
 
 _PURPOSES = {
     OUTAGE_RUN: "an outage run",
@@ -158,7 +160,22 @@ class FaultGate:
         self._heal_guard = threading.Lock()  # the heal running in the background, and when it began
         self._heal_thread: threading.Thread | None = None
         self._heal_began = 0.0
-        self._heal_bound_s = settings.heal_timeout_s + settings.heal_settle_s  # the longest a heal defers the gate
+        self._heal_bound_s = heal_wait_s(settings)  # the longest a heal defers the gate
+        self._settings = settings
+
+    def max_deferral_s(self) -> DeferralBound | None:
+        """The longest this gate's checks may stay deferred, for the core to hold the campaign's `max_defer_s` to at
+        its start (`healthgate.deferral_bound`): with a declared heal, a session drain and then a heal of its whole
+        bound (`heal_deferral_s`), whether this gate heals or another process's does; None with the heal off."""
+        settings = self._settings
+        if settings.heal == "off":
+            return None
+        detail = (
+            f'[faults] heal = "{settings.heal}": session_drain_s ({settings.session_drain_s:g} s), then heal_timeout_s '
+            f"({settings.heal_timeout_s:g} s) and heal_settle_s ({settings.heal_settle_s:g} s); lower heal_timeout_s "
+            'or session_drain_s, or set heal = "off", to shorten it'
+        )
+        return DeferralBound(heal_deferral_s(settings), detail)
 
     @property
     def last_heal(self) -> dict[str, Any] | None:

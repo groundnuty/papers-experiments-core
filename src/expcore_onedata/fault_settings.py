@@ -95,6 +95,15 @@ default 900 s, a heuristic for the start and the teardown, never a worst case of
 earlier run left (as the injector's `cancel_wait_s` counts), and one session drain of `session_drain_s`, which that
 start waits out after it restored a provider an earlier run left down (`FaultInjector._wait_owed`). With the defaults
 (4,200 s and 320 s) that is 9,620 s.
+
+**A declared heal needs a campaign `max_defer_s` that outlives it.** While the fault gate heals, every check answers the
+uncharged deferral, for up to `heal_timeout_s` plus `heal_settle_s` from the heal's start (`heal_wait_s`), and after an
+outage run the session drain comes first, with no check between them that passes. The core turns a deferral past the
+campaign's `max_defer_s` (3,600 s by default) into a blocking hold, on which a campaign that exits when blocked stops.
+So the check declares the sum (`heal_deferral_s`: `session_drain_s`, `heal_timeout_s` and `heal_settle_s`; none with
+the heal off) as its longest deferral (`FaultGate.max_deferral_s`, `PlatformHealth.max_deferral_s`), and the core
+refuses a campaign whose `max_defer_s` is shorter at its start. With the defaults that is 4,700 s for four providers,
+and 4,790 s for five at the 4,290 s they need.
 """
 
 import hashlib
@@ -275,6 +284,21 @@ def heal_token_margin_s(settings: FaultSettings) -> float:
     if settings.heal == "off":
         return 0.0
     return TOKEN_MARGIN_BASE_S + 2 * settings.heal_timeout_s + settings.session_drain_s
+
+
+def heal_wait_s(settings: FaultSettings) -> float:
+    """The longest the fault gate waits for its heal, from the heal's start (`fault_gate.FaultGate`): `heal_timeout_s`
+    and the settle after its last restart, `heal_settle_s`."""
+    return settings.heal_timeout_s + settings.heal_settle_s
+
+
+def heal_deferral_s(settings: FaultSettings) -> float:
+    """The longest the platform's health check may stay deferred with a declared heal (see the module docstring): the
+    session drain after an outage run (`session_drain_s`; 0 declares none), then the fault gate's heal of the stuck
+    pairs that run left (`heal_wait_s`), with no check between them that passes; 0 with the heal off."""
+    if settings.heal == "off":
+        return 0.0
+    return settings.session_drain_s + heal_wait_s(settings)
 
 
 def heal_link_reserve(settings: FaultSettings) -> float:
