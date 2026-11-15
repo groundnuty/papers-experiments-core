@@ -1,9 +1,12 @@
 """Reading a finished store from a copy (R16): the store and its -wal, never its -shm, unchanged across the copy."""
 
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -12,6 +15,7 @@ from campaign_support import make_schema, open_store
 from tree_support import read_only, tree_of
 
 from expcore.campaign import storecopy
+from expcore.campaign.lock import filesystem_type
 from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapshot, take_snapshot
 from expcore.campaign.storecopy import COPY_ATTEMPTS, StoreChanged, copy_store
@@ -126,28 +130,95 @@ def test_r16_a_fingerprint_in_the_wal_alone_is_read_through_the_copy_in_a_read_o
     assert tree_of(out) == before
 
 
-def test_r16_a_change_the_timestamps_cannot_show_is_caught_by_the_bytes(killed, tmp_path, monkeypatch, quick):
-    """R16: a file system's timestamps may be too coarse to show a write between the copy of the store and that of
-    its -wal; the bytes read again after the copy show it, so that copy is thrown away and made again."""
-    monkeypatch.setattr(storecopy, "_identity", lambda path: ("the same", "whatever happens"))
-    wal = killed.with_name(killed.name + "-wal")
+@pytest.fixture
+def killed_on_tmpfs(tmp_path) -> Iterator[Path]:
+    """A killed dispatcher's store (see `killed`) on tmpfs, where file times move only on the kernel's coarse tick,
+    as on the HPC nodes and temporary directories shards run in; skipped where no writable tmpfs exists."""
+    shm = Path("/dev/shm")
+    if filesystem_type(shm) != "tmpfs" or not os.access(shm, os.W_OK):
+        pytest.skip("no writable tmpfs at /dev/shm on this host, so the coarse-tick case cannot be shown here")
+    base = Path(tempfile.mkdtemp(prefix="expcore-r16-", dir=shm))
+    try:
+        out = base / "out"
+        out.mkdir()
+        store = out / "state.sqlite"
+        done = subprocess.run(
+            [sys.executable, str(CRASH), str(store), str(tmp_path / "run"), "after_metadata"],
+            capture_output=True,
+            text=True,
+        )
+        assert done.returncode == KILLED, done.stderr
+        yield store
+    finally:
+        shutil.rmtree(base)
+
+
+def rewrite_a_page_in_place(store: Path) -> None:
+    """Commit as a writer could within one tick of the clock: change bytes of the store in place, then put its
+    modification time back, so its size, time and inode are what they were and only its contents differ."""
+    was = os.stat(store)
+    with open(store, "r+b") as handle:
+        handle.seek(was.st_size - 16)
+        old = handle.read(16)
+        handle.seek(was.st_size - 16)
+        handle.write(bytes(byte ^ 0xFF for byte in old))
+    os.utime(store, ns=(was.st_atime_ns, was.st_mtime_ns))
+    now = os.stat(store)
+    assert (now.st_size, now.st_mtime_ns, now.st_ino) == (was.st_size, was.st_mtime_ns, was.st_ino)
+
+
+def write_during_copies(monkeypatch, store: Path, *, when: str, times: int | None) -> list[str]:
+    """Rewrite a page of the store in place just before (`when="before"`) or just after (`"after"`) each of its
+    copies, the first `times` times (every time with None); return the names copied, in order."""
     copied: list[str] = []
     real = storecopy._copy_file
+    rewrites = 0
 
-    def copy_then_write(source: Path, target: Path) -> str:
+    def copy_with_writer(source: Path, target: Path) -> str:
+        nonlocal rewrites
+        due = source == store and (times is None or rewrites < times)
+        if due and when == "before":
+            rewrite_a_page_in_place(store)
         digest = real(source, target)
+        if due and when == "after":
+            rewrite_a_page_in_place(store)
+        rewrites += due
         copied.append(source.name)
-        if len(copied) == 2:  # once, after the first copy of the -wal
-            with open(wal, "ab") as appended:
-                appended.write(b"a frame the copy did not see")
         return digest
 
-    monkeypatch.setattr(storecopy, "_copy_file", copy_then_write)
+    monkeypatch.setattr(storecopy, "_copy_file", copy_with_writer)
+    return copied
+
+
+def test_r16_on_tmpfs_a_writer_that_keeps_size_time_and_inode_during_every_copy_is_refused(
+    killed_on_tmpfs, tmp_path, monkeypatch, quick
+):
+    """R16: a commit during every copy that leaves the store's size, modification time and inode as they were is
+    seen in its contents, which the signature before and after the copy hashes: the copy is never accepted, and
+    after the bounded attempts it is refused, naming the store, with nothing left where it was made."""
+    copied = write_during_copies(monkeypatch, killed_on_tmpfs, when="after", times=None)
     into = tmp_path / "copy"
     into.mkdir()
-    copy_store(killed, into)
+    with pytest.raises(StoreChanged, match=f"{killed_on_tmpfs}: it changed while it was copied"):
+        copy_store(killed_on_tmpfs, into)
+    assert copied == ["state.sqlite", "state.sqlite-wal"] * COPY_ATTEMPTS
+    assert list(into.iterdir()) == []
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_r16_on_tmpfs_a_page_rewritten_once_around_the_copy_is_copied_again_never_torn(
+    killed_on_tmpfs, tmp_path, monkeypatch, quick, when
+):
+    """R16: the bytes copied must equal the contents hashed both before and after the copy, so a store rewritten in
+    place just before its copy is read (after the signature was taken) or just after, size, time and inode kept, is
+    copied again; what is accepted is one state of both files."""
+    copied = write_during_copies(monkeypatch, killed_on_tmpfs, when=when, times=1)
+    into = tmp_path / "copy"
+    into.mkdir()
+    copy_store(killed_on_tmpfs, into)
     assert copied == ["state.sqlite", "state.sqlite-wal"] * 2
-    assert (into / wal.name).read_bytes() == wal.read_bytes()
+    for name in ("state.sqlite", "state.sqlite-wal"):
+        assert (into / name).read_bytes() == (killed_on_tmpfs.parent / name).read_bytes()
 
 
 def test_r16_a_store_that_changes_during_the_copy_is_copied_again(killed, tmp_path, monkeypatch, quick):

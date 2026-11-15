@@ -10,11 +10,13 @@ instead and reads the copy:
   after a killed dispatcher), are copied as they are, the `-wal` only when there is one;
 - the `-shm` never: it is an index of the `-wal` shared between live connections, and SQLite rebuilds it from the
   `-wal` when the copy is opened;
-- both files are stated (device, inode, size, modification and change times) before and after the copy, and read
-  again after it and compared, by SHA-256, with the bytes copied: a file system's timestamps may be too coarse to
-  show a write (a checkpoint into the store and a reset of the `-wal` between the two copies, say), its bytes are
-  not. A copy across which either file changed, appeared or went away may mix two states: it is thrown away and made
-  again, at most `COPY_ATTEMPTS` times, `COPY_PAUSE_S` apart, and then `StoreChanged` is raised, naming the store;
+- each file's signature is taken before and after the copy: device, inode, size, modification time and the SHA-256
+  of its contents, read in chunks (a missing `-wal` is part of it). A copy is kept only when both signatures of each
+  file are equal and the SHA-256 of the bytes copied equals both. File times move only on the kernel's coarse tick,
+  on tmpfs too, so a commit that rewrites a page in place within one tick leaves size, time and inode as they were:
+  only the contents show it. A copy across which either file changed, appeared or went away may mix two states: it
+  is thrown away and made again, at most `COPY_ATTEMPTS` times, `COPY_PAUSE_S` apart, and then `StoreChanged` is
+  raised, naming the file that changed;
 - the copy lies in a temporary directory of its own (`store_copy`), which the caller opens read-write, so that SQLite
   replays the `-wal` into what it reads, and which is removed afterwards.
 
@@ -38,34 +40,15 @@ COPY_PAUSE_S = 0.25
 WAL_SUFFIX = "-wal"
 _CHUNK = 1 << 20
 
-_Identity = tuple[int, int, int, int, int] | None
+_Signature = tuple[int, int, int, int, str] | None  # device, inode, size, modification time (ns), SHA-256
 
 
 class StoreChanged(RuntimeError):
     """The store or its -wal changed while it was copied, on every attempt: it has a writer."""
 
 
-def _identity(path: Path) -> _Identity:
-    """What changes when a file is written, replaced or removed: device, inode, size, modification and change times."""
-    try:
-        found = os.stat(path)
-    except FileNotFoundError:
-        return None
-    return (found.st_dev, found.st_ino, found.st_size, found.st_mtime_ns, found.st_ctime_ns)
-
-
-def _copy_file(source: Path, target: Path) -> str:
-    """Copy one file's bytes, and nothing of its metadata; return the SHA-256 of the bytes copied."""
-    digest = hashlib.sha256()
-    with open(source, "rb") as reader, open(target, "wb") as writer:
-        for chunk in iter(lambda: reader.read(_CHUNK), b""):
-            digest.update(chunk)
-            writer.write(chunk)
-    return digest.hexdigest()
-
-
 def _sha256(path: Path) -> str | None:
-    """The SHA-256 of a file's bytes; None when it is not there."""
+    """The SHA-256 of a file's bytes, read in chunks; None when it is not there."""
     digest = hashlib.sha256()
     try:
         with open(path, "rb") as reader:
@@ -76,31 +59,73 @@ def _sha256(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _signature(path: Path) -> _Signature:
+    """A file's device, inode, size, modification time and the SHA-256 of its contents; None when it is not there."""
+    try:
+        found = os.stat(path)
+    except FileNotFoundError:
+        return None
+    digest = _sha256(path)
+    if digest is None:
+        return None  # it went away between the two
+    return (found.st_dev, found.st_ino, found.st_size, found.st_mtime_ns, digest)
+
+
+def _copy_file(source: Path, target: Path) -> str:
+    """Copy one file's bytes in chunks, and nothing of its metadata; return the SHA-256 of the bytes copied."""
+    digest = hashlib.sha256()
+    with open(source, "rb") as reader, open(target, "wb") as writer:
+        for chunk in iter(lambda: reader.read(_CHUNK), b""):
+            digest.update(chunk)
+            writer.write(chunk)
+    return digest.hexdigest()
+
+
+def _changed(before: _Signature, copied: str | None, after: _Signature) -> bool:
+    """Whether a file changed across its copy: its signatures differ, or the bytes copied are not the ones both name
+    (for a file that is not there, None throughout)."""
+    if before != after:
+        return True
+    return copied != (None if before is None else before[-1])
+
+
 def copy_store(source: Path, into: Path) -> Path:
     """Copy the store at `source` and its -wal, never its -shm, into the existing directory `into`; return the copy.
 
-    Raises StoreChanged when every attempt saw either file change, and leaves `into` without a copy then.
+    Raises StoreChanged, naming the file, when every attempt saw either file change, and leaves `into` without a copy
+    then.
     """
     wal = source.with_name(source.name + WAL_SUFFIX)
     target, target_wal = into / source.name, into / wal.name
+    changed = source
     for attempt in range(COPY_ATTEMPTS):
         if attempt:
             time.sleep(COPY_PAUSE_S)
-        before = (_identity(source), _identity(wal))
+        before = (_signature(source), _signature(wal))
         if before[0] is None:
             raise FileNotFoundError(f"{source}: no campaign store here")
+        copied: tuple[str | None, str | None] | None
         try:
             copied = (_copy_file(source, target), None if before[1] is None else _copy_file(wal, target_wal))
         except FileNotFoundError:
-            copied = None  # one of them went away during the copy: a change
-        unchanged = copied is not None and (_sha256(source), _sha256(wal)) == copied
-        if unchanged and (_identity(source), _identity(wal)) == before:
-            return target
+            copied = None  # one of them went away during the copy: a change, seen in the signatures after
+        after = (_signature(source), _signature(wal))
+        if copied is None:
+            changed = source if before[0] != after[0] else wal
+        else:
+            moved = [
+                path
+                for path, was, got, now in zip((source, wal), before, copied, after, strict=True)
+                if _changed(was, got, now)
+            ]
+            if not moved:
+                return target
+            changed = moved[0]
         target.unlink(missing_ok=True)
         target_wal.unlink(missing_ok=True)
     raise StoreChanged(
-        f"{source}: it changed while it was copied, {COPY_ATTEMPTS} times in a row, so a process is writing it; "
-        "read it once that process has stopped"
+        f"{changed}: it changed while it was copied, {COPY_ATTEMPTS} times in a row, so a process is writing it; "
+        "read the store once that process has stopped"
     )
 
 
