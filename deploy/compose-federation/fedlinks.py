@@ -49,12 +49,13 @@ def check_after_up(layout: Layout, space_ids: dict[str, str]) -> str:
     client = OnezoneClient(config)
     record = layout.root / REPORT
     try:
-        with recording(record):  # one check at a time makes the record: a restore's or a heal's, if one is under way
+        with recording(record) as serialized:  # one check at a time makes the record: a restore's or a heal's, if any
             report = check_links(config, client)
             write_record(report, record)
     finally:
         client.close()
+    note = "" if serialized else "; the record's lock could not be taken, so a check under way elsewhere may overlap"
     if not report.ok:
-        raise RuntimeError(f"the link check failed, so the federation is not ready: {report.detail}")
+        raise RuntimeError(f"the link check failed, so the federation is not ready: {report.detail}{note}")
     rows = (f"{p.source} -> {p.reader} {p.seconds:.2f} s {p.bytes} B" for p in report.pairs)
-    return f"link check: every pair transferred ({'; '.join(rows)}); {REPORT} written"
+    return f"link check: every pair transferred ({'; '.join(rows)}); {REPORT} written{note}"

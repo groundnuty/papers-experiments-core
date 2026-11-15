@@ -7,6 +7,7 @@ These tests run the platform layer's real link check over the fake federation; t
 in `tests/onedata/test_fault_link_record.py`.
 """
 
+import contextlib
 import json
 import logging
 from functools import partial
@@ -173,6 +174,27 @@ def test_o35_a_record_in_a_directory_that_refuses_both_is_emptied_in_place_so_no
     assert matrix.ok
     assert (tmp_path / RECORD).read_bytes() == b""
     assert (tmp_path / RECORD).stat().st_mtime == 0
+
+
+def test_o35_a_check_that_cannot_take_the_lock_publishes_no_verdict_and_removes_the_older_one(
+    tmp_path, serves, monkeypatch, caplog
+):
+    """O35: without the record's lock the check's verdict could be overtaken by, or overtake, another's, so no record is
+    written at all: the older one is removed, a warning says why, and the check still answers as made."""
+    serves.matrix(SERVICE)
+    assert (tmp_path / RECORD).exists()
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+
+    monkeypatch.setattr(fault_serves, "recording", unlocked)
+    with caplog.at_level(logging.WARNING, logger=fault_serves.__name__):
+        matrix = serves.matrix(SERVICE)
+    assert matrix is not None
+    assert matrix.ok
+    assert not (tmp_path / RECORD).exists()
+    assert any("lock could not be taken" in r.getMessage() for r in caplog.records)
 
 
 def test_o35_a_record_that_can_be_neither_written_nor_removed_is_said_twice_and_changes_nothing_else(

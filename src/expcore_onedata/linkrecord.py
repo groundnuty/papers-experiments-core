@@ -20,8 +20,11 @@ record, exclusively around a check and the writing of its record, so a check tha
 waits for it to end and writes after it, and the record is the latest-started check's, never an older one's that
 finished late. Under a restore's and a heal's exclusive admission the lock is never contended; it orders what the
 admission does not (`up` run on a federation another process is checking, say). No clock is read for the order. The
-lock is a leaf of the federation's lock order (`admission`). A lock that cannot be taken is no reason to skip the
-check: `recording` yields False and the caller goes on unserialized, saying so.
+lock is a leaf of the federation's lock order (`admission`). The lock file is opened read-only, which `flock` needs no
+write permission for, so every process that can write the directory can take part. A lock that still cannot be taken
+is no reason to skip the check: `recording` yields False, and a caller that cannot serialize publishes no verdict (the
+probe removes the older record instead), so an unordered write never leaves an old pass standing; `up`, which
+alone runs while nothing else does, writes and says so.
 
 **An older verdict never stands.** `discard_record` removes the record, or, when the directory refuses that, empties it
 in place (which needs only the file's own write permission) and dates it to the epoch, so that no reader takes it, by
@@ -109,12 +112,13 @@ def _empty(path: Path) -> None:
 def recording(path: Path) -> Iterator[bool]:
     """Hold the record's lock (`LOCK`, beside `path`) exclusively, waiting for any other check under way to end, for a
     check and the writing of its record; yield whether it is held. False means the lock file could not be opened or
-    locked, and the caller goes on unserialized. The lock is let go when the block ends, and by the kernel with a
-    process that dies."""
+    locked, and the caller must not publish a verdict that is not ordered. The file is opened read-only (created when
+    it is not there): `flock` needs no write permission, so a lock file another user made is taken all the same. The
+    lock is let go when the block ends, and by the kernel with a process that dies."""
     descriptor = None
     held = False
     try:
-        descriptor = os.open(Path(path).parent / LOCK, os.O_RDWR | os.O_CREAT, 0o666)
+        descriptor = os.open(Path(path).parent / LOCK, os.O_RDONLY | os.O_CREAT, 0o666)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         held = True
     except OSError:

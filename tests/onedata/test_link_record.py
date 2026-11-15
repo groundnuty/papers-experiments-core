@@ -273,6 +273,16 @@ def test_o35_a_check_that_starts_while_another_is_under_way_waits_for_it(tmp_pat
     assert LOCK in directory_names(tmp_path)
 
 
+def test_o35_a_lock_file_another_user_made_read_only_is_still_taken(tmp_path):
+    """O35: `flock` needs no write permission, so the lock file is opened read-only: a lock file that only its owner can
+    write (0644, or here 0444) is taken by every process that can read it, and is not skipped."""
+    lock = tmp_path / LOCK
+    lock.write_bytes(b"")
+    lock.chmod(0o444)
+    with recording(tmp_path / RECORD) as held:
+        assert held is True
+
+
 def test_o35_a_lock_that_cannot_be_taken_is_said_by_a_false_and_never_raises(tmp_path):
     """O35: a directory that cannot hold the lock file is no reason to skip a check: the caller is told it runs
     unserialized."""

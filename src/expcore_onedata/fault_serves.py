@@ -110,20 +110,22 @@ class ServingProbe:
         """The platform layer's all-pairs check, and its record (`expcore_onedata.linkrecord`), pass or fail: the record
         on disk is always the latest check's verdict, never an older one. The check and the writing of its record are
         one step under the record's lock, so a check that starts while another is under way waits for it and writes
-        after it. A check that raises answers nothing, so the older record is removed (or, when the directory refuses
-        that, emptied in place) before the error goes on to the caller; a record that cannot be written is treated the
-        same, and logged (its error's type only), and the check's answer is returned as made: the record is advisory,
-        and neither the restore's verdict nor the heal's depends on it. It touches no federation lock and no epoch
-        (`fault_epoch`)."""
+        after it; one that cannot take the lock writes no record at all, and removes the older one. A check that raises
+        answers nothing, so the older record is removed (or, when the directory refuses that, emptied in place) before
+        the error goes on to the caller; a record that cannot be written is treated the same, and logged (its error's
+        type only), and the check's answer is returned as made: the record is advisory, and neither the restore's
+        verdict nor the heal's depends on it. It touches no federation lock and no epoch (`fault_epoch`)."""
         path = self._config.file.parent / RECORD
         with recording(path) as serialized:
-            if not serialized:
-                log.warning("the link check's record lock could not be taken, so another check may overlap this one")
             try:
                 report = check_links(self._config, self._client)
             except Exception:
                 self._discarded(path)
                 raise
+            if not serialized:  # a verdict that another check's may overlap is published by no one: the old one goes
+                log.warning("the link check's record lock could not be taken, so no record is written")
+                self._discarded(path)
+                return report
             try:
                 write_record(report, path)
             except OSError as error:

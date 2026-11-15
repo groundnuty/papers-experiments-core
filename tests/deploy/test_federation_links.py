@@ -2,6 +2,7 @@
 space the agent may reach supports, refused at load otherwise; up runs the platform layer's check last, through the
 platform.toml it rendered, and is not ready until every pair transfers."""
 
+import contextlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -188,6 +189,23 @@ def test_up_writes_its_record_in_the_text_it_always_has_through_the_layers_write
     expected = json.dumps(report.to_json(), indent=2, sort_keys=True) + "\n"
     assert (tmp_path / "link-check.json").read_text(encoding="utf-8") == expected
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []  # no draft is left
+
+
+def test_up_whose_record_lock_cannot_be_taken_writes_its_record_and_says_so(fed, fedlinks, tmp_path, monkeypatch):
+    """O35: up runs while nothing else does, so it writes its record without the lock, and its output says that a check
+    under way elsewhere may overlap."""
+    layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
+    passed = PairResult("providers[0]", "providers[1]", True, 0.25, 65536)
+    monkeypatch.setattr(fedlinks, "check_links", lambda config, client: LinkReport(True, "ok", (passed,), 1.0, 2.0))
+
+    @contextlib.contextmanager
+    def unlocked(path):
+        yield False
+
+    monkeypatch.setattr(fedlinks, "recording", unlocked)
+    out = fedlinks.check_after_up(layout, {"link-probes": "sp-probe-0009"})
+    assert "lock could not be taken" in out
+    assert json.loads((tmp_path / fedlinks.REPORT).read_text(encoding="utf-8"))["ok"] is True
 
 
 def test_a_stuck_pair_fails_up_naming_it(fed, fedlinks, tmp_path, monkeypatch):
