@@ -44,6 +44,12 @@ The same rule covers a zero numerator sum, whose log ratio is minus infinity.
 A pair lost because a run's numerator is None while its denominator is 0 is counted under `numerator_none_at_zero`:
 a failed run's cost left unmeasured makes the ratio one over successful runs alone, which is what it exists to avoid.
 The analysis refuses a confirmatory contrast that has any (`analysis.RatioNumeratorRefused`).
+
+Each arm may read a column of its own for either role (`RatioForm.numerator_a`, `numerator_b`, `denominator_a`,
+`denominator_b`), so N_A and D_A are sums of arm A's columns and N_B and D_B of arm B's: a sensitivity estimate that
+puts arm A at its upper-bound cost and arm B at its lower-bound one is a contrast of its own beside the main one. Each
+per-arm column defaults to the shared one. This module sums the totals it is handed; which column a run is read in is
+the pairing's (`pairing._columns`), from the run's own arm.
 """
 
 from __future__ import annotations
@@ -51,8 +57,9 @@ from __future__ import annotations
 import math
 import numbers
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
+from typing import Any
 
 import numpy as np
 
@@ -61,9 +68,17 @@ from expcore.stats.estimators import POOLED, PairedDifferences
 ZERO_RULES = ("exclude", "continuity")  # what a cell with a zero sum does, as the preregistration declares
 ZERO_CAUSES = ("zero_denominator", "zero_numerator")  # why the rule excludes a cell, and so each of its pairs
 RATIO_CAUSES = ("numerator_none_at_zero", *ZERO_CAUSES)  # the missing causes it adds
+ROLES = ("numerator", "denominator")  # the two outcomes of a ratio, each a shared column or one per arm
+ARM_SUFFIXES = ("a", "b")  # arm A's and arm B's per-arm keys: `numerator_a`, `denominator_b`, ...
+# A dataclass field's metadata key: the analysis record (`analysis.json`) leaves the field out while it is None, so a
+# form that declares no per-arm column is written byte for byte as before per-arm columns existed.
+OMIT_NONE = "omit_none"
 __all__ = [
+    "ARM_SUFFIXES",
+    "OMIT_NONE",
     "POOLED",
     "RATIO_CAUSES",
+    "ROLES",
     "ZERO_CAUSES",
     "ZERO_RULES",
     "RatioForm",
@@ -76,28 +91,47 @@ __all__ = [
 Totals = tuple[float, float]  # (numerator, denominator) of one run, or the sums of an arm in a cell
 
 
+def _arm_column() -> Any:
+    """A per-arm column of a form: None while the arm reads the shared column, and then absent from the record."""
+    return field(default=None, metadata={OMIT_NONE: True})
+
+
 @dataclass(frozen=True)
 class RatioForm:
-    """What a ratio contrast compares: `numerator` per unit of `denominator`, and its declared rule for a zero sum.
+    """What a ratio contrast compares: each arm's numerator per unit of its denominator, and its declared rule for a
+    zero sum.
 
+    `numerator` and `denominator` are the columns both arms read; `numerator_a` and `numerator_b` (and `denominator_a`
+    and `denominator_b`) are arm A's and arm B's own, each defaulting to the shared one. The form is held one way
+    whichever way it is written: a role whose two arms read one column holds it as the shared column, its per-arm
+    fields None; a role whose arms differ holds both arms' columns and None as the shared one. A shared column beside
+    both arms' own, which no arm would read, is refused, and so is an arm with no column of a role.
     `continuity_correction` is given with `zero_denominator = "continuity"` and only then.
     """
 
-    numerator: str
-    denominator: str
+    numerator: str | None
+    denominator: str | None
     zero_denominator: str
     continuity_correction: float | None = None
+    numerator_a: str | None = _arm_column()
+    numerator_b: str | None = _arm_column()
+    denominator_a: str | None = _arm_column()
+    denominator_b: str | None = _arm_column()
 
     def __post_init__(self) -> None:
-        """Require two different named outcomes, a declared rule, and a positive finite correction with its rule."""
-        for role in ("numerator", "denominator"):
-            value = getattr(self, role)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"a ratio contrast's {role} must name an outcome, got {value!r}")
-        if self.numerator == self.denominator:
-            raise ValueError(
-                f"a ratio's numerator and denominator must be two different outcomes, got {self.numerator!r}"
-            )
+        """Hold each role's columns canonically; require each arm to read two different named outcomes, a declared
+        rule, and a positive finite correction with its rule."""
+        for role in ROLES:
+            self._resolve(role)
+        for side, arm in enumerate("AB"):
+            numerator, denominator = self.columns(side)
+            if numerator != denominator:
+                continue
+            if self.per_arm:
+                raise ValueError(
+                    f"a ratio's arm {arm}'s numerator and denominator must be two different outcomes, got {numerator!r}"
+                )
+            raise ValueError(f"a ratio's numerator and denominator must be two different outcomes, got {numerator!r}")
         if self.zero_denominator not in ZERO_RULES:
             raise ValueError(
                 f"zero_denominator must be one of {', '.join(map(repr, ZERO_RULES))}, got {self.zero_denominator!r}"
@@ -113,10 +147,51 @@ class RatioForm:
         if not (number and math.isfinite(correction) and correction > 0):
             raise ValueError(f"continuity_correction must be a positive finite number, got {correction!r}")
 
+    def _resolve(self, role: str) -> None:
+        """Check one role's declared columns and hold them canonically: the shared column when both arms read one,
+        else each arm's and no shared one."""
+        names = (role, *(f"{role}_{suffix}" for suffix in ARM_SUFFIXES))
+        shared, own_a, own_b = (getattr(self, name) for name in names)
+        for name, value in zip(names, (shared, own_a, own_b), strict=True):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"a ratio contrast's {name} must name an outcome, got {value!r}")
+        if shared is not None and own_a is not None and own_b is not None and shared not in (own_a, own_b):
+            raise ValueError(
+                f"a ratio contrast's {role} {shared!r} is read by no arm: {role}_a and {role}_b name both arms' columns"
+            )
+        column_a, column_b = (shared if own is None else own for own in (own_a, own_b))
+        for arm, column in (("A", column_a), ("B", column_b)):
+            if column is None:
+                raise ValueError(
+                    f"a ratio contrast's arm {arm} reads no {role}: name the {role} both arms read, or each arm's "
+                    f"({role}_a and {role}_b)"
+                )
+        held = (column_a, None, None) if column_a == column_b else (None, column_a, column_b)
+        for name, value in zip(names, held, strict=True):
+            object.__setattr__(self, name, value)
+
+    def columns(self, arm: int) -> tuple[str, str]:
+        """The (numerator, denominator) columns arm `arm` reads: 0 is arm A, 1 is arm B."""
+        if arm not in (0, 1):
+            raise ValueError(f"a ratio contrast has arms 0 (A) and 1 (B), got {arm!r}")
+        suffix = ARM_SUFFIXES[arm]
+        numerator, denominator = (
+            getattr(self, role) if getattr(self, role) is not None else getattr(self, f"{role}_{suffix}")
+            for role in ROLES
+        )
+        return numerator, denominator
+
+    @property
+    def per_arm(self) -> bool:
+        """Whether the two arms read different columns for either role."""
+        return self.columns(0) != self.columns(1)
+
     @property
     def label(self) -> str:
-        """The contrast's outcome as tables show it: numerator over denominator."""
-        return f"{self.numerator}/{self.denominator}"
+        """The contrast's outcome as tables show it: numerator over denominator, or, when the arms read different
+        columns, arm A's ratio vs arm B's."""
+        ratios = [f"{numerator}/{denominator}" for numerator, denominator in (self.columns(0), self.columns(1))]
+        return ratios[0] if not self.per_arm else " vs ".join(ratios)
 
     @property
     def correction(self) -> float:
