@@ -49,6 +49,7 @@ PLUMBING = {
         "self._p.retry"
     ],  # the global clock, Onezone's reading
     ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
+    ("reset.py", "SpaceReset._job", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
     # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): the counter, and every file's block
     # map at each provider that can hold the space's bytes
@@ -257,12 +258,13 @@ HELPER_USERS = {
         "provisioner.read_through",
     },
     "reset.py": {
-        "provisioner.verify_space",
         "provisioner.mutate",
         "provisioner.resolve_many",
         "layer.evict_ids",
         "layer.evict_tree",
     },
+    "resetspaces.py": {"provisioner.verify_space"},  # the driver verifies each space before any stage
+    "resetplan.py": {"provisioner.verify_space"},  # the planner's reading verifies its space before it reads
     "resetqos.py": {"provisioner.children"},
     "resetremove.py": {"provisioner.mutate"},
     "storageimport.py": {  # the check of a space provisioned by storage import (O41): plumbing, as a baseline's
@@ -282,6 +284,7 @@ NOT_THE_PROVISIONERS = {
     ("day0/outage_run.py", "Run.agent_baseline", "self.tools"),
     ("day0/outage_run.py", "Run.during", "tools"),
     ("shared_holds.py", "SharedHolds.open_holds", "self"),  # the record of the tools' shared holds (O48)
+    ("resetgrant.py", "_settled", "holds"),  # the record of the reset lock's holds (O11), not a block map
 }
 
 # Modules whose every read measures: no site in them may ever name another policy, or call a helper that retries.

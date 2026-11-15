@@ -28,6 +28,7 @@ of its reads.
 """
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -136,6 +137,35 @@ def bounded_map[K, V](call: Callable[[K], V], keys: Sequence[K], workers: int) -
         futures = [pool.submit(call, key) for key in keys]
         wait(futures)
     return [future.result() for future in futures]
+
+
+class WaitLog:
+    """The waits an operation took, by why each was taken: how many, and their seconds, for its record. `sleeper`
+    wraps a sleep so that each wait through it is logged under its reason; several threads may log at once."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._waits: dict[str, list[float]] = {}  # reason -> [count, seconds]
+
+    def add(self, why: str, seconds: float) -> None:
+        with self._lock:
+            entry = self._waits.setdefault(why, [0, 0.0])
+            entry[0] += 1
+            entry[1] += seconds
+
+    def sleeper(self, why: str, sleep: Callable[[float], None]) -> Callable[[float], None]:
+        """`sleep`, logging each wait under `why` before it is taken."""
+
+        def logged(seconds: float) -> None:
+            self.add(why, seconds)
+            sleep(seconds)
+
+        return logged
+
+    def facts(self) -> dict[str, dict[str, float | int]]:
+        """Each reason's `count` and `seconds`, in the order the reasons were first logged."""
+        with self._lock:
+            return {why: {"count": int(n), "seconds": round(s, 3)} for why, (n, s) in self._waits.items()}
 
 
 @dataclass(frozen=True)

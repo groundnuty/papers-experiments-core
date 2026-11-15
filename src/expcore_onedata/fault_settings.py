@@ -66,17 +66,18 @@ federation whose agents never read a file a stopped provider alone holds may cho
 of every provider in quick succession, settles with no fetch, checks every pair, and falls back to restarting a stuck
 pair's reader's container. `"link_then_container"` and `"link"` are the per-reader design, kept: each stuck pair's
 reader's link restarted in turn, then (in the first) its container. A container restart is itself an outage of that
-provider, so declare a mode that can make one knowingly. `heal_settle_s` is the enforced settle after every link or
-container restart: no probe, no gate read, no check and no run until it has passed, since a fetch through a provider
-soon after its link restarts can leave the pair stale (seen live 23 s after a restart; a clean 3-minute settle left
-every pair healthy). `heal_timeout_s` bounds the heal: no step starts whose declared bounds would carry the heal
-past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming the key and
-the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a ping and a
-link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one container
-restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice, `ready_timeout_s`
-and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one
-settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in
-`"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it.
+provider, so declare a mode that can make one knowingly. The fault gate's health check heals the stuck pairs its own
+link check finds with the same mode and bounds, between runs (`fault_gate_heal`). `heal_settle_s` is the enforced settle
+after every link or container restart: no probe, no gate read, no check and no run until it has passed, since a fetch
+through a provider soon after its link restarts can leave the pair stale (seen live 23 s after a restart; a clean
+3-minute settle left every pair healthy). `heal_timeout_s` bounds the heal: no step starts whose declared bounds would
+carry the heal past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming
+the key and the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a
+ping and a link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one
+container restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice,
+`ready_timeout_s` and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link
+restart, and one settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four
+providers in `"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it.
 `heal_container_fallback = false` keeps `"all_links"` to link restarts: a pair they do not mend fails the restore
 closed, for an operator to decide, and no container is restarted; its least `heal_timeout_s` then holds no container
 restart (2,220 s for four providers, 2,730 s for five, with the other defaults). `"link_then_container"` with it false
@@ -125,6 +126,33 @@ study declares the long margin: `margin_s` of at least `heal_token_margin_s`, th
 `heal_timeout_s` (the restore's and the start's recovery's, as the injector's `cancel_wait_s` counts them) and one
 session drain of `session_drain_s`, which that start waits out after it restored a provider an earlier run left down
 (`FaultInjector._wait_owed`): 10,854 s with the defaults. A heal is never refused at load for the margin.
+
+**A declared heal needs a campaign `max_defer_s` that outlives it.** While the fault gate heals, every check answers the
+uncharged deferral, for up to `heal_timeout_s` plus `heal_settle_s` from the heal's start (`heal_wait_s`), and after an
+outage run the session drain comes first, with no check between them that passes. The heal begins at a check, so one
+wait between two checks (`recheck_s`, 30 s, and up to `poll_interval_s`, 1 s) and that check (up to `health_timeout_s`,
+60 s) sit between the drain and the heal, and after the heal, whose last deferred answer can come just before it ends,
+another such wait and the check that makes the link check afresh (a call that meets it waits for it). The core turns a
+deferral past the campaign's `max_defer_s` (3,600 s by default) into a blocking hold, on which a campaign that exits
+when blocked stops. So the check declares the sum of its own times (`heal_deferral_s`: `session_drain_s`,
+`heal_timeout_s` and `heal_settle_s`; none with the heal off) as its longest deferral (`FaultGate.max_deferral_s`,
+`PlatformHealth.max_deferral_s`), with how many of the core's waits it includes, and the core, which alone knows its own
+settings, adds them: the campaign's `max_defer_s` must be at least that total, or it is refused at its start. With the
+defaults (`recheck_s` 30 s, `poll_interval_s` 1 s, `health_timeout_s` 60 s) that is 4,700 s and 182 s, 4,882 s, for
+four providers, and 4,790 s and 182 s, 4,972 s, for five at the 4,290 s they need; with `session_drain_s = 0` the first
+deferral is the check that starts the heal, and only the waits after the heal are added (the 4,470 s of five providers
+and 91 s, 4,561 s). A `health_timeout_s` of 150 s, as the link check needs, makes them 5,062 s, 5,152 s and 4,651 s.
+
+The figure assumes the heal ends within its own bound (a heal that overruns it closes the gate, and the settle's hold it
+leaves can defer a check later still), and every check ends within `health_timeout_s`, as a check must (the link check
+too: keep it above `visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but
+its thread runs on and can still start the heal later than the figure counts. A deferral that began before the drain
+(an outage run still running, and another worker's check deferred on it) or for another reason (a run on an ingest
+baseline, or a run's shortcut reset holding the reset lock), a heal that waits for another holder of the federation
+(the hold `federation_busy`), a heal cut short by its process's end, which the next process settles and heals once
+more, and a heal that fails with a container restart left open, which the next check recovers, owing a session drain
+and holding a settle when none is journalled, before the gate closes, count from the deferral's first answer, so its
+age holds that wait too, which no setting here bounds.
 """
 
 import hashlib
@@ -406,6 +434,23 @@ def heal_token_margin_s(settings: FaultSettings) -> float:
     if settings.heal == "off":
         return 0.0
     return restore_token_margin_s(settings) + 2 * settings.heal_timeout_s + settings.session_drain_s
+
+
+def heal_wait_s(settings: FaultSettings) -> float:
+    """The longest the fault gate waits for its heal, from the heal's start (`fault_gate.FaultGate`): `heal_timeout_s`
+    and the settle after its last restart, `heal_settle_s`."""
+    return settings.heal_timeout_s + settings.heal_settle_s
+
+
+def heal_deferral_s(settings: FaultSettings) -> float:
+    """The platform's own time of the longest deferral of its health check with a declared heal (see the module
+    docstring): the session drain after an outage run (`session_drain_s`; 0 declares none), then the fault gate's heal
+    of the stuck pairs that run left (`heal_wait_s`); 0 with the heal off. The core's waits between and around them
+    (`recheck_s`, `poll_interval_s`, `health_timeout_s`) are not here: the gate declares how many of each
+    (`FaultGate.max_deferral_s`) and the core adds its own figures."""
+    if settings.heal == "off":
+        return 0.0
+    return settings.session_drain_s + heal_wait_s(settings)
 
 
 def heal_link_reserve(settings: FaultSettings) -> float:
