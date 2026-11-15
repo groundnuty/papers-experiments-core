@@ -44,6 +44,15 @@ status; a pass, before or after a run, ends it. A pre-run check deferred longer 
 does, charging the run that found it, and the outage is `blocking`, a hold that does not end by itself, so a campaign
 that exits when blocked stops instead of waiting on a holder that may never let go. A gate already closed is checked
 by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
+A platform whose own waits are bounded declares the longest (`max_deferral_s`, a `DeferralBound`), so a wait it ends
+by itself (a repair it runs) is never cut off by that bound: a campaign whose `max_defer_s` is shorter is refused at
+its start, before its store is opened (`deferral_bound`, `SchedulerConfig.check_deferral_bound`). The bound is the
+platform's own seconds and the core's waits its wait includes: between two checks (`recheck_s`, `poll_interval_s`)
+and a check's own time (`health_timeout_s`), which only the core's settings give, each named in the refusal. **The
+platform declares it twice**, so a study's own check around the platform's, which hides the method, cannot hold the
+campaign to nothing: its run admission may also declare it (`declared_deferral_s`, the same `DeferralBound`, read from
+the platform's settings), and a health check that exposes no `max_deferral_s`, or a smaller bound than the platform's
+declared one, refuses the campaign at its start (`SchedulerConfig.check_declared_deferral`).
 
 **A failure an earlier attempt left charges no one.** A platform answers `Health(False, detail, charge=False)` for a
 failure it knows another attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
@@ -63,6 +72,7 @@ its post-run check), can see that the run still holds it, and that it runs insid
 import contextlib
 import contextvars
 import json
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -71,6 +81,7 @@ from typing import Any, NamedTuple, Protocol
 
 from expcore.campaign.deferral import Deferral, deferral_alarms, parse_deferral
 from expcore.campaign.store import Store
+from expcore.config.loading import ConfigError
 
 META = "health_outages"
 HOW_PASSED = "check_passed"  # the dispatcher's own health check passed: dispatch resumed by itself
@@ -92,11 +103,74 @@ class Health(NamedTuple):
 
 
 class HealthCheck(Protocol):
-    """What the platform supplies: a quick look at whether runs can start. It may raise; that reads as unhealthy."""
+    """What the platform supplies: a quick look at whether runs can start. It may raise; that reads as unhealthy.
+
+    A check may also declare the longest it can stay deferred, with a method `max_deferral_s()` answering a
+    `DeferralBound` or None (`deferral_bound`); the protocol leaves it out, so a check without it is still one. A check
+    that wraps the platform's passes the method on: where the platform declares a deferral of its own, a check without
+    it, or with a smaller bound, is refused when the scheduler is built (`SchedulerConfig.check_declared_deferral`)."""
 
     def __call__(self) -> Health:
         """Return the platform's health."""
         ...
+
+
+class DeferralBound(NamedTuple):
+    """The longest a platform's check may stay deferred, from its first deferred answer to its last with no pass
+    between them, and in the platform's words what defers it that long and how to shorten it (`detail`): what a check's
+    optional `max_deferral_s()` answers. The core refuses a campaign whose `max_defer_s` is shorter at its start
+    (`SchedulerConfig.check_deferral_bound`), since past it the platform's own wait would block the campaign.
+
+    `seconds` is the platform's own time. A wait that only a later check can start (a repair that begins at a check)
+    also holds waits whose lengths are the core's settings, which the platform cannot know: `rechecks` counts the waits
+    between two of the core's checks (`recheck_s` and up to `poll_interval_s` each) and `checks` the checks' own time
+    (`health_timeout_s` each) the wait includes beyond `seconds`; the core adds them with its figures and names each."""
+
+    seconds: float
+    detail: str
+    rechecks: int = 0
+    checks: int = 0
+
+
+DEFERRAL_HOOK = "max_deferral_s"
+DECLARED_HOOK = "declared_deferral_s"  # the platform's own declaration, on its run admission (`StudyPlugin.admission`)
+HEALTH_OWNER = "the platform's health check"
+ADMISSION_OWNER = "the platform's run admission"
+
+
+def exposes_deferral(check: Any) -> bool:
+    """Whether a health check has the optional `max_deferral_s`, whatever it answers."""
+    return getattr(check, DEFERRAL_HOOK, None) is not None
+
+
+def deferral_bound(check: Any, hook: str = DEFERRAL_HOOK, owner: str = HEALTH_OWNER) -> DeferralBound | None:
+    """The longest deferral a health check declares through its optional `max_deferral_s()` (or, with `hook` and
+    `owner`, what the platform's run admission declares through `declared_deferral_s()`); None for an object without
+    the hook, or one that declares none. Raise ConfigError for a hook that is not callable, or that answers anything
+    but None or a `DeferralBound` of a finite, non-negative number of seconds and a detail."""
+    method = getattr(check, hook, None)
+    if method is None:
+        return None
+    if not callable(method):
+        raise ConfigError(f"{owner} has a {hook} that is not a method")
+    answer = method()
+    if answer is None:
+        return None
+    seconds = answer.seconds if isinstance(answer, DeferralBound) else None
+    number = isinstance(seconds, int | float) and not isinstance(seconds, bool)
+    if (
+        not number
+        or not math.isfinite(seconds)
+        or seconds < 0
+        or not isinstance(answer.detail, str)
+        or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:])
+    ):
+        raise ConfigError(
+            f"{owner} answered {hook}() with {answer!r:.120}, not None or a "
+            "DeferralBound of a finite, non-negative number of seconds, a detail and non-negative whole counts of "
+            "the core's own waits"
+        )
+    return answer
 
 
 def read_health(check: Callable[[], Any]) -> Health:

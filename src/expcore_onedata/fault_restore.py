@@ -4,13 +4,18 @@
 `LinkSettling` is a part of `fault_recovery.Recovery`, kept in a module of its own. Once a restored provider serves,
 `_links_settled` polls the session gate (`fault_sessions.await_sessions`) within `gate_timeout_s`, then checks every
 ordered pair through the driver (`ComposeDriver.link_matrix`, or the detail alone, `restored_links`), and, only when the
-caller holds the federation exclusively and `[faults] heal` allows, runs the heal (`fault_heal.LinkHeal`).
+caller holds the federation exclusively and `[faults] heal` allows, runs the heal (`fault_heal.LinkHeal`). At the
+heal's start it asks `heal_skip` (the injector's: a step of the run that uses its tokens still runs and the long token
+margin is not declared): a skipped heal is recorded in `restore_record` (`heal_skipped`) and the restore fails
+`links_stuck`, the injection not marked healed, so a later settling with no such step may heal it.
 
 **Once per injection, durably.** Before its first action the heal journals that it heals the injection: a `clear_failed`
 line (`links_stuck`, which the restore is at that moment) marked `healing`, which `InjectionJournal.open_entries` reads
 back as `healed`. Neither a later clear by the same injector nor another process's recovery of the same injection heals
 it again, so no provider gets a second `restart_link` or container restart in its restore. A journal that cannot take
-the line heals nothing. An injection that is itself a heal's container restart (`heal` on its line) is never healed.
+the line heals nothing. Before the line the heal raises the federation's link epoch (`fault_epoch`), so a run whose
+pre-run check passed before it is refused, uncharged, at its admission; an epoch that cannot be raised heals nothing.
+An injection that is itself a heal's container restart (`heal` on its line) is never healed.
 
 **A reader's container restart** (`restart_container`) is an injection of its own: journalled before its stop with the
 gate probe of the injection it heals, under the reader's lock, restored and waited for as any injection is, and
@@ -45,6 +50,7 @@ from typing import Any
 
 from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
+from expcore_onedata.fault_epoch import HEAL, LinkEpoch
 from expcore_onedata.fault_heal import HealResult, LinkHeal
 from expcore_onedata.fault_journal import InjectionJournal, holder
 from expcore_onedata.fault_matrix import LinkMatrix
@@ -106,6 +112,7 @@ class LinkSettling:
     _quiet_until: float | None
     _wall: Callable[[], float]
     _waited_wall: float
+    _heal_skip: Callable[[], Mapping[str, Any] | None] | None  # asked at a heal's start: why to skip it, or None
     _hold_for: Callable[[float], None] | None
     _defer: bool
     journal: InjectionJournal
@@ -212,10 +219,17 @@ class LinkSettling:
         log.warning("a restored provider's link check failed: %s", self.links_detail)
         if matrix is None or not self._may_heal(entry, heal, matrix):
             return "links_stuck"
+        skipped = self._heal_skip() if self._heal_skip is not None else None
+        if skipped is not None:  # a step of the run that uses its tokens still runs: no heal may outlast its token
+            self.restore_record["heal_skipped"] = dict(skipped)
+            log.warning("a restored provider's heal was skipped: a step of the run that uses its tokens still runs")
+            return "links_stuck"  # not marked healed: a later settling with no such step may heal it
         self._healed.add(entry["id"])  # one heal per injection: a later settling of it only checks
-        try:  # durable before any action, so no process heals this injection again
+        try:  # durable before any action, so no process heals this injection again, and a run checked before the heal
+            # is refused at its admission (`fault_epoch`)
+            LinkEpoch(self.journal.directory).raise_for(HEAL)
             self.journal.append({"event": "clear_failed", "id": entry["id"], "how": "links_stuck", "healing": True})
-        except OSError:
+        except (OSError, ValueError):
             return "links_stuck"
         how = self._heal(entry, service, gate_probe, matrix)
         return None if how == "healed" else how
