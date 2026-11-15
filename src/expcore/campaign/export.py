@@ -55,6 +55,21 @@ counts the runs served by more than one, and `runs_without_mix` the analysed run
 recovery committed from its marker). A campaign without such a model has no `deployment_shares`, so its export is
 the one it had before the key.
 
+A campaign whose health gate was closed, or its check deferred, with a reason only an operator can end (C11: the fault
+gate's failed heal, O35) also exports `operator_holds`, after `deployment_shares`: each such outage of the store's
+`health_outages` in the order it began, with `start_utc`, `end_utc` (None while the gate is closed), `blocking`
+(the deferral outlasted `max_defer_s`), `charged` (whether a run was charged an attempt for it), `checks` and the
+latest `reason` an answer of the outage led with (the gate keeps it apart from its details, `healthgate.py`). A hold
+starts no run and leaves no attempt, so the run lists do not say it. A campaign with none, or whose record cannot be
+read, has no such key, and its export is the one it had before it.
+
+A campaign whose platform supplied settings that are in no fingerprint (`campaign.reset_settings`, C35) also exports
+`reset_settings`, after `deployment_shares` and `operator_holds`: `changes`, one entry for each setting a resume found
+changed (`at`, the start's time; `key`; `old` and `new`, each absent where that side lacked the key), and
+`unknown_before`, one entry (`at`) for each start that found a store with no record, whose earlier settings are
+unknown. Both lists are written out when empty, so the key says the settings were recorded. A campaign whose platform
+supplied none has no such key.
+
 A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
@@ -87,7 +102,11 @@ from typing import Any, Protocol
 
 from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
+from expcore.campaign.healthgate import META as HEALTH_META
+from expcore.campaign.healthgate import parse as parse_outages
 from expcore.campaign.manifest import fingerprint_sha256
+from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
+from expcore.campaign.reset_settings import exported as exported_settings
 from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
 from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
@@ -159,6 +178,11 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         declared = store.q("SELECT value FROM meta WHERE key=?", (ACCEPTED_META,))
         fingerprint = stored_fingerprint(store)
         shard = _shard_facts(store)
+        outages = store.q("SELECT value FROM meta WHERE key=?", (HEALTH_META,))
+        try:
+            settings = exported_settings(store)
+        except ValueError as error:
+            raise ExportError(f"the store's {SETTINGS_KEY} cannot be exported: {error}") from None
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
     scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
@@ -226,6 +250,11 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
             data["deployment_shares"] = deployment_shares(json.loads(declared[0]["value"]), scored)
         except (ValueError, DeploymentsUnreadable) as error:
             raise ExportError(f"the store's {ACCEPTED_META} cannot be exported: {error}") from None
+    holds = _operator_holds(outages[0]["value"] if outages else None)
+    if holds:  # only a campaign an operator's hold touched has the key (C11)
+        data["operator_holds"] = holds
+    if settings is not None:  # only a campaign whose platform supplied settings has the key (C35)
+        data[SETTINGS_KEY] = settings
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
@@ -305,6 +334,28 @@ def verify_export_fingerprint(data: Mapping[str, Any], expected_sha256: str | No
             f"with is {expected_sha256}"
         )
     return f"campaign fingerprint {held}, the one it is read with"
+
+
+def _operator_holds(raw: str | None) -> list[dict[str, Any]]:
+    """The outages of the health gate record `raw` (the store's `health_outages`) that an answer led with a reason
+    only an operator can end, oldest first, each with the latest such reason the gate kept (`operator_reason`: its
+    detail fields hold the first failure's words and, once a check has passed, the pass's). A record that cannot be
+    read lists none: the status says it is unreadable."""
+    holds = []
+    for outage in parse_outages(raw) or []:
+        reason = outage.get("operator_reason")
+        if isinstance(reason, str):
+            holds.append(
+                {
+                    "start_utc": outage["start_utc"],
+                    "end_utc": outage.get("end_utc"),
+                    "blocking": bool(outage.get("blocking")),
+                    "charged": outage.get("charged") is not False,
+                    "checks": int(outage.get("checks", 0)),
+                    "reason": reason,
+                }
+            )
+    return holds
 
 
 def _shard_facts(store: RunState) -> dict[str, Any] | None:

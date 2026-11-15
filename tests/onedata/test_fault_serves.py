@@ -111,12 +111,13 @@ def test_o11_the_ready_timeout_defaults_above_the_measured_start_up_and_is_read_
 
     def without_the_key(document):
         document["faults"] = {key: value for key, value in faults_table().items() if key != "ready_timeout_s"}
+        document["tokens"] = {"margin_s": 1800}  # the default wait to serve outgrows the default token margin
 
     default = write_platform(tmp_path, without_the_key)
     config = load_platform(default)
     assert load_faults(default, config).ready_timeout_s == 180
     (tmp_path / "other").mkdir()
-    other = write_faults(tmp_path / "other", ready_timeout_s=240)
+    other = write_faults(tmp_path / "other", ready_timeout_s=240, margin_s=1800)
     assert load_faults(other, load_platform(other)).ready_timeout_s == 240
 
 
