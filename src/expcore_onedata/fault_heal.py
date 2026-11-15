@@ -49,10 +49,11 @@ the gate and a fresh matrix; then the container step, enforced the same way.
 
 **Bounds.** At most one `restart_link` and one container restart per provider per restore: the restore journals that
 it heals before the first action, so neither a later clear nor another process's recovery heals the same injection
-again. At most `ROUNDS` passes of per-reader steps, and `[faults] heal_timeout_s` (4,200 s, provisional) in all: no
-step starts unless its declared bounds fit in what is left (`fault_settings.heal_all_links_reserve`,
-`heal_link_reserve`, `heal_container_reserve`), and each wait for transfers or the gate is cut to what is left. The
-link check's own time is outside the reserve, so the heal can end one check's time past the bound.
+again. At most `ROUNDS` passes of per-reader steps, and `[faults] heal_timeout_s` (derived by default from the least
+one round needs, `fault_settings.default_heal_timeout_s`; provisional) in all: no step starts unless its declared bounds
+fit in what is left (`fault_settings.heal_all_links_reserve`, `heal_link_reserve`, `heal_container_reserve`), and each
+wait for transfers or the gate is cut to what is left. The link check's own time is outside the reserve, so the heal
+can end one check's time past the bound.
 
 **Fail closed.** A step after which a pair that passed before it fails stops the heal at once (`heal_broke_pair`). A
 gate that does not pass stops it (`sessions_not_ready`), and so does a transfer still active (`transfers_active`) and a
