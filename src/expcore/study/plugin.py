@@ -72,7 +72,9 @@ class StudyPlugin:
       differ.
     - `prompts`, `tools`: for each condition, the SHA-256 of its prompt template and of its tool manifest
       (`tools_sha256`); they go into the campaign fingerprint, so a resume cannot change either unnoticed.
-    - `health`: the platform's quick look at whether runs can start; None when it has no such check.
+    - `health`: the platform's quick look at whether runs can start; None when it has no such check. A platform whose
+      `admission` declares that it needs one (`campaign.health_required`; the Onedata layer's does with `[faults]`)
+      refuses a campaign without it, when the scheduler is built.
     - `probe`, `lease_group`, `lease_keys`: the platform's resources. `lease_group` maps a run's factor values to the
       group of leases it needs (None: no lease) and `lease_keys` the keys of a group; `probe` answers for holders and
       resources. Leave them out for a study that shares nothing.

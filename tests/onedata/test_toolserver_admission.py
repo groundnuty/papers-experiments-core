@@ -21,9 +21,10 @@ import pytest
 from fault_support import faults_table
 from mcp import StdioServerParameters
 
+from expcore.campaign import prerun
 from expcore.tools.manifest import FrozenManifest, live_manifest
 from expcore_onedata import toolserver
-from expcore_onedata.admission import TOOL_SERVER_STEP, FederationLock, TokenStepRefused
+from expcore_onedata.admission import TOOL_SERVER_STEP, AdmissionRefused, FederationLock, TokenStepRefused
 from expcore_onedata.admission_share import to_thread_holding_admission
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
@@ -285,3 +286,20 @@ def test_o11_a_check_without_the_runs_admission_is_refused_before_its_thread_sta
 
     asyncio.run(go())
     assert ran == []
+
+
+def test_o35_a_launch_in_a_try_with_no_health_check_starts_no_check_thread_and_holds_nothing(world):
+    """O35, O11: in a try of a campaign with no health check (`prerun.UNCHECKED`), the launch is refused before its
+    check before the spawn starts, under the run's admission: no check thread runs, and it leaves no count of the tool
+    server's step and no share of the admission behind."""
+
+    async def go():
+        async with world.lock.admitted(exclusive=False) as admission:
+            world.issuer.arm()  # counts the examinations from here: the token's mint made one
+            with prerun.opened(checked=False), pytest.raises(AdmissionRefused, match="needs the gate's health check"):
+                await world.launch()
+            assert world.issuer.calls == 0  # no check examined the token
+            assert (admission.open_steps(), admission.shares.count) == ((), 1)
+        assert not world.held_by_another()
+
+    asyncio.run(go())

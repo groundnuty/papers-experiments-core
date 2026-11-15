@@ -146,7 +146,8 @@ The injection's own entry holds `target`, `injected`, `cleared`, `verified` and,
 schema)`, with the study's factor schema), which admits each run to the federation before anything starts (exclusive
 when its condition declares `provider_outage` or `exclusive = true`) and keeps it until after the post-run check, and
 the platform's half of the fingerprint (`platform=config.fingerprint()`), which holds the injector's sanction and
-targets. The executor, already admitted, starts the sandbox and
+targets. It passes the platform's health check too (`health=PlatformHealth(...)`): the admission declares that it needs
+one, and a campaign without one is refused when it is built. The executor, already admitted, starts the sandbox and
 the tool server, builds the injector for the target its condition declares and runs the agent inside `running`:
 
     injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
