@@ -109,16 +109,14 @@ def test_o35_a_heal_that_is_off_needs_no_bound(tmp_path):
     assert load(tmp_path, 5, heal="off").heal == "off"
 
 
-def test_o35_the_token_margin_a_heal_needs_follows_the_derived_bound(tmp_path):
-    """O35: the margin is the base (900 s), two heals of the effective `heal_timeout_s` and a session drain: for five
-    providers, 900 + 2 x 4,740 + 320 = 10,700 s with the default drain, 10,380 s with none. A shorter `[tokens]
-    margin_s` is refused naming the figure, the derived bound and the drain; that much loads."""
-    for drain, needed in ((None, 10_700), (0, 10_380)):
+def test_o35_the_long_token_margin_follows_the_derived_bound(tmp_path):
+    """O35: the long margin, with which a heal runs while a step of the run that uses its tokens still runs
+    (`heal_token_margin_s`), is the restore's margin, two heals of the effective `heal_timeout_s` and a session drain:
+    for five providers at the derived 4,740 s, 2,134 + 2 x 4,740 + 320 = 11,934 s with the default drain, and
+    1,814 + 2 x 4,740 = 11,294 s with none. It is never asked at load: a `[tokens] margin_s` one second short of it, and
+    no shorter than the restore's own margin, loads, and the heal is then skipped while such a step runs."""
+    for drain, needed in ((None, 11_934), (0, 11_294)):
         faults = {"heal": "all_links"} if drain is None else {"heal": "all_links", "session_drain_s": drain}
-        with pytest.raises(ConfigError, match=rf"\[tokens\] margin_s of at least {needed} s, not {needed - 1} s"):
-            load(tmp_path, 5, margin_s=needed - 1, **faults)
-        settings = load(tmp_path, 5, margin_s=needed, **faults)
+        settings = load(tmp_path, 5, margin_s=needed - 1, **faults)
         assert settings.heal_timeout_s == 4740
         assert heal_token_margin_s(settings) == needed
-    with pytest.raises(ConfigError, match=r"4740 s.*derived.*session_drain_s \(320 s\)"):
-        load(tmp_path, 5, margin_s=900, heal="all_links")

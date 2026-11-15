@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.gate import Budget
 from expcore.campaign.harness_stop import HarnessStopConfig
+from expcore.campaign.healthgate import DeferralBound
+from expcore.config.loading import ConfigError
 from expcore.errors import infra_kinds, untreatable_kinds
 
 
@@ -24,7 +26,8 @@ class SchedulerConfig:
       treatment, because a run that never started, or that the wrong endpoint served, must not be scored as its fault.
     - `recheck_s`, `health_timeout_s`: how often the closed gate is checked (and how long a run whose check was
       deferred waits before it is tried again), and how long a check may take. `max_defer_s`: how long the platform's
-      check may stay deferred (a run holds the platform on purpose) before the gate fails and blocks dispatch (C11).
+      check may stay deferred (a run holds the platform on purpose) before the gate fails and blocks dispatch (C11); at
+      least the longest deferral the platform's check declares, or the campaign is refused (`check_deferral_bound`).
     - `lease_timeout_s`: how long a run waits for a lease before it is left unstarted; None: for ever.
     - `harness_stop`, `budget`: the harness-error stops (C10) and the budget gate (C12); no budget runs without one.
     - `exit_when_blocked`: `run` returns, instead of waiting, when nothing is in flight and every pending run is
@@ -73,6 +76,42 @@ class SchedulerConfig:
     def kind_roles(self) -> dict[str, str]:
         """The kinds this campaign charges its own failures to, by the key of `[scheduler]` that names each."""
         return {"health_kind": self.health_kind, "identity_kind": self.identity_kind}
+
+    def deferral_needed(self, bound: DeferralBound) -> tuple[float, str]:
+        """The longest a platform's check may stay deferred, this campaign's own waits included (the `max_defer_s` it
+        needs), and in words the core's waits the platform's declared (`bound.rechecks` waits between two checks of
+        `recheck_s` and up to `poll_interval_s` each, `bound.checks` checks of up to `health_timeout_s` each); empty
+        when it declared none."""
+        between = bound.rechecks * (self.recheck_s + self.poll_interval_s)
+        checking = bound.checks * self.health_timeout_s
+        parts = []
+        if bound.rechecks:
+            parts.append(
+                f"{bound.rechecks} x (recheck_s {self.recheck_s:g} s + poll_interval_s {self.poll_interval_s:g} s)"
+            )
+        if bound.checks:
+            parts.append(f"{bound.checks} x health_timeout_s {self.health_timeout_s:g} s")
+        return bound.seconds + between + checking, " and ".join(parts)
+
+    def check_deferral_bound(self, bound: DeferralBound | None) -> None:
+        """Refuse a `max_defer_s` shorter than the longest the platform's check may stay deferred (`bound`, from
+        `healthgate.deferral_bound`; None: the platform declares none), the core's own waits it declared included
+        (`deferral_needed`). Past `max_defer_s` a deferral closes the gate blocking, so a campaign that exits when
+        blocked would stop on a wait the platform ends by itself. The gate fails a deferral only once its age is past
+        `max_defer_s`, so a bound equal to it starts."""
+        if bound is None:
+            return
+        needed, core = self.deferral_needed(bound)
+        if needed <= self.max_defer_s:
+            return
+        own = f"{bound.seconds:g} s of the platform's own: {bound.detail}; plus the core's waits {core}" if core else ""
+        raise ConfigError(
+            f"campaign.toml [scheduler] max_defer_s is {self.max_defer_s:g} s, but the platform's health check may "
+            f"stay deferred for up to {needed:g} s ({own or bound.detail}); a deferral past max_defer_s closes the "
+            "health gate as blocking, so a campaign that exits when blocked would stop on a wait it should have waited "
+            f"out: raise max_defer_s to at least {needed:g}, or shorten the platform's wait"
+            + (", or recheck_s or health_timeout_s" if core else "")
+        )
 
     def check_kinds(self, schema: FactorSchema) -> None:
         """Refuse a health or identity kind that is unknown or that a condition declares as its treatment.

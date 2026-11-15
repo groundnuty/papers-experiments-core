@@ -1418,6 +1418,195 @@ def test_s13_the_one_model_a_cell_key_leaves_keeps_its_estimate_whatever_its_nam
     assert contrast.per_model[0].estimate == pytest.approx(contrast.estimate)
 
 
+# --- per-arm columns: an adverse sensitivity estimate, arm A at its upper bound and arm B at its lower ------------
+
+ARM_COLUMNS = """\
+alpha = 0.05
+holm_family = ["main-per-win", "adverse-per-win"]
+
+[bootstrap]
+replicates = 300
+seed = 9
+
+[contrasts.main-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend_low"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+estimation_unit = ["model", "group"]
+
+[contrasts.adverse-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator_a = "spend_high"
+numerator_b = "spend_low"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+estimation_unit = ["model", "group"]
+
+[contrasts.high-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend_high"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+estimation_unit = ["model", "group"]
+"""
+SCALE = {"model-a": (1, 2, 4), "model-b": (4, 1, 2)}  # r of each (model, group) cell, groups g0, g1, g2
+
+
+def arm_column_rows():
+    """Per (model, group) cell, with r = SCALE[model][group], two seeds of one task:
+
+        arm A: seed 1 spend_high 60 r, spend_low 20 r, wins 1; seed 2 (failed) 30 r, 10 r, wins 0
+        arm B: seed 1 spend_high 20,   spend_low 10,   wins 1; seed 2 (failed) 10,   5,    wins 0
+
+    so arm A's sums are 90 r (high), 30 r (low) over 1 win, and arm B's 30 (high), 15 (low) over 1 win."""
+    rows = []
+    for model, scales in SCALE.items():
+        for g, r in enumerate(scales):
+            for condition, (high, low), (failed_high, failed_low) in (
+                ("cond-a", (60.0 * r, 20.0 * r), (30.0 * r, 10.0 * r)),
+                ("cond-b", (20.0, 10.0), (10.0, 5.0)),
+            ):
+                for seed, (h, lo, wins) in ((1, (high, low, 1.0)), (2, (failed_high, failed_low, 0.0))):
+                    extra = {"spend_high": h, "spend_low": lo}
+                    rows.append(
+                        ratio_row(f"t{g}", model, seed, None, wins, condition=condition, cluster=f"g{g}", extra=extra)
+                    )
+    return rows
+
+
+def arm_column_prereg(text=ARM_COLUMNS):
+    """The preregistration above, parsed with a fixed hash."""
+    return parse(tomllib.loads(text), "inline", "d" * 64, ARMS)
+
+
+def test_s13_an_adverse_estimate_puts_arm_a_on_its_upper_column_and_arm_b_on_its_lower_known_answers():
+    """S13, by hand. A cell's adverse log ratio is ln((90 r / 1) / (15 / 1)) = ln 6r; its main one, both arms on
+    spend_low, ln((30 r / 1) / (15 / 1)) = ln 2r; both on spend_high, ln((90 r / 1) / (30 / 1)) = ln 3r.
+
+    Adverse: model-a's cells are ln 6, ln 12, ln 24 and model-b's ln 24, ln 6, ln 12, so with equal model weight the
+    groups are g0 (ln 6 + ln 24) / 2 = ln 12, g1 (ln 12 + ln 6) / 2 = ln 6 sqrt 2, g2 (ln 24 + ln 12) / 2 =
+    ln 12 sqrt 2, and the estimate (ln 12 + ln 6 sqrt 2 + ln 12 sqrt 2) / 3 = ln (1728 ** (1/3)) = ln 12. Main: every
+    cell ln 3 lower, so the groups are ln 4, ln 2 sqrt 2, ln 4 sqrt 2 and the estimate ln 4. Three positive groups:
+    the exact two-sided p-value is 2 / 2**3 for both. Each model's adverse estimate is (ln 6 + ln 12 + ln 24) / 3 =
+    ln 12. Had the cells been pooled over the models, g0 would be ln((450 / 2) / (30 / 2)) = ln 15, not ln 12."""
+    result = analyse(arm_column_rows(), arm_column_prereg())
+    adverse, main = result.contrast("adverse-per-win"), result.contrast("main-per-win")
+    root2 = math.sqrt(2.0)
+    groups = [math.log(12.0), math.log(6.0 * root2), math.log(12.0 * root2)]
+    assert list(analyse_cells(adverse)) == pytest.approx(groups)
+    assert adverse.estimate == pytest.approx(math.log(12.0))
+    assert list(analyse_cells(main)) == pytest.approx([g - math.log(3.0) for g in groups])
+    assert main.estimate == pytest.approx(math.log(4.0))
+    assert adverse.estimate - main.estimate == pytest.approx(math.log(3.0))  # the two declared analyses differ
+    assert result.contrast("high-per-win").estimate == pytest.approx(math.log(6.0))
+    assert (adverse.p_value, main.p_value) == (pytest.approx(0.25), pytest.approx(0.25))
+    assert [(m.model, m.estimate) for m in adverse.per_model] == [
+        ("model-a", pytest.approx(math.log(12.0))),
+        ("model-b", pytest.approx(math.log(12.0))),
+    ]
+    assert (adverse.n_clusters, adverse.n_cells, adverse.n_pairs) == (3, 6, 12)
+    assert adverse.ratio.columns(0) == ("spend_high", "wins")
+    assert adverse.ratio.columns(1) == ("spend_low", "wins")
+
+
+def analyse_cells(contrast):
+    """A contrast's group values, recomputed from its rows: the equal-weight mean of each group's model cells."""
+    spec = arm_column_prereg().contrasts[contrast.name]
+    return pair_rows(arm_column_rows(), spec).differences.cluster_differences
+
+
+def family_of(member):
+    """The preregistration above with `member` its one confirmatory contrast, the other two exploratory."""
+    return arm_column_prereg(ARM_COLUMNS.replace('["main-per-win", "adverse-per-win"]', f'["{member}"]'))
+
+
+@pytest.mark.parametrize(
+    ("condition", "column", "member"),
+    [
+        ("cond-a", "spend_high", "adverse-per-win"),  # arm A's own column in the adverse contrast
+        ("cond-b", "spend_low", "adverse-per-win"),  # arm B's own column in the adverse contrast
+        ("cond-a", "spend_low", "main-per-win"),  # the column the adverse contrast's arm A never reads
+        ("cond-b", "spend_high", "high-per-win"),  # the column the adverse contrast's arm B never reads
+    ],
+)
+def test_s13_a_confirmatory_contrast_reading_a_failed_runs_none_in_either_arm_is_refused(condition, column, member):
+    """S13: a failed run (0 wins) whose numerator is None in the column its arm reads refuses the confirmatory
+    contrast that reads it, whichever arm the run is in."""
+    rows = arm_column_rows()
+    failed = next(r for r in rows if r.condition == condition and r.factors["seed"] == 2 and r.task == "t0")
+    failed.outcomes[column] = None
+    with pytest.raises(RatioNumeratorRefused, match=rf"'{member}' drops 1 pair"):
+        analyse(rows, family_of(member))
+
+
+def test_s13_a_none_in_the_column_the_other_arm_reads_leaves_the_adverse_contrast_its_known_answer():
+    """S13: arm A's failed runs have no lower bound and arm B's no upper bound, the columns the adverse contrast's
+    arms do not read: confirmatory, it keeps every pair and its estimate ln 12, while the exploratory contrasts that
+    read those columns, both arms on spend_low and both on spend_high, count the failures."""
+    rows = arm_column_rows()
+    for r in rows:
+        if r.factors["seed"] == 2 and r.task == "t0":
+            r.outcomes["spend_low" if r.condition == "cond-a" else "spend_high"] = None
+    result = analyse(rows, family_of("adverse-per-win"))
+    adverse = result.contrast("adverse-per-win")
+    assert (adverse.n_pairs, adverse.pairs_missing["numerator_none_at_zero"]) == (12, 0)
+    assert adverse.estimate == pytest.approx(math.log(12.0))
+    assert result.contrast("main-per-win").pairs_missing["numerator_none_at_zero"] == 2
+    assert result.contrast("high-per-win").pairs_missing["numerator_none_at_zero"] == 2
+
+
+def test_s13_the_refusal_of_a_per_arm_contrast_names_each_arms_columns():
+    """S13: the message says which column each arm reads, so the fix names the right scorer output."""
+    rows = arm_column_rows()
+    next(r for r in rows if r.condition == "cond-a" and r.factors["seed"] == 2).outcomes["spend_high"] = None
+    with pytest.raises(RatioNumeratorRefused) as caught:
+        analyse(rows, arm_column_prereg())
+    message = str(caught.value)
+    assert "arm 'cond-a' reads 'spend_high' over 'wins', arm 'cond-b' 'spend_low' over 'wins'" in message
+    assert "Make the scorer return 'spend_high' and 'spend_low' for every run of the arm that reads each" in message
+
+
+def test_s13_the_record_names_each_arms_columns_and_leaves_them_out_of_a_one_column_contrast():
+    """S13: analysis.json holds the adverse contrast's numerator per arm and no shared numerator; the main contrast's
+    form is written exactly as before per-arm columns existed, with no key for them."""
+    result = analyse(arm_column_rows(), arm_column_prereg())
+    written = {c["name"]: c for c in json.loads(_json_text({"contrasts": result.contrasts}))["contrasts"]}
+    adverse, main = written["adverse-per-win"], written["main-per-win"]
+    assert adverse["ratio"] == {
+        "continuity_correction": None,
+        "denominator": "wins",
+        "numerator": None,
+        "numerator_a": "spend_high",
+        "numerator_b": "spend_low",
+        "zero_denominator": "exclude",
+    }
+    assert adverse["outcome"] == "spend_high/wins vs spend_low/wins"
+    assert main["ratio"] == {
+        "continuity_correction": None,
+        "denominator": "wins",
+        "numerator": "spend_low",
+        "zero_denominator": "exclude",
+    }
+    assert set(adverse) == set(main)  # the per-arm columns live in the form; no contrast key is added
+
+
+def test_s13_a_per_arm_key_restating_the_shared_column_gives_the_one_column_record_byte_for_byte():
+    """S13: `numerator_a = numerator` declares nothing, so its contrast's analysis.json is the undeclared one's."""
+    plain = ARM_COLUMNS.split("[contrasts.adverse-per-win]")[0]
+    restated = plain.replace('numerator = "spend_low"\n', 'numerator = "spend_low"\nnumerator_a = "spend_low"\n')
+    plain, restated = (text.replace(', "adverse-per-win"', "") for text in (plain, restated))
+    one = analyse(arm_column_rows(), arm_column_prereg(plain)).contrast("main-per-win")
+    other = analyse(arm_column_rows(), arm_column_prereg(restated)).contrast("main-per-win")
+    assert _json_text(one) == _json_text(other)
+
+
 # --- an equivalence family: Holm over the two one-sided tests (S15) ---------------------------------------------------
 
 EQUIVALENCE_TEXT = """\

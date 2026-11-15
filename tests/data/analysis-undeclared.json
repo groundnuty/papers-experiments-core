@@ -1,0 +1,204 @@
+{
+ "alpha": 0.05,
+ "contrasts": [
+  {
+   "arm_runs": [
+    {
+     "arm": "cond-a",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    },
+    {
+     "arm": "cond-b",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    }
+   ],
+   "arms": [
+    "cond-a",
+    "cond-b"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": 0.29253124999999996,
+   "ci_low": 0.13996875,
+   "cluster": "group",
+   "conclusion": "trivial_difference",
+   "counts": {
+    "zero_dropped": 0
+   },
+   "equivalence_interval": [
+    0.14487499999999995,
+    0.2704374999999999
+   ],
+   "equivalence_interval_adjusted": null,
+   "equivalence_level": null,
+   "equivalence_margin": 0.3,
+   "equivalent": true,
+   "estimate": 0.20500000000000002,
+   "estimation_unit": [
+    "model",
+    "group"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": false,
+   "factor": null,
+   "in_equivalence_family": false,
+   "in_family": true,
+   "independent_unit": "group",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": 0.13050521646397673,
+   "n_cells": 8,
+   "n_clusters": 8,
+   "n_clusters_dropped": 0,
+   "n_pairs": 16,
+   "n_pairs_missing": 0,
+   "n_unpaired": 0,
+   "name": "score-a-vs-b",
+   "outcome": "score",
+   "p_value": 0.0078125,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 0
+   },
+   "per_model": [
+    {
+     "ci_high": 0.29253124999999996,
+     "ci_low": 0.13996875,
+     "estimate": 0.20500000000000002,
+     "model": "model-a",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": true,
+   "tasks_dropped": [],
+   "tost_p": null,
+   "tost_p_holm": null,
+   "treatment_outcomes": null
+  },
+  {
+   "arm_runs": [
+    {
+     "arm": "cond-a",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    },
+    {
+     "arm": "cond-b",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    }
+   ],
+   "arms": [
+    "cond-a",
+    "cond-b"
+   ],
+   "cells_lost": {
+    "no_pair": 0,
+    "zero_denominator": 0,
+    "zero_numerator": 0
+   },
+   "ci_high": 0.9391219115110679,
+   "ci_low": 0.30396265253262517,
+   "cluster": "group",
+   "conclusion": "difference",
+   "counts": {
+    "zero_dropped": 0
+   },
+   "equivalence_interval": null,
+   "equivalence_interval_adjusted": null,
+   "equivalence_level": null,
+   "equivalence_margin": null,
+   "equivalent": false,
+   "estimate": 0.6296419303550196,
+   "estimation_unit": [
+    "group"
+   ],
+   "estimator": "ratio",
+   "exploratory": true,
+   "factor": null,
+   "in_equivalence_family": false,
+   "in_family": false,
+   "independent_unit": "group",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": 0.6623829996448043,
+   "n_cells": 8,
+   "n_clusters": 8,
+   "n_clusters_dropped": 0,
+   "n_pairs": 16,
+   "n_pairs_missing": 0,
+   "n_unpaired": 0,
+   "name": "spend-per-win",
+   "outcome": "spend/wins",
+   "p_value": 0.0234375,
+   "pairs_missing": {
+    "exhausted": 0,
+    "numerator_none_at_zero": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 0,
+    "zero_denominator": 0,
+    "zero_numerator": 0
+   },
+   "per_model": [],
+   "ratio": {
+    "continuity_correction": null,
+    "denominator": "wins",
+    "numerator": "spend",
+    "zero_denominator": "exclude"
+   },
+   "significant": true,
+   "tasks_dropped": [],
+   "tost_p": null,
+   "tost_p_holm": null,
+   "treatment_outcomes": null
+  }
+ ],
+ "holm": [
+  {
+   "level": 0.05,
+   "name": "score-a-vs-b",
+   "p_holm": 0.0078125,
+   "p_value": 0.0078125,
+   "reject": true
+  }
+ ]
+}

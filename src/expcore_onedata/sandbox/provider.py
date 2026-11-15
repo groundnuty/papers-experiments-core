@@ -71,7 +71,15 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
-from expcore_onedata.admission import current_admission, require_admission, retain_admission
+from expcore_onedata.admission import (
+    SANDBOX_STEP,
+    begin_token_step,
+    current_admission,
+    require_admission,
+    retain_admission,
+    retain_to_act,
+    token_step,
+)
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
@@ -167,6 +175,21 @@ class _Share:
                 return
             self._state = "ended"
         self._give_up()
+
+
+def _counted(ended: Callable[[], None]) -> Callable[[], None]:
+    """`ended` (a mint or start thread's end, `_StartThreads.began`), which also ends a count of the run's sandbox step
+    taken now (`admission.begin_token_step`): such a thread uses the run's tokens and may outlive a cancelled launch,
+    so the step stays counted until it has ended (O35). Once only, however often it is called."""
+    step_ended = begin_token_step(SANDBOX_STEP)
+
+    def both() -> None:
+        try:
+            ended()
+        finally:
+            step_ended()
+
+    return both
 
 
 class _StartThreads:
@@ -571,7 +594,38 @@ class SandboxPlatform:
         check, so it covers the start, the run, the teardown and the check. Its wait is before the agent's clock starts. Without it `launch` raises `AdmissionRefused` before
         it mints a token or enters a wait (O11). An injector's own admission, taken when its run holds none, is not
         the run's: the run must be admitted before it launches.
+
+        From its start to the end of its stop (the slot's revocation included) the launch is a step of the run that
+        uses its tokens, counted on the run's admission (`admission.token_step`), so the fault injector's restore can
+        tell that it still runs (O35).
         """
+        with token_step(SANDBOX_STEP):  # ended only once the stop below has ended, however the launch ends
+            async with self._launch(
+                ctx,
+                run_key=run_key,
+                level=level,
+                ceiling_s=ceiling_s,
+                lease=lease,
+                condition=condition,
+                inputs=inputs,
+                inputs_record=inputs_record,
+            ) as sandbox:
+                yield sandbox
+
+    @contextlib.asynccontextmanager
+    async def _launch(
+        self,
+        ctx: CallContext,
+        *,
+        run_key: str,
+        level: str,
+        ceiling_s: float,
+        lease: Lease | None = None,
+        condition: str | None = None,
+        inputs: Sequence[ReadOnlyInput] = (),
+        inputs_record: InputsRecord | None = None,
+    ) -> AsyncIterator[DockerSandbox]:
+        """The launch itself (see `launch`)."""
         if lease is not None:  # a lease-less platform has no slot for it (O38): refused before anything else
             self._slots_needed("take a lease")
         if condition is not None:
@@ -582,13 +636,16 @@ class SandboxPlatform:
             raise StartRefused("a read-only input passed to launch was not declared to the platform (inputs.declare)")
         if inputs and inputs_record is None:
             raise ValueError("a run with read-only inputs needs the instrument that keeps them in its record")
+        # held from the admission check until the start thread holds a share of its own, so no shortcut section of the
+        # run can seal the admission while the sandbox is authorised and started (O11)
+        authorised = retain_to_act()
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None
         minting: asyncio.Future[RunTokens | None] | None = None
         revoking = lease if mode is not DataPathMode.NONE or condition is not None else None  # its slot's, at the end
         try:
             async with ctx.infrastructure_wait(WAIT_KIND):
-                minted = self._threads.began(lease.key if lease is not None else None)  # before the thread exists
+                minted = _counted(self._threads.began(lease.key if lease is not None else None))  # before the thread
                 minting = asyncio.ensure_future(
                     asyncio.to_thread(self._mint_tracked, mode, lease, ceiling_s, condition, minted)
                 )
@@ -598,7 +655,7 @@ class SandboxPlatform:
                 if revoking is not None:  # from here the sandbox's stop revokes them (`_stop`)
                     self._revocable[sandbox] = _Revocable(revoking, tokens)
                 self._begin_sessions(sandbox)  # its mount and gate are drained after, when the run is an outage's
-                ended = self._threads.began(lease.key if lease is not None else None)
+                ended = _counted(self._threads.began(lease.key if lease is not None else None))
                 share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
@@ -616,6 +673,8 @@ class SandboxPlatform:
             elif revoking is not None and minting is not None:  # a mint that may have left a token, and no start
                 await self._revoke_unstarted(ctx, revoking, minting, sandbox)
             raise
+        finally:
+            authorised()  # the start thread holds its own share by now, or the start was undone
         try:
             yield sandbox
         except Exception as error:
@@ -704,7 +763,7 @@ class SandboxPlatform:
             began = time.monotonic()
             try:
                 try:
-                    await _complete(_in_daemon_thread(sandbox.stop), within=self._teardown_s)
+                    await _complete(_in_daemon_thread(_counted_stop(sandbox)), within=self._teardown_s)
                 except SandboxError as error:
                     self._record_teardown(sandbox, "failed", began)
                     if not quiet:
@@ -842,6 +901,21 @@ class TeardownCut(Exception):
     def __init__(self, deadline_s: float, *, cancelled: bool = False) -> None:
         super().__init__(f"the teardown was cut at its deadline of {deadline_s:g} s")
         self.cancelled = cancelled
+
+
+def _counted_stop(sandbox: DockerSandbox) -> Callable[[], None]:
+    """The sandbox's stop, counted as the run's sandbox step from now (`admission.begin_token_step`) until the stop
+    itself has ended: one cut at its deadline goes on in its thread after the launch has left, its mount or gate maybe
+    still up, so no heal may begin until it ends (O35)."""
+    step_ended = begin_token_step(SANDBOX_STEP)
+
+    def stop() -> None:
+        try:
+            sandbox.stop()
+        finally:
+            step_ended()
+
+    return stop
 
 
 def _in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future[Any]:

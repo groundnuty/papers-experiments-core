@@ -217,3 +217,66 @@ def test_s13_a_cell_input_is_not_pooled_even_for_a_model_named_pooled():
     """S13: the input says it is by cell, so a model that happens to be called `pooled` is read as a model."""
     differences, _, _ = aggregate_by_model({(POOLED, "grp-a"): [((300.0, 1.0), (100.0, 2.0))]}, EXCLUDE)
     assert (differences.clusters, differences.models, differences.pooled) == (("grp-a",), (POOLED,), False)
+
+
+# --- per-arm columns: arm A and arm B may each read their own numerator or denominator column ---------------------
+
+
+def test_s13_a_form_with_one_column_per_role_reads_it_in_both_arms_and_keeps_its_label():
+    """S13: with no per-arm column, both arms read the shared ones, as before per-arm columns existed."""
+    assert (EXCLUDE.columns(0), EXCLUDE.columns(1)) == (("spend", "wins"), ("spend", "wins"))
+    assert not EXCLUDE.per_arm
+    assert EXCLUDE.label == "spend/wins"
+
+
+def test_s13_a_per_arm_numerator_overrides_the_shared_one_for_its_arm_only():
+    """S13: `numerator_a` is what arm A reads; arm B keeps the shared `numerator`, and both the shared denominator."""
+    form = RatioForm("spend_low", "wins", "exclude", numerator_a="spend_high")
+    assert (form.columns(0), form.columns(1)) == (("spend_high", "wins"), ("spend_low", "wins"))
+    assert form.per_arm
+    assert form.label == "spend_high/wins vs spend_low/wins"
+
+
+def test_s13_a_form_holds_a_role_whose_arms_differ_as_both_arms_columns_and_no_shared_one():
+    """S13: one analysis has one form whichever way it is written: a role whose arms differ holds both arms' columns
+    and no shared column, so a record never leaves its reader to apply the default."""
+    written = RatioForm("spend_low", "wins", "exclude", numerator_a="spend_high")
+    both = RatioForm(None, "wins", "exclude", numerator_a="spend_high", numerator_b="spend_low")
+    other_way = RatioForm("spend_high", "wins", "exclude", numerator_b="spend_low")
+    assert written == both == other_way
+    assert (both.numerator, both.numerator_a, both.numerator_b) == (None, "spend_high", "spend_low")
+    assert (both.denominator, both.denominator_a, both.denominator_b) == ("wins", None, None)
+
+
+def test_s13_per_arm_columns_that_restate_the_shared_one_give_the_one_column_form_exactly():
+    """S13: arm columns that are one column are the one-column form, field for field."""
+    assert RatioForm("spend", "wins", "exclude", numerator_a="spend") == EXCLUDE
+    assert RatioForm(None, "wins", "exclude", numerator_a="spend", numerator_b="spend") == EXCLUDE
+    assert RatioForm("spend", None, "exclude", denominator_a="wins", denominator_b="wins") == EXCLUDE
+
+
+def test_s13_a_per_arm_denominator_is_read_by_its_arm_only():
+    """S13: the denominator takes per-arm columns too."""
+    form = RatioForm("spend", "wins", "exclude", denominator_b="wins_strict")
+    assert (form.columns(0), form.columns(1)) == (("spend", "wins"), ("spend", "wins_strict"))
+    assert form.label == "spend/wins vs spend/wins_strict"
+
+
+@pytest.mark.parametrize(
+    ("args", "declared", "message"),
+    [
+        (("spend", "wins", "exclude"), {"numerator_a": "hi", "numerator_b": "lo"}, "numerator 'spend' is read by no"),
+        ((None, "wins", "exclude"), {"numerator_a": "hi"}, "arm B reads no numerator"),
+        ((None, "wins", "exclude"), {"numerator_b": "lo"}, "arm A reads no numerator"),
+        (("spend", None, "exclude"), {}, "arm A reads no denominator"),
+        (("spend", "wins", "exclude"), {"numerator_a": " "}, "numerator_a must name an outcome"),
+        (("spend", "wins", "exclude"), {"denominator_b": 3}, "denominator_b must name an outcome"),
+        (("spend", "wins", "exclude"), {"numerator_a": "wins"}, "arm A's numerator and denominator"),
+        (("spend", "wins", "exclude"), {"denominator_b": "spend"}, "arm B's numerator and denominator"),
+    ],
+)
+def test_s13_a_per_arm_form_that_leaves_an_arm_without_a_column_or_a_column_unread_is_refused(args, declared, message):
+    """S13: a shared column with both arms' own beside it is read by no arm; an arm with no column of a role has no
+    ratio; and each arm's numerator and denominator are two different outcomes."""
+    with pytest.raises(ValueError, match=message):
+        RatioForm(*args, **declared)

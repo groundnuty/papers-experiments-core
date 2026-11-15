@@ -50,7 +50,10 @@ the content type its verdict is not kept: a stuck link is remedied while the cam
 every call after a failure, and whenever its last run is older than `[link_check] every_s` (600 s by default). A failure
 at the first call holds every run until a re-check of the closed gate passes; one later, a link that stuck
 mid-campaign, closes the gate, sets the run whose check found it aside as infrastructure and holds the whole campaign
-the same way. A federation with no pair (every space supported by the local provider alone) has nothing to check; one
+the same way. With `[faults]` and a declared `heal`, a stuck pair the check finds is healed by the fault gate around it,
+between runs and under its own exclusive admission (`fault_gate_heal`), and the call answers healthy only once the
+check passes again; `gate_heal` holds the latest such heal's record. A federation with no pair (every space supported
+by the local provider alone) has nothing to check; one
 with pairs and no `[link_check]` always fails. `links` holds the last report: each pair's seconds and bytes and the
 transfers the check made. `monotonic` and `sleep` are its clock and its pauses, a test's `Ticker`. The check writes
 probes and evicts them, so a caller that must change nothing, day-0's read-only `health` check alone, builds this with
@@ -72,7 +75,7 @@ import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from expcore.campaign.healthgate import Health, HealthCheck
+from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck
 from expcore.config.loading import ConfigError
 from expcore_onedata.admission import fault_settings_of
 from expcore_onedata.client import OnezoneClient, PlatformError
@@ -153,17 +156,26 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
 
 
 def _fault_gate(
-    config: PlatformConfig, client: OnezoneClient, driver: FaultDriver | None, inner: HealthCheck
+    config: PlatformConfig,
+    client: OnezoneClient,
+    driver: FaultDriver | None,
+    inner: HealthCheck,
+    links: Callable[[], LinkReport | None],
+    relink: Callable[[], None],
 ) -> FaultGate | None:
     """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
     not valid raises ConfigError here, so a platform with an injector never runs without the gate. The Compose driver
-    it recovers through finds a restored provider serving by reading through the check's own client."""
+    it recovers through finds a restored provider serving by reading through the check's own client. `links` takes the
+    link report the check made in the calling thread, `relink` makes its next call check the links again, and the
+    providers' services are those of `[faults.services]`, by label, so the gate heals the stuck pairs its own link
+    check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
     settings = fault_settings_of(config)
     if settings is None:
         return None
     if driver is None:
         driver = compose_driver(settings, probe=provider_serves(config, settings, client))
-    return FaultGate(settings, driver, inner)
+    labels = {config.provider_label(name): service for name, service in settings.services.items()}
+    return FaultGate(settings, driver, inner, labels=labels, links=links, relink=relink)
 
 
 class PlatformHealth:
@@ -195,12 +207,33 @@ class PlatformHealth:
         self._links_at = 0.0  # when the last link check ended, on `monotonic`
         self._links_passed = False  # whether any link check of this campaign passed
         self._links_lock = threading.Lock()
+        self._expiries = 0  # how many times the fault gate expired the last link report (after a heal)
+        self._fresh_for = 0  # the expiries the last link report postdates: older than `_expiries`, it is no answer
+        self._made = threading.local()  # the link report each thread's call made, which only that thread takes
         self._with_links = links
         self._ingest_journals = tuple(Path(journal) for journal in ingest_journals)  # read at every call (O44)
         # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
         # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
         self._gate = PreCampaignHealth(self._regular, self._measure)
-        self._faults = _fault_gate(config, client, fault_driver, self._gate)  # outermost: it holds the federation
+        # outermost: it holds the federation, and heals the stuck pairs the link check finds (`fault_gate_heal`)
+        self._faults = _fault_gate(config, client, fault_driver, self._gate, self._take_links, self._expire_links)
+
+    @property
+    def gate_heal(self) -> dict | None:
+        """The record of the latest heal of stuck pairs the fault gate ran (`fault_gate_heal`), None before one or
+        without `[faults]`."""
+        return None if self._faults is None else self._faults.last_heal
+
+    def max_deferral_s(self) -> DeferralBound | None:
+        """The longest this check may stay deferred, which the core holds the campaign's `max_defer_s` to at its start
+        (`healthgate.deferral_bound`): the fault gate's (`FaultGate.max_deferral_s`), None without `[faults]`. A study
+        that wraps this check in its own passes the method on, or the campaign is held to nothing."""
+        return None if self._faults is None else self._faults.max_deferral_s()
+
+    def wait_for_gate_heal(self, timeout_s: float | None = None) -> bool:
+        """Wait, at most `timeout_s`, for a heal the fault gate runs in the background to end; whether none runs now
+        (`FaultGate.wait_for_heal`; True without `[faults]`)."""
+        return True if self._faults is None else self._faults.wait_for_heal(timeout_s)
 
     @property
     def content_type(self) -> ContentTypeVerdict | None:
@@ -222,6 +255,21 @@ class PlatformHealth:
         self._links = check_links(self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock)
         self._links_at = self._monotonic()
         self._links_passed = self._links_passed or self._links.ok
+        self._made.report = self._links  # this thread's own: another thread's call never takes it
+
+    def _take_links(self) -> LinkReport | None:
+        """The link report this thread's calls made since it last took one, None when they made none (for the fault
+        gate: only a report its own call made is one it acts on)."""
+        report = getattr(self._made, "report", None)
+        self._made.report = None
+        return report
+
+    def _expire_links(self) -> None:
+        """Make the next call check the links again, whatever the last verdict and its age (the fault gate, after a
+        heal: a pass another call made before the heal is no pass of the healed links). Until a check made after it
+        has answered, the last report is no answer for any call (`_regular`)."""
+        with self._lock:
+            self._expiries += 1
 
     def _regular(self) -> Health:
         """Every call once the content type passed: the space, then the links (O35), at the first call and again
@@ -235,11 +283,16 @@ class PlatformHealth:
         every_s = settings.every_s if settings is not None else LinkCheckSettings.every_s
         if self._links_lock.acquire(blocking=self._links is None):
             try:
-                last = self._links
-                if last is None or not last.ok or self._monotonic() - self._links_at >= every_s:
+                last, asked = self._links, self._expiries
+                stale = asked > self._fresh_for or self._monotonic() - self._links_at >= every_s
+                if last is None or not last.ok or stale:
                     self._check_links()
+                    self._fresh_for = max(self._fresh_for, asked)  # only once a check made after the expiry answered
             finally:
                 self._links_lock.release()
+        elif self._expiries > self._fresh_for:  # another call checks afresh after a heal: the last report is no answer
+            detail = "the link check is being made afresh after a heal, so no run is admitted until it answers"
+            return Health(False, detail, deferred=True, charge=False)
         report = self._links
         if report is None:  # pragma: no cover - the first check is waited for, so a report is there
             return Health(False, "the link check has not answered yet, so no run is admitted")

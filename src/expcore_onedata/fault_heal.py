@@ -12,6 +12,11 @@ code.) So every restart here is followed by an **enforced settle**: no probe, no
 injector holds the federation exclusively) until `heal_settle_s` has passed, with no active transfer before the restart
 or at the settle's end.
 
+**The fault gate heals with it too** (`fault_gate_heal`): stuck pairs its own link check found, under its exclusive
+admission, with no provider restored (`restored` None: no restored provider's gate after the all-links sequence and no
+container to spare for it) and with `sources_seen`, so a provider that was ever the source of a failing pair keeps its
+container.
+
 **`"all_links"`, the one-round mode.** Between runs, under the injector's exclusive admission:
 
 1. a fresh matrix of every pair (`LinkMatrix`); nothing more is done when it passes;
@@ -63,7 +68,7 @@ step: the provider by label (`all` for the transfer readings and the all-pairs c
 them, the settle, the gate's reading and the matrix after it. Nothing a command printed is kept.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -71,15 +76,17 @@ from typing import Any
 from expcore_onedata.compose import DriverError
 from expcore_onedata.fault_matrix import LinkMatrix, PairState, label_order, unreadable
 
-__all__ = ["ROUNDS", "HealResult", "LinkHeal", "LinkMatrix", "PairState", "unreadable"]
+__all__ = ["INTERRUPTED", "ROUNDS", "HealResult", "LinkHeal", "LinkMatrix", "PairState", "unreadable"]
 
 ROUNDS = 2
+INTERRUPTED = "heal_interrupted"  # how a heal ends that a clean exit stopped between two steps (`stopping`)
 
 
 @dataclass
 class HealResult:
     """How a heal ended: `how` is `healed`, `links_stuck`, `heal_broke_pair`, `sessions_not_ready`,
-    `transfers_active` or `heal_restart_failed`; `record` goes into the injector's snapshot."""
+    `transfers_active` or `heal_restart_failed`, or `heal_interrupted` for one a clean exit stopped between two steps
+    (`stopping`, the fault gate's heal only); `record` goes into the injector's snapshot."""
 
     how: str
     record: dict[str, Any] = field(default_factory=dict)
@@ -100,12 +107,17 @@ class LinkHeal:
     """One heal of a restore's stuck links (see the module docstring).
 
     `services` maps a provider's label to its service, and `restored` is the label of the provider the restore brought
-    back. `matrix()` reads every pair; `gate(service, timeout_s)` passes the session gate for a provider and returns its
-    reading (`ok` among its keys); `transfers()` counts the active transfer listings (None when it cannot know);
-    `restart_container(label, service, budget_s)` restarts a reader's container, verified, its waits ending within
-    `budget_s` (`ok`, `how`, `serves_after_s`).
+    back (None for the fault gate's heal, which follows no restore). `matrix()` reads every pair; `gate(service,
+    timeout_s)` passes the session gate for a provider and returns its reading (`ok` among its keys); `transfers()`
+    counts the active transfer listings (None when it cannot know); `restart_container(label, service, budget_s)`
+    restarts a reader's container, verified, its waits ending within `budget_s` (`ok`, `how`, `serves_after_s`).
     `command_s` bounds one driver command, `settle_s` is the settle, and `link_s`, `all_links_s` and `container_s` are
-    the declared bounds of a ping with a link restart, of the whole all-links sequence and of a container restart."""
+    the declared bounds of a ping with a link restart, of the whole all-links sequence and of a container restart.
+    `sources_seen`, when given, are providers whose container is never restarted (the sources of the stuck pairs the
+    fault gate's check found), and the source of every failing pair of every matrix the heal reads joins them, so a
+    provider that was ever the source of a failing pair is never restarted, even once that pair passes. With
+    `only_stuck` (the fault gate's heal), a fresh matrix that shows no stuck pair (none failed a fetch, or it could not
+    be read) ends the heal at once, with nothing done."""
 
     def __init__(
         self,
@@ -113,7 +125,7 @@ class LinkHeal:
         mode: str,
         driver: Any,
         services: Mapping[str, str],
-        restored: str,
+        restored: str | None,
         bound_s: float,
         gate_s: float,
         poll_s: float,
@@ -131,8 +143,16 @@ class LinkHeal:
         container_fallback: bool = True,
         sleep: Callable[[float], None],
         utc: Callable[[], str] = _utc,
+        sources_seen: Iterable[str] | None = None,
+        only_stuck: bool = False,
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
         self._mode, self._driver, self._services, self._restored = mode, driver, dict(services), restored
+        self._only_stuck = only_stuck  # act only when the fresh matrix shows a stuck pair (the fault gate's heal)
+        self._stopping, self._stopped = stopping, False  # a clean exit: no step starts once it asks (`_fits`)
+        self._kept = (
+            None if sources_seen is None else set(sources_seen)
+        )  # never restarted: ever a failing pair's source
         self._fallback = container_fallback  # whether all_links may restart a stuck reader's container
         self._bound_s, self._gate_s, self._poll_s, self._settle_s = bound_s, gate_s, poll_s, settle_s
         self._link_cost, self._restart_cost = link_s, link_s - 2 * command_s  # what is left once a ping is done
@@ -152,16 +172,27 @@ class LinkHeal:
 
     def _read(self) -> LinkMatrix:
         try:
-            return self._matrix()
+            matrix = self._matrix()
         except Exception as error:  # a check that cannot answer is a failed one, never a pass
             return unreadable(error)
+        if self._kept is not None:
+            self._kept |= matrix.sources()
+        return matrix
 
     def _left(self) -> float:
         return self._bound_s - (self._clock() - self._started)
 
+    def _stop_asked(self) -> bool:
+        """Whether a clean exit has asked the heal to start no further step (`stopping`); once it has, the heal ends
+        `heal_interrupted` at its next step boundary (`_end`)."""
+        if self._stopping is not None and self._stopping():
+            self._stopped = True
+        return self._stopped
+
     def _fits(self, cost: float) -> bool:
-        """Whether a step whose declared bounds are `cost` seconds ends within `heal_timeout_s`."""
-        return cost <= self._left()
+        """Whether a step whose declared bounds are `cost` seconds ends within `heal_timeout_s`, and the process is not
+        exiting (`stopping`): a step under way finishes, its settle included, and none starts after the exit asked."""
+        return not self._stop_asked() and cost <= self._left()
 
     def _gate_within(self, service: str) -> dict[str, Any]:
         """The gate after a step, waiting at most `gate_timeout_s` and never past `heal_timeout_s`."""
@@ -173,6 +204,8 @@ class LinkHeal:
         self._actions.append({**entry, **extra, **({} if after is None else {"matrix_after": after.to_json()})})
 
     def _end(self, how: str, current: LinkMatrix, before: LinkMatrix, why: str | None = None) -> HealResult:
+        if self._stopped and how != "healed":  # stopped at a step boundary: no step's own failure, only the exit
+            how, why = INTERRUPTED, "the process is exiting, so the heal stopped before its next step"
         tried = ", ".join(f"{a['action']} on {a['provider']} ({a['result']})" for a in self._actions) or "nothing"
         record = {
             "ok": how == "healed",
@@ -267,6 +300,8 @@ class LinkHeal:
         """One reader's link or container restart, enforced as the all-links sequence's is: no active transfer before
         it, then the settle with no fetch at all, no active transfer at its end, then its gate and a fresh matrix.
         `cost` is the step's declared bounds, checked again once the transfers are quiet."""
+        if self._stop_asked():  # before the wait for quiet transfers: an exit waits for no step that has not begun
+            return "links_stuck", before, f"the process is exiting, before the {action} on {label}"
         if not self._no_transfers("before"):
             return "transfers_active", before, f"a transfer stayed active before the {action} on {label}"
         if not self._fits(cost):
@@ -369,6 +404,10 @@ class LinkHeal:
             if label == self._restored:
                 self._skipped.append({"provider": label, "why": "the restored provider's container is not restarted"})
                 return None, current, ""
+            if self._kept is not None and label in self._kept:
+                why = "a provider that was the source of a failing pair is never restarted"
+                self._skipped.append({"provider": label, "why": why})
+                return None, current, ""
             if not self._fits(self._container_cost):
                 return "links_stuck", current, "heal_timeout_s leaves no time for a container restart"
             return self._act(label, service, "container_restart", current, self._container_cost)
@@ -403,6 +442,9 @@ class LinkHeal:
         current = before = self._read()
         if current.ok:
             return self._end("healed", current, before)
+        if self._only_stuck and not current.stuck_readers():  # no failed fetch: no link to heal, so nothing is done
+            why = "the heal's fresh link check could not run" if not current.pairs else "no pair failed a fetch"
+            return self._end("links_stuck", current, before, f"{why} in the heal's fresh matrix, so nothing was done")
         if self._mode == "all_links":
             stop, current, why = self._all_links(before)
             if stop is not None:

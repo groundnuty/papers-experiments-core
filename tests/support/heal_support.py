@@ -6,12 +6,9 @@ pair `alpha` reads passes, and the restored provider's own pairs pass. `HealServ
 `ping` and `restart_link`, and what a link or a container restart mends or breaks.
 """
 
-import math
-
 from fault_support import FakeClock, FakeServices, faults_table, injector_for
 
 from expcore_onedata.fault_heal import LinkMatrix, PairState
-from expcore_onedata.fault_settings import DEFAULT_SESSION_DRAIN_S, TOKEN_MARGIN_BASE_S
 from expcore_onedata.testing import write_platform
 
 NAMES = ("alpha", "beta", "gamma", "delta")
@@ -140,32 +137,25 @@ class HealServices(FakeServices):
             self.stuck = {pair for pair in self.stuck if pair[0] != LABEL[service]}
 
 
-def four_providers(data, **faults):
-    """Four providers, each with a service; short commands and settles, a declared heal bounded at `HEAL_TIMEOUT_S`
-    unless the test says otherwise (the loader would derive a much shorter one from these settles), and a token margin
-    that outlives two heals of its bound and a session drain, which a declared heal needs at load."""
+def four_providers(data, tokens=None, **faults):
+    """Four providers, each with a service; short commands and settles, and a declared heal bounded at
+    `HEAL_TIMEOUT_S` unless the test says otherwise (the loader would derive a much shorter one from these settles).
+    `tokens` replaces keys of `[tokens]` (a study's long margin, say)."""
     for name, index in (("gamma", 3), ("delta", 4)):
         data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
     pinned = {"heal_timeout_s": HEAL_TIMEOUT_S} if faults.get("heal", "off") != "off" else {}
     data["faults"] = faults_table(
         **{"services": dict(STORES), "command_timeout_s": 10, "heal_settle_s": 30, **pinned, **faults}
     )
-    data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
+    if tokens is not None:
+        data["tokens"] = {**data.get("tokens", {}), **tokens}
 
 
-def heal_margin_s(faults) -> int:
-    """The `[tokens] margin_s` a declared heal of this `[faults]` table needs at load (`heal_token_margin_s`): the base,
-    two heals of its bound and its session drain."""
-    heal_timeout_s = faults.get("heal_timeout_s", HEAL_TIMEOUT_S)
-    drain_s = faults.get("session_drain_s", DEFAULT_SESSION_DRAIN_S)
-    return math.ceil(TOKEN_MARGIN_BASE_S + 2 * heal_timeout_s + drain_s)
-
-
-def heal_injector(tmp_path, services=None, **faults):
+def heal_injector(tmp_path, services=None, tokens=None, **faults):
     """A sanctioned injector for providers[1] of the four-provider federation, on its own fake clock, with its
-    services."""
+    services; `tokens` as for `four_providers`."""
     tmp_path.mkdir(parents=True, exist_ok=True)  # a test may build a second federation under a subdirectory
-    platform = write_platform(tmp_path, lambda data: four_providers(data, **faults))
+    platform = write_platform(tmp_path, lambda data: four_providers(data, tokens, **faults))
     services = services or HealServices()
     clock = FakeClock()
     services.clock = clock

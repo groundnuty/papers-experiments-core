@@ -61,7 +61,7 @@ from pathlib import Path
 from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
-from expcore_onedata.admission import require_admission
+from expcore_onedata.admission import TOOL_SERVER_STEP, begin_token_step, require_admission, token_step
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.credentials import Principal
@@ -206,6 +206,25 @@ def _recheck(
     issuer.check_clusters(spec, token.reveal())
 
 
+async def _in_counted_thread(check: Callable[..., None], *args: object) -> None:
+    """Run one of the plane's checks, which examine the run's token, in a worker thread counted as the tool server's
+    step on the run's admission until the thread itself has ended (`admission.begin_token_step`). A cancellation of
+    the await does not stop the thread, so the count outlives a launch that leaves without it, and no restore heals
+    while it still examines the token (O35); the thread's failure is then never unretrieved. A thread the event loop's
+    shutdown kept from ever starting leaves the count open, so the restore fails closed."""
+    end = begin_token_step(TOOL_SERVER_STEP)
+
+    def work() -> None:
+        try:
+            check(*args)
+        finally:
+            end()
+
+    running = asyncio.ensure_future(asyncio.to_thread(work))
+    running.add_done_callback(lambda done: done.cancelled() or done.exception())
+    await asyncio.shield(running)
+
+
 class ToolServerLauncher:
     """Starts the tool server of a condition for a run, stops it again, and checks at the end that its plane held.
 
@@ -222,7 +241,7 @@ class ToolServerLauncher:
         """Re-verify the tool plane after the server stopped; raise InfraError of kind tool_plane_integrity unless it held."""
         label = self._config.condition_label(condition)
         try:
-            await asyncio.to_thread(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
+            await _in_counted_thread(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
         except PrivilegesMismatch as changed:
             detail = f"{label}: the tool plane's rights changed during the run: {changed}"
             error = InfraError(INTEGRITY_KIND, detail)
@@ -260,12 +279,19 @@ class ToolServerLauncher:
         change from the condition's declared rights records `tool_plane_rights_changed` and raises `InfraError` of kind
         `tool_plane_integrity`, which replaces any exception of the run's body, because the run is set aside whatever
         it did.
+
+        From before its first check to the end of that last one, the launch is a step of the run that uses its token,
+        counted on the run's admission (`admission.token_step`), so the fault injector's restore can tell that it
+        still runs and that a heal might outlast the token (O35).
         """
         if principal is not None and token.subject != principal.user_id:
             raise ValueError("the tool-server token was not minted for the leased slot's tool-server user")
         require_admission(self._config)  # a platform with a fault injector: the run holds the federation (O11)
         server, chosen = _server(self._config), self._config.condition(condition)
-        with _private_bundle(self._config) as ca_copy:  # the run's copy of the verified CA bytes, gone with the server
+        with (
+            token_step(TOOL_SERVER_STEP),  # ended only once the re-verification at teardown has ended
+            _private_bundle(self._config) as ca_copy,  # the run's copy of the verified CA bytes, gone with the server
+        ):
             env = server_environment(self._config, chosen, token, extra_env, ca_copy=ca_copy)
             provider = McpToolProvider(
                 server.command,
@@ -277,7 +303,7 @@ class ToolServerLauncher:
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:
-                    await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
+                    await _in_counted_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
                 except TokenRefused as refused:
                     label = self._config.condition_label(condition)
                     raise _integrity_failure(label, "before the start", refused) from None
