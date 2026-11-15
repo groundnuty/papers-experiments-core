@@ -53,6 +53,16 @@ def five_providers(data, **faults):
     data["tokens"] = {**data.get("tokens", {}), "margin_s": RESTORE_MARGIN_S}
 
 
+def five_derived(data, **faults):
+    """Five providers at the designed bounds of a restore's waits, the heal's bound left out: the loader derives it
+    (4,740 s for five providers in `"all_links"` with a container fallback, from the settles at these bounds)."""
+    for name, index in (("gamma", 3), ("delta", 4), ("epsilon", 5)):
+        data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
+    designed = {"settle_timeout_s": 180, "ready_timeout_s": 180, "session_drain_s": 320}
+    data["faults"] = faults_table(**{"services": dict(FIVE_STORES), **designed, **faults})
+    data["tokens"] = {**data.get("tokens", {}), "margin_s": RESTORE_MARGIN_S}
+
+
 def four_providers(data, **faults):
     """Four providers at the defaults of the heal: the 4,200 s and 320 s a declared heal gets with no other word (the
     bound derived from the settles at their defaults, since the fixture's own are short), and the token margin its
@@ -176,3 +186,32 @@ def test_o35_without_faults_the_platform_declares_no_longest_deferral(tmp_path, 
     health, faults = platform_check(tmp_path / "platform", fake, lambda data: None)
     assert faults is None
     assert health.max_deferral_s() is None
+
+
+# the study guide's table: the heal_timeout_s it assumes, the drain, and the total at health_timeout_s 60 s and 150 s
+FIGURES = [
+    ("four", 4200.0, 320, 4882.0, 5062.0),
+    ("four", 4200.0, 0, 4471.0, 4561.0),
+    ("five-derived", 4740.0, 320, 5422.0, 5602.0),
+    ("five-derived", 4740.0, 0, 5011.0, 5101.0),
+    ("five-declared", 4290.0, 320, 4972.0, 5152.0),
+    ("five-declared", 4290.0, 0, 4561.0, 4651.0),
+]
+EDITORS = {"four": four_providers, "five-derived": five_derived, "five-declared": five_providers}
+
+
+@pytest.mark.parametrize(("which", "heal_s", "drain_s", "at_60", "at_150"), FIGURES)
+def test_o35_every_figure_the_study_guide_tabulates_is_the_total_the_refusal_prints(
+    tmp_path, fake, which, heal_s, drain_s, at_60, at_150
+):
+    """O35: the table of `max_defer_s` totals in the study guide: four providers' derived heal timeout, five
+    providers' derived one and the 4,290 s declared for five, with and without a session drain, at a `health_timeout_s`
+    of 60 s and of 150 s. Each total is what the refusal of a shorter `max_defer_s` prints, so a change to the
+    derivation, the bound or the core's waits that moves one fails here, and the guide is corrected with it."""
+    edit = partial(EDITORS[which], heal="all_links", session_drain_s=drain_s)
+    health, faults = platform_check(tmp_path / "platform", fake, edit)
+    assert faults.heal_timeout_s == heal_s
+    for health_timeout_s, needed in ((60.0, at_60), (150.0, at_150)):
+        settings = settings_for(health_timeout_s=health_timeout_s, **POLL)
+        with pytest.raises(ConfigError, match=f"up to {needed:g} s"):
+            build(tmp_path / f"campaign-{health_timeout_s:g}", health=health, settings=settings, plan=SMALL)
