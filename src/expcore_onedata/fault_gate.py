@@ -206,8 +206,8 @@ class FaultGate:
             exclusive = self._lock.acquire(exclusive=True, timeout_s=self._wait_s, purpose=RECOVERY)
         except FederationBusy:
             why = (
-                f"the fault gate's heal did not run: a run or a tool held the federation past health_wait_s "
-                f"({self._wait_s:g} s), so the gate stays closed"
+                f"the fault gate's heal did not run: the federation was not free of runs, tools and drains within "
+                f"health_wait_s ({self._wait_s:g} s), so the gate stays closed"
             )
             return Health(False, f"{verdict.detail}; {why}")
         try:
@@ -220,8 +220,12 @@ class FaultGate:
             self._last_heal = result.record
             if not result.healed:
                 return Health(False, f"{verdict.detail}; {said}")
-            again, _ = self._judged()  # the gate opens only on its own check, run again under the exclusive admission
-            return Health(again.ok, f"{again.detail}; {said}")
+            # the gate opens only on its own check, run again under the exclusive admission, its link check passing
+            again, _ = self._judged()
+            latest = self._report()
+            if again.ok and (latest is None or latest.ok is not True):
+                return Health(False, f"{again.detail}; {said}; the gate's link check did not pass again after the heal")
+            return again._replace(detail=f"{again.detail}; {said}")
         finally:
             exclusive.close()
 

@@ -120,11 +120,14 @@ class GateCheck:
         self.federation, self.report, self.runs = federation, None, 0
         self.space_ok = True
         self.grow: dict[int, set[tuple[str, str]]] = {}
+        self.unlinked_from: int | None = None  # from this check on it answers healthy without running its link check
 
     def __call__(self) -> Health:
         self.runs += 1
         if not self.space_ok:
             return Health(False, "the providers supporting the space differ from the declared set")
+        if self.unlinked_from is not None and self.runs >= self.unlinked_from:
+            return Health(True, "the space is supported by its declared set")
         self.federation.stuck |= self.grow.get(self.runs, set())
         self.federation.reads.append(("gate", self.federation.now()))
         self.report = self.federation.matrix()
@@ -365,6 +368,17 @@ def test_o35_the_gate_never_opens_with_a_pair_its_own_check_still_finds_stuck(tm
     reading = gate()
     assert reading.ok is False
     assert "providers[1]->providers[3]" in reading.detail
+    assert len(acted(federation, "restart_link")) == 4
+
+
+def test_o35_the_gate_never_opens_on_a_recheck_whose_link_check_did_not_pass(tmp_path):
+    """O35: the check run again after the heal answers healthy without running its link check, so the latest report
+    is still the stuck one: the gate stays closed."""
+    gate, federation, check, _ = gate_of(tmp_path, heal="all_links")
+    check.unlinked_from = 2
+    reading = gate()
+    assert reading.ok is False
+    assert "did not pass again after the heal" in reading.detail
     assert len(acted(federation, "restart_link")) == 4
 
 
