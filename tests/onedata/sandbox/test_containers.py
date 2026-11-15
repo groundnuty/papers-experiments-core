@@ -270,6 +270,20 @@ def test_o36_the_command_refuses_settings_that_would_give_oneclient_two_force_op
         C.sidecar_command("p.test", dataclasses.replace(s, mount=mount))
 
 
+@pytest.mark.parametrize("mode", ["proxy", "direct"])
+@pytest.mark.parametrize("argument", ["--disable-log-buffering", "--disable-log", "--disable-log-buffering=1"])
+def test_o54_the_command_refuses_a_second_log_switch_in_either_mode(s, mode, argument):
+    """O54: the sidecar passes `--disable-log-buffering` itself, in either mode, and oneclient refuses a switch given
+    twice: settings whose mount was set past its own check still never yield an argv with a second one."""
+    mount = dataclasses.replace(with_io_mode(s, mode).mount)
+    object.__setattr__(mount, "extra_args", (argument,))
+    broken = dataclasses.replace(s, mount=mount)
+    with pytest.raises(ValueError, match="extra_args"):
+        C.sidecar_command("p.test", broken)
+    with pytest.raises(ValueError, match="extra_args"):
+        C.sidecar_options(broken)
+
+
 def test_o36_a_direct_mount_has_one_force_option_and_the_closed_inputs_of_a_proxy_one(s):
     """O36: a direct mount's command has exactly one force option, the config file and the closed environment, as for
     proxy."""

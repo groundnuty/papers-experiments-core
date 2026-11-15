@@ -153,12 +153,16 @@ def test_o40_a_storage_override_in_any_spelling_is_refused_as_an_extra_argument(
 def test_o54_the_log_buffering_switch_is_the_cores_own_in_every_io_mode(mode, argument):
     """O54: the sidecar passes `--disable-log-buffering` with every mount, proxy included, so the collection reads the
     start lines (glog holds INFO lines up to 30 s otherwise); a second one, from a study, would make oneclient refuse to
-    start, so it is refused in either mode, at load and at the command."""
+    start, so it is refused in either mode: here by `mount_problem` and the constructor, at load in test_settings and at
+    the command in test_containers."""
     storages, check = (("0123abcd", "/srv/a"),), "space/f"
     extra = (storages, check) if mode == "direct" else ((), None)
     assert "--disable-log-buffering" in extra_arg_problem(argument)
     assert "sidecar passes it" in mount_problem(mode, (argument,), *extra)
     assert mount_problem(mode, ("--disable-read-events",), *extra) is None  # another option that starts `--disable-`
+    if mode == "proxy":  # the constructor holds the same check (a direct MountSettings also needs its storages)
+        with pytest.raises(ValueError, match="disable-log-buffering"):
+            MountSettings("/data", mode, (argument,))
 
 
 def test_o36_oneclients_own_options_are_kept_by_name_and_nothing_else_is():
