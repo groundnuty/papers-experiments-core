@@ -35,11 +35,13 @@ with no provider restored, **in the background** (`_heal_on`). The check that be
 answers the uncharged deferral (`Health(..., deferred=True, charge=False)`) at once, so a heal longer than the
 campaign's `health_timeout_s` never reads as down and a pair it mends charges no run; past the heal's own bound
 (`heal_timeout_s` and `heal_settle_s` since it began) a heal still running closes the gate, uncharged. That bound, after
-a session drain, is the longest the gate declares it may defer (`max_deferral_s`), and the core refuses a campaign whose
-`max_defer_s` is shorter at its start, so a heal never turns into a blocking hold that stops the campaign. A check that
-found the pair too and meets a heal under way (this gate's, or another check's holding the federation) waits the same
-way, never taking the latch the heal set for a closed episode, and so does another process's check that meets a heal's
-container restart journalled `clear_failed` during its settle. Whatever the heal did, the next check makes the link
+a session drain and with the core's waits between and around them (a recheck and the check that starts the heal, and
+the check that makes the link check afresh after it), is the longest the gate declares it may defer
+(`max_deferral_s`), and the core refuses a campaign whose `max_defer_s` is shorter at its start, so a heal never turns
+into a blocking hold that stops the campaign. A check that found the pair too and meets a heal under way (this gate's,
+or another check's holding the federation) waits the same way, never taking the latch the heal set for a closed
+episode, and so does another process's check that meets a heal's container restart journalled `clear_failed` during
+its settle. Whatever the heal did, the next check makes the link
 check afresh (`relink`), so no pass from before the heal's end opens the gate: a heal that left a pair failing leaves it
 to the next check, which finds it stuck and fails closed, and none runs again until the gate's link check passes. A
 check under a run's admission keeps a share of it until it ends, so one that outlives its caller's wait still holds the
@@ -165,17 +167,33 @@ class FaultGate:
 
     def max_deferral_s(self) -> DeferralBound | None:
         """The longest this gate's checks may stay deferred, for the core to hold the campaign's `max_defer_s` to at
-        its start (`healthgate.deferral_bound`): with a declared heal, a session drain and then a heal of its whole
-        bound (`heal_deferral_s`), whether this gate heals or another process's does; None with the heal off."""
+        its start (`healthgate.deferral_bound`); None with the heal off. With a declared heal the first deferral can be
+        the session drain of an outage run (`session_drain_s`), and the waits that follow it are these, whether this
+        gate heals or another process's does: one wait between two checks and the check that starts the heal (the
+        heal begins at a check, so it begins up to `recheck_s` plus the poll and `health_timeout_s` after the drain
+        ends), the heal's whole bound (`heal_wait_s`: `heal_timeout_s` and `heal_settle_s`), and the check that makes
+        the link check afresh after it, which a call that meets it waits for, uncharged (`PlatformHealth._regular`).
+        The platform's own seconds are the drain and the heal's bound (`heal_deferral_s`); the other waits are the
+        core's settings, which it adds (`DeferralBound.rechecks`, `checks`). With no drain the first deferral is the
+        check that starts the heal, and only the check after the heal is added. A deferral that began before that (an
+        outage run still running, another worker's check waiting on it) is not included: it is as long as the run."""
         settings = self._settings
         if settings.heal == "off":
             return None
-        detail = (
-            f'[faults] heal = "{settings.heal}": session_drain_s ({settings.session_drain_s:g} s), then heal_timeout_s '
-            f"({settings.heal_timeout_s:g} s) and heal_settle_s ({settings.heal_settle_s:g} s); lower heal_timeout_s "
-            'or session_drain_s, or set heal = "off", to shorten it'
+        drained = settings.session_drain_s > 0
+        first = (
+            f"session_drain_s ({settings.session_drain_s:g} s) after an outage run, then one wait between two checks "
+            "(the core's recheck_s and poll_interval_s) and the check that starts the heal (its health_timeout_s), "
+            "then "
+            if drained
+            else "the check that starts the heal, then "
         )
-        return DeferralBound(heal_deferral_s(settings), detail)
+        detail = (
+            f'[faults] heal = "{settings.heal}": {first}heal_timeout_s ({settings.heal_timeout_s:g} s) and '
+            f"heal_settle_s ({settings.heal_settle_s:g} s), then the check that makes the link check afresh after the "
+            'heal (its health_timeout_s); lower heal_timeout_s or session_drain_s, or set heal = "off", to shorten it'
+        )
+        return DeferralBound(heal_deferral_s(settings), detail, rechecks=int(drained), checks=2 if drained else 1)
 
     @property
     def last_heal(self) -> dict[str, Any] | None:

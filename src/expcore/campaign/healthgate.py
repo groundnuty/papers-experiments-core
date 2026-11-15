@@ -46,7 +46,9 @@ that exits when blocked stops instead of waiting on a holder that may never let 
 by the dispatcher alone, and its deferred checks count the same way: past the bound its outage becomes blocking too.
 A platform whose own waits are bounded declares the longest (`max_deferral_s`, a `DeferralBound`), so a wait it ends
 by itself (a repair it runs) is never cut off by that bound: a campaign whose `max_defer_s` is shorter is refused at
-its start, before its store is opened (`deferral_bound`, `SchedulerConfig.check_deferral_bound`).
+its start, before its store is opened (`deferral_bound`, `SchedulerConfig.check_deferral_bound`). The bound is the
+platform's own seconds and the core's waits its wait includes: between two checks (`recheck_s`, `poll_interval_s`)
+and a check's own time (`health_timeout_s`), which only the core's settings give, each named in the refusal.
 
 **A failure an earlier attempt left charges no one.** A platform answers `Health(False, detail, charge=False)` for a
 failure it knows another attempt left behind (a progressive ingest's baseline that a failed reset, or an attempt
@@ -111,10 +113,17 @@ class DeferralBound(NamedTuple):
     """The longest a platform's check may stay deferred, from its first deferred answer to its last with no pass
     between them, and in the platform's words what defers it that long and how to shorten it (`detail`): what a check's
     optional `max_deferral_s()` answers. The core refuses a campaign whose `max_defer_s` is shorter at its start
-    (`SchedulerConfig.check_deferral_bound`), since past it the platform's own wait would block the campaign."""
+    (`SchedulerConfig.check_deferral_bound`), since past it the platform's own wait would block the campaign.
+
+    `seconds` is the platform's own time. A wait that only a later check can start (a repair that begins at a check)
+    also holds waits whose lengths are the core's settings, which the platform cannot know: `rechecks` counts the waits
+    between two of the core's checks (`recheck_s` and up to `poll_interval_s` each) and `checks` the checks' own time
+    (`health_timeout_s` each) the wait includes beyond `seconds`; the core adds them with its figures and names each."""
 
     seconds: float
     detail: str
+    rechecks: int = 0
+    checks: int = 0
 
 
 DEFERRAL_HOOK = "max_deferral_s"
@@ -134,10 +143,17 @@ def deferral_bound(check: Any) -> DeferralBound | None:
         return None
     seconds = answer.seconds if isinstance(answer, DeferralBound) else None
     number = isinstance(seconds, int | float) and not isinstance(seconds, bool)
-    if not number or not math.isfinite(seconds) or seconds < 0 or not isinstance(answer.detail, str):
+    if (
+        not number
+        or not math.isfinite(seconds)
+        or seconds < 0
+        or not isinstance(answer.detail, str)
+        or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:])
+    ):
         raise ConfigError(
             f"the platform's health check answered {DEFERRAL_HOOK}() with {answer!r:.120}, not None or a "
-            "DeferralBound of a finite, non-negative number of seconds and a detail"
+            "DeferralBound of a finite, non-negative number of seconds, a detail and non-negative whole counts of "
+            "the core's own waits"
         )
     return answer
 

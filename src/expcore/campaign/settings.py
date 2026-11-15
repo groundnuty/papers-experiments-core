@@ -77,18 +77,40 @@ class SchedulerConfig:
         """The kinds this campaign charges its own failures to, by the key of `[scheduler]` that names each."""
         return {"health_kind": self.health_kind, "identity_kind": self.identity_kind}
 
+    def deferral_needed(self, bound: DeferralBound) -> tuple[float, str]:
+        """The longest a platform's check may stay deferred, this campaign's own waits included (the `max_defer_s` it
+        needs), and in words the core's waits the platform's declared (`bound.rechecks` waits between two checks of
+        `recheck_s` and up to `poll_interval_s` each, `bound.checks` checks of up to `health_timeout_s` each); empty
+        when it declared none."""
+        between = bound.rechecks * (self.recheck_s + self.poll_interval_s)
+        checking = bound.checks * self.health_timeout_s
+        parts = []
+        if bound.rechecks:
+            parts.append(
+                f"{bound.rechecks} x (recheck_s {self.recheck_s:g} s + poll_interval_s {self.poll_interval_s:g} s)"
+            )
+        if bound.checks:
+            parts.append(f"{bound.checks} x health_timeout_s {self.health_timeout_s:g} s")
+        return bound.seconds + between + checking, " and ".join(parts)
+
     def check_deferral_bound(self, bound: DeferralBound | None) -> None:
         """Refuse a `max_defer_s` shorter than the longest the platform's check may stay deferred (`bound`, from
-        `healthgate.deferral_bound`; None: the platform declares none). Past `max_defer_s` a deferral closes the gate
-        blocking, so a campaign that exits when blocked would stop on a wait the platform ends by itself. The gate fails
-        a deferral only once its age is past `max_defer_s`, so a bound equal to it starts."""
-        if bound is None or bound.seconds <= self.max_defer_s:
+        `healthgate.deferral_bound`; None: the platform declares none), the core's own waits it declared included
+        (`deferral_needed`). Past `max_defer_s` a deferral closes the gate blocking, so a campaign that exits when
+        blocked would stop on a wait the platform ends by itself. The gate fails a deferral only once its age is past
+        `max_defer_s`, so a bound equal to it starts."""
+        if bound is None:
             return
+        needed, core = self.deferral_needed(bound)
+        if needed <= self.max_defer_s:
+            return
+        own = f"{bound.seconds:g} s of the platform's own: {bound.detail}; plus the core's waits {core}" if core else ""
         raise ConfigError(
             f"campaign.toml [scheduler] max_defer_s is {self.max_defer_s:g} s, but the platform's health check may "
-            f"stay deferred for up to {bound.seconds:g} s ({bound.detail}); a deferral past max_defer_s closes the "
+            f"stay deferred for up to {needed:g} s ({own or bound.detail}); a deferral past max_defer_s closes the "
             "health gate as blocking, so a campaign that exits when blocked would stop on a wait it should have waited "
-            f"out: raise max_defer_s to at least {bound.seconds:g}, or shorten the platform's wait"
+            f"out: raise max_defer_s to at least {needed:g}, or shorten the platform's wait"
+            + (", or recheck_s or health_timeout_s" if core else "")
         )
 
     def check_kinds(self, schema: FactorSchema) -> None:

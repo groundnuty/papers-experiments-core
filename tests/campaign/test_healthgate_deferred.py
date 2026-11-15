@@ -382,11 +382,75 @@ def test_c11_a_check_that_declares_no_longest_deferral_holds_max_defer_s_to_noth
         DeferralBound(float("inf"), "a repair"),
         DeferralBound(True, "a repair"),
         DeferralBound(5.0, None),
+        DeferralBound(5.0, "a repair", rechecks=-1),
+        DeferralBound(5.0, "a repair", checks=1.5),
+        DeferralBound(5.0, "a repair", rechecks=True),
     ],
-    ids=["number", "text", "negative", "nan", "infinite", "boolean", "no-detail"],
+    ids=[
+        "number",
+        "text",
+        "negative",
+        "nan",
+        "infinite",
+        "boolean",
+        "no-detail",
+        "negative-rechecks",
+        "fraction",
+        "bool",
+    ],
 )
 def test_c11_a_longest_deferral_that_is_not_one_refuses_the_start(tmp_path, answer):
     """C11: what the hook answers crosses into the core, so anything but None or a `DeferralBound` of a finite,
-    non-negative number of seconds and a detail is refused at the start, naming the hook."""
+    non-negative number of seconds, a detail and non-negative whole counts of the core's own waits is refused at the
+    start, naming the hook."""
     with pytest.raises(ConfigError, match="max_deferral_s"):
         build(tmp_path, health=Bounded(answer), plan=SMALL)
+
+
+PLATFORM = DeferralBound(5000.0, "the platform's repair", rechecks=1, checks=2)
+CORE_WAITS = {"recheck_s": 30.0, "poll_interval_s": 1.0, "health_timeout_s": 60.0}  # the defaults, but the poll's
+NEEDED = 5000.0 + (30.0 + 1.0) + 2 * 60.0  # the platform's own seconds and the core's waits it declares
+
+
+def test_c11_the_cores_own_waits_a_platform_declares_are_added_to_its_bound_and_named(tmp_path):
+    """C11: a platform's wait can include waits only the core knows, since they are its settings (`recheck_s` and
+    `poll_interval_s` between two checks, `health_timeout_s` for a check that starts or ends the platform's own wait),
+    and a bound that left them out would let the campaign stop on a wait the platform ends by itself. The platform
+    declares how many of each its wait includes (`DeferralBound.rechecks`, `checks`), and the refusal adds the core's
+    own values and names every term with its figure."""
+    with pytest.raises(ConfigError) as refused:
+        build(tmp_path, health=Bounded(PLATFORM), settings=settings_for(max_defer_s=5000.0, **CORE_WAITS), plan=SMALL)
+    text = str(refused.value)
+    terms = (
+        f"up to {NEEDED:g} s",
+        "5000 s of the platform's own",
+        PLATFORM.detail,
+        "1 x (recheck_s 30 s + poll_interval_s 1 s)",
+        "2 x health_timeout_s 60 s",
+        f"raise max_defer_s to at least {NEEDED:g}",
+    )
+    for part in terms:
+        assert part in text, text
+
+
+def test_c11_a_max_defer_s_one_second_short_of_the_platform_and_the_cores_waits_is_refused_and_the_total_starts(
+    tmp_path,
+):
+    """C11: the figure the campaign must reach is the platform's own seconds and the core's waits it declared; the total
+    starts, since a deferral fails only once its age is past `max_defer_s`, and one second less is refused."""
+    short = settings_for(max_defer_s=NEEDED - 1, **CORE_WAITS)
+    with pytest.raises(ConfigError, match="max_defer_s"):
+        build(tmp_path / "short", health=Bounded(PLATFORM), settings=short, plan=SMALL)
+    enough = settings_for(max_defer_s=NEEDED, **CORE_WAITS)
+    with build(tmp_path / "enough", health=Bounded(PLATFORM), settings=enough, plan=SMALL):
+        pass
+
+
+def test_c11_a_bound_that_declares_no_core_waits_adds_none(tmp_path):
+    """C11: a platform that declares no waits of the core's (`rechecks` and `checks` 0, their defaults) is held to its
+    own seconds alone, whatever `recheck_s`, `poll_interval_s` and `health_timeout_s` are."""
+    bound = DeferralBound(5000.0, "the platform's repair")
+    assert (bound.rechecks, bound.checks) == (0, 0)
+    big = settings_for(max_defer_s=5000.0, recheck_s=900.0, poll_interval_s=60.0, health_timeout_s=900.0)
+    with build(tmp_path, health=Bounded(bound), settings=big, plan=SMALL):
+        pass
