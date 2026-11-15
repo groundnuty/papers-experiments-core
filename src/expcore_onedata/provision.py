@@ -43,7 +43,10 @@ configured name or lies outside the prefixes. On top of that gate:
   caller names a policy), and what is read inside a poll that already counts a failed read as a poll that did not match.
   An instrument's own read (`resolve(wait=False)`) is one attempt. A reset's per-file reads go under a policy made for
   each reading (`reading_retry`), which also retries a connection failure, never an answer, and under a per-provider
-  bound on the reads in flight (`reading_slot`, `[placement] provider_concurrency`, `readslots.py`).
+  bound on the reads in flight (`reading_slot`, `[placement] provider_concurrency`, `readslots.py`); so do, when the
+  reset names its policy, the gate's reads (`mutate(gate_retry=)`, `schedule_transfer(gate_retry=)`), the space's name
+  (`verify_space(retry=)`), the root's first read and the listings of `resolve`, `resolve_many` and `walk` (`retry=`),
+  the last two each under a slot. The mutation is sent once whatever the policy.
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
 no token and no credential. A last line a crash cut short (no newline after it, and not a whole line) is no line, and

@@ -129,20 +129,22 @@ read and every check is made on each provider that supports the space, since eac
 **Before any stage** the plan is checked (no provider to evict from or allowed to hold bytes is the data provider, by
 name or id, or one that does not support the space) and the space's live name is verified (`verify_space`).
 
-**Reads that time out are tried again, boundedly and in the log** (O29, `readretry.py`): the reset's own reads (the
-walks' listings, the summaries, the transfer listings, records and waits, the eviction stage's waits for its transfers,
-the occupancy, a space's root and the gate's reads before each cancel and removal) go under the provisioner's policy,
-three attempts with pauses of 2 s and 5 s, and the record says how many were retried (`reads_retried`). A read inside
-a poll that counts a failed read as one that did not match (the requirements' removal check) is one attempt: the poll is
-the retry. The reads of each reading (the scans, `summaries` mode's directory listings included, the settle, the
-occupancy with its counter, the quiet stage's maps) go under a policy made for that reading
-(`Provisioner.reading_retry`), which also tries a connection failure again, four attempts 2, 5 and 15 s apart, at most
-`[placement] provider_concurrency` in flight at one provider, and whose tally is the stage's `read_retry` (O46, O51).
-So do each stage's own transfer reads (the listings, the records, the waits for its jobs, the eviction stage's included,
-and Onezone's clock), under a policy per stage (`stage_reads`) tallied as the stage's `transfer_read_retry`. Still
-timeouts only: the mutation gate's reads before a cancel, an eviction or a requirement's deletion, the space's name
-(`verify_space`), the eviction stage's path listings and the space root's first read. Nothing else is tried again: an
-error answer, a connection error elsewhere and every mutation stand as before.
+**Reads that fail are tried again, boundedly and in the log** (O29, O46, O51, `readretry.py`). A read inside a poll that
+counts a failed read as one that did not match (the requirements' fulfilment and removal checks, the eviction's block
+maps) is one attempt: the poll is the retry. Every other read the reset makes goes under a policy that also tries a
+connection failure again, four attempts 2, 5 and 15 s apart, never an answer (`Provisioner.reading_retry`): the reads of
+each reading (the scans, `summaries` mode's directory listings included, the settle, the occupancy with its counter, the
+quiet stage's maps) under one made for that reading, at most `[placement] provider_concurrency` in flight at one
+provider, tallied as the stage's `read_retry`; each stage's own transfer reads (the listings, the records, the waits for
+its jobs, the eviction stage's included, and Onezone's clock) under one per stage (`stage_reads`), tallied as the
+stage's `transfer_read_retry`; and the mutation gate's reads before a cancel, an eviction or a requirement's deletion,
+the space's name (`verify_space`; the driver's tallied as `verify_read_retry`), the eviction stage's path listings and
+the space root's first read, each under the policy of the stage it is made in. The record says how many reads were
+retried (`reads_retried`). Still timeouts only, under the provisioner's policy (three attempts, 2 s and 5 s apart): the
+visibility wait before each eviction (`Provisioner.await_visible`). Nothing else is tried again: an error answer stands
+as before, and **a mutation is sent once**: a cancel, an eviction or a deletion whose answer was lost after it went out
+(`client.sent_unanswered`) may have been applied, so it is never sent again; the job's record, the block maps or the
+deletion barrier decide, failing closed at their bounds, and the stage records `unanswered` (O09).
 
 **Fail closed.** A stage that cannot verify what it did, a read that fails, an answer in another shape, a bound
 reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, with the record of the stages so far

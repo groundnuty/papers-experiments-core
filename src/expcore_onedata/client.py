@@ -1490,9 +1490,11 @@ class OnezoneClient:
         reset's, own space) the target must be that space alone: its id, its name, and its own prefixes.
 
         `gate_retry` is the policy of the gate's own reads, the ones that find the target's space, and of those alone:
-        a read that timed out is tried again under it (`readretry.py`), each attempt answered is read afresh, and after
-        the last timeout the target is unread and nothing is sent (`ScopeUnread`). The request itself is sent once,
-        whatever the policy, and a caller that measures the platform leaves the default, one attempt.
+        a read that timed out (or, under a reset's policy, failed to connect) is tried again under it (`readretry.py`),
+        each attempt answered is read afresh, and after the last failed attempt the target is unread and nothing is
+        sent (`ScopeUnread`). The request itself is sent once, whatever the policy, and a caller that measures the
+        platform leaves the default, one attempt; one whose answer is lost is the caller's to judge, never to send
+        again blindly (`sent_unanswered`).
 
         With `fresh` the request goes on a connection of its own, opened for it by a one-shot client built as the pool's
         is (the same `[tls]`) and closed when the answer is in, never on an idle connection of the pool: a write of a
