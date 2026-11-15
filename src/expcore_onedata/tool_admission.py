@@ -14,7 +14,7 @@ outage run, which needs it exclusively, never overlaps one; and the same turnsti
 outage run out for ever. What it does around that:
 
 - **It waits for an outage run in progress, within a bound** (`timeout_s`, by default `[faults] admission_timeout_s`;
-  `timeout_s=0` tries once), and past the bound is refused as `FederationBusy`, an `injector_failure`.
+  `timeout_s=0` tries once), and past the bound is refused as `FederationBusy`, the hold `federation_busy`.
 - **It is refused, under the lock, when the federation is not in its baseline state:** an injection the fault journal
   holds open (a provider may be down), a fault journal or a record of the tools' holds that cannot be read, and, for
   the `ingest_journals` it is given, a preallocated ingest's baseline that is not whole

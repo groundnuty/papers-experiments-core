@@ -7,7 +7,8 @@ import dataclasses
 import pytest
 from qos_world import FILES, calls, federation, provisioner_with, two_providers
 
-from expcore_onedata.reset import SpaceReset
+from expcore_onedata import resetqos
+from expcore_onedata.reset import ResetFailed, SpaceReset
 from expcore_onedata.testing import BETA_ID, DATA, write_platform
 
 
@@ -55,6 +56,39 @@ def test_o46_a_provider_declared_never_to_hold_has_no_file_read_and_the_counter_
     reset = SpaceReset(listing, now=ticker.clock)
     assert reset.plan_scan(never_holds=["beta"]).held == {}
     assert len(reset.plan_scan().held["beta"]) == len(FILES)
+
+
+def test_o46_a_file_a_providers_own_listing_missed_is_still_read_there_by_the_planner(
+    monkeypatch, listing, fake, ticker
+):
+    """O51: the planner reads every regular file any provider's listing showed at each provider that can hold the
+    space's bytes, as the occupancy does, so a file beta's own listing missed, which beta holds, is in beta's plan."""
+    missed = fake.id_of(FILES[4])
+    original = resetqos.listed
+
+    def listed(p, provider):
+        entries, pages = original(p, provider)
+        return ({k: v for k, v in entries.items() if provider != "beta" or k != missed}, pages)
+
+    monkeypatch.setattr(resetqos, "listed", listed)
+    holdings = SpaceReset(listing, now=ticker.clock).plan_scan()
+    assert holdings.held["beta"][missed] == len(DATA)
+    assert FILES[4] in holdings.plan()["beta"]
+
+
+def test_o46_a_hard_link_is_named_in_no_plan_and_the_occupancy_still_refuses_its_bytes(listing, fake, ticker):
+    """O51: a hard link beta holds bytes of is not in the planner's plan, whose paths are the regular files'; the
+    reset given the reading still reads the link at the occupancy stage and fails on its bytes, saying so (O46)."""
+    link = fake._create(fake.id_of("study"), "link.bin", "LNK")
+    fake.nodes[link].content = bytearray(DATA)
+    fake.blocks[(link, BETA_ID)] = [[0, len(DATA)]]
+    reset = SpaceReset(listing, now=ticker.clock)
+    holdings = reset.plan_scan()
+    assert link not in holdings.held["beta"]
+    assert holdings.plan() == {"beta": sorted(FILES)}
+    with pytest.raises(ResetFailed, match=r"occupancy stage") as caught:
+        reset.run(holdings.plan(), planned=holdings, qos_rights=False)
+    assert f"{len(DATA)} bytes of it are in hard link(s)" in str(caught.value)
 
 
 def test_o33_a_reset_given_the_planners_reading_lists_the_space_no_second_time(listing, fake, ticker):

@@ -110,7 +110,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.occupancy import Reading
+from expcore_onedata.occupancy import Listing, Reading
 from expcore_onedata.placement import Range, held_bytes, merged
 from expcore_onedata.provision import Listings, Provisioner, ProvisionError
 from expcore_onedata.transferrecord import Unreadable
@@ -152,17 +152,17 @@ class Found:
     """What a scan found: each requirement with the provider that showed it first, the regular files each applies to,
     each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, the
     depth of the deepest regular file of the space it saw (0 when it saw none), and the ids of the regular files
-    (`REG`) each provider's listing showed, the files the occupancy stage reads the block maps of there (O46); the last
-    two cost no read of their own. A scan also names the space and the providers it read by their Onezone ids, never a
-    position a configuration gives, so a reset given it refuses one of another space or of other providers, and the
-    listing gives each regular file's path relative to the root (`paths`, empty for `summaries`), which a planner names
-    its eviction plan by (`resetplan.py`)."""
+    (`REG`) and hard links (`LNK`) any provider's listing showed, the files the occupancy reads the block maps of at
+    every provider (O46); the last two cost no read of their own. A scan also names the space and the providers it read
+    by their Onezone ids, never a position a configuration gives, so a reset given it refuses one of another space or of
+    other providers, and the listing gives each regular file's path relative to the root (`paths`, empty for
+    `summaries`), which a planner names its eviction plan by (`resetplan.py`)."""
 
     where: dict[str, str]
     files: dict[str, dict[str, int]]
     reads: dict[str, int] = field(default_factory=dict)
     deepest: int = 0
-    regular: dict[str, frozenset[str]] = field(default_factory=dict)
+    listing: Listing = field(default_factory=Listing)
     space: str = ""  # the space's Onezone id
     providers: tuple[tuple[str, str], ...] = ()  # each provider read, (name, Onezone id), in order
     paths: dict[str, str] = field(default_factory=dict)
@@ -218,12 +218,15 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
     """Every requirement any provider's summaries show: on each provider, the root's and every leaf's."""
     where: dict[str, str] = {}
     files: dict[str, dict[str, int]] = {}
-    regular: dict[str, frozenset[str]] = {}
+    listing = Listing()
     read, deepest = 0, 0
     for provider in providers:
         root, leaves = tree(p, provider)
         deepest = max([deepest, *(depth for _, kind, depth in leaves if kind != "DIR")])
-        regular[provider] = frozenset(file_id for file_id, kind, _ in leaves if kind == "REG")
+        listing |= Listing(
+            frozenset(file_id for file_id, kind, _ in leaves if kind == "REG"),
+            frozenset(file_id for file_id, kind, _ in leaves if kind == "LNK"),
+        )
         entries = [root, *(file_id for file_id, _, _ in leaves)]
         summaries = consistency.bounded_map(lambda f, q=provider: _summary(p, f, q), entries, p.settings.concurrency)
         for qid in sorted(set().union(*summaries)):
@@ -233,20 +236,20 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
                 files.setdefault(qid, {})[file_id] = depth
         read += len(entries)
     found = {q: files.get(q, {}) for q in where}
-    return Found(where, found, {"summaries": read}, deepest, regular, p.space_id, _ids(p, providers))
+    return Found(where, found, {"summaries": read}, deepest, listing, p.space_id, _ids(p, providers))
 
 
 @dataclass(frozen=True)
 class Listed:
     """One entry of the recursive listing: its id, its path relative to the space root ("." for the root), whether
-    it is a directory, its `effQosInheritancePath`, and whether it is a regular file (`REG`). `listed` reads them for
-    one provider; the QoS scan and a reset planner share one reading (`resetplan.py`)."""
+    it is a directory, its `effQosInheritancePath`, and its type (`REG`, `LNK`, ...). `listed` reads them for one
+    provider; the QoS scan and a reset planner share one reading (`resetplan.py`)."""
 
     file_id: str
     path: str
     directory: bool
     inheritance: str
-    regular: bool = False
+    kind: str = ""
 
 
 def _listing_page(p: Provisioner, provider: str, root: str, token: str | None) -> tuple[list[Listed], str | None]:
@@ -283,7 +286,7 @@ def _entries_of(answer: Any) -> tuple[list[Listed], str | None]:
             raise Unreadable("an entry of the recursive listing has no plain fileId or no path")
         if inheritance not in INHERITANCE or not isinstance(kind, str):
             raise Unreadable("an entry of the recursive listing has no effQosInheritancePath or no type")
-        entries.append(Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance, kind == "REG"))
+        entries.append(Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance, kind))
     return entries, token
 
 
@@ -356,9 +359,12 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
         "records": len(qids),
     }
     deepest = max((len(e.path.split("/")) for e in entries.values() if not e.directory), default=0)
-    regular = {provider: frozenset(e.file_id for e in found.values() if e.regular) for provider, found, _ in listings}
-    paths = {e.file_id: e.path for e in entries.values() if e.regular}
-    return Found(where, files, reads, deepest, regular, p.space_id, _ids(p, providers), paths)
+    listing = Listing(
+        frozenset(e.file_id for e in entries.values() if e.kind == "REG"),
+        frozenset(e.file_id for e in entries.values() if e.kind == "LNK"),
+    )
+    paths = {e.file_id: e.path for e in entries.values() if e.kind == "REG"}
+    return Found(where, files, reads, deepest, listing, p.space_id, _ids(p, providers), paths)
 
 
 def scan(p: Provisioner, providers: Sequence[str]) -> Found:

@@ -19,28 +19,33 @@ them for two uses: a provider declared never to hold whose counter reads 0 has n
 each provider whose files were read and whose counter differs from their sum, higher or lower, gives an event
 (`COUNTER_DISAGREES`) with both figures.
 
-**Which files.** The regular files (`REG`) the reset's QoS scan listed on that provider (`resetqos.Found.regular`), so
-the files cost no listing of their own; a provider the scan did not list has every file any listing showed read.
-Nothing but the reset acts on the space between its stages (`consistency.guard`), so a file created after the scan is
-not looked for. What no listing shows, the trash and a deleted file still open, is not read; the counter may count
-it, and the event then shows the gap.
+**Which files.** Every regular file (`REG`) and hard link (`LNK`) any provider's listing showed the reset's QoS
+scan, both scans when it ran two (`Listing`, `resetqos.Found.listing`), is read at every such provider, so a file one
+provider's listing missed is still read there, and the files cost no listing of their own; a provider that answers it
+has no such file (`client.answered_absent`) holds none of it. A hard link shares its target's blocks under its own id,
+so it is counted on its own: a provider whose files hold more than allowed with bytes in a hard link is refused with
+that said, since a link and its target may count the same bytes twice (fail-closed). Nothing but the reset acts on the
+space between its stages (`consistency.guard`), so a file created after the scan is not looked for. What no listing
+shows, the trash and a deleted file still open (the space's tmp directory), is not read; the counter may count it
+(the trash's, not the tmp directory's, by the source), and the event then shows the gap.
 
-**Bounded.** The reads go `[placement] concurrency` at a time, at most `READS_MAX` in one reading, within
-`READ_BOUND_S`; past either the reading fails, closed, with the figures, never falling back on the counter.
+**Bounded.** The reads go `[placement] concurrency` at a time, at most `READS_MAX` in one reading, its calls together,
+within `READ_BOUND_S`, looked at after every batch; past either the reading fails, closed, with the figures, never
+falling back on the counter.
 
 The counter is read only once no transfer runs on any provider (the caller makes sure, `reset.py`). Anything unknown
 raises, never a zero: a provider the answer leaves out or marks failed, a backend that failed (directory statistics
 turned off for the space answers so), a size that is not a whole number of bytes, or a block map that cannot be read.
-A provider no declaration fits that holds bytes of the space by the counter is refused too: there is no provider to
-read its files on.
+A provider no declaration fits that supports the space is refused too, whatever its counter says: there is no
+declared provider to read its files on.
 """
 
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from expcore_onedata import consistency
-from expcore_onedata.client import PlatformError
+from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.placement import held_bytes, merged
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
@@ -73,12 +78,17 @@ def _physical(entry: Any) -> int:
 
 
 def physical_sizes(
-    provisioner: Provisioner, providers: Sequence[str], *, retry: ReadRetry = ONE_ATTEMPT
+    provisioner: Provisioner,
+    providers: Sequence[str],
+    *,
+    retry: ReadRetry = ONE_ATTEMPT,
+    undeclared_ok: bool = True,
 ) -> dict[str, int]:
     """Return each declared provider's physical bytes of the provisioner's space by the counter, from one read of its
     root's distribution on the data provider; `providers` must all be in the answer. Raise Unreadable for anything
-    unknown, and ProvisionError when an undeclared provider holds bytes. The read that timed out is tried again under
-    `retry`, the policy of a caller that reads it as plumbing (the reset); by default it is one attempt (O29)."""
+    unknown, and ProvisionError when an undeclared provider holds bytes, or, without `undeclared_ok`, is in the answer
+    at all. The read that timed out is tried again under `retry`, the policy of a caller that reads it as plumbing (the
+    reset); by default it is one attempt (O29)."""
     root = provisioner.root()
     answer = provisioner.client.get(f"/data/{root}/distribution", provider=provisioner.settings.holder, retry=retry)
     per = answer.get("distributionPerProvider") if isinstance(answer, Mapping) else None
@@ -91,6 +101,11 @@ def physical_sizes(
         if name is None:
             if size:
                 raise ProvisionError("a provider no declaration fits holds bytes of the space")
+            if not undeclared_ok:
+                raise ProvisionError(
+                    "a provider no declaration fits supports the space: its files cannot be read there, and the "
+                    "directory statistics alone are no verdict"
+                )
             continue
         sizes[name] = size
     missing = [provisioner.client.provider_label(p) for p in providers if p not in sizes]
@@ -100,12 +115,29 @@ def physical_sizes(
 
 
 @dataclass(frozen=True)
+class Listing:
+    """The ids of the regular files (`REG`) and of the hard links (`LNK`) of the space that any provider's listing
+    showed the reset's QoS scan: what the occupancy reads at every provider that can hold the space's bytes (O46)."""
+
+    regular: frozenset[str] = frozenset()
+    links: frozenset[str] = frozenset()
+
+    def __or__(self, other: "Listing") -> "Listing":
+        return Listing(self.regular | other.regular, self.links | other.links)
+
+    def ids(self) -> list[str]:
+        """Every id to read, sorted: a file's position in this list is how a message names it."""
+        return sorted(self.regular | self.links)
+
+
+@dataclass(frozen=True)
 class Reading:
-    """One reading of the occupancy: the counter per provider, and the bytes each file's block map holds at each
-    provider whose files were read (file id to bytes)."""
+    """One reading of the occupancy: the counter per provider, the bytes each file's block map holds at each
+    provider whose files were read (file id to bytes), and which of the ids are hard links."""
 
     counter: dict[str, int]
     files: dict[str, dict[str, int]]
+    links: frozenset[str] = frozenset()
 
     def held(self, provider: str) -> int:
         """What a provider holds of the space by its files, 0 for one whose files were not read (the fast path)."""
@@ -138,34 +170,41 @@ class OccupancyExceeded(ProvisionError):
         self.facts = facts
 
 
-def _files_at(regular: Mapping[str, Collection[str]], provider: str) -> list[str]:
-    """The files to read at a provider: those its own listing showed, or every listed file when it was not listed."""
-    ids = regular[provider] if provider in regular else set().union(*regular.values())
-    return sorted(ids)
+@dataclass
+class Budget:
+    """What one reading has spent of its bounds: when it began, and the block-map reads it has made, every call
+    together. Mutable on purpose: the calls of one reading share it."""
+
+    began: float
+    reads: int = field(default=0)
 
 
-def read_files(p: Provisioner, wanted: Mapping[str, Sequence[str]], label: Label) -> dict[str, dict[str, int]]:
+def read_files(
+    p: Provisioner, wanted: Mapping[str, Sequence[str]], label: Label, budget: Budget
+) -> dict[str, dict[str, int]]:
     """The bytes each file's block map holds at each provider, read there, `concurrency` at a time; raise
-    ProvisionError, closed and with the figures, past `READS_MAX` reads or `READ_BOUND_S`."""
+    ProvisionError, closed and with the figures, when the reading's reads would pass `READS_MAX` or its time
+    `READ_BOUND_S`, which is looked at after every batch, the last included."""
     pairs = [(file_id, provider, i) for provider, ids in wanted.items() for i, file_id in enumerate(ids)]
     where = ", ".join(f"{label(q)}: {len(ids)} file(s)" for q, ids in wanted.items())
-    if len(pairs) > READS_MAX:
+    if budget.reads + len(pairs) > READS_MAX:
         raise ProvisionError(
-            f"the occupancy's per-file reading needs {len(pairs)} block-map read(s), past its budget of {READS_MAX} "
-            f"({where}); the directory statistics alone are no verdict"
+            f"the occupancy's per-file reading needs {budget.reads + len(pairs)} block-map read(s), past its budget of "
+            f"{READS_MAX} ({where}); the directory statistics alone are no verdict"
         )
-    began, step = p.clock(), max(1, p.settings.concurrency) * ROUND
+    budget.reads += len(pairs)
+    step = max(1, p.settings.concurrency) * ROUND
     held: dict[str, dict[str, int]] = {provider: {} for provider in wanted}  # filled in place: the reading it returns
     for start in range(0, len(pairs), step):
-        if p.clock() - began > READ_BOUND_S:
-            raise ProvisionError(
-                f"the occupancy's per-file reading read {start} of {len(pairs)} block map(s) in {READ_BOUND_S:.0f} s, "
-                f"its bound ({where}); the directory statistics alone are no verdict"
-            )
         chunk = pairs[start : start + step]
         sizes = consistency.bounded_map(lambda key: _held(p, key, label), chunk, p.settings.concurrency)
         for (file_id, provider, _), size in zip(chunk, sizes, strict=True):
             held[provider][file_id] = size
+        if p.clock() - budget.began > READ_BOUND_S:
+            raise ProvisionError(
+                f"the occupancy's per-file reading had read {start + len(chunk)} of {len(pairs)} block map(s) past its "
+                f"bound of {READ_BOUND_S:.0f} s ({where}); the directory statistics alone are no verdict"
+            )
     return held
 
 
@@ -177,6 +216,8 @@ def _held(p: Provisioner, key: tuple[str, str, int], label: Label) -> int:
     try:
         return held_bytes(merged(p.blocks(file_id, provider, retry=p.retry)))
     except PlatformError as error:
+        if answered_absent(error):
+            return 0  # the provider has no such file, as one another listing showed but this one has not met yet
         raise Unreadable(
             f"the block map of files[{index}] at {label(provider)} is unknown ({error}): the occupancy's per-file "
             "reading has no verdict, and the directory statistics alone are none"
@@ -185,22 +226,24 @@ def _held(p: Provisioner, key: tuple[str, str, int], label: Label) -> int:
 
 def holdings(
     p: Provisioner,
-    regular: Mapping[str, Collection[str]],
+    listing: Listing,
     never_holds: Collection[str],
     *,
     providers: Sequence[str],
     label: Label,
     retry: ReadRetry = ONE_ATTEMPT,
 ) -> Reading:
-    """Read the occupancy: the block maps of every regular file at each provider of the space other than the data
-    provider and those in `never_holds`, then the counter (`physical_sizes` over `providers`), then the files of each
-    other provider the counter credits with bytes, a provider in `never_holds` among them."""
-    holder = p.settings.holder
-    can_hold = [q for q in p.space.support.providers if q != holder and q not in never_holds]
-    files = read_files(p, {q: _files_at(regular, q) for q in can_hold}, label)
-    counter = physical_sizes(p, providers, retry=retry)
-    credited = [q for q, size in counter.items() if q != holder and q not in files and size > 0]
-    return Reading(counter, {**files, **read_files(p, {q: _files_at(regular, q) for q in credited}, label)})
+    """Read the occupancy: the block map of every listed file at each provider of the space other than the data
+    provider and those in `never_holds`, then the counter (`physical_sizes` over `providers`, an undeclared provider in
+    it refused), then the files of every other provider but those in `never_holds` whose counter reads an explicit 0:
+    one the counter leaves out, or credits with bytes, is read too. One budget covers the reading."""
+    holder, ids, budget = p.settings.holder, listing.ids(), Budget(p.clock())
+    support = [q for q in p.space.support.providers if q != holder]
+    files = read_files(p, {q: ids for q in support if q not in never_holds}, label, budget)
+    counter = physical_sizes(p, providers, retry=retry, undeclared_ok=False)
+    skipped = {q for q in never_holds if counter.get(q) == 0}  # the only fast path: a 0 read, never a gap
+    rest = [q for q in dict.fromkeys([*support, *counter]) if q != holder and q not in files and q not in skipped]
+    return Reading(counter, {**files, **read_files(p, dict.fromkeys(rest, ids), label, budget)}, listing.links)
 
 
 def judge(reading: Reading, allowed: Mapping[str, int], label: Label) -> None:
@@ -215,12 +258,25 @@ def judge(reading: Reading, allowed: Mapping[str, int], label: Label) -> None:
     for q in over:
         files = {f"files[{i}]": n for i, (_, n) in enumerate(sorted(reading.files[q].items())) if n}
         held, bound, counter = reading.held(q), allowed.get(q, 0), reading.counter.get(q)
-        details[label(q)] = {"files_bytes": held, "allowed_bytes": bound, "counter_bytes": counter, "files": files}
+        linked = sum(n for file_id, n in reading.files[q].items() if file_id in reading.links)
+        details[label(q)] = {
+            "files_bytes": held,
+            "allowed_bytes": bound,
+            "counter_bytes": counter,
+            "links_bytes": linked,
+            "files": files,
+        }
         shown = ", ".join(f"{name} {n} bytes" for name, n in list(files.items())[:SHOWN])
         more = f", and {len(files) - SHOWN} more" if len(files) > SHOWN else ""
+        links = (
+            f"; {linked} bytes of it are in hard link(s), each counted on its own, so a link and its target may count "
+            "the same bytes twice"
+            if linked
+            else ""
+        )
         parts.append(
             f"{label(q)} holds {held} bytes of the space in {len(files)} file(s), beyond what the reset allows "
-            f"({bound} bytes; the space root's directory statistics read {counter} bytes): {shown}{more}"
+            f"({bound} bytes; the space root's directory statistics read {counter} bytes): {shown}{more}{links}"
         )
     raise OccupancyExceeded("; ".join(parts), {**reading.facts(label), "over": details})
 
@@ -229,6 +285,8 @@ __all__ = [
     "COUNTER_DISAGREES",
     "READS_MAX",
     "READ_BOUND_S",
+    "Budget",
+    "Listing",
     "OccupancyExceeded",
     "Reading",
     "holdings",
