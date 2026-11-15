@@ -24,7 +24,7 @@ it opens, so a restart in the outage restores it (`restarts` counts those) and t
 and, when a failed answer of the outage led with a reason only an operator can end (`deferral.operator_reason`),
 `"operator_reason"`: the latest such reason, kept apart because the passing check that opens the gate overwrites
 `last_detail` and an ordinary failure can be followed by one (a heal the dispatcher's own check began failed). The
-status's alarms, the hold the run says and the export's `operator_holds` read it.
+export's `operator_holds` reads it; the status's alarms and the hold the run says read the open outage's latest detail.
 
 **A gate state that cannot be read at a restart opens closed**: whether the platform is up is then unknown, and the
 first passing check ends it. Nothing is charged for a restart. A restored outage that was blocking does not block
