@@ -26,6 +26,8 @@ from expcore_onedata.testing import ALPHA_ID, BETA_ID
 from expcore_onedata.transferrecord import CONFLICTING, job_of, record_of, state_of
 from expcore_onedata.transferwindow import FINAL_STATES
 
+REPLICATED = statuses(LIVE_REPLICATION)  # the live ended replication's status fields
+
 # Each phase of each kind as op-worker f118ed9 records it: (kind, transferStatus, replicationStatus, evictionStatus,
 # the state the job is in). `transferStatus` is `transfer:status/1` (`transfer.erl:474-495`): `active` reads
 # `replicating` or `evicting`, and a migration whose replication completed reads its eviction's. A migration replicates
@@ -167,7 +169,7 @@ def test_o32_the_consistency_waits_read_the_state_as_the_transfer_log_does(
 
 
 @pytest.mark.parametrize(
-    ("kind", "statuses"),
+    ("kind", "fields"),
     [
         pytest.param(
             "replication",
@@ -254,15 +256,41 @@ def test_o32_the_consistency_waits_read_the_state_as_the_transfer_log_does(
             {"replicationStatus": "skipped", "evictionStatus": "completed", "transferStatus": 3},
             id="a summary that is no string",
         ),
+        pytest.param(
+            "replication",
+            {**REPLICATED, "evictingProviderId": ALPHA_ID},
+            id="a replication's record that names an evicting provider, a migration's",
+        ),
+        pytest.param(
+            "replication",
+            {**REPLICATED, "replicatingProviderId": None},
+            id="a replication's record that names no replicating provider",
+        ),
+        pytest.param(
+            "eviction",
+            {**statuses(EVICTION_ENDED), "replicatingProviderId": BETA_ID},
+            id="an eviction's record that names a replicating provider",
+        ),
+        pytest.param(
+            "migration",
+            {**statuses(MIGRATION_ENDED), "evictingProviderId": None},
+            id="a migration's record that names no evicting provider, a replication's",
+        ),
+        pytest.param(
+            "migration",
+            {**statuses(MIGRATION_ENDED), "replicatingProviderId": ""},
+            id="a migration's record whose replicating provider is empty",
+        ),
     ],
 )
-def test_o32_status_fields_that_contradict_each_other_read_conflicting_never_final(kind, statuses):
+def test_o32_status_fields_that_contradict_each_other_read_conflicting_never_final(kind, fields):
     """O32: a contradiction is still one: a summary that disagrees with the half the job is in, a half the job does not
     do that is not `skipped`, the half it does marked `skipped`, a migration whose replication failed but whose eviction
-    completed (op-worker fails both halves, `replication_status.erl:244-258`), and a field that cannot be read."""
-    assert state_of(record(kind, statuses)) == CONFLICTING
+    completed (op-worker fails both halves, `replication_status.erl:244-258`), a field that cannot be read, and provider
+    ids that name another kind than the record's `type`, which op-worker derives from them (`transfer.erl:397-403`)."""
+    assert state_of(record(kind, fields)) == CONFLICTING
     assert CONFLICTING not in FINAL_STATES
-    assert transfer_state(record(kind, statuses)) not in ENDED_STATES
+    assert transfer_state(record(kind, fields)) not in ENDED_STATES
 
 
 @pytest.mark.parametrize(
@@ -292,7 +320,7 @@ def test_o32_status_fields_that_contradict_each_other_read_conflicting_never_fin
         ),
     ],
 )
-def test_o32_a_missing_half_never_makes_a_job_read_final(kind, statuses, expected):
+def test_o32_a_missing_half_the_state_rests_on_never_reads_final(kind, statuses, expected):
     """O32: a half the job does not do may be absent, as in the fake's records. A half the state comes from may not: a
     migration whose other half is not in the record is not final, nor is a record that holds only the half its job
     does not do."""
@@ -346,3 +374,10 @@ def test_o32_a_record_of_no_known_type_is_final_only_when_every_status_field_agr
     as before; `job_of` refuses such a record anyway, and the walk of the ended listing keeps it, which fails closed."""
     assert state_of({"type": "copy", **statuses}) == expected
     assert state_of(dict(statuses)) == expected
+
+
+def test_o32_a_provider_id_the_record_does_not_carry_is_not_checked():
+    """O32: the kind's provider ids are checked against its `type` only where the record carries them; a record that
+    names neither is read from its halves."""
+    assert state_of({"type": "replication", **REPLICATED}) == "completed"
+    assert state_of({"type": "eviction", **statuses(EVICTION_ENDED)}) == "completed"

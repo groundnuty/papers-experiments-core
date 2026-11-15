@@ -47,6 +47,9 @@ _STATE_KEYS = (*_SUMMARIES, _REPLICATION, _EVICTION)
 SKIPPED = "skipped"  # a half the job does not do, from its creation on (op-worker f118ed9, `transfer.erl:157-166`)
 _HALF_ENDED = frozenset({"completed", "failed", "cancelled", SKIPPED})  # a half that ended: `transfer.erl:443-455`
 _HALF_WAITING = frozenset({"scheduled", "enqueued", "active"})  # an eviction a migration's summary reads `evicting`
+_PROVIDER_KEYS = ("replicatingProviderId", "evictingProviderId")
+# Which of the two provider ids each kind names: op-worker derives a record's `type` from them (`transfer.erl:397-403`).
+_NAMED = {"replication": (True, False), "eviction": (False, True), "migration": (True, True)}
 
 
 class Unreadable(ValueError):
@@ -136,8 +139,11 @@ def _state(body: Mapping[str, Any]) -> str | None:
 
     The record's summary, `transferStatus` (and `transferState`, which 25.0 does not give), is op-worker's own reading
     of the halves, so a summary other than the one the halves give is a contradiction (`_summary`). A record that
-    carries no half is read from its summary alone. A record whose `type` is none of the three has no half its job does
-    not do, so every status field it carries must say the same; `job_of` refuses such a record anyway.
+    carries no half is read from its summary alone. A record whose provider ids name another kind than its `type` is a
+    contradiction too, since op-worker derives the type from them (a `type` of replication beside an
+    `evictingProviderId` is a migration's record); an id the record does not carry is not checked. A record whose
+    `type` is none of the three has no half its job does not do, so every status field it carries must say the same;
+    `job_of` refuses such a record anyway.
 
     `effectiveJobStatus` is not read: it is the summary of the newest job in the record's chain of reruns
     (`transfer_rest_translator.erl:78-88,123`; `transfer.erl:303-318`), another job, with its own id, record and
@@ -148,6 +154,9 @@ def _state(body: Mapping[str, Any]) -> str | None:
     kind = body.get("type")
     if kind not in TYPES:
         return _agreed(present.values())
+    named = (isinstance(body.get(key), str) and bool(body.get(key)) for key in _PROVIDER_KEYS)
+    if any(key in body and n is not want for key, n, want in zip(_PROVIDER_KEYS, named, _NAMED[kind], strict=True)):
+        return CONFLICTING
     replication, eviction = present.get(_REPLICATION), present.get(_EVICTION)
     summaries = [present[key] for key in _SUMMARIES if key in present]
     if replication is None and eviction is None:
