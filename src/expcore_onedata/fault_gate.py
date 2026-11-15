@@ -286,11 +286,12 @@ class FaultGate:
         """The check under the caller's admission, a share of it kept until the check ends: a check that outlives its
         caller's wait (the core gives up on it, and the run lets its admission go) still holds the federation while it
         reads, so no heal's admission is granted under it, and no shortcut section of the run can seal the admission
-        while the check reads a study's file. An admission already being let go fails it closed; one the run's own
-        shortcut reset holds (its section sealed it, or its share of the reset lock is given up) defers the check,
-        uncharged."""
+        while the check reads a study's file. An admission already let go fails it closed; one still held of which no
+        share may act (the run's own shortcut section sealed it, or its share of the reset lock is given up, or its
+        last share is being given up) defers the check, uncharged. Whether it is held is read after the refusal, and
+        a lock let go is never held again, so a section that ends meanwhile never turns the deferral into a failure."""
         give_up = held.try_retain()
-        if give_up is None and not held.shares.sealed:
+        if give_up is None and not held.held:
             return Health(
                 False, "the run's admission was let go before its check could hold it, so nothing was checked"
             )
