@@ -521,6 +521,79 @@ def test_c34_a_schema_cut_to_the_kind_names_alone_loses_the_target_and_is_refuse
     assert FactorSchema(base.declared, base.order, base.conditions, treatment=kept).digest == schema.digest
 
 
+def test_c37_a_schema_rebuilt_from_its_parts_is_the_schema_and_holds_every_rule_again(registry):
+    """C37: `rebuilt` runs the constructor over the schema's own parts, so a schema is checked again against the
+    vocabulary in scope now and against the rules of the constructor, and a valid one is the schema it was: the same
+    digest, the same targets, the same tasks and exclusive conditions. One whose parts were edited after it was built
+    is refused as a schema built that way would be."""
+    errors.register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    base = chain_schema()
+    declared = {"api-none": ["endpoint", {"kind": "provider_down", "target": "providers[1]"}]}
+    schema = FactorSchema(
+        base.declared,
+        base.order,
+        base.conditions,
+        treatment=declared,
+        tasks={name: tasks for name, tasks in base.condition_tasks.items() if tasks is not None},
+        exclusive={"api-none": True},
+    )
+    again = schema.rebuilt()
+    assert again is not schema
+    assert again.digest == schema.digest
+    assert again.treatment_targets == schema.treatment_targets
+    assert again.condition_tasks == schema.condition_tasks
+    assert again.exclusive == schema.exclusive
+    schema.treatment_targets["api-none"] = {}  # edited after it was built: the targeted kind is now a plain name
+    with pytest.raises(ConfigError, match=r"\[conditions\.api-none\]: key 'infrastructure_is_treatment'.*no target"):
+        schema.rebuilt()
+
+
+def test_c37_a_schema_whose_conditions_were_swapped_after_it_was_built_is_refused_not_rebuilt_around():
+    """C37: a run key resolves to its condition by a lookup built with the schema. Swapping the levels of two conditions
+    afterwards leaves a lookup that gives each key the other's treatment kinds, which a rebuild that only checked the
+    parts would accept; the schema is refused, naming the file and the schema."""
+    schema = make_schema()
+    key = schema.expand(["task-a"], ["m1"], [1])[0]
+    before = schema.condition_of(key)
+    schema.conditions["mount-read"], schema.conditions["api-none"] = (
+        schema.conditions["api-none"],
+        schema.conditions["mount-read"],
+    )
+    assert schema.condition_of(key) == before  # the stale lookup still answers, which is the hazard
+    with pytest.raises(ConfigError, match=r"the schema: no longer matches .*\(its lookup of a condition by its levels"):
+        schema.rebuilt()
+
+
+@pytest.mark.parametrize(
+    ("deleted", "label"),
+    [
+        ("treatment_kinds", "its treatment kinds"),
+        ("treatment_targets", "its treatment targets"),
+        ("condition_tasks", "its condition tasks"),
+        ("exclusive", "its exclusive conditions"),
+    ],
+)
+def test_c37_a_schema_with_a_condition_deleted_from_one_of_its_parts_is_refused_not_given_the_default(deleted, label):
+    """C37: a rebuild gives a condition missing from a part the default the constructor gives, which would equal the
+    digest, while the schema's own accessors would raise KeyError for that condition's run keys at run time; the
+    schema is refused naming the part that differs."""
+    schema = chain_schema()
+    assert schema.digest  # taken before the edit
+    del getattr(schema, deleted)["download-write"]
+    with pytest.raises(ConfigError, match=rf"the schema: no longer matches .*\({label} differs\)"):
+        schema.rebuilt()
+
+
+def test_c37_a_schema_edited_after_its_digest_was_taken_is_refused():
+    """C37: the digest is taken once and is what the campaign fingerprint holds, so a schema edited after it was taken
+    no longer is what its digest says, and is refused."""
+    schema = make_schema()
+    assert schema.digest == schema.rebuilt().digest  # taken, and unchanged by a rebuild
+    schema.exclusive["api-none"] = True  # a valid edit, which the cached digest does not show
+    with pytest.raises(ConfigError, match=r"the schema: no longer matches its digest"):
+        schema.rebuilt()
+
+
 def test_c34_a_study_s_own_kind_named_provider_outage_is_held_to_a_target_too(tmp_path, registry):
     """C34: in a process that never imported the platform, a study that declares a kind named `provider_outage` of its
     own in `[study.kinds]` is held to the same rule: its plain name is refused, and no outage is scored as its
