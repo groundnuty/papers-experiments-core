@@ -1130,6 +1130,8 @@ else:
     raise AssertionError("the check should have refused")
 ```
 
+A class that wraps an instrument passes both methods on, or it drops them without a word. The core finds `at_first_turn` and `check` by name on the object it is given, so a wrapper that forwards `start` and `finish` only hides the wrapped instrument's refusal, and the attempt is scored. `expcore.records.instruments.OPTIONAL_HOOKS` lists the names, and `missing_hooks(wrapper, wrapped)` returns the ones a wrapper lacks, so a test of your wrapper can assert `missing_hooks(wrapper, wrapped) == ()` ([the wrapper rule](interfaces.md#a-class-that-wraps-an-instrument)).
+
 [`interfaces.md`](interfaces.md#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check) says when each runs, what it may do and how a failure is classified.
 
 ### Data that arrives during a run
