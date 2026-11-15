@@ -270,6 +270,20 @@ def test_o36_the_command_refuses_settings_that_would_give_oneclient_two_force_op
         C.sidecar_command("p.test", dataclasses.replace(s, mount=mount))
 
 
+@pytest.mark.parametrize("mode", ["proxy", "direct"])
+@pytest.mark.parametrize("argument", ["--disable-log-buffering", "--disable-log", "--disable-log-buffering=1"])
+def test_o54_the_command_refuses_a_second_log_switch_in_either_mode(s, mode, argument):
+    """O54: the sidecar passes `--disable-log-buffering` itself, in either mode, and oneclient refuses a switch given
+    twice: settings whose mount was set past its own check still never yield an argv with a second one."""
+    mount = dataclasses.replace(with_io_mode(s, mode).mount)
+    object.__setattr__(mount, "extra_args", (argument,))
+    broken = dataclasses.replace(s, mount=mount)
+    with pytest.raises(ValueError, match="extra_args"):
+        C.sidecar_command("p.test", broken)
+    with pytest.raises(ValueError, match="extra_args"):
+        C.sidecar_options(broken)
+
+
 def test_o36_a_direct_mount_has_one_force_option_and_the_closed_inputs_of_a_proxy_one(s):
     """O36: a direct mount's command has exactly one force option, the config file and the closed environment, as for
     proxy."""
@@ -319,14 +333,41 @@ def test_o40_each_storage_is_bound_read_only_into_the_sidecar_at_its_place(s, na
     assert not any("/srv/invented" in v for f, v in pairs(args) if f == "-v")
 
 
-def test_o40_a_proxy_mount_binds_no_storage_and_passes_no_override_or_log_switch(s, names):
-    """O40: proxy reads through the provider: the sidecar gets no storage, and oneclient no override and no log
-    switch of the core's."""
+def test_o40_a_proxy_mount_binds_no_storage_and_passes_no_override(s, names):
+    """O40: proxy reads through the provider: the sidecar gets no storage, and oneclient no override."""
     command = C.sidecar_command("p.test", s)
     assert "--override" not in command
-    assert "--disable-log-buffering" not in command
     args = sidecar_args(s, names)
     assert not any(C.DIRECT_STORAGE_ROOT in word for word in args)
+
+
+@pytest.mark.parametrize("mode", ["proxy", "direct"])
+def test_o54_every_mount_passes_the_log_switch_once_so_the_start_lines_are_in_the_log(s, names, mode):
+    """O54: a proxy mount's sidecar passes `--disable-log-buffering` as a direct one's does, exactly once, after
+    `--config /dev/null` and before the study's arguments; oneclient's glog holds INFO lines up to 30 s without it, and
+    the collection that reads the start lines found none, so it set the attempt aside as unknown."""
+    declared = with_io_mode(s, mode, extra_args=("--provider-timeout", "30"))
+    command = C.sidecar_command("p.test", declared)
+    assert command.count("--disable-log-buffering") == 1
+    assert C.sidecar_options(declared).count("--disable-log-buffering") == 1
+    assert command.index("--config") < command.index("--disable-log-buffering") < command.index("--provider-timeout")
+    args = sidecar_args(declared, names)
+    assert args[args.index("-c") + 1 :].count("--disable-log-buffering") == 1
+
+
+def test_o54_the_log_switch_leaves_the_proxy_mounts_privileges_and_data_path_as_they_were(s, names):
+    """O54: the switch is one of oneclient's own arguments and changes only when its INFO lines are written: it is not
+    among docker's options, and the capabilities, devices and security options of the sidecar are those of a direct
+    mount's, which has always passed it; the proxy mount's other oneclient options are as they were."""
+    proxy, direct = sidecar_args(s, names), sidecar_args(with_io_mode(s, "direct"), names)
+    assert "--disable-log-buffering" not in proxy[: proxy.index("-c")]
+    held = {"--cap-add", "--cap-drop", "--device", "--security-opt", "--privileged", "--user", "--network"}
+    assert [(f, v) for f, v in pairs(proxy) if f in held] == [(f, v) for f, v in pairs(direct) if f in held]
+    options = C.sidecar_options(s)
+    assert options == [
+        *("-o", "ro,allow_other", "--force-proxy-io", "--log-dir", C.SIDECAR_LOG_DIR, "--config", "/dev/null"),
+        "--disable-log-buffering",
+    ]
 
 
 def test_o40_the_agent_never_gets_a_storage_in_a_direct_mount(s, names):
