@@ -585,8 +585,8 @@ def _finite(value: Any) -> Any:
     """Reduce a value to JSON data: dataclasses and mappings to dicts, sequences to lists, NaN and infinity to None.
 
     A dataclass field whose metadata sets `OMIT_NONE` is left out while it is None (a ratio contrast's per-arm columns,
-    S13), so a record that declares none is written byte for byte as before the field existed; every other field is
-    written, None as null."""
+    S13; a contrast's smallest effect of interest, S16), so a record that declares none is written byte for byte as
+    before the field existed; every other field is written, None as null."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {
             f.name: _finite(getattr(value, f.name))

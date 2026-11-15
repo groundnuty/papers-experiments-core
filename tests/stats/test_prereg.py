@@ -822,3 +822,55 @@ def test_s14_a_one_arm_estimate_may_not_share_a_contrasts_name_or_join_the_holm_
     family = edited('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["a-vs-b", "waited-in-a"]')
     with pytest.raises(ConfigError, match="names 'waited-in-a', which is not a declared contrast"):
         load(write(tmp_path, family + DESCRIPTIVES))
+
+
+# --- a smallest effect of interest (S16) -----------------------------------------------------------------------------
+
+
+def with_smallest(difference="", ratio=""):
+    """The base text with the ratio contrast appended, `difference` declared on a-vs-b and `ratio` on the ratio."""
+    head = 'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"\n'
+    return edited(head, f"{head}{difference}\n") + RATIO + ratio + "\n"
+
+
+def test_s16_a_smallest_effect_and_a_smallest_ratio_load_with_their_direction(tmp_path):
+    """S16: a difference on the outcome's scale, a ratio as written, compared as its natural log."""
+    text = with_smallest('smallest_effect = 0.1\ndirection = "higher"', "smallest_ratio = 2")
+    contrasts = load(write(tmp_path, text)).contrasts
+    assert (contrasts["a-vs-b"].smallest_effect, contrasts["a-vs-b"].direction) == (0.1, "higher")
+    assert (contrasts["spend-per-win"].smallest_ratio, contrasts["spend-per-win"].direction) == (2, None)
+    assert contrasts["spend-per-win"].smallest_rule.threshold == pytest.approx(0.693147, abs=1e-6)
+    assert contrasts["gate-effect"].smallest_rule is None
+
+
+@pytest.mark.parametrize(
+    ("difference", "ratio", "contrast", "key", "message"),
+    [
+        ("smallest_ratio = 2", "", "a-vs-b", "smallest_ratio", "belongs to a ratio contrast"),
+        ("", "smallest_effect = 0.5", "spend-per-win", "smallest_effect", "belongs to a contrast of one outcome"),
+        ("", "smallest_ratio = 1.0", "spend-per-win", "smallest_ratio", "a factor of one"),
+        ("", "smallest_ratio = 0", "spend-per-win", "smallest_ratio", "positive ratio"),
+        ("", "smallest_ratio = -2", "spend-per-win", "smallest_ratio", "positive ratio"),
+        ("smallest_effect = 0", "", "a-vs-b", "smallest_effect", "must be positive"),
+        ("smallest_effect = -0.1", "", "a-vs-b", "smallest_effect", "must be positive"),
+        ('smallest_effect = "0.1"', "", "a-vs-b", "smallest_effect", "finite number"),
+        ('direction = "higher"', "", "a-vs-b", "direction", "without smallest_effect or smallest_ratio"),
+        ('smallest_effect = 0.1\ndirection = "up"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
+        ('smallest_effect = 0.1\ndirection = "either"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
+        ("", 'smallest_ratio = 0.5\ndirection = "higher"', "spend-per-win", "smallest_ratio", "below 1"),
+    ],
+)
+def test_s16_a_smallest_effect_of_the_wrong_form_or_value_is_refused_naming_the_contrast_and_the_key(
+    tmp_path, difference, ratio, contrast, key, message
+):
+    """S16: the loader refuses what the rule refuses, naming the file, the table and the key."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.{contrast}\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_smallest(difference, ratio)))
+
+
+def test_s16_the_preregistration_hash_covers_a_smallest_effect(tmp_path):
+    """S16, P04: the declaration is in the file, so in the hash every output carries; changing it is another file."""
+    first = load(write(tmp_path, with_smallest("smallest_effect = 0.1")))
+    second = load(write(tmp_path, with_smallest("smallest_effect = 0.2")))
+    third = load(write(tmp_path, with_smallest('smallest_effect = 0.1\ndirection = "lower"')))
+    assert len({first.sha256, second.sha256, third.sha256}) == 3

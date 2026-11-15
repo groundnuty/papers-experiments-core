@@ -43,6 +43,8 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
                                    # treatment attempt scored None is refused without it, and with "scored" too
     max_unscored_treatment = 1 # optional, with "scored" in the Holm family only: the pairs it may still lose to a
                                # treatment attempt that genuinely could not be measured (default 0)
+    smallest_effect = 0.1      # optional (S16): the smallest difference of interest, on the outcome's scale
+    direction = "higher"       # optional, beside it: the claimed sign of A - B ("higher" or "lower"); none is either
 
     [contrasts.gate-effect]    # factor form: a declared factor of the schema and two of its levels
     factor = "gate"
@@ -59,6 +61,7 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     zero_denominator = "exclude"   # or "continuity", with `continuity_correction = 0.5` (required with it, only with it)
     cluster = "group"              # the independent unit, as for every contrast
     estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group, the group their mean (S13)
+    smallest_ratio = 2             # optional (S16): a ratio of interest, a factor of two, compared as ln 2 = 0.6931
 
     [contrasts.cost-per-success-adverse]  # each arm may read its own column (S13): numerator_a, numerator_b,
     conditions = ["cond-a", "cond-b"]     # denominator_a, denominator_b, each defaulting to the shared key; the
@@ -88,7 +91,7 @@ from typing import Any
 
 from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
-from expcore.stats import estimators
+from expcore.stats import estimators, smallest
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
 from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import MODEL_KEY, TREATMENT_OUTCOMES, ContrastSpec
@@ -129,6 +132,7 @@ _CONTRAST_KEYS = (
     "treatment_outcomes",
     "max_unscored_treatment",
     *_RATIO_KEYS,
+    *smallest.KEYS,
 )
 
 
@@ -660,6 +664,20 @@ def _estimation_unit(section: Section, cluster: str, ratio: bool) -> tuple[str, 
     )
 
 
+def _smallest(section: Section, *, ratio: bool) -> dict[str, Any]:
+    """Read a contrast's smallest effect of interest (S16): `smallest_effect` beside an estimator of one outcome,
+    `smallest_ratio` beside one of the ratio form, and the optional `direction`; refused naming the key as the rule
+    refuses it. A declared number is held as a float; the keys left out stay None."""
+    declared = {key: section.data.get(key) for key in smallest.KEYS}
+    try:
+        rule = smallest.rule(**declared, ratio=ratio)
+    except smallest.RuleError as error:
+        raise section.fail(error.key, error.message) from None
+    if rule is not None:
+        declared["smallest_ratio" if ratio else "smallest_effect"] = rule.declared
+    return declared
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
@@ -680,6 +698,7 @@ def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSc
         "max_unscored_treatment": _max_unscored(section, treatment),
         "ratio": form,
         "estimation_unit": unit,
+        **_smallest(section, ratio=form is not None),
     }
     if "conditions" in table:
         for extra in ("factor", "levels"):

@@ -42,6 +42,10 @@ are the same text: no clock, no path and no random number enters it.
   contrast estimated per model's cell, each model's estimate as an exploratory breakdown. Its pairs table has three
   more causes, `-` for a contrast of one outcome. A report with no ratio contrast has none of this, so it is the text
   it was before ratio contrasts existed.
+- A contrast that preregisters a smallest effect of interest (S16) has a row in a section "Smallest effects of
+  interest" after the contrast tables (`expcore.report_smallest`): the estimate with its sign and its interval against
+  it, the decision, the minimum detectable effect and whether the design detects it; its terminal line adds the
+  decision with the signed estimate. A report with none has neither, so it keeps its bytes.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
   the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13).
@@ -77,6 +81,8 @@ from expcore.report_notes import (
     percent,
 )
 from expcore.report_shards import shard_lines
+from expcore.report_smallest import section as smallest_section
+from expcore.report_smallest import summary_suffix
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.armruns import LOST_CAUSES
 from expcore.stats.pairing import MISSING_CAUSES
@@ -267,6 +273,7 @@ def _exploratory_only(result: AnalysisResult, level: float | None) -> list[str]:
     return [
         *lines,
         "",
+        *smallest_section(contrasts, level, _table),
         *_ratios(contrasts),
         *_missing_pairs(contrasts),
         "",
@@ -309,6 +316,7 @@ def _contrasts(result: AnalysisResult, level: float | None) -> list[str]:
     return [
         *lines,
         "",
+        *smallest_section(result.contrasts, level, _table),
         *_ratios(result.contrasts),
         *_missing_pairs(result.contrasts),
         "",
@@ -605,7 +613,9 @@ def summary_lines(result: AnalysisResult) -> list[str]:
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
         scale = "" if r.ratio is None else " (ln ratio)"  # a log ratio printed bare reads as a difference (S13)
         tost = f", Holm TOST p {_p(r.tost_p_holm)}" if r.in_equivalence_family else ""  # the basis of `equivalent`
-        lines.append(f"{r.name}: estimate {_num(r.estimate)}{scale}, p {_p(r.p_value)}, Holm p {holm}, {word}{tost}")
+        smallest = summary_suffix(r)  # the decision under a smallest effect of interest, with the signed estimate (S16)
+        line = f"{r.name}: estimate {_num(r.estimate)}{scale}, p {_p(r.p_value)}, Holm p {holm}, {word}{tost}"
+        lines.append(line + smallest)
     for d in result.descriptives:  # no test and no word: a one-arm estimate is descriptive (S14)
         kind, arm = d.kind.replace("_", " "), " + ".join(d.conditions)
         interval = f"[{_num(d.ci_low)}, {_num(d.ci_high)}]"

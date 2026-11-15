@@ -62,6 +62,13 @@ reported with it. `equivalence_feasibility` simulates, before the campaign, how 
 Each contrast's result carries what became of each arm's own planned runs (`arm_runs`, S14), and the analysis carries
 every preregistered one-arm estimate (`descriptives`, `expcore.stats.onearm`), which is descriptive: no test, no
 conclusion and no place in the Holm family.
+
+A contrast may preregister a smallest effect of interest (S16, `expcore.stats.smallest`): `smallest_effect`, a
+difference, or for a ratio contrast `smallest_ratio`, a ratio compared as its natural log, with an optional
+`direction`. Its result then carries `smallest_effect`: the decision under the study's rule (significant, and the
+estimate at or beyond it on the claimed side), where the interval lies against it, and whether the minimum detectable
+effect is at most it. It is judged after Holm has decided, so a member of the family is judged by Holm's decision. A
+contrast that declares none has no such field in analysis.json, whose bytes stay what they were.
 """
 
 from __future__ import annotations
@@ -80,9 +87,10 @@ from expcore.stats.estimators import ModelEstimate, PairedDifferences
 from expcore.stats.onearm import DescriptiveResult, describe
 from expcore.stats.pairing import ContrastSpec, Pairing, pair_rows
 from expcore.stats.prereg import Preregistration, name_digest
-from expcore.stats.ratio import RatioForm
+from expcore.stats.ratio import OMIT_NONE, RatioForm
 from expcore.stats.rejection import rejects
 from expcore.stats.rows import AbsentRun, Row
+from expcore.stats.smallest import SmallestEffect, judge
 
 UNTESTABLE = "untestable"  # the conclusion of a contrast that used no pair
 CONCLUSIONS = ("difference", "trivial_difference", "equivalent", "not_detected", UNTESTABLE)
@@ -151,6 +159,9 @@ class ContrastResult:
     equivalence_level: float | None = None  # 1 - 2 x the member's Holm level
     equivalence_interval_adjusted: tuple[float, float] | None = None  # the interval at equivalence_level
     arm_runs: tuple[ArmRuns, ...] = ()  # arm A's and arm B's planned runs, measured or lost by cause (S14)
+    # the preregistered smallest effect of interest and what this result says against it (S16); None, and absent from
+    # analysis.json, for a contrast that declares none
+    smallest_effect: SmallestEffect | None = dataclasses.field(default=None, metadata={OMIT_NONE: True})
 
     @property
     def n_tasks_dropped(self) -> int:
@@ -349,6 +360,24 @@ def _refuse_unmeasured_failures(spec: ContrastSpec, prereg: Preregistration, pai
     )
 
 
+def _judged(result: ContrastResult, spec: ContrastSpec) -> ContrastResult:
+    """The result with its smallest effect of interest judged on its significance as it stands (S16), so `analyse`
+    judges again once Holm has decided; unchanged for a contrast that declares none. Every number handed to the rule
+    is on the estimate's scale, a ratio contrast's a natural-log ratio, as the rule's threshold is."""
+    rule = spec.smallest_rule
+    if rule is None:
+        return result
+    judged = judge(
+        rule,
+        estimate=result.estimate,
+        interval=(result.ci_low, result.ci_high),
+        significant=result.significant,
+        untestable=result.n_pairs == 0,
+        minimum_detectable_effect=result.minimum_detectable_effect,
+    )
+    return dataclasses.replace(result, smallest_effect=judged)
+
+
 def _check_form(spec: ContrastSpec) -> None:
     """Refuse a contrast whose form is not the one its estimator reads (S13): a spec built past the loader cannot hand
     a difference estimator log ratios, or the ratio estimator differences."""
@@ -377,7 +406,8 @@ def run_contrast(
     that loses one to a failed run's None numerator is refused too (`RatioNumeratorRefused`, S13).
 
     A member of the equivalence family gets its TOST p-value (S15), and, called alone, `equivalent` is that p-value
-    at alpha, with nothing adjusting for the family; `analyse` replaces it with Holm's decision over the family.
+    at alpha, with nothing adjusting for the family; `analyse` replaces it with Holm's decision over the family. A
+    declared smallest effect of interest is judged on `significant` as it is here (S16), and again by `analyse`.
     """
     return _run_contrast(rows, spec, prereg, significant, absent)[0]
 
@@ -450,7 +480,7 @@ def _run_contrast(
         tost_p=tost,
         arm_runs=pairing.arm_runs,
     )
-    return result, pairing
+    return _judged(result, spec), pairing
 
 
 def _equivalence_family(
@@ -519,6 +549,7 @@ def analyse(rows: Iterable[Row], prereg: Preregistration, absent: Iterable[Absen
     )
     pairings = {name: pairing for name, (_, pairing) in runs.items()}
     decided, equivalence = _equivalence_family(decided, pairings, prereg)
+    decided = tuple(_judged(r, prereg.contrasts[r.name]) for r in decided)  # on Holm's decision, not the raw p (S16)
     described = tuple(
         describe(rows, spec, prereg.descriptive_settings(spec), absent) for spec in prereg.descriptives.values()
     )

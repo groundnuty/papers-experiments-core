@@ -1264,6 +1264,8 @@ A preregistration that makes no confirmatory claim, such as a pilot's, says so w
 
 A ratio contrast's numbers are natural-log ratios, its margin included: `equivalence_margin = 0.2231` is ln 1.25, so equivalence means A's ratio is within a factor of 1.25 of B's (at most a quarter above it, a fifth below it), and "x2" and "x1/2" are 0.6931 and -0.6931. The report gives its estimate and interval as ratios beside them.
 
+A rule such as "a difference counts when it is Holm-significant and its estimate is at least 10 points" is a smallest effect of interest, not an equivalence margin: declare `smallest_effect = 0.1` in the contrast's table, and for a ratio contrast `smallest_ratio = 2` for a factor of two (written as the ratio, never its log; the analysis compares it as ln 2, the scale of the contrast's numbers). Add `direction = "higher"` or `"lower"` when the hypothesis says which arm is above: only an estimate of that sign then `meets` it, and a significant effect the other way is `opposite_direction`, however large. Without a direction the rule holds either way and reads `meets (either direction)`, with the estimate's sign beside it. The decision rests on the same significance as the conclusion (Holm's, for a member of the family), and the report's section "Smallest effects of interest" also says whether the interval includes the smallest effect or excludes it (beyond or short of it), and whether the design could detect it: its minimum detectable effect at most the smallest effect, or n/a without `[power]`. A pilot declares it to see that before the campaign. A margin and a smallest effect are two declarations, and a contrast may hold both. [The interfaces](interfaces.md#a-smallest-effect-of-interest) give the rule and its refusals.
+
 Several "no difference" hypotheses, one per primary outcome, are several chances of a false `equivalent`. List them in `equivalence_family = [...]` (each a member of `holm_family` with a margin): each gets the two one-sided t-tests' p-value of its mean cluster difference, Holm adjusts them together, and a member is `equivalent` only when Holm rejects, which the report's "Equivalence family" table shows beside the test's interval at the level Holm used. One cluster, or clusters that do not differ at all, give no p-value and are never equivalent. Before the campaign, `expcore.stats.analysis.equivalence_feasibility(prereg)` says, for each such claim, how often it would be reached at your planned clusters, at a true difference of 0 and of half the margin, from your `[power]` SDs or from pilot rows; preregister an equivalence hypothesis only if it is reachable, and say so if it is not. [The interfaces](interfaces.md#estimator) give the rule.
 
 A contrast that declares `treatment_outcomes = "excluded"` compares its arms without the runs the outage ended, so its conclusion says nothing about the outage itself, and `not_detected` there is not the absence of an outage effect. The report puts `excluded` and the pairs it left out in the contrast's own row, beside its conclusion.
@@ -1276,6 +1278,12 @@ assert conclude(significant=False, equivalent=True) == "equivalent"  # needs a m
 assert conclude(significant=False, equivalent=False) == "not_detected"
 assert conclude(significant=True, equivalent=True) == "trivial_difference"
 assert conclude(significant=False, equivalent=False, untestable=True) == "untestable"  # no pair: nothing was tested
+
+from expcore.stats.smallest import decide
+
+drop = {"significant": True, "estimate": -0.12, "threshold": 0.1}  # a significant 12-point drop, a 10-point rule
+assert decide(**drop, direction="higher") == "opposite_direction"  # never confirms a claimed rise
+assert decide(**drop, direction="either") == "meets_either_direction"  # no direction: it says which way it met
 
 analysis = json.loads(Path("my-study/out/analysis.json").read_text())
 labels = {c["name"]: (c["exploratory"], c["equivalence_margin"]) for c in analysis["contrasts"]}
