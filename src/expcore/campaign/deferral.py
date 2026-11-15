@@ -20,6 +20,8 @@ from typing import Any
 from expcore.campaign.store import Store
 
 DEFERRAL_META = "health_deferral"
+OPERATOR_ACTION = "operator action needed"  # what a platform's detail says of a wait or a failure only a person can end
+_CLAUSE_END = "; "  # a platform's detail leads with its reason, and the rest of its words follow after this
 
 
 def parse_deferral(raw: str | None) -> dict[str, Any] | None:
@@ -31,6 +33,16 @@ def parse_deferral(raw: str | None) -> dict[str, Any] | None:
         raise ValueError("not a deferral")
     seconds_between(record["since_utc"], record["since_utc"])  # a stamp that is not one is refused here
     return record
+
+
+def operator_reason(detail: object) -> str | None:
+    """The reason a platform's detail leads with when only an operator can end what it says (`OPERATOR_ACTION`): the
+    clause before the first semicolon, None for a detail that does not lead with one. The core keeps the first 200
+    characters of a detail, so a reason that leads is kept whole while the rest of the words may be cut."""
+    if not isinstance(detail, str):
+        return None
+    clause = detail.split(_CLAUSE_END, 1)[0]
+    return clause if OPERATOR_ACTION in clause else None
 
 
 def seconds_between(earlier: str, later: str) -> float:

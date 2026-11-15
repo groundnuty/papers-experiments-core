@@ -90,7 +90,7 @@ from expcore_onedata.admission import (
     current_admission,
     require_same_federation,
 )
-from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
+from expcore_onedata.fault_gate_heal import GateHeal, GateHeals, failed_heal_reason
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling
@@ -346,9 +346,27 @@ class FaultGate:
             stuck = made is not None and not verdict.ok and any(pair.stuck for pair in made.pairs)
             return self._heal(verdict, made) if stuck and made is not None else verdict
         except RestoreSettling as settling:  # a recovered container restart settles before its gate and pairs
-            return Health(False, settling.detail, deferred=True, charge=False)
+            return self._operator(Health(False, settling.detail, deferred=True, charge=False))
         except InfraError as error:
-            return Health(False, error.detail)
+            return self._operator(Health(False, error.detail))
+
+    def _operator(self, health: Health) -> Health:
+        """`health` led by the reason a failed heal needs an operator (`failed_heal_reason`), when the current stuck
+        episode holds a failed heal (`GateHeals.failed`): the gate's hold in the heal's aftermath, a wait for the
+        recovery of the restart it left open or the closing on the pair it left stuck, then reads as the hold it is,
+        first, since the core keeps only the first 200 characters of a detail and a status shows 160 of them. A heal
+        under way, one cut short or one that mended its pairs holds nothing for an operator, and a record that cannot
+        be read leaves the answer as it is (the latch says so itself)."""
+        if health.ok:
+            return health
+        try:
+            failed = self._heals.failed()
+        except (OSError, ValueError):
+            return health
+        reason = None if failed is None else failed_heal_reason(failed)
+        if reason is None or health.detail.startswith(reason):
+            return health
+        return health._replace(detail=f"{reason}; {health.detail}")
 
     def _held_check(self, held: Admission) -> Health:
         """The check under the caller's admission, a share of it kept until the check ends: a check that outlives its
@@ -381,7 +399,7 @@ class FaultGate:
         """With the federation held: the journal, then the rest of the check."""
         entries = self._recovery.entries()
         if entries:
-            return _unsettled(entries)
+            return self._operator(_unsettled(entries))
         return read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
 
     def _taken(self) -> Any:
@@ -413,7 +431,7 @@ class FaultGate:
         if not latched:
             return None
         why = "the fault gate has healed once since its link check last passed, and no heal runs again until a link "
-        return verdict._replace(detail=f"{verdict.detail}; {why}check passes")
+        return self._operator(verdict._replace(detail=f"{verdict.detail}; {why}check passes"))
 
     def _heal(self, verdict: Health, trigger: LinkMatrix) -> Health:
         """The check's own link check found a stuck pair, and the check holds no run's admission: take an exclusive
@@ -540,26 +558,27 @@ class FaultGate:
         if heals_own and recovering is not None:
             # only a heal's own container restarts failed, and the health check that heals still holds the
             # federation for their settle: a heal not over yet, a wait that charges no run (closed past its bound)
-            return recovering
+            return self._operator(recovering)
         if heals_own and self._lock.drain_left() > 0:
             # a heal that ended (or was cut short) left its container restarts open, and its settle still closes the
             # federation: the recovery that settles them waits for it, and so does this check, charging no run
-            return Health(False, "a heal's settle still closes the federation: the check waits", True, False)
+            return self._operator(
+                Health(False, "a heal's settle still closes the federation: the check waits", True, False)
+            )
         if failed:
-            return _unsettled(entries)  # a restore failed: a fault of the federation, whoever still holds it
+            return self._operator(_unsettled(entries))  # a restore failed: a fault of the federation, whoever holds it
         if recovering is not None:
             # before the drain record, which a heal that outlived its bound may still be extending with a late settle
-            return recovering
+            return self._operator(recovering)
         draining = self._lock.drain_left()
         if draining > 0:  # nobody holds it: it is closed while an outage run's sessions drain (or a heal's settle
             # runs out), and that charges no run
-            return Health(
-                False,
+            detail = (
                 f"the federation is closed for {draining:.0f} s more while an outage run's sessions drain or a heal "
-                "settles: the check waits for it",
-                deferred=True,
-                charge=False,  # nor once it outlasts the gate's bound: the drain says nothing about the waiting run
+                "settles: the check waits for it"
             )
+            # charged to no run, nor once it outlasts the gate's bound: the drain says nothing of the waiting run
+            return self._operator(Health(False, detail, deferred=True, charge=False))
         if record is None or holder_alive(record) is not False:
             # contention, a heal under way included (its marker is no failed restore yet): a wait that charges no run,
             # nor the one that finds it once it outlasts the gate's bound, as an outage run with a heal can

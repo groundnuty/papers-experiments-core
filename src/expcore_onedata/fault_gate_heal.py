@@ -62,8 +62,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.deferral import OPERATOR_ACTION
 from expcore.campaign.lease import process_gone
 from expcore.campaign.liveness import this_process
+from expcore.errors import TARGET_LABEL
 from expcore_onedata.fault_heal import INTERRUPTED, HealResult
 from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_matrix import LinkMatrix, label_order
@@ -75,10 +77,33 @@ GATE_HEALS = "gate-heals.jsonl"
 _EVENTS = ("healing", "ended", "links_passed")
 _UNTIL = "no heal runs again until a link check passes, so the gate stays closed for an operator"
 FORGIVEN = 1  # heals cut short (their process gone, no `ended` line) that an episode lets a heal follow
+NAMED_PAIRS = 2  # the stuck pairs a failed heal's reason names; it says how many more there are
 
 
 def _utc() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def failed_heal_reason(record: Mapping[str, Any]) -> str | None:
+    """What the gate's holds say first while a failed heal's pairs wait for an operator, from the heal's `ended` line
+    (`GateHeals.failed`): `a failed heal: operator action needed (stuck pairs: providers[2] reading from
+    providers[0], ...)`, the pairs by label in label order (the first `NAMED_PAIRS`, then how many more), as the link
+    check names them and never by a provider's name or id (O12). None when the line names no pair by a label. The core
+    keeps the first 200 characters of a detail, so the reason leads and the rest of the words follow it
+    (`healthgate.operator_reason`)."""
+    failing = record.get("failing")
+    pairs = {
+        (pair["reader"], pair["source"])
+        for pair in (failing if isinstance(failing, list) else [])
+        if isinstance(pair, dict)
+        and all(isinstance(pair.get(key), str) and TARGET_LABEL.fullmatch(pair[key]) for key in ("reader", "source"))
+    }
+    if not pairs:
+        return None
+    ordered = sorted(pairs, key=lambda pair: (label_order(pair[0]), label_order(pair[1])))
+    named = ", ".join(f"{reader} reading from {source}" for reader, source in ordered[:NAMED_PAIRS])
+    more = f" and {len(ordered) - NAMED_PAIRS} more" if len(ordered) > NAMED_PAIRS else ""
+    return f"a failed heal: {OPERATOR_ACTION} (stuck pairs: {named}{more})"
 
 
 class GateHeals:
@@ -132,6 +157,15 @@ class GateHeals:
                 return True  # its process lives, or cannot be told gone: a heal under way, or one that may yet end
             cut_short += 1
         return cut_short > FORGIVEN
+
+    def failed(self) -> dict[str, Any] | None:
+        """The heal of the current stuck episode that ended with a pair still failing (its `ended` line), None when
+        the episode holds none: a heal under way or cut short has no `ended` line, and one that mended every pair left
+        none failing. A heal's wait for a pair it will mend is never one that needs an operator."""
+        for line in reversed(self._episode()):
+            if line["event"] == "ended":
+                return line if not line.get("ok") and line.get("failing") else None
+        return None
 
     def passed(self) -> None:
         """The gate's own link check found every pair passing: the episode ends, a heal cut short in it included, and
