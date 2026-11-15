@@ -98,8 +98,9 @@ def physical_sizes(
     root's distribution on the data provider; `providers` must all be in the answer. Raise Unreadable for anything
     unknown, and ProvisionError when an undeclared provider holds bytes, or, without `undeclared_ok`, is in the answer
     at all. The read that timed out is tried again under `retry`, the policy of a caller that reads it as plumbing (the
-    reset); by default it is one attempt (O29)."""
-    root = provisioner.root()
+    reset); by default it is one attempt (O29). So is the space root's first read, when no earlier one is kept
+    (`Provisioner.root`), on the slot the caller holds for the counter (O46)."""
+    root = provisioner.root(retry=retry)
     answer = provisioner.client.get(f"/data/{root}/distribution", provider=provisioner.settings.holder, retry=retry)
     per = answer.get("distributionPerProvider") if isinstance(answer, Mapping) else None
     if not isinstance(per, Mapping):

@@ -41,8 +41,17 @@ one: unknown is never zero.
 The wait for the transfers to end polls each one's record, and a poll that times out ends the eviction, so those polls
 are tried again under the provisioner's policy (O29, `readretry.py`), within the wait's own bound, or under the policy
 a caller hands in (`reads`): the reset's eviction stage hands its stage's, which tries a connection failure again too
-(O46). The block-map reads
+(O46), and under which the space's name (`verify_space`), the tree's listings (`walk`) and the mutation gate's reads
+before each eviction are read as well. The block-map reads
 of the verification are inside a poll that counts a failed read as one that did not match, and stay one attempt.
+
+**An eviction whose answer was lost is never sent again** (O09, O46). One that went past the gate and got no answer
+back whole (`client.sent_unanswered`: a connection failure, a reset or a timeout once it was sent) may or may not have
+been applied, and a second would be a second job on the transfer listing. It is not retried, and no later attempt
+schedules its files (or its tree) again: with no transfer id there is no record to wait on, so the caller's `quiet`
+check, which waits for every job listed waiting or ongoing, the lost one among them, and then the block maps decide,
+the same verification as for any other attempt. An eviction already applied counts as done; one that never was leaves
+bytes the last attempt's bound fails closed on. The record counts such evictions (`unanswered`) when there was one.
 
 **A caller can watch.** `scheduled` is told each attempt's transfer ids when they are sent, `ended` the same ids once
 their records have reported an ended state on the evicting provider (before `quiet` runs), and a `consistency.WaitLog`
@@ -50,11 +59,13 @@ given as `waits` logs every wait the eviction takes, by why: `transfers_ending` 
 verification's polls) and `retry_pause` (before an attempt again). The reset records them (`reset.py`).
 """
 
+import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from expcore_onedata import consistency
+from expcore_onedata.client import PlatformError, sent_unanswered
 from expcore_onedata.placement import held_bytes
 from expcore_onedata.provision import (
     EVICTION_ATTEMPTS,
@@ -70,6 +81,9 @@ from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.transferrecord import eviction_counters
 
 COUNTERS = ("files_processed", "files_evicted", "files_failed")  # the record's keys of `eviction_counters`, in order
+log = logging.getLogger(__name__)
+# files -> (their transfer ids, the files whose eviction's answer was lost, how many evictions' answers were lost)
+Schedule = Callable[[Sequence[str]], tuple[list[str], list[str], int]]
 
 
 class EvictionIncomplete(NotPlaced):
@@ -215,24 +229,49 @@ class _Watch:
     reads: ReadRetry | None = None
 
 
+def _sent(provisioner: Provisioner, provider: str, send: Callable[[], str]) -> str | None:
+    """Send one eviction (`send` returns its transfer id); None when it went past the gate and its answer was lost
+    (`client.sent_unanswered`), which is never sent again: the block maps decide. Any other failure propagates, a
+    request the gate refused unsent (`NotSent`) among them."""
+    try:
+        return send()
+    except PlatformError as error:
+        if not sent_unanswered(error):
+            raise
+        log.warning(
+            "%s%s: an eviction was sent and its answer was lost (%s); it is never sent again, the block maps decide",
+            provisioner.where,
+            provisioner.client.provider_label(provider),
+            error,
+        )
+        return None
+
+
 def _evict_verified(
     provisioner: Provisioner,
     provider: str,
     files: Sequence[str],
-    schedule: Callable[[Sequence[str]], list[str]],
+    schedule: Schedule,
     quiet: Callable[[], None] | None,
     watch: _Watch,
 ) -> dict[str, Any]:
     """Schedule the evictions (`schedule` takes the files still holding bytes and returns the transfer ids, which
-    `watch.scheduled` is given when set, and `watch.ended` once they have ended), wait for them to end, and judge them
-    by the block maps alone, scheduling again what still holds bytes after `EVICTION_CHECK_S`, up to
-    `EVICTION_ATTEMPTS` in all; the last attempt waits the whole settle bound. Return the transfers, their end states,
-    the last attempt's counters, the polls and the attempts; raise `EvictionIncomplete` when files still hold bytes
-    then."""
+    `watch.scheduled` is given when set, and `watch.ended` once they have ended, with the files whose eviction's
+    answer was lost and how many evictions those were), wait for them to end, and judge them by the block maps alone,
+    scheduling again what still holds bytes after `EVICTION_CHECK_S`, up to `EVICTION_ATTEMPTS` in all, but never a
+    file whose eviction's answer was lost (it may have been applied, O09); the last attempt waits the whole settle
+    bound. Return the transfers, their end states, the last attempt's counters, the polls, the attempts and, when there
+    were any, how many evictions' answers were lost (`unanswered`); raise `EvictionIncomplete` when files still hold
+    bytes then."""
     pending, transfers, polls = list(files), 0, 0
     states: dict[str, int] = {}
+    lost: set[str] = set()  # files whose eviction went unanswered: never scheduled again
+    unanswered = 0  # the evictions whose answers were lost
     for attempt in range(1, EVICTION_ATTEMPTS + 1):
-        tids = schedule(pending)
+        sending = [file_id for file_id in pending if file_id not in lost]
+        tids, unread, count = schedule(sending) if sending else ([], [], 0)
+        lost.update(unread)
+        unanswered += count
         if watch.scheduled is not None:
             watch.scheduled(tids)
         transfers += len(tids)
@@ -248,11 +287,25 @@ def _evict_verified(
         bound = provisioner.settings.settle_timeout_s if last else EVICTION_CHECK_S
         result = _converge_empty(provisioner, provider, pending, bound, watch.waits)
         polls += result.polls
+        noted = {"unanswered": unanswered} if unanswered else {}
         if result.converged:
-            return {"transfers": transfers, "transfer_states": states, **counts, "polls": polls, "attempts": attempt}
+            return {
+                "transfers": transfers,
+                "transfer_states": states,
+                **counts,
+                "polls": polls,
+                "attempts": attempt,
+                **noted,
+            }
         if last:
             raise _not_empty(
-                provisioner, files, result, provider=provider, last=counts, transfers=transfers, attempts=attempt
+                provisioner,
+                files,
+                result,
+                provider=provider,
+                last={**counts, **noted},
+                transfers=transfers,
+                attempts=attempt,
             )
         pending = list(result.pending)  # completed, and these still hold bytes: never evicted; schedule them again
         _sleep(provisioner, watch.waits, "retry_pause")(EVICTION_RETRY_PAUSE_S)
@@ -275,7 +328,8 @@ def evict_ids(
     `scheduled`, when given, is called with the ids of each attempt's transfers: the reset tells its own jobs from
     others' by them (O46); `ended` with the same ids once their records have reported an ended state on the evicting
     provider, before `quiet` is called; `waits` logs every wait the eviction takes, by why; `reads` is the policy of
-    the waits' record reads (the provisioner's by default; the reset's stage hands its own, O46)."""
+    the waits' record reads, of the space's name and of each eviction's gate (the provisioner's by default; the reset's
+    stage hands its own, O46). An eviction whose answer was lost is never sent again (`unanswered`)."""
     provisioner.check_eviction(from_provider)
     ids = list(dict.fromkeys(file_ids))
     if not ids:
@@ -292,14 +346,19 @@ def evict_ids(
             "seconds": 0.0,
         }
     began = provisioner.clock()
-    provisioner.verify_space()
+    provisioner.verify_space(retry=reads)
 
-    def schedule(pending: Sequence[str]) -> list[str]:
-        return consistency.bounded_map(
-            lambda fid: provisioner.schedule_transfer("eviction", fid, from_provider),
-            list(pending),
-            provisioner.settings.concurrency,
+    def send(fid: str) -> str | None:
+        return _sent(
+            provisioner,
+            from_provider,
+            lambda: provisioner.schedule_transfer("eviction", fid, from_provider, gate_retry=reads),
         )
+
+    def schedule(pending: Sequence[str]) -> tuple[list[str], list[str]]:
+        sent = consistency.bounded_map(send, list(pending), provisioner.settings.concurrency)
+        lost = [fid for fid, tid in zip(pending, sent, strict=True) if tid is None]
+        return [tid for tid in sent if tid is not None], lost, len(lost)
 
     watch = _Watch(scheduled, ended, waits, reads)
     done = _evict_verified(provisioner, from_provider, ids, schedule, quiet, watch)
@@ -323,24 +382,27 @@ def evict_tree(
     already) must be a directory. An attempt that left bytes schedules the directory's eviction again. `listed`, when
     given, is called with the ids of the files the listing found, before the transfer: the reset's quiet check holds
     those files' block maps on this provider to the empty map the eviction verified (O33), so it never lists the tree a
-    second time. `scheduled`, `ended`, `waits` and `reads` are as `evict_ids` takes them."""
+    second time. `scheduled`, `ended`, `waits` and `reads` are as `evict_ids` takes them; the tree's listings go under
+    `reads` too. A directory's eviction whose answer was lost is never sent again, for any file under it."""
     provisioner.check_eviction(from_provider)
     began = provisioner.clock()
-    provisioner.verify_space()
-    directory = path if isinstance(path, Entry) else provisioner.resolve(path)
+    provisioner.verify_space(retry=reads)
+    directory = path if isinstance(path, Entry) else provisioner.resolve(path, retry=reads)
     if directory.kind != "DIR":
         raise ProvisionError(f"{provisioner.where}a tree eviction names a directory; this path is not one")
-    files = [entry.file_id for entry, _ in provisioner.walk(directory.file_id) if entry.kind != "DIR"]
+    files = [entry.file_id for entry, _ in provisioner.walk(directory.file_id, retry=reads) if entry.kind != "DIR"]
     if listed is not None:
         listed(files)
-    done = _evict_verified(
-        provisioner,
-        from_provider,
-        files,
-        lambda _pending: [provisioner.schedule_transfer("eviction", directory.file_id, from_provider)],
-        quiet,
-        _Watch(scheduled, ended, waits, reads),
-    )
+
+    def schedule(pending: Sequence[str]) -> tuple[list[str], list[str]]:
+        tid = _sent(
+            provisioner,
+            from_provider,
+            lambda: provisioner.schedule_transfer("eviction", directory.file_id, from_provider, gate_retry=reads),
+        )
+        return ([tid], [], 0) if tid is not None else ([], list(pending), 1)
+
+    done = _evict_verified(provisioner, from_provider, files, schedule, quiet, _Watch(scheduled, ended, waits, reads))
     return {"files": len(files), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 
 

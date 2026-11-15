@@ -708,6 +708,14 @@ def answered_absent(error: PlatformError) -> bool:
     return error.status == 404 or (error.status, error.code, error.errno) == POSIX_ABSENT
 
 
+def sent_unanswered(error: PlatformError) -> bool:
+    """Tell whether a mutation went past the gate and no answer came back whole: a connection failure, a reset or a
+    timeout while it was sent or answered (`transport`). It may or may not have been applied, so a caller never sends
+    it again: it reads the state and decides from that (O09, O46). A request refused unsent (`NotSent`, the gate's
+    `ScopeUnread` among them) was never sent, and an answer of any status is an answer, not a lost one."""
+    return error.transport and not isinstance(error, NotSent)
+
+
 def _streamed_error_fields(response: httpx.Response) -> tuple[str | None, str | None]:
     """Return Onedata's error id and its POSIX errno from a streamed error answer, as `_error_fields` does, reading at
     most `ERROR_BODY_BYTES` of it."""

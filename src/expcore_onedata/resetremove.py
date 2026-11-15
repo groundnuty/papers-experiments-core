@@ -45,14 +45,15 @@ file's size, and rare, since it needs a missed cancel. It may land after T, the 
 them.
 """
 
+import logging
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from expcore_onedata import consistency, resetqos
-from expcore_onedata.client import PlatformError, answered_absent
+from expcore_onedata.client import PlatformError, answered_absent, sent_unanswered
 from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import Provisioner, ProvisionError
-from expcore_onedata.readretry import ONE_ATTEMPT, recorded
+from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry, recorded
 from expcore_onedata.transferrecord import Unreadable
 
 SETTLED = frozenset({"fulfilled", "impossible"})  # the statuses a requirement may be deleted in
@@ -60,6 +61,7 @@ STATUSES = frozenset({*SETTLED, "pending"})  # every status the build's record g
 BARRIER_BOUND_S = 60.0  # the longest the reset waits for every provider to process the deletions
 
 Key = tuple[str, str]  # (provider, requirement id)
+log = logging.getLogger(__name__)
 
 
 def _record(p: Provisioner, key: Key) -> dict[str, str] | None:
@@ -156,6 +158,28 @@ def barrier(p: Provisioner, providers: Sequence[str], entries: dict[str, str]) -
     return {"barrier_s": round(p.clock() - began, 3), "barrier_polls": waited.polls}
 
 
+def _delete(p: Provisioner, qid: str, provider: str, gate: ReadRetry) -> bool:
+    """Delete one requirement through the gate, whose reads go under `gate` (the stage's reading policy, O46); return
+    whether the deletion was answered. One that went past the gate and got no answer back (`client.sent_unanswered`)
+    may or may not have been applied: it is never sent again (False), and the barrier, which reads every provider until
+    each has processed it, decides, failing at its bound on one that never was (O09). Any other failure propagates, a
+    deletion the gate refused unsent (`ScopeUnread` once its reads are spent) among them."""
+    try:
+        p.mutate("DELETE", f"/qos_requirements/{qid}", provider=provider, gate_retry=gate)
+    except PlatformError as error:
+        if not sent_unanswered(error):
+            raise
+        log.warning(
+            "%s%s: a QoS requirement's deletion was sent and its answer was lost (%s); it is never sent again, the "
+            "barrier decides",
+            p.where,
+            p.client.provider_label(provider),
+            error,
+        )
+        return False
+    return True
+
+
 def remove(
     p: Provisioner, providers: Sequence[str], baseline: Iterable[str], found: resetqos.Found | None = None
 ) -> tuple[dict[str, Any], dict[str, int], int, Listing]:
@@ -166,7 +190,9 @@ def remove(
     files and hard links any provider's listing showed, in either scan. `found`, when given, is the first scan, made by
     the caller (a planner's, `resetplan.py`) on the same space and providers; the second scan is always made here. The
     scans' reads go under one policy made for the stage (`Provisioner.reading_retry`), whose tally is in the facts
-    (`read_retry`), a failure's included; the polls of the fulfilment and the barrier keep one attempt."""
+    (`read_retry`), a failure's included, and so do the gate's reads before each deletion; the polls of the fulfilment
+    and the barrier keep one attempt. A deletion whose answer was lost is never sent again (`_delete`): the barrier
+    decides, and the facts count such deletions (`unanswered`) when there was one."""
     kept = frozenset(baseline)
     scanned = found is not None
     scans = p.reading_retry()
@@ -184,10 +210,10 @@ def remove(
             "barrier_polls": 0,
         }
         reads, listing = dict(found.reads), found.listing
+        lost = 0  # deletions sent whose answers were lost: never sent again, the barrier decides
         if added:
             waits, entries = fulfilled(p, providers, sorted(added))
-            for qid, provider in added.items():
-                p.mutate("DELETE", f"/qos_requirements/{qid}", provider=provider)
+            lost = sum(not _delete(p, qid, provider, scans) for qid, provider in added.items())
             waits.update(barrier(p, providers, entries))
             again = resetqos.scan(p, providers, scans)
             left = [qid for qid in again.where if qid not in kept]
@@ -196,6 +222,8 @@ def remove(
             reads = {k: reads.get(k, 0) + again.reads.get(k, 0) for k in reads.keys() | again.reads.keys()}
             listing |= again.listing
     facts.update(removed=len(added), affected_files=len(affected), **waits, reads=reads, read_retry=scans.facts())
+    if lost:
+        facts["unanswered"] = lost
     return facts, affected, found.deepest, listing
 
 

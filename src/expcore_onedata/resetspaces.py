@@ -61,13 +61,13 @@ every space) and `concurrency`; a failed one adds `failed` (the positions of the
 
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any
 
 from expcore_onedata import consistency, occupancy, resetheld, resetshortcut
 from expcore_onedata.provision import ProvisionError
-from expcore_onedata.readretry import ReadRetry
+from expcore_onedata.readretry import ReadRetry, recorded
 from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, SpaceReset
 from expcore_onedata.resetgrant import ResetGrant, federation_for
 from expcore_onedata.resetplan import Holdings, given_scan
@@ -159,6 +159,15 @@ class _Space:
     def live(self) -> bool:
         return self.failure is None
 
+    def verify(self) -> None:
+        """Verify the space's live name before any stage (`Provisioner.verify_space`), its read under a reset's policy
+        (`Provisioner.reading_retry`: a connection failure tried again, an answer never, O46), whose tally the record
+        keeps (`verify_read_retry`); a read that stays failed raises, with the tally, and no stage runs."""
+        reads = self.p.reading_retry()
+        with recorded(reads, "verify_read_retry"):
+            self.p.verify_space(retry=reads)
+        self.record["verify_read_retry"] = reads.facts()
+
     def begin(self, stage: str) -> None:
         self._started[stage] = self.p.clock()
         self._reads[stage] = self.reset.stage_reads()
@@ -217,11 +226,13 @@ class _Space:
 
 @dataclass
 class _Settle:
-    """One space's transfer settle: the cancels sent, the observations, the clean ones in a row, and whether every
-    observation so far showed nothing (`fast`), so that two clean ones settle it."""
+    """One space's transfer settle: the cancels sent (and those of them whose answer was lost, never sent again), the
+    observations, the clean ones in a row, and whether every observation so far showed nothing (`fast`), so that two
+    clean ones settle it."""
 
     polls: int
     cancelled: set[tuple[str, str]]
+    unanswered: set[tuple[str, str]] = field(default_factory=set)
     observations: int = 0
     clean: int = 0
     fast: bool = True
@@ -296,7 +307,7 @@ class SpacesReset:
             raise ValueError("a reset of several spaces takes one plan per space, in the order of its resets")
         spaces = [_Space(reset, plan) for reset, plan in zip(self._resets, given, strict=True)]
         for space in spaces:
-            space.p.verify_space()
+            space.verify()
         self._waits, self._walls = {}, {}
         stages: dict[str, Callable[[list[_Space]], None]] = {
             "qos": lambda live: self._each(live, "qos", lambda s: s.reset._qos(s.baseline, s.run)),
@@ -372,7 +383,7 @@ class SpacesReset:
     @staticmethod
     def _observe(space: _Space) -> None:
         settle = space.settle
-        active = space.step("transfers", lambda: space.reset._observe(settle.cancelled))
+        active = space.step("transfers", lambda: space.reset._observe(settle.cancelled, settle.unanswered))
         if active is not None:
             settle.observed(active)
 
@@ -386,7 +397,9 @@ class SpacesReset:
             space.run["cancelled"].update(settle.cancelled)  # jobs of an earlier run: the shortcut reads their files
             space.run["transfers_at"] = space.p.clock()  # the last observation, which the shortcut's walk follows
             cancelled = len({tid for _, tid in settle.cancelled})
-            space.done("transfers", {"cancelled": cancelled, "observations": settle.observations, "fast": settle.fast})
+            facts = {"cancelled": cancelled, "observations": settle.observations, "fast": settle.fast}
+            lost = {"unanswered": len(settle.unanswered)} if settle.unanswered else {}  # cancels whose answer was lost
+            space.done("transfers", {**facts, **lost})
             return True
         if settle.exhausted:
             message = (

@@ -155,6 +155,7 @@ through `resetspaces.SpacesReset`: the same stages for each, the waits they shar
 at once; `run` is that driver with this space alone.
 """
 
+import logging
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -162,7 +163,7 @@ from functools import partial
 from typing import Any
 
 from expcore_onedata import consistency, occupancy, resetgrant, resetheld, resetqos, resetremove, resetshortcut
-from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError
+from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError, sent_unanswered
 from expcore_onedata.eviction import evict_ids, evict_tree, sum_counts
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.readretry import ReadRetry
@@ -191,6 +192,7 @@ LISTED_MAX = 100_000
 OCCUPANCY_ROUNDS = 3
 FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, Unreadable, KeyError)  # a stage's, recorded
 NOT_IN_SPACE = "a path the plan names is not in the space"  # a KeyError's own text holds a path's part (O12)
+log = logging.getLogger(__name__)
 
 
 class ResetFailed(ProvisionError):
@@ -432,15 +434,29 @@ class SpaceReset:
         moved += [p for p, tid in self._active() if tid not in ended]
         return [self._label(p) for p in dict.fromkeys(moved)]
 
-    def _cancel(self, provider: str, tid: str) -> None:
-        """Cancel one job on one provider through the gate; a 400 answered to the cancel is a job that has ended, which
-        the wait then shows. A cancel the gate refused unsent (`NotSent`, which keeps the status of the gate's own read,
-        a 400 among them) is never taken for that: it propagates, as does any other failure."""
+    def _cancel(self, provider: str, tid: str) -> bool:
+        """Cancel one job on one provider through the gate, whose reads go under the stage's policy (`stage_reads`);
+        return whether the cancel was answered. A 400 answered to the cancel is a job that has ended, which the wait
+        then shows. A cancel that went past the gate and got no answer back (`client.sent_unanswered`) may or may not
+        have been applied: it is never sent again (False), and the wait for the job's record decides, failing at its
+        bound on a job that never ends (O09). A cancel the gate refused unsent (`NotSent`, which keeps the status of the
+        gate's own read, a 400 among them, or `ScopeUnread` once its reads are spent) is never taken for either: it
+        propagates, as does any other failure."""
         try:
-            self._p.mutate("DELETE", f"/transfers/{tid}", provider=provider)
+            self._p.mutate("DELETE", f"/transfers/{tid}", provider=provider, gate_retry=self._reads)
         except PlatformError as error:
+            if sent_unanswered(error):
+                log.warning(
+                    "%s%s: a cancel was sent and its answer was lost (%s); it is never sent again, the job's record "
+                    "decides",
+                    self._p.where,
+                    self._label(provider),
+                    error,
+                )
+                return False
             if isinstance(error, NotSent) or error.status != 400:
                 raise
+        return True
 
     def _wait_ended(self, pairs: Iterable[tuple[str, str]], what: str) -> None:
         """Wait, on each provider, for the jobs it listed to report an ended state there; raise at the bound."""
@@ -463,16 +479,18 @@ class SpaceReset:
                 f"{self._label(provider)}: {what}",
             )
 
-    def _observe(self, cancelled: set[tuple[str, str]]) -> bool:
+    def _observe(self, cancelled: set[tuple[str, str]], unanswered: set[tuple[str, str]]) -> bool:
         """One observation of the transfers stage: cancel every job a provider lists as waiting or ongoing that the
         stage has not cancelled yet, on that provider, and wait until each reports an ended state there; return whether
         any job was listed. `cancelled` gathers the `(provider, transfer id)` pairs the stage sent a cancel to (one
-        answered 400, a job that had just ended, included), mutated on purpose: the driver counts the observations of
-        every space and decides when each has settled (`resetspaces.py`)."""
+        answered 400, a job that had just ended, included, and one whose answer was lost, never sent again), and
+        `unanswered` the last, both mutated on purpose: the driver counts the observations of every space and decides
+        when each has settled (`resetspaces.py`)."""
         active = self._active()
         fresh = [pair for pair in dict.fromkeys(active) if pair not in cancelled]
         for provider, tid in fresh:
-            self._cancel(provider, tid)
+            if not self._cancel(provider, tid):
+                unanswered.add((provider, tid))
             cancelled.add((provider, tid))
         self._wait_ended(fresh, "a cancelled transfer")
         return bool(active)
@@ -512,7 +530,7 @@ class SpaceReset:
         when a listing shows them late, and, once their records have reported them ended, the ones that hold no read
         up (`run["ended"]`, `_require_quiet`). The record gives every wait the stage took, by why (`waits`)."""
         try:
-            resolved = self._p.resolve_many(path for paths in plan.values() for path in paths)
+            resolved = self._p.resolve_many((path for paths in plan.values() for path in paths), retry=self._reads)
         except KeyError:
             raise ProvisionError(NOT_IN_SPACE) from None
         out: dict[str, Any] = {}
@@ -539,6 +557,7 @@ class SpaceReset:
             evicted.update((file_id, provider) for file_id in files)
             if files:
                 results.append(evict_ids(self._p, files, provider, quiet=quiet, **watched))
+            unanswered = sum(r.get("unanswered", 0) for r in results)  # evictions sent once, their answers lost
             out[self._label(provider)] = {
                 "trees": sum(1 for entry in entries if entry.kind == "DIR"),
                 "files": sum(r["files"] for r in results),
@@ -546,6 +565,7 @@ class SpaceReset:
                 "polls": max((r["polls"] for r in results), default=0),
                 "attempts": max((r["attempts"] for r in results), default=0),
                 **sum_counts(results),
+                **({"unanswered": unanswered} if unanswered else {}),
             }
         quiet()
         run["ended_head"] = self._ended_heads()
