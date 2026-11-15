@@ -33,10 +33,14 @@ otherwise let the run in onto a stuck link once the heal lets the federation go,
     campaign that has the admission and no health check, since nothing would ever write a note and every run would be
     admitted blind.
   - **At run time, for a declaration the refusal never saw** (an admission a study wrapped in a function of its own
-    without `functools.wraps`, or a runner built by hand): a try of a campaign with no health check has a note that says
-    so (`prerun.UNCHECKED`), and this admission, reached through the wrapper, refuses it as `AdmissionRefused`, a
-    configuration error and not an `InfraError`, so the campaign stops loudly with no attempt made, charged or scored,
-    never a run admitted and never one asked again for ever.
+    without `functools.wraps`, a runner built by hand, or a study that gives the campaign no run admission and takes the
+    federation in its executor): a try of a campaign with no health check has a note that says so (`prerun.UNCHECKED`),
+    and both this admission, reached through the wrapper, and `admission.require_admission`, which the sandbox and the
+    tool server call before they start anything under any admission, refuse it as `AdmissionRefused`, a configuration
+    error and not an `InfraError`, so the campaign stops loudly with nothing scored, never a run admitted and never one
+    asked again for ever. The note travels in the context of the run's try, so a wrapper or an executor that runs the
+    platform's work in a context of its own, with no copy of the worker's, reads no note, as a health check that does
+    the same notes nothing; that is outside what a note can guard.
 
   A check that never reaches the fault gate still has a note, with no epoch, so its runs are refused above until it
   does.

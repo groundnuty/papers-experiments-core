@@ -2,9 +2,9 @@
 """A platform's run admission may declare that it needs a health check, and a campaign without one is refused (O35).
 
 An admission can read what a try's pre-run check noted (`expcore.campaign.prerun`) and refuse a run the check cannot
-vouch for. A campaign with no health check has no try note, so such an admission would admit every run on nothing: a
-run is let in onto a federation no check has looked at, and the refusal it was written to make never happens. A
-platform whose admission depends on the check therefore declares it:
+vouch for. In a campaign with no health check nothing ever writes a note, so such an admission would admit every run
+on nothing: a run is let in onto a federation no check has looked at, and the refusal it was written to make never
+happens. A platform whose admission depends on the check therefore declares it:
 
     admission = requiring_health_check(admit, "why the platform needs it, and what to pass")
 
@@ -20,9 +20,11 @@ health check. It runs before the dispatcher's lock is taken and before the store
 touches nothing. Without the declaration nothing changes: a campaign with no health check runs as it did.
 
 An admission that wraps another one in a function of its own must keep the attribute (`functools.wraps` does), or the
-refusal at load does not see it. The platform's admission then refuses at run time instead: a try of a campaign with no
-health check has a note that says so (`prerun.UNCHECKED`), which the platform's admission, reached through the wrapper,
-reads, so no run is admitted blind whichever way the campaign was built.
+refusal at load does not see it. The platform then refuses at run time instead: a try of a campaign with no health
+check has a note that says so (`prerun.UNCHECKED`), which the platform reads wherever it admits or starts a run (its
+admission, reached through the wrapper, and what it calls before it starts a run's infrastructure under any
+admission), so no run is admitted blind however the campaign was built. The note travels in the context of the run's
+try: work that a wrapper or an executor runs in a context of its own, with no copy of the worker's, reads no note.
 """
 
 from dataclasses import dataclass

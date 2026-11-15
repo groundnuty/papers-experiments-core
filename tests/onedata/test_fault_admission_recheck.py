@@ -23,7 +23,14 @@ from expcore.campaign.factors import FactorSchema
 from expcore.campaign.health_required import required_reason
 from expcore.config.loading import ConfigError
 from expcore.errors import uncharged_kinds
-from expcore_onedata.admission import AdmissionRefused, FederationBusy, run_admission
+from expcore_onedata.admission import (
+    EXCLUSIVE_RUN,
+    AdmissionRefused,
+    FederationBusy,
+    FederationLock,
+    require_admission,
+    run_admission,
+)
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_epoch import GATE_NOTE, LinkEpoch, noted_of
 from expcore_onedata.fault_gate_heal import GateHeals
@@ -475,3 +482,56 @@ def test_o35_the_platforms_admission_is_called_with_keywords_as_it_was_before_it
     admit = admission_in(federation_dir)
     with admit(treatment_kinds=(), treatment_targets={}, cancel=threading.Event(), exclusive=False) as mode:
         assert mode == "shared"
+
+
+def held_by_the_executor(federation_dir):
+    """The federation held the way an executor does that takes it itself, not through a run admission of the
+    campaign's: the platform's settings, and a shared hold of the lock as the running task's admission."""
+    platform = federation_dir / "platform.toml"
+    config = load_platform(platform, require_secrets=False)
+    lock = FederationLock(load_faults(platform, config))
+    return config, lock.held(exclusive=False, timeout_s=5, cancel=threading.Event(), purpose=EXCLUSIVE_RUN)
+
+
+def test_o35_a_runs_infrastructure_in_a_try_of_a_campaign_with_no_health_check_is_refused_under_any_admission(tmp_path):
+    """O35: a campaign that gave no run admission (the executor takes the federation itself) and has no health check
+    passes neither the refusal at load nor the run admission's. The sandbox and the tool server's `require_admission`
+    reads the try's note, which says there is no check, and refuses, however the federation was taken; a try with a
+    check, and a tool outside any campaign (no note), pass."""
+    federation_dir = tmp_path / "federation"
+    gate_of(federation_dir, heal="off")
+    config, held = held_by_the_executor(federation_dir)
+    with held, prerun.opened(checked=False), pytest.raises(AdmissionRefused, match="needs the gate's health check"):
+        require_admission(config)
+    config, held = held_by_the_executor(federation_dir)
+    with held, prerun.opened():
+        require_admission(config)
+    config, held = held_by_the_executor(federation_dir)
+    with held:
+        require_admission(config)
+
+
+def test_o35_a_campaign_with_no_admission_and_no_health_check_never_scores_a_run_that_starts_infrastructure(tmp_path):
+    """O35: the study gave `admission=None` and no health check, and its executor takes the federation itself and
+    starts its infrastructure. The platform refuses that start in the run's try, so nothing is scored."""
+    federation_dir = tmp_path / "federation"
+    gate_of(federation_dir, heal="off")
+    config, held = held_by_the_executor(federation_dir)
+    executor = FakeExecutor()
+
+    async def start_infrastructure(request):
+        with held:
+            require_admission(config)
+        return await executor._run(request, "finish")
+
+    executor.default = start_infrastructure
+    with build(
+        tmp_path / "campaign", schema=ONE, executor=executor, plan=SMALL, settings=settings_for(max_attempts=1)
+    ) as scheduler:
+        try:
+            summary = scheduler.run()
+        except RuntimeError:  # a campaign stopped by the platform's refusal is as good as one that scores nothing
+            summary = None
+        scored = scheduler.store.q("SELECT state FROM attempts WHERE state='done'")
+    assert scored == []
+    assert summary is None or "done" not in summary.statuses

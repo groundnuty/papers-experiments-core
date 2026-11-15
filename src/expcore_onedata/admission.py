@@ -744,10 +744,15 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
 
 
 def require_admission(config: PlatformConfig) -> None:
-    """Refuse to start a run's infrastructure on a platform with `[faults]` unless the run holds that federation."""
+    """Refuse to start a run's infrastructure on a platform with `[faults]` unless the run holds that federation, and
+    not in a try of a campaign that has no health check (its note says so, `prerun.UNCHECKED`): however the federation
+    was taken (the campaign's run admission, or the executor's own), no run starts with no link verdict behind it."""
     settings = fault_settings_of(config)
     if settings is None:
         return
+    unchecked = unchecked_refusal(prerun.current())
+    if unchecked is not None:
+        raise AdmissionRefused(unchecked)
     admission = current_admission()
     if admission is None:
         raise AdmissionRefused(
