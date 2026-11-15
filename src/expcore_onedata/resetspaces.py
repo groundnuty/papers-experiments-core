@@ -41,10 +41,12 @@ runs its next check later: every check reads the federation's state when it runs
 
 **At once, within bounds.** At most `[placement] reset_concurrency` spaces (4 by default) do their own work at once,
 each under its own `[placement] concurrency` (16), so at most their product of requests is in flight: 64 with the
-defaults, under the 100 connections of the HTTP client's pool (httpx's default, which the client keeps), which makes a
-request beyond them wait for a connection rather than fail. Each space's work is its own provisioner's, on its own
-space; the client and the fake federation serve several threads. Every wait the spaces share is taken on the calling
-thread, never in a space's work, so a reset with `reset_concurrency` 1 runs wholly on it.
+defaults, under the 100 connections of the HTTP client's pool, all kept alive (`client.POOL_CONNECTIONS`), which makes
+a request beyond them wait for a connection rather than fail. The spaces of one federation share their providers, so
+their readings' reads (block maps; the QoS scans' root, pages, summaries, records) are bounded at each provider, by
+`[placement] provider_concurrency` (16) for the whole process (`readslots.py`). Each space's work is its own
+provisioner's, on its own space; the client and the fake federation serve several threads. Every wait the spaces share
+is taken on the calling thread, never in a space's work, so a reset with `reset_concurrency` 1 runs wholly on it.
 
 **A failure in one space fails the reset.** A stage that fails in one space is recorded there, as `SpaceReset.run`
 records it; the other spaces end the stage they are in, and no space begins a later one. `ResetFailed` then holds every
@@ -65,6 +67,7 @@ from typing import Any
 
 from expcore_onedata import consistency, occupancy, resetheld, resetshortcut
 from expcore_onedata.provision import ProvisionError
+from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, SpaceReset
 from expcore_onedata.resetgrant import ResetGrant, federation_for
 from expcore_onedata.resetplan import Holdings, given_scan
@@ -150,6 +153,7 @@ class _Space:
         self.settle = _Settle(self.p.settings.transfer_settle_polls, set())  # the transfers stage's
         self._began, self._retried = self.p.clock(), self.p.reads_retried
         self._started: dict[str, float] = {}
+        self._reads: dict[str, ReadRetry] = {}  # each stage's policy for its own transfer reads (`stage_reads`)
 
     @property
     def live(self) -> bool:
@@ -157,10 +161,17 @@ class _Space:
 
     def begin(self, stage: str) -> None:
         self._started[stage] = self.p.clock()
+        self._reads[stage] = self.reset.stage_reads()
+
+    def _transfer_reads(self, stage: str) -> dict[str, Any]:
+        """The stage's own transfer reads' tally, for its record, when it made any (`transfer_read_retry`)."""
+        reads = self._reads.get(stage)
+        tally = reads.facts() if reads is not None else None
+        return {"transfer_read_retry": tally} if tally and tally["reads"] else {}
 
     def done(self, stage: str, facts: Mapping[str, Any]) -> None:
         seconds = round(self.p.clock() - self._started[stage], 3)
-        self.record["stages"][stage] = {"ok": True, "seconds": seconds, **facts}
+        self.record["stages"][stage] = {"ok": True, "seconds": seconds, **facts, **self._transfer_reads(stage)}
 
     def step[T](self, stage: str, call: Callable[[], T]) -> T | None:
         """One step of a stage: its result, or None once a failure the stage records has failed the space."""
@@ -182,7 +193,12 @@ class _Space:
         carries, its message (never a path's part, O12), and the record so far."""
         detail = NOT_IN_SPACE if isinstance(error, KeyError) else str(error)
         seconds = round(self.p.clock() - self._started[stage], 3)
-        self.record["stages"][stage] = {"ok": False, "seconds": seconds, **getattr(error, "facts", {})}
+        self.record["stages"][stage] = {
+            "ok": False,
+            "seconds": seconds,
+            **getattr(error, "facts", {}),
+            **self._transfer_reads(stage),
+        }
         self.record["stages"][stage]["error"] = detail
         self.close(ok=False)
         message = (

@@ -39,7 +39,9 @@ record the last attempt's counts (`files_processed`, `files_evicted`, `files_fai
 one: unknown is never zero.
 
 The wait for the transfers to end polls each one's record, and a poll that times out ends the eviction, so those polls
-are tried again under the provisioner's policy (O29, `readretry.py`), within the wait's own bound. The block-map reads
+are tried again under the provisioner's policy (O29, `readretry.py`), within the wait's own bound, or under the policy
+a caller hands in (`reads`): the reset's eviction stage hands its stage's, which tries a connection failure again too
+(O46). The block-map reads
 of the verification are inside a poll that counts a failed read as one that did not match, and stay one attempt.
 
 **A caller can watch.** `scheduled` is told each attempt's transfer ids when they are sent, `ended` the same ids once
@@ -64,6 +66,7 @@ from expcore_onedata.provision import (
     Provisioner,
     ProvisionError,
 )
+from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.transferrecord import eviction_counters
 
 COUNTERS = ("files_processed", "files_evicted", "files_failed")  # the record's keys of `eviction_counters`, in order
@@ -174,9 +177,14 @@ def require_empty_each(provisioner: Provisioner, provider: str, file_ids: Iterab
 
 
 def _wait_ended(
-    provisioner: Provisioner, provider: str, transfer_ids: list[str], waits: consistency.WaitLog | None = None
+    provisioner: Provisioner,
+    provider: str,
+    transfer_ids: list[str],
+    waits: consistency.WaitLog | None,
+    reads: ReadRetry,
 ) -> consistency.TransferReport:
-    """Wait for the transfers to end, together; raise WaitTimeout when one has not ended at the bound."""
+    """Wait for the transfers to end, together, their records read under `reads`; raise WaitTimeout when one has not
+    ended at the bound."""
     settings = provisioner.settings
     return consistency.require_ended(
         consistency.wait_transfers(
@@ -188,7 +196,7 @@ def _wait_ended(
             workers=settings.concurrency,
             clock=provisioner.clock,
             sleep=_sleep(provisioner, waits, "transfers_ending"),
-            retry=provisioner.retry,
+            retry=reads,
         ),
         f"{provisioner.where}eviction",
     )
@@ -198,11 +206,13 @@ def _wait_ended(
 class _Watch:
     """What a caller is told of an eviction's jobs and waits: `scheduled` gets each attempt's transfer ids when they
     are sent, `ended` the same ids once each record has reported an ended state on the evicting provider, and `waits`
-    logs every wait the eviction takes, by why (`transfers_ending`, `block_maps`, `retry_pause`)."""
+    logs every wait the eviction takes, by why (`transfers_ending`, `block_maps`, `retry_pause`); `reads` is the policy
+    of the waits' record reads (`evict_ids`), the provisioner's when the caller names none."""
 
     scheduled: Callable[[Sequence[str]], None] | None = None
     ended: Callable[[Sequence[str]], None] | None = None
     waits: consistency.WaitLog | None = None
+    reads: ReadRetry | None = None
 
 
 def _evict_verified(
@@ -226,7 +236,7 @@ def _evict_verified(
         if watch.scheduled is not None:
             watch.scheduled(tids)
         transfers += len(tids)
-        done = _wait_ended(provisioner, provider, tids, watch.waits)
+        done = _wait_ended(provisioner, provider, tids, watch.waits, watch.reads or provisioner.retry)
         if watch.ended is not None:
             watch.ended(tids)
         for state, count in done.states().items():
@@ -258,12 +268,14 @@ def evict_ids(
     scheduled: Callable[[Sequence[str]], None] | None = None,
     ended: Callable[[Sequence[str]], None] | None = None,
     waits: consistency.WaitLog | None = None,
+    reads: ReadRetry | None = None,
 ) -> dict[str, Any]:
     """Evict files, given by id, from a provider, at most `concurrency` requests at once, and return a record once
     every file's block map there shows nothing held. Never from the data provider; no id means nothing to do.
     `scheduled`, when given, is called with the ids of each attempt's transfers: the reset tells its own jobs from
     others' by them (O46); `ended` with the same ids once their records have reported an ended state on the evicting
-    provider, before `quiet` is called; `waits` logs every wait the eviction takes, by why."""
+    provider, before `quiet` is called; `waits` logs every wait the eviction takes, by why; `reads` is the policy of
+    the waits' record reads (the provisioner's by default; the reset's stage hands its own, O46)."""
     provisioner.check_eviction(from_provider)
     ids = list(dict.fromkeys(file_ids))
     if not ids:
@@ -289,7 +301,7 @@ def evict_ids(
             provisioner.settings.concurrency,
         )
 
-    watch = _Watch(scheduled, ended, waits)
+    watch = _Watch(scheduled, ended, waits, reads)
     done = _evict_verified(provisioner, from_provider, ids, schedule, quiet, watch)
     return {"files": len(ids), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 
@@ -304,13 +316,14 @@ def evict_tree(
     scheduled: Callable[[Sequence[str]], None] | None = None,
     ended: Callable[[Sequence[str]], None] | None = None,
     waits: consistency.WaitLog | None = None,
+    reads: ReadRetry | None = None,
 ) -> dict[str, Any]:
     """Evict every file under a directory from a provider with one transfer, then verify all of them together, the
     tree listed once; return the record. Never from the data provider; `path` (or the entry a caller resolved
     already) must be a directory. An attempt that left bytes schedules the directory's eviction again. `listed`, when
     given, is called with the ids of the files the listing found, before the transfer: the reset's quiet check holds
     those files' block maps on this provider to the empty map the eviction verified (O33), so it never lists the tree a
-    second time. `scheduled`, `ended` and `waits` are as `evict_ids` takes them."""
+    second time. `scheduled`, `ended`, `waits` and `reads` are as `evict_ids` takes them."""
     provisioner.check_eviction(from_provider)
     began = provisioner.clock()
     provisioner.verify_space()
@@ -326,7 +339,7 @@ def evict_tree(
         files,
         lambda _pending: [provisioner.schedule_transfer("eviction", directory.file_id, from_provider)],
         quiet,
-        _Watch(scheduled, ended, waits),
+        _Watch(scheduled, ended, waits, reads),
     )
     return {"files": len(files), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 

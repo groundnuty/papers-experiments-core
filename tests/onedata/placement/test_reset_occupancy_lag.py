@@ -56,9 +56,9 @@ def land_at_t(monkeypatch, fake, file_id) -> None:
     """Make `file_id`'s bytes land on beta as the quiet stage reads its block maps, at T."""
     original = resetqos.read_pairs
 
-    def landing(p, pairs):
+    def landing(p, pairs, reads):
         fake.blocks[(file_id, BETA_ID)] = [[0, len(DATA)]]
-        return original(p, pairs)
+        return original(p, pairs, reads)
 
     monkeypatch.setattr(resetqos, "read_pairs", landing)
 
@@ -273,10 +273,10 @@ def test_o46_an_eviction_that_ends_during_the_quiet_stage_fails_it(
     fake.blocks[(kept, BETA_ID)] = [[0, len(DATA)]]
     original = resetqos.read_pairs
 
-    def at_t(p, pairs):
+    def at_t(p, pairs, reads):
         outside_job(fake, ticker, "eviction", kept)
         fake.blocks[(late, BETA_ID)] = [[0, len(DATA)]]
-        return original(p, pairs)
+        return original(p, pairs, reads)
 
     monkeypatch.setattr(resetqos, "read_pairs", at_t)
     provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
@@ -314,10 +314,10 @@ def test_o46_an_eviction_listed_late_during_the_quiet_stage_fails_it(
     platform = slow_listings(fake, ticker, tmp_path)
     original = resetqos.read_pairs
 
-    def at_t(p, pairs):
+    def at_t(p, pairs, reads):
         outside_job(fake, ticker, "eviction", kept)
         fake.blocks[(late, BETA_ID)] = [[0, len(DATA)]]
-        return original(p, pairs)
+        return original(p, pairs, reads)
 
     monkeypatch.setattr(resetqos, "read_pairs", at_t)
     provisioner = provisioner_with(client, config, platform, ticker, tmp_path)
