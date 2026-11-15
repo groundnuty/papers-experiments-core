@@ -140,6 +140,7 @@ class Held:
 
     def __init__(self, first: bytes) -> None:
         self._first, self.release, self.blocked = first, threading.Event(), threading.Event()
+        self._late = b"late"
 
     def read1(self, n: int) -> bytes:
         if self._first:
@@ -147,7 +148,8 @@ class Held:
             return first
         self.blocked.set()
         self.release.wait(10)
-        return b"late"
+        late, self._late = self._late, b""  # one late chunk, then the end of the stream
+        return late
 
 
 def test_o55_a_reader_given_up_on_keeps_the_bytes_it_held_back_as_output_and_counts_them():
@@ -162,9 +164,8 @@ def test_o55_a_reader_given_up_on_keeps_the_bytes_it_held_back_as_output_and_cou
     assert pipe.snapshot() == (b"head\x1e", 5)
     stream.release.set()
     pipe.join(10)
-    kept, produced = pipe.snapshot()
-    assert kept == b"head\x1e"
-    assert produced >= 5
+    assert not pipe.is_alive()
+    assert pipe.snapshot() == (b"head\x1e", 9)  # the late bytes are counted, and none of them kept
 
 
 def test_o55_a_timed_out_command_keeps_the_bytes_it_held_back_whole(tmp_path):
