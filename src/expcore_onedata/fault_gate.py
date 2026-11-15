@@ -15,9 +15,12 @@ the check counts as down before its wait can run out.
 **A wait that runs out is told apart** by the holder record the exclusive holder keeps beside the lock
 (`expcore_onedata.admission`). When the check's wait runs out it reads the journal and the record. An injection whose
 restore failed (journalled `clear_failed`) fails the check, naming the target by its label, whoever still holds the
-federation. A live holder, or none recorded, is contention, an outage run in progress, which is no fault of the
-federation: the check answers deferred (`Health(..., deferred=True)`), which the core's gate treats as a wait that
-charges no run. A recorded holder that is gone while the lock stays held is
+federation; a heal's own marker (`clear_failed` with `healing`, its latest line) is no failed restore yet, but a heal
+under way. A live holder, or none recorded, is contention, an outage run in progress, its heal included, which is no
+fault of the federation: the check answers deferred and charging no one (`Health(..., deferred=True, charge=False)`),
+which the core's gate treats as a wait that charges no run, and, once it outlasts `max_defer_s` (as an outage run
+with a heal can), as a blocking hold that still charges no run. A recorded holder that is gone while the lock stays
+held is
 stuck: the check recovers, verified, whatever the journal holds open, marks the record `stuck_since` (the first such
 verdict's time) and fails, saying the lock is stuck. The record is never deleted for it, so every later timeout is stuck
 too; only an acquisition of the lock, which proves it usable, clears it.
@@ -195,13 +198,13 @@ class FaultGate:
             latched = self._heals.latched()
         except (OSError, ValueError) as error:
             why = f"the record of the fault gate's heals cannot be read ({type(error).__name__}), so no heal runs"
-            return Health(False, f"{verdict.detail}; {why}")
+            return verdict._replace(detail=f"{verdict.detail}; {why}")
         if latched:
             why = (
                 "the fault gate has healed once since its link check last passed, and no heal runs again until a "
                 "link check passes"
             )
-            return Health(False, f"{verdict.detail}; {why}")
+            return verdict._replace(detail=f"{verdict.detail}; {why}")
         try:
             exclusive = self._lock.acquire(exclusive=True, timeout_s=self._wait_s, purpose=RECOVERY)
         except FederationBusy:
@@ -209,17 +212,17 @@ class FaultGate:
                 f"the fault gate's heal did not run: the federation was not free of runs, tools and drains within "
                 f"health_wait_s ({self._wait_s:g} s), so the gate stays closed"
             )
-            return Health(False, f"{verdict.detail}; {why}")
+            return verdict._replace(detail=f"{verdict.detail}; {why}")
         try:
             entries = self._recovery.entries()
             if entries:  # an injection opened since the check: its restore owns the links
                 return _unsettled(entries)
             result, said = self._healer.run(trigger)
             if result is None:
-                return Health(False, f"{verdict.detail}; {said}")
+                return verdict._replace(detail=f"{verdict.detail}; {said}")
             self._last_heal = result.record
             if not result.healed:
-                return Health(False, f"{verdict.detail}; {said}")
+                return verdict._replace(detail=f"{verdict.detail}; {said}")
             # the gate opens only on its own check, run again under the exclusive admission, its link check passing
             again, _ = self._judged()
             latest = self._report()
@@ -232,7 +235,7 @@ class FaultGate:
     def _busy(self) -> Health:
         """The wait for the federation ran out: tell a failed restore, a stuck holder and an outage run on it apart."""
         entries = self._recovery.entries()
-        if any("clear_failed" in entry for entry in entries):
+        if any("clear_failed" in entry and not entry.get("healing") for entry in entries):
             return _unsettled(entries)  # a restore failed: a fault of the federation, whoever still holds it
         draining = self._lock.drain_left()
         if draining > 0:  # nobody holds it: it is closed while an outage run's sessions drain (or a heal's settle
@@ -242,10 +245,14 @@ class FaultGate:
                 f"the federation is closed for {draining:.0f} s more while an outage run's sessions drain or a heal "
                 "settles: the check waits for it",
                 deferred=True,
+                charge=False,  # nor once it outlasts the gate's bound: the drain says nothing about the waiting run
             )
         record = self._journal.read_holder()
-        if record is None or holder_alive(record) is not False:  # contention: a wait, which charges no run
-            return Health(False, f"{_named(record)} holds the federation: the check waits for it", deferred=True)
+        if record is None or holder_alive(record) is not False:
+            # contention, a heal under way included (its marker is no failed restore yet): a wait that charges no run,
+            # nor the one that finds it once it outlasts the gate's bound, as an outage run with a heal can
+            detail = f"{_named(record)} holds the federation: the check waits for it"
+            return Health(False, detail, deferred=True, charge=False)
         since = datetime.now(UTC).isoformat(timespec="seconds")
         marked = self._journal.mark_holder_stuck(record.get("token"), since) or record
         stuck = marked.get("stuck_since")

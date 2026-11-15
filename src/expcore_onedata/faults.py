@@ -119,7 +119,9 @@ stuck, and fails the start the same way instead of being skipped as a live run's
 **Baseline (O11).** While an injection proceeds or is unsettled the federation is not in its baseline state, so no
 other run may be on it. An outage run holds the federation's lock exclusively for its whole run, inject and clear
 included (`expcore_onedata.admission`): the injector uses its run's exclusive admission, takes one itself when the run
-holds none, refuses a shared one, and keeps it until the restore is verified. Every other run holds it shared, so the
+holds none, refuses a shared one, and keeps it until the restore is verified. Its own wait that runs out while another
+run holds the federation, or while it stays closed for an outage run's session drain, is `federation_busy`, a hold that
+costs the run no attempt, never `injector_failure`. Every other run holds it shared, so the
 two never overlap; a turnstile in front of the lock keeps a stream of shared holders from starving an outage run. An
 injector also refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
 settle, and the platform's standard health check (`PlatformHealth`), whenever platform.toml has a `[faults]` table,
@@ -189,6 +191,7 @@ from expcore_onedata.admission import (
     INJECTOR,
     Admission,
     AdmissionRefused,
+    FederationBusy,
     FederationLock,
     current_admission,
     require_same_federation,
@@ -389,14 +392,15 @@ class FaultInjector:
         """Wait, inside `admission_timeout_s` and until cancelled, for the federation's drain record to pass. It is read
         after the journal was (`_recover` read it): a restore that cleared an injection without holding this admission
         (the health gate's recovery of a stuck holder's injection) wrote its record before it cleared, so a start that
-        finds the journal settled finds the record too, whatever it read before. A start that cannot wait it out fails
-        as `injector_failure`, with nothing taken down."""
+        finds the journal settled finds the record too, whatever it read before. A start that cannot wait it out is the
+        hold `federation_busy` (`FederationBusy`), as a wait for the lock that runs out is, with nothing taken down; a
+        cancelled wait fails as `injector_failure`."""
         deadline = self._clock() + self._settings.admission_timeout_s
         while (left := self._federation.drain_left()) > 0:
             if self._cancel.is_set():
                 raise self._fail("the wait for the federation was cancelled")
             if self._clock() >= deadline:
-                raise self._fail(
+                raise FederationBusy(
                     "the federation stayed closed past the bound of the wait: an outage run's sessions drain"
                 )
             self._sleep(min(left, 0.5))
@@ -425,6 +429,8 @@ class FaultInjector:
                 self._admission = self._federation.acquire(
                     exclusive=True, timeout_s=timeout_s, cancel=cancel, purpose=INJECTOR, target=self.target
                 )
+            except FederationBusy:  # another run holds the federation: a hold that costs no attempt, never a failure
+                raise
             except InfraError as error:
                 raise self._fail(error.detail) from None
 
@@ -772,7 +778,8 @@ class FaultInjector:
           owner cannot let the lock go under it; one whose last share is already given up is not held for this purpose);
         - else an exclusive admission this injector takes for the restore and gives up when it ends (`own` true: no
           sandbox of the run is under it), which waits for the federation inside `[faults] admission_timeout_s`; one it
-          cannot get is `refused`, an InfraError of kind `injector_failure`, and nothing is restored;
+          cannot get is `refused`, and nothing is restored: the hold `federation_busy` (`FederationBusy`) when the wait
+          ran out, else an InfraError of kind `injector_failure`;
         - with `session_drain_s` 0, nothing: there is no drain to keep.
 
         Declared limits. A restore that holds no admission waits for the federation (and for a drain still standing)
@@ -799,6 +806,9 @@ class FaultInjector:
                 purpose=INJECTOR,
                 target=self.target,
             )
+        except FederationBusy as busy:  # another run holds the federation, or it drains: a hold, never a failure (O11)
+            yield None, False, busy
+            return
         except InfraError as error:
             yield None, False, self._fail(error.detail)
             return

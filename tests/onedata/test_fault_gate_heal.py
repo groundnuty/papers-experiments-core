@@ -11,7 +11,8 @@ import json
 from collections import Counter
 
 import pytest
-from fault_support import SERVICES, FakeClock, FakeServices, faults_table, write_faults
+from fault_support import SERVICES, FakeClock, FakeServices, faults_table
+from heal_support import NAMES, STORES, four_providers, heal_margin_s
 
 from expcore.campaign.healthgate import Health
 from expcore_onedata import health as platform_health
@@ -27,8 +28,6 @@ from expcore_onedata.linkcheck import REMEDY, LinkReport, PairResult
 from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.tokens import TokenIssuer
 
-NAMES = ("alpha", "beta", "gamma", "delta")
-STORES = {name: f"store-{name}" for name in NAMES}
 CRASHED, OTHER, READER, SECOND = (f"providers[{index}]" for index in range(4))
 EVERY = (CRASHED, OTHER, READER, SECOND)
 
@@ -136,19 +135,12 @@ class GateCheck:
         return Health(False, f"no run is admitted until every provider link transfers: {self.report.detail}")
 
 
-def four_providers(data, **faults):
-    """Four providers, each with a service; short commands and settles, so a declared heal fits its default bound,
-    and a short wait for the federation."""
-    for name, index in (("gamma", 3), ("delta", 4)):
-        data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
-    table = {"services": dict(STORES), "command_timeout_s": 10, "heal_settle_s": 30, "health_wait_s": 0.2, **faults}
-    data["faults"] = faults_table(**table)
-
-
 def gate_of(tmp_path, federation=None, **faults):
-    """The fault gate around `GateCheck`, as `PlatformHealth` builds it, on a fake clock that is also its wall."""
+    """The fault gate around `GateCheck`, as `PlatformHealth` builds it, on a fake clock that is also its wall: four
+    providers (`heal_support.four_providers`, with the token margin a declared heal needs) and a short wait for the
+    federation."""
     tmp_path.mkdir(parents=True, exist_ok=True)  # a test may build a second federation under a subdirectory
-    platform = write_platform(tmp_path, lambda data: four_providers(data, **faults))
+    platform = write_platform(tmp_path, lambda data: four_providers(data, **{"health_wait_s": 0.2, **faults}))
     config = load_platform(platform, require_secrets=False)
     settings = load_faults(platform, config)
     federation = federation or Federation()
@@ -206,7 +198,12 @@ def test_o35_the_gate_heal_runs_through_the_platforms_standard_health_check(tmp_
     federation = Federation(SERVICES)
     federation.stuck = {("providers[1]", "providers[0]")}
     monkeypatch.setattr(platform_health, "check_links", lambda *args, **kwargs: report_of(federation))
-    platform = write_faults(tmp_path, heal="all_links", heal_settle_s=0, health_wait_s=0.2)
+
+    def edit(data):
+        data["faults"] = faults_table(heal="all_links", heal_settle_s=0, health_wait_s=0.2)
+        data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
+
+    platform = write_platform(tmp_path, edit)
     config = load_platform(platform)
     client = OnezoneClient(config, http=fake.client_http())
     issuer = TokenIssuer(client, config, clock=lambda: NOW)
