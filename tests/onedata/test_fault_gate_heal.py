@@ -8,26 +8,34 @@ no-fetch settle, fresh pair reads around each action, its record, and failing cl
 """
 
 import contextvars
-import json
 import threading
 import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from campaign_support import keys_under, planned_store
 from fault_support import SERVICES, faults_table
-from gate_support import CRASHED, EVERY, OTHER, READER, SECOND, Federation, GateCheck, ProcessEnded, gate_of
+from gate_heal_support import (
+    ANY_ACTION,
+    GONE_PROCESS,
+    UNCHARGED_WAIT,
+    acted,
+    core_gate,
+    heal_lines,
+    healed,
+    left_by_a_killed_process,
+    next_process,
+)
+from gate_support import CRASHED, EVERY, OTHER, READER, SECOND, Federation, ProcessEnded, gate_of
 from heal_support import NAMES, STORES
 
-from expcore.campaign.healthgate import DEFER, FOUND, GO, HealthGate
+from expcore.campaign.healthgate import DEFER, FOUND, GO
 from expcore.errors import InfraError
 from expcore_onedata import fault_gate_heal
 from expcore_onedata import health as platform_health
 from expcore_onedata.admission import OUTAGE_RUN, RECOVERY, FederationLock
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
-from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_gate_heal import GateHeals
 from expcore_onedata.fault_journal import InjectionJournal, holder
 from expcore_onedata.fault_matrix import LinkMatrix
@@ -36,43 +44,6 @@ from expcore_onedata.health import PlatformHealth
 from expcore_onedata.linkcheck import REMEDY, LinkReport, PairResult
 from expcore_onedata.testing import NOW, write_platform
 from expcore_onedata.tokens import TokenIssuer
-
-
-def acted(federation, *verbs):
-    return [(verb, label) for verb, label, _ in federation.actions if verb in verbs]
-
-
-def heal_lines(settings):
-    path = settings.journal / "gate-heals.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
-ANY_ACTION = ("arm_gate", "ping", "restart_link", "stop", "start")
-UNCHARGED_WAIT = (False, True, False)  # (ok, deferred, charge): the hold a heal in progress answers
-
-
-def healed(gate, federation):
-    """The check that finds the stuck pair begins the heal and answers the uncharged deferral; once the heal has ended
-    and its settle's drain record has passed, the answer of the next check."""
-    first = gate()
-    assert (first.ok, first.deferred, first.charge) == UNCHARGED_WAIT, first.detail
-    assert gate.wait_for_heal(10)
-    federation.clock.sleep(600)  # past the drain record each restart's settle wrote
-    return gate()
-
-
-def core_gate(tmp_path, check, **options):
-    """The core's health gate around `check`, over a small planned campaign: the gate, its store and a run's key."""
-    campaign = tmp_path / "campaign"
-    campaign.mkdir()
-    store, schema, manifest = planned_store(campaign)
-    clock = iter(f"2026-01-01T00:{minute:02d}:00Z" for minute in range(1, 60))
-    core = HealthGate(store, check, lambda: next(clock), **options)
-    core.load()
-    return core, store, keys_under(schema, manifest, "mount-read")[0]
-
 
 # --- it heals what its own check found stuck --------------------------------------------------------------------
 
@@ -241,38 +212,6 @@ def test_o35_a_failed_heal_never_reopens_the_gate_on_a_pass_cached_before_it(tmp
     reading = healed(gate, federation)
     assert (reading.ok, reading.deferred) == (False, False)
     assert "until a link check passes" in reading.detail
-
-
-GONE = {"pid": 999999, "boot_id": "a boot that is over"}  # a holder record's process that has ended
-GONE_PROCESS = "a-boot-that-is-over:999999:1"  # `liveness.this_process` of a process of a boot that is over
-
-
-def left_by_a_killed_process(settings) -> None:
-    """What a killed healing process leaves beside the federation's lock: its holder record (the kernel let its lock
-    go with it, and no line was journalled past the point it reached)."""
-    since = datetime.now(UTC).isoformat(timespec="seconds")
-    InjectionJournal(settings.journal).write_holder(
-        {"token": "killed", **GONE, "purpose": RECOVERY, "target": None, "since_utc": since}
-    )
-
-
-def next_process(settings, federation) -> tuple[FaultGate, GateCheck]:
-    """The next process's fault gate, a gate and a check of its own, on the same federation, journal and clock."""
-    check = GateCheck(federation)
-    labels = {f"providers[{index}]": STORES[name] for index, name in enumerate(NAMES)}
-    clock = federation.clock
-    gate = FaultGate(
-        settings,
-        federation,
-        check,
-        labels=labels,
-        links=check.take,
-        relink=check.expire,
-        clock=clock,
-        sleep=clock.sleep,
-        wall=clock,
-    )
-    return gate, check
 
 
 def no_run_is_admitted(settings) -> None:

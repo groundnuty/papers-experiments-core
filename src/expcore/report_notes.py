@@ -300,3 +300,12 @@ BUDGET_HOLD_NOTES = [
     "outage's kind, is counted here too. They are counted over every run of the campaign, a run a partial analysis",
     "leaves out included. A model with more of them had its runs stopped by the budget more often than the others.",
 ]
+
+HOLD_NOTES = [
+    "Each row is a stretch in which the platform's health check said that only an operator could end what it found (a",
+    "repair that failed and left its fault in place), so no run started. A held run has no attempt; the hold itself is",
+    "in none of the counts above. Until: when a check passed again, or `open` when the campaign ended with the gate",
+    "closed. Blocking: the wait outlasted `max_defer_s`, and a campaign that exits when blocked stopped. Charged a",
+    "run: one run was charged an attempt for the hold, the run whose check found it, and that attempt is among the",
+    "infrastructure failures above. The reason is the platform's own words, naming what is stuck by label only.",
+]

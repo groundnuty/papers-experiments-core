@@ -342,3 +342,46 @@ def test_b18_c32_shards_none_of_which_export_deployment_shares_join_into_an_expo
     """B18, C32: a campaign whose models declare no set has no `deployment_shares`, merged or not."""
     joined = join_exports({1: export(analysed=[entry("a")]), 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS)
     assert "deployment_shares" not in joined
+
+
+def hold(start: str, **more) -> dict:
+    """One entry of a shard's `operator_holds` (C11), as `export_run_state` lists it."""
+    held = {"start_utc": start, "end_utc": None, "blocking": False, "charged": True, "checks": 2, "reason": "a reason"}
+    return {**held, **more}
+
+
+def with_holds(data: dict, holds: list[dict]) -> dict:
+    """`data` with `operator_holds` where `export_run_state` puts it: after `kinds` and the deployment shares."""
+    placed = {}
+    for key, value in data.items():
+        placed[key] = value
+        if key == ("deployment_shares" if "deployment_shares" in data else "kinds"):
+            placed["operator_holds"] = holds
+    return placed
+
+
+def test_c11_the_holds_of_shards_join_in_shard_order_each_entry_tagged_with_its_shard():
+    """C11: a hold an operator ends was met by the shard whose platform check said it, so each entry says which shard,
+    and a shard that met none adds none, whichever shard is first; the key stands where `export_run_state` puts it
+    (after `kinds`, and after `deployment_shares` when there is one)."""
+    shares = deployment_shares(declared({"fp-east": PROBE}), ONE)
+    first, second = hold("2026-03-01T10:00:00Z"), hold("2026-03-02T09:00:00Z", blocking=True)
+    met = with_holds(export(analysed=[entry("a")]), [first, second])
+    none = with_shares("b", shares)
+    for exports in ({1: met, 2: none}, {1: none, 2: met}):
+        joined = join_exports(exports, plan("a", "b"), SHARDS)
+        met_by = 1 if exports[1] is met else 2
+        assert joined["operator_holds"] == [{**first, "shard": met_by}, {**second, "shard": met_by}]
+        keys = list(joined)
+        assert keys.index("operator_holds") == keys.index("deployment_shares") + 1
+    keys = list(join_exports({1: met, 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS))
+    assert keys.index("operator_holds") == keys.index("kinds") + 1
+    both = {1: with_holds(none, [first]), 2: with_holds(export(analysed=[entry("a")]), [second])}
+    joined = join_exports(both, plan("a", "b"), SHARDS)
+    assert joined["operator_holds"] == [{**first, "shard": 1}, {**second, "shard": 2}]
+
+
+def test_c11_shards_none_of_which_met_such_a_hold_join_into_an_export_without_the_key():
+    """C11: the merged export of a campaign no hold of an operator touched is the export it was."""
+    joined = join_exports({1: export(analysed=[entry("a")]), 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS)
+    assert "operator_holds" not in joined
