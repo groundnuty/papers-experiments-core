@@ -18,7 +18,8 @@ declared for raises ConfigError, naming the file and the table, never the servic
 `ComposeDriver.restored_links`) for the link check of every ordered pair of providers, not the provider's own alone
 (an outage can leave another pair stuck), and a pair that does not pass fails the restore (`links_stuck`): the
 injection stays open and the fault gate fails, as for a restore that never served, until a later clear finds every link
-transferring.
+transferring. `ServingProbe.matrix` is the same check pair by pair, which the heal of `[faults] heal` reads, and `arm`
+and `sessions` are the session gate that comes before it (`expcore_onedata.fault_sessions`).
 """
 
 from collections.abc import Callable
@@ -26,6 +27,8 @@ from collections.abc import Callable
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_matrix import LinkMatrix
+from expcore_onedata.fault_sessions import SessionGate
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.linkcheck import check_links
 from expcore_onedata.readretry import ONE_ATTEMPT
@@ -49,6 +52,7 @@ class ServingProbe:
     def __init__(self, config: PlatformConfig, settings: FaultSettings, client: OnezoneClient) -> None:
         self._config, self._settings, self._client = config, settings, client
         self._by_service = {service: provider for provider, service in settings.services.items()}
+        self._gate = SessionGate(config, client)
 
     def _provider(self, service: str) -> str:
         provider = self._by_service.get(service)
@@ -76,11 +80,31 @@ class ServingProbe:
         of, while every pair the local provider reads through transferred). A read through any stuck pair would hang.
         `service` must be one a provider is declared for. Without a `[link_check]` nothing is checked:
         a federation with pairs and none is refused at its campaign's start."""
+        matrix = self.matrix(service)
+        return None if matrix is None or matrix.ok else matrix.detail
+
+    def matrix(self, service: str) -> LinkMatrix | None:
+        """The same check as a matrix of every pair by label, which the heal reads (`fault_heal`); None without a
+        `[link_check]`."""
         self._provider(service)
         if self._config.link_check is None:
             return None
-        report = check_links(self._config, self._client)
-        return None if report.ok else report.detail
+        return LinkMatrix.from_report(check_links(self._config, self._client))
+
+    def arm(self, service: str) -> str | None:
+        """Before an injection: the session gate's probe file, found or written and seen by every provider of the probe
+        space (`fault_sessions.SessionGate.arm`); its id, or None without a `[link_check]`."""
+        self._provider(service)
+        return self._gate.arm()
+
+    def sessions(self, service: str, gate_probe: str | None) -> str | None:
+        """One reading of the session gate for the provider behind a restored service (`SessionGate.sessions`)."""
+        return self._gate.sessions(self._provider(service), gate_probe)
+
+    def transfers(self) -> int:
+        """How many transfer listings of the declared spaces and the probe space show a job not yet ended
+        (`SessionGate.active_transfers`), which the all-links heal waits on."""
+        return self._gate.active_transfers()
 
 
 def provider_serves(config: PlatformConfig, settings: FaultSettings, client: OnezoneClient) -> Callable[[str], bool]:

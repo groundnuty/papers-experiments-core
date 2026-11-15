@@ -35,7 +35,9 @@ def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[R
     """Return the sorted `(offset, length)` blocks a provider holds of one file, from a `/distribution` answer.
 
     Only an explicit empty list says a provider holds nothing. A provider that is absent from the answer is unknown, as
-    is a listed one without a table of storage backends, a backend without a `blocks` list, or any other shape: each
+    is a listed one without a table of storage backends, one or a backend marked `"success": false` (the build answers
+    an error so, with no size, `data_distribution_translator.erl`), a backend without a `blocks` list, or any other
+    shape: each
     raises ValueError, as does any block that is not a pair of integers (a bool is none) with an offset of zero or more
     and a length of one or more. The answer may be partial, so absence is not proof of an empty holding, and an unknown is never
     read as an empty list (O01, O08), or an eviction could be confirmed by it.
@@ -46,6 +48,8 @@ def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[R
     if provider_id not in per_provider:
         raise ValueError("the distribution answer does not list the provider, so what it holds is unknown")
     entry = per_provider[provider_id]
+    if isinstance(entry, Mapping) and entry.get("success") is False:
+        raise ValueError("the distribution answer marks the provider failed, so what it holds is unknown")
     backends = entry.get("distributionPerStorageBackend") if isinstance(entry, Mapping) else None
     if not isinstance(backends, Mapping) or not backends:
         raise ValueError("the distribution answer lists the provider but has no 'distributionPerStorageBackend' table")
@@ -53,6 +57,8 @@ def provider_blocks(distribution: Mapping[str, Any], provider_id: str) -> list[R
     for backend in backends.values():
         if not isinstance(backend, Mapping):
             raise ValueError("the distribution answer's storage backend entry is not a table")
+        if backend.get("success") is False:
+            raise ValueError("the distribution answer marks a storage backend failed, so what it holds is unknown")
         blocks = backend.get("blocks")
         if not isinstance(blocks, list | tuple):
             raise ValueError("the distribution answer's storage backend has no list of 'blocks'")

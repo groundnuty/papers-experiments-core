@@ -341,6 +341,9 @@ command_timeout_s = 300                # a stop waits for its grace period, 120 
 
 [faults.services]
 pine = "pine"                          # provider name -> Compose service
+
+[tokens]
+margin_s = 4360                        # outlives the restore, its gate and the drain (restore_token_margin_s, 4,354 s here), which load_faults requires
 ```
 
 ```sh

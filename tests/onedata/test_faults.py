@@ -37,6 +37,7 @@ from expcore_onedata.faults import (
     load_faults,
     provider_outage,
 )
+from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
 from expcore_onedata.testing import NOW, write_platform
 
 OUTAGE_SERVICE = SERVICES["beta"]
@@ -145,7 +146,9 @@ def test_o11_finish_brings_the_provider_back_with_a_new_identity_and_records_eve
 
 def test_o11_a_restore_that_does_not_change_the_identity_is_a_failure(tmp_path):
     """O11: back and running, but with the identity it had: not a restore. The snapshot says so, the journal keeps
-    the injection open, and the next start fails as the injector's own failure instead of running on."""
+    the injection open, and the next start is refused instead of running on: the failed injector keeps the federation
+    held, so its wait runs out as the hold `federation_busy`, never charged to the run that waited (the failure is the
+    first run's own, in its snapshot), and nothing more is injected."""
     services = FakeServices(start_keeps_identity=True)
     platform = write_faults(tmp_path)
     injector = injector_for(platform, services)
@@ -163,7 +166,8 @@ def test_o11_a_restore_that_does_not_change_the_identity_is_a_failure(tmp_path):
     assert len(open_injections(tmp_path)) == 1
     with pytest.raises(InfraError) as caught:
         injector_for(platform, services).start({**RUN, "attempt": 2})
-    assert (caught.value.kind, caught.value.target) == (INJECTOR_FAILURE, OUTAGE_TARGET)
+    assert (caught.value.kind, caught.value.target) == (FEDERATION_BUSY, None)
+    assert len(open_injections(tmp_path)) == 1
 
 
 def test_o11_a_raising_trial_still_clears_the_fault(tmp_path):
@@ -374,7 +378,9 @@ def test_c06_a_campaign_does_not_resume_under_another_target_service_or_sanction
     schema, manifest = make_schema(), make_manifest(make_schema())
     configs = {
         "started": write_faults(folder(tmp_path, "a")),
-        "other waits": write_faults(folder(tmp_path, "b"), settle_timeout_s=60, admission_timeout_s=10, poll_s=3),
+        "other waits": write_faults(
+            folder(tmp_path, "b"), settle_timeout_s=60, admission_timeout_s=10, poll_s=3, margin_s=1800
+        ),
         "other service": write_faults(folder(tmp_path, "c"), services={**SERVICES, "beta": "store-three"}),
         "other project": write_faults(folder(tmp_path, "f"), project="stack-b"),
         "unsanctioned": write_faults(folder(tmp_path, "d"), sanctioned=False),

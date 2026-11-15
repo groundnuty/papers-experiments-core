@@ -114,10 +114,10 @@ def verdict(guard) -> tuple[int, str]:
     return guard.returncode, out
 
 
-def test_o48_the_guard_passes_when_this_launchs_administrator_answers_and_an_anonymous_request_is_refused(
+def test_o53_the_guard_passes_when_this_launchs_administrator_answers_and_an_anonymous_request_is_refused(
     launch, processes
 ):
-    """O48: the guard passes only on both requests: this launch's administrator gets 200 and is named, and an
+    """O53: the guard passes only on both requests: this launch's administrator gets 200 and is named, and an
     anonymous GET /settings/web gets 401."""
     secrets_dir, user, password = launch
     port = free_port()
@@ -130,8 +130,8 @@ def test_o48_the_guard_passes_when_this_launchs_administrator_answers_and_an_ano
     assert "FAILED" not in out
 
 
-def test_o48_a_bucket_without_an_administrator_fails_the_start(launch, processes):
-    """O48: the third live run's incident. cluster-init skipped the administrator with exit status 0, bucket-create
+def test_o53_a_bucket_without_an_administrator_fails_the_start(launch, processes):
+    """O53: the third live run's incident. cluster-init skipped the administrator with exit status 0, bucket-create
     ran, and Couchbase served with none: the guard fails as soon as the bucket shows."""
     secrets_dir, user, password = launch
     port = free_port()
@@ -145,8 +145,8 @@ def test_o48_a_bucket_without_an_administrator_fails_the_start(launch, processes
     assert "guard passed" not in out
 
 
-def test_o48_an_anonymous_admin_request_that_is_answered_fails_the_start(launch, processes):
-    """O48: our administrator answers, but so does an anonymous caller: anyone can act as the administrator."""
+def test_o53_an_anonymous_admin_request_that_is_answered_fails_the_start(launch, processes):
+    """O53: our administrator answers, but so does an anonymous caller: anyone can act as the administrator."""
     secrets_dir, user, password = launch
     port = free_port()
     guard = start_guard(processes, secrets_dir, port)
@@ -158,8 +158,8 @@ def test_o48_an_anonymous_admin_request_that_is_answered_fails_the_start(launch,
     assert "guard passed" not in out
 
 
-def test_o48_an_administrator_that_is_not_this_launchs_fails_the_start(launch, processes):
-    """O48: Couchbase already has an administrator, someone else's: ours is refused (401) and the start fails."""
+def test_o53_an_administrator_that_is_not_this_launchs_fails_the_start(launch, processes):
+    """O53: Couchbase already has an administrator, someone else's: ours is refused (401) and the start fails."""
     secrets_dir, _, _ = launch
     port = free_port()
     other = "cbffffffffffff:" + "".join(secrets.choice(ALNUM) for _ in range(24))
@@ -170,8 +170,8 @@ def test_o48_an_administrator_that_is_not_this_launchs_fails_the_start(launch, p
     assert "has an administrator that is not this launch's" in out
 
 
-def test_o48_couchbase_stopping_before_it_has_an_administrator_fails_the_start(launch, processes):
-    """O48: our listener goes away while Couchbase still has no administrator: no verdict of 'passed' is possible."""
+def test_o53_couchbase_stopping_before_it_has_an_administrator_fails_the_start(launch, processes):
+    """O53: our listener goes away while Couchbase still has no administrator: no verdict of 'passed' is possible."""
     secrets_dir, _, _ = launch
     port = free_port()
     guard = start_guard(processes, secrets_dir, port)
@@ -182,8 +182,8 @@ def test_o48_couchbase_stopping_before_it_has_an_administrator_fails_the_start(l
     assert "before it had an administrator" in out
 
 
-def test_o48_no_administrator_within_the_guards_time_fails_the_start(launch, processes):
-    """O48: Couchbase listens but onepanel never runs its setup: the guard fails at its deadline, not later."""
+def test_o53_no_administrator_within_the_guards_time_fails_the_start(launch, processes):
+    """O53: Couchbase listens but onepanel never runs its setup: the guard fails at its deadline, not later."""
     secrets_dir, _, _ = launch
     port = free_port()
     guard = start_guard(processes, secrets_dir, port, timeout=2)
@@ -195,8 +195,8 @@ def test_o48_no_administrator_within_the_guards_time_fails_the_start(launch, pro
     assert time.monotonic() - started < 10
 
 
-def test_o48_an_error_of_the_guard_itself_is_a_failed_verdict(launch, processes):
-    """O48: fail closed. An unreadable launch secret is an error of the guard, which is a FAILED verdict, never a
+def test_o53_an_error_of_the_guard_itself_is_a_failed_verdict(launch, processes):
+    """O53: fail closed. An unreadable launch secret is an error of the guard, which is a FAILED verdict, never a
     silent pass."""
     secrets_dir, _, _ = launch
     write_secret(secrets_dir / "couchbase-password", "")
@@ -206,8 +206,8 @@ def test_o48_an_error_of_the_guard_itself_is_a_failed_verdict(launch, processes)
     assert "the guard itself failed: ValueError" in out
 
 
-def test_o48_a_failed_verdict_stops_the_start_script_at_once(launch, tmp_path):
-    """O48: the guard sends SIGTERM to the start script that started it (its parent, START_PID), whose trap stops
+def test_o53_a_failed_verdict_stops_the_start_script_at_once(launch, tmp_path):
+    """O53: the guard sends SIGTERM to the start script that started it (its parent, START_PID), whose trap stops
     every component: a Couchbase with no administrator does not run on. Here the start script is a shell whose trap
     records the signal; the guard fails on its first look, as it does when its own secrets are unreadable."""
     secrets_dir, _, _ = launch
@@ -249,8 +249,8 @@ def load_guard(monkeypatch, answers):
     return guard, queue
 
 
-def test_o48_an_administrator_created_between_two_questions_is_not_taken_for_none(launch, monkeypatch):
-    """O48: onepanel creates the administrator, then the bucket, between the guard's GET /pools (unprovisioned) and its
+def test_o53_an_administrator_created_between_two_questions_is_not_taken_for_none(launch, monkeypatch):
+    """O53: onepanel creates the administrator, then the bucket, between the guard's GET /pools (unprovisioned) and its
     bucket listing (the new bucket, which an anonymous caller may list once there is an administrator). That is a
     healthy start: the guard asks again whether Couchbase has an administrator before it calls the start failed."""
     secrets_dir, user, password = launch
@@ -269,8 +269,8 @@ def test_o48_an_administrator_created_between_two_questions_is_not_taken_for_non
     assert not queue
 
 
-def test_o48_a_bucket_while_couchbase_still_has_no_administrator_fails_on_the_second_look(launch, monkeypatch):
-    """O48: the incident, asked twice: a bucket, and Couchbase still unprovisioned after it (an administrator, once
+def test_o53_a_bucket_while_couchbase_still_has_no_administrator_fails_on_the_second_look(launch, monkeypatch):
+    """O53: the incident, asked twice: a bucket, and Couchbase still unprovisioned after it (an administrator, once
     created, never goes away), so there was none when the bucket was listed."""
     secrets_dir, _, _ = launch
     guard, queue = load_guard(
