@@ -317,3 +317,60 @@ def test_o35_a_link_check_under_way_past_the_admissions_bound_refuses_the_run_un
             release.set()
             checker.join(10)
     assert refused.value.kind == FEDERATION_BUSY
+
+
+def test_o35_a_raise_the_directory_refuses_spoils_the_record_in_place_so_the_waiting_run_is_refused(
+    tmp_path, monkeypatch
+):
+    """O35: the journal's directory refuses both the new record and the removal of the old one, while the record file
+    itself still takes writes: the record is emptied in place, which no reader takes for a count, so the waiting run is
+    refused; once the directory takes writes again, the next check makes the record anew and a run checked afresh is
+    admitted."""
+    gate, federation, _, settings = gate_of(tmp_path, heal="off")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+
+    def refused_by_the_directory(self, *args):
+        raise PermissionError("the directory takes no new entry")
+
+    with prerun.opened():
+        assert gate().ok
+        federation.stuck = {(READER, CRASHED)}
+        with monkeypatch.context() as patched:
+            patched.setattr(LinkEpoch, "_write", refused_by_the_directory)
+            patched.setattr(LinkEpoch, "_remove", refused_by_the_directory)
+            assert elsewhere(gate).ok is False
+        assert (settings.journal / "link-epoch.json").read_bytes() == b""
+        with pytest.raises(FederationBusy, match="missing"):
+            admitted(admit)
+    federation.stuck = set()
+    with prerun.opened():
+        assert gate().ok
+        assert admitted(admit) == "shared"
+
+
+def test_o35_a_raise_that_nothing_can_record_keeps_every_admission_out_until_one_is_recorded(tmp_path, monkeypatch):
+    """O35: neither a new record, nor the removal of the old one, nor an overwrite of it can be made: the gate keeps
+    `link-epoch.lock` held, so every admission's wait runs out and the run is refused, uncharged, instead of being
+    admitted on the old count; the gate's next check that records the raise lets it go, and a run checked afresh is
+    admitted."""
+    gate, federation, _, _ = gate_of(tmp_path, heal="off", admission_timeout_s=0.2)
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+
+    def read_only(self, *args):
+        raise PermissionError("the journal is read-only")
+
+    with prerun.opened():
+        assert gate().ok
+        federation.stuck = {(READER, CRASHED)}
+        with monkeypatch.context() as patched:
+            for step in ("_write", "_remove", "_truncate"):
+                patched.setattr(LinkEpoch, step, read_only)
+            assert elsewhere(gate).ok is False
+        with pytest.raises(FederationBusy, match="under way"):
+            admitted(admit)
+    federation.stuck = set()
+    with prerun.opened():
+        assert gate().ok  # it records the raise it owed, and lets the lock go
+        assert admitted(admit) == "shared"

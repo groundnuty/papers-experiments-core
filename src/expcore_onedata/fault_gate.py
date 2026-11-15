@@ -55,8 +55,10 @@ a section under way keeps the heal out until `health_wait_s` runs out, and the g
 run's admission reads the link epoch (`fault_epoch`) under its shared hold and notes it in the try's note
 (`expcore.campaign.prerun`); the run's admission compares it with the epoch then, and a heal begun or a pair found
 failing since refuses the run, uncharged. A link check of the gate that finds a pair failing, in any call, raises the
-epoch. A link report made before the epoch last moved is no answer: the check makes the link check afresh (`relink`),
-so a failing pair or a heal another process saw is seen at this process's next check.
+epoch; one that cannot record the raise, nor spoil the old count, keeps `link-epoch.lock` held until a later check
+records it, so no admission reads the old count meanwhile. A link report made before the epoch last moved is no
+answer: the check makes the link check afresh (`relink`), so a failing pair or a heal another process saw is seen at
+this process's next check.
 
 **A heal cut short** (its process killed, or a clean exit that stopped it between two steps, `stop_heal`) leaves no
 `ended` line, and the first one of a stuck episode is forgiven (`GateHeals.latched`): the next check that finds a pair
@@ -91,9 +93,9 @@ from expcore_onedata.admission import (
     current_admission,
     require_same_federation,
 )
-from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, noted_of
+from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, RaiseLost, noted_of
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
-from expcore_onedata.fault_journal import holder_alive
+from expcore_onedata.fault_journal import HeldLock, holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
 from expcore_onedata.fault_settings import FaultSettings, heal_all_links_reserve, heal_container_reserve
@@ -194,6 +196,8 @@ class FaultGate:
         self._epoch = LinkEpoch(settings.journal)
         self._fresh_guard = threading.Lock()  # the link epoch (`id`, count) the latest link check it took answers for
         self._fresh: dict[str, Any] | None = None
+        self._strand_guard = threading.Lock()  # the hold of link-epoch.lock kept while a raise is recorded nowhere
+        self._stranded: HeldLock | None = None
         declared = settings.heal != "off" and self._may_recover
         heals = declared and links is not None and relink is not None and bool(labels)
         self._exiting = threading.Event()  # a clean exit asked the heal to start no further step (`stop_heal`)
@@ -337,6 +341,7 @@ class FaultGate:
         dispatcher's check has none). A link report made before the epoch last moved, or before it was made anew, is no
         answer (a heal, or a failing pair, maybe in another process), so the link check is then made afresh (`relink`).
         A record that cannot be read or made fails the check."""
+        self._unstrand()  # a raise owed before this check, recorded first
         try:
             noted = noted_of(self._epoch.ensure())
         except (OSError, ValueError) as error:  # its type only (O12)
@@ -378,13 +383,40 @@ class FaultGate:
     def _counted(self, verdict: Health) -> Health:
         """A link check of this call found a pair failing: raise the federation's link epoch, so a run whose pre-run
         check came before it is refused at its admission. One that cannot be raised is said in the detail; its record
-        is then removed (`LinkEpoch.raise_for`), which refuses such a run too."""
+        is then spoiled (`LinkEpoch.raise_for`), which refuses such a run too, and when even that fails the gate keeps
+        `link-epoch.lock` held until it records the raise (`_strand`), so every admission refuses meanwhile."""
         try:
             self._epoch.raise_for(LINKS_FAILED)
         except (OSError, ValueError) as error:  # its type only (O12)
             why = f"the federation's link epoch could not be raised ({type(error).__name__})"
+            if isinstance(error, RaiseLost) and not error.spoiled:
+                self._strand()
+                why = f"{why}, nor its old count spoiled: no run is admitted until it is"
             return verdict._replace(detail=f"{verdict.detail}; {why}")
         return verdict
+
+    def _strand(self) -> None:
+        """Keep `link-epoch.lock` held shared, past this check, until the raise it owes is recorded (`_unstrand`)."""
+        with self._strand_guard:
+            if self._stranded is None:
+                self._stranded = self._epoch.hold_shared()
+
+    def _unstrand(self) -> None:
+        """A raise this gate owes and could not record: record it now (or have the record spoiled), and let go the hold
+        of `link-epoch.lock` kept meanwhile; while neither can be done, keep it."""
+        with self._strand_guard:
+            held = self._stranded
+            if held is None:
+                return
+            try:
+                self._epoch.raise_for(LINKS_FAILED)
+            except RaiseLost as lost:
+                if not lost.spoiled:
+                    return
+            except (OSError, ValueError):  # a record that cannot be read refuses every admission by itself
+                pass
+            held.close()
+            self._stranded = None
 
     def _latched(self, verdict: Health) -> Health | None:
         """The answer when no heal may run (a heal has begun since the gate's link check last passed, or the record
