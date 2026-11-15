@@ -41,9 +41,11 @@ runs its next check later: every check reads the federation's state when it runs
 
 **At once, within bounds.** At most `[placement] reset_concurrency` spaces (4 by default) do their own work at once,
 each under its own `[placement] concurrency` (16), so at most their product of requests is in flight: 64 with the
-defaults, under the 100 connections of the HTTP client's pool (httpx's default, which the client keeps), which makes a
-request beyond them wait for a connection rather than fail. Each space's work is its own provisioner's, on its own
-space; the client and the fake federation serve several threads. Every wait the spaces share is taken on the calling
+defaults, under the 100 connections of the HTTP client's pool, all kept alive (`client.POOL_CONNECTIONS`), which makes
+a request beyond them wait for a connection rather than fail. The spaces of one federation share their providers, so
+their per-file reads (block maps, QoS summaries and records) are bounded at each provider too, by `[placement]
+provider_concurrency` (16) for the whole process (`readslots.py`). Each space's work is its own provisioner's, on its
+own space; the client and the fake federation serve several threads. Every wait the spaces share is taken on the calling
 thread, never in a space's work, so a reset with `reset_concurrency` 1 runs wholly on it.
 
 **A failure in one space fails the reset.** A stage that fails in one space is recorded there, as `SpaceReset.run`

@@ -134,8 +134,11 @@ walks' listings, the summaries, the transfer listings, records and waits, the ev
 the occupancy, a space's root and the gate's reads before each cancel and removal) go under the provisioner's policy,
 three attempts with pauses of 2 s and 5 s, and the record says how many were retried (`reads_retried`). A read inside
 a poll that counts a failed read as one that did not match (the requirements' removal check) is one attempt: the poll is
-the retry. Nothing but a read that timed out is tried again: an error answer, a connection error and every mutation
-stand as before.
+the retry. The per-file reads of each reading (the scans, the settle, the occupancy, the quiet stage's maps) go under a
+policy made for that reading (`Provisioner.reading_retry`), which also tries a connection failure again, four attempts
+2, 5 and 15 s apart, at most `[placement] provider_concurrency` in flight at one provider, and whose tally is the
+stage's `read_retry` (O46, O51). Nothing else is tried again: an error answer, a connection error elsewhere and every
+mutation stand as before.
 
 **Fail closed.** A stage that cannot verify what it did, a read that fails, an answer in another shape, a bound
 reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, with the record of the stages so far
