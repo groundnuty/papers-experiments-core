@@ -52,7 +52,7 @@ from expcore_onedata import consistency, resetqos
 from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import Provisioner, ProvisionError
-from expcore_onedata.readretry import ONE_ATTEMPT
+from expcore_onedata.readretry import ONE_ATTEMPT, recorded
 from expcore_onedata.transferrecord import Unreadable
 
 SETTLED = frozenset({"fulfilled", "impossible"})  # the statuses a requirement may be deleted in
@@ -164,28 +164,38 @@ def remove(
     none is left but the baseline's. Return the stage's facts, the affected files (those the removed requirements
     applied to, each with its depth), the depth of the deepest regular file of the space, from the first scan, and the
     files and hard links any provider's listing showed, in either scan. `found`, when given, is the first scan, made by
-    the caller (a planner's, `resetplan.py`) on the same space and providers; the second scan is always made here."""
+    the caller (a planner's, `resetplan.py`) on the same space and providers; the second scan is always made here. The
+    scans' reads go under one policy made for the stage (`Provisioner.reading_retry`), whose tally is in the facts
+    (`read_retry`), a failure's included; the polls of the fulfilment and the barrier keep one attempt."""
     kept = frozenset(baseline)
     scanned = found is not None
-    found = found if found is not None else resetqos.scan(p, providers)
-    added = {qid: where for qid, where in found.where.items() if qid not in kept}
-    facts: dict[str, Any] = {"scan": "given" if scanned else p.settings.qos_scan, "found": len(found.where)}
-    facts["kept"] = len(found.where) - len(added)
-    affected = {file_id: depth for qid in added for file_id, depth in found.files[qid].items()}
-    waits: dict[str, Any] = {"fulfil_s": 0.0, "fulfil_polls": 0, "impossible": 0, "barrier_s": 0.0, "barrier_polls": 0}
-    reads, listing = dict(found.reads), found.listing
-    if added:
-        waits, entries = fulfilled(p, providers, sorted(added))
-        for qid, provider in added.items():
-            p.mutate("DELETE", f"/qos_requirements/{qid}", provider=provider)
-        waits.update(barrier(p, providers, entries))
-        again = resetqos.scan(p, providers)
-        left = [qid for qid in again.where if qid not in kept]
-        if left:
-            raise ProvisionError(f"the scan after the removals still finds {len(left)} QoS requirement(s) not kept")
-        reads = {k: reads.get(k, 0) + again.reads.get(k, 0) for k in reads.keys() | again.reads.keys()}
-        listing |= again.listing
-    facts.update(removed=len(added), affected_files=len(affected), **waits, reads=reads)
+    scans = p.reading_retry()
+    with recorded(scans):
+        found = found if found is not None else resetqos.scan(p, providers, scans)
+        added = {qid: where for qid, where in found.where.items() if qid not in kept}
+        facts: dict[str, Any] = {"scan": "given" if scanned else p.settings.qos_scan, "found": len(found.where)}
+        facts["kept"] = len(found.where) - len(added)
+        affected = {file_id: depth for qid in added for file_id, depth in found.files[qid].items()}
+        waits: dict[str, Any] = {
+            "fulfil_s": 0.0,
+            "fulfil_polls": 0,
+            "impossible": 0,
+            "barrier_s": 0.0,
+            "barrier_polls": 0,
+        }
+        reads, listing = dict(found.reads), found.listing
+        if added:
+            waits, entries = fulfilled(p, providers, sorted(added))
+            for qid, provider in added.items():
+                p.mutate("DELETE", f"/qos_requirements/{qid}", provider=provider)
+            waits.update(barrier(p, providers, entries))
+            again = resetqos.scan(p, providers, scans)
+            left = [qid for qid in again.where if qid not in kept]
+            if left:
+                raise ProvisionError(f"the scan after the removals still finds {len(left)} QoS requirement(s) not kept")
+            reads = {k: reads.get(k, 0) + again.reads.get(k, 0) for k in reads.keys() | again.reads.keys()}
+            listing |= again.listing
+    facts.update(removed=len(added), affected_files=len(affected), **waits, reads=reads, read_retry=scans.facts())
     return facts, affected, found.deepest, listing
 
 

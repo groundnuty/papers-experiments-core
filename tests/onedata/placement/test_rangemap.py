@@ -137,6 +137,16 @@ def test_o11_a_reset_of_several_spaces_works_on_4_at_once_by_default_and_at_leas
             load(tmp_path, reset_concurrency=bad)
 
 
+def test_o51_a_resets_reads_in_flight_at_one_provider_are_16_by_default_and_at_least_one(tmp_path):
+    """O51: `provider_concurrency` bounds a reset's per-file reads in flight at one provider, every space together
+    (`readslots.py`): 16 by default, a single space's own level, settable, a whole number of at least one."""
+    assert load(tmp_path).settings.provider_concurrency == 16
+    assert load(tmp_path, provider_concurrency=4).settings.provider_concurrency == 4
+    for bad in (0, 2.5, True):
+        with pytest.raises(ConfigError, match=r"key 'provider_concurrency'.*integer"):
+            load(tmp_path, provider_concurrency=bad)
+
+
 def test_o08_the_allowance_for_clock_skew_defaults_to_5_s_and_cannot_be_negative(tmp_path):
     """O08: the run's window is widened by the providers' estimated clock offsets plus an allowance of 5 s by
     default, which can be set and is never negative."""
@@ -218,6 +228,7 @@ def test_o25_a_positional_construction_from_before_the_connection_threshold_stil
         "reset_concurrency",
         "reset_shortcut",
         "reset_exclusive_wait_s",
+        "provider_concurrency",
     ]
 
 
