@@ -25,8 +25,14 @@ otherwise let the run in onto a stuck link once the heal lets the federation go,
 
   The refusal's words say which, and the campaign puts them in the run's `run_unstarted` event. It then asks again,
   and the run's next pre-run check sees the federation as it is now.
-- **A run with no note at all is admitted as before.** No pre-run check was asked (a campaign with no health check, or
-  a caller that is no campaign), so no check vouched for anything an admission could find outdated.
+- **A run with no note at all is admitted.** No pre-run check was asked, so no check vouched for anything an admission
+  could find outdated. That is a caller that is no campaign (a tool outside one, a test). It is never a campaign with
+  `[faults]`: a campaign with no health check does not start. The platform's run admission declares that it needs one
+  (`HEALTH_REQUIRED`, through `expcore.campaign.health_required`), and the scheduler refuses, when it is built and
+  before its lock or store, a campaign that has the admission and no health check, since nothing would ever write a
+  note and every run would be admitted blind. A study that wraps the admission in a function of its own must keep the
+  declaration (`functools.wraps` does). A check that never reaches the fault gate still has a note, with no epoch, so
+  its runs are refused above until it does.
 """
 
 import re
@@ -38,6 +44,12 @@ from typing import Any
 from expcore_onedata.fault_epoch import GATE_NOTE, HEAL, LINKS_FAILED, LinkEpoch
 from expcore_onedata.fault_gate_heal import GateHeals
 
+# What the platform's run admission declares: why a campaign with `[faults]` needs a health check, and what to pass.
+HEALTH_REQUIRED = (
+    "an outage-capable federation needs the gate's health check, or runs would be admitted without a link verdict; "
+    "pass the platform's health check (expcore_onedata.health.PlatformHealth, which runs the fault gate, "
+    "expcore_onedata.fault_gate.FaultGate, around the whole check) to the campaign"
+)
 _SAID = {HEAL: "a heal began", LINKS_FAILED: "the fault gate's link check found a pair failing"}
 _STAMP = re.compile(r"[0-9T:+.-]{10,40}")
 _AGAIN = "the run is checked again before it is admitted, and no attempt is used"

@@ -20,6 +20,8 @@ from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings
 
 from expcore.campaign import prerun
 from expcore.campaign.factors import FactorSchema
+from expcore.campaign.health_required import required_reason
+from expcore.config.loading import ConfigError
 from expcore.errors import uncharged_kinds
 from expcore_onedata.admission import FederationBusy, run_admission
 from expcore_onedata.config import load_platform
@@ -27,6 +29,7 @@ from expcore_onedata.fault_epoch import GATE_NOTE, LinkEpoch, noted_of
 from expcore_onedata.fault_gate_heal import GateHeals
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
+from expcore_onedata.testing import write_platform
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
@@ -374,3 +377,59 @@ def test_o35_a_raise_that_nothing_can_record_keeps_every_admission_out_until_one
     with prerun.opened():
         assert gate().ok  # it records the raise it owed, and lets the lock go
         assert admitted(admit) == "shared"
+
+
+NEEDS_THE_GATE = (
+    "an outage-capable federation needs the gate's health check, or runs would be admitted without a link verdict"
+)
+
+
+@pytest.mark.parametrize("heal", ["off", "all_links"])
+def test_o35_a_faults_campaign_with_no_health_check_is_refused_at_load_naming_why_and_the_fix(tmp_path, heal):
+    """O35: with `[faults]`, a try with no health check has no note and would be admitted blind, so the campaign is
+    refused when the scheduler is built, before its lock or store: the message says why and to pass the platform's
+    health check, whatever the heal mode."""
+    federation_dir = tmp_path / "federation"
+    gate_of(federation_dir, heal=heal)
+    admit = admission_in(federation_dir)
+    assert NEEDS_THE_GATE in required_reason(admit)
+    with pytest.raises(ConfigError) as refused:
+        build(tmp_path / "campaign", schema=ONE, executor=FakeExecutor(), plan=SMALL, admission=admit)
+    message = str(refused.value)
+    assert NEEDS_THE_GATE in message
+    assert "PlatformHealth" in message
+    assert "FaultGate" in message
+    assert not (tmp_path / "campaign" / "campaign.lock").exists()
+
+
+def test_o35_a_faults_campaign_with_the_platforms_health_check_starts_and_runs(tmp_path):
+    """O35: given the gate as its health check, the same campaign starts and runs its run, admitted on the check's
+    note."""
+    federation_dir = tmp_path / "federation"
+    gate, federation, _, _ = gate_of(federation_dir, heal="all_links")
+    federation.stuck = set()
+    with build(
+        tmp_path / "campaign",
+        schema=ONE,
+        executor=FakeExecutor(),
+        plan=SMALL,
+        settings=settings_for(),
+        health=gate,
+        admission=admission_in(federation_dir),
+    ) as scheduler:
+        summary = scheduler.run()
+    assert summary.statuses == {"done": 1}
+
+
+def test_o35_a_platform_without_faults_declares_nothing_and_a_campaign_with_no_health_check_starts_as_before(tmp_path):
+    """O35: without `[faults]` there is no run admission, so nothing needs a health check: today's behaviour stands."""
+    (tmp_path / "plain").mkdir()
+    config = load_platform(write_platform(tmp_path / "plain"), require_secrets=False)
+    admit = run_admission(config)
+    assert admit is None
+    assert required_reason(admit) is None
+    with build(
+        tmp_path / "campaign", schema=ONE, executor=FakeExecutor(), plan=SMALL, settings=settings_for(), admission=admit
+    ) as scheduler:
+        summary = scheduler.run()
+    assert summary.statuses == {"done": 1}

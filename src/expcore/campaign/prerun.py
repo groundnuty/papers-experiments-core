@@ -10,8 +10,10 @@ refers to the same note, so what the check writes there, the admission, entered 
 
 A note is a dictionary keyed by names the platform chooses. There is none (`current()` is None) where no pre-run check
 is asked: outside a try (the dispatcher's own check, a caller that is no campaign) and in a campaign with no health
-check. The post-run check runs inside the same try and sees the note too, so a platform notes from its pre-run check
-alone.
+check. A platform whose admission depends on the note declares that it needs a health check
+(`expcore.campaign.health_required`), so a campaign without one never reaches that admission with no note: the
+scheduler refuses it when it is built. The post-run check runs inside the same try and sees the note too, so a
+platform notes from its pre-run check alone.
 """
 
 import contextlib
