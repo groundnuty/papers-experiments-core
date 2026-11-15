@@ -52,10 +52,14 @@ begun but not ended (`token_step`, `Admission.open_steps`): the tool server's la
 end of its stop's re-verification of the plane, which examines its token, and the sandbox's (`SANDBOX_STEP`), from its
 mint up to the end of its stop. Both launches note their own, and each worker thread of theirs that uses a token
 (the tool server's checks, the sandbox's mint and start) is counted until the thread itself has ended, which a
-cancellation of the launch does not hasten. The fault injector reads them at the start of a restore
-or of its start's recovery, either of which may heal for up to `heal_timeout_s`: a step still running then could find
-its token expired after the heal (`expcore_onedata.faults`, "The token's window"). A copy of the context (a worker
-thread, a task) sees the same admission, and so the same count.
+cancellation of the launch does not hasten. On a platform with `[faults]` such a thread starts only under the run's
+admission, held now: without it the step is refused before it starts, naming it (`begin_token_step`,
+`TokenStepRefused`), so every step that uses a token is counted where the injector reads, and a token is minted only
+after the run's admission, and every wait for it, has been granted. The fault injector reads them at the start of a
+restore or of its start's recovery, either of which may heal for up to `heal_timeout_s`: a step still running then
+could find its token expired after the heal (`expcore_onedata.faults`, "The token's window"), and before it tries a
+failed restore again (`FaultInjector._clear`). A copy of the context (a worker thread, a task) sees the same
+admission, and so the same count.
 
 A tool outside a campaign (a smoke driver, a warm-up) holds the shared admission too, through
 `expcore_onedata.tool_admission.shared_admission`, so no outage can overlap it. Whoever takes the lock exclusively
@@ -105,6 +109,19 @@ _STRANDED: list[HeldLock] = []
 
 class AdmissionRefused(ConfigError):
     """A run of a platform with a fault injector would start, or inject, without the admission its condition needs."""
+
+
+class TokenStepRefused(AdmissionRefused):
+    """A step that uses the run's tokens would start, on a platform with `[faults]`, without the run's admission held:
+    refused before it starts (`begin_token_step`). `step` is the step's kind (`TOOL_SERVER_STEP`, `SANDBOX_STEP`)."""
+
+    def __init__(self, config: PlatformConfig, step: str, what: str) -> None:
+        self.step = step
+        super().__init__(
+            f"{config.file}: [faults]: {what} (the run's {step} step) uses the run's tokens and starts only under the "
+            "run's admission to the federation, which this context does not hold: refused before it starts, so that "
+            "no step the fault injector cannot see runs (O35)"
+        )
 
 
 class FederationBusy(InfraError):
@@ -283,20 +300,40 @@ def retain_admission() -> Callable[[], None]:
     return admission.retain() if admission is not None else (lambda: None)
 
 
-def begin_token_step(name: str) -> Callable[[], None]:
-    """Count a step of the run that uses its tokens on the running context's admission (`Admission.begin_step`), and
-    return the call that ends the count, once; nothing is counted without an admission, as on a platform without
-    `[faults]`, which has no injector to read it. A worker thread a cancellation cannot stop takes a count of its own
-    before it is dispatched and ends it as it ends, so the step outlives a launch that left without it."""
+def begin_token_step(name: str, config: PlatformConfig, what: str) -> Callable[[], None]:
+    """Start a step of the run that uses its tokens (`what`, in words: the tool server's checks, the sandbox's mint
+    and start), counted on the run's admission (`Admission.begin_step`), and return the call that ends the count, once.
+
+    On a platform with `[faults]` the step starts only under the run's admission, held now and for that federation:
+    without it the step is refused before it starts (`TokenStepRefused`, naming it), failing closed. So no such step
+    runs uncounted, where the injector's heal could not see it, and no token is minted, or examined, but after the
+    run's admission and every wait for it (O35). Without `[faults]` there is no injector and no admission: nothing is
+    counted or refused. A worker thread a cancellation cannot stop takes a count of its own before it is dispatched and
+    ends it as it ends, so the step outlives a launch that left without it."""
+    settings = fault_settings_of(config)
+    if settings is None:
+        return lambda: None
+    admission = current_admission()
+    if admission is None:
+        raise TokenStepRefused(config, name, what)
+    require_same_federation(admission, federation_of(settings))
+    return admission.begin_step(name)
+
+
+def count_token_step(name: str) -> Callable[[], None]:
+    """Count a step of the run that uses its tokens on the running context's admission when one is held, and return
+    the call that ends the count, once; never refuse. For what must run whatever is held: a launch's own span, entered
+    after or right before `require_admission` refuses an unadmitted run, and the sandbox's stop, which tears down what
+    the run started."""
     admission = current_admission()
     return admission.begin_step(name) if admission is not None else (lambda: None)
 
 
 @contextlib.contextmanager
 def token_step(name: str) -> Iterator[None]:
-    """For the body of a `with`, a step of the run that uses its tokens, counted from its start to its end however the
-    body ends (`begin_token_step`)."""
-    end = begin_token_step(name)
+    """For the body of a `with`, a launch of the run that uses its tokens, counted from its start to its end however
+    the body ends (`count_token_step`); its worker threads that use a token start with `begin_token_step`."""
+    end = count_token_step(name)
     try:
         yield
     finally:

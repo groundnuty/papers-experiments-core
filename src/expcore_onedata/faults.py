@@ -327,6 +327,8 @@ class FaultInjector:
             + settings.session_drain_s  # and the drain a clear waits out before it lets its own admission go
         )  # about a start's longest
         self._pending: tuple[str, str] | None = None  # the open injection's journal id and identity digest
+        self._tried = 0  # restores of the pending injection tried so far: a later one is a retry (`_retry_now`)
+        self._left_open = False  # this run's injection, handed to recovery open (`_hand_over`): never verified here
         self._run: dict[str, Any] | None = None
         self._steps: list[dict[str, Any]] = []
         self._injection: dict[str, Any] | None = None
@@ -380,7 +382,7 @@ class FaultInjector:
         run_key, attempt = identity.get("run_key"), identity.get("attempt")
         if not isinstance(run_key, str) or isinstance(attempt, bool) or not isinstance(attempt, int):
             raise FaultRefused("a fault injector is started with the run's identity: its run_key and attempt")
-        self._origin, self._steps, self._injection = self._clock(), [], None
+        self._origin, self._steps, self._injection, self._left_open = self._clock(), [], None, False
         self._run = {"run_key": run_key, "attempt": attempt}
         self._admit()
         self._step("sanctioned", True)
@@ -393,7 +395,7 @@ class FaultInjector:
         if self._lock is None:
             raise self._fail(f"{self.target} is held by another run's fault injector")
         digest, entry = self._journal_injection()
-        self._pending, self._went_down = (entry, digest), False
+        self._pending, self._went_down, self._tried = (entry, digest), False, 0
         self._injection = {"target": self.target, "injected": False, "cleared": False, "verified": False}
         try:
             # durable before the command, so a process killed while it blocks leaves the line (a failing journal stops here)
@@ -655,7 +657,7 @@ class FaultInjector:
     def _unrestored(self) -> RestoreNotVerified | None:
         """The failure of a restore that is not verified, read from the injector's own steps; None when there is none."""
         injection = self._injection
-        open_ = self._pending is not None
+        open_ = self._pending is not None or self._left_open  # handed to recovery, it is still open in the journal
         if not open_ and not (injection is not None and injection["injected"] and not injection["verified"]):
             return None
         cleared = [step for step in self._steps if step["step"] == "cleared"]
@@ -738,6 +740,9 @@ class FaultInjector:
     def _clear(self) -> bool:
         if self._pending is None:
             return True
+        if self._tried and not self._retry_now():  # a retry inside the token's window: handed to recovery instead
+            return False
+        self._tried += 1
         with self._restoring() as (admission, own, refused):
             if refused is not None:
                 # the federation could not be taken for the restore, so nothing was restored and nothing is journalled
@@ -745,6 +750,37 @@ class FaultInjector:
                 self._step("cleared", False, how="federation_unavailable")
                 return False
             return self._settle_pending(admission, own)
+
+    def _retry_now(self) -> bool:
+        """Before the pending injection's restore is tried again: whether it may be now, decided at once, never waited
+        for (O35, O11). It may when no step of the run that uses its tokens still runs (the run's admission counts
+        them, `admission.token_step`): the token's window has then closed, as in an executor that stops its sandbox and
+        tool server before `running`'s exit. While one runs, a second restore inside the window would outlast the
+        least margin, which counts one: the injection is handed to recovery instead (`_hand_over`). Either way a
+        `restore_retry` step records the path taken, why, and the steps that ran."""
+        held = current_admission()
+        running = list(held.open_steps()) if held is not None else []
+        if not running:
+            why = "no step of the run that uses its tokens still runs, so the restore is tried again outside its window"
+            self._step("restore_retry", True, path="after_steps", why=why, steps=running)
+            return True
+        why = (
+            "a step of the run that uses its tokens still runs, so a second restore would fall inside the token's "
+            "window: the injection is left open, the run set aside, and the next start's recovery restores it"
+        )
+        self._step("restore_retry", False, path="left_open", why=why, steps=running)
+        self._hand_over()
+        return False
+
+    def _hand_over(self) -> None:
+        """Leave the pending injection open in the journal (`clear_failed` already says how), for the recovery of the
+        next start or of the health gate: the target's lock is let go so that recovery can take it, and nothing of
+        this injector touches the target again. The federation is what keeps others off meanwhile: the run's exclusive
+        admission, held until after its post-run check, and after it a shared admission refuses a journal with an
+        injection open. The snapshot keeps the restore unverified and the injection open (`_unrestored`), so the
+        record is never scored (#245)."""
+        self._pending, self._stop_unknown, self._left_open = None, False, True
+        self._unlock()
 
     def _settle_pending(self, admission: Admission | None, own: bool) -> bool:
         """Settle the pending injection under `admission`, which the restore keeps held: the drain is armed before the

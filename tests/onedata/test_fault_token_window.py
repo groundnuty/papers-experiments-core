@@ -21,7 +21,7 @@ import time
 import pytest
 from campaign_support import LATER, NOW, keys_under, make_manifest, make_schema, open_store
 from fault_support import injector_for
-from heal_support import TARGET, four_providers, heal_injector, stale
+from heal_support import TARGET, HealServices, four_providers, heal_injector, stale
 from mcp import StdioServerParameters
 from record_support import record_run
 
@@ -35,7 +35,16 @@ from expcore.records.injections import restore_refusal
 from expcore.records.instruments import finish_instruments
 from expcore.tools.manifest import FrozenManifest, live_manifest
 from expcore_onedata import toolserver
-from expcore_onedata.admission import SANDBOX_STEP, TOOL_SERVER_STEP, FederationLock, fault_settings_of, token_step
+from expcore_onedata.admission import (
+    SANDBOX_STEP,
+    TOOL_SERVER_STEP,
+    AdmissionRefused,
+    FederationLock,
+    TokenStepRefused,
+    begin_token_step,
+    fault_settings_of,
+    token_step,
+)
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import (
@@ -45,6 +54,7 @@ from expcore_onedata.fault_settings import (
     load_faults,
     restore_bound_s,
     restore_drain_s,
+    restore_margin_derivation,
     restore_token_margin_s,
 )
 from expcore_onedata.faults import INJECTOR_FAILURE, PROVIDER_OUTAGE
@@ -302,6 +312,7 @@ class Outage:
         self.token = issuer.mint(spec, TOOLS, ceiling_s=CEILING_S)
         self.steps: list[str] = []
         self.at_restore = None  # what happens to the wall clock as the restore begins
+        self.at_finish = None  # what happens after `running`'s exit, before `finish_instruments`
         self.heal_s = 0.0  # the wall seconds the heal takes, at its first action
         self.services.on_ping = self._healing
 
@@ -345,6 +356,8 @@ class Outage:
 
         async def finished(record):
             self.steps.append("restored")
+            if self.at_finish is not None:
+                self.at_finish()
             record = await asyncio.to_thread(finish_instruments, record, [injector])
             self.steps.append("finish_instruments")
             return record
@@ -461,7 +474,8 @@ def test_o35_while_a_token_step_runs_the_restore_runs_its_heal_is_skipped_and_re
     runs is skipped: the provider is brought back and passes its gate, the reading records the skip with the steps
     that ran, the margin and the long margin, nothing heals, and the stuck pair leaves the restore unverified
     (`links_stuck`): the record is kept and refused as `injector_failure`, never scored, the injection stays open for
-    the health gate, and the tool server's stop that follows finds its token valid."""
+    the health gate, and the tool server's stop that follows finds its token valid. `finish` does not try the restore
+    again while the step still runs, so one restore ran inside the token's window."""
     schema, _, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     record = outage.run(schema, key, order)
@@ -471,10 +485,11 @@ def test_o35_while_a_token_step_runs_the_restore_runs_its_heal_is_skipped_and_re
     assert "heal" not in outage.steps
     reading = record.instruments["fault_injector"]
     assert (reading["restore_verified"], reading["how"]) == (False, "links_stuck")
-    skipped = [step for step in reading["steps"] if step["step"] == "heal_skipped"]
-    assert skipped  # `running`'s exit, and again `finish` while the step still ran
-    for step in skipped:
-        assert (step["steps"], step["margin_s"], step["long_margin_s"]) == (running, DEFAULT_MARGIN_S, LONG_MARGIN_S)
+    (step,) = [step for step in reading["steps"] if step["step"] == "heal_skipped"]  # `running`'s exit alone
+    assert (step["steps"], step["margin_s"], step["long_margin_s"]) == (running, DEFAULT_MARGIN_S, LONG_MARGIN_S)
+    assert len([step for step in reading["steps"] if step["step"] == "cleared"]) == 1
+    (retry,) = [step for step in reading["steps"] if step["step"] == "restore_retry"]
+    assert (retry["ok"], retry["path"], retry["steps"]) == (False, "left_open", running)
     assert restore_refusal(record.instruments)["infra_kind"] == INJECTOR_FAILURE
     assert record.instrument_refusal["infra_kind"] == INJECTOR_FAILURE
     assert is_charged(INJECTOR_FAILURE)
@@ -634,3 +649,121 @@ def test_o35_a_cancelled_tool_server_launch_counts_its_step_until_its_check_thre
     with lock.held(exclusive=True, timeout_s=5) as admission:
         asyncio.run(go(admission))
     assert seen == [(TOOL_SERVER_STEP,), ()]
+
+
+def test_o35_a_token_step_without_the_runs_admission_is_refused_naming_it(tmp_path):
+    """O35, O11: on a platform with `[faults]`, a step that uses the run's tokens (the tool server's checks, the
+    sandbox's mint and start) starts only under the run's admission, held now: without one it is refused before it
+    starts, failing closed with an `AdmissionRefused` that names the step and what it was about to do, so no step runs
+    that the injector's heal cannot see and no token is minted before the run's admission was granted."""
+    config = load_platform(platform_with(tmp_path), require_secrets=False)
+    with pytest.raises(TokenStepRefused) as caught:
+        begin_token_step(SANDBOX_STEP, config, "the sandbox's mint")
+    assert isinstance(caught.value, AdmissionRefused)
+    assert caught.value.step == SANDBOX_STEP
+    assert "the sandbox's mint (the run's sandbox step) uses the run's tokens" in str(caught.value)
+    assert "starts only under the run's admission" in str(caught.value)
+
+
+def test_o35_without_faults_a_token_step_needs_no_admission(tmp_path):
+    """O35: a platform without `[faults]` has no injector and no admission, so a step that uses the run's tokens starts
+    without one and nothing is counted."""
+    config = load_platform(write_platform(tmp_path), require_secrets=False)
+    end = begin_token_step(TOOL_SERVER_STEP, config, "the tool server's check before its start")
+    end()
+
+
+def test_o35_the_tool_servers_check_at_its_stop_without_the_runs_admission_is_refused_naming_it(
+    tmp_path, fake, frozen_manifests
+):
+    """O35, O11: a run whose admission was let go while its tool server still ran cannot re-verify the plane at the
+    stop uncounted: the check that examines the token is refused before its thread starts, naming the step, and the
+    launch fails closed with that refusal."""
+    outage = Outage(tmp_path / "federation", fake, frozen_manifests)
+    lock = FederationLock(load_faults(outage.platform, outage.config))
+
+    async def go(admission):
+        async with outage.tool_server():
+            admission.close()  # the run's admission is let go while its tool server still runs
+
+    with lock.held(exclusive=True, timeout_s=5) as admission, pytest.raises(TokenStepRefused) as caught:
+        asyncio.run(go(admission))
+    assert caught.value.step == TOOL_SERVER_STEP
+    assert "the tool server's check at its stop (the run's tool_server step)" in str(caught.value)
+    assert "tool_server_stopped" not in outage.steps
+
+
+def serving_only_after_finish(outage):
+    """The restore at `running`'s exit finds its provider back but never serving (`not_serving`), and it serves from
+    `finish_instruments` on: a retry then verifies it, with no link stuck."""
+    outage.services.stuck = set()
+    outage.at_restore = lambda: outage.services.knobs.__setitem__("never_serves", True)
+    outage.at_finish = lambda: outage.services.knobs.__setitem__("never_serves", False)
+
+
+def test_o35_o11_with_the_launches_stopped_first_a_failed_exit_clear_is_retried_once_the_steps_have_ended(
+    tmp_path, fake, frozen_manifests, outage_condition
+):
+    """O35, O11: in the other study's order the sandbox and the tool server stop before `running`'s exit, so when the
+    restore there fails, `finish` tries it again with no step of the run running, outside the token's window: the
+    provider serves, the restore is verified, the reading names the path taken and why, and the attempt is done and
+    uncharged."""
+    schema, store, key = outage_condition
+    outage = Outage(tmp_path / "federation", fake, frozen_manifests, services=HealServices())
+    serving_only_after_finish(outage)
+    record = outage.run(schema, key, STOPPED_FIRST)
+    reading = record.instruments["fault_injector"]
+    cleared = [step for step in reading["steps"] if step["step"] == "cleared"]
+    assert [(step["ok"], step["how"]) for step in cleared] == [(False, "not_serving"), (True, "found_restored")]
+    (retry,) = [step for step in reading["steps"] if step["step"] == "restore_retry"]
+    assert (retry["ok"], retry["path"], retry["steps"]) == (True, "after_steps", [])
+    assert "no step of the run that uses its tokens still runs" in retry["why"]
+    assert reading["restore_verified"] is True
+    assert outage.services.running(outage.injector._service)
+    assert outage.injector._journal.open_entries() == []
+    assert stored(store, key, record) == ("done", 0, None)
+
+
+def test_o35_o11_in_the_documented_order_a_failed_exit_clear_is_left_open_for_the_next_starts_recovery(
+    tmp_path, fake, frozen_manifests, outage_condition
+):
+    """O35, O11: in the documented order the tool server and the sandbox still run at `finish`, inside the token's
+    window, so a restore that failed at `running`'s exit is not tried again there: one restore ran in the window, as
+    the least margin counts. The reading names the path and the steps that ran, the injection stays open in the
+    journal with its target's lock let go, the record is refused as `injector_failure` and never scored (#245), and the
+    tool server's stop finds its token valid. Once the run has ended, the next start's recovery restores it."""
+    schema, _, key = outage_condition
+    outage = Outage(tmp_path / "federation", fake, frozen_manifests, services=HealServices())
+    serving_only_after_finish(outage)
+    record = outage.run(schema, key, NESTED)
+    assert outage.steps[-2:] == ["tool_server_stopped", "sandbox_stop"]  # the token examined, still valid
+    reading = record.instruments["fault_injector"]
+    cleared = [step for step in reading["steps"] if step["step"] == "cleared"]
+    assert [(step["ok"], step["how"]) for step in cleared] == [(False, "not_serving")]
+    (retry,) = [step for step in reading["steps"] if step["step"] == "restore_retry"]
+    assert (retry["ok"], retry["path"], retry["steps"]) == (False, "left_open", [SANDBOX_STEP, TOOL_SERVER_STEP])
+    assert "the next start's recovery" in retry["why"]
+    assert (reading["restore_verified"], reading["how"]) == (False, "not_serving")
+    assert restore_refusal(record.instruments)["infra_kind"] == INJECTOR_FAILURE  # the campaign sets it aside
+    assert record.instrument_refusal["infra_kind"] == INJECTOR_FAILURE
+    assert "stays open in the journal" in record.instrument_refusal["detail"]
+    assert outage.injector._lock is None  # handed over: recovery may take the target
+    (entry,) = outage.injector._journal.open_entries()
+    assert (entry["target"], entry["clear_failed"]) == (TARGET, "not_serving")
+    following = injector_for(outage.platform, outage.services, target=TARGET, clock=outage.services.clock)
+    with FederationLock(load_faults(outage.platform, outage.config)).held(exclusive=True, timeout_s=5):
+        following.start({"run_key": "the-next-run", "attempt": 1})
+        (recovered,) = [step for step in following.snapshot()["steps"] if step["step"] == "recovered"]
+        assert following.clear() is True
+    assert (recovered["ok"], recovered["how"]) == (True, "found_restored")
+    assert outage.injector._journal.open_entries() == []
+
+
+def test_o35_the_least_margin_counts_one_restore_since_none_is_retried_inside_the_window(tmp_path):
+    """O35, O06: no restore is tried again inside the token's window, so the least margin counts one restore and its
+    gate, unchanged: each of the restore's terms once, 2,134 s at the defaults."""
+    settings = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 2134)))
+    derivation = restore_margin_derivation(settings)
+    for term in ("a stop of unknown outcome", "starts each with its wait", "the wait to serve", "the session gate ("):
+        assert derivation.count(term) == 1, term
+    assert restore_token_margin_s(settings) == 2134
