@@ -150,6 +150,13 @@ RATIO_NOTES = [
     "and moves each log ratio most where its sums are small).",
 ]
 
+RATIO_ARM_COLUMNS_NOTES = [  # after the ratio notes, only for a contrast whose arms read different columns
+    "A contrast whose Numerator or Denominator names two columns, each with its arm, reads its own columns in each",
+    "arm: in each cell N_A and D_A are summed from arm A's columns and N_B and D_B from arm B's, such as a",
+    "sensitivity estimate that puts arm A at its upper-bound cost and arm B at its lower-bound one. Its outcome",
+    "names arm A's ratio, then arm B's.",
+]
+
 RATIO_BY_MODEL_NOTES = [  # after the ratio contrasts' table, only for a contrast estimated per model's cell
     "Each model's Estimate is the mean log ratio of its own cells, with its ratio and interval from the same",
     "resamples of the values of the independent unit as the contrast's: a breakdown with no test of its own, outside",
@@ -225,6 +232,20 @@ SHARD_NOTES = [
     "score is shown by shard. A pair never crosses shards, so a host effect meets both arms alike, and a score by",
     "shard would mostly show which instances landed on which host. A difference between shards is for the reader to",
     "weigh: a condition whose figures differ by shard is worth a look at the shards before it is read as an effect.",
+]
+
+SELECTION_NOTES = [
+    "This batch was merged from selections: one campaign run in batches, each the runs whose factors have the levels",
+    "it names, by one driver. Each run belongs to one selection, and a pair of runs may cross two: a contrast between",
+    "conditions of different selections pairs a run of each by task, model and seed, as one driver's runs are paired.",
+    "Planned counts the condition's runs in that selection; the three rates are the shares of those planned runs that",
+    "were analysed, exhausted or unfinished (a run a partial analysis leaves out is in none of the three), and `n/a`",
+    "where the selection ran none of the condition's runs.",
+    "",
+    "The selections are batches of one design, not a factor of it: the contrasts above pool the runs of every",
+    "selection, and every figure in this section is descriptive. A contrast across selections compares runs made at",
+    "different times, and possibly on a platform that changed in between; the environment identity every selection",
+    "recorded is the same, which the merge checked, and anything it does not cover is for the reader to weigh.",
 ]
 
 SHARD_KIND_NOTES = [

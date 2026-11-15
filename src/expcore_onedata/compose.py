@@ -19,6 +19,17 @@ takes a restore for a ready provider without asking.
 
 No message holds a service name, a path or a command's output, which can echo either: a failure says which step failed
 and how the command ended.
+
+**The heal's two commands (O35, `expcore_onedata.fault_heal`)** run inside the service's own container, found by its
+Compose project and service as `observe` finds it, never through a shell on the host. `ping` runs the image's
+`/usr/sbin/op_worker ping` and is True only when it prints `pong`. `restart_link` runs op-worker's
+`rtransfer_config:restart_link()` through node_package's `nodetool rpcterms` (`RESTART_LINK_SCRIPT`; the trailing `""`
+makes the call arity 0, and `env.sh` finds the node's name and cookie inside the container, so neither is on the host's
+command line), with an RPC timeout of `RPC_TIMEOUT_S` and a command bound `RESTART_LINK_MARGIN_S` above it, so that
+nodetool's own timeout answer is read rather than the command killed. Its result is a word (`LINK_RESULTS`): `ok` is the
+call returning `ok`; `badrpc_timeout`, `badrpc`, `unexpected` and `command_timeout` mean the restart may be going on
+or may have happened, never that nothing happened; `no_node` and `not_run` mean nodetool reached no node or the command
+could not run. nodetool prints the node's name in its failure line, so its output is never kept, only the word.
 """
 
 import re
@@ -26,13 +37,24 @@ import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from expcore_onedata.client import PlatformError
+
+if TYPE_CHECKING:  # the heal's module imports this one
+    from expcore_onedata.fault_matrix import LinkMatrix
 
 # The fourth field is the container's health status, empty for a container with no health check.
 INSPECT_FORMAT = "{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}"
 HEALTH_STATUS = re.compile(r"[a-z]{1,20}")  # Docker's: healthy, unhealthy, starting (and none, for no health check)
+OP_WORKER = "/usr/sbin/op_worker"  # node_package's runner in the image's deb layout
+RPC_TIMEOUT_S = 120.0
+RESTART_LINK_SCRIPT = (
+    '. /usr/lib/op_worker/lib/env.sh && $NODETOOL -rpctimeout 120000 rpcterms rtransfer_config restart_link ""'
+)
+RESTART_LINK_MARGIN_S = 30.0  # the command's bound above the RPC's, so nodetool's timeout answer is read
+LINK_RESULTS = ("ok", "badrpc_timeout", "badrpc", "unexpected", "command_timeout", "no_node", "not_run")
+_BADRPC = re.compile(r"RPC to \S+ failed: (\S+)")
 
 
 class DriverError(PlatformError):
@@ -148,8 +170,81 @@ class ComposeDriver:
             return False
         return self._probe(service) is True
 
+    def _container(self, service: str) -> str:
+        """The id of the service's one container; raise DriverError when it has none or several."""
+        listed = self._run([*self._compose, "ps", "--all", "--quiet", service], "list the service's containers")
+        containers = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+        if len(containers) != 1:
+            raise DriverError(f"the service has {len(containers)} containers, so none is exec'd into")
+        return containers[0]
+
+    def ping(self, service: str) -> bool:
+        """Whether the op-worker node in the service's container answers `pong` to its runner's `ping`. A command that
+        fails, times out or prints anything else is no pong; raise DriverError only when no container is found."""
+        argv = [*self._docker, "exec", self._container(service), OP_WORKER, "ping"]
+        try:
+            done = self._runner(argv, timeout_s=self._timeout_s)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return done.returncode == 0 and done.stdout.strip() == "pong"
+
+    def restart_link(self, service: str) -> str:
+        """Restart the rtransfer link of the op-worker node in the service's container, once, and return how it ended
+        as a word of `LINK_RESULTS` (see the module docstring); never the command's output, which names the node. Raise
+        DriverError only when the container cannot be found, before anything was sent to it."""
+        argv = [*self._docker, "exec", self._container(service), "bash", "-c", RESTART_LINK_SCRIPT]
+        try:
+            done = self._runner(argv, timeout_s=RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S)
+        except subprocess.TimeoutExpired:
+            return "command_timeout"  # the CLI was killed; the RPC may still be running on the node
+        except OSError:
+            return "not_run"
+        return link_result(done)
+
     def restored_links(self, service: str) -> str | None:
         """The link check of every pair the provider behind a restored service is in (O35): None when each passed, or
         when the probe checks no link, else why one did not. The recovery asks it once the service serves."""
         links = getattr(self._probe, "links", None)
         return None if links is None else links(service)
+
+    def link_matrix(self, service: str) -> "LinkMatrix | None":
+        """The link check of every ordered pair as a matrix (`fault_heal.LinkMatrix`), which the heal reads pair by
+        pair; None when the probe checks no link."""
+        matrix = getattr(self._probe, "matrix", None)
+        return None if matrix is None else matrix(service)
+
+    def arm_gate(self, service: str) -> str | None:
+        """Before an injection: the id of the session gate's probe file, made and seen by every provider of the probe
+        space (`fault_sessions`); None when the probe has no session gate."""
+        arm = getattr(self._probe, "arm", None)
+        return None if arm is None else arm(service)
+
+    def active_transfers(self) -> int | None:
+        """How many transfer listings show a job not yet ended (`fault_sessions.SessionGate.active_transfers`); None
+        when the probe cannot tell."""
+        transfers = getattr(self._probe, "transfers", None)
+        return None if transfers is None else transfers()
+
+    @property
+    def has_sessions(self) -> bool:
+        """Whether the probe has a session gate: without one the restore records no gate reading."""
+        return getattr(self._probe, "sessions", None) is not None
+
+    def sessions_ready(self, service: str, gate_probe: str | None) -> str | None:
+        """One reading of the session gate for the provider behind a service: None when it passes, else why not."""
+        sessions = getattr(self._probe, "sessions", None)
+        return None if sessions is None else sessions(service, gate_probe)
+
+
+def link_result(done: CommandResult) -> str:
+    """How a `restart_link` command ended, as a word of `LINK_RESULTS`: nodetool prints the call's return value (`ok`),
+    or "RPC to <node> failed: <reason>" and exits 1, or says the node does not answer its ping."""
+    out = f"{done.stdout}\n{done.stderr}"
+    if done.returncode == 0:
+        return "ok" if done.stdout.strip() == "ok" else "unexpected"
+    found = _BADRPC.search(out)
+    if found:
+        return "badrpc_timeout" if found.group(1) == "timeout" else "badrpc"
+    if "not responding to pings" in out:
+        return "no_node"
+    return "unexpected"  # a failure nodetool did not describe: the call may have reached the node
