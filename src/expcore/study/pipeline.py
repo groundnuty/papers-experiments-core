@@ -53,7 +53,7 @@ import math
 import os
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +69,7 @@ from expcore.campaign.merge import MergeRefused, read_merge
 from expcore.campaign.merged import read_held, verify_merged, verify_queried
 from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_fingerprint, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
+from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import MERGE_FILE, ModelShards, ShardError, ShardSpec, by_model, check_identity, pair_of
 from expcore.campaign.shard_run import (
@@ -116,6 +117,7 @@ from expcore.study.config import (
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
+from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
 
 RUNS_DIR = "runs"
@@ -217,7 +219,8 @@ def run_study(
     allow_dirty: bool = False,
     code_root: str | os.PathLike[str] | None = None,
     crash_hook: Callable[[str, str], None] | None = None,
-    shard: ShardSpec | None = None,
+    shard: Spec | None = None,
+    after: Sequence[str | os.PathLike[str]] = (),
 ) -> RunSummary:
     """Load the study at `path` and run its campaign: `run_built_study` of what `load_study` returned.
 
@@ -225,7 +228,7 @@ def run_study(
     fewer conditions or a selection, has no directory to name and calls `run_built_study` with it.
     """
     return run_built_study(
-        load_study(path), allow_dirty=allow_dirty, code_root=code_root, crash_hook=crash_hook, shard=shard
+        load_study(path), allow_dirty=allow_dirty, code_root=code_root, crash_hook=crash_hook, shard=shard, after=after
     )
 
 
@@ -235,7 +238,8 @@ def run_built_study(
     allow_dirty: bool = False,
     code_root: str | os.PathLike[str] | None = None,
     crash_hook: Callable[[str, str], None] | None = None,
-    shard: ShardSpec | None = None,
+    shard: Spec | None = None,
+    after: Sequence[str | os.PathLike[str]] = (),
 ) -> RunSummary:
     """Open or resume the campaign of a `StudyConfig` and run the scheduler until nothing more can start.
 
@@ -252,7 +256,10 @@ def run_built_study(
     when it supplies none. `crash_hook` is the scheduler's own test seam for killing the process at a chosen point of
     an attempt. With `shard` the campaign is that shard of N: its part of the plan, its shares of the caps and the
     budget, and the environment identity the plugin gives, kept in the store (`campaign.shard_run`); a shard that has
-    no run, or whose share of a total is nothing, is refused before the store is touched.
+    no run, or whose share of a total is nothing, is refused before the store is touched. A `SelectionSpec` runs the
+    selected runs instead (C38, `study.selection_start`), after the earlier selections `after` names when sequential:
+    the same entry for a selection of a study read from disk and of one built in code, so either keeps the study's
+    kinds in scope.
 
     The store is `<study.root>/out`, and the campaign fingerprint covers the plan (the schema, tasks, models and
     seeds), so a cut config refuses to resume the store of the whole study (C06): run a smoke from a copy of the study
@@ -265,7 +272,7 @@ def run_built_study(
         )
     check_study(study)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
-        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard)
+        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard, [Path(p) for p in after])
 
 
 def _run_campaign(
@@ -273,7 +280,8 @@ def _run_campaign(
     allow_dirty: bool,
     code_root: str | os.PathLike[str] | None,
     crash_hook: Callable[[str, str], None] | None,
-    shard: ShardSpec | None = None,
+    shard: Spec | None = None,
+    after: Sequence[Path] = (),
 ) -> RunSummary:
     """Internal: the body of `run_built_study`, which is the one to call.
 
@@ -288,7 +296,15 @@ def _run_campaign(
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
     manifest, started = study.manifest, None
-    if shard is not None:
+    if isinstance(shard, SelectionSpec):
+        try:
+            manifest, settings, started = selection_start(
+                study, settings, shard, fingerprint=fingerprint, environment=_identity_of(study, plugin), after=after
+            )
+        except ShardError as error:
+            raise Refused(str(error)) from None
+        print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
+    elif shard is not None:
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
         print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
     options = {} if crash_hook is None else {"crash_hook": crash_hook}
@@ -490,7 +506,9 @@ def _check_merged(
     raw = (out / MERGE_FILE).read_bytes()
     try:
         merged = read_merge(raw, out / MERGE_FILE)
-        held = read_held(out, merged)
+        loaded = load_study(study.root) if merged["rule"] == RULE_SELECTION else None
+        pricing = None if loaded is None else pricing_of(loaded)  # a selection's spend is checked again (C38)
+        held = read_held(out, merged, pricing)
     except MergeRefused as error:
         raise Refused(str(error)) from None
     for shard in held.values():
@@ -501,7 +519,7 @@ def _check_merged(
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
     try:
-        verify_merged(merged, held, load_study(study.root).manifest)
+        verify_merged(merged, held, (loaded or load_study(study.root)).manifest, pricing)
     except MergeRefused as error:
         raise Refused(str(error)) from None
     import_what_the_records_need(study, directory)
@@ -653,7 +671,7 @@ def _analyse_loaded(
     if verified.merge is not None:  # what merge.json says must be what its snapshots say, for this plan
         try:
             queries = {index: snapshot.q for index, snapshot in verified.snapshots.items() if index is not None}
-            verify_queried(verified.merge, queries, out, study.manifest)
+            verify_queried(verified.merge, queries, out, study.manifest, pricing_of(study))
         except MergeRefused as error:
             verified.close()
             raise Refused(str(error)) from None

@@ -205,6 +205,20 @@ SHARD_NOTES = [
     "weigh: a condition whose figures differ by shard is worth a look at the shards before it is read as an effect.",
 ]
 
+SELECTION_NOTES = [
+    "This batch was merged from selections: one campaign run in batches, each the runs whose factors have the levels",
+    "it names, by one driver. Each run belongs to one selection, and a pair of runs may cross two: a contrast between",
+    "conditions of different selections pairs a run of each by task, model and seed, as one driver's runs are paired.",
+    "Planned counts the condition's runs in that selection; the three rates are the shares of those planned runs that",
+    "were analysed, exhausted or unfinished (a run a partial analysis leaves out is in none of the three), and `n/a`",
+    "where the selection ran none of the condition's runs.",
+    "",
+    "The selections are batches of one design, not a factor of it: the contrasts above pool the runs of every",
+    "selection, and every figure in this section is descriptive. A contrast across selections compares runs made at",
+    "different times, and possibly on a platform that changed in between; the environment identity every selection",
+    "recorded is the same, which the merge checked, and anything it does not cover is for the reader to weigh.",
+]
+
 SHARD_KIND_NOTES = [
     "Set aside (all runs): attempts that ended as an infrastructure failure, or were discarded for an outage, in",
     "every run of the shard, by the kind of their outcome as the batch's retries are counted; `not recorded` for an",

@@ -11,13 +11,21 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-from study_support import HEAD, Campaign, clean_environment, finish, make_copy
+from selection_support import DIRECT, RELAY, make_selection_study, run_selection, select_args
+from shard_support import IDENTITY, declaring, meta_of
+from study_support import HEAD, Campaign, clean_environment, cli, finish, make_copy
 
 from expcore import errors
+from expcore.campaign.manifest import selection_manifest
 from expcore.campaign.resume import read_fingerprint
+from expcore.campaign.selection import Selection, SelectionSpec
+from expcore.campaign.shard import META_SHARES
+from expcore.campaign.shard_run import ShardMismatch
 from expcore.config.loading import ConfigError
 from expcore.provenance.codestamp import write_stamp
 from expcore.records.record import load_record
@@ -277,3 +285,147 @@ def test_c37_a_config_that_is_not_a_study_config_is_refused_naming_what_arrived(
         TypeError, match=r"run_built_study takes a StudyConfig, not PosixPath; run_study takes the path"
     ):
         run_built_study(root)  # type: ignore[arg-type]
+
+
+# --- a selection through the one entry (C37 with C38) ----------------------------------------------------------------
+
+KILLED = 9
+KILL_AFTER_THE_FIRST_RESULT = """\
+import dataclasses, json, os, sys
+from pathlib import Path
+from expcore.campaign.selection import Selection, SelectionSpec
+from expcore.study import pipeline
+from expcore.study.config import load_study
+
+root, after, select, identity = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+real = pipeline.load_plugin
+pipeline.load_plugin = lambda context: dataclasses.replace(real(context), environment_identity=lambda: dict(identity))
+
+def hook(at, run_key):
+    if at == "after_metadata":  # the store has recorded the first result: die as a kill does, with no clean-up
+        os._exit(9)
+
+spec = SelectionSpec("later", Selection.parse([select]), True)
+pipeline.run_built_study(load_study(root), shard=spec, after=[Path(after)], crash_hook=hook)
+os._exit(0)
+"""
+
+
+def later_after(select: str) -> SelectionSpec:
+    """The second of two sequential selections, as a launcher builds it in code."""
+    return SelectionSpec("later", Selection.parse([select]), True)
+
+
+def selected(root: Path, select: str) -> set[str]:
+    """The run keys of the plan a selection keeps, from the study's own manifest."""
+    study = load_study(root)
+    return {
+        row.key.text for row in selection_manifest(study.manifest, Selection.parse([select]).checked(study.schema)).rows
+    }
+
+
+def stored(root: Path, query: str) -> list[tuple]:
+    connection = sqlite3.connect(root / "out" / "state.sqlite")
+    try:
+        return connection.execute(query).fetchall()
+    finally:
+        connection.close()
+
+
+def first_selection(base: Path, env: dict[str, str], root: Path | None = None) -> Path:
+    """The first sequential selection (access=direct, labelled now), run by the command line; its store's out/."""
+    if root is None:
+        return run_selection(base, "now", env, [DIRECT], "now", sequential=True).root / "out"
+    with pytest.MonkeyPatch.context() as patch:
+        declaring(patch, IDENTITY)
+        code, stderr = cli(env, "run", str(root), *select_args([DIRECT], "now", sequential=True))
+    assert code == 0, stderr
+    return root / "out"
+
+
+def test_c37_a_sequential_selection_of_a_study_built_in_code_runs_after_an_earlier_one_with_its_kinds_in_scope(
+    tmp_path, registry, clean_environment
+):
+    """C37, C38: the path a launcher of batches takes: `run_built_study` with a selection and the store of the
+    earlier sequential selection (`after`, as `--after`). It runs exactly the selected runs, its shares name the earlier
+    one, and the study's own kind, raised in a thread the executor starts, ends its attempts instead of being refused
+    as an unknown one: one entry carries the selection and keeps the kinds in scope."""
+    now = first_selection(tmp_path, clean_environment, flapping_copy(tmp_path / "now"))
+    root = flapping_copy(tmp_path / "later")
+    with pytest.MonkeyPatch.context() as patch:
+        declaring(patch, IDENTITY)
+        summary = run_built_study(load_study(root), shard=later_after(RELAY), after=[now])
+    assert "harness_errors" not in {hold.kind for hold in summary.holds.values()}, summary.holds
+    assert summary.harness_log is None
+    assert {key for (key,) in stored(root, "SELECT run_key FROM runs")} == selected(root, RELAY)
+    assert "pending" not in {status for (status,) in stored(root, "SELECT status FROM runs")}
+    kinds = {kind for (kind,) in stored(root, "SELECT infra_kind FROM attempts")}
+    assert "relay_flap" in kinds
+    assert kinds <= {"relay_flap", None}, kinds
+    shares = json.loads(meta_of(Campaign(root))[META_SHARES])
+    assert [entry["label"] for entry in shares["after"]] == ["now"]
+    assert errors.infra_kinds() == errors.CORE_KINDS
+
+
+def test_c37_a_selection_store_built_in_code_refuses_another_selection(tmp_path, clean_environment):
+    """C37, C38: the store of a selection run through `run_built_study` resumes only as that selection: another one
+    handed to the same entry is refused before it runs anything."""
+    now = first_selection(tmp_path, clean_environment)
+    root = make_selection_study(tmp_path, "later")
+    with pytest.MonkeyPatch.context() as patch:
+        declaring(patch, IDENTITY)
+        run_built_study(load_study(root), shard=later_after(RELAY), after=[now])
+        attempts = stored(root, "SELECT id, run_key, state FROM attempts")
+        with pytest.raises(ShardMismatch, match="resumes only as itself"):
+            run_built_study(load_study(root), shard=SelectionSpec("later", Selection.parse([DIRECT]), False))
+    assert stored(root, "SELECT id, run_key, state FROM attempts") == attempts
+
+
+def test_c37_a_killed_sequential_selection_built_in_code_resumes_without_running_a_finished_run_again(
+    tmp_path, clean_environment
+):
+    """C37, C38: a batch run through `run_built_study` with `after` is killed once the store has its first result; the
+    same call resumes it, finishing the selected runs, and no run whose result the store had gets another attempt."""
+    now = first_selection(tmp_path, clean_environment)
+    root = make_selection_study(tmp_path, "later")
+    child = tmp_path / "kill_after_the_first_result.py"
+    child.write_text(KILL_AFTER_THE_FIRST_RESULT, encoding="utf-8")
+    died = subprocess.run(
+        [sys.executable, str(child), str(root), str(now), RELAY, json.dumps(IDENTITY)],
+        capture_output=True,
+        text=True,
+        env=clean_environment,
+    )
+    assert died.returncode == KILLED, died.stderr
+    finished = {key for (key, status) in stored(root, "SELECT run_key, status FROM runs") if status == "done"}
+    before = {row for row in stored(root, "SELECT id, run_key, state FROM attempts") if row[1] in finished}
+    assert finished, "the kill came after the store recorded a result"
+    with pytest.MonkeyPatch.context() as patch:
+        declaring(patch, IDENTITY)
+        run_built_study(load_study(root), shard=later_after(RELAY), after=[now])
+    assert {key for (key,) in stored(root, "SELECT run_key FROM runs")} == selected(root, RELAY)
+    assert {status for (status,) in stored(root, "SELECT status FROM runs")} == {"done"}
+    after = {row for row in stored(root, "SELECT id, run_key, state FROM attempts") if row[1] in finished}
+    assert after == before  # a finished run is never run again
+
+
+def test_c37_the_command_line_runs_a_sequential_selection_after_an_earlier_one_as_the_entry_does(
+    tmp_path, clean_environment
+):
+    """C37, C38: `run --select access=relay --shard-label later --sequential --after <now>/out`, end to end, goes
+    through the same entry: it runs the same selected runs, with the same shares, as `run_built_study` with that
+    selection and `after`."""
+    now = first_selection(tmp_path, clean_environment)
+    by_cli, by_entry = make_selection_study(tmp_path, "by-cli"), make_selection_study(tmp_path, "by-entry")
+    with pytest.MonkeyPatch.context() as patch:
+        declaring(patch, IDENTITY)
+        args = select_args([RELAY], "later", sequential=True, after=[now])
+        code, stderr = cli(clean_environment, "run", str(by_cli), *args)
+        assert code == 0, stderr
+        run_built_study(load_study(by_entry), shard=later_after(RELAY), after=[now])
+    for root in (by_cli, by_entry):
+        assert {key for (key,) in stored(root, "SELECT run_key FROM runs")} == selected(root, RELAY)
+        assert {status for (status,) in stored(root, "SELECT status FROM runs")} == {"done"}
+    shares = [json.loads(meta_of(Campaign(root))[META_SHARES]) for root in (by_cli, by_entry)]
+    assert shares[0] == shares[1]
+    assert [entry["label"] for entry in shares[0]["after"]] == ["now"]
