@@ -221,6 +221,7 @@ A versioned Python package (`expcore`, with the Onedata platform layer `expcore_
 - Maintainer-only tests need the private paths: `EXPCORE_STUDY_TOKENS=<plain list> EXPCORE_SOURCE_REPOS="<repo>=<path>;..." uv run pytest tests/test_provenance_history.py tests/test_no_study_tokens.py`.
 - Before pushing: `uv run python -m expcore.provenance.study_tokens check-commits <base>..HEAD` (commit messages are scanned too).
 - After changing the private list: `uv run python -m expcore.provenance.study_tokens hash "$EXPCORE_STUDY_TOKENS" > tests/data/study_tokens.sha256`.
+- CI runs on pull requests (testing the merge with `main`) and on pushes to `main`. To test one branch tip exactly, such as a pin built on an older commit, run `gh workflow run ci.yml --ref <branch>`.
 
 ## Conventions
 
