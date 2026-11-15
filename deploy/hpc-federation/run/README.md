@@ -21,6 +21,11 @@ cover what they write and how the summary reads it, on invented data. The first 
 3. **An item whose file is missing, empty or unparsable fails.** A parser that raises fails its item. The verdict is
    `PASS` only when every item of the catalog parsed and every item's own check passed; a step that was skipped is a
    failed item, never an absent one.
+4. **The evidence is this run's.** The first step (`zone-up.sh`) needs an empty `$E` and writes `run.json` (a fresh run
+   id, the allocation's job id, the start); every other step refuses an `$E` without it or of another allocation. A
+   step's directory is made once per run, so a step cannot run again into the same run; the cell is the one step
+   repeated (`cell.sh`), and its earlier attempt is moved aside to `sandbox.attempt-<n>`, which the summary does not
+   read. The summary names the run id and the start, never the job id.
 
 ```bash
 python3 -I run/evidence.py "$E"     # prints the summary as JSON; exit 0 on PASS, 1 on FAIL
@@ -69,17 +74,18 @@ python3 -I run/evidence.py "$E"
 
 | Evidence (under `$E`) | Written by | Summary item and what fails it |
 |---|---|---|
+| `run.json` | `zone-up.sh` (common.sh's `begin_run`) | `run_identity`: no run id of 32 hex digits, no allocation, no start |
 | `<role>/up.json` | `zone-up.sh`, `providers-up.sh` | `<role>_up`: no verdict line, a `FAIL`, `ERROR` or `FINISH FAILED` line, or a missing guard, default, port or hashed-value `ok:` line, in the service's batch log |
 | `<role>/cb-guard-*.json` | the same | `<role>_couchbase_guard`: one `hpcop-evidence` line of the log per file; every request's status must equal its expected one (administrator 200, anonymous 401), at the start of the service, after onepanel's setup and after the rotation |
 | `P<n>/registration.json` | `providers-up.sh` | `P<n>_registration`: a mint or delivery step with a non-zero exit status |
 | `providers/online.*` | `providers-up.sh` | `providers_online`: fewer than three online in the zone |
 | `roundtrip/prepare.json`, `support-P<n>.*`, `write.*` | `roundtrip.sh` | `space_prepared`, `support_P<n>`, `write_P1`: a failed step; a read-back SHA-256 that is not the written one |
 | `roundtrip/read-P<n>.*` | `roundtrip.sh` | `read_P<n>`: the SHA-256 read is not the expected one, or the expected one is not the writer's |
-| `roundtrip/http-*.jsonl` | `fed_zone.py`, `fed_provider.py` | not read by an item: each call's status and body size and SHA-256, raw |
+| `roundtrip/http-*.jsonl`, `providers/http-zone.jsonl` | `fed_zone.py`, `fed_provider.py` | `fact_http_calls`: each call's method, path, status and body size and SHA-256 (no header, no body), raw; fewer than the zone's log and one per provider, or a line in another shape |
 | `sandbox/agent.json` | `sandbox.sh` (the cell's output) | `gate_read` (the two SHA-256 strings compared, and the byte count), `gate_lookup`, `gate_listing`, `gate_write_refused` (a 4xx), `gate_strips_client_token` (a bogus client token answered as the control request is), `direct_no_token` (401 or 403), `reach_matrix` (no internal port open, the public ones open as the control), `cell_clean` (no token-like variable, three files in `/cell`) |
 | `sandbox/gate-requests.jsonl`, `gate-end.json` | `sandbox.sh` | `gate_log`: no `teardown_complete` line, a forwarded write (a request other than a GET or a POST to one of the policy's two lookups, unless the gate's own decision was `deny` with a 4xx), no served content read |
-| `sandbox/token-scan-*.json` | `sandbox.sh` | `gate_token_scan`: a count above 0, a grep error (exit 2), an empty pattern or a blank line in it, a missing scan of any of the six files, an empty gate log |
-| `sandbox/egress.jsonl`, `egress-collector.json`, `canary.json` | `sandbox.sh` | `egress`: not this launch's nonce, a gap in `seq`, no end line or end counts that are not the log's, a malformed, unwritten or dropped record, a record from another uid than the collector's, no records, a first record that is not the canary's, a collector that did not exit 0 |
+| `sandbox/token-scan-*.json`, and the six scanned logs | `sandbox.sh` | `gate_token_scan`: a count above 0, a grep error (exit 2), an empty pattern or a blank line in it, a missing scan of any of the six files, a scanned log that is missing or not the bytes its scan recorded (its size and SHA-256), an empty gate log |
+| `sandbox/egress.jsonl`, `egress-collector.json`, `canary.json` | `sandbox.sh` | `egress`: anything the core reads as damaged (a line of no known kind or not in the collector's shape, another format, not this launch's nonce, a gap in `seq` or a clock that goes back, no end line or end counts that are not the log's, a malformed, unwritten or dropped record, a record from another uid than the collector's), a first record that is not the canary's, a collector that did not exit 0 |
 | `<role>/teardown.json`, `service-end.json`, `service-step.rc.json` | `teardown-all.sh`, `detach.sh` | `<role>_teardown`: no `service stopped` or `work directory removed`, a service that ended by itself, a service step with a non-zero exit status |
 | `teardown/steps-left.json`, `nodecheck-<role>.json` | `teardown-all.sh` | `steps_left`, `nodes_clean`: a step left besides the allocation's own, a leftover on any of the five nodes, a node not checked, a node whose `ps` or `ss` did not exit 0 |
 | `release/scancel.rc.json`, `squeue-final.json` | `release.sh` | `release_scancel`, `release_squeue`: a job whose name starts with `hpcop-` in `squeue -u $USER -h -o '%i %j'` after the release; the total is counted but another job of the same user is not ours |
@@ -96,7 +102,9 @@ asserts the scan's file is exactly one non-blank line before starting anything (
 blank line matches every line), stops the gate and the collector, copies each log into `$E/sandbox/`, and runs
 `grep -c -F -f <token file> <file>` once per file, over the gate's request log, its stdout and stderr, the agent's stdout
 and stderr, and the egress log. Exit status 1 is a count of 0, and 2 an error, which fails the run. Each count and exit
-status is saved; the token is never printed; the scan's copy is removed after. **A count above 0 fails the run.** The
+status is saved with the scanned file's size and SHA-256, and the summary reads the six files too, so a log removed or
+changed after its scan voids its count; the token is never printed; the scan's copy is removed after. **A count above 0
+fails the run.** The
 sandbox step's own stderr (its messages) is not scanned: it prints no token, and the token reaches no command line.
 
 ## Egress detection
@@ -113,8 +121,9 @@ first record must be a `connect` to that endpoint: a log that opens with anythin
 unknown (the shim may never have loaded), and the `egress` item fails it. The canary must also have succeeded in the cell.
 
 After the cell exits, `sandbox.sh` stops the collector and saves its exit status and log. The summary checks only what it
-can without the core, as the core reads it: the file parses, starts with this launch's nonce, opens with the canary's
-record, has no gap in `seq`, ends with the end line whose counts are the log's, and holds no malformed, unwritten or
+can without the core, as the core reads it: every line is of a kind the collector writes and in its shape, the start
+line is in the collector's format with this launch's nonce, the first record is the canary's, `seq` has no gap and the
+clock never goes back, the end line is the last and its counts are the log's, and there is no malformed, unwritten or
 dropped record and none from another uid than the collector's. It counts the distinct (address, port, type)
 destinations, and how many are loopback, but names no address: the summary is what gets pasted. Classifying them as
 gate, loopback or outside is `expcore.egress`'s job, not this step's.
@@ -124,7 +133,8 @@ cannot see or signal the collector or the gate, and the directory of the log fil
 the agent can still send forged datagrams to the collector's socket: they add lines to the log, never remove one, and a
 malformed one makes the log unknown. It can also bypass the shim with a static binary, raw system calls or io_uring, which
 the log does not see. If the collector dies mid-run, the shim refuses every later connect with EACCES (the agent's data
-path fails too) and the log has no end line, so it reads as unknown. Detection, not prevention.
+path fails too), and if it stops reading, so it does after waiting at most 2 s for room; a log without its end line
+reads as unknown. Detection, not prevention.
 
 ## What the checks leave out
 

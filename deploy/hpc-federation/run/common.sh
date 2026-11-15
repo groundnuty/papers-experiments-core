@@ -33,8 +33,33 @@ HPC_USER=${USER:-$(id -un)}
 : "${E:?E must name the run evidence directory, a 0700 directory on a filesystem every node sees (run/README.md)}"
 [[ -d $E && ! -L $E && -O $E && $(stat -c %a -- "$E") == 700 ]] || die "E is not a private (0700) directory of yours"
 
-ev() { [[ -d $E/$1 ]] || mkdir -m 700 -- "$E/$1"; }         # <step>: that step's evidence directory
 rec() { python3 -I "$RUN/record.py" "$@"; }                # how evidence files are written (record.py)
+# <step>: that step's evidence directory, made once per run: a step that ran already cannot run again into this run,
+# where its earlier files would stand beside the new ones (the cell is the one step repeated: fresh_step_dir).
+ev() {
+  mkdir -m 700 -- "$E/$1" 2> /dev/null \
+    || die "the evidence of step $1 is already in this run: a step's evidence is written once (start a new run)"
+}
+fresh_step_dir() {  # <step>: an earlier attempt's directory moved aside, kept as raw evidence the summary does not read
+  local n=1
+  if [[ -e $E/$1 ]]; then
+    while [[ -e $E/$1.attempt-$n ]]; do n=$((n + 1)); done
+    mv -- "$E/$1" "$E/$1.attempt-$n"
+  fi
+  ev "$1"
+}
+# The run's identity. Its first step (zone-up.sh, STEP_BEGINS_RUN=1) needs an empty $E and writes run.json; every
+# other step checks that run.json is this allocation's. So no file of an earlier run stands for a step of this one.
+begin_run() {
+  [[ -z $(ls -A -- "$E") ]] || die "E is not empty: a run starts in a fresh directory (mktemp -d), never an earlier run's"
+  rec kv "$E/run.json" "run_id=str:$(rec nonce)" "job=str:$HPC_JOB" "started=str:$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+in_run() {
+  local job
+  job=$(rec field "$E/run.json" job 2> /dev/null) || die "E holds no run.json: start the run with zone-up.sh in a fresh E"
+  [[ $job == "$HPC_JOB" ]] || die "E holds a run of another allocation: start a new run in a fresh E"
+}
+if [[ ${STEP_BEGINS_RUN:-} == 1 ]]; then begin_run; else in_run; fi
 node_of() { local v=NODE_$1; printf '%s' "${!v}"; }         # <role>: the node's name
 addr_of() { local v=ADDR_$1; printf '%s' "${!v}"; }         # <role>: the node's address on the providers' network
 svc_log() {                                                 # <role>: the batch log of that role's service step
@@ -91,10 +116,9 @@ END_COUNTS=(
   'exited_by_itself=service exited by itself'
 )
 
-record_up() {  # <role>: the counts of the service's log, and the guard's status codes, one file each
-  local log
+record_up() {  # <role>: the counts of the service's log, and the guard's status codes, one file each (the role's
+  local log     # directory is the step's own, made when it launched the service)
   log=$(svc_log "$1")
-  ev "$1"
   rec logscan "$E/$1/up.json" "$log" "${UP_COUNTS[@]}"
   rec guard-lines "$log" "$E/$1" > /dev/null
 }
@@ -107,7 +131,7 @@ cell_step() {
     && sha=$(rec field "$w" sha256) || die "no usable roundtrip/write.out.json: run roundtrip.sh first"
   zf=$(fqdn_of "$(svc_log Z)") p1=$(fqdn_of "$(svc_log P1)") p2=$(fqdn_of "$(svc_log P2)") p3=$(fqdn_of "$(svc_log P3)")
   [[ -n $zf && -n $p1 && -n $p2 && -n $p3 ]] || die "a service's FQDN is not in its log"
-  ev sandbox
+  fresh_step_dir sandbox   # cell.sh repeats the cell: the summary reads only this attempt's files
   srun --jobid="$HPC_JOB" --overlap --export=PATH -w "$NODE_S" -N1 -n1 -c4 --mem=16G \
     bash "$RUN/sandbox.sh" "$RUN" "$B" "$GATE_DIR" "$SH/oneprovider-docker.tar" "$E" "$SPACE_NAME" "$sid" "$root" "$fid" "$sha" \
     "$zf" "$p1" "$p2" "$p3" 2>&1 | tee "$L/sandbox.out"

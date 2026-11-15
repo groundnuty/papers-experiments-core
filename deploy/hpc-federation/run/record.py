@@ -13,7 +13,8 @@ what it saw here and never a verdict of its own.
                                               (a line that is not one JSON object is kept as its raw text, which the
                                               summary then fails as unparsable)
   record.py scan OUT NAME PATTERN FILE GREP_RC COUNT   one token scan: what the pattern file held (sizes only, never
-                                              its content), the file's size, grep's exit status and its count
+                                              its content), the file's size and SHA-256, grep's exit status and
+                                              its count
   record.py canary OUT ADDRESS PORT RC FILE   the egress canary: its endpoint, the cell's exit status and
                                               the connect result the cell printed (FILE's one JSON line; "unparsable"
                                               when it is not): {"address", "port", "rc", "result"}
@@ -105,9 +106,15 @@ def guard_lines(log, directory):
 
 
 def scan(out, name, pattern, scanned, grep_rc, count):
-    """The pattern file is read for its shape only: no byte of it is printed or kept."""
+    """The pattern file is read for its shape only: no byte of it is printed or kept. The scanned file's size and
+    SHA-256 bind the count to the bytes it was taken of (None when it could not be read: the summary fails that)."""
     text = read_bytes(pattern).decode("utf-8", "replace")
     lines = text.splitlines()
+    try:
+        data = read_bytes(scanned)
+        size, digest = len(data), hashlib.sha256(data).hexdigest()
+    except OSError:
+        size, digest = None, None
     write_json(
         out,
         {
@@ -115,7 +122,8 @@ def scan(out, name, pattern, scanned, grep_rc, count):
             "pattern_bytes": len(text.encode("utf-8")),
             "pattern_lines": len(lines),
             "pattern_blank_lines": sum(1 for line in lines if not line.strip()),
-            "scanned_bytes": os.path.getsize(scanned),
+            "scanned_bytes": size,
+            "scanned_sha256": digest,
             "grep_rc": integer(grep_rc, "grep's exit status"),
             "matches": integer(count, "the count") if re.fullmatch(r"[0-9]{1,18}", count) else None,
         },

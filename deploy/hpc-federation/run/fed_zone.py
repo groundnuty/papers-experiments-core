@@ -23,6 +23,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import stat
@@ -34,6 +35,24 @@ from typing import Any
 API = "/api/v3/onezone"
 LIFETIME = 3600
 EVIDENCE_FILE: str | None = None
+
+
+ERROR_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
+
+
+def answer_note(status: int, body: bytes | str) -> str:
+    """A failed answer as a message may carry it: its status, the body's size and SHA-256, and the error's id when the
+    body is Onedata's error object. Never the body: an error may echo an account, a path or a credential."""
+    raw = body if isinstance(body, bytes) else str(body).encode("utf-8", "replace")
+    note = f"HTTP {status}, {len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:16]}"
+    try:
+        error = json.loads(raw.decode("utf-8")).get("error")
+        found = error.get("id") if isinstance(error, dict) else None
+    except (ValueError, AttributeError):
+        found = None
+    if isinstance(found, str) and ERROR_ID.fullmatch(found):
+        note += f", error id {found}"
+    return note
 
 
 def die(msg: str) -> None:
@@ -111,7 +130,7 @@ class Zone:
     def json(self, method: str, path: str, body: dict[str, Any] | None = None) -> tuple[Any, str | None]:
         status, raw, location = self.call(method, path, body)
         if status not in (200, 201, 204):
-            die(f"{method} {path}: HTTP {status}: {raw[:300]}")
+            die(f"{method} {path}: {answer_note(status, raw)}")
         return (json.loads(raw) if raw.strip() else {}), location
 
 

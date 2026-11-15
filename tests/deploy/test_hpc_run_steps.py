@@ -141,6 +141,7 @@ def test_record_scan_keeps_the_shape_of_the_pattern_and_never_its_content(tmp_pa
     doc = parsed(tmp_path / "scan.json")
     assert (doc["pattern_bytes"], doc["pattern_lines"], doc["pattern_blank_lines"]) == (len(secret) + 1, 1, 0)
     assert (doc["scanned_bytes"], doc["grep_rc"], doc["matches"]) == (15, 1, 0)
+    assert doc["scanned_sha256"] == __import__("hashlib").sha256(b"a line\nanother\n").hexdigest()
     assert secret not in (tmp_path / "scan.json").read_text(encoding="utf-8")
     assert secret not in done.stdout + done.stderr
 
@@ -170,16 +171,16 @@ TOKEN = "gate-tok-" + "k3Lm" * 10
 
 
 def scan_all(run_dir, token_text, contents):
-    """Run the step's own scan() over each file with the token file holding `token_text`; return its stderr."""
-    (run_dir / "scanned").mkdir(exist_ok=True)
+    """Run the step's own scan() over each evidence copy in sandbox/, as the step does, with the token file holding
+    `token_text`; a file named in `contents` is rewritten first, the others keep the passing fixture's. Return the
+    scan's output."""
     (run_dir / "d" / "scan").mkdir(parents=True, exist_ok=True)
     (run_dir / "d" / "scan" / "token").write_text(token_text, encoding="utf-8")
     calls = ""
     for name, filename in SCAN_FILES.items():
-        (run_dir / "scanned" / filename).write_text(
-            contents.get(name, f"nothing of note in {name}\n"), encoding="utf-8"
-        )
-        calls += f'scan {name} "{run_dir}/scanned/{filename}"\n'
+        if name in contents:
+            (run_dir / "sandbox" / filename).write_text(contents[name], encoding="utf-8")
+        calls += f'scan {name} "{run_dir}/sandbox/{filename}"\n'
     script = (
         f'set -euo pipefail; D="{run_dir}/d"; E="{run_dir}"\n'
         f'rec() {{ "{sys.executable}" -I "{RUN}/record.py" "$@"; }}\n'
@@ -202,7 +203,7 @@ def test_a_token_in_any_scanned_file_fails_the_run_and_is_counted_never_printed(
     """O52: the step's real grep -c -F -f over each saved log, its count read back by the summary."""
     out = scan_all(run_dir, TOKEN + "\n", {name: f"line\n{TOKEN}\nline\nxx {TOKEN} yy\n"})
     summary = evidence.summary(run_dir)
-    assert failed(summary) == {"gate_token_scan"}
+    assert "gate_token_scan" in failed(summary)  # a JSON evidence file so rewritten fails its own item as well
     assert item(summary, "gate_token_scan")["detail"]["matches"] == {name: 2}
     assert TOKEN not in out
     assert TOKEN not in json.dumps(summary)
@@ -210,7 +211,7 @@ def test_a_token_in_any_scanned_file_fails_the_run_and_is_counted_never_printed(
 
 def test_the_steps_scan_with_an_empty_token_file_fails_the_run(run_dir):
     """grep -f an empty file matches nothing, so every count would be 0: the summary must not take that for a pass."""
-    scan_all(run_dir, "", {"gate-requests": f"{TOKEN}\n"})
+    scan_all(run_dir, "", {"gate-stdout": f"{TOKEN}\n"})
     assert failed(evidence.summary(run_dir)) == {"gate_token_scan"}
 
 
@@ -221,9 +222,9 @@ def test_the_steps_scan_with_a_blank_line_in_the_token_file_fails_the_run(run_di
 
 def test_the_steps_scan_of_a_file_it_cannot_read_is_an_error_and_fails_the_run(run_dir):
     scan_all(run_dir, TOKEN + "\n", {})
-    (run_dir / "scanned" / "gate-stderr.txt").unlink()
-    (run_dir / "scanned" / "gate-stderr.txt").mkdir()  # a directory: grep exits 2
-    calls = f'scan gate-stderr "{run_dir}/scanned/gate-stderr.txt"\n'
+    (run_dir / "sandbox" / "gate-stderr.txt").unlink()
+    (run_dir / "sandbox" / "gate-stderr.txt").mkdir()  # a directory: grep exits 2
+    calls = f'scan gate-stderr "{run_dir}/sandbox/gate-stderr.txt"\n'
     script = (
         f'set -uo pipefail; D="{run_dir}/d"; E="{run_dir}"; rec() {{ "{sys.executable}" -I "{RUN}/record.py" "$@"; }}\n'
         f"{SCAN_FUNCTION}{calls}"
@@ -237,6 +238,12 @@ def test_the_steps_scan_of_a_file_it_cannot_read_is_an_error_and_fails_the_run(r
 def test_the_sandbox_step_scans_exactly_the_files_the_summary_expects():
     scanned = re.findall(r"^scan (\S+) ", SANDBOX, re.M)
     assert sorted(scanned) == sorted(evidence.SCANNED)
+
+
+def test_the_sandbox_step_scans_the_evidence_copies_the_summary_binds_each_scan_to():
+    """O52: each scan is of the file in $E/sandbox that the summary hashes and compares with the scan's record."""
+    scanned = dict(re.findall(r'^scan (\S+) "\$E/(sandbox/\S+)"$', SANDBOX, re.M))
+    assert scanned == base.SCANNED_FILES == evidence.SCANNED_FILES
 
 
 def test_the_sandbox_step_keeps_the_token_file_until_after_the_scans_and_checks_it_first():
@@ -303,7 +310,7 @@ def site(tmp_path):
     evidence_dir.mkdir(mode=0o700)
     env_file = tmp_path / "site.env"
     values = {
-        "HPC_JOB": "1",
+        "HPC_JOB": base.JOB,
         "B": "/b",
         "SH": "/sh",
         "L": str(logs),
@@ -320,6 +327,7 @@ def site(tmp_path):
     }
     env_file.write_text("".join(f"{k}='{v}'\n" for k, v in values.items()), encoding="utf-8")
     env = {"PATH": os.environ["PATH"], "SITE_ENV": str(env_file), "E": str(evidence_dir)}
+    write_files(evidence_dir, {"run.json": good_files()["run.json"]})  # a run in progress, of this allocation
     return type("Site", (), {"logs": logs, "E": evidence_dir, "env": env})
 
 
@@ -334,6 +342,64 @@ def sh(site, script):
     )
     assert done.returncode == 0, done.stderr
     return done.stdout
+
+
+def sh_status(site, script, **extra):
+    """A step's shell, its exit status and output kept: for the refusals."""
+    return subprocess.run(
+        ["bash", "-c", f'source "{RUN}/common.sh"; {script}'],
+        env={**site.env, **extra},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_the_runs_first_step_refuses_an_evidence_directory_that_is_not_empty(site):
+    """O52: a run starts in a fresh directory, so no file of an earlier run can stand for a step of this one."""
+    done = sh_status(site, "true", STEP_BEGINS_RUN="1")
+    assert done.returncode != 0
+    assert "not empty" in done.stderr
+
+
+def test_the_runs_first_step_writes_its_identity_into_an_empty_directory(site):
+    (site.E / "run.json").unlink()
+    done = sh_status(site, "true", STEP_BEGINS_RUN="1")
+    assert done.returncode == 0, done.stderr
+    doc = parsed(site.E / "run.json")
+    assert re.fullmatch(r"[0-9a-f]{32}", doc["run_id"])
+    assert (doc["job"], bool(doc["started"])) == (base.JOB, True)
+    assert mode(site.E / "run.json") == 0o600
+
+
+@pytest.mark.parametrize("state", ["no run.json", "another allocation's"])
+def test_a_later_step_refuses_an_evidence_directory_that_is_not_this_allocations_run(site, state):
+    """O52: a step adds to its own run's directory only; an earlier allocation's evidence is never added to."""
+    if state == "no run.json":
+        (site.E / "run.json").unlink()
+    else:
+        write_files(site.E, {"run.json": dict(good_files()["run.json"], job="999")})
+    done = sh_status(site, "true")
+    assert done.returncode != 0
+    assert "run" in done.stderr
+
+
+def test_a_steps_evidence_directory_is_made_once_per_run(site):
+    """O52: a step that ran already cannot run again into the same run, where its earlier files would mix in."""
+    done = sh_status(site, "ev roundtrip; ev roundtrip")
+    assert done.returncode != 0
+    assert "already" in done.stderr
+
+
+def test_a_repeated_cell_keeps_the_earlier_attempts_evidence_aside_and_starts_afresh(site):
+    """O52: the summary reads only the last attempt's files; an earlier attempt's stay, renamed, as raw evidence."""
+    (site.E / "sandbox").mkdir(mode=0o700)
+    (site.E / "sandbox" / "agent.json").write_text("{}", encoding="utf-8")
+    sh(site, "fresh_step_dir sandbox; fresh_step_dir sandbox")
+    assert (site.E / "sandbox.attempt-1" / "agent.json").is_file()
+    assert (site.E / "sandbox.attempt-2").is_dir()
+    assert list((site.E / "sandbox").iterdir()) == []
 
 
 def guard_job_log():
@@ -571,6 +637,56 @@ def test_the_zones_online_output_passes_the_online_item(run_dir):
         assert zone_module.online(FakeZone(), 3, 0) == 0
     write_files(run_dir, {"providers/online.out.json": json.loads(out.getvalue())})
     assert "providers_online" not in failed(evidence.summary(run_dir))
+
+
+SECRET_BODY = '{"error": {"id": "forbidden", "description": "user secret-value at a site path"}}'
+
+
+def test_a_zone_call_that_failed_names_its_status_and_error_id_never_its_body(capsys):
+    """O52: an error answer may echo an account, a path or a credential; its message keeps the status, the body's
+    size and hash, and the error's id."""
+    zone_module = load(RUN / "fed_zone.py", "hpcop_run_zone_error")
+    zone = object.__new__(zone_module.Zone)
+    zone.call = lambda method, path, body=None: (403, SECRET_BODY, None)
+    with pytest.raises(SystemExit):
+        zone.json("GET", "/user")
+    err = capsys.readouterr().err
+    assert "HTTP 403" in err
+    assert "forbidden" in err
+    assert "secret-value" not in err
+
+
+@pytest.mark.parametrize("failing", ["create", "write"])
+def test_a_provider_call_that_failed_names_its_status_never_its_body(capsys, failing):
+    """O52: as for the zone's calls: the status, the body's size and hash, the error's id."""
+    provider = load(RUN / "fed_provider.py", f"hpcop_run_provider_error_{failing}")
+
+    class Refusing(FakeWorker):
+        def call(self, method, path, body=None, headers=None):
+            if (method == "POST") == (failing == "create"):
+                return 400, SECRET_BODY.encode()
+            return super().call(method, path, body, headers)
+
+    with pytest.raises(SystemExit):
+        provider.write(Refusing(), "root-id", {"space_id": "s"})
+    captured = capsys.readouterr()
+    assert "HTTP 400" in captured.err
+    assert "secret-value" not in captured.err + captured.out
+
+
+def test_onboardings_failure_lines_keep_their_status_and_never_a_body(capsys, monkeypatch):
+    """O52: onboard.py prints a failed answer's first 200 characters; the support step keeps each line up to its
+    status."""
+    provider = load(RUN / "fed_provider.py", "hpcop_run_provider_onboard")
+    done = subprocess.CompletedProcess(
+        [], 1, "support HTTP 400; users mapped 0/1\n", f"onboard: FAILED support: HTTP 400 {SECRET_BODY}\n"
+    )
+    monkeypatch.setattr(provider.subprocess, "run", lambda *a, **k: done)
+    with pytest.raises(SystemExit):
+        provider.support("/w", "/b", {"space_id": "s", "token": "t"}, {"space_id": "s"})
+    out = json.loads(capsys.readouterr().out)
+    assert out["onboard_err"] == "onboard: FAILED support: HTTP 400 (body not kept)"
+    assert "secret-value" not in json.dumps(out)
 
 
 def test_the_helpers_note_each_http_call_as_a_status_and_a_body_hash_never_a_header_or_body(tmp_path):

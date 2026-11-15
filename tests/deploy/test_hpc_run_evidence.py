@@ -31,6 +31,15 @@ NONCE = "0123456789abcdef0123456789abcdef"
 SPACE, ROOT, FILE = "space-id", "root-id", "file-id"
 WHENS = ("after onepanel's Couchbase setup", "after the rotation")
 SENT = ("GET /settings/web (administrator)", 200), ("GET /settings/web (anonymous)", 401)
+RUN_ID, JOB = "fedcba9876543210fedcba9876543210", "4242424"  # the run's identity (run.json); the job is invented
+SCANNED_FILES = {
+    "gate-requests": "sandbox/gate-requests.jsonl",
+    "gate-stdout": "sandbox/gate-stdout.txt",
+    "gate-stderr": "sandbox/gate-stderr.txt",
+    "agent-stdout": "sandbox/agent.json",
+    "agent-stderr": "sandbox/agent.err",
+    "egress-log": "sandbox/egress.jsonl",
+}
 
 
 def load_evidence():
@@ -68,7 +77,8 @@ def egress_text(nonce=NONCE, destinations=(("127.0.0.1", 41234, "tcp"), ("127.0.
         rec.update({"address": address, "port": port, "result": None, "dropped": 0})
         lines.append({"event": "record", "peer": {"pid": 5, "uid": COLLECTOR_UID}, "rec": rec})
     lines.append({"event": "end", "records": len(destinations), "malformed": 0, "unwritten": 0})
-    return "\n".join(json.dumps(dict(line, seq=n)) for n, line in enumerate(lines)) + "\n"
+    stamped = [dict(line, seq=n, wall=1794700000.0 + n, mono=100.0 + n) for n, line in enumerate(lines)]
+    return "\n".join(json.dumps(line) for line in stamped) + "\n"
 
 
 def egress_rows():
@@ -164,10 +174,10 @@ def good_files():
     files["sandbox/step.rc.json"] = {"name": "sandbox_step", "rc": 0}
     files["sandbox/agent.rc.json"] = {"name": "agent", "rc": 0}
     files["sandbox/agent.json"] = agent()
-    for name in ("gate-requests", "gate-stdout", "gate-stderr", "agent-stdout", "agent-stderr", "egress-log"):
-        scan = {"name": name, "pattern_bytes": 160, "pattern_lines": 1, "pattern_blank_lines": 0}
-        files[f"sandbox/token-scan-{name}.json"] = dict(scan, scanned_bytes=500, grep_rc=1, matches=0)
     files["sandbox/gate-requests.jsonl"] = gate_text()
+    files["sandbox/gate-stdout.txt"] = "gate ready\n"
+    files["sandbox/gate-stderr.txt"] = "gate: teardown\n"
+    files["sandbox/agent.err"] = "agent: done\n"
     files["sandbox/gate-end.json"] = {"name": "gate", "rc": 0}
     files["sandbox/egress.jsonl"] = egress_text()
     files["sandbox/egress-collector.json"] = {"nonce": NONCE, "ready_lines": 1, "rc": 0}
@@ -179,14 +189,48 @@ def good_files():
         files[f"teardown/nodecheck-{role}.json"] = dict(zero, role=role)
     files["release/scancel.rc.json"] = {"name": "scancel", "rc": 0}
     files["release/squeue-final.json"] = {"name": "squeue_final", "rc": 0, "lines": ["777 other-study-job"]}
+    files["run.json"] = {"run_id": RUN_ID, "job": JOB, "started": "2026-11-15T00:00:00Z"}
+    files.update(http_files())
+    for name, rel in SCANNED_FILES.items():
+        files[f"sandbox/token-scan-{name}.json"] = scan_doc(name, as_bytes(files[rel]))
     return files
 
 
+def http_files():
+    """The helpers' HTTP call logs: the zone's (prepare and the online check) and one per provider's work directory."""
+    call = {"method": "GET", "path": "/spaces/s", "status": 200, "body_bytes": 2, "body_sha256": SHA}
+    files = {"providers/http-zone.jsonl": json.dumps(call) + "\n"}
+    for name in ("zone", "Ab1", "Cd2", "Ef3"):
+        files[f"roundtrip/http-{name}.jsonl"] = json.dumps(call) + "\n"
+    return files
+
+
+def as_bytes(value):
+    """A fixture file's bytes, as write_files writes it."""
+    return (value if isinstance(value, str) else json.dumps(value)).encode("utf-8")
+
+
+def scan_doc(name, content):
+    """What sandbox.sh's scan() records of a clean scan of `content`."""
+    shape = {"name": name, "pattern_bytes": 160, "pattern_lines": 1, "pattern_blank_lines": 0}
+    digest = hashlib.sha256(content).hexdigest()
+    return dict(shape, scanned_bytes=len(content), scanned_sha256=digest, grep_rc=1, matches=0)
+
+
 def write_files(root, files):
+    """Write evidence files; a scanned file a test rewrites gets its scan re-stamped, as the step would have scanned
+    what it wrote (a test that means to break that binding writes the file itself)."""
     for rel, value in files.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
+    for name, rel in SCANNED_FILES.items():
+        scan = root / "sandbox" / f"token-scan-{name}.json"
+        if rel in files and f"sandbox/token-scan-{name}.json" not in files and scan.exists():
+            content = (root / rel).read_bytes()
+            doc = json.loads(scan.read_text(encoding="utf-8"))
+            doc.update(scanned_bytes=len(content), scanned_sha256=hashlib.sha256(content).hexdigest())
+            scan.write_text(json.dumps(doc), encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -601,6 +645,32 @@ def test_an_egress_end_line_whose_malformed_count_is_not_the_logs_fails_the_run(
     assert failed(evidence.summary(run_dir)) == {"egress"}
 
 
+def renumbered(rows):
+    """The collector's numbering and clock readings, redone after a line is inserted."""
+    return [dict(row, seq=n, mono=100.0 + n) for n, row in enumerate(rows)]
+
+
+EGRESS_DAMAGE = {
+    "the clock goes back": lambda rows: rows[2].update(mono=rows[1]["mono"] - 1) or rows,
+    "an event of no known kind": lambda rows: renumbered([*rows[:2], {"event": "note"}, *rows[2:]]),
+    "another format": lambda rows: rows[0].update(format="hpcop-egress/0") or rows,
+    "an operation the shim has not": lambda rows: rows[2]["rec"].update(op="bind") or rows,
+    "a record without its time": lambda rows: rows[2]["rec"].pop("time") and rows,
+    "an address of another family": lambda rows: rows[2]["rec"].update(family="inet6") or rows,
+    "an attempt with a result": lambda rows: rows[2]["rec"].update(result=0) or rows,
+    "an address that is not text": lambda rows: rows[2]["rec"].update(address=2130706433) or rows,
+    "a start line without the collector's uid": lambda rows: rows[0].pop("uid") and rows,
+}
+
+
+@pytest.mark.parametrize("damage", sorted(EGRESS_DAMAGE))
+def test_an_egress_log_the_core_reads_as_damaged_fails_the_run(evidence, run_dir, damage):
+    """O52: the summary reads the collector's log as expcore.egress does; a log the core would call unknown never
+    passes here."""
+    write_files(run_dir, {"sandbox/egress.jsonl": rows_text(EGRESS_DAMAGE[damage](egress_rows()))})
+    assert failed(evidence.summary(run_dir)) == {"egress"}
+
+
 def test_a_collector_that_exited_badly_fails_the_run(evidence, run_dir):
     change(run_dir, "sandbox/egress-collector.json", lambda d: dict(d, rc=1))
     assert failed(evidence.summary(run_dir)) == {"egress"}
@@ -615,6 +685,44 @@ def test_the_egress_item_counts_the_distinct_destinations_and_names_no_address(e
     assert detail["destinations"] == {"distinct": 3, "loopback": 2, "other": 1}
     assert detail["records"] == 4
     assert "192.0.2.9" not in json.dumps(summary)
+
+
+# --- the run's identity, the scans' binding to what they scanned, the HTTP call logs ---
+
+
+def test_the_summary_names_the_runs_identity_and_never_the_allocations_job(evidence, run_dir):
+    """O52: run.json, made by the run's first step in an empty directory, says which run the evidence is of."""
+    summary = evidence.summary(run_dir)
+    detail = item(summary, "run_identity")["detail"]
+    assert (detail["run_id"], detail["started"]) == (RUN_ID, "2026-11-15T00:00:00Z")
+    assert JOB not in json.dumps(summary)
+
+
+@pytest.mark.parametrize("bad", [{"run_id": "not-a-nonce"}, {"job": ""}, {"started": ""}, {"run_id": 5}])
+def test_a_run_identity_that_is_not_one_fails_the_run(evidence, run_dir, bad):
+    change(run_dir, "run.json", lambda d: dict(d, **bad))
+    assert failed(evidence.summary(run_dir)) == {"run_identity"}
+
+
+@pytest.mark.parametrize("name", sorted(SCANNED_FILES))
+def test_a_scanned_file_that_changed_after_its_scan_fails_the_token_scan(evidence, run_dir, name):
+    """O52: a count holds for the bytes it was taken of; a file replaced after its scan (with a token, say) voids it."""
+    path = run_dir / SCANNED_FILES[name]
+    path.write_bytes(path.read_bytes() + b"\n")  # still parses: only the scan's binding breaks
+    assert failed(evidence.summary(run_dir)) == {"gate_token_scan"}
+
+
+@pytest.mark.parametrize("name", ["gate-stdout", "gate-stderr", "agent-stderr"])
+def test_a_scanned_file_removed_after_its_scan_fails_the_token_scan(evidence, run_dir, name):
+    """O52: the logs no item parses are read by the scan's item, so a missing one is never a clean scan."""
+    (run_dir / SCANNED_FILES[name]).unlink()
+    assert failed(evidence.summary(run_dir)) == {"gate_token_scan"}
+
+
+def test_a_missing_http_call_log_fails_the_run(evidence, run_dir):
+    """O52: a provider's call log is raw evidence of the round trip; without it the run does not pass."""
+    (run_dir / "roundtrip" / "http-Ef3.jsonl").unlink()
+    assert failed(evidence.summary(run_dir)) == {"fact_http_calls"}
 
 
 def test_an_item_cannot_be_built_outside_the_one_constructor(evidence):
@@ -876,7 +984,8 @@ def rows_of(text):
 
 
 def text_of(rows):
-    return "".join(json.dumps(dict(row, seq=n)) + "\n" for n, row in enumerate(rows))
+    """The rows as the collector numbers them: seq and its clock reading redone in order."""
+    return "".join(json.dumps(dict(row, seq=n, mono=100.0 + n)) + "\n" for n, row in enumerate(rows))
 
 
 def test_an_egress_log_whose_first_record_is_not_a_connect_to_the_canary_endpoint_fails_the_run(evidence, run_dir):

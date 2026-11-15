@@ -42,7 +42,27 @@ GUARD_REQUIRED = {
     for when in whens
     for request in GUARD_REQUESTS
 }
-SCANNED = ("gate-requests", "gate-stdout", "gate-stderr", "agent-stdout", "agent-stderr", "egress-log")
+# What sandbox.sh's scan() greps for the token: the evidence copy of each log, which the summary hashes and compares
+# with the scan's own record of what it scanned.
+SCANNED_FILES = {
+    "gate-requests": "sandbox/gate-requests.jsonl",
+    "gate-stdout": "sandbox/gate-stdout.txt",
+    "gate-stderr": "sandbox/gate-stderr.txt",
+    "agent-stdout": "sandbox/agent.json",
+    "agent-stderr": "sandbox/agent.err",
+    "egress-log": "sandbox/egress.jsonl",
+}
+SCANNED = tuple(SCANNED_FILES)
+RAW = "raw:"  # a slot of a log no item parses: read whole, for its SHA-256 and size
+HTTP_LOGS = 4  # roundtrip/http-*.jsonl: the zone's prepare-n, and one per provider's work directory
+HEX = "0123456789abcdef"
+# The collector's log, as egress-collector.py writes it and expcore.egress.log reads it.
+EGRESS_FORMAT = "hpcop-egress/1"
+EGRESS_EVENTS = ("start", "record", "malformed", "end")
+EGRESS_OUTCOMES = ("result", "async")
+EGRESS_TYPES = ("tcp", "udp", "raw", "other")
+EGRESS_FAMILIES = {"inet": 4, "inet6": 6}
+EGRESS_REC_KEYS = {"op", "pid", "fd", "time", "type", "family", "address", "port", "result", "dropped"}
 CELL_FILES = ["agent.py", "ca.pem", "hosts.txt"]
 OTHER_STEPS = ("batch", "extern")  # the allocation's own steps, which a teardown leaves
 OURS = "hpcop-"  # the name every job of ours starts with
@@ -155,25 +175,47 @@ def _read_lines(path, rel):
     return rows, record
 
 
+def _read_raw(path, rel):
+    """({"sha256", "bytes"}, file record) for a log kept as it was written: present, and read whole; it may be empty."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        raise ValueError("missing: %s" % rel) from None
+    except OSError as err:
+        raise ValueError("unreadable: %s (%s)" % (rel, type(err).__name__)) from None
+    record = {"path": rel, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    return {"sha256": record["sha256"], "bytes": record["bytes"]}, record
+
+
+def _read_one(path, rel):
+    if rel.endswith(".jsonl"):
+        return _read_lines(path, rel)
+    return _read_object(path, rel)
+
+
 def _load(base, pattern):
-    """One slot: a path (one object), a path ending in .jsonl (a list of objects), or a glob (a list of objects)."""
-    if ".." in pattern.split("/") or pattern.startswith("/"):
-        raise ValueError("an evidence path stays under the evidence directory: %s" % pattern)
-    path = os.path.join(base, *pattern.split("/"))
-    if "*" in pattern:
+    """One slot: a path (one object), a path ending in .jsonl (a list of objects), a glob of either (a list of those),
+    or "raw:" and a path (a log no item parses: its SHA-256 and size)."""
+    raw = pattern.startswith(RAW)
+    rel = pattern[len(RAW) :] if raw else pattern
+    if ".." in rel.split("/") or rel.startswith("/"):
+        raise ValueError("an evidence path stays under the evidence directory: %s" % rel)
+    path = os.path.join(base, *rel.split("/"))
+    if raw:
+        doc, record = _read_raw(path, rel)
+        return doc, [record]
+    if "*" in rel:
         found = sorted(glob.glob(path))
         if not found:
-            raise ValueError("missing: %s" % pattern)
+            raise ValueError("missing: %s" % rel)
         docs, records = [], []
         for name in found:
-            doc, record = _read_object(name, os.path.relpath(name, base).replace(os.sep, "/"))
+            doc, record = _read_one(name, os.path.relpath(name, base).replace(os.sep, "/"))
             docs.append(doc)
             records.append(record)
         return docs, records
-    if pattern.endswith(".jsonl"):
-        rows, record = _read_lines(path, pattern)
-        return rows, [record]
-    doc, record = _read_object(path, pattern)
+    doc, record = _read_one(path, rel)
     return doc, [record]
 
 
@@ -486,7 +528,7 @@ def _token_scan(d):
         if name not in scans:
             problems.append("no scan of %s" % name)
             continue
-        doc = scans[name]
+        doc, seen = scans[name], d["file:" + name]
         rc, found = _int(doc, "grep_rc"), doc.get("matches")
         if _int(doc, "pattern_bytes") <= 0 or _int(doc, "pattern_lines") != 1 or _int(doc, "pattern_blank_lines") != 0:
             problems.append("%s: the pattern file was not one non-blank line" % name)
@@ -496,7 +538,10 @@ def _token_scan(d):
             problems.append("%s: the count contradicts grep's exit status" % name)
         elif found > 0:
             matches[name] = found
-        if name == "gate-requests" and _int(doc, "scanned_bytes") <= 0:
+        # A count holds for the bytes it was taken of: the evidence file must be the one the scan read.
+        if doc.get("scanned_sha256") != seen["sha256"] or doc.get("scanned_bytes") != seen["bytes"]:
+            problems.append("%s: the evidence file is not the one scanned (changed or replaced after it)" % name)
+        if name == "gate-requests" and seen["bytes"] <= 0:
             problems.append("the gate's log was empty")
     checks = {"every file was scanned": not problems, "no scan errored": not errors, "no match": not matches}
     return _checked(checks, scanned=sorted(scans), matches=matches, errors=errors, problems=problems)
@@ -507,47 +552,90 @@ def _destinations(records):
     The summary is what gets pasted: no address goes into it; the log keeps them, for the core to classify."""
     distinct = set()
     for rec in records:
-        if _str(rec, "op") in ATTEMPTS:
-            distinct.add((ipaddress.ip_address(_str(rec, "address")), _int(rec, "port"), _str(rec, "type")))
+        if rec["op"] in ATTEMPTS:
+            distinct.add((ipaddress.ip_address(rec["address"]), rec["port"], rec["type"]))
     loopback = sum(1 for address, _, _ in distinct if address.is_loopback)
     return {"distinct": len(distinct), "loopback": loopback, "other": len(distinct) - loopback}
 
 
+def _whole(value, low, high):
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _egress_record(rec):
+    """True when `rec` is a record as the collector parses it, and as expcore.egress.log reads it."""
+    if not isinstance(rec, dict) or set(rec) != EGRESS_REC_KEYS:
+        return False
+    if rec["op"] not in ATTEMPTS + EGRESS_OUTCOMES or rec["type"] not in EGRESS_TYPES:
+        return False
+    if rec["family"] not in EGRESS_FAMILIES or not _whole(rec["port"], 0, 65535):
+        return False
+    if not all(_whole(rec[key], 0, 2**63) for key in ("pid", "fd", "dropped")) or not isinstance(rec["time"], str):
+        return False
+    if (rec["result"] is None) != (rec["op"] in ATTEMPTS):
+        return False  # an attempt's result is "-", an outcome's a number
+    if rec["result"] is not None and not _whole(rec["result"], 0, 4095):
+        return False
+    if rec["address"] == "-":
+        return rec["op"] == "async"
+    if not isinstance(rec["address"], str):
+        return False
+    try:
+        return ipaddress.ip_address(rec["address"]).version == EGRESS_FAMILIES[rec["family"]]
+    except ValueError:
+        return False
+
+
+def _egress_lines(rows):
+    """Every line of a kind the collector writes, numbered 0, 1, 2, ... with a clock that never goes back, and every
+    record in the collector's shape, as the core reads them. A ValueError, which fails the item, names the first line
+    that is not."""
+    last = None
+    for index, row in enumerate(rows):
+        mono = row.get("mono")
+        if row.get("event") not in EGRESS_EVENTS:
+            raise ValueError("line %d is of no kind the collector writes" % index)
+        if not _whole(row.get("seq"), index, index) or isinstance(mono, bool) or not isinstance(mono, (int, float)):
+            raise ValueError("line %d is not numbered %d with a clock reading" % (index, index))
+        if last is not None and not mono >= last:
+            raise ValueError("the clock goes back at line %d" % index)
+        if row["event"] == "record" and not _egress_record(row.get("rec")):
+            raise ValueError("line %d is not a record as the collector writes one" % index)
+        last = mono
+
+
 def _egress(d):
     rows, collector, canary = d["rows"], d["collector"], d["canary"]
-    nonce = _str(collector, "nonce")
+    _egress_lines(rows)
     first, last = rows[0], rows[-1]
     address, port = _str(canary, "address"), _int(canary, "port")
-    # Nothing but the canary may connect through the shim between the collector's start and the canary: the first line
-    # after the start is its record. A log that opens with anything else is unknown, not clean (the shim may not have
-    # loaded).
-    opening = rows[1] if len(rows) > 1 else {}
-    opened = opening.get("rec") if opening.get("event") == "record" else None
-    malformed = sum(1 for r in rows if r.get("event") == "malformed")
-    records = [r for r in rows if r.get("event") == "record"]
-    recs = [_obj(row, "rec") for row in records]
-    uid = _int(first, "uid") if first.get("event") == "start" else None
+    records = [row for row in rows if row["event"] == "record"]
+    recs = [row["rec"] for row in records]
+    malformed = sum(1 for row in rows if row["event"] == "malformed")
+    started = first["event"] == "start" and first.get("format") == EGRESS_FORMAT and _whole(first.get("uid"), 0, 2**32)
+    uid = first["uid"] if started else None
     # As the core reads the log (expcore.egress.log): a record from another uid than the collector's is not this cell's,
     # and a record whose sender dropped some says the log misses destinations.
     foreign = sum(1 for row in records if not isinstance(row.get("peer"), dict) or row["peer"].get("uid") != uid)
-    dropped = sum(_int(rec, "dropped") for rec in recs)
+    dropped = sum(rec["dropped"] for rec in recs)
+    # Nothing but the canary may connect through the shim between the collector's start and the canary: the first line
+    # after the start is its record. A log that opens with anything else is unknown, not clean (the shim may not have
+    # loaded).
+    opened = rows[1]["rec"] if len(rows) > 1 and rows[1]["event"] == "record" else {}
+    ends = [index for index, row in enumerate(rows) if row["event"] == "end"]
     checks = {
-        "it starts with this launch's nonce": first.get("event") == "start" and first.get("nonce") == nonce,
-        "it ends with its end line": last.get("event") == "end" and len(rows) > 1,
-        "one start and one end": sum(1 for r in rows if r.get("event") in ("start", "end")) == 2,
-        "seq runs from 0 without a gap": [r.get("seq") for r in rows] == list(range(len(rows))),
+        "it opens with the collector's start line": started,
+        "it is this launch's (its nonce)": first.get("nonce") == _str(collector, "nonce"),
+        "one start line": sum(1 for row in rows if row["event"] == "start") == 1,
+        "its end line is its last and only one": ends == [len(rows) - 1],
         "its end line counts the records": last.get("records") == len(records),
         "its end line counts the malformed lines": last.get("malformed") == malformed,
         "no datagram went unwritten": last.get("unwritten") == 0,
+        "no malformed datagram": malformed == 0,
         "no sender dropped a record": dropped == 0,
         "every record came from the collector's uid": uid is not None and foreign == 0,
-        "the cell's own connects were seen": len(records) >= 1,
-        "no malformed datagram": malformed == 0,
         "its first record is the canary's connect to the saved endpoint": (
-            isinstance(opened, dict)
-            and opened.get("op") == "connect"
-            and opened.get("address") == address
-            and opened.get("port") == port
+            opened.get("op") == "connect" and opened.get("address") == address and opened.get("port") == port
         ),
         "the canary connect succeeded in the cell": _rc(canary) == 0 and _str(canary, "result") == "open",
         "the collector was ready": _int(collector, "ready_lines") >= 1,
@@ -562,6 +650,29 @@ def _egress(d):
         destinations=_destinations(recs),
         canary={"port": port, "loopback": ipaddress.ip_address(address).is_loopback},
     )
+
+
+def _run_identity(d):
+    """run.json, written by the run's first step in an empty directory; the job is checked by every step against the
+    allocation it runs in, and never printed."""
+    run = d["run"]
+    run_id, job, started = run.get("run_id"), run.get("job"), run.get("started")
+    checks = {
+        "its id is a nonce": isinstance(run_id, str) and len(run_id) == 32 and all(c in HEX for c in run_id),
+        "it names its allocation": isinstance(job, str) and bool(job),
+        "it says when it started": isinstance(started, str) and bool(started),
+    }
+    return _checked(checks, run_id=run_id if checks["its id is a nonce"] else None, started=started)
+
+
+def _http_calls(d):
+    """The helpers' call logs: each call's method, path, status and body size and SHA-256. Raw evidence of the round
+    trip that no check reads further; a log that is missing, or a line in another shape, fails the run."""
+    logs = d["round"]
+    calls = [row for rows in logs for row in rows] + list(d["online"])
+    for row in calls:
+        _str(row, "method"), _str(row, "path"), _int(row, "status"), _int(row, "body_bytes"), _hex64(row, "body_sha256")
+    return _checked({"the zone's log and one per provider": len(logs) >= HTTP_LOGS}, logs=len(logs), calls=len(calls))
 
 
 def _listeners(d):
@@ -624,7 +735,7 @@ def _squeue(d):
 
 def catalog():
     """Every item of the summary: (name, kind, slots, parser). The summary builds all of them, every time."""
-    items = []
+    items = [("run_identity", "check", (("run", "run.json"),), _run_identity)]
     for role in SERVICES:
         items.append((role + "_up", "check", (("up", role + "/up.json"),), _service_up))
         items.append((role + "_couchbase_guard", "check", (("lines", role + "/cb-guard-*.json"),), _guard))
@@ -656,7 +767,8 @@ def catalog():
     items.append(("cell_clean", "check", (agent,), _cell_clean))
     gate = (("rows", "sandbox/gate-requests.jsonl"), ("end", "sandbox/gate-end.json"))
     items.append(("gate_log", "check", gate, _gate_log))
-    items.append(("gate_token_scan", "check", (("scans", "sandbox/token-scan-*.json"),), _token_scan))
+    scanned = tuple(("file:" + name, RAW + rel) for name, rel in SCANNED_FILES.items())
+    items.append(("gate_token_scan", "check", (("scans", "sandbox/token-scan-*.json"), *scanned), _token_scan))
     egress = (
         ("rows", "sandbox/egress.jsonl"),
         ("collector", "sandbox/egress-collector.json"),
@@ -664,6 +776,8 @@ def catalog():
     )
     items.append(("egress", "check", egress, _egress))
     items.append(("fact_sandbox_listeners", "fact", (("node", "sandbox/node.json"),), _listeners))
+    calls = (("round", "roundtrip/http-*.jsonl"), ("online", "providers/http-zone.jsonl"))
+    items.append(("fact_http_calls", "fact", calls, _http_calls))
     for role in SERVICES:
         slots = (
             ("teardown", role + "/teardown.json"),

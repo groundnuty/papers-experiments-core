@@ -23,6 +23,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import stat
@@ -33,6 +34,29 @@ import time
 API = "/api/v3/oneprovider"
 SIZE = 1 << 20
 EVIDENCE_FILE: str | None = None
+
+
+ERROR_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
+
+
+def answer_note(status, body) -> str:
+    """A failed answer as a message may carry it: its status, the body's size and SHA-256, and the error's id when the
+    body is Onedata's error object. Never the body: an error may echo an account, a path or a credential."""
+    raw = body if isinstance(body, bytes) else str(body).encode("utf-8", "replace")
+    note = f"HTTP {status}, {len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:16]}"
+    try:
+        error = json.loads(raw.decode("utf-8")).get("error")
+        found = error.get("id") if isinstance(error, dict) else None
+    except (ValueError, AttributeError):
+        found = None
+    if isinstance(found, str) and ERROR_ID.fullmatch(found):
+        note += f", error id {found}"
+    return note
+
+
+def status_only(text):
+    """onboard.py's failure lines, each kept up to the status it names: what follows is the answer's body."""
+    return "\n".join(re.sub(r"(HTTP [0-9]{3})\b.*", r"\1 (body not kept)", line) for line in text.splitlines())
 
 
 def die(msg, result=None):
@@ -106,12 +130,12 @@ def support(workdir, bundle, payload, result):
     result.update(
         {
             "onboard_rc": done.returncode,
-            "onboard_out": done.stdout.strip()[:300],
+            "onboard_out": status_only(done.stdout.strip())[:300],
             "support_s": round(time.monotonic() - t0, 2),
         }
     )
     if done.stderr.strip():
-        result["onboard_err"] = done.stderr.strip()[:600]
+        result["onboard_err"] = status_only(done.stderr.strip())[:600]
     if done.returncode != 0:
         die("onboard.py failed", result)
     print(json.dumps(result))
@@ -125,11 +149,11 @@ def write(worker, root, result):
     started = time.monotonic()
     status, body = worker.call("POST", f"/data/{root}/children?name={name}&type=REG")
     if status != 201:
-        die(f"create file: HTTP {status}: {body[:300]!r}", result)
+        die(f"create file: {answer_note(status, body)}", result)
     fid = json.loads(body)["fileId"]
     status, body = worker.call("PUT", f"/data/{fid}/content", data, {"Content-Type": "application/octet-stream"})
     if status not in (200, 201, 204):
-        die(f"write content: HTTP {status}: {body[:300]!r}", result)
+        die(f"write content: {answer_note(status, body)}", result)
     status, back = worker.call("GET", f"/data/{fid}/content")
     got = hashlib.sha256(back).hexdigest() if status == 200 else None
     result.update(

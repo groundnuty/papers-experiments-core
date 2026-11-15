@@ -4,6 +4,7 @@
 #   Z/cb-guard-*.json  every `hpcop-evidence` line of the log: the Couchbase guard's status codes
 #   Z/service-step.rc.json   written when the service step ends (teardown-all.sh): how the service ended
 # Usage: E=<evidence dir> bash zone-up.sh
+STEP_BEGINS_RUN=1   # the run's first step: $E must be empty, and run.json is written (common.sh)
 source "$(dirname "$0")/common.sh"
 LOG=$(svc_log Z)
 ev Z
