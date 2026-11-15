@@ -93,6 +93,14 @@ class SchedulerConfig:
             parts.append(f"{bound.checks} x health_timeout_s {self.health_timeout_s:g} s")
         return bound.seconds + between + checking, " and ".join(parts)
 
+    def _deferral_words(self, bound: DeferralBound) -> tuple[float, str]:
+        """The `max_defer_s` a bound needs, and in words its parts: the platform's own seconds and detail, and the
+        core's waits it declared with their values (`deferral_needed`)."""
+        needed, core = self.deferral_needed(bound)
+        if not core:
+            return needed, bound.detail
+        return needed, f"{bound.seconds:g} s of the platform's own: {bound.detail}; plus the core's waits {core}"
+
     def check_deferral_bound(self, bound: DeferralBound | None) -> None:
         """Refuse a `max_defer_s` shorter than the longest the platform's check may stay deferred (`bound`, from
         `healthgate.deferral_bound`; None: the platform declares none), the core's own waits it declared included
@@ -101,16 +109,50 @@ class SchedulerConfig:
         `max_defer_s`, so a bound equal to it starts."""
         if bound is None:
             return
-        needed, core = self.deferral_needed(bound)
+        needed, words = self._deferral_words(bound)
         if needed <= self.max_defer_s:
             return
-        own = f"{bound.seconds:g} s of the platform's own: {bound.detail}; plus the core's waits {core}" if core else ""
         raise ConfigError(
             f"campaign.toml [scheduler] max_defer_s is {self.max_defer_s:g} s, but the platform's health check may "
-            f"stay deferred for up to {needed:g} s ({own or bound.detail}); a deferral past max_defer_s closes the "
+            f"stay deferred for up to {needed:g} s ({words}); a deferral past max_defer_s closes the "
             "health gate as blocking, so a campaign that exits when blocked would stop on a wait it should have waited "
             f"out: raise max_defer_s to at least {needed:g}, or shorten the platform's wait"
-            + (", or recheck_s or health_timeout_s" if core else "")
+            + (", or recheck_s or health_timeout_s" if bound.rechecks or bound.checks else "")
+        )
+
+    def check_declared_deferral(
+        self, declared: DeferralBound | None, reported: DeferralBound | None, *, exposed: bool
+    ) -> None:
+        """Refuse a health check that does not carry what the platform declares: `declared` is the platform's own
+        declaration of its longest deferral (the run admission's `declared_deferral_s`, read from its settings, with no
+        health object between), `reported` what the health check passed to the scheduler declares (`max_deferral_s`),
+        and `exposed` whether it has that method at all. A study's own check around the platform's that leaves the
+        method out would hold `max_defer_s` to nothing, and one that declares less would hold it to less: both are
+        refused, naming the platform's figure, what the check declares and the fix, compared as the `max_defer_s` each
+        needs under this campaign's own waits (`deferral_needed`). A check that declares more, or the same, agrees.
+        Nothing is asked of a platform that declares none."""
+        if declared is None:
+            return
+        platform, platform_words = self._deferral_words(declared)
+        if platform <= 0:
+            return
+        theirs = 0.0 if reported is None else self.deferral_needed(reported)[0]
+        if exposed and theirs >= platform:
+            return
+        if not exposed:
+            reason = "the health check passed to the scheduler doesn't expose max_deferral_s"
+        elif reported is None:
+            reason = "the health check passed to the scheduler answers max_deferral_s() with None"
+        else:
+            reason = (
+                f"the health check passed to the scheduler declares a deferral of {theirs:g} s through max_deferral_s "
+                f"({self._deferral_words(reported)[1]}), shorter than the platform's"
+            )
+        raise ConfigError(
+            f"{reason}, but the platform declares a deferral of {platform:g} s ({platform_words}); pass the method "
+            "on: a study's own check around the platform's must have a max_deferral_s() that returns the wrapped "
+            f"check's, or campaign.toml [scheduler] max_defer_s ({self.max_defer_s:g} s) is not held to what the "
+            "platform declares, and a deferral past it closes the health gate as blocking"
         )
 
     def check_kinds(self, schema: FactorSchema) -> None:
