@@ -200,10 +200,11 @@ def test_r16_a_snapshot_of_a_finished_store_in_a_read_only_out_leaves_it_byte_fo
     assert without(tree_of(finished_out), "runs/") == without(before, "runs/")
 
 
-def test_r16_a_live_store_is_backed_up_in_place_over_a_read_only_connection(finished_out):
-    """R16: a store a dispatcher holds is being written, so no copy of its files is one state; `in_place` takes the
-    online backup over a read-only connection, which sees one committed state, and leaves the -shm and -wal a live
-    store has beside it anyway (never selected for a package)."""
+def test_r16_in_place_backs_the_store_itself_up_over_a_read_only_connection(finished_out):
+    """R16: `in_place`, which `check --partial` uses for a store a dispatcher holds (no copy of a store being written
+    is one state), reads the store itself over a read-only connection rather than a copy: it leaves the -shm and
+    -wal a live store has beside it anyway, never selected for a package. (That the backup sees one committed state
+    under a writer is shown above, with a write transaction open.)"""
     before = tree_of(finished_out)
     take_snapshot(finished_out / STATE_FILE, finished_out / "runs" / SNAPSHOT_FILE, in_place=True)
     new = added(without(before, "runs/"), without(tree_of(finished_out), "runs/"))

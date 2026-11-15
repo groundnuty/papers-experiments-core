@@ -1,5 +1,7 @@
 """One dispatcher per store, by a non-blocking exclusive lock (C07)."""
 
+import errno
+import os
 import signal
 import subprocess
 import sys
@@ -8,10 +10,12 @@ import textwrap
 import pytest
 from tree_support import read_only, tree_of
 
+from expcore.campaign import lock as lock_module
 from expcore.campaign.lock import (
     CampaignLocked,
     DispatchLock,
     LockMissing,
+    LockUnavailable,
     NetworkFilesystemWarning,
     ReaderLock,
     filesystem_type,
@@ -101,20 +105,43 @@ def test_c07_an_unreadable_mount_table_gives_no_type(tmp_path):
 # --- a reader's hold (R16) -------------------------------------------------------------------------------------------
 
 
-def test_r16_a_reader_never_creates_the_lock_file_and_where_there_is_none_holds_nothing(tmp_path):
-    """R16: a dispatcher makes the lock file before it opens the store, so a store with none beside it has no
-    dispatcher; a reader writes nothing there, a sealed snapshot's directory included."""
-    with ReaderLock(tmp_path) as lock:
-        assert not lock.held
+def test_r16_a_reader_never_creates_the_lock_file_and_is_refused_where_there_is_none(tmp_path):
+    """R16: a dispatcher makes the lock file before it opens the store, so a store with none beside it never had one
+    (or was copied without it), and nothing would keep a dispatcher off while it is read: the reader is refused,
+    naming the file, and writes nothing there, a sealed snapshot's directory included."""
+    with pytest.raises(LockMissing, match="no dispatcher ever ran there") as caught:
+        ReaderLock(tmp_path).acquire()
+    assert str(tmp_path / "campaign.lock") in str(caught.value)
     assert list(tmp_path.iterdir()) == []
 
 
-def test_r16_a_reader_that_requires_the_lock_file_is_refused_where_there_is_none(tmp_path):
-    """R16: `--after` names a finished selection, whose dispatcher made the lock file; a store with none beside it
-    never had one, so a reader that requires the file is refused, naming it, and makes none."""
-    with pytest.raises(LockMissing, match="no dispatcher ever ran there"):
-        ReaderLock(tmp_path, required=True).acquire()
-    assert list(tmp_path.iterdir()) == []
+def test_r16_a_lock_file_the_reader_cannot_open_is_refused_naming_it_not_taken_for_a_dispatcher(tmp_path):
+    """R16: a lock file copied from another account may be unreadable; that is LockUnavailable, naming the file and
+    the reason, never an uncaught error and never CampaignLocked (which alone sends `check --partial` in place)."""
+    DispatchLock(tmp_path).acquire().release()
+    (tmp_path / "campaign.lock").chmod(0o000)
+    try:
+        assert not os.access(tmp_path / "campaign.lock", os.R_OK), "the test runs with a user that ignores file modes"
+        with pytest.raises(LockUnavailable, match="cannot be opened") as caught:
+            ReaderLock(tmp_path).acquire()
+    finally:
+        (tmp_path / "campaign.lock").chmod(0o644)
+    assert not isinstance(caught.value, CampaignLocked)
+    assert str(tmp_path / "campaign.lock") in str(caught.value)
+
+
+def test_r16_a_file_system_that_cannot_lock_is_refused_not_taken_for_a_dispatcher(tmp_path, monkeypatch):
+    """R16: a `flock` that fails for another reason than a holder (a file system without it) is LockUnavailable,
+    naming the file; only a lock a dispatcher holds is CampaignLocked."""
+    DispatchLock(tmp_path).acquire().release()
+
+    def unsupported(fd, operation):
+        raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+
+    monkeypatch.setattr(lock_module.fcntl, "flock", unsupported)
+    with pytest.raises(LockUnavailable, match="cannot be locked") as caught:
+        ReaderLock(tmp_path).acquire()
+    assert not isinstance(caught.value, CampaignLocked)
 
 
 def test_r16_a_reader_is_refused_while_a_dispatcher_holds_the_store_and_keeps_one_off_while_it_reads(tmp_path):
@@ -136,6 +163,6 @@ def test_r16_a_reader_holds_the_lock_of_a_read_only_directory_and_changes_nothin
     DispatchLock(tmp_path).acquire().release()
     (tmp_path / "campaign.lock").chmod(0o444)
     before = tree_of(tmp_path)
-    with read_only(tmp_path), ReaderLock(tmp_path, required=True) as lock:
+    with read_only(tmp_path), ReaderLock(tmp_path) as lock:
         assert lock.held
     assert tree_of(tmp_path) == before

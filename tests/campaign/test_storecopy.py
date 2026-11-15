@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pytest
 from campaign_crash import KILLED
-from campaign_support import make_schema
+from campaign_support import make_schema, open_store
 from tree_support import read_only, tree_of
 
 from expcore.campaign import storecopy
-from expcore.campaign.resume import read_fingerprint
+from expcore.campaign.resume import FINGERPRINT_KEY, read_fingerprint
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, StoreSnapshot, take_snapshot
 from expcore.campaign.storecopy import COPY_ATTEMPTS, StoreChanged, copy_store
 
@@ -60,12 +60,13 @@ def bump_on_copy(monkeypatch, store: Path, times: int | None) -> list[str]:
     copied: list[str] = []
     real = storecopy._copy_file
 
-    def copy_and_bump(source: Path, target: Path) -> None:
-        real(source, target)
+    def copy_and_bump(source: Path, target: Path) -> str:
+        digest = real(source, target)
         copied.append(source.name)
         if times is None or len(copied) <= times:
             now = store.stat().st_mtime_ns + 1_000_000_000
             os.utime(store, ns=(now, now))
+        return digest
 
     monkeypatch.setattr(storecopy, "_copy_file", copy_and_bump)
     return copied
@@ -85,8 +86,7 @@ def test_r16_a_copy_holds_the_store_and_its_wal_and_never_its_shm(killed, tmp_pa
 
 def test_r16_a_killed_dispatchers_rows_in_the_wal_alone_are_read_through_the_copy_in_a_read_only_out(killed, tmp_path):
     """R16: what a killed dispatcher committed may be in its -wal alone. The copy, opened read-write in its own
-    directory, replays the -wal, so the snapshot and the fingerprint read see it; the read-only out/ keeps every
-    byte and gains no file."""
+    directory, replays the -wal, so the snapshot sees it; the read-only out/ keeps every byte and gains no file."""
     alone = tmp_path / "alone"
     alone.mkdir()
     (alone / killed.name).write_bytes(killed.read_bytes())
@@ -94,13 +94,60 @@ def test_r16_a_killed_dispatchers_rows_in_the_wal_alone_are_read_through_the_cop
     before = tree_of(killed.parent)
     with read_only(killed.parent):
         take_snapshot(killed, tmp_path / SNAPSHOT_FILE)
-        assert read_fingerprint(killed) is None  # the child records none; the read itself is what is shown
     assert tree_of(killed.parent) == before
     snapshot = StoreSnapshot((tmp_path / SNAPSHOT_FILE).read_bytes(), make_schema())
     try:
         assert [row["state"] for row in snapshot.q(DONE)] == ["done"]
     finally:
         snapshot.close()
+
+
+def test_r16_a_fingerprint_in_the_wal_alone_is_read_through_the_copy_in_a_read_only_out(tmp_path):
+    """R16: a store whose fingerprint was committed and never checkpointed holds it in its -wal alone; read through
+    the copy, the fingerprint is there, and the read-only out/ keeps every byte."""
+    store = open_store(tmp_path / "live")
+    store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (FINGERPRINT_KEY, '{"plan": 1}', "x"))
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ("campaign.db", "campaign.db-wal"):  # what a kill leaves, its -shm aside
+        (out / name).write_bytes((tmp_path / "live" / name).read_bytes())
+    store.close()
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    (alone / "campaign.db").write_bytes((out / "campaign.db").read_bytes())
+    connection = sqlite3.connect(alone / "campaign.db")
+    try:
+        assert connection.execute("SELECT name FROM sqlite_master WHERE name='meta'").fetchall() == []
+    finally:
+        connection.close()
+    before = tree_of(out)
+    with read_only(out):
+        assert read_fingerprint(out / "campaign.db") == {"plan": 1}
+    assert tree_of(out) == before
+
+
+def test_r16_a_change_the_timestamps_cannot_show_is_caught_by_the_bytes(killed, tmp_path, monkeypatch, quick):
+    """R16: a file system's timestamps may be too coarse to show a write between the copy of the store and that of
+    its -wal; the bytes read again after the copy show it, so that copy is thrown away and made again."""
+    monkeypatch.setattr(storecopy, "_identity", lambda path: ("the same", "whatever happens"))
+    wal = killed.with_name(killed.name + "-wal")
+    copied: list[str] = []
+    real = storecopy._copy_file
+
+    def copy_then_write(source: Path, target: Path) -> str:
+        digest = real(source, target)
+        copied.append(source.name)
+        if len(copied) == 2:  # once, after the first copy of the -wal
+            with open(wal, "ab") as appended:
+                appended.write(b"a frame the copy did not see")
+        return digest
+
+    monkeypatch.setattr(storecopy, "_copy_file", copy_then_write)
+    into = tmp_path / "copy"
+    into.mkdir()
+    copy_store(killed, into)
+    assert copied == ["state.sqlite", "state.sqlite-wal"] * 2
+    assert (into / wal.name).read_bytes() == wal.read_bytes()
 
 
 def test_r16_a_store_that_changes_during_the_copy_is_copied_again(killed, tmp_path, monkeypatch, quick):

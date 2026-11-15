@@ -353,6 +353,29 @@ def test_r16_a_merge_refuses_a_shard_a_dispatcher_still_holds(base, clean_enviro
     assert not (target.root / "out").exists()
 
 
+def test_r16_a_merge_refuses_a_shard_whose_lock_file_is_missing_or_unreadable(base, clean_environment, shard1, shard2):
+    """R16: without a lock file it can take, nothing keeps a dispatcher off a shard's store while it is copied, so
+    the shard is refused, naming the file and why, and nothing is written there; never an uncaught error."""
+    missing = copy_campaign(shard2, base, "r16-no-lock-shard")
+    (missing.root / "out" / "campaign.lock").unlink()
+    unreadable = copy_campaign(shard2, base, "r16-unreadable-lock-shard")
+    lock = unreadable.root / "out" / "campaign.lock"
+    cases = ((missing, "no dispatcher ever ran there"), (unreadable, "cannot be opened"))
+    before = [tree_of(shard.root / "out") for shard, _ in cases]
+    lock.chmod(0o000)
+    try:
+        for shard, fragment in cases:
+            target = Campaign(make_study(base, f"r16-merge-{shard.root.name}"))
+            code, errors = merge_into(clean_environment, target, shard1, shard)
+            assert code == 1, errors
+            assert fragment in errors, errors
+            assert str(shard.root / "out") in errors, errors
+            assert not (target.root / "out").exists()
+    finally:
+        lock.chmod(0o644)
+    assert [tree_of(shard.root / "out") for shard, _ in cases] == before
+
+
 def test_r16_check_analyze_and_regenerate_read_a_merged_batchs_sealed_snapshots_and_leave_it_as_it_was(
     base, clean_environment, merged
 ):

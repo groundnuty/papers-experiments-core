@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.lock import CampaignLocked, ReaderLock
+from expcore.campaign.lock import CampaignLocked, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, compare_fingerprints, fingerprint_sha256
 from expcore.campaign.resume import FINGERPRINT_KEY, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE
@@ -144,8 +144,8 @@ def read_shard(out: Path, scratch: Path, pricing: Pricing | None = None) -> Shar
 
     The shard's `out/` is only read, and may be read-only (R16): its lock is held as a reader (`ReaderLock`, which
     never makes the file) while its store is read from a private copy (`take_snapshot`). Refuses a shard a dispatcher
-    still holds, a store with attempts still running or that changes while it is copied, and a store that is not a
-    shard's (`facts_of`).
+    still holds, one whose lock file is missing (copy the shard's `out/` whole) or cannot be opened or locked, a store
+    with attempts still running or that changes while it is copied, and a store that is not a shard's (`facts_of`).
     """
     store = out / STATE_FILE
     try:
@@ -153,6 +153,10 @@ def read_shard(out: Path, scratch: Path, pricing: Pricing | None = None) -> Shar
             take_snapshot(store, scratch)
     except CampaignLocked as error:
         raise MergeRefused(f"{out}: {error}; a shard is merged when it has finished") from None
+    except LockMissing as error:
+        raise MergeRefused(f"{out}: {error}; copy the shard's out/ whole, with its lock file") from None
+    except LockUnavailable as error:
+        raise MergeRefused(f"{out}: {error}; the shard cannot be shown to have finished") from None
     except AttemptsRunning as error:
         raise MergeRefused(f"{out}: {error}; a shard is merged when it has finished") from None
     except SnapshotError as error:

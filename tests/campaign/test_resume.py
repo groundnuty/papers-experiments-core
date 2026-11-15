@@ -439,9 +439,10 @@ def test_r16_reading_a_finished_stores_fingerprint_in_a_read_only_out_leaves_it_
     assert tree_of(out) == before
 
 
-def test_r16_the_fingerprint_of_a_live_store_is_read_in_place(tmp_path):
-    """R16: a store a dispatcher holds is read over a read-only connection in place, which sees one committed state;
-    it leaves the -shm and -wal a live store has beside it anyway (never selected for a package)."""
+def test_r16_in_place_reads_the_fingerprint_from_the_store_itself(tmp_path):
+    """R16: `in_place`, which `check --partial` uses for a store a dispatcher holds, reads the store itself over a
+    read-only connection rather than a copy: it leaves the -shm and -wal a live store has beside it anyway, never
+    selected for a package."""
     store, _ = start(tmp_path)
     store.close()
     before = tree_of(tmp_path)

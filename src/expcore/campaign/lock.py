@@ -115,7 +115,11 @@ class DispatchLock:
 
 
 class LockMissing(RuntimeError):
-    """A reader that requires the lock file found none: no dispatcher ever ran there."""
+    """The lock file a dispatcher makes before it opens its store is missing: no dispatcher ever ran there."""
+
+
+class LockUnavailable(RuntimeError):
+    """The lock file cannot be opened or locked, for another reason than a dispatcher holding it."""
 
 
 class ReaderLock:
@@ -125,26 +129,28 @@ class ReaderLock:
     shared, non-blocking `flock` on it. The dispatcher holds the exclusive one for as long as it runs, so a reader is
     refused (CampaignLocked) while one holds the store, and a dispatcher cannot start while a reader holds it: the
     reader holds it across its copy of the store. Readers share it. Nothing is written, so a campaign copied
-    read-only is locked as it is. A dispatcher makes the file before it opens the store, so a store with none beside
-    it never had one: a reader with `required` raises LockMissing, naming the file; another holds nothing (`held`
-    stays False) and relies on the copy's own check that the store does not change.
+    read-only is locked as it is. A store that cannot be held is never read as a finished one:
+    - a dispatcher makes the file before it opens the store, so a store with none beside it never had one, or was
+      copied without it, and nothing would keep a dispatcher off while it is read: LockMissing, naming the file;
+    - a file that cannot be opened (no read permission) or locked (a file system without `flock`, where no
+      dispatcher of this core runs either) is LockUnavailable, naming the file and the reason. Only CampaignLocked
+      means a dispatcher holds the store.
     """
 
-    def __init__(self, root: Path, *, required: bool = False) -> None:
+    def __init__(self, root: Path) -> None:
         self.path = Path(root) / LOCK_NAME
-        self.required = required
         self._fd: int | None = None
 
     def acquire(self) -> "ReaderLock":
-        """Take the shared lock, or raise CampaignLocked while a dispatcher holds it (LockMissing, see the class)."""
+        """Take the shared lock, or raise CampaignLocked, LockMissing or LockUnavailable (see the class)."""
         if self._fd is not None:
             raise RuntimeError("this reader already holds the lock")
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC)
         except FileNotFoundError:
-            if self.required:
-                raise LockMissing(f"{self.path}: missing, so no dispatcher ever ran there") from None
-            return self
+            raise LockMissing(f"{self.path}: missing, so no dispatcher ever ran there") from None
+        except OSError as error:
+            raise LockUnavailable(f"{self.path}: cannot be opened ({type(error).__name__}: {error.strerror})") from None
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -152,7 +158,7 @@ class ReaderLock:
             raise CampaignLocked(f"another dispatcher holds {self.path}: one dispatcher per store") from None
         except OSError as error:
             os.close(fd)
-            raise CampaignLocked(f"cannot lock {self.path}: the file system does not support flock ({error})") from None
+            raise LockUnavailable(f"{self.path}: cannot be locked ({type(error).__name__}: {error.strerror})") from None
         self._fd = fd
         return self
 
@@ -168,7 +174,7 @@ class ReaderLock:
 
     @property
     def held(self) -> bool:
-        """Tell whether this reader holds the lock (False where the store has no lock file)."""
+        """Tell whether this reader holds the lock."""
         return self._fd is not None
 
     def __enter__(self) -> "ReaderLock":

@@ -5,7 +5,9 @@ One finished campaign is built for the module; each test changes a copy of it an
 what they make of it.
 """
 
+import errno
 import json
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -14,6 +16,7 @@ import pytest
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
 from tree_support import read_only, tree_of, without
 
+from expcore.campaign import lock as lock_module
 from expcore.campaign.export import read_export
 from expcore.campaign.lock import DispatchLock
 from expcore.campaign.snapshot import SNAPSHOT_FILE
@@ -229,6 +232,39 @@ def test_r16_check_of_a_live_store_backs_it_up_in_place_under_partial_and_is_ref
         assert cli(clean_environment, "check", str(copy.runs), "--partial")[0] == 0
     assert sorted(p.name for p in out.glob("state.sqlite-*")) == ["state.sqlite-shm", "state.sqlite-wal"]
     assert stored_check(copy)["snapshot"] == {"file": SNAPSHOT_FILE, "attempts_running": 0, "partial": True}
+
+
+def test_r16_check_refuses_a_store_whose_lock_file_is_missing_partial_or_not_and_writes_nothing(
+    copy, clean_environment
+):
+    """R16: without its lock file nothing keeps a dispatcher off the store while it is read, so it is never copied
+    as a finished store nor read in place as a live one: refused, naming the file, with or without --partial."""
+    out = drop_side_files(copy)
+    (out / "campaign.lock").unlink()
+    before = tree_of(out)
+    for extra in ((), ("--partial",)):
+        code, errors = cli(clean_environment, "check", str(copy.runs), *extra)
+        assert code == 1
+        assert "no dispatcher ever ran there" in errors, errors
+    assert tree_of(out) == before
+
+
+def test_r16_check_refuses_a_lock_the_file_system_cannot_take_and_never_reads_the_store_in_place(
+    copy, clean_environment, monkeypatch
+):
+    """R16: a lock that cannot be taken for another reason than a dispatcher (a file system without flock) is not
+    a live store, so even --partial does not read the store in place: refused, naming the lock, nothing written."""
+    out = drop_side_files(copy)
+    before = tree_of(out)
+
+    def unsupported(fd, operation):
+        raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+
+    monkeypatch.setattr(lock_module.fcntl, "flock", unsupported)
+    code, errors = cli(clean_environment, "check", str(copy.runs), "--partial")
+    assert code == 1
+    assert "cannot be locked" in errors, errors
+    assert tree_of(out) == before
 
 
 @pytest.mark.parametrize(
