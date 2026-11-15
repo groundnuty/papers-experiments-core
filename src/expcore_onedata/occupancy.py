@@ -138,6 +138,12 @@ class Reading:
     counter: dict[str, int]
     files: dict[str, dict[str, int]]
     links: frozenset[str] = frozenset()
+    carried: dict[str, int] = field(default_factory=dict)  # per provider, the files carried as empty, not read
+
+    @property
+    def reads(self) -> int:
+        """The block maps this reading read: its files less those a reset's shortcut carried as empty."""
+        return sum(len(held) for held in self.files.values()) - sum(self.carried.values())
 
     def held(self, provider: str) -> int:
         """What a provider holds of the space by its files, 0 for one whose files were not read (the fast path)."""
@@ -153,13 +159,14 @@ class Reading:
 
     def facts(self, label: Label) -> dict[str, Any]:
         """The record's figures: the counter (`physical_bytes`, every provider), the files' sums, the reads, the
-        events."""
-        return {
+        events; and the files carried as empty (`files_carried`) when a shortcut carried any."""
+        facts = {
             "physical_bytes": {label(q): n for q, n in self.counter.items()},
             "files_bytes": {label(q): self.held(q) for q in self.files},
-            "files_read": sum(len(held) for held in self.files.values()),
+            "files_read": self.reads,
             "events": self.events(label),
         }
+        return {**facts, "files_carried": sum(self.carried.values())} if self.carried else facts
 
 
 class OccupancyExceeded(ProvisionError):
@@ -232,18 +239,28 @@ def holdings(
     providers: Sequence[str],
     label: Label,
     retry: ReadRetry = ONE_ATTEMPT,
+    only: Mapping[str, Collection[str]] | None = None,
 ) -> Reading:
     """Read the occupancy: the block map of every listed file at each provider of the space other than the data
     provider and those in `never_holds`, then the counter (`physical_sizes` over `providers`, an undeclared provider in
     it refused), then the files of every other provider but those in `never_holds` whose counter reads an explicit 0:
-    one the counter leaves out, or credits with bytes, is read too. One budget covers the reading."""
+    one the counter leaves out, or credits with bytes, is read too. One budget covers the reading. `only`, from a
+    reset's shortcut (`resetshortcut.py`), names for some of the first providers the ids to read there; every other
+    listed id is carried as holding nothing (`Reading.carried`), and a provider it does not name is read whole."""
     holder, ids, budget = p.settings.holder, listing.ids(), Budget(p.clock())
     support = [q for q in p.space.support.providers if q != holder]
-    files = read_files(p, {q: ids for q in support if q not in never_holds}, label, budget)
+    first = [q for q in support if q not in never_holds]
+    narrowed = only or {}
+    wanted = {q: [i for i in ids if i in narrowed[q]] if q in narrowed else ids for q in first}
+    files = read_files(p, wanted, label, budget)
+    carried = {q: len(ids) - len(wanted[q]) for q in first if q in narrowed}
+    for q in carried:
+        files[q].update((i, 0) for i in ids if i not in narrowed[q])  # in place: the reading's own table
     counter = physical_sizes(p, providers, retry=retry, undeclared_ok=False)
     skipped = {q for q in never_holds if counter.get(q) == 0}  # the only fast path: a 0 read, never a gap
     rest = [q for q in dict.fromkeys([*support, *counter]) if q != holder and q not in files and q not in skipped]
-    return Reading(counter, {**files, **read_files(p, dict.fromkeys(rest, ids), label, budget)}, listing.links)
+    reading = {**files, **read_files(p, dict.fromkeys(rest, ids), label, budget)}
+    return Reading(counter, reading, listing.links, carried)
 
 
 def judge(reading: Reading, allowed: Mapping[str, int], label: Label) -> None:

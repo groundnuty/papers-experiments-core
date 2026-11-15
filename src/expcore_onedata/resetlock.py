@@ -148,7 +148,8 @@ class ResetShare:
     def take_shared(self) -> None:
         """Take the share back after a reset (`given_up` to `shared`), on a new descriptor, waiting while another reset
         holds the lock exclusively, within `retake_s`; record the hold. Raise the `busy` error when the wait runs out,
-        the share still given up, so the run's agent cannot start (`admission.require_admission` refuses). A share the
+        and InfraError of kind `injector_failure` when the hold cannot be recorded (the share let go again), the share
+        still given up either way, so the run's agent cannot start (`admission.require_admission` refuses). A share the
         admission let go meanwhile takes nothing."""
         deadline = None if self._retake_s is None else time.monotonic() + self._retake_s
         while True:
@@ -159,8 +160,12 @@ class ResetShare:
                     raise RuntimeError(f"a share of the reset lock in state {self._state!r} cannot be taken back")
                 held = self._try_take(fcntl.LOCK_SH)
                 if held is not None:
-                    self._held, self._state = held, SHARED
-                    self._token = self._begin()
+                    try:
+                        token = self._begin()
+                    except BaseException:  # never a share without its line: let it go, the share still given up
+                        held.close()
+                        raise
+                    self._held, self._token, self._state = held, token, SHARED
                     return
             if deadline is not None and time.monotonic() >= deadline:
                 raise self._busy(

@@ -49,6 +49,7 @@ PLUMBING = {
         "self._p.retry"
     ],  # the global clock, Onezone's reading
     ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
+    ("reset.py", "SpaceReset._job", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
     # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): the counter, and every file's block
     # map at each provider that can hold the space's bytes
@@ -279,6 +280,7 @@ NOT_THE_PROVISIONERS = {
     ("ingestbase.py", "Baseline._write_back", "self"),
     ("transferlog.py", "_placement", "edges"),  # a window of transfer edges, not a block map
     ("transferwindow.py", "Edges.bears_on", "self"),
+    ("shared_holds.py", "SharedHolds.open_holds", "self"),  # the record of the holds, not a block map
     # the agent's tool `schedule_file_replication` through the tool server (MCP), which reaches no Onezone read of ours
     ("day0/outage_run.py", "Run.agent_baseline", "self.tools"),
     ("day0/outage_run.py", "Run.during", "tools"),

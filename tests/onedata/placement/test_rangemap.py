@@ -206,7 +206,12 @@ def test_o25_a_positional_construction_from_before_the_connection_threshold_stil
     assert settings.fresh_connection_bytes == 16 << 20  # not given: the default
     assert isinstance(settings.probe_attempts, int)
     names = [field.name for field in dataclasses.fields(PlacementSettings)]  # each field added later goes last
-    assert names[names.index("fresh_connection_bytes") :] == ["fresh_connection_bytes", "reset_concurrency"]
+    assert names[names.index("fresh_connection_bytes") :] == [
+        "fresh_connection_bytes",
+        "reset_concurrency",
+        "reset_shortcut",
+        "reset_exclusive_wait_s",
+    ]
 
 
 def test_o25_the_threshold_for_a_new_connection_can_be_set(tmp_path):

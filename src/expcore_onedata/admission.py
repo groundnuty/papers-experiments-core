@@ -52,6 +52,45 @@ A tool outside a campaign (a smoke driver, a warm-up) holds the shared admission
 knows that no such tool holds it, and ends the record of any a dead one left open (`expcore_onedata.shared_holds`); a
 wait for it that runs out says that tools outside a campaign hold the federation. An admission's `endings` are what
 runs, last first, when the last share lets the lock go.
+
+**The reset lock (`federation.reset`, `resetlock.py`, `resetgrant.py`).** Every shared admission (a campaign run's, a
+tool's outside a campaign, the health check's) also holds `federation.reset` shared, recorded in `reset-holds.jsonl`,
+for as long as it holds `federation.lock`. A shortcut reset (O51), which skips the block maps of files a planner's
+reading showed empty and so needs no reader to place bytes during it, takes `federation.reset` exclusively: its run
+gives up its own share of `federation.reset` (its agent has not started) and keeps its share of `federation.lock`, polls
+for the exclusive hold within `[placement] reset_exclusive_wait_s`, and afterwards lets it go and takes its share back
+within `admission_timeout_s`, each on a new descriptor: a flock is never converted in place (`LOCK_SH` to `LOCK_EX` on
+one descriptor drops the old lock before it waits, and a failed non-blocking conversion has lost it). An exclusive
+admission of `federation.lock` takes no reset lock: it already excludes every shared holder, every resetter included.
+
+**The lock order, which every holder keeps:** `federation.intent`, then `federation.lock`, then (after the turnstile is
+let go) `federation.reset`. Who waits for what, holding what:
+
+- a shared admission waits for `federation.intent` holding nothing, for `federation.lock` (shared) holding the
+  turnstile, and for `federation.reset` (shared) holding `federation.lock`;
+- an exclusive one (an outage run, the injector, an `exclusive = true` run, the health gate's `RECOVERY`) waits for the
+  turnstile holding nothing and for `federation.lock` (exclusive) holding the turnstile, and takes nothing more;
+- a shortcut reset waits for `federation.reset` (exclusive) holding `federation.lock` shared and no share of
+  `federation.reset`, and, its exclusive hold let go, for its share back holding the same.
+
+No holder of `federation.reset` waits for `federation.lock` or the turnstile, and no holder of `federation.lock` waits
+for the turnstile, so no wait closes a cycle. Two resetters cannot deadlock: each gives up its share before it waits, so
+neither holds what the other waits for, one is granted, and the other's wait is bounded (past it, the full reads). The
+windows the shortcut must not have: **an outage run never gets in during it**, since the resetting run's share of
+`federation.lock`, which the exclusive admission conflicts with, is never let go (so it never lapses either); **no other
+run's agent, no tool and no health check acts during it**, since each acts only under its share of `federation.reset`,
+which conflicts with the exclusive hold, and the resetting run's own infrastructure is refused while its share is given
+up (`require_admission`, `require_reset_share`); a health check that meets the hold is deferred, uncharged.
+
+**No lock outlives its holder.** The kernel drops a dead process's flocks. Every lock file is opened `O_CLOEXEC`, so an
+exec'd child never inherits one, and every held lock is a `HeldLock`, which the fork hook closes in a forked child
+(`fault_journal`); no `subprocess` call of the package passes descriptors on (`pass_fds`, `close_fds=False`). The tool
+server never holds a lock: the attempt holds it for it. The MCP client starts the server in a session of its own
+(`start_new_session`), so it survives its parent's death; `PR_SET_PDEATHSIG` is not set, since the client gives no hook
+to set it, it would reach only the direct child (a configured launcher such as `uv run` leaves the server a
+grandchild), and it would fire with the forking thread rather than the process. Instead a shortcut reset that finds a
+holder line whose process is gone takes no shortcut (`resetgrant.HOLDER_GONE`): a read it sent may still be placing
+bytes, and a server it started may still run.
 """
 
 import asyncio
@@ -360,12 +399,14 @@ class FederationLock:
         if not exclusive:
             with contextlib.suppress(OSError):  # a stale record only misleads a diagnosis, which reads its holder
                 journal.clear_holder(None)
+            if reset is None:
+                main.close()
+                raise RuntimeError("a shared admission holds the reset lock shared")
             try:
                 share = self._share(reset)
             except BaseException:
                 try:
-                    if reset is not None:
-                        reset.close()
+                    reset.close()
                 finally:
                     main.close()
                 raise
@@ -384,10 +425,8 @@ class FederationLock:
         drain = SessionDrain(self._drain_s, clock=self._clock, sleep=self._sleep, journal=journal, wall=self._wall)
         return Admission(True, main, self.federation, journal, record, drain=drain)
 
-    def _share(self, reset: HeldLock | None) -> ResetShare:
+    def _share(self, reset: HeldLock) -> ResetShare:
         """A shared admission's share of the reset lock just taken, recorded (`resetlock.ResetShare`)."""
-        if reset is None:
-            raise RuntimeError("a shared admission holds the reset lock shared")
         return ResetShare(
             self.directory,
             reset,
@@ -451,7 +490,9 @@ class FederationLock:
         `cancel` is set, and then, holding the lock, for the drain record to pass (`drain_left`), inside the same bound;
         raise `FederationBusy` (the hold `federation_busy`) when either wait ran out, and InfraError of kind
         `injector_failure` when it was cancelled or the holder record failed. `purpose` and `target` go into the holder
-        record of an exclusive admission."""
+        record of an exclusive admission. Shared, it then takes its share of the reset lock within the same bound
+        (`resetlock.py`): every shared holder does, the health check's too, whose first call reads a file of a study's
+        space (`precampaign.content_type_check`), so a shortcut reset defers it, uncharged."""
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         try:
             intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
@@ -464,13 +505,13 @@ class FederationLock:
                 raise self._explained(busy) from None
             raise
         self._await_drain(main.close, deadline, cancel)
-        reset = None
-        if not exclusive:  # after the main lock and outside the turnstile: the order every holder keeps
-            try:
-                reset = self._wait(FEDERATION_RESET, fcntl.LOCK_SH, deadline, cancel)
-            except BaseException:
-                main.close()
-                raise
+        if exclusive:
+            return self._admit(main, exclusive, purpose, target)
+        try:  # after the main lock and outside the turnstile: the order every holder keeps
+            reset = self._wait(FEDERATION_RESET, fcntl.LOCK_SH, deadline, cancel)
+        except BaseException:
+            main.close()
+            raise
         return self._admit(main, exclusive, purpose, target, reset)
 
     def _explained(self, busy: FederationBusy) -> FederationBusy:

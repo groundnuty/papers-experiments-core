@@ -7,6 +7,7 @@ with the holders, and takes its share back. Every test runs against the real loc
 the waits are real seconds, kept short.
 """
 
+import ast
 import contextlib
 import fcntl
 import json
@@ -20,10 +21,11 @@ import time
 from pathlib import Path
 
 import pytest
-from fault_support import OUTAGE_TARGET, write_faults
+from fault_support import OUTAGE_TARGET, FakeServices, write_faults
 from reset_lock_support import hold_and_fork, run_and_hang
 from shared_support import hold_and_die
 
+from expcore.errors import InfraError
 from expcore_onedata.admission import (
     FEDERATION_LOCK,
     AdmissionRefused,
@@ -33,6 +35,7 @@ from expcore_onedata.admission import (
     require_admission,
 )
 from expcore_onedata.config import load_platform
+from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import _HELD, boot_id
 from expcore_onedata.faults import load_faults
 from expcore_onedata.rangemap import PlacementSettings
@@ -322,6 +325,24 @@ def test_o11_the_runs_share_of_the_federation_lock_is_held_throughout_the_shortc
     assert got == [], "the run's share of federation.lock lapsed during its shortcut reset"
 
 
+def test_o11_a_health_check_during_a_shortcut_reset_is_deferred_uncharged_and_passes_after_it(tmp_path):
+    """O11: the health check's shared hold takes its share of the reset lock like every shared admission (its first
+    call reads a file of a study's space): during a shortcut reset it is deferred, charging no run, and the exclusive
+    hold is never broken; once the reset has ended it passes."""
+    config, settings, lock = federation(tmp_path, health_wait_s=0.3)
+    with lock.held(exclusive=False, timeout_s=PROBE_S):
+        with exclusive(config, shortcut()) as grant:
+            thread, landed = in_thread(lambda: FaultGate(settings, FakeServices())())  # no admission in its context
+            thread.join(WAIT_S)
+            (health,) = landed
+            assert (health.ok, health.deferred, health.charge) == (False, True, False), health.detail
+            assert grant.held
+        thread, landed = in_thread(lambda: FaultGate(settings, FakeServices())())
+        thread.join(WAIT_S)
+        (health,) = landed
+        assert health.ok, health.detail
+
+
 def test_o11_no_tool_and_no_agent_start_while_the_runs_reset_share_is_given_up(tmp_path):
     """O11: while its share of the reset lock is given up, the run's infrastructure may not start
     (`require_admission`, which the tool server and the sandbox call) and no tool may reuse its admission."""
@@ -474,13 +495,16 @@ def test_o11_no_lock_descriptor_is_inheritable_and_no_exec_child_receives_one(tm
 
 def test_o11_no_subprocess_call_in_the_package_passes_descriptors_on():
     """O11: no `subprocess` call of the package passes descriptors to a child (`pass_fds`, `close_fds=False`), which
-    could hand a lock to a process that outlives its holder."""
-    offending = [
-        f"{path.relative_to(SRC)}:{number}"
-        for path in SRC.rglob("*.py")
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-        if "pass_fds" in line or "close_fds=False" in line.replace(" ", "")
-    ]
+    could hand a lock to a process that outlives its holder. Every call of every module is read, by its keywords."""
+    offending = []
+    for path in SRC.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            for keyword in node.keywords if isinstance(node, ast.Call) else ():
+                kept = keyword.arg == "close_fds" and not (
+                    isinstance(keyword.value, ast.Constant) and keyword.value.value is True
+                )
+                if keyword.arg == "pass_fds" or kept:
+                    offending.append(f"{path.relative_to(SRC)}:{node.lineno}")
     assert offending == []
 
 
@@ -493,8 +517,32 @@ def test_o11_a_shared_admission_is_refused_when_its_reset_share_cannot_be_record
         raise OSError("disk full")
 
     monkeypatch.setattr(SharedHolds, "begin", broken)
-    with pytest.raises(Exception, match="could not be recorded"):
+    with pytest.raises(InfraError, match="could not be recorded"):
         lock.acquire(exclusive=False, timeout_s=PROBE_S)
     assert free(settings, FEDERATION_LOCK)
     assert free(settings, FEDERATION_RESET)
     assert current_admission() is None
+
+
+def test_o11_a_share_taken_back_that_cannot_be_recorded_is_let_go_and_refuses_the_agent(tmp_path, monkeypatch):
+    """O11: a share of the reset lock is never held without its line in the record: one taken back after a shortcut
+    reset whose line cannot be written is let go again, the failure raised, and the run's agent refused, its share of
+    `federation.lock` still held."""
+    config, settings, lock = federation(tmp_path)
+
+    def broken(self, reason):
+        raise OSError("disk full")
+
+    def section_that_breaks_the_record():
+        with exclusive(config, shortcut()) as grant:
+            assert grant.shortcut
+            monkeypatch.setattr(SharedHolds, "begin", broken)
+
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        with pytest.raises(InfraError, match="could not be recorded"):
+            section_that_breaks_the_record()
+        assert not admission.reset.shared
+        assert free(settings, FEDERATION_RESET)
+        assert not free(settings, FEDERATION_LOCK)
+        with pytest.raises(AdmissionRefused, match="reset"):
+            require_admission(config)

@@ -58,13 +58,15 @@ every space) and `concurrency`; a failed one adds `failed` (the positions of the
 """
 
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any
 
-from expcore_onedata import consistency, occupancy, resetheld
+from expcore_onedata import consistency, occupancy, resetheld, resetshortcut
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, SpaceReset
+from expcore_onedata.resetgrant import ResetGrant
 from expcore_onedata.resetplan import Holdings, given_scan
 
 
@@ -122,6 +124,13 @@ class _Space:
             # a planner's scan, the qos stage's first, and when its listing began (None: the stage scans itself)
             "scan": None if plan.planned is None else given_scan(reset, plan.planned),
             "scan_at": None if plan.planned is None else plan.planned.read_at,
+            # the shortcut (`resetshortcut.py`): the planner's reading, the reads' mode and its record, the jobs the
+            # transfers stage cancelled and when it ended, and the ids the occupancy reads (None: every listed file)
+            "planned": plan.planned,
+            "reads": resetshortcut.initial(self.p.settings, plan.planned),
+            "cancelled": set(),
+            "transfers_at": None,
+            "only": None,
         }
         self.plan = {provider: list(dict.fromkeys(paths)) for provider, paths in (plan.evict or {}).items()}
         self.allowed = dict(plan.allowed or {})
@@ -135,6 +144,7 @@ class _Space:
             "stages": {},
             "seconds": None,
             "reads_retried": 0,
+            "occupancy_reads": self.run["reads"],  # the same dict: the occupancy stage updates it as it falls back
         }
         self.failure: ResetFailed | None = None
         self.settle = _Settle(self.p.settings.transfer_settle_polls, set())  # the transfers stage's
@@ -250,6 +260,11 @@ class SpacesReset:
         message = f"the reset of {len(spaces)} space(s) failed: {where}. The first: {failures[0]}"
         raise ResetFailed(message, failures[0].stage, record)
 
+    def exclusive(self) -> AbstractContextManager[ResetGrant]:
+        """The exclusive section of a shortcut reset of every space (`SpaceReset.exclusive`, one for all: the reset
+        lock is the federation's): every planner's reading and the reset go inside."""
+        return self._resets[0].exclusive()
+
     def run_one(self, plan: ResetPlan) -> dict[str, Any]:
         """The reset of the one space this driver holds, as `SpaceReset.run` returns it and raises."""
         if len(self._resets) != 1:
@@ -352,6 +367,8 @@ class SpacesReset:
         if settle.settled:
             space.run["own"].update(tid for _, tid in settle.cancelled)
             space.run["ended"].update(tid for _, tid in settle.cancelled)  # each was waited on until it ended
+            space.run["cancelled"].update(settle.cancelled)  # jobs of an earlier run: the shortcut reads their files
+            space.run["transfers_at"] = space.p.clock()  # the last observation, which the shortcut's walk follows
             cancelled = len({tid for _, tid in settle.cancelled})
             space.done("transfers", {"cancelled": cancelled, "observations": settle.observations, "fast": settle.fast})
             return True
