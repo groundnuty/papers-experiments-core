@@ -56,6 +56,7 @@ from expcore_onedata.admission import (
     FederationLock,
     current_admission,
     fault_settings_of,
+    require_reset_share,
 )
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_recovery import failure
@@ -107,6 +108,7 @@ def _reusable(plan: _Plan, lock: FederationLock) -> tuple[Admission, Callable[[]
     held = current_admission()
     if held is None or held.exclusive or held.federation != lock.federation:
         return None
+    require_reset_share(held)  # its own shortcut reset holds the reset lock: no tool may act until it ends
     _require_baselines(plan)
     share = held.try_retain()
     if share is None:

@@ -61,6 +61,7 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
 from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
+from expcore_onedata.resetlock import FEDERATION_RESET, ResetShare
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 from expcore_onedata.shared_holds import SharedHolds
 
@@ -120,10 +121,17 @@ class Admission:
     record: Mapping[str, Any] | None = None
     shares: _Shares = field(default_factory=_Shares, compare=False, repr=False)
     endings: list[Callable[[], None]] = field(default_factory=list, compare=False, repr=False)
+    reset: ResetShare | None = field(default=None, compare=False, repr=False)  # a shared admission's federation.reset
 
     @property
     def held(self) -> bool:
         return self.lock.held
+
+    @property
+    def may_act(self) -> bool:
+        """Whether the holder may act on the federation: held, and, shared, with its share of the reset lock held, not
+        given up for its own shortcut reset (`resetlock.py`)."""
+        return self.held and (self.reset is None or self.reset.shared)
 
     def retain(self) -> Callable[[], None]:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
@@ -167,9 +175,10 @@ class Admission:
         self._give_up()
 
     def _release(self) -> None:
-        """Let the lock go, its records first, so no record outlives a lock let go this way, and the lock goes whatever
-        a record's end does, an interrupt included. A forked child's copy of the admission holds nothing (the fork hook
-        closed its descriptor), so it ends and clears nothing of its parent's."""
+        """Let the locks go, the records first, so no record outlives a lock let go this way, and the locks go whatever
+        a record's end does, an interrupt included: the reset lock first, in whatever mode it is held, then the main
+        lock, the reverse of the order they were taken in. A forked child's copy of the admission holds nothing (the
+        fork hook closed its descriptors), so it ends and clears nothing of its parent's."""
         owned = self.held
         try:
             if owned:
@@ -182,7 +191,11 @@ class Admission:
                     with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
                         self.journal.clear_holder(self.record["token"])
         finally:
-            self.lock.close()
+            try:
+                if self.reset is not None:
+                    self.reset.close(record=owned)
+            finally:
+                self.lock.close()
 
 
 def current_admission() -> Admission | None:
@@ -205,20 +218,26 @@ class FederationLock:
     def __init__(self, settings: FaultSettings, *, poll_s: float = 0.05) -> None:
         self.directory, self._poll_s = Path(settings.journal), poll_s
         self.federation = federation_of(settings)
+        self._retake_s = settings.admission_timeout_s  # the bound of a shared admission's wait for its reset share back
 
     def _try(self, name: str, mode: int) -> HeldLock | None:
-        """Take one of the two lock files in `mode` without waiting; None when another holds it in a conflicting one."""
+        """Take one of the lock files in `mode` without waiting; None when another holds it in a conflicting one. The
+        file is opened close-on-exec, so no exec'd child (the tool server, a sandbox command) inherits the lock, and
+        the descriptor is a `HeldLock`, which the fork hook closes in a forked child."""
         make_directories(self.directory)
-        descriptor = os.open(self.directory / name, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor = os.open(self.directory / name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         try:
             fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(descriptor)
             return None
+        except BaseException:
+            os.close(descriptor)
+            raise
         return HeldLock(descriptor)
 
     def _wait(self, name: str, mode: int, deadline: float | None, cancel: threading.Event | None) -> HeldLock:
-        """Poll for one of the two lock files until the deadline or the cancellation."""
+        """Poll for one of the lock files until the deadline or the cancellation."""
         while True:
             held = self._try(name, mode)
             if held is not None:
@@ -229,14 +248,26 @@ class FederationLock:
                 raise FederationBusy(INJECTOR_FAILURE, "the federation stayed held past the bound of the wait")
             time.sleep(self._poll_s)
 
-    def _admit(self, main: HeldLock, exclusive: bool, purpose: str, target: str | None) -> Admission:
+    def _admit(
+        self, main: HeldLock, exclusive: bool, purpose: str, target: str | None, reset: HeldLock | None = None
+    ) -> Admission:
         """The admission of a lock just taken. Exclusive, it writes its holder record (or lets the lock go and raises
-        InfraError of kind `injector_failure`); shared, it clears any record, which no holder can then own."""
+        InfraError of kind `injector_failure`); shared, it clears any record, which no holder can then own, and records
+        its share of the reset lock (`reset`), or lets both locks go and raises when that cannot be recorded."""
         journal = InjectionJournal(self.directory)
         if not exclusive:
             with contextlib.suppress(OSError):  # a stale record only misleads a diagnosis, which reads its holder
                 journal.clear_holder(None)
-            return Admission(False, main, self.federation)
+            try:
+                share = self._share(reset)
+            except BaseException:
+                try:
+                    if reset is not None:
+                        reset.close()
+                finally:
+                    main.close()
+                raise
+            return Admission(False, main, self.federation, reset=share)
         record = {"token": uuid.uuid4().hex, **holder(), "purpose": purpose, "target": target}
         record["since_utc"] = datetime.now(UTC).isoformat(timespec="seconds")
         try:
@@ -249,6 +280,19 @@ class FederationLock:
             raise
         self._settle_tools()
         return Admission(True, main, self.federation, journal, record)
+
+    def _share(self, reset: HeldLock | None) -> ResetShare:
+        """A shared admission's share of the reset lock just taken, recorded (`resetlock.ResetShare`)."""
+        if reset is None:
+            raise RuntimeError("a shared admission holds the reset lock shared")
+        return ResetShare(
+            self.directory,
+            reset,
+            try_take=lambda mode: self._try(FEDERATION_RESET, mode),
+            busy=lambda detail: FederationBusy(INJECTOR_FAILURE, detail),
+            retake_s=self._retake_s,
+            poll_s=self._poll_s,
+        )
 
     def _settle_tools(self) -> None:
         """Under the exclusive lock, no tool outside a campaign holds the federation shared: end the record of any that
@@ -269,7 +313,19 @@ class FederationLock:
             main = self._try(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         finally:
             intent.close()
-        return None if main is None else self._admit(main, exclusive, purpose, target)
+        if main is None:
+            return None
+        reset = None
+        if not exclusive:
+            try:
+                reset = self._try(FEDERATION_RESET, fcntl.LOCK_SH)
+            except BaseException:
+                main.close()
+                raise
+            if reset is None:  # a shortcut reset holds it exclusively
+                main.close()
+                return None
+        return self._admit(main, exclusive, purpose, target, reset)
 
     def acquire(
         self,
@@ -294,7 +350,14 @@ class FederationLock:
             if exclusive:
                 raise self._explained(busy) from None
             raise
-        return self._admit(main, exclusive, purpose, target)
+        reset = None
+        if not exclusive:  # after the main lock and outside the turnstile: the order every holder keeps
+            try:
+                reset = self._wait(FEDERATION_RESET, fcntl.LOCK_SH, deadline, cancel)
+            except BaseException:
+                main.close()
+                raise
+        return self._admit(main, exclusive, purpose, target, reset)
 
     def _explained(self, busy: FederationBusy) -> FederationBusy:
         """An exclusive wait that ran out, with the tools outside a campaign that hold the federation shared named,
@@ -450,3 +513,15 @@ def require_admission(config: PlatformConfig) -> None:
             "(FederationLock.admitted, shared for a baseline run, exclusive for an outage run)"
         )
     require_same_federation(admission, federation_of(settings))
+    require_reset_share(admission)
+
+
+def require_reset_share(admission: Admission) -> None:
+    """Refuse to act under a shared admission whose share of the reset lock is not held: given up for its own shortcut
+    reset, or not taken back after it (`resetlock.py`). Nothing of the run may then reach the federation, since a reset
+    that holds the lock exclusively counts on no reader placing bytes."""
+    if not admission.may_act:
+        raise AdmissionRefused(
+            "the run's share of the reset lock is given up for a shortcut reset, or was not taken back after it: "
+            "nothing of the run may act on the federation until it is held again"
+        )
