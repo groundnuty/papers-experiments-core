@@ -500,7 +500,9 @@ Not yet in it: #27's sanction, durable recovery (the preallocated mode's marks a
 ```python
 from expcore.egress import EgressLog, declaration
 
-declared = declaration([("127.0.0.1", gate_port)], ("127.0.0.1", gate_port), hosts=["provider-a.test"], network_calls=True)
+declared = declaration(
+    [("127.0.0.1", gate_port)], ("127.0.0.1", gate_port), hosts=["provider-a.test"], network_calls=True
+)
 instruments = [..., EgressLog(source, declared, nonce)]  # source.egress_log() -> bytes | None
 ```
 
