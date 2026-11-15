@@ -33,9 +33,13 @@ restored) then wait. The platform's health check runs before any attempt launche
   the gate's own link check finds every pair passing (`links_passed`), in this process or a later one: a heal that left
   a pair failing keeps the gate closed for an operator, and the link restarts never pile up against the supervisor's
   bound of 10 restarts of the link in 3,600 s.
-- **Fail closed.** A heal that does not end `healed` fails the check, naming why and each pair still failing by its
-  reader; the gate opens only once its own link check, made afresh under the exclusive admission after the heal (a
-  recent pass another call made before it is not reused), passes.
+- **In the background, a wait that charges no run.** The gate hands its admission to the heal in a thread of its own
+  and answers the uncharged deferral, as every check does while the heal runs, so a heal longer than the campaign's
+  `health_timeout_s` is never counted as down and a pair it mends charges no run; a heal still running past
+  `heal_timeout_s` plus `heal_settle_s` since it began closes the gate, uncharged.
+- **Fail closed.** A heal that does not end `healed` leaves the pair to the next check, which finds it still stuck and
+  fails closed, the latch keeping a second heal out; the gate opens only on its own link check, made afresh under the
+  exclusive admission after the heal (a recent pass another call made before it is not reused), and passing.
 
 **The record** is `gate-heals.jsonl` beside the fault journal, by label only (O12): a `healing` line (`id`,
 `start_utc`, `mode`, `trigger`: the gate's check as a matrix), an `ended` line (the heal's record, `fault_heal`:

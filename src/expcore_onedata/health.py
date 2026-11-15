@@ -223,6 +223,11 @@ class PlatformHealth:
         without `[faults]`."""
         return None if self._faults is None else self._faults.last_heal
 
+    def wait_for_gate_heal(self, timeout_s: float | None = None) -> bool:
+        """Wait, at most `timeout_s`, for a heal the fault gate runs in the background to end; whether none runs now
+        (`FaultGate.wait_for_heal`; True without `[faults]`)."""
+        return True if self._faults is None else self._faults.wait_for_heal(timeout_s)
+
     @property
     def content_type(self) -> ContentTypeVerdict | None:
         """What the content-type check found at the first call (None before it), so that a caller can tell a type that
