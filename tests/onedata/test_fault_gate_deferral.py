@@ -7,8 +7,9 @@ blocking hold, and a campaign that exits when blocked (every `run`) would stop o
 the platform's check declares that bound (`max_deferral_s`), and the core refuses a shorter `max_defer_s` at the start.
 
 The bound also holds the waits between those, which are the core's own settings: after the drain one `recheck_s` (and
-`poll_interval_s`) passes and then the check that starts the heal (`health_timeout_s`), and after the heal the check
-that makes the link check afresh (`health_timeout_s`), which a call meeting it waits for, uncharged. The platform
+`poll_interval_s`) passes and then the check that starts the heal (`health_timeout_s`), and after the heal another
+`recheck_s` and the check that makes the link check afresh (`health_timeout_s`), which a call meeting it waits for,
+uncharged (the last deferred answer before the heal ends is followed by a check one recheck later). The platform
 declares how many of each (`DeferralBound.rechecks`, `checks`) and the core adds its own figures.
 """
 
@@ -32,10 +33,12 @@ FIVE_STORES = {name: f"store-{name}" for name in FIVE}
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 POLL = {"poll_interval_s": 1.0}  # the core's defaults (recheck_s 30 s, health_timeout_s 60 s) with a poll of 1 s
 CORE = settings_for(**POLL)
-# What the core adds to the platform's own seconds: with a session drain one recheck and the check that starts the heal
-# and the one after it, without one only the check after it (the first deferral is then the heal's own start).
-AFTER_A_DRAIN = (CORE.recheck_s + CORE.poll_interval_s) + 2 * CORE.health_timeout_s  # 151 s
-WITHOUT_A_DRAIN = CORE.health_timeout_s  # 60 s
+# What the core adds to the platform's own seconds: with a session drain a recheck and the check that starts the heal,
+# and a recheck and the check after it; without one only the pair after the heal (the first deferral is then the
+# heal's own start).
+BETWEEN = CORE.recheck_s + CORE.poll_interval_s  # 31 s
+AFTER_A_DRAIN = 2 * BETWEEN + 2 * CORE.health_timeout_s  # 182 s
+WITHOUT_A_DRAIN = BETWEEN + CORE.health_timeout_s  # 91 s
 
 
 def five_providers(data, **faults):
@@ -80,8 +83,8 @@ def test_o35_five_providers_healing_all_links_refuse_the_default_max_defer_s_at_
     tmp_path, fake, drain_s, own_s, needed_s
 ):
     """O35: five providers healing `"all_links"` defer the gate for up to `session_drain_s`, `heal_timeout_s` and
-    `heal_settle_s` (4,790 s at the designed bounds, 4,470 s with no drain) and the core's own waits around them (151 s
-    with a drain, 60 s without), 4,941 s and 4,530 s in all with the defaults, past the default `max_defer_s` of 3,600
+    `heal_settle_s` (4,790 s at the designed bounds, 4,470 s with no drain) and the core's own waits around them (182 s
+    with a drain, 91 s without), 4,972 s and 4,561 s in all with the defaults, past the default `max_defer_s` of 3,600
     s: the campaign is refused when it starts, naming the figures and the fix."""
     edit = partial(five_providers, heal="all_links", session_drain_s=drain_s)
     health, faults = platform_check(tmp_path / "platform", fake, edit)
@@ -93,13 +96,13 @@ def test_o35_five_providers_healing_all_links_refuse_the_default_max_defer_s_at_
         assert part in text, text
 
 
-def test_o35_four_providers_at_the_defaults_need_4851_s_and_five_need_4941_s(tmp_path, fake):
+def test_o35_four_providers_at_the_defaults_need_4882_s_and_five_need_4972_s(tmp_path, fake):
     """O35: the figures with the defaults, a drain of 320 s, a heal of 4,200 s (4,290 s for five providers) and its
-    settle of 180 s: the platform's own 4,700 s and 4,790 s, and the core's 151 s around them, 4,851 s and 4,941 s."""
+    settle of 180 s: the platform's own 4,700 s and 4,790 s, and the core's 182 s around them, 4,882 s and 4,972 s."""
     four, _ = platform_check(tmp_path / "four", fake, four_providers)
     five, _ = platform_check(tmp_path / "five", fake, partial(five_providers, heal="all_links"))
     assert [health.max_deferral_s().seconds for health in (four, five)] == [4700.0, 4790.0]
-    for health, needed in ((four, 4851.0), (five, 4941.0)):
+    for health, needed in ((four, 4882.0), (five, 4972.0)):
         with pytest.raises(ConfigError, match=f"up to {needed:g} s"):
             build(tmp_path / f"campaign-{needed:g}", health=health, settings=CORE, plan=SMALL)
         with build(
@@ -111,10 +114,10 @@ def test_o35_four_providers_at_the_defaults_need_4851_s_and_five_need_4941_s(tmp
 def test_o35_the_bound_names_every_term_and_the_refusal_gives_each_its_value(tmp_path, fake):
     """O35: what the platform declares names each wait it holds, and the refusal gives every one its figure: the drain,
     the heal's two bounds, and the core's `recheck_s`, `poll_interval_s` and `health_timeout_s`; a platform that
-    declares a drain counts one recheck and two checks, and one with none counts only the check after the heal."""
+    declares a drain counts two rechecks and two checks, and one with none counts those after the heal."""
     health, _ = platform_check(tmp_path / "platform", fake, partial(five_providers, heal="all_links"))
     bound = health.max_deferral_s()
-    assert (bound.rechecks, bound.checks) == (1, 2)
+    assert (bound.rechecks, bound.checks) == (2, 2)
     for part in (
         "session_drain_s (320 s)",
         "heal_timeout_s (4290 s)",
@@ -133,7 +136,7 @@ def test_o35_the_bound_names_every_term_and_the_refusal_gives_each_its_value(tmp
         assert part in text, text
     quick, _ = platform_check(tmp_path / "quick", fake, partial(five_providers, heal="all_links", session_drain_s=0))
     undrained = quick.max_deferral_s()
-    assert (undrained.rechecks, undrained.checks) == (0, 1)
+    assert (undrained.rechecks, undrained.checks) == (1, 1)
     assert "the check that starts the heal (its health_timeout_s)" not in undrained.detail, undrained.detail
     assert "after the heal (its health_timeout_s)" in undrained.detail, undrained.detail  # only the check after it
 

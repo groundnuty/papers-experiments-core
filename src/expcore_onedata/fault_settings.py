@@ -100,20 +100,24 @@ start waits out after it restored a provider an earlier run left down (`FaultInj
 uncharged deferral, for up to `heal_timeout_s` plus `heal_settle_s` from the heal's start (`heal_wait_s`), and after an
 outage run the session drain comes first, with no check between them that passes. The heal begins at a check, so one
 wait between two checks (`recheck_s`, 30 s, and up to `poll_interval_s`, 1 s) and that check (up to `health_timeout_s`,
-60 s) sit between the drain and the heal, and the check that makes the link check afresh after the heal (another
-`health_timeout_s`) is waited for by a call that meets it. The core turns a deferral past the campaign's `max_defer_s`
-(3,600 s by default) into a blocking hold, on which a campaign that exits when blocked stops. So the check declares the
-sum of its own times (`heal_deferral_s`: `session_drain_s`, `heal_timeout_s` and `heal_settle_s`; none with the heal
-off) as its longest deferral (`FaultGate.max_deferral_s`, `PlatformHealth.max_deferral_s`), with how many of the core's
-waits it includes, and the core, which alone knows its own settings, adds them: the campaign's `max_defer_s` must be at
-least that total, or it is refused at its start. With the defaults that is 4,700 s and 151 s, 4,851 s, for four
-providers, and 4,790 s and 151 s, 4,941 s, for five at the 4,290 s they need; with `session_drain_s = 0` the first
-deferral is the check that starts the heal, and only the check after the heal is added (the 4,470 s of five providers
-and 60 s, 4,530 s). The figure assumes every check ends within `health_timeout_s`, as a check must (the link check too:
-keep it above `visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but its
-thread runs on and can still start the heal later than the figure counts. A deferral that began before the drain (an
-outage run still running, and another worker's check deferred on it) or for another reason (a run on an ingest
-baseline) counts from its first answer, so its age holds that wait too, which no setting here bounds.
+60 s) sit between the drain and the heal, and after the heal, whose last deferred answer can come just before it ends,
+another such wait and the check that makes the link check afresh (a call that meets it waits for it). The core turns a
+deferral past the campaign's `max_defer_s` (3,600 s by default) into a blocking hold, on which a campaign that exits
+when blocked stops. So the check declares the sum of its own times (`heal_deferral_s`: `session_drain_s`,
+`heal_timeout_s` and `heal_settle_s`; none with the heal off) as its longest deferral (`FaultGate.max_deferral_s`,
+`PlatformHealth.max_deferral_s`), with how many of the core's waits it includes, and the core, which alone knows its own
+settings, adds them: the campaign's `max_defer_s` must be at least that total, or it is refused at its start. With the
+defaults (`recheck_s` 30 s, `poll_interval_s` 1 s, `health_timeout_s` 60 s) that is 4,700 s and 182 s, 4,882 s, for
+four providers, and 4,790 s and 182 s, 4,972 s, for five at the 4,290 s they need; with `session_drain_s = 0` the first
+deferral is the check that starts the heal, and only the waits after the heal are added (the 4,470 s of five providers
+and 91 s, 4,561 s). A `health_timeout_s` of 150 s, as the link check needs, makes them 5,062 s, 5,152 s and 4,651 s.
+
+The figure assumes every check ends within `health_timeout_s`, as a check must (the link check too: keep it above
+`visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but its thread runs on
+and can still start the heal later than the figure counts. A deferral that began before the drain (an outage run still
+running, and another worker's check deferred on it) or for another reason (a run on an ingest baseline), and a heal
+that waits for another holder of the federation (the hold `federation_busy`), count from the deferral's first answer, so
+its age holds that wait too, which no setting here bounds.
 """
 
 import hashlib

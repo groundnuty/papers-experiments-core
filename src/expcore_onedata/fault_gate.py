@@ -36,7 +36,7 @@ answers the uncharged deferral (`Health(..., deferred=True, charge=False)`) at o
 campaign's `health_timeout_s` never reads as down and a pair it mends charges no run; past the heal's own bound
 (`heal_timeout_s` and `heal_settle_s` since it began) a heal still running closes the gate, uncharged. That bound, after
 a session drain and with the core's waits between and around them (a recheck and the check that starts the heal, and
-the check that makes the link check afresh after it), is the longest the gate declares it may defer
+a recheck and the check that makes the link check afresh after it), is the longest the gate declares it may defer
 (`max_deferral_s`), and the core refuses a campaign whose `max_defer_s` is shorter at its start, so a heal never turns
 into a blocking hold that stops the campaign. A check that found the pair too and meets a heal under way (this gate's,
 or another check's holding the federation) waits the same way, never taking the latch the heal set for a closed
@@ -171,19 +171,22 @@ class FaultGate:
         the session drain of an outage run (`session_drain_s`), and the waits that follow it are these, whether this
         gate heals or another process's does: one wait between two checks and the check that starts the heal (the
         heal begins at a check, so it begins up to `recheck_s` plus the poll and `health_timeout_s` after the drain
-        ends), the heal's whole bound (`heal_wait_s`: `heal_timeout_s` and `heal_settle_s`), and the check that makes
-        the link check afresh after it, which a call that meets it waits for, uncharged (`PlatformHealth._regular`).
-        The platform's own seconds are the drain and the heal's bound (`heal_deferral_s`); the other waits are the
-        core's settings, which it adds (`DeferralBound.rechecks`, `checks`). With no drain the first deferral is the
-        check that starts the heal, and only the check after the heal is added.
+        ends), the heal's whole bound (`heal_wait_s`: `heal_timeout_s` and `heal_settle_s`), and then, since the last
+        deferred answer of the heal can come just before it ends, one more wait between two checks and the check that
+        makes the link check afresh, which a call that meets it waits for, uncharged (`PlatformHealth._regular`). The
+        platform's own seconds are the drain and the heal's bound (`heal_deferral_s`); the waits between and around
+        them are the core's settings, which it adds (`DeferralBound.rechecks`, `checks`): two rechecks and two checks
+        with a drain. With no drain the first deferral is the check that starts the heal, so one recheck and one check
+        (the pair after the heal) are added.
 
-        **What it assumes.** Every check ends within the campaign's `health_timeout_s`, the check's own contract
-        (`docs/interfaces.md`, HealthCheck), and the link check is bounded by it too (`linkcheck`: keep it above
-        `visible_timeout_s + timeout_s + evict_timeout_s`). The core gives up on a check that outlives it, reads it as
-        down and throws its answer away, but the check's thread runs on and can still start the heal, later than the
-        bound counts. And a deferral that began before the drain (an outage run still running, another worker's check
-        deferred on it) or for another reason (a run on an ingest baseline, `PlatformHealth`'s first answer) counts
-        from its first answer, so its age holds that wait too; neither is included."""
+        **What it assumes and leaves out.** Every check, whole (its waits for the federation and its link check),
+        ends within the campaign's `health_timeout_s`, the check's own contract (`docs/interfaces.md`, HealthCheck; the
+        link check too, `linkcheck`: keep it above `visible_timeout_s + timeout_s + evict_timeout_s`). The core gives
+        up on a check that outlives it, reads it as down and throws its answer away, but the check's thread runs on and
+        can still start the heal later than the bound counts. And three waits are not in it: a deferral that began
+        before the drain (an outage run still running, another worker's check deferred on it) or for another reason (a
+        run on an ingest baseline, which `PlatformHealth` checks first) counts from its first answer, and so does a
+        heal that waits for another holder of the federation (the hold `federation_busy`), so each adds to its age."""
         settings = self._settings
         if settings.heal == "off":
             return None
@@ -197,11 +200,14 @@ class FaultGate:
         )
         detail = (
             f'[faults] heal = "{settings.heal}": {first}heal_timeout_s ({settings.heal_timeout_s:g} s) and '
-            f"heal_settle_s ({settings.heal_settle_s:g} s), then the check that makes the link check afresh after the "
-            "heal (its health_timeout_s), each check assumed to end within its health_timeout_s; lower "
-            'heal_timeout_s or session_drain_s, or set heal = "off", to shorten it'
+            f"heal_settle_s ({settings.heal_settle_s:g} s), then another wait between two checks and the check that "
+            "makes the link check afresh after the heal (its health_timeout_s), each check assumed to end within its "
+            "health_timeout_s, and no deferral begun earlier or for another reason, nor a wait for another holder of "
+            'the federation, counted; lower heal_timeout_s or session_drain_s, or set heal = "off", to shorten it'
         )
-        return DeferralBound(heal_deferral_s(settings), detail, rechecks=int(drained), checks=2 if drained else 1)
+        return DeferralBound(
+            heal_deferral_s(settings), detail, rechecks=2 if drained else 1, checks=2 if drained else 1
+        )
 
     @property
     def last_heal(self) -> dict[str, Any] | None:
