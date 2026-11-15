@@ -16,6 +16,8 @@ snapshot and this module joins the results:
   of the first shard, in index order, that did. Each shard serves one model under `expcore-shard/3`, and a store keeps
   a record of accepted fingerprints only when the models of its plan declare a set, so a shard's export may lack the
   key that another's has: it counts as no entries, and the joined export has the key exactly when any shard's does;
+- `operator_holds` (C11), when any shard has it: every shard's own entries in shard order, each with `"shard"` added,
+  so a report can say which host's platform check met each hold; a shard that met none adds none;
 - `shard_retries_by_kind` keeps what the sum of `retries_by_kind` loses: every row of every shard's own table, in shard
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
@@ -54,9 +56,10 @@ _TABLES = {
     "budget_holds": ("condition", "model"),
 }
 DEPLOYMENTS = "deployment_shares"
+HOLDS = "operator_holds"  # the holds an operator ends (C11): a shard's export has the key only when it met one
 _MODEL_SUMS = ("analysed_runs", "runs_without_mix", "mixed_runs", "turns")
 _FINGERPRINT_SUMS = ("turns", "runs")
-_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS)  # keys that one shard's export may have and another's lack
+_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS)  # keys that one shard's export may have and another's lack
 
 
 def join_exports(
@@ -78,6 +81,9 @@ def join_exports(
     for key in _keys_of_the_join(exports, order):
         if key == DEPLOYMENTS:  # a shard whose plan has no model with a set exports none: it has no entries
             joined[key] = _join_deployments([exports[index].get(key, ()) for index in order])
+            continue
+        if key == HOLDS:  # a shard that met no hold of an operator's has none
+            joined[key] = [{**hold, SHARD_KEY: index} for index in order for hold in exports[index].get(key, ())]
             continue
         parts = [exports[index][key] for index in order]
         if key in LISTS:
@@ -123,10 +129,13 @@ def _require_the_plan(joined: Mapping[str, Any], seq_of: Mapping[str, int]) -> N
 
 def _keys_of_the_join(exports: Mapping[int, Mapping[str, Any]], order: Sequence[int]) -> list[str]:
     """The keys of the joined export, in the first shard's order, without the shard's own key. `deployment_shares`
-    is in when any shard's export has it, where `export_run_state` puts it, after `kinds`."""
+    and `operator_holds` are in when any shard's export has them, where `export_run_state` puts them: after `kinds`,
+    the holds after the shares."""
     keys = [key for key in exports[order[0]] if key != EXPORT_KEY]
-    if DEPLOYMENTS not in keys and any(DEPLOYMENTS in exports[index] for index in order):
-        keys.insert(keys.index("kinds") + 1 if "kinds" in keys else len(keys), DEPLOYMENTS)
+    for key in (DEPLOYMENTS, HOLDS):
+        if key not in keys and any(key in exports[index] for index in order):
+            after = DEPLOYMENTS if key == HOLDS and DEPLOYMENTS in keys else "kinds"  # read as the keys stand now
+            keys.insert(keys.index(after) + 1 if after in keys else len(keys), key)
     return keys
 
 

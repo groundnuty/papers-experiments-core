@@ -32,6 +32,10 @@ are the same text: no clock, no path and no random number enters it.
   0 is never mistaken for "not reported" (C23); and per condition and model the attempts a budget hold set aside, a row
   of zeros for each pair the plan runs, so a reader sees whether the budget stopped one model more than another (C26).
   Those come from the export's `budget_holds`, which counts a hold by its own kind even where an outage overlapped it.
+- A campaign whose health gate was held for a reason only an operator can end (a failed heal, O35; its export has
+  `operator_holds`) gets a section "Holds that needed an operator" after the budget holds (`expcore.report_holds`): each
+  hold's start, its end or `open`, whether it blocked the campaign and whether it charged a run, and the platform's
+  reason. A report of an export without them is the text it was before (C11).
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
@@ -64,6 +68,7 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.report_families import check_families, one_line, steps_lines
+from expcore.report_holds import section as operator_holds
 from expcore.report_notes import (
     ARM_LOST_HEADINGS,
     ARM_RUNS_NOTES,
@@ -583,6 +588,7 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         "",
         *_budget_holds(export),
         "",
+        *operator_holds(export, _table),  # only an export with such a hold has it (C11)
     ]
 
 

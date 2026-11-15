@@ -25,6 +25,7 @@ from gate_heal_support import (
 )
 
 from expcore.campaign.deferral import DEFERRAL_META
+from expcore.campaign.export import export_run_state
 from expcore.campaign.healthgate import META, alarms, fact
 from expcore_onedata import fault_gate_heal
 from expcore_onedata.admission import OUTAGE_RUN, FederationLock
@@ -251,3 +252,5 @@ def test_o35_a_failed_heals_wait_past_max_defer_s_is_a_blocking_hold_the_status_
     assert REASON in alarm
     (closed,) = [row["detail"] for row in store.q("SELECT detail FROM events WHERE kind='health_gate_closed'")]
     assert REASON in closed
+    (hold,) = export_run_state(store)["operator_holds"]  # and the export, so the report says it too (C11)
+    assert (hold["blocking"], hold["charged"], hold["end_utc"], hold["reason"]) == (True, False, None, REASON)
