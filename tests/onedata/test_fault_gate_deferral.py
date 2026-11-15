@@ -54,12 +54,14 @@ def five_providers(data, **faults):
 
 
 def four_providers(data, **faults):
-    """Four providers at the defaults of the heal: the 4,200 s and 320 s a declared heal gets with no other word, and
-    the token margin its restore bounds need."""
+    """Four providers at the defaults of the heal: the 4,200 s and 320 s a declared heal gets with no other word (the
+    bound derived from the settles at their defaults, since the fixture's own are short), and the token margin its
+    restore bounds need."""
     for name, index in (("gamma", 3), ("delta", 4)):
         data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
     stores = {name: f"store-{name}" for name in FIVE[:4]}
-    data["faults"] = faults_table(**{"services": stores, "heal": "all_links", "session_drain_s": 320, **faults})
+    defaults = {"settle_timeout_s": 180, "ready_timeout_s": 180, "session_drain_s": 320}
+    data["faults"] = faults_table(**{"services": stores, "heal": "all_links", **defaults, **faults})
     data["tokens"] = {**data.get("tokens", {}), "margin_s": RESTORE_MARGIN_S}
 
 

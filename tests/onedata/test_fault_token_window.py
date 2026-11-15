@@ -21,7 +21,7 @@ import time
 import pytest
 from campaign_support import LATER, NOW, keys_under, make_manifest, make_schema, open_store
 from fault_support import injector_for
-from heal_support import TARGET, four_providers, heal_injector, stale
+from heal_support import HEAL_TIMEOUT_S, TARGET, four_providers, heal_injector, stale
 from mcp import StdioServerParameters
 from record_support import record_run
 
@@ -39,7 +39,6 @@ from expcore_onedata.admission import SANDBOX_STEP, TOOL_SERVER_STEP, Federation
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import (
-    DEFAULT_HEAL_TIMEOUT_S,
     TOKEN_SLACK_S,
     heal_token_margin_s,
     load_faults,
@@ -59,7 +58,7 @@ DEFAULT_MARGIN_S = 900  # `[tokens] margin_s` by default
 # two starts each with its wait (2 x (10 s + 5 s + 1 s)) and a pause between them (1 s), the wait to serve (5 s + 1 s)
 # and the session gate (240 s), and the slack (300 s): 585 s. The long margin adds two heals of 4,200 s.
 FIXTURE_RESTORE_MARGIN_S = 585
-LONG_MARGIN_S = FIXTURE_RESTORE_MARGIN_S + 2 * int(DEFAULT_HEAL_TIMEOUT_S)  # 8,985 s
+LONG_MARGIN_S = FIXTURE_RESTORE_MARGIN_S + 2 * HEAL_TIMEOUT_S  # 8,985 s
 NESTED = "nested"  # the documented order: `running` inside both launches, so its exit restores while they run
 STOPPED_FIRST = "stopped_first"  # the other study's order: both launches stopped before `running`'s exit
 SANDBOX_OPEN = "sandbox_open"  # the tool server stopped before the restore, the sandbox not
@@ -427,7 +426,7 @@ def test_o35_an_executor_that_stops_the_tool_server_and_sandbox_before_the_resto
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     assert outage.config.tokens.margin_s == DEFAULT_MARGIN_S
     outage.at_restore = lambda: outage.wall.__setitem__(0, outage.token.expires_at + 1)
-    outage.heal_s = DEFAULT_HEAL_TIMEOUT_S
+    outage.heal_s = HEAL_TIMEOUT_S
     record = outage.run(schema, key, STOPPED_FIRST)
     assert outage.steps == [
         "record_run",
@@ -514,8 +513,8 @@ def test_o35_with_the_long_margin_declared_a_heal_inside_the_launches_runs_and_i
     schema, store, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests, margin_s=LONG_MARGIN_S)
     assert outage.config.tokens.margin_s == LONG_MARGIN_S
-    outage.services.on_stop = lambda service: outage.wall.__setitem__(0, outage.wall[0] + DEFAULT_HEAL_TIMEOUT_S)
-    outage.heal_s = DEFAULT_HEAL_TIMEOUT_S
+    outage.services.on_stop = lambda service: outage.wall.__setitem__(0, outage.wall[0] + HEAL_TIMEOUT_S)
+    outage.heal_s = HEAL_TIMEOUT_S
     record = outage.run(schema, key, NESTED)
     assert outage.steps == [
         "record_run",
@@ -525,7 +524,7 @@ def test_o35_with_the_long_margin_declared_a_heal_inside_the_launches_runs_and_i
         "tool_server_stopped",
         "sandbox_stop",
     ]
-    assert outage.wall[0] - WALL_START == 2 * DEFAULT_HEAL_TIMEOUT_S + CEILING_S
+    assert outage.wall[0] - WALL_START == 2 * HEAL_TIMEOUT_S + CEILING_S
     assert outage.wall[0] < outage.token.expires_at
     assert record.instruments["fault_injector"]["restore_verified"] is True
     assert stored(store, key, record) == ("done", 0, None)
