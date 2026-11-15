@@ -41,7 +41,15 @@ container restart journalled `clear_failed` during its settle. Whatever the heal
 check afresh (`relink`), so no pass from before the heal's end opens the gate: a heal that left a pair failing leaves it
 to the next check, which finds it stuck and fails closed, and none runs again until the gate's link check passes. A
 check under a run's admission keeps a share of it until it ends, so one that outlives its caller's wait still holds the
-federation.
+federation and no shortcut section of the run begins while it reads; while the run's own shortcut reset holds the
+federation's reset lock (`federation.reset`) the check is deferred, uncharged.
+
+**The heal takes no reset lock.** Its exclusive admission of `federation.lock` waits for the turnstile holding nothing
+and for the main lock holding the turnstile, as every exclusive admission does (`admission`, the lock order), and so it
+already excludes every shared holder, each with its share of `federation.reset`, and every shortcut reset, whose run
+keeps its share of `federation.lock` for the whole section. No section runs while the heal restarts links and reads the
+links again, and no holder of `federation.reset` waits for what the heal holds, so the heal never deadlocks with one:
+a section under way keeps the heal out until `health_wait_s` runs out, and the gate stays closed, uncharged.
 
 **A heal cut short** (its process killed, or a clean exit that stopped it between two steps, `stop_heal`) leaves no
 `ended` line, and the first one of a stuck episode is forgiven (`GateHeals.latched`): the next check that finds a pair
@@ -277,11 +285,23 @@ class FaultGate:
     def _held_check(self, held: Admission) -> Health:
         """The check under the caller's admission, a share of it kept until the check ends: a check that outlives its
         caller's wait (the core gives up on it, and the run lets its admission go) still holds the federation while it
-        reads, so no heal's admission is granted under it. An admission already being let go fails it closed."""
+        reads, so no heal's admission is granted under it, and no shortcut section of the run can seal the admission
+        while the check reads a study's file. An admission already being let go fails it closed; one the run's own
+        shortcut reset holds (its section sealed it, or its share of the reset lock is given up) defers the check,
+        uncharged."""
         give_up = held.try_retain()
-        if give_up is None:
+        if give_up is None and not held.shares.sealed:
             return Health(
                 False, "the run's admission was let go before its check could hold it, so nothing was checked"
+            )
+        if give_up is None or not held.may_act:
+            if give_up is not None:
+                give_up()
+            return Health(
+                False,
+                "the run's own shortcut reset holds the federation's reset lock: the check waits for it",
+                deferred=True,
+                charge=False,
             )
         try:
             return self._judged()[0]
@@ -330,7 +350,9 @@ class FaultGate:
         """The check's own link check found a stuck pair, and the check holds no run's admission: take an exclusive
         admission of the gate's own and hand it to a heal in the background, answering the uncharged deferral, so the
         heal never runs past the core's wait for this check (`health_timeout_s`) and no run is charged for it; fail
-        closed whenever it cannot begin."""
+        closed whenever it cannot begin. The admission takes no reset lock (see the module docstring): the check's own
+        shared hold, with its share of `federation.reset`, is let go before it, and the exclusive hold of
+        `federation.lock` already keeps every shortcut reset out."""
         if self._healer is None or self._relink is None:  # no heal declared, or no sanction, services or reports
             return verdict
         refused = self._refused(verdict)  # read first, so a latched gate waits for nobody

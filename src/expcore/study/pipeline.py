@@ -101,6 +101,7 @@ from expcore.replay.check import (
 from expcore.replay.native import has_native_parser
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
+from expcore.stats.ratio import OMIT_NONE
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
     MODELS_FILE,
@@ -581,9 +582,17 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _finite(value: Any) -> Any:
-    """Reduce a value to JSON data: dataclasses and mappings to dicts, sequences to lists, NaN and infinity to None."""
+    """Reduce a value to JSON data: dataclasses and mappings to dicts, sequences to lists, NaN and infinity to None.
+
+    A dataclass field whose metadata sets `OMIT_NONE` is left out while it is None (a ratio contrast's per-arm columns,
+    S13; a contrast's smallest effect of interest, S16), so a record that declares none is written byte for byte as
+    before the field existed; every other field is written, None as null."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: _finite(getattr(value, f.name)) for f in dataclasses.fields(value)}
+        return {
+            f.name: _finite(getattr(value, f.name))
+            for f in dataclasses.fields(value)
+            if not (f.metadata.get(OMIT_NONE) and getattr(value, f.name) is None)
+        }
     if isinstance(value, Mapping):
         return {str(k): _finite(v) for k, v in value.items()}
     if isinstance(value, list | tuple):
@@ -720,11 +729,21 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
     return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
 
 
+def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
+    """The Holm decisions `analysis.json` holds: `holm`, every member's decision as its own family made it, and,
+    only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
+    decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named."""
+    entries: dict[str, Any] = {"holm": result.holm}
+    if result.holm_families:
+        entries["holm_families"] = result.holm_families
+    return entries
+
+
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
-    Holm decision. `exploratory_only` is true when the preregistration makes no confirmatory claim (S12): there is then
-    no Holm decision, and every contrast is exploratory."""
+    Holm decision, with each named family's steps (S17). `exploratory_only` is true when the preregistration makes no
+    confirmatory claim (S12): there is then no Holm decision, and every contrast is exploratory."""
     return {
         "preregistration": dict(analysis.result.manifest),
         "exploratory_only": analysis.result.exploratory_only,
@@ -737,7 +756,7 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         "excluded_attempts": analysis.export["excluded_attempts"],
         "conditions": condition_accounting(analysis.export),
         "contrasts": analysis.result.contrasts,
-        "holm": analysis.result.holm,
+        **_holm_entries(analysis.result),
     }
 
 
