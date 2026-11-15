@@ -43,6 +43,13 @@ to the next check, which finds it stuck and fails closed, and none runs again un
 check under a run's admission keeps a share of it until it ends, so one that outlives its caller's wait still holds the
 federation.
 
+**It notes the federation's link epoch for the run's admission (O35, `admission_recheck`).** A check that holds no
+run's admission reads the link epoch (`fault_epoch`) under its shared hold and notes it in the try's note
+(`expcore.campaign.prerun`); the run's admission compares it with the epoch then, and a heal begun or a pair found
+failing since refuses the run, uncharged. A link check of the gate that finds a pair failing, in any call, raises the
+epoch. A link report made before the epoch last moved is no answer: the check makes the link check afresh (`relink`),
+so a failing pair or a heal another process saw is seen at this process's next check.
+
 **A heal cut short** (its process killed, or a clean exit that stopped it between two steps, `stop_heal`) leaves no
 `ended` line, and the first one of a stuck episode is forgiven (`GateHeals.latched`): the next check that finds a pair
 stuck heals again. A reader's container it stopped and never started is an open injection, which the check's recovery
@@ -62,6 +69,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from expcore.campaign import prerun
 from expcore.campaign.healthgate import Health, HealthCheck, read_health
 from expcore.errors import TARGET_LABEL, InfraError
 from expcore_onedata.admission import (
@@ -75,10 +83,11 @@ from expcore_onedata.admission import (
     current_admission,
     require_same_federation,
 )
+from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
-from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling
+from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
 from expcore_onedata.fault_settings import FaultSettings, heal_all_links_reserve, heal_container_reserve
 
 _PURPOSES = {
@@ -174,6 +183,9 @@ class FaultGate:
         self._inner = inner
         self._links, self._relink = links, relink
         self._heals = GateHeals(settings.journal)
+        self._epoch = LinkEpoch(settings.journal)
+        self._fresh_guard = threading.Lock()  # the link epoch the latest link check this gate took answers for
+        self._fresh_epoch: int | None = None
         declared = settings.heal != "off" and self._may_recover
         heals = declared and links is not None and relink is not None and bool(labels)
         self._exiting = threading.Event()  # a clean exit asked the heal to start no further step (`stop_heal`)
@@ -264,7 +276,7 @@ class FaultGate:
             except FederationBusy:
                 return self._busy()
             try:  # held shared for the whole check: no injection starts until it has answered
-                verdict, made = self._judged()
+                verdict, made = self._judged(self._noted())
             finally:
                 shared.close()
             stuck = made is not None and not verdict.ok and any(pair.stuck for pair in made.pairs)
@@ -298,10 +310,28 @@ class FaultGate:
     def _taken(self) -> Any:
         return None if self._links is None else self._links()
 
-    def _judged(self) -> tuple[Health, LinkMatrix | None]:
+    def _noted(self) -> int:
+        """Under the shared hold of a check that holds no run's admission: the federation's link epoch, noted for the
+        run's admission in the try's note (`admission_recheck`, `prerun`; a dispatcher's check has none). A link report
+        made before the epoch last moved is no answer (a heal, or a failing pair, maybe in another process), so the
+        link check is then made afresh (`relink`). A record that cannot be read fails the check."""
+        try:
+            epoch = int(self._epoch.read()["epoch"])
+        except (OSError, ValueError) as error:  # its type only (O12)
+            raise failure(f"the federation's link epoch cannot be read ({type(error).__name__})") from None
+        with self._fresh_guard:
+            stale = self._fresh_epoch is None or self._fresh_epoch < epoch
+        if stale and self._relink is not None:
+            self._relink()
+        prerun.note(GATE_NOTE, epoch)
+        return epoch
+
+    def _judged(self, epoch: int | None = None) -> tuple[Health, LinkMatrix | None]:
         """With the federation held: the check (`_checked`), and the matrix of the link check it made in this call, in
         this thread (None when it made none: a report another call made is never this call's). A link check of this
-        call that passed lets a later stuck pair be healed again (`GateHeals.passed`), while the federation is held."""
+        call that passed lets a later stuck pair be healed again (`GateHeals.passed`), while the federation is held;
+        one that found a pair failing raises the federation's link epoch (`fault_epoch`). `epoch` is what `_noted`
+        read for this call: a link check it made answers for that epoch."""
         self._taken()  # whatever this thread's earlier calls left untaken is not this call's
         verdict = self._checked()
         report = self._taken()
@@ -311,7 +341,22 @@ class FaultGate:
         if matrix.ok:
             with contextlib.suppress(OSError, ValueError):  # the latch then stays, and no heal runs: closed
                 self._heals.passed()
+        else:
+            verdict = self._counted(verdict)
+        if epoch is not None:
+            with self._fresh_guard:
+                self._fresh_epoch = epoch if self._fresh_epoch is None else max(self._fresh_epoch, epoch)
         return verdict, matrix
+
+    def _counted(self, verdict: Health) -> Health:
+        """A link check of this call found a pair failing: raise the federation's link epoch, so a run whose pre-run
+        check came before it is refused at its admission. One that cannot be raised is said in the detail."""
+        try:
+            self._epoch.raise_for(LINKS_FAILED)
+        except (OSError, ValueError) as error:  # its type only (O12)
+            why = f"the federation's link epoch could not be raised ({type(error).__name__})"
+            return verdict._replace(detail=f"{verdict.detail}; {why}")
+        return verdict
 
     def _latched(self, verdict: Health) -> Health | None:
         """The answer when no heal may run (a heal has begun since the gate's link check last passed, or the record

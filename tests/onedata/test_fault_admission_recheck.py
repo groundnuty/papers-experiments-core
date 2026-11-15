@@ -1,0 +1,221 @@
+"""O35: a run's admission re-reads the fault gate's state, and refuses, uncharged, a run its check cannot vouch for.
+
+A run's pre-run check can pass before a heal (or before a pair fails), and the run then waits for its lease and for the
+federation's admission. A heal that runs, or a link check that finds a pair failing, in that window would otherwise let
+the run in onto a stuck link once the heal let the federation go. So the check notes the federation's link epoch in the
+try's note (`expcore.campaign.prerun`), and the run admission, holding the lock it took, compares it with the epoch
+now: a heal begun or a pair found failing since refuses the run as the hold `federation_busy`, which uses no attempt,
+and the campaign asks again, with a fresh check.
+"""
+
+import contextlib
+import contextvars
+import threading
+
+import pytest
+from campaign_support import make_schema
+from expcore_onedata.fault_epoch import GATE_NOTE, LinkEpoch
+from gate_support import CRASHED, EVERY, READER, Federation, gate_of
+from heal_support import heal_injector, stale
+from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings_for
+
+from expcore.campaign import prerun
+from expcore.campaign.factors import FactorSchema
+from expcore.errors import uncharged_kinds
+from expcore_onedata.admission import FederationBusy, run_admission
+from expcore_onedata.config import load_platform
+from expcore_onedata.fault_gate_heal import GateHeals
+from expcore_onedata.fault_settings import load_faults
+from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
+
+RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
+SMALL = {"tasks": ("task-a",), "seeds": (1,)}
+SCHEMA = make_schema()
+ONE = FactorSchema(SCHEMA.declared, SCHEMA.order, {"api-none": SCHEMA.conditions["api-none"]})  # a plan of one run
+ONE_KEY = key_of(ONE, "api-none")
+HEAL_WAITS = (False, True, False)  # (ok, deferred, charge): the answer of the check that begins a heal
+
+
+def admission_in(directory):
+    """The campaign's run admission for the platform in `directory`."""
+    return run_admission(load_platform(directory / "platform.toml", require_secrets=False))
+
+
+def admitted(admit) -> str:
+    """Enter and leave a baseline run's admission; what it held."""
+    with admit((), {}, threading.Event(), False) as mode:
+        return mode
+
+
+def elsewhere(call):
+    """`call` in a context of its own: another worker's check, never the try under test's."""
+    return contextvars.Context().run(call)
+
+
+def heal_meanwhile(gate, federation):
+    """Another run's check finds the pair stuck and begins the heal; once it has ended, past its settle."""
+    federation.stuck = {(READER, CRASHED)}
+    began = elsewhere(gate)
+    assert (began.ok, began.deferred, began.charge) == HEAL_WAITS, began.detail
+    assert gate.wait_for_heal(10)
+    federation.clock.sleep(600)  # past the drain record each restart's settle wrote on the gate's clock
+
+
+def test_o35_a_heal_between_a_runs_check_and_its_admission_refuses_it_until_a_fresh_check(tmp_path):
+    """O35: the run's check passed; then another check heals a stuck pair, and the heal mends it. The run is refused at
+    admission, uncharged, and admitted once a check made after the heal has passed."""
+    gate, federation, _, _ = gate_of(tmp_path, heal="all_links")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    with prerun.opened():
+        assert gate().ok
+        heal_meanwhile(gate, federation)
+        assert gate.last_heal["outcome"] == "healed"
+        with pytest.raises(FederationBusy, match="a heal began") as refused:
+            admitted(admit)
+        assert gate().ok  # the run's next check, after the heal
+        assert admitted(admit) == "shared"
+    assert refused.value.kind == FEDERATION_BUSY
+    assert FEDERATION_BUSY in uncharged_kinds()
+
+
+def test_o35_a_heal_that_leaves_the_pair_stuck_with_no_container_restart_refuses_the_waiting_run(tmp_path):
+    """O35: the heal ends `links_stuck` and restarted no container; the run whose check passed before it is refused at
+    admission, and its next check finds the pair still stuck, so it is never admitted onto it."""
+    federation = Federation()
+    federation.link_fixes = dict.fromkeys(EVERY, ())
+    gate, federation, _, _ = gate_of(tmp_path, federation, heal="all_links", heal_container_fallback=False)
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    with prerun.opened():
+        assert gate().ok
+        heal_meanwhile(gate, federation)
+        assert gate.last_heal["outcome"] == "links_stuck"
+        assert [verb for verb, _, _ in federation.actions if verb in ("stop", "start")] == []
+        with pytest.raises(FederationBusy, match="a heal began"):
+            admitted(admit)
+        after = gate()
+    assert (after.ok, after.deferred) == (False, False), after.detail
+
+
+def test_o35_a_pair_found_failing_between_a_runs_check_and_its_admission_refuses_it_uncharged(tmp_path):
+    """O35: no heal runs (`heal = "off"`), but another check finds a pair failing after the run's check passed: the run
+    is refused at admission as the uncharged hold."""
+    gate, federation, _, _ = gate_of(tmp_path, heal="off")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    with prerun.opened():
+        assert gate().ok
+        federation.stuck = {(READER, CRASHED)}
+        assert elsewhere(gate).ok is False
+        with pytest.raises(FederationBusy, match="found a pair failing") as refused:
+            admitted(admit)
+    assert refused.value.kind == FEDERATION_BUSY
+
+
+def test_o35_a_run_whose_federation_saw_no_heal_and_no_failure_since_its_check_is_admitted(tmp_path):
+    """O35: other checks pass meanwhile and nothing is healed: the run is admitted as it would be without the
+    re-check."""
+    gate, federation, _, _ = gate_of(tmp_path, heal="all_links")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    with prerun.opened():
+        assert gate().ok
+        assert elsewhere(gate).ok
+        assert admitted(admit) == "shared"
+
+
+def test_o35_a_try_whose_check_noted_no_link_epoch_is_refused_once_then_admitted_after_its_check(tmp_path):
+    """O35: the try's check never reached the fault gate, so when it was made is unknown: the run is refused once,
+    uncharged, never admitted blind, and admitted after a check of the gate."""
+    gate, federation, _, _ = gate_of(tmp_path, heal="all_links")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    with prerun.opened():
+        with pytest.raises(FederationBusy, match="unknown"):
+            admitted(admit)
+        assert gate().ok
+        assert admitted(admit) == "shared"
+
+
+def test_o35_a_heal_on_record_since_the_gates_link_check_last_passed_refuses_the_admission(tmp_path):
+    """O35: the heal record holds a heal begun since the gate's link check last passed (one the epoch did not count):
+    the gate has not seen every pair pass since, so the run is refused, uncharged."""
+    gate, federation, _, settings = gate_of(tmp_path, heal="all_links")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    with prerun.opened():
+        assert gate().ok
+        GateHeals(settings.journal).append({"event": "healing", "id": "another-process", "mode": "all_links"})
+        with pytest.raises(FederationBusy, match="since the fault gate's link check last passed"):
+            admitted(admit)
+
+
+def test_o35_a_failure_another_process_found_makes_the_next_check_check_the_links_afresh(tmp_path):
+    """O35: this process's last link check passed and is still recent; another process's gate then finds a pair
+    failing. The next check here checks the links afresh instead of answering the older pass, so it never vouches for
+    a run on that pair."""
+    gate, federation, check, settings = gate_of(tmp_path, heal="off")
+    check.cache = True
+    federation.stuck = set()
+    assert gate().ok
+    federation.stuck = {(READER, CRASHED)}
+    assert gate().ok  # the recent pass answers: nothing here knows the pair is failing
+    LinkEpoch(settings.journal).raise_for("links_failed")  # another process's gate finds it
+    after = gate()
+    assert (after.ok, after.deferred) == (False, False), after.detail
+
+
+def test_o35_a_restores_heal_raises_the_link_epoch_so_a_run_checked_before_it_is_refused(tmp_path):
+    """O35: an outage run's restore heals the pairs its provider's outage left stuck; a run whose check passed before
+    that heal is refused at its admission, as for a heal of the gate's."""
+    injector, _ = heal_injector(tmp_path, stale(), heal="all_links")
+    platform = tmp_path / "platform.toml"
+    journal = load_faults(platform, load_platform(platform, require_secrets=False)).journal
+    before = LinkEpoch(journal).read()["epoch"]
+    injector.start(RUN)
+    assert injector.clear() is True
+    assert LinkEpoch(journal).read()["event"] == "heal"
+    with prerun.opened():
+        prerun.note(GATE_NOTE, before)  # what the run's check noted before the outage run took the federation
+        with pytest.raises(FederationBusy, match="a heal began"):
+            admitted(admission_in(tmp_path))
+
+
+def test_o35_a_campaign_run_refused_for_a_heal_uses_no_attempt_and_runs_after_a_fresh_check(tmp_path):
+    """O35: in a campaign whose `max_attempts` is 1, a heal runs between the run's pre-run check and its admission. The
+    run is left unstarted with the reason in its event, uses no attempt, and runs once a fresh check has passed."""
+    federation_dir = tmp_path / "federation"
+    gate, federation, _, _ = gate_of(federation_dir, heal="all_links")
+    federation.stuck = set()
+    admit = admission_in(federation_dir)
+    asked = []
+
+    @contextlib.contextmanager
+    def heal_first(kinds, targets, cancel, exclusive):
+        asked.append(kinds)
+        if len(asked) == 1:  # between this run's check and its admission, another check heals a stuck pair
+            heal_meanwhile(gate, federation)
+        with admit(kinds, targets, cancel, exclusive) as mode:
+            yield mode
+
+    settings = settings_for(max_attempts=1)
+    with build(
+        tmp_path / "campaign",
+        schema=ONE,
+        executor=FakeExecutor(),
+        plan=SMALL,
+        settings=settings,
+        health=gate,
+        admission=heal_first,
+    ) as scheduler:
+        summary = scheduler.run()
+        rows = attempts_of(scheduler.store, ONE_KEY)
+        charged = scheduler.store.charged_attempts(ONE_KEY)
+        unstarted = [r["detail"] for r in scheduler.store.q("SELECT detail FROM events WHERE kind='run_unstarted'")]
+    assert summary.statuses == {"done": 1}
+    assert [state for state, _, _ in rows] == ["done"]
+    assert charged == 0
+    assert len(unstarted) == 1
+    assert "no attempt used" in unstarted[0]
+    assert "a heal began" in unstarted[0]

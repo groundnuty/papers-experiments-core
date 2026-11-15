@@ -62,10 +62,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign import prerun
 from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.errors import InfraError
+from expcore_onedata.admission_recheck import refusal
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
@@ -478,6 +480,10 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
     bounded by `admission_timeout_s`, ends with the campaign, and runs before the agent's clock starts; one that fails
     leaves the run unstarted.
 
+    Holding the lock, it re-reads the fault gate's state (`admission_recheck`): a run whose pre-run check a heal or a
+    failing pair has outdated since, or whose check noted nothing, is refused as `FederationBusy`, uncharged, and the
+    campaign checks it again.
+
     Given the study's `schema`, a condition that declares `exclusive = true` on a platform without `[faults]` is
     refused, naming the study file and the key: there is no federation lock to hold.
     """
@@ -507,6 +513,11 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
         with lock.held(
             exclusive=outage or exclusive, timeout_s=timeout_s, target=target, cancel=cancel, purpose=purpose
         ) as admission:
+            # under the lock, so no heal begins while it decides: a heal or a failing pair since the run's pre-run check
+            # refuses it, uncharged, and the campaign checks it again (`admission_recheck`)
+            refused = refusal(settings.journal, prerun.current())
+            if refused is not None:
+                raise FederationBusy(refused)
             yield "exclusive" if admission.exclusive else "shared"  # what it took, never what was asked
 
     return admit
