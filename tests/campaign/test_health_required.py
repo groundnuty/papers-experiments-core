@@ -93,6 +93,24 @@ def test_o35_a_platform_cannot_declare_the_need_without_saying_why(reason):
         requiring(hold, reason)
 
 
+def test_o35_declaring_a_need_hides_no_other_declaration_of_the_wrapped_admission():
+    """O35: the core reads other hooks off the admission it is given (the deferral the platform declares, say), so the
+    admission that declares a need passes every other attribute of the one it wraps through, and an attribute the
+    wrapped one lacks is still absent."""
+
+    class Declares:
+        def __call__(self, *args):
+            return hold(*args)
+
+        def declared_deferral_s(self):
+            return 42
+
+    wrapped = requiring(Declares(), WHY)
+    assert wrapped.declared_deferral_s() == 42
+    assert getattr(wrapped, "no_such_hook", None) is None
+    assert required_reason(wrapped) == WHY
+
+
 def test_o35_the_declaring_admission_is_called_with_keywords_as_the_admission_it_wraps_is():
     """O35: the wrapper forwards what it is called with, keywords included, so a caller that named its arguments
     before the declaration still works."""

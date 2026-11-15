@@ -48,6 +48,13 @@ class _Requiring:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.admit(*args, **kwargs)
 
+    def __getattr__(self, name: str) -> Any:
+        """Any other declaration of the wrapped admission (a hook the core reads, such as `declared_deferral_s`) is the
+        wrapper's too, so declaring a need hides nothing the platform declared."""
+        if name == "admit" or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self.admit, name)
+
 
 def requiring_health_check(admit: RunAdmission, reason: str) -> RunAdmission:
     """`admit`, declaring that its platform needs a health check for `reason` (what a study's author is shown).

@@ -128,11 +128,12 @@ from typing import Any
 from expcore.campaign import prerun
 from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
-from expcore.campaign.health_required import requiring_health_check
+from expcore.campaign.healthgate import DeferralBound
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.errors import InfraError
 from expcore_onedata.admission_recheck import HEALTH_REQUIRED, refusal, unchecked_refusal
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_deferral import heal_deferral_bound
 from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
 from expcore_onedata.fault_recovery import failure
@@ -744,8 +745,42 @@ def require_same_federation(admission: Admission, federation: Federation) -> Non
         )
 
 
+class RunAdmit:
+    """The campaign's run admission of a platform with `[faults]`: a callable the core enters around every attempt
+    (`RunAdmission`), which also declares the longest the platform's health check may stay deferred, read from the same
+    `[faults]` settings with no health object between (`declared_deferral_s`). The core compares it with the health
+    check it is given and refuses the campaign when that check does not carry it (`fault_deferral`). A study that
+    wraps the admission in a callable of its own passes `declared_deferral_s` on too, or only the health check's own
+    declaration is read.
+
+    It declares that the campaign needs a health check (`requires_health_check`, the reason `HEALTH_REQUIRED`, read by
+    `expcore.campaign.health_required`): the scheduler refuses, when it is built, a campaign with this admission and no
+    health check, and a wrapper of the study's own passes the attribute on as well (`functools.wraps` does)."""
+
+    requires_health_check = HEALTH_REQUIRED
+
+    def __init__(self, admit: RunAdmission, settings: FaultSettings) -> None:
+        self._admit, self._settings = admit, settings
+
+    def __call__(
+        self,
+        treatment_kinds: tuple[str, ...],
+        treatment_targets: Mapping[str, str],
+        cancel: threading.Event,
+        exclusive: bool,
+    ) -> contextlib.AbstractContextManager[str]:
+        return self._admit(treatment_kinds, treatment_targets, cancel, exclusive)
+
+    def declared_deferral_s(self) -> DeferralBound | None:
+        """The platform's declared longest deferral of its health check, as `PlatformHealth.max_deferral_s` answers it
+        (`fault_deferral.heal_deferral_bound`); None with `heal = "off"`."""
+        return heal_deferral_bound(self._settings)
+
+
 def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) -> RunAdmission | None:
-    """The campaign's run admission for a platform with `[faults]` (`StudyPlugin.admission`), None without one.
+    """The campaign's run admission for a platform with `[faults]` (`StudyPlugin.admission`), None without one. It
+    also declares the platform's longest deferral (`RunAdmit.declared_deferral_s`), which the core holds the health
+    check passed to the scheduler to.
 
     The core enters it before an attempt starts and leaves it after the attempt's post-run check: a run whose condition
     declares `provider_outage` holds the federation exclusively, with its target's label in the holder record, and so
@@ -800,7 +835,7 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
                 raise FederationBusy(refused)
             yield "exclusive" if admission.exclusive else "shared"  # what it took, never what was asked
 
-    return requiring_health_check(admit, HEALTH_REQUIRED)
+    return RunAdmit(admit, settings)
 
 
 def require_admission(config: PlatformConfig) -> None:
