@@ -222,7 +222,8 @@ class InjectionJournal:
         """Return the open injections, each with `injected` set when it was seen down, `stop_unknown` when the stop was
         asked for (`stopping`, or a stop command that raised) and the target was not then seen down, and
         `stop_unrecorded` when no line says the stop was asked for and the target was not seen down either, and
-        `healed` when a `clear_failed` line says a link heal ran for it (`healing`, O35); raise ValueError when a
+        `healed` when a `clear_failed` line says a link heal ran for it (`healing`, O35), and `healing` when that marker
+        is its latest `clear_failed` line (the heal is under way, or was cut short); raise ValueError when a
         complete line is not an injection event. Only an incomplete final line is ignored: it was never acted on."""
         if not self.path.exists():
             return []
@@ -248,6 +249,8 @@ class InjectionJournal:
                 entries[key]["stop_unknown"] = True  # the stop was asked for: the daemon may still be stopping it
             elif event == "clear_failed" and key in entries:
                 entries[key]["clear_failed"] = str(line.get("how"))  # still open: its restore failed
+                # the heal's own marker as the latest line: a heal under way, or cut short, not yet a failed restore
+                entries[key]["healing"] = line.get("healing") is True
                 if line.get("healing") is True:  # a link heal ran for it (O35): no process heals it again
                     entries[key]["healed"] = True
                 held = line.get("settle_until")  # a heal's settle (O35): no process reads through the links before it

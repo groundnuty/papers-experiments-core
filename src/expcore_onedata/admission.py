@@ -13,12 +13,14 @@ server and the sandbox (`SandboxPlatform.launch`) refuse to start without an adm
 
 Waiting for the lock is admission, before the agent's loop starts, so it is outside the agent's time and charges it
 nothing, as a lease taken before the run is. Taken inside a tool call instead, it is a `lease_queue` wait (`waits=`).
-The wait is a poll of a non-blocking lock with a bound (`admission_timeout_s`), which a cancellation stops. Under a
-shared admission the journal must show no unsettled injection, checked while the lock is held, or the run is refused
-as `injector_failure`. A held admission is a `HeldLock`: closed by its finalizer when its owner is dropped, and closed
-in a forked child. An admission names the federation it holds (`Federation`: the lock file's resolved path and the
-digest of platform.toml), and `require_admission` and the injector refuse one held for another federation, so a run
-of one platform is never admitted by a lock of another.
+The wait is a poll of a non-blocking lock with a bound (`admission_timeout_s`), which a cancellation stops; one that
+runs out while another run holds the federation (an outage run's heal, say), or while it stays closed for an outage
+run's session drain (below), is `FederationBusy`, the hold `federation_busy`, which costs the waiting run no attempt.
+Under a shared admission the journal must show no unsettled injection, checked while the lock is held, or the run is
+refused as `injector_failure`. A held admission is a `HeldLock`: closed by its finalizer when its owner is dropped, and
+closed in a forked child. An admission names the federation it holds (`Federation`: the lock file's resolved path and
+the digest of platform.toml), and `require_admission` and the injector refuse one held for another federation, so a
+run of one platform is never admitted by a lock of another.
 
 `flock` is not fair, so a steady stream of shared holders could keep an outage run out for ever. A turnstile prevents
 that: every admission, shared or exclusive, first takes `federation.intent` exclusively, then the main lock, and only
@@ -69,7 +71,7 @@ from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, make_directories
 from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
-from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
+from expcore_onedata.sandbox.kinds import FEDERATION_BUSY, PROVIDER_OUTAGE
 
 FEDERATION_LOCK = "federation.lock"
 FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock
@@ -85,7 +87,10 @@ class AdmissionRefused(ConfigError):
 
 
 class FederationBusy(InfraError):
-    """The bounded wait for the federation ran out: another holds it (kind `injector_failure`, as any failed wait)."""
+    """The bounded wait for the federation ran out while another held it: the hold `federation_busy`, never charged."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(FEDERATION_BUSY, detail)
 
 
 @dataclass(frozen=True)
@@ -269,9 +274,9 @@ class FederationLock:
                 if cancel is not None and cancel.is_set():
                     raise failure("the wait for the federation was cancelled")
                 if deadline is not None and time.monotonic() >= deadline:
+                    # the hold `federation_busy`, as a wait for the lock that runs out: the run did nothing (O11)
                     raise FederationBusy(
-                        INJECTOR_FAILURE,
-                        "the federation stayed closed past the bound of the wait: an outage run's sessions drain",
+                        "the federation stayed closed past the bound of the wait: an outage run's sessions drain"
                     )
                 pause = min(left, 0.5)
                 time.sleep(pause if deadline is None else min(pause, max(0.0, deadline - time.monotonic())))
@@ -299,7 +304,7 @@ class FederationLock:
             if cancel is not None and cancel.is_set():
                 raise failure("the wait for the federation was cancelled")
             if deadline is not None and time.monotonic() >= deadline:
-                raise FederationBusy(INJECTOR_FAILURE, "the federation stayed held past the bound of the wait")
+                raise FederationBusy("the federation stayed held past the bound of the wait")
             time.sleep(self._poll_s)
 
     def _admit(self, main: HeldLock, exclusive: bool, purpose: str, target: str | None) -> Admission:
@@ -356,8 +361,9 @@ class FederationLock:
     ) -> Admission:
         """Pass the turnstile, then wait for the lock while holding it, polling, at most `timeout_s` in all and until
         `cancel` is set, and then, holding the lock, for the drain record to pass (`drain_left`), inside the same bound;
-        raise InfraError of kind `injector_failure` when it could not be had (`FederationBusy` when the wait ran out).
-        `purpose` and `target` go into the holder record of an exclusive admission."""
+        raise `FederationBusy` (the hold `federation_busy`) when either wait ran out, and InfraError of kind
+        `injector_failure` when it was cancelled or the holder record failed. `purpose` and `target` go into the holder
+        record of an exclusive admission."""
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
         try:
