@@ -43,6 +43,8 @@ from expcore_onedata.fault_settings import (
     TOKEN_SLACK_S,
     heal_token_margin_s,
     load_faults,
+    restore_bound_s,
+    restore_drain_s,
     restore_token_margin_s,
 )
 from expcore_onedata.faults import INJECTOR_FAILURE, PROVIDER_OUTAGE
@@ -73,9 +75,16 @@ def settings_of(platform):
 
 
 def at_default_bounds(data, heal, margin_s, **faults):
-    """The four-provider federation with `[faults]` at its default bounds (the fixture shortens them)."""
+    """The four-provider federation with `[faults]` at its default bounds and drain (the fixture shortens them)."""
     four_providers(data, heal=heal)
-    for key in ("settle_timeout_s", "ready_timeout_s", "clear_attempts", "command_timeout_s", "poll_s"):
+    for key in (
+        "settle_timeout_s",
+        "ready_timeout_s",
+        "clear_attempts",
+        "command_timeout_s",
+        "poll_s",
+        "session_drain_s",
+    ):
         data["faults"].pop(key, None)
     data["faults"].update(faults)
     data["tokens"] = {"margin_s": margin_s}
@@ -83,8 +92,12 @@ def at_default_bounds(data, heal, margin_s, **faults):
 
 # the derivation at the default bounds, as the refusal spells it: the stop's wait and its pause (180 + 2), three
 # starts with their waits and pauses (3 x (120 + 180 + 2)), two pauses between them (2 x 2), the wait to serve and its
-# pause (180 + 2), the session gate (240) and the slack (300)
-DEFAULT_DERIVATION = r"182 \+ 906 \+ 4 \+ 182 \+ 240 \+ 300 = 1814"
+# pause (180 + 2), the session gate (240), the slack (300) and the session drain (320), which a clear that takes the
+# federation itself waits out before it restores; its own drain ends inside the restore's bound (1,514 s)
+DEFAULT_DERIVATION = r"182 \+ 906 \+ 4 \+ 182 \+ 240 \+ 300 \+ 320 = 2134"
+DRAIN_WORDS = (
+    "a drain record still standing, which a clear that takes the federation itself waits out before it restores"
+)
 
 
 @pytest.mark.parametrize("tokens", [None, {}, {"max_excess_s": 600}], ids=["no table", "empty table", "no key"])
@@ -101,9 +114,10 @@ def test_o35_a_platform_with_faults_that_declares_no_token_margin_is_refused_nam
             data["tokens"] = dict(tokens)
 
     expected = (
-        r"\[tokens\] margin_s is not declared.*the least is 1814 s.*settle_timeout_s 180 s.*command_timeout_s 120 s.*"
-        r"ready_timeout_s 180 s.*poll_s 2 s.*gate_timeout_s 240 s.*slack 300 s.*" + DEFAULT_DERIVATION + r".*"
-        r"add: \[tokens\] margin_s = 1814"
+        r"\[tokens\] margin_s is not declared.*the least is 2134 s.*settle_timeout_s 180 s.*command_timeout_s 120 s.*"
+        r"ready_timeout_s 180 s.*poll_s 2 s.*gate_timeout_s 240 s.*slack 300 s.*session_drain_s 320 s.*"
+        + DEFAULT_DERIVATION
+        + r".*add: \[tokens\] margin_s = 2134"
     )
     with pytest.raises(ConfigError, match=expected):
         settings_of(write_platform(tmp_path, edit))
@@ -115,42 +129,98 @@ def test_o35_a_token_margin_the_restore_and_gate_could_outlast_is_refused_with_i
     margin_s` must outlive it: a stop of unknown outcome waited out (settle_timeout_s 180 s), three starts each with its
     wait for the new identity (3 x (command_timeout_s 120 s + settle_timeout_s 180 s)) and two pauses between them, the
     wait to serve (ready_timeout_s 180 s), each wait one pause (poll_s 2 s) past its bound, and the session gate
-    (gate_timeout_s 240 s), 1,514 s at the defaults, and 300 s of slack: 1,814 s. A margin of 900 s is refused with
-    that derivation and the line to change, heal declared or not; the least, 1,814 s, loads."""
+    (gate_timeout_s 240 s), 1,514 s at the defaults, 300 s of slack, and the session drain (session_drain_s 320 s):
+    2,134 s. A margin of 900 s is refused with that derivation and the line to change, heal declared or not; the least,
+    2,134 s, loads."""
     expected = (
-        r"\[tokens\] margin_s = 900 is too small: the least is 1814 s.*settle_timeout_s 180 s.*3 starts.*"
+        r"\[tokens\] margin_s = 900 is too small: the least is 2134 s.*settle_timeout_s 180 s.*3 starts.*"
         r"command_timeout_s 120 s.*ready_timeout_s 180 s.*poll_s 2 s.*gate_timeout_s 240 s.*slack 300 s.*"
-        + DEFAULT_DERIVATION
-        + r".*set: \[tokens\] margin_s = 1814"
+        r"session_drain_s 320 s.*" + DEFAULT_DERIVATION + r".*set: \[tokens\] margin_s = 2134"
     )
     with pytest.raises(ConfigError, match=expected):
         settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, DEFAULT_MARGIN_S)))
-    with pytest.raises(ConfigError, match=r"margin_s = 1813 is too small: the least is 1814 s"):
-        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 1813)))
-    settings = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 1814)))
-    assert (restore_token_margin_s(settings), TOKEN_SLACK_S) == (1814, 300)
+    with pytest.raises(ConfigError, match=r"margin_s = 2133 is too small: the least is 2134 s"):
+        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 2133)))
+    settings = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 2134)))
+    assert (restore_token_margin_s(settings), TOKEN_SLACK_S, restore_drain_s(settings)) == (2134, 300, 320)
 
 
 def test_o35_a_least_margin_with_a_fraction_of_a_second_rounds_up_to_the_whole_second_the_line_names(tmp_path):
     """O35: `margin_s` is a whole number of seconds, so a least figure with a fraction (poll_s 0.5 s) names the next
     whole second as the least and in the line to add, and that margin loads."""
-    with pytest.raises(ConfigError, match=r"the least is 1804 s.*= 1803\.5.*\[tokens\] margin_s = 1804"):
+    with pytest.raises(ConfigError, match=r"the least is 2124 s.*= 2123\.5.*\[tokens\] margin_s = 2124"):
         settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 900, poll_s=0.5)))
-    assert settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 1804, poll_s=0.5)))
+    assert settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 2124, poll_s=0.5)))
 
 
 def test_o35_a_large_least_margin_is_named_in_full_never_in_exponent_form(tmp_path):
     """O35: the least and the line to write are whole numbers written out in full, which TOML reads as an integer, and
-    the derivation keeps every digit: a session gate of 1,000,000 s needs exactly 1,001,574 s."""
+    the derivation keeps every digit: a session gate of 1,000,000 s needs exactly 1,001,894 s."""
     with pytest.raises(ConfigError) as caught:
         settings_of(
             write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 900, gate_timeout_s=1_000_000))
         )
     message = str(caught.value)
-    assert "the least is 1001574 s" in message
-    assert "182 + 906 + 4 + 182 + 1000000 + 300 = 1001574" in message
-    assert message.endswith("[tokens] margin_s = 1001574")
+    assert "the least is 1001894 s" in message
+    assert "182 + 906 + 4 + 182 + 1000000 + 300 + 320 = 1001894" in message
+    assert message.endswith("[tokens] margin_s = 1001894")
     assert "e+" not in message
+
+
+def test_o35_the_refusal_names_the_session_drain_a_clear_that_takes_the_federation_itself_waits(tmp_path):
+    """O35, O11: the injector can always hold an exclusive admission of its own, whatever its run holds: a clear that
+    finds none held takes the federation itself, and that wait passes a drain record still standing, up to
+    `session_drain_s`, before it restores. So the least counts the drain, and the refusal names it with its declared
+    value: 320 s at the defaults, for a least of 2,134 s. The clear's own drain after the restore runs from the
+    restore's start and ends inside the restore's 1,514 s, so it adds nothing here."""
+    with pytest.raises(ConfigError) as caught:
+        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", DEFAULT_MARGIN_S)))
+    detail = str(caught.value).split("the least is", 1)[1]
+    assert detail.startswith(" 2134 s, the restore, its gate and the session drain before the tool server's stop")
+    assert f"slack 300 s + {DRAIN_WORDS} (session_drain_s 320 s): " in detail
+    assert "+ 300 + 320 = 2134" in detail
+    assert "past the restore's bound" not in detail
+
+
+def test_o35_a_session_drain_of_zero_takes_its_term_out_of_the_least(tmp_path):
+    """O35, O11: `session_drain_s = 0` declares no drain: a clear then takes no admission and waits for none, so the
+    derivation has no drain term and the least is the restore's bound and the slack, 1,814 s at the other defaults."""
+
+    def undrained(margin_s):
+        return write_platform(tmp_path, lambda data: at_default_bounds(data, "off", margin_s, session_drain_s=0))
+
+    with pytest.raises(ConfigError) as caught:
+        settings_of(undrained(DEFAULT_MARGIN_S))
+    detail = str(caught.value).split("the least is", 1)[1]
+    assert detail.startswith(" 1814 s, the restore and its gate before")
+    assert "182 + 906 + 4 + 182 + 240 + 300 = 1814" in detail
+    assert "session_drain_s" not in detail
+    assert DRAIN_WORDS not in detail
+    settings = settings_of(undrained(1814))
+    assert (restore_drain_s(settings), restore_token_margin_s(settings)) == (0, 1814)
+
+
+def test_o35_a_session_drain_longer_than_the_restore_adds_what_its_own_drain_outlasts(tmp_path):
+    """O35, O11: the clear's own drain, after its restore, runs from the restore's start, so it adds only what outlasts
+    the restore's bound: with `session_drain_s` of 2,000 s against the default bound of 1,514 s, the least is the
+    bound, the slack, the standing drain waited before the restore (2,000 s) and the 486 s its own drain outlasts the
+    restore: 4,300 s, each term named with its values."""
+
+    def drained(margin_s):
+        return write_platform(tmp_path, lambda data: at_default_bounds(data, "off", margin_s, session_drain_s=2000))
+
+    with pytest.raises(ConfigError) as caught:
+        settings_of(drained(DEFAULT_MARGIN_S))
+    message = str(caught.value)
+    past = "its own drain past the restore's bound (session_drain_s 2000 s - 1514 s)"
+    assert f"{DRAIN_WORDS} (session_drain_s 2000 s) + {past}: " in message
+    assert "182 + 906 + 4 + 182 + 240 + 300 + 2000 + 486 = 4300" in message
+    assert message.endswith("[tokens] margin_s = 4300")
+    with pytest.raises(ConfigError, match=r"margin_s = 4299 is too small: the least is 4300 s"):
+        settings_of(drained(4299))
+    settings = settings_of(drained(4300))
+    assert restore_bound_s(settings) == 1514
+    assert restore_drain_s(settings) == 2000 + (2000 - 1514)
 
 
 def test_o35_a_platform_without_faults_needs_no_token_margin_declared(tmp_path):
@@ -164,24 +234,28 @@ def test_o35_a_platform_without_faults_needs_no_token_margin_declared(tmp_path):
 
 def test_o35_a_long_pause_counts_against_the_token_margin_since_each_wait_ends_one_pause_past_its_bound(tmp_path):
     """O35, O06: each wait checks its bound only after a reading, so a restore can end one pause past each bound: with
-    `poll_s` of 2,000 s, a margin of 1,814 s, enough for the default pause, is refused, and the figure counts the pause
+    `poll_s` of 2,000 s, a margin of 2,134 s, enough for the default pause, is refused, and the figure counts the pause
     after the stop's wait, after each start's wait and between them, and after the wait to serve."""
-    with pytest.raises(ConfigError, match=r"margin_s = 1814 is too small: the least is .* s.*poll_s 2000 s"):
-        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 1814, poll_s=2000)))
+    with pytest.raises(ConfigError, match=r"margin_s = 2134 is too small: the least is .* s.*poll_s 2000 s"):
+        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 2134, poll_s=2000)))
     slow = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 20000, poll_s=2000)))
-    assert restore_token_margin_s(slow) == 1814 - 7 * 2 + 7 * 2000  # seven pauses with three starts
+    assert restore_token_margin_s(slow) == 2134 - 7 * 2 + 7 * 2000  # seven pauses with three starts
 
 
 def test_o35_the_fixtures_restore_fits_the_default_margin_and_the_long_margin_adds_two_heals(tmp_path):
     """O35: the four-provider fixture's shorter bounds fit the default margin, so a declared heal loads with it; the
     long margin is that restore's margin plus two heals of `heal_timeout_s` and the session drain the start's recovery
-    waits out (the fixture declares none), and nothing for a heal that is off."""
+    waits out (the fixture declares none), and nothing for a heal that is off. A drain declared counts in the restore's
+    margin too (the clear's: 320 s for the standing record, and the 35 s its own drain outlasts the fixture's 285 s
+    restore), and once more for the start's recovery in the long margin."""
     settings = settings_of(platform_with(tmp_path, heal="all_links"))
     assert load_platform(platform_with(tmp_path, heal="all_links"), require_secrets=False).tokens.margin_s == 900
     assert restore_token_margin_s(settings) == FIXTURE_RESTORE_MARGIN_S
     assert heal_token_margin_s(settings) == LONG_MARGIN_S == 585 + 2 * 4200
-    drained = settings_of(platform_with(tmp_path, heal="all_links", session_drain_s=320))
-    assert heal_token_margin_s(drained) == LONG_MARGIN_S + 320
+    drained = settings_of(platform_with(tmp_path, heal="all_links", session_drain_s=320, tokens={"margin_s": 940}))
+    assert restore_bound_s(drained) == 285
+    assert restore_token_margin_s(drained) == FIXTURE_RESTORE_MARGIN_S + 320 + (320 - 285) == 940
+    assert heal_token_margin_s(drained) == 940 + 2 * 4200 + 320
     assert heal_token_margin_s(settings_of(platform_with(tmp_path))) == 0.0
 
 

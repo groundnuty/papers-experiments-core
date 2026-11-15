@@ -40,6 +40,7 @@ def config(tmp_path, fake):
     def edit(data):
         add_sandbox(data)
         data["faults"] = faults_table(admission_timeout_s=10, session_drain_s=320)
+        data["tokens"] = {"margin_s": 1125}  # the fixture's restore, the slack and the drain (505 + 300 + 320 s)
 
     return load_platform(write_platform(tmp_path, edit))
 
