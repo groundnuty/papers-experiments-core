@@ -558,7 +558,7 @@ def missing_hooks(wrapper: Instrument, wrapped: Instrument) -> tuple[str, ...]
 ```
 
 - **The wrapper rule.** A wrapper passes each name in `OPTIONAL_HOOKS` on, as a method that calls the wrapped instrument's or through `__getattr__`, or leaves one out on purpose and says so in its test. `namespace`, `start` and `finish` are not optional, are not in the list, and a wrapper must have them.
-- **The list is the core's discovery.** `_method`, the one lookup of an optional hook, refuses a name that is not in `OPTIONAL_HOOKS`, and a test compares the list with every name the module looks an instrument up by, so a hook the core gains later is in the list, and so in the rule, or its tests fail.
+- **The list is the core's discovery.** `_method`, the one lookup of an optional hook, refuses a name that is not in `OPTIONAL_HOOKS`, and a test compares the list with every name the module looks an instrument up by, and fails on a lookup outside `_method` whose name it cannot read, so a hook the core gains later is in the list, and so in the rule, or its tests fail.
 - **`missing_hooks` is for a study's own test.** It returns the names the wrapped instrument has and the wrapper does not, in the list's order: `assert missing_hooks(wrapper, wrapped) == ()` for a wrapper that passes everything on, or the tuple a wrapper that drops one on purpose expects. A hook counts as the core counts it when it looks it up: an attribute that is callable. A property that answers None is no hook (the progressive ingest's `at_first_turn` is one outside its preallocated mode), so a wrapper around it misses nothing then, and a hook only the wrapper has is not missing. Test the wrapper around each instrument it wraps, in each mode that changes which hooks the instrument has.
 
 

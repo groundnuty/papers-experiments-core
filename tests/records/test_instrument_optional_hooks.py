@@ -18,16 +18,31 @@ REQUIRED = {"namespace", "start", "finish"}  # what every instrument has: not op
 LOOKUPS = {"_method", "getattr", "hasattr"}
 
 
-def discovered_names(source: str) -> set[str]:
-    """The names a module's source looks an optional member up by: the literal second argument of every call of
-    `_method`, `getattr` and `hasattr`, less the members every instrument has."""
+def lookups(source: str) -> tuple[set[str], list[int]]:
+    """How a module's source looks a member up on an instrument: the names given as a literal second argument of
+    every call of `_method`, `getattr` and `hasattr` (less the members every instrument has), and the lines of the
+    `getattr` and `hasattr` calls whose name is not a literal, which the scan cannot read. Whatever stands inside
+    `def _method` is the guarded lookup itself and is left out."""
+    tree = ast.parse(source)
+    guarded = {
+        id(inner)
+        for outer in ast.walk(tree)
+        if isinstance(outer, ast.FunctionDef) and outer.name == "_method"
+        for inner in ast.walk(outer)
+    }
     names: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
+    unreadable: list[int] = []
+    for node in ast.walk(tree):
+        if id(node) in guarded:
+            continue
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in LOOKUPS):
             continue
-        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
-            names.add(node.args[1].value)
-    return names - REQUIRED
+        name = node.args[1] if len(node.args) >= 2 else None
+        if isinstance(name, ast.Constant) and isinstance(name.value, str):
+            names.add(name.value)
+        elif node.func.id != "_method":  # `_method` refuses a name outside the list when it runs
+            unreadable.append(node.lineno)
+    return names - REQUIRED, unreadable
 
 
 class Bare:
@@ -87,8 +102,15 @@ def test_c31_the_exported_list_names_each_optional_hook_once_and_none_of_the_req
 def test_c31_the_list_is_every_optional_name_the_discovery_code_looks_an_instrument_up_by():
     """C31: a hook the discovery code calls but the list lacks (or one the list names that nothing looks up) fails
     here, so a hook added to the core without the list, and so without the wrapper rule, is caught."""
-    found = discovered_names(inspect.getsource(core_instruments))
-    assert found == set(OPTIONAL_HOOKS)
+    names, _ = lookups(inspect.getsource(core_instruments))
+    assert names == set(OPTIONAL_HOOKS)
+
+
+def test_c31_every_lookup_of_the_discovery_code_goes_through_the_guarded_helper_or_names_its_hook_in_the_source():
+    """C31: a lookup whose name the scan cannot read (a variable given to `getattr`) would reach a hook the list lacks
+    and the equality above would still pass, so the module has none outside the helper that guards the list."""
+    _, unreadable = lookups(inspect.getsource(core_instruments))
+    assert unreadable == []
 
 
 def test_c31_the_scan_finds_a_hook_looked_up_by_any_of_the_three_ways_and_leaves_the_required_members():
@@ -100,9 +122,25 @@ def test_c31_the_scan_finds_a_hook_looked_up_by_any_of_the_three_ways_and_leaves
         "    getattr(instrument, 'b_hook', None)\n"
         "    hasattr(instrument, 'c_hook')\n"
         "    getattr(instrument, 'namespace', None)\n"
-        "    getattr(instrument, name, None)\n"
     )
-    assert discovered_names(source) == {"a_hook", "b_hook", "c_hook"}
+    assert lookups(source) == ({"a_hook", "b_hook", "c_hook"}, [])
+
+
+def test_c31_the_scan_reports_a_lookup_by_a_variable_outside_the_helper_and_not_the_helpers_own():
+    """C31: a hook reached as `name = "at_last_turn"; getattr(instrument, name, None)` is reported by its line, so it
+    cannot go around the list unseen, while the one `getattr` of the guarded helper, which takes its name as a
+    variable by design, is not."""
+    source = (
+        "def _method(instrument, name):\n"
+        "    return getattr(instrument, name, None)\n"
+        "\n"
+        "def g(instrument):\n"
+        "    name = 'at_last_turn'\n"
+        "    hook = getattr(instrument, name, None)\n"
+        "    ok = hasattr(instrument, name)\n"
+        "    return _method(instrument, name)\n"
+    )
+    assert lookups(source) == (set(), [6, 7])
 
 
 def test_c31_the_discovery_helper_refuses_a_name_that_is_not_in_the_list():
