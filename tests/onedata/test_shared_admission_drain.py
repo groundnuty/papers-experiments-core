@@ -1,0 +1,131 @@
+"""O48: a tool outside a campaign is admitted the way a campaign run is, so it meets the session drain and the uncharged
+hold `federation_busy`.
+
+An outage run's release closes the federation for `[faults] session_drain_s` (`federation.drain`), and every admission
+waits for that record inside its bound; one whose bound runs out is `FederationBusy`, the hold `federation_busy`, which
+charges nothing. `shared_admission` goes through the same `FederationLock.held` (`admitted` for the async form), so a
+tool waits for the drain too, and its time-out is the same uncharged hold. Every test runs against the real lock and
+journal on the fixture's directory.
+"""
+
+import asyncio
+import dataclasses
+import time
+
+import pytest
+from fault_support import OUTAGE_TARGET, write_faults
+
+from expcore.errors import InfraError
+from expcore_onedata.admission import FederationBusy, FederationLock, current_admission
+from expcore_onedata.config import load_platform
+from expcore_onedata.fault_journal import DRAIN, InjectionJournal
+from expcore_onedata.faults import INJECTOR_FAILURE, load_faults
+from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
+from expcore_onedata.shared_holds import SharedHolds
+from expcore_onedata.tool_admission import shared_admission, shared_admission_async
+
+WAIT_S = 10.0  # a bound no test should reach
+PROBE_S = 0.2  # a bound that runs out
+DRAIN_S = 3.0  # the session drain an outage run's release leaves in these tests: long enough to outlast a slow fsync
+REASON = "smoke: warm-up of the first space"
+
+
+def federation(tmp_path, drain_s=DRAIN_S):
+    """The platform's configuration and its `[faults]` settings, with a drain of `drain_s`."""
+    platform = write_faults(tmp_path)
+    config = load_platform(platform, require_secrets=False)
+    settings = dataclasses.replace(load_faults(platform, config), session_drain_s=drain_s)
+    return config, settings
+
+
+def drained_outage(settings):
+    """An outage run that restored its provider and let the federation go: its armed drain is recorded on release.
+    Returns the wall-clock time the record holds."""
+    outage = FederationLock(settings).acquire(exclusive=True, timeout_s=PROBE_S, target=OUTAGE_TARGET)
+    outage.drain.arm()
+    outage.close()
+    until = InjectionJournal(settings.journal).read_drain()
+    assert until is not None
+    assert until > time.time()
+    return until
+
+
+def test_o48_a_tool_waits_for_the_session_drain_an_outage_run_left(tmp_path):
+    """O48: a tool that arrives just after an outage run let the federation go waits until its session drain has
+    passed, as a campaign run does, and only then holds the federation and records its hold."""
+    config, settings = federation(tmp_path)
+    until = drained_outage(settings)
+    with shared_admission(config, reason=REASON, timeout_s=WAIT_S) as admission:
+        assert time.time() >= until  # admitted only once the drain record had passed
+        assert admission is not None
+        assert admission.held
+    (hold,) = SharedHolds(settings.journal).holds()
+    assert hold["reason"] == REASON
+
+
+def test_o48_a_tools_bound_that_ends_inside_the_drain_is_the_uncharged_federation_busy(tmp_path):
+    """O48: a tool whose bound runs out inside an outage run's session drain is `FederationBusy`, the hold
+    `federation_busy` that costs a campaign run nothing, never an `injector_failure`; it holds and records nothing."""
+    config, settings = federation(tmp_path, drain_s=WAIT_S)
+    drained_outage(settings)
+    with pytest.raises(FederationBusy) as caught, shared_admission(config, reason=REASON, timeout_s=PROBE_S):
+        raise AssertionError("a tool was admitted inside an outage run's session drain")
+    assert caught.value.kind == FEDERATION_BUSY
+    assert "drain" in caught.value.detail
+    assert current_admission() is None
+    assert SharedHolds(settings.journal).holds() == []
+
+
+def test_o48_a_tools_wait_for_an_outage_run_that_runs_out_is_the_uncharged_federation_busy(tmp_path):
+    """O48: a tool whose bound runs out while an outage run holds the federation is the same uncharged hold
+    `federation_busy` a campaign run's wait ends in."""
+    config, settings = federation(tmp_path)
+    outage = FederationLock(settings).acquire(exclusive=True, timeout_s=PROBE_S, target=OUTAGE_TARGET)
+    try:
+        with pytest.raises(FederationBusy) as caught, shared_admission(config, reason=REASON, timeout_s=PROBE_S):
+            raise AssertionError("a tool was admitted beside an outage run")
+    finally:
+        outage.close()
+    assert caught.value.kind == FEDERATION_BUSY
+    assert SharedHolds(settings.journal).holds() == []
+
+
+def test_o48_a_drain_record_that_cannot_be_read_refuses_the_tool(tmp_path):
+    """O48: a drain record that is not one refuses the tool as `injector_failure`, as it refuses a campaign run: no
+    admission can tell the federation is open."""
+    config, settings = federation(tmp_path)
+    settings.journal.mkdir(parents=True, exist_ok=True)
+    (settings.journal / DRAIN).write_text("not a record", encoding="utf-8")
+    with pytest.raises(InfraError) as caught, shared_admission(config, reason=REASON, timeout_s=PROBE_S):
+        raise AssertionError("a tool was admitted on an unreadable drain record")
+    assert caught.value.kind == INJECTOR_FAILURE
+    assert SharedHolds(settings.journal).holds() == []
+
+
+def test_o48_the_async_form_waits_for_the_drain(tmp_path):
+    """O48: `shared_admission_async` waits for the session drain as the synchronous form does."""
+    config, settings = federation(tmp_path)
+    until = drained_outage(settings)
+
+    async def drive():
+        async with shared_admission_async(config, reason=REASON, timeout_s=WAIT_S) as admission:
+            return time.time(), admission.held
+
+    admitted_at, held = asyncio.run(drive())
+    assert admitted_at >= until
+    assert held
+
+
+def test_o48_the_async_forms_bound_that_ends_inside_the_drain_is_the_uncharged_federation_busy(tmp_path):
+    """O48: the async form's bound that runs out inside the drain is the uncharged hold `federation_busy`."""
+    config, settings = federation(tmp_path, drain_s=WAIT_S)
+    drained_outage(settings)
+
+    async def drive():
+        async with shared_admission_async(config, reason=REASON, timeout_s=PROBE_S):
+            raise AssertionError("a tool was admitted inside an outage run's session drain")
+
+    with pytest.raises(FederationBusy) as caught:
+        asyncio.run(drive())
+    assert caught.value.kind == FEDERATION_BUSY
+    assert SharedHolds(settings.journal).holds() == []

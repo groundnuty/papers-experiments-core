@@ -13,8 +13,10 @@ It takes the same lock a campaign attempt takes, shared, so tools and attempts h
 outage run, which needs it exclusively, never overlaps one; and the same turnstile, so a stream of tools cannot keep an
 outage run out for ever. What it does around that:
 
-- **It waits for an outage run in progress, within a bound** (`timeout_s`, by default `[faults] admission_timeout_s`;
-  `timeout_s=0` tries once), and past the bound is refused as `FederationBusy`, an `injector_failure`.
+- **It waits for an outage run in progress, and for its session drain, within a bound** (`timeout_s`, by default
+  `[faults] admission_timeout_s`; `timeout_s=0` tries once), and past the bound is refused as `FederationBusy`, the
+  hold `federation_busy`, which charges nothing: it is admitted through `FederationLock.held` (`admitted`), the path a
+  campaign run takes, so it meets the same lock, turnstile, journal check and drain record (`federation.drain`).
 - **It is refused, under the lock, when the federation is not in its baseline state:** an injection the fault journal
   holds open (a provider may be down), a fault journal or a record of the tools' holds that cannot be read, and, for
   the `ingest_journals` it is given, a preallocated ingest's baseline that is not whole
@@ -142,9 +144,10 @@ def shared_admission(
     (see the module docstring). `reason` is the tool's own words, one printable line of at most 200 characters, which
     goes into the record and nowhere else. Yields the admission, or None for a platform without `[faults]`.
 
-    Raises `ValueError` for a reason or a bound that is not valid, `FederationBusy` when an outage run held the
-    federation past the bound, `InfraError` of kind `injector_failure` when it is refused, `AdmissionRefused` inside
-    an exclusive admission or one of another federation."""
+    Raises `ValueError` for a reason or a bound that is not valid, `FederationBusy` (kind `federation_busy`) when an
+    outage run held the federation, or its session drain kept it closed, past the bound, `InfraError` of kind
+    `injector_failure` when it is refused, `AdmissionRefused` inside an exclusive admission or one of another
+    federation."""
     plan = _plan(config, reason, timeout_s, ingest_journals)
     settings = plan.settings
     if settings is None:
