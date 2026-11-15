@@ -165,15 +165,22 @@ class LinkSettling:
         return result.how
 
     def heal_stuck(
-        self, service: str, first: LinkMatrix, *, hold: Callable[[float], None], gate_probe: str | None
+        self,
+        service: str,
+        first: LinkMatrix,
+        *,
+        hold: Callable[[float], None],
+        gate_probe: str | None,
+        stopping: Callable[[], bool] | None = None,
     ) -> tuple[HealResult, LinkMatrix]:
         """The fault gate's heal of the stuck pairs its own link check found (`first`), with no injection open and no
         restored provider (`expcore_onedata.fault_gate_heal`): the same heal, its bounds, settle and fallback, by the
-        caller's `hold`, never restarting the container of a provider that was ever the source of a failing pair.
-        `service` is any declared service, which the driver's link check takes. The container restarts it made are
-        cleared when every pair passes, else left open, journalled `clear_failed`. Return how it ended and the latest
-        link check that answered."""
-        result, latest, children = self._run_heal(service, None, gate_probe, hold, first, sources=first.sources())
+        caller's `hold`, never restarting the container of a provider that was ever the source of a failing pair, and
+        starting no step once `stopping()` (a clean exit) says so. `service` is any declared service, which the
+        driver's link check takes. The container restarts it made are cleared when every pair passes, else left open,
+        journalled `clear_failed`. Return how it ended and the latest link check that answered."""
+        sources = first.sources()
+        result, latest, children = self._run_heal(service, None, gate_probe, hold, first, sources, stopping)
         self._close_children(result, children)
         return result, latest
 
@@ -185,6 +192,7 @@ class LinkSettling:
         hold: Callable[[float], None],
         first: LinkMatrix,
         sources: set[str] | None = None,
+        stopping: Callable[[], bool] | None = None,
     ) -> tuple[HealResult, LinkMatrix, list[str]]:
         """Run one heal (`fault_heal.LinkHeal`); return how it ended, the latest link check that answered (`first`, or
         the heal's last that did) and the journal ids of the container restarts it made."""
@@ -226,6 +234,7 @@ class LinkSettling:
             sleep=self._sleep,
             sources_seen=sources,
             only_stuck=sources is not None,  # the fault gate's heal: nothing is done unless a fetch failed
+            stopping=stopping,
         ).run()
         return result, answered[-1], children
 

@@ -117,7 +117,8 @@ class GateHeals:
 
 class GateHeal:
     """One heal of the fault gate, under its exclusive admission (see the module docstring). `labels` maps each
-    provider's label to its service; `hold_for(seconds)` closes the federation to every admission for that long."""
+    provider's label to its service; `hold_for(seconds)` closes the federation to every admission for that long;
+    `stopping()` says the process is exiting cleanly, and no step of the heal starts after it does."""
 
     def __init__(
         self,
@@ -127,9 +128,10 @@ class GateHeal:
         labels: Mapping[str, str],
         hold_for: Callable[[float], None],
         record: GateHeals,
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
         self._settings, self._driver, self._recovery, self._labels = settings, driver, recovery, dict(labels)
-        self._hold_for, self._record = hold_for, record
+        self._hold_for, self._record, self._stopping = hold_for, record, stopping
 
     def _hold(self, seconds: float) -> None:
         """No read through the links for `seconds` from now, in this process and, by the drain record, in every
@@ -164,7 +166,9 @@ class GateHeal:
         except OSError as error:
             return None, f"the fault gate's heal did not begin: its record cannot be written ({type(error).__name__})"
         try:
-            result, latest = self._recovery.heal_stuck(service, trigger, hold=self._hold, gate_probe=gate_probe)
+            result, latest = self._recovery.heal_stuck(
+                service, trigger, hold=self._hold, gate_probe=gate_probe, stopping=self._stopping
+            )
         except Exception as error:  # a restart that raised was settled before it unwound; the gate stays closed
             why = f"the heal raised {type(error).__name__}"
             result = HealResult("links_stuck", {"ok": False, "mode": self._settings.heal, "outcome": "links_stuck"})

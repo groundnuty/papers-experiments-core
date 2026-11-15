@@ -142,9 +142,11 @@ class LinkHeal:
         utc: Callable[[], str] = _utc,
         sources_seen: Iterable[str] | None = None,
         only_stuck: bool = False,
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
         self._mode, self._driver, self._services, self._restored = mode, driver, dict(services), restored
         self._only_stuck = only_stuck  # act only when the fresh matrix shows a stuck pair (the fault gate's heal)
+        self._stopping, self._stopped = stopping, False  # a clean exit: no step starts once it asks (`_fits`)
         self._kept = (
             None if sources_seen is None else set(sources_seen)
         )  # never restarted: ever a failing pair's source
@@ -178,7 +180,11 @@ class LinkHeal:
         return self._bound_s - (self._clock() - self._started)
 
     def _fits(self, cost: float) -> bool:
-        """Whether a step whose declared bounds are `cost` seconds ends within `heal_timeout_s`."""
+        """Whether a step whose declared bounds are `cost` seconds ends within `heal_timeout_s`, and the process is not
+        exiting (`stopping`): a step under way finishes, its settle included, and none starts after the exit asked."""
+        if self._stopping is not None and self._stopping():
+            self._stopped = True
+            return False
         return cost <= self._left()
 
     def _gate_within(self, service: str) -> dict[str, Any]:
@@ -191,6 +197,8 @@ class LinkHeal:
         self._actions.append({**entry, **extra, **({} if after is None else {"matrix_after": after.to_json()})})
 
     def _end(self, how: str, current: LinkMatrix, before: LinkMatrix, why: str | None = None) -> HealResult:
+        if self._stopped and how != "healed":
+            why = "the process is exiting, so the heal stopped before its next step"
         tried = ", ".join(f"{a['action']} on {a['provider']} ({a['result']})" for a in self._actions) or "nothing"
         record = {
             "ok": how == "healed",

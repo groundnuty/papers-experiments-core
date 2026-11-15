@@ -44,11 +44,13 @@ check under a run's admission keeps a share of it until it ends, so one that out
 federation.
 """
 
+import atexit
 import contextlib
 import logging
 import re
 import threading
 import time
+import weakref
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -70,7 +72,7 @@ from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_recovery import FaultDriver, Recovery
-from expcore_onedata.fault_settings import FaultSettings
+from expcore_onedata.fault_settings import FaultSettings, heal_all_links_reserve, heal_container_reserve
 
 _PURPOSES = {
     OUTAGE_RUN: "an outage run",
@@ -93,6 +95,13 @@ def _named(record: Mapping[str, Any] | None) -> str:
     of = f" of {target}" if isinstance(target, str) and TARGET_LABEL.fullmatch(target) else ""
     at = f" since {since}" if isinstance(since, str) and _STAMP.fullmatch(since) else ""
     return f"{who}{of}{at}"
+
+
+def _stop_heal_at_exit(gate: "weakref.ref[FaultGate]") -> None:
+    """At a clean exit of the process: the gate's heal finishes its step and starts no other (`FaultGate.stop_heal`)."""
+    alive = gate()
+    if alive is not None:
+        alive.stop_heal()
 
 
 def _held_for(record: Mapping[str, Any]) -> float | None:
@@ -149,16 +158,19 @@ class FaultGate:
         self._heals = GateHeals(settings.journal)
         declared = settings.heal != "off" and self._may_recover
         heals = declared and links is not None and relink is not None and bool(labels)
+        self._exiting = threading.Event()  # a clean exit asked the heal to start no further step (`stop_heal`)
+        hold_for, stopping = self._lock.hold_for, self._exiting.is_set
         self._healer = (
-            GateHeal(settings, driver, self._recovery, labels or {}, self._lock.hold_for, self._heals)
-            if heals
-            else None
+            GateHeal(settings, driver, self._recovery, labels or {}, hold_for, self._heals, stopping) if heals else None
         )
         self._last_heal: dict[str, Any] | None = None
         self._heal_guard = threading.Lock()  # the heal running in the background, and when it began
         self._heal_thread: threading.Thread | None = None
         self._heal_began = 0.0
         self._heal_bound_s = settings.heal_timeout_s + settings.heal_settle_s  # the longest a heal defers the gate
+        # the longest one step of a heal can take, its settle included: what a clean exit waits for it at most
+        self._step_bound_s = max(heal_container_reserve(settings), heal_all_links_reserve(settings))
+        self._exit_hooked = False
 
     @property
     def last_heal(self) -> dict[str, Any] | None:
@@ -173,6 +185,18 @@ class FaultGate:
         if thread is not None:
             thread.join(timeout_s)
         return thread is None or not thread.is_alive()
+
+    def stop_heal(self, timeout_s: float | None = None) -> bool:
+        """Ask the heal running in the background to start no further step, and wait for it to end: the step under way
+        finishes, its settle included (a container it stopped is started and verified), at most `timeout_s`, by
+        default the longest step's reserve. What a clean exit of the process does (`atexit`); whether no heal runs now.
+        A heal that does not end in time is left to the daemon thread's end, and the next process settles what it
+        left: its journalled container restart, restored once the settle it held has passed."""
+        self._exiting.set()
+        done = self.wait_for_heal(self._step_bound_s if timeout_s is None else timeout_s)
+        if done:
+            self._exiting.clear()
+        return done
 
     def _healing(self) -> Health | None:
         """While this gate's heal runs: the uncharged deferral, within the heal's own bound (`heal_timeout_s` and
@@ -310,6 +334,9 @@ class FaultGate:
             if refused is not None:
                 return refused
             with self._heal_guard:
+                if not self._exit_hooked:  # a clean exit lets the heal finish its step first (`stop_heal`)
+                    atexit.register(_stop_heal_at_exit, weakref.ref(self))
+                    self._exit_hooked = True
                 self._heal_began = self._clock()
                 thread = threading.Thread(
                     target=self._heal_on, args=(exclusive, trigger), name="fault-gate-heal", daemon=True
