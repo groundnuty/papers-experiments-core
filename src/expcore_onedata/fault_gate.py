@@ -95,6 +95,18 @@ def _named(record: Mapping[str, Any] | None) -> str:
     return f"{who}{of}{at}"
 
 
+def _held_for(record: Mapping[str, Any]) -> float | None:
+    """The seconds since a holder record's `since_utc`, on the wall clock; None when it holds no readable time."""
+    since = record.get("since_utc")
+    try:
+        taken = datetime.fromisoformat(since) if isinstance(since, str) else None
+    except ValueError:
+        return None
+    if taken is None or taken.tzinfo is None:
+        return None
+    return (datetime.now(UTC) - taken).total_seconds()
+
+
 def _unsettled(entries: list[dict[str, Any]]) -> Health:
     """The failure of a journal with open injections: a failed restore by its target's label and how it failed."""
     failed = sorted({(entry["target"], entry["clear_failed"]) for entry in entries if "clear_failed" in entry})
@@ -331,14 +343,22 @@ class FaultGate:
         return self._latched(verdict)
 
     def _healing_elsewhere(self) -> Health | None:
-        """The uncharged deferral while another process's health check holds the federation for its recovery or heal
-        (its holder record, alive); None otherwise."""
+        """While another health check, in this process or another, holds the federation for its recovery or heal (its
+        holder record, alive): the uncharged deferral within the heal's bound (`heal_timeout_s` and `heal_settle_s`
+        since the record's `since_utc`), and past it, or when the record does not say since when, a closed gate,
+        still uncharged, so a hung heal of a live process never defers for ever; None when no such holder holds it."""
         record = self._journal.read_holder()
         if record is None or record.get("purpose") != RECOVERY or holder_alive(record) is False:
             return None
-        return Health(
-            False, f"{_named(record)} holds the federation: the check waits for it", deferred=True, charge=False
+        held_s, bound = _held_for(record), self._heal_bound_s
+        if held_s is not None and held_s <= bound:
+            detail = f"{_named(record)} holds the federation: the check waits for it"
+            return Health(False, detail, deferred=True, charge=False)
+        detail = (
+            f"{_named(record)} has held the federation past the heal's bound of {bound:g} s (heal_timeout_s and "
+            "heal_settle_s), or its record does not say since when: the gate stays closed until a check after it passes"
         )
+        return Health(False, detail, deferred=False, charge=False)
 
     def _heal_on(self, exclusive: Admission, trigger: LinkMatrix) -> None:
         """The heal, in the background, under the exclusive admission it was handed, which it lets go at its end. A
@@ -389,6 +409,10 @@ class FaultGate:
             )
         record = self._journal.read_holder()
         if record is None or holder_alive(record) is not False:
+            if record is not None and record.get("purpose") == RECOVERY:  # a health check's recovery or heal:
+                bounded = self._healing_elsewhere()  # its wait, closed once it outlasts the heal's bound
+                if bounded is not None:
+                    return bounded
             # contention, a heal under way included (its marker is no failed restore yet): a wait that charges no run,
             # nor the one that finds it once it outlasts the gate's bound, as an outage run with a heal can
             detail = f"{_named(record)} holds the federation: the check waits for it"

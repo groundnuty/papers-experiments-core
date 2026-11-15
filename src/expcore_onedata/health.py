@@ -207,7 +207,8 @@ class PlatformHealth:
         self._links_at = 0.0  # when the last link check ended, on `monotonic`
         self._links_passed = False  # whether any link check of this campaign passed
         self._links_lock = threading.Lock()
-        self._links_expired = False  # set by the fault gate after a heal: the next call checks the links again
+        self._expiries = 0  # how many times the fault gate expired the last link report (after a heal)
+        self._fresh_for = 0  # the expiries the last link report postdates: older than `_expiries`, it is no answer
         self._made = threading.local()  # the link report each thread's call made, which only that thread takes
         self._with_links = links
         self._ingest_journals = tuple(Path(journal) for journal in ingest_journals)  # read at every call (O44)
@@ -259,8 +260,10 @@ class PlatformHealth:
 
     def _expire_links(self) -> None:
         """Make the next call check the links again, whatever the last verdict and its age (the fault gate, after a
-        heal: a pass another call made before the heal is no pass of the healed links)."""
-        self._links_expired = True
+        heal: a pass another call made before the heal is no pass of the healed links). Until a check made after it
+        has answered, the last report is no answer for any call (`_regular`)."""
+        with self._lock:
+            self._expiries += 1
 
     def _regular(self) -> Health:
         """Every call once the content type passed: the space, then the links (O35), at the first call and again
@@ -274,13 +277,16 @@ class PlatformHealth:
         every_s = settings.every_s if settings is not None else LinkCheckSettings.every_s
         if self._links_lock.acquire(blocking=self._links is None):
             try:
-                last = self._links
-                stale = self._links_expired or self._monotonic() - self._links_at >= every_s
+                last, asked = self._links, self._expiries
+                stale = asked > self._fresh_for or self._monotonic() - self._links_at >= every_s
                 if last is None or not last.ok or stale:
-                    self._links_expired = False
                     self._check_links()
+                    self._fresh_for = max(self._fresh_for, asked)  # only once a check made after the expiry answered
             finally:
                 self._links_lock.release()
+        elif self._expiries > self._fresh_for:  # another call checks afresh after a heal: the last report is no answer
+            detail = "the link check is being made afresh after a heal, so no run is admitted until it answers"
+            return Health(False, detail, deferred=True, charge=False)
         report = self._links
         if report is None:  # pragma: no cover - the first check is waited for, so a report is there
             return Health(False, "the link check has not answered yet, so no run is admitted")

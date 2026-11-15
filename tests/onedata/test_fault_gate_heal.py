@@ -12,6 +12,7 @@ import json
 import threading
 import time
 from collections import Counter
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from campaign_support import keys_under, planned_store
@@ -285,7 +286,10 @@ def test_o35_a_check_that_meets_another_checks_heal_waits_uncharged_instead_of_t
 
     def another_heal_begins():  # while this check reads its pairs: another check's heal takes the federation
         GateHeals(settings.journal).append({"event": "healing", "id": "another-check", "mode": "all_links"})
-        journal.write_holder({"token": "another-check", **holder(), "purpose": RECOVERY, "target": None})
+        since = datetime.now(UTC).isoformat(timespec="seconds")
+        journal.write_holder(
+            {"token": "another-check", **holder(), "purpose": RECOVERY, "target": None, "since_utc": since}
+        )
 
     check.on_check = another_heal_begins
     reading = gate()
@@ -309,6 +313,70 @@ def test_o35_another_process_waits_uncharged_while_a_heals_container_restart_is_
     finally:
         healing.close()
     assert (reading.ok, reading.deferred, reading.charge) == UNCHARGED_WAIT, reading.detail
+
+
+def test_o35_another_processs_heal_past_its_bound_closes_the_gate_uncharged(tmp_path):
+    """O35: another process's health check has held the federation for its heal longer than the heal's bound
+    (`heal_timeout_s` and `heal_settle_s`), its process still alive: a check that meets it closes the gate, uncharged,
+    instead of deferring for as long as that holder lives."""
+    gate, _, _, settings = gate_of(tmp_path, heal="all_links")
+    healing = FederationLock(settings).acquire(exclusive=True, purpose=RECOVERY)
+    long_ago = datetime.now(UTC) - timedelta(seconds=settings.heal_timeout_s + settings.heal_settle_s + 60)
+    InjectionJournal(settings.journal).write_holder({**healing.record, "since_utc": long_ago.isoformat()})
+    try:
+        reading = gate()
+    finally:
+        healing.close()
+    assert (reading.ok, reading.deferred, reading.charge) == (False, False, False), reading.detail
+    assert "past the heal's bound" in reading.detail
+
+
+def test_o35_while_the_link_check_is_made_afresh_after_a_heal_no_check_answers_an_older_pass(
+    tmp_path, fake, monkeypatch
+):
+    """O35: after a heal the platform's last link report is expired; while one check makes the link check afresh,
+    another that cannot run it at the same time waits, uncharged, instead of answering with the pass from before."""
+    federation = Federation(SERVICES)
+    federation.stuck = set()  # the heal's own fresh read passes: it does nothing, and writes no drain record
+    stuck = {("providers[1]", "providers[0]")}
+    reports = [stuck, set()]  # the check that finds the pair, the heal's own check after it; then the fresh one
+    fresh_began, release = threading.Event(), threading.Event()
+
+    def scripted(*args, **kwargs):
+        if reports:
+            federation.stuck = reports.pop(0)
+        else:  # the check made afresh after the heal: it takes its time, and finds the pair stuck again
+            fresh_began.set()
+            release.wait(10)
+            federation.stuck = stuck
+        report = report_of(federation)
+        federation.stuck = set()
+        return report
+
+    monkeypatch.setattr(platform_health, "check_links", scripted)
+
+    def edit(data):
+        data["faults"] = faults_table(heal="all_links", heal_settle_s=0, health_wait_s=0.2)
+        data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
+
+    platform = write_platform(tmp_path, edit)
+    config = load_platform(platform)
+    client = OnezoneClient(config, http=fake.client_http())
+    issuer = TokenIssuer(client, config, clock=lambda: NOW)
+    health = PlatformHealth(config, client, issuer, clock=lambda: NOW, fault_driver=federation)
+    first = health()
+    assert (first.ok, first.deferred, first.charge) == UNCHARGED_WAIT, first.detail
+    assert health.wait_for_gate_heal(10)
+    assert health.links.ok is True  # the heal's own check passed, and the report is now expired
+    fresh = threading.Thread(target=health)
+    fresh.start()
+    try:
+        assert fresh_began.wait(10)
+        meanwhile = health()
+    finally:
+        release.set()
+        fresh.join(10)
+    assert (meanwhile.ok, meanwhile.deferred, meanwhile.charge) == UNCHARGED_WAIT, meanwhile.detail
 
 
 def test_o35_a_failed_heal_never_reopens_the_gate_on_a_pass_cached_before_it(tmp_path):
