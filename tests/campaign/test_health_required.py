@@ -8,6 +8,7 @@ these tests use a toy admission and a toy check.
 """
 
 import contextlib
+import threading
 
 import pytest
 from scheduler_support import FakeExecutor, build, settings_for
@@ -92,11 +93,20 @@ def test_o35_a_platform_cannot_declare_the_need_without_saying_why(reason):
         requiring(hold, reason)
 
 
-@pytest.mark.parametrize("declared", ["", "  ", 1, True, ["a reason"]])
+def test_o35_the_declaring_admission_is_called_with_keywords_as_the_admission_it_wraps_is():
+    """O35: the wrapper forwards what it is called with, keywords included, so a caller that named its arguments
+    before the declaration still works."""
+    with requiring(hold, WHY)(
+        treatment_kinds=(), treatment_targets={}, cancel=threading.Event(), exclusive=False
+    ) as held:
+        assert held == "shared"
+
+
+@pytest.mark.parametrize("declared", ["", "  ", 1, True, False, None, ["a reason"]])
 def test_o35_an_admission_whose_own_declaration_is_not_a_reason_is_refused_at_the_boundary(declared):
-    """O35: an admission that sets the attribute itself, to anything but a non-empty text, is refused with a message
-    naming the attribute, whether or not the campaign has a health check: a malformed declaration is never read as
-    'none'."""
+    """O35: an admission that sets the attribute itself, to anything but a non-empty text (an explicit None and False
+    included), is refused with a message naming the attribute, whether or not the campaign has a health check: a
+    malformed declaration is never read as 'none'; an admission that leaves it out declares none."""
 
     class Declares:
         requires_health_check = declared

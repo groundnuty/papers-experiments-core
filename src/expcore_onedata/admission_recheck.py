@@ -25,14 +25,21 @@ otherwise let the run in onto a stuck link once the heal lets the federation go,
 
   The refusal's words say which, and the campaign puts them in the run's `run_unstarted` event. It then asks again,
   and the run's next pre-run check sees the federation as it is now.
-- **A run with no note at all is admitted.** No pre-run check was asked, so no check vouched for anything an admission
-  could find outdated. That is a caller that is no campaign (a tool outside one, a test). It is never a campaign with
-  `[faults]`: a campaign with no health check does not start. The platform's run admission declares that it needs one
-  (`HEALTH_REQUIRED`, through `expcore.campaign.health_required`), and the scheduler refuses, when it is built and
-  before its lock or store, a campaign that has the admission and no health check, since nothing would ever write a
-  note and every run would be admitted blind. A study that wraps the admission in a function of its own must keep the
-  declaration (`functools.wraps` does). A check that never reaches the fault gate still has a note, with no epoch, so
-  its runs are refused above until it does.
+- **A run with no note at all is admitted.** It is a caller that is no campaign (a tool outside one, a test): no
+  pre-run check was asked, so no check vouched for anything an admission could find outdated. It is never a campaign
+  with `[faults]`, which never runs without a health check, two ways:
+  - **At load.** The platform's run admission declares that it needs one (`HEALTH_REQUIRED`, through
+    `expcore.campaign.health_required`), and the scheduler refuses, when it is built and before its lock or store, a
+    campaign that has the admission and no health check, since nothing would ever write a note and every run would be
+    admitted blind.
+  - **At run time, for a declaration the refusal never saw** (an admission a study wrapped in a function of its own
+    without `functools.wraps`, or a runner built by hand): a try of a campaign with no health check has a note that says
+    so (`prerun.UNCHECKED`), and this admission, reached through the wrapper, refuses it as `AdmissionRefused`, a
+    configuration error and not an `InfraError`, so the campaign stops loudly with no attempt made, charged or scored,
+    never a run admitted and never one asked again for ever.
+
+  A check that never reaches the fault gate still has a note, with no epoch, so its runs are refused above until it
+  does.
 """
 
 import re
@@ -41,6 +48,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign import prerun
 from expcore_onedata.fault_epoch import GATE_NOTE, HEAL, LINKS_FAILED, LinkEpoch
 from expcore_onedata.fault_gate_heal import GateHeals
 
@@ -64,6 +72,19 @@ def _noted(note: Mapping[str, Any]) -> tuple[str, int] | None:
     if not isinstance(key, str) or isinstance(epoch, bool) or not isinstance(epoch, int):
         return None
     return key, epoch
+
+
+def unchecked_refusal(note: Mapping[str, Any] | None) -> str | None:
+    """Why a run whose try's `note` (`prerun.current()`) says its campaign has no health check may not be admitted, or
+    None for a try with a check and for a caller that is no campaign (no note). The admission raises it as
+    `AdmissionRefused`; see the module docstring."""
+    if note is None or not note.get(prerun.UNCHECKED):
+        return None
+    return (
+        f"the campaign has no health check, and the run admission needs one: {HEALTH_REQUIRED}. The scheduler refuses "
+        "such a campaign when it is built, unless the declaration never reached it: an admission wrapped in a function "
+        "of its own must keep its requires_health_check attribute (functools.wraps does)"
+    )
 
 
 def refusal(

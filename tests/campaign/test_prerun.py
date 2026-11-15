@@ -59,13 +59,24 @@ def test_o35_a_runs_admission_reads_what_its_own_pre_run_check_noted(tmp_path):
     assert all(note == {} for note in seen[1:])
 
 
-def test_o35_a_campaign_with_no_health_check_admits_with_no_note(tmp_path):
-    """O35: no pre-run check is asked, so the admission finds no note at all, which says nothing was checked."""
+def test_o35_a_try_of_a_campaign_with_no_health_check_has_a_note_that_says_so(tmp_path):
+    """O35: no pre-run check is asked, so nothing will write the try's note, and it says so (`prerun.UNCHECKED`): an
+    admission can tell a try of a campaign with no check from a caller that is no campaign, which has no note."""
     seen = []
     with build(tmp_path, executor=FakeExecutor(), plan=TWO_RUNS, admission=reading(seen)) as scheduler:
         scheduler.run()
     assert seen
-    assert all(note is None for note in seen)
+    assert all(note == {prerun.UNCHECKED: True} for note in seen)
+
+
+def test_o35_a_note_opened_for_a_campaign_with_no_health_check_carries_the_mark_and_one_with_a_check_does_not():
+    """O35: `opened(checked=False)` is the mark; the default note is empty, as before."""
+    with prerun.opened(checked=False) as note:
+        assert note == {prerun.UNCHECKED: True}
+        assert prerun.current() is note
+    with prerun.opened() as note:
+        assert note == {}
+    assert prerun.current() is None
 
 
 def test_o35_outside_a_try_noting_does_nothing():

@@ -23,7 +23,7 @@ from expcore.campaign.factors import FactorSchema
 from expcore.campaign.health_required import required_reason
 from expcore.config.loading import ConfigError
 from expcore.errors import uncharged_kinds
-from expcore_onedata.admission import FederationBusy, run_admission
+from expcore_onedata.admission import AdmissionRefused, FederationBusy, run_admission
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_epoch import GATE_NOTE, LinkEpoch, noted_of
 from expcore_onedata.fault_gate_heal import GateHeals
@@ -433,3 +433,44 @@ def test_o35_a_platform_without_faults_declares_nothing_and_a_campaign_with_no_h
     ) as scheduler:
         summary = scheduler.run()
     assert summary.statuses == {"done": 1}
+
+
+def test_o35_an_admission_wrapped_without_the_declaration_stops_a_campaign_with_no_health_check_loudly(tmp_path):
+    """O35: a study wraps the platform's admission in a function that leaves the declaration out, so the scheduler's
+    refusal at load never sees it. The try of a campaign with no health check carries a note that says so, and the
+    platform's admission, reached through the wrapper, stops the campaign instead of admitting the run blind: no
+    attempt is made, charged or scored."""
+    federation_dir = tmp_path / "federation"
+    gate_of(federation_dir, heal="off")
+    admit = admission_in(federation_dir)
+
+    @contextlib.contextmanager
+    def wrapper(kinds, targets, cancel, exclusive):  # no `functools.wraps`: the attribute is not carried over
+        with admit(kinds, targets, cancel, exclusive) as mode:
+            yield mode
+
+    with build(
+        tmp_path / "campaign",
+        schema=ONE,
+        executor=FakeExecutor(),
+        plan=SMALL,
+        settings=settings_for(),
+        admission=wrapper,
+    ) as scheduler:
+        with pytest.raises(RuntimeError, match="stopped by an unexpected error") as stopped:
+            scheduler.run()
+        rows = attempts_of(scheduler.store, ONE_KEY)
+    assert isinstance(stopped.value.__cause__, AdmissionRefused)
+    assert NEEDS_THE_GATE in str(stopped.value.__cause__)
+    assert "keep" in str(stopped.value.__cause__)  # the fix: the wrapper must keep the declaration
+    assert rows == []
+
+
+def test_o35_the_platforms_admission_is_called_with_keywords_as_it_was_before_it_declared_anything(tmp_path):
+    """O35: a caller that names the admission's arguments is admitted as before the declaration, and a caller that is
+    no campaign (no try note) is admitted without a health check."""
+    federation_dir = tmp_path / "federation"
+    gate_of(federation_dir, heal="off")
+    admit = admission_in(federation_dir)
+    with admit(treatment_kinds=(), treatment_targets={}, cancel=threading.Event(), exclusive=False) as mode:
+        assert mode == "shared"

@@ -11,8 +11,10 @@ import time
 from fault_support import FakeClock, FakeServices
 from heal_support import STORES, four_providers
 
+from expcore.campaign import prerun
 from expcore.campaign.healthgate import Health
 from expcore_onedata.config import load_platform
+from expcore_onedata.fault_epoch import GATE_NOTE, LinkEpoch, noted_of
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_matrix import LinkMatrix, PairState
 from expcore_onedata.fault_settings import load_faults
@@ -162,6 +164,17 @@ class GateCheck:
         if self.report.ok:
             return Health(True, "every provider pair transferred")
         return Health(False, f"no run is admitted until every provider link transfers: {self.report.detail}")
+
+
+def noting_check(journal):
+    """A health check that always passes and notes the federation's link epoch in the try's note, as the fault gate's
+    pre-run check does: for a campaign whose admission needs a check and whose test is not about the gate itself."""
+
+    def check() -> Health:
+        prerun.note(GATE_NOTE, noted_of(LinkEpoch(journal).ensure()))
+        return Health(True, "the federation is up")
+
+    return check
 
 
 def gate_of(tmp_path, federation=None, **faults):

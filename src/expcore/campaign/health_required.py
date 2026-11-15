@@ -20,7 +20,9 @@ health check. It runs before the dispatcher's lock is taken and before the store
 touches nothing. Without the declaration nothing changes: a campaign with no health check runs as it did.
 
 An admission that wraps another one in a function of its own must keep the attribute (`functools.wraps` does), or the
-campaign is not refused: the declaration travels with the admission that is passed to the campaign.
+refusal at load does not see it. The platform's admission then refuses at run time instead: a try of a campaign with no
+health check has a note that says so (`prerun.UNCHECKED`), which the platform's admission, reached through the wrapper,
+reads, so no run is admitted blind whichever way the campaign was built.
 """
 
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ from expcore.campaign.healthgate import HealthCheck
 from expcore.config.loading import ConfigError
 
 ATTRIBUTE = "requires_health_check"
+_ABSENT = object()  # the attribute is not there: an explicit None is a declaration, and a malformed one
 
 
 @dataclass(frozen=True)
@@ -40,8 +43,8 @@ class _Requiring:
     admit: RunAdmission
     requires_health_check: str
 
-    def __call__(self, *args: Any) -> Any:
-        return self.admit(*args)
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.admit(*args, **kwargs)
 
 
 def requiring_health_check(admit: RunAdmission, reason: str) -> RunAdmission:
@@ -57,11 +60,12 @@ def requiring_health_check(admit: RunAdmission, reason: str) -> RunAdmission:
 def required_reason(admission: RunAdmission | None) -> str | None:
     """Why the admission's platform needs a health check, or None when it declares no need.
 
-    A declaration that is not a non-empty text is refused with a `ConfigError` naming the attribute: it is never read
-    as no need, or an admission could lose its protection by setting it wrongly.
+    A declaration that is not a non-empty text (an explicit None and False included) is refused with a `ConfigError`
+    naming the attribute: it is never read as no need, or an admission could lose its protection by setting it
+    wrongly. A platform that needs no health check leaves the attribute out.
     """
-    declared = getattr(admission, ATTRIBUTE, None)
-    if declared is None:
+    declared = getattr(admission, ATTRIBUTE, _ABSENT)
+    if declared is _ABSENT:
         return None
     if not isinstance(declared, str) or not declared.strip():
         raise ConfigError(

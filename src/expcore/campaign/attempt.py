@@ -17,7 +17,7 @@ The order is fixed, and each step is decided by what a kill at that point must l
    unstarted and uses no attempt. Its wait can be long too, so once admitted the run **looks at the gates again**, as
    after its lease: if one is closed now the admission is let go and the run stays pending, uncharged. What the run's
    pre-run check noted for its admission is in the try's note (`expcore.campaign.prerun`), open from step 1 to the end
-   of the try whenever a pre-run check is asked;
+   of every try: with no health check the note holds only `prerun.UNCHECKED`;
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
    under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26). From the
@@ -139,9 +139,10 @@ class AttemptRunner:
         return self.p.schema.treatment_targets[self.p.schema.condition_named(factors, run_key)]
 
     def work(self, row: Any) -> float:
-        """Run one attempt of the row's run, end to end. Return the seconds before the run may start again. A try
-        that asks a pre-run check has a note of its own (`prerun`), which its check writes and its admission reads."""
-        with prerun.opened() if self.p.health is not None else contextlib.nullcontext():
+        """Run one attempt of the row's run, end to end. Return the seconds before the run may start again. Every try
+        has a note of its own (`prerun`), which its pre-run check writes and its admission reads; with no health check
+        the note says so (`prerun.UNCHECKED`)."""
+        with prerun.opened(checked=self.p.health is not None):
             return self._tried(row)
 
     def _tried(self, row: Any) -> float:
