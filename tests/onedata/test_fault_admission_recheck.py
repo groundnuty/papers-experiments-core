@@ -513,7 +513,8 @@ def test_o35_a_runs_infrastructure_in_a_try_of_a_campaign_with_no_health_check_i
 
 def test_o35_a_campaign_with_no_admission_and_no_health_check_never_scores_a_run_that_starts_infrastructure(tmp_path):
     """O35: the study gave `admission=None` and no health check, and its executor takes the federation itself and
-    starts its infrastructure. The platform refuses that start in the run's try, so nothing is scored."""
+    starts its infrastructure. The platform refuses that start in the run's try: the attempt is a harness error that
+    names the refusal, and nothing is scored."""
     federation_dir = tmp_path / "federation"
     gate_of(federation_dir, heal="off")
     config, held = held_by_the_executor(federation_dir)
@@ -528,10 +529,7 @@ def test_o35_a_campaign_with_no_admission_and_no_health_check_never_scores_a_run
     with build(
         tmp_path / "campaign", schema=ONE, executor=executor, plan=SMALL, settings=settings_for(max_attempts=1)
     ) as scheduler:
-        try:
-            summary = scheduler.run()
-        except RuntimeError:  # a campaign stopped by the platform's refusal is as good as one that scores nothing
-            summary = None
-        scored = scheduler.store.q("SELECT state FROM attempts WHERE state='done'")
-    assert scored == []
-    assert summary is None or "done" not in summary.statuses
+        scheduler.run()
+        rows = scheduler.store.q("SELECT state, detail FROM attempts")
+    assert [row["state"] for row in rows] == ["harness_error"]  # a defect of the study's setup, never a score
+    assert rows[0]["detail"].startswith("AdmissionRefused")  # the platform's refusal, not another failure
