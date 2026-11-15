@@ -54,9 +54,27 @@ def answer_note(status, body) -> str:
     return note
 
 
-def status_only(text):
-    """onboard.py's failure lines, each kept up to the status it names: what follows is the answer's body."""
-    return "\n".join(re.sub(r"(HTTP [0-9]{3})\b.*", r"\1 (body not kept)", line) for line in text.splitlines())
+ONBOARD_SUMMARY = re.compile(r"(already supported|support HTTP [0-9]{3}); users mapped [0-9]+/[0-9]+")
+
+
+def onboard_lines(text):
+    """onboard.py's own messages ("onboard: ..."), each cut at the status it names: what follows is an answer's body.
+    Any other line is a body's continuation, never onboard's: it is dropped, and counted."""
+    kept, dropped = [], 0
+    for line in text.splitlines():
+        if line.startswith("onboard: "):
+            kept.append(re.sub(r"(HTTP [0-9]{3})\b.*", r"\1 (body not kept)", line))
+        elif line.strip():
+            dropped += 1
+    if dropped:
+        kept.append("(%d other lines not kept)" % dropped)
+    return "\n".join(kept)
+
+
+def onboard_summary(text):
+    """onboard.py's one line on stdout, kept only in its own format."""
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    return first if ONBOARD_SUMMARY.fullmatch(first) else "(not onboard's summary line: %d bytes)" % len(text)
 
 
 def die(msg, result=None):
@@ -130,12 +148,12 @@ def support(workdir, bundle, payload, result):
     result.update(
         {
             "onboard_rc": done.returncode,
-            "onboard_out": status_only(done.stdout.strip())[:300],
+            "onboard_out": onboard_summary(done.stdout),
             "support_s": round(time.monotonic() - t0, 2),
         }
     )
     if done.stderr.strip():
-        result["onboard_err"] = status_only(done.stderr.strip())[:600]
+        result["onboard_err"] = onboard_lines(done.stderr)[:600]
     if done.returncode != 0:
         die("onboard.py failed", result)
     print(json.dumps(result))

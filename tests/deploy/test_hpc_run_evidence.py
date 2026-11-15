@@ -660,6 +660,8 @@ EGRESS_DAMAGE = {
     "an attempt with a result": lambda rows: rows[2]["rec"].update(result=0) or rows,
     "an address that is not text": lambda rows: rows[2]["rec"].update(address=2130706433) or rows,
     "a start line without the collector's uid": lambda rows: rows[0].pop("uid") and rows,
+    "an end line whose clock is not finite": lambda rows: rows[-1].update(mono=float("inf")) or rows,
+    "a clock reading that is not a number": lambda rows: rows[2].update(mono=float("nan")) or rows,
 }
 
 

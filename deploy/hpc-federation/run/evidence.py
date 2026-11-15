@@ -129,6 +129,12 @@ def _unique(pairs):
     return dict(pairs)
 
 
+def _no_constant(name):
+    """NaN and Infinity, which Python's json reads and JSON has not: a file holding one is unparsable (the core reads a
+    clock of either as one that went back)."""
+    raise ValueError("%s is no JSON number" % name)
+
+
 def _read_object(path, rel):
     """(object, file record) for one JSON file holding one object; ValueError names what is wrong."""
     try:
@@ -142,7 +148,7 @@ def _read_object(path, rel):
     if not data.strip():
         raise ValueError("empty: %s" % rel)
     try:
-        value = json.loads(data.decode("utf-8"), object_pairs_hook=_unique)
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=_unique, parse_constant=_no_constant)
     except ValueError:
         raise ValueError("unparsable: %s" % rel) from None
     if not isinstance(value, dict):
@@ -166,7 +172,7 @@ def _read_lines(path, rel):
     try:
         for line in data.decode("utf-8").splitlines():
             if line.strip():
-                row = json.loads(line, object_pairs_hook=_unique)
+                row = json.loads(line, object_pairs_hook=_unique, parse_constant=_no_constant)
                 if not isinstance(row, dict):
                     raise ValueError("a line that is not an object")
                 rows.append(row)

@@ -689,6 +689,26 @@ def test_onboardings_failure_lines_keep_their_status_and_never_a_body(capsys, mo
     assert "secret-value" not in json.dumps(out)
 
 
+def test_onboardings_multiline_failure_keeps_no_continuation_of_the_body(capsys, monkeypatch):
+    """O52: a failed answer's body may span lines; only onboard.py's own lines are kept, each cut at its status."""
+    provider = load(RUN / "fed_provider.py", "hpcop_run_provider_onboard_lines")
+    err = (
+        'onboard: FAILED support: HTTP 400 {\n  "description": "secret-value"\n}\nonboard: FAILED user u: not mapped\n'
+    )
+    done = subprocess.CompletedProcess([], 1, "support HTTP 400; users mapped 0/1\n", err)
+    monkeypatch.setattr(provider.subprocess, "run", lambda *a, **k: done)
+    with pytest.raises(SystemExit):
+        provider.support("/w", "/b", {"space_id": "s", "token": "t"}, {"space_id": "s"})
+    out = json.loads(capsys.readouterr().out)
+    assert "secret-value" not in json.dumps(out)
+    assert out["onboard_err"].splitlines() == [
+        "onboard: FAILED support: HTTP 400 (body not kept)",
+        "onboard: FAILED user u: not mapped",
+        "(2 other lines not kept)",
+    ]
+    assert out["onboard_out"] == "support HTTP 400; users mapped 0/1"
+
+
 def test_the_helpers_note_each_http_call_as_a_status_and_a_body_hash_never_a_header_or_body(tmp_path):
     for name in ("fed_zone", "fed_provider"):
         module = load(RUN / f"{name}.py", f"hpcop_note_{name}")
