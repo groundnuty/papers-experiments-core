@@ -44,7 +44,7 @@ from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, def
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
-from expcore.campaign.healthgate import HealthCheck, HealthGate
+from expcore.campaign.healthgate import HealthCheck, HealthGate, deferral_bound
 from expcore.campaign.holds import ALL, Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import LeasePool
@@ -147,6 +147,8 @@ class Scheduler:
             else ()
         )
         self.settings.check_kinds(schema)
+        if health is not None:  # before the lock or the store: the platform's own wait must fit under max_defer_s
+            self.settings.check_deferral_bound(deferral_bound(health))
         exclusive = [name for name, value in schema.exclusive.items() if value]
         if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
             raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(

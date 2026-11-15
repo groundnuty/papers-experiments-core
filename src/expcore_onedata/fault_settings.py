@@ -95,6 +95,33 @@ default 900 s, a heuristic for the start and the teardown, never a worst case of
 earlier run left (as the injector's `cancel_wait_s` counts), and one session drain of `session_drain_s`, which that
 start waits out after it restored a provider an earlier run left down (`FaultInjector._wait_owed`). With the defaults
 (4,200 s and 320 s) that is 9,620 s.
+
+**A declared heal needs a campaign `max_defer_s` that outlives it.** While the fault gate heals, every check answers the
+uncharged deferral, for up to `heal_timeout_s` plus `heal_settle_s` from the heal's start (`heal_wait_s`), and after an
+outage run the session drain comes first, with no check between them that passes. The heal begins at a check, so one
+wait between two checks (`recheck_s`, 30 s, and up to `poll_interval_s`, 1 s) and that check (up to `health_timeout_s`,
+60 s) sit between the drain and the heal, and after the heal, whose last deferred answer can come just before it ends,
+another such wait and the check that makes the link check afresh (a call that meets it waits for it). The core turns a
+deferral past the campaign's `max_defer_s` (3,600 s by default) into a blocking hold, on which a campaign that exits
+when blocked stops. So the check declares the sum of its own times (`heal_deferral_s`: `session_drain_s`,
+`heal_timeout_s` and `heal_settle_s`; none with the heal off) as its longest deferral (`FaultGate.max_deferral_s`,
+`PlatformHealth.max_deferral_s`), with how many of the core's waits it includes, and the core, which alone knows its own
+settings, adds them: the campaign's `max_defer_s` must be at least that total, or it is refused at its start. With the
+defaults (`recheck_s` 30 s, `poll_interval_s` 1 s, `health_timeout_s` 60 s) that is 4,700 s and 182 s, 4,882 s, for
+four providers, and 4,790 s and 182 s, 4,972 s, for five at the 4,290 s they need; with `session_drain_s = 0` the first
+deferral is the check that starts the heal, and only the waits after the heal are added (the 4,470 s of five providers
+and 91 s, 4,561 s). A `health_timeout_s` of 150 s, as the link check needs, makes them 5,062 s, 5,152 s and 4,651 s.
+
+The figure assumes the heal ends within its own bound (a heal that overruns it closes the gate, and the settle's hold it
+leaves can defer a check later still), and every check ends within `health_timeout_s`, as a check must (the link check
+too: keep it above `visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but
+its thread runs on and can still start the heal later than the figure counts. A deferral that began before the drain
+(an outage run still running, and another worker's check deferred on it) or for another reason (a run on an ingest
+baseline, or a run's shortcut reset holding the reset lock), a heal that waits for another holder of the federation
+(the hold `federation_busy`), a heal cut short by its process's end, which the next process settles and heals once
+more, and a heal that fails with a container restart left open, which the next check recovers, owing a session drain
+and holding a settle when none is journalled, before the gate closes, count from the deferral's first answer, so its
+age holds that wait too, which no setting here bounds.
 """
 
 import hashlib
@@ -275,6 +302,23 @@ def heal_token_margin_s(settings: FaultSettings) -> float:
     if settings.heal == "off":
         return 0.0
     return TOKEN_MARGIN_BASE_S + 2 * settings.heal_timeout_s + settings.session_drain_s
+
+
+def heal_wait_s(settings: FaultSettings) -> float:
+    """The longest the fault gate waits for its heal, from the heal's start (`fault_gate.FaultGate`): `heal_timeout_s`
+    and the settle after its last restart, `heal_settle_s`."""
+    return settings.heal_timeout_s + settings.heal_settle_s
+
+
+def heal_deferral_s(settings: FaultSettings) -> float:
+    """The platform's own time of the longest deferral of its health check with a declared heal (see the module
+    docstring): the session drain after an outage run (`session_drain_s`; 0 declares none), then the fault gate's heal
+    of the stuck pairs that run left (`heal_wait_s`); 0 with the heal off. The core's waits between and around them
+    (`recheck_s`, `poll_interval_s`, `health_timeout_s`) are not here: the gate declares how many of each
+    (`FaultGate.max_deferral_s`) and the core adds its own figures."""
+    if settings.heal == "off":
+        return 0.0
+    return settings.session_drain_s + heal_wait_s(settings)
 
 
 def heal_link_reserve(settings: FaultSettings) -> float:
