@@ -34,7 +34,7 @@ from gate_heal_support import (
     left_by_a_killed_process,
     next_process,
 )
-from heal_support import NAMES, STORES, heal_margin_s
+from heal_support import NAMES, STORES
 
 from expcore.campaign.healthgate import DEFER, FOUND, GO
 from expcore.errors import InfraError
@@ -187,7 +187,6 @@ def test_o35_while_the_link_check_is_made_afresh_after_a_heal_no_check_answers_a
 
     def edit(data):
         data["faults"] = faults_table(heal="all_links", heal_settle_s=0, health_wait_s=0.2)
-        data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
 
     platform = write_platform(tmp_path, edit)
     config = load_platform(platform)
@@ -639,7 +638,6 @@ def test_o35_the_gate_heal_runs_through_the_platforms_standard_health_check(tmp_
 
     def edit(data):
         data["faults"] = faults_table(heal="all_links", heal_settle_s=0, health_wait_s=0.2)
-        data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
 
     platform = write_platform(tmp_path, edit)
     config = load_platform(platform)

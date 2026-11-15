@@ -183,14 +183,17 @@ class Recovery(LinkSettling):
         sleep: Callable[[float], None] = time.sleep,
         labels: Mapping[str, str] | None = None,
         wall: Callable[[], float] = time.time,
+        heal_skip: Callable[[], Mapping[str, Any] | None] | None = None,
         hold_for: Callable[[float], None] | None = None,
     ) -> None:
         """`labels` maps each provider's label to its service, which the heal needs to act on a reader by its label;
-        `wall` is the clock a settle is journalled on, which every process shares; `hold_for(seconds)`, when given,
-        closes the federation to every admission for that long (`FederationLock.hold_for`), which a recovered container
-        restart's settle does before it is journalled (`LinkSettling._settle_child`)."""
+        `wall` is the clock a settle is journalled on, which every process shares; `heal_skip`, asked at a heal's start,
+        says why the heal must be skipped (`FaultInjector._heal_skipped`: a step of the run that uses its tokens still
+        runs), or None to let it run; `hold_for(seconds)`, when given, closes the federation to every admission for
+        that long (`FederationLock.hold_for`), which a recovered container restart's settle does before it is
+        journalled (`LinkSettling._settle_child`)."""
         self._settings, self._driver, self._clock, self._sleep = settings, driver, clock, sleep
-        self._wall, self._hold_for = wall, hold_for
+        self._wall, self._heal_skip, self._hold_for = wall, heal_skip, hold_for
         self._defer = False  # inside `recover(defer=True)`: a held settle is never slept out (`RestoreSettling`)
         self.journal = InjectionJournal(settings.journal)
         self.last: Observation | None = None  # the latest reading `wait` took
