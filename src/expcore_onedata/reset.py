@@ -129,13 +129,22 @@ read and every check is made on each provider that supports the space, since eac
 **Before any stage** the plan is checked (no provider to evict from or allowed to hold bytes is the data provider, by
 name or id, or one that does not support the space) and the space's live name is verified (`verify_space`).
 
-**Reads that time out are tried again, boundedly and in the log** (O29, `readretry.py`): the reset's own reads (the
-walks' listings, the summaries, the transfer listings, records and waits, the eviction stage's waits for its transfers,
-the occupancy, a space's root and the gate's reads before each cancel and removal) go under the provisioner's policy,
-three attempts with pauses of 2 s and 5 s, and the record says how many were retried (`reads_retried`). A read inside
-a poll that counts a failed read as one that did not match (the requirements' removal check) is one attempt: the poll is
-the retry. Nothing but a read that timed out is tried again: an error answer, a connection error and every mutation
-stand as before.
+**Reads that fail are tried again, boundedly and in the log** (O29, O46, O51, `readretry.py`). A read inside a poll that
+counts a failed read as one that did not match (the requirements' fulfilment and removal checks, the eviction's block
+maps) is one attempt: the poll is the retry. Every other read the reset makes goes under a policy that also tries a
+connection failure again, four attempts 2, 5 and 15 s apart, never an answer (`Provisioner.reading_retry`): the reads of
+each reading (the scans, `summaries` mode's directory listings included, the settle, the occupancy with its counter, the
+quiet stage's maps) under one made for that reading, at most `[placement] provider_concurrency` in flight at one
+provider, tallied as the stage's `read_retry`; each stage's own transfer reads (the listings, the records, the waits for
+its jobs, the eviction stage's included, and Onezone's clock) under one per stage (`stage_reads`), tallied as the
+stage's `transfer_read_retry`; and the mutation gate's reads before a cancel, an eviction or a requirement's deletion,
+the space's name (`verify_space`; the driver's tallied as `verify_read_retry`), the eviction stage's path listings and
+visibility wait (`Provisioner.await_visible`) and the space root's first read, each under the policy of the stage it is
+made in. The record says how many reads were retried (`reads_retried`). No read is left on timeouts only. Nothing else
+is tried again: an error answer stands as before, and **a mutation is sent once**: a cancel, an eviction or a deletion
+whose answer was lost after it went out (`client.sent_unanswered`) may have been applied, so it is never sent again; the
+job's record, the block maps or the deletion barrier decide, failing closed at their bounds, and the stage records
+`unanswered` (O09).
 
 **Fail closed.** A stage that cannot verify what it did, a read that fails, an answer in another shape, a bound
 reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, with the record of the stages so far
@@ -148,6 +157,7 @@ through `resetspaces.SpacesReset`: the same stages for each, the waits they shar
 at once; `run` is that driver with this space alone.
 """
 
+import logging
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -155,9 +165,10 @@ from functools import partial
 from typing import Any
 
 from expcore_onedata import consistency, occupancy, resetgrant, resetheld, resetqos, resetremove, resetshortcut
-from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError
+from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError, sent_unanswered
 from expcore_onedata.eviction import evict_ids, evict_tree, sum_counts
 from expcore_onedata.provision import Provisioner, ProvisionError
+from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.resetgrant import ResetGrant
 from expcore_onedata.resetplan import Holdings, plan_scan
 from expcore_onedata.transferlog import PAGE_LIMIT
@@ -183,6 +194,7 @@ LISTED_MAX = 100_000
 OCCUPANCY_ROUNDS = 3
 FAILURES = (PlatformError, ProvisionError, consistency.WaitTimeout, Unreadable, KeyError)  # a stage's, recorded
 NOT_IN_SPACE = "a path the plan names is not in the space"  # a KeyError's own text holds a path's part (O12)
+log = logging.getLogger(__name__)
 
 
 class ResetFailed(ProvisionError):
@@ -217,6 +229,16 @@ class SpaceReset:
         if listed_max < 1:
             raise ValueError("a listing's bound is at least one id")
         self._listed_max, self._now = listed_max, now
+        # The policy of the reset's own transfer reads in the stage under way (`stage_reads`): listings, records, the
+        # waits for its jobs and Onezone's clock. One space is worked on by one thread at a time (`resetspaces.py`).
+        self._reads = provisioner.reading_retry()
+
+    def stage_reads(self) -> ReadRetry:
+        """Begin a stage's own transfer reads (its listings, records, waits and Onezone's clock): a new reading policy
+        (`Provisioner.reading_retry`: a connection failure tried again, an answer never, a read that stays failed
+        failing the stage), whose tally the stage's record carries (`transfer_read_retry`, `resetspaces.py`)."""
+        self._reads = self._p.reading_retry()
+        return self._reads
 
     @property
     def provisioner(self) -> Provisioner:
@@ -371,7 +393,9 @@ class SpaceReset:
         """One page of a provider's listing in one state: its ids and the next page's token, None on the last."""
         params = {"state": state, "limit": PAGE_LIMIT, **({"page_token": token} if token else {})}
         path = f"/spaces/{self._p.space_id}/transfers"
-        return page_of(self._p.client.get(path, provider=provider, params=params, retry=self._p.retry))
+        with self._p.reading_slot(provider, self._reads):
+            answer = self._p.client.get(path, provider=provider, params=params, retry=self._reads)
+        return page_of(answer)
 
     def _listed(self, provider: str, state: str) -> list[str]:
         """Every id one provider lists in one state, page by page to the end; raise Unreadable past the bound. The
@@ -412,15 +436,29 @@ class SpaceReset:
         moved += [p for p, tid in self._active() if tid not in ended]
         return [self._label(p) for p in dict.fromkeys(moved)]
 
-    def _cancel(self, provider: str, tid: str) -> None:
-        """Cancel one job on one provider through the gate; a 400 answered to the cancel is a job that has ended, which
-        the wait then shows. A cancel the gate refused unsent (`NotSent`, which keeps the status of the gate's own read,
-        a 400 among them) is never taken for that: it propagates, as does any other failure."""
+    def _cancel(self, provider: str, tid: str) -> bool:
+        """Cancel one job on one provider through the gate, whose reads go under the stage's policy (`stage_reads`);
+        return whether the cancel was answered. A 400 answered to the cancel is a job that has ended, which the wait
+        then shows. A cancel that went past the gate and got no answer back (`client.sent_unanswered`) may or may not
+        have been applied: it is never sent again (False), and the wait for the job's record decides, failing at its
+        bound on a job that never ends (O09). A cancel the gate refused unsent (`NotSent`, which keeps the status of the
+        gate's own read, a 400 among them, or `ScopeUnread` once its reads are spent) is never taken for either: it
+        propagates, as does any other failure."""
         try:
-            self._p.mutate("DELETE", f"/transfers/{tid}", provider=provider)
+            self._p.mutate("DELETE", f"/transfers/{tid}", provider=provider, gate_retry=self._reads)
         except PlatformError as error:
+            if sent_unanswered(error):
+                log.warning(
+                    "%s%s: a cancel was sent and its answer was lost (%s); it is never sent again, the job's record "
+                    "decides",
+                    self._p.where,
+                    self._label(provider),
+                    error,
+                )
+                return False
             if isinstance(error, NotSent) or error.status != 400:
                 raise
+        return True
 
     def _wait_ended(self, pairs: Iterable[tuple[str, str]], what: str) -> None:
         """Wait, on each provider, for the jobs it listed to report an ended state there; raise at the bound."""
@@ -438,21 +476,23 @@ class SpaceReset:
                     workers=settings.concurrency,
                     clock=self._p.clock,
                     sleep=self._p.sleep,
-                    retry=self._p.retry,
+                    retry=self._reads,
                 ),
                 f"{self._label(provider)}: {what}",
             )
 
-    def _observe(self, cancelled: set[tuple[str, str]]) -> bool:
+    def _observe(self, cancelled: set[tuple[str, str]], unanswered: set[tuple[str, str]]) -> bool:
         """One observation of the transfers stage: cancel every job a provider lists as waiting or ongoing that the
         stage has not cancelled yet, on that provider, and wait until each reports an ended state there; return whether
         any job was listed. `cancelled` gathers the `(provider, transfer id)` pairs the stage sent a cancel to (one
-        answered 400, a job that had just ended, included), mutated on purpose: the driver counts the observations of
-        every space and decides when each has settled (`resetspaces.py`)."""
+        answered 400, a job that had just ended, included, and one whose answer was lost, never sent again), and
+        `unanswered` the last, both mutated on purpose: the driver counts the observations of every space and decides
+        when each has settled (`resetspaces.py`)."""
         active = self._active()
         fresh = [pair for pair in dict.fromkeys(active) if pair not in cancelled]
         for provider, tid in fresh:
-            self._cancel(provider, tid)
+            if not self._cancel(provider, tid):
+                unanswered.add((provider, tid))
             cancelled.add((provider, tid))
         self._wait_ended(fresh, "a cancelled transfer")
         return bool(active)
@@ -492,14 +532,14 @@ class SpaceReset:
         when a listing shows them late, and, once their records have reported them ended, the ones that hold no read
         up (`run["ended"]`, `_require_quiet`). The record gives every wait the stage took, by why (`waits`)."""
         try:
-            resolved = self._p.resolve_many(path for paths in plan.values() for path in paths)
+            resolved = self._p.resolve_many((path for paths in plan.values() for path in paths), retry=self._reads)
         except KeyError:
             raise ProvisionError(NOT_IN_SPACE) from None
         out: dict[str, Any] = {}
         evicted: set[tuple[str, str]] = run["evicted"]  # mutated on purpose: what this stage hands the quiet stage
         own: set[str] = run["own"]  # mutated on purpose: the jobs it sends, which the occupancy stage knows as its own
         waits = consistency.WaitLog()
-        watched = {"scheduled": own.update, "ended": run["ended"].update, "waits": waits}
+        watched = {"scheduled": own.update, "ended": run["ended"].update, "waits": waits, "reads": self._reads}
         quiet = partial(self._require_quiet, run, waits)
         for provider, paths in plan.items():
             entries = [resolved[path] for path in paths]
@@ -519,6 +559,7 @@ class SpaceReset:
             evicted.update((file_id, provider) for file_id in files)
             if files:
                 results.append(evict_ids(self._p, files, provider, quiet=quiet, **watched))
+            unanswered = sum(r.get("unanswered", 0) for r in results)  # evictions sent once, their answers lost
             out[self._label(provider)] = {
                 "trees": sum(1 for entry in entries if entry.kind == "DIR"),
                 "files": sum(r["files"] for r in results),
@@ -526,6 +567,7 @@ class SpaceReset:
                 "polls": max((r["polls"] for r in results), default=0),
                 "attempts": max((r["attempts"] for r in results), default=0),
                 **sum_counts(results),
+                **({"unanswered": unanswered} if unanswered else {}),
             }
         quiet()
         run["ended_head"] = self._ended_heads()
@@ -536,14 +578,15 @@ class SpaceReset:
     def _holdings(self, run: dict[str, Any]) -> occupancy.Reading:
         """One reading of the occupancy: every regular file's block map at each provider that can hold the space's
         bytes, and the counter beside them (`occupancy.holdings`); under the shortcut, only the files that may have
-        changed since the planner's reading (`run["only"]`, `resetshortcut.py`), the rest carried as empty."""
+        changed since the planner's reading (`run["only"]`, `resetshortcut.py`), the rest carried as empty. Every read
+        of it, the counter's too, goes under a policy made for the reading."""
         return occupancy.holdings(
             self._p,
             run["files"],
             run["never_holds"],
             providers=self._providers,
             label=self._label,
-            retry=self._p.retry,
+            retry=self._p.reading_retry(),
             only=run["only"],
         )
 
@@ -653,7 +696,8 @@ class SpaceReset:
 
     def _job(self, provider: str, tid: str) -> tuple[float, str]:
         """An ended job's finish time (`_finish`) and the file id its record names; Unreadable without either."""
-        record = self._p.client.get(f"/transfers/{tid}", provider=provider, retry=self._p.retry)
+        with self._p.reading_slot(provider, self._reads):
+            record = self._p.client.get(f"/transfers/{tid}", provider=provider, retry=self._reads)
         value = record.get("finishTime") if isinstance(record, dict) else None
         file_id = record.get("fileId") if isinstance(record, dict) else None
         if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
@@ -666,7 +710,8 @@ class SpaceReset:
     def _finish(self, provider: str, tid: str) -> float:
         """An ended job's finish time, from its record; 0 for a job cancelled before it started, which was given none
         (`transferorder.py`). One without a number there is unreadable."""
-        record = self._p.client.get(f"/transfers/{tid}", provider=provider, retry=self._p.retry)
+        with self._p.reading_slot(provider, self._reads):
+            record = self._p.client.get(f"/transfers/{tid}", provider=provider, retry=self._reads)
         value = record.get("finishTime") if isinstance(record, dict) else None
         if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
             raise Unreadable("an ended transfer's record has no finishTime that is a number")
@@ -677,7 +722,7 @@ class SpaceReset:
         endpoint, sent with no credential: its offset from this host and half the round trip, which spans any retry;
         None when the answer cannot be read. A read that fails raises, and fails the stage."""
         sent = self._now()
-        answer, date = self._p.client.get_dated(ZONE_TIME_PATH, retry=self._p.retry, anonymous=True)
+        answer, date = self._p.client.get_dated(ZONE_TIME_PATH, retry=self._reads, anonymous=True)  # Onezone: no slot
         return zone_clock_of(answer, date, sent, self._now())
 
     def _dated_page(self, provider: str, token: str | None) -> tuple[list[str], str | None, float | None]:
@@ -686,7 +731,8 @@ class SpaceReset:
         a diagnostic, since a finish time is on the global clock."""
         params = {"state": "ended", "limit": PAGE_LIMIT, **({"page_token": token} if token else {})}
         path = f"/spaces/{self._p.space_id}/transfers"
-        answer, date = self._p.client.get_dated(path, provider=provider, params=params, retry=self._p.retry)
+        with self._p.reading_slot(provider, self._reads):
+            answer, date = self._p.client.get_dated(path, provider=provider, params=params, retry=self._reads)
         ids, following = page_of(answer)
         return ids, following, offset_of(date, self._now())
 

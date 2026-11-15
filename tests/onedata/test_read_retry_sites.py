@@ -14,6 +14,7 @@ scanned); the provisioner's helpers and the layer's functions that retry by defa
 under a constant name. A call the scanner cannot classify fails the test, naming it.
 """
 
+import ast
 import functools
 from pathlib import Path
 
@@ -27,13 +28,17 @@ SKIPPED = {"sandbox/gate.py"}  # the data gate, a program of its own with no cli
 PLUMBING = {
     ("provision.py", "Provisioner._size_of", "client.get"): ["self._retry"],
     ("provision.py", "Provisioner.read_file", "client.get"): ["self._retry"],  # the metadata read, with the deadline
-    ("provision.py", "Provisioner.await_visible", "client.get"): ["self._retry"],
-    ("provision.py", "Provisioner.await_visible", "consistency.wait_visible"): ["self._retry"],
+    # the visibility wait before a transfer: a reset's policy when its stage names one (`retry`, O46)
+    ("provision.py", "Provisioner.await_visible", "client.get"): ["self._retry if retry is None else retry"],
+    ("provision.py", "Provisioner.await_visible", "consistency.wait_visible"): [
+        "self._retry if retry is None else retry"
+    ],
     ("provision.py", "Provisioner.replicate_file", "consistency.wait_transfers"): ["self._retry"],
     ("provision.py", "Provisioner.evict", "consistency.wait_transfers"): ["self._retry"],
-    # the mutation gate's reads, and the gate of a range read and of a streamed read: the request itself is sent once
-    ("provision.py", "Provisioner.mutate", "client.mutate"): ["self._retry"],
-    ("provision.py", "Provisioner.verify_space", "client.space_name"): ["self._retry"],
+    # the mutation gate's reads, and the gate of a range read and of a streamed read: the request itself is sent once;
+    # the gate's reads and the space's name go under a reset's policy when its stage names one (`gate_retry`, `retry`)
+    ("provision.py", "Provisioner.mutate", "client.mutate"): ["self._retry if gate_retry is None else gate_retry"],
+    ("provision.py", "Provisioner.verify_space", "client.space_name"): ["self._retry if retry is None else retry"],
     ("provision.py", "Provisioner.read_file", "client.read_content"): ["self._retry"],
     ("provision.py", "Provisioner.fetch", "client.read_range"): ["self._retry"],
     ("ingestbase.py", "Baseline._times", "client.get"): ["self._p.retry"],
@@ -43,29 +48,8 @@ PLUMBING = {
     ("ingestsparse.py", "SparseBaseline._complete", "provisioner.blocks"): ["self._p.retry"],
     ("ingestsparse.py", "SparseBaseline.check_holdings", "provisioner.blocks"): ["self._p.retry"],  # before a removal
     ("ingestsparse.py", "SparseBaseline._restore_replicas", "provisioner.blocks"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._page", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._dated_page", "client.get_dated"): ["self._p.retry"],  # the history's, with its Date
-    ("reset.py", "SpaceReset._zone_clock", "client.get_dated"): [
-        "self._p.retry"
-    ],  # the global clock, Onezone's reading
-    ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._job", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
-    # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): the counter, and every file's block
-    # map at each provider that can hold the space's bytes
-    ("reset.py", "SpaceReset._holdings", "holdings"): ["self._p.retry"],
-    ("occupancy.py", "_held", "provisioner.blocks"): ["p.retry"],
-    # the reset's QoS stages (O33): the scans, each requirement's record, and the settle's and the quiet stage's
-    # block maps, whose failure fails the stage (a read that fails is no poll that did not match)
-    ("resetqos.py", "_summary", "client.get"): ["p.retry"],
-    ("resetqos.py", "tree", "consistency.space_root"): ["p.retry"],
-    ("resetqos.py", "listed", "consistency.space_root"): ["p.retry"],
-    ("resetqos.py", "_listing_page", "client.get"): ["p.retry"],
-    ("resetqos.py", "_requirement_entry", "client.get"): ["p.retry"],
-    ("resetqos.py", "read_pairs", "provisioner.blocks"): ["p.retry"],
     # the check of a space provisioned by storage import (O41): its block maps are read by the harness, as a baseline's
     ("storageimport.py", "SpaceCheck._check_blocks.whole", "provisioner.blocks"): ["self._p.retry"],
-    ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["provisioner.retry"],
     # the placement's block-map reads outside a poll: a stall there ends the placement
     ("ranges.py", "_held", "provisioner.blocks"): ["provisioner.retry"],
     ("ranges.py", "place_ranges", "provisioner.holds"): ["provisioner.retry"],
@@ -78,6 +62,47 @@ PLUMBING = {
     ("day0/outage_run.py", "Run.prove_holdings", "provisioner.blocks"): ["self.provisioner.retry"],
 }
 
+# A reset's per-file reads (O29, O46, O51): the occupancy's block maps (the occupancy and quiet stages', the shortcut's
+# and the planner's), the QoS scans' root, listing pages, summaries and records, and the settle's and the quiet stage's
+# maps, whose failure fails the stage. Each goes under a policy made for its reading by the provisioner
+# (`reading_retry()`), which also retries a connection failure, never an answer; its tally is the reading's record.
+READING = {
+    # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): its counter and every file's map
+    ("reset.py", "SpaceReset._holdings", "holdings"): ["self._p.reading_retry()"],
+    ("occupancy.py", "_held", "provisioner.blocks"): ["budget.retry"],
+    # each stage's own transfer reads, under the stage's policy (`SpaceReset.stage_reads`, `transfer_read_retry`)
+    ("reset.py", "SpaceReset._page", "client.get"): ["self._reads"],
+    ("reset.py", "SpaceReset._dated_page", "client.get_dated"): ["self._reads"],  # the history's, with its Date
+    ("reset.py", "SpaceReset._zone_clock", "client.get_dated"): ["self._reads"],  # the global clock, Onezone's reading
+    ("reset.py", "SpaceReset._finish", "client.get"): ["self._reads"],
+    ("reset.py", "SpaceReset._job", "client.get"): ["self._reads"],
+    ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._reads"],
+    # the gate's reads before a cancel and a QoS deletion, under the stage's policy; the request is sent once (O09, O46)
+    ("reset.py", "SpaceReset._cancel", "client.mutate"): ["self._reads"],
+    ("resetremove.py", "_delete", "client.mutate"): ["gate"],
+    ("resetqos.py", "_summary", "client.get"): ["reads"],
+    ("resetqos.py", "_root", "consistency.space_root"): ["reads"],
+    ("resetqos.py", "_listing_page", "client.get"): ["reads"],
+    ("resetqos.py", "_requirement_entry", "client.get"): ["reads"],
+    ("resetqos.py", "_pair_map", "provisioner.blocks"): ["reads"],
+}
+
+# Where a reading's policy is made (`Provisioner.reading_retry()`): the reset's readings alone, never a measuring one.
+READING_MADE = {
+    ("occupancy.py", "holdings"),  # a new one when its caller names none
+    ("reset.py", "__init__"),  # SpaceReset's first stage policy, for reads made outside a stage
+    ("reset.py", "stage_reads"),
+    ("reset.py", "_holdings"),
+    ("resetspaces.py", "verify"),  # the space's name, read before any stage (`verify_read_retry`)
+    ("resetplan.py", "plan_scan"),
+    ("resetqos.py", "listed"),
+    ("resetqos.py", "by_listing"),
+    ("resetqos.py", "scan"),
+    ("resetqos.py", "settle"),
+    ("resetqos.py", "quiet_maps"),
+    ("resetremove.py", "remove"),
+}
+
 # A read whose policy is its caller's: a parameter that the caller names, so each caller is a row above or below.
 CALLER_CHOOSES = {
     ("consistency.py", "space_root", "client.get"): ["retry"],
@@ -87,12 +112,19 @@ CALLER_CHOOSES = {
     ("provision.py", "Provisioner._list_pages", "client.get"): ["reads"],  # `children` decides, below
     ("provision.py", "Provisioner.blocks", "client.get"): ["retry"],  # one attempt unless the caller says: place_ranges
     ("provision.py", "Provisioner.holds", "provisioner.blocks"): ["retry"],
+    # the bulk eviction's waits: the provisioner's policy, or the reset's eviction stage's (`evict_ids(reads=)`)
+    ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["reads"],
+    # a transfer's gate: the provisioner's policy, or the reset's eviction stage's (`schedule_transfer(gate_retry=)`)
+    ("provision.py", "Provisioner.schedule_transfer", "client.mutate"): ["gate_retry"],
     ("ingestsparse.py", "SparseBaseline.layout", "client.get"): ["retry"],  # a poll's one attempt, or the part's check
 }
 
 # Plumbing unless it is an instrument's read: `children` and `root` say so by their own arguments.
 INSTRUMENT_AWARE = {
-    ("provision.py", "Provisioner.root", "consistency.space_root"): ["self._retry if wait else ONE_ATTEMPT"],
+    # a reset names its policy (`retry`, O46), which an instrument's read refuses
+    ("provision.py", "Provisioner.root", "consistency.space_root"): [
+        "(self._retry if retry is None else retry) if wait else ONE_ATTEMPT"
+    ],
 }
 
 # What measures the platform or checks it, and a poll that already counts a failed read as one that did not match:
@@ -211,6 +243,7 @@ HELPER_USERS = {
     },
     "eviction.py": {
         "provisioner.verify_space",
+        "provisioner.await_visible",  # before each eviction, apart: a read that fails there is no lost eviction
         "provisioner.schedule_transfer",
         "provisioner.resolve",
         "provisioner.walk",
@@ -258,7 +291,6 @@ HELPER_USERS = {
         "provisioner.read_through",
     },
     "reset.py": {
-        "provisioner.mutate",
         "provisioner.resolve_many",
         "layer.evict_ids",
         "layer.evict_tree",
@@ -266,7 +298,6 @@ HELPER_USERS = {
     "resetspaces.py": {"provisioner.verify_space"},  # the driver verifies each space before any stage
     "resetplan.py": {"provisioner.verify_space"},  # the planner's reading verifies its space before it reads
     "resetqos.py": {"provisioner.children"},
-    "resetremove.py": {"provisioner.mutate"},
     "storageimport.py": {  # the check of a space provisioned by storage import (O41): plumbing, as a baseline's
         "provisioner.root",
         "provisioner.children",
@@ -351,8 +382,8 @@ def test_o29_every_read_names_its_policy_and_the_table_lists_each_choice():
     """O29: no read, wait, gate call or occupancy read leaves a module without naming its policy, the client's own
     calls included, and the choice of each is the one this table records: a plumbing read with the policy of its
     owner, a caller's pass-through, an instrument's read, or one attempt."""
-    expected = {**PLUMBING, **CALLER_CHOOSES, **INSTRUMENT_AWARE, **ONE_ATTEMPT_SITES, **CLIENT_INTERNAL}
-    tables = (PLUMBING, CALLER_CHOOSES, INSTRUMENT_AWARE, ONE_ATTEMPT_SITES, CLIENT_INTERNAL)
+    expected = {**PLUMBING, **READING, **CALLER_CHOOSES, **INSTRUMENT_AWARE, **ONE_ATTEMPT_SITES, **CLIENT_INTERNAL}
+    tables = (PLUMBING, READING, CALLER_CHOOSES, INSTRUMENT_AWARE, ONE_ATTEMPT_SITES, CLIENT_INTERNAL)
     assert len(expected) == sum(len(table) for table in tables)
     found = every_read()
     assert not [site for site, named in found.items() if MISSING in named], "a read names no policy"
@@ -387,6 +418,31 @@ def test_o29_the_measuring_modules_keep_one_attempt_in_every_read_and_every_help
     probe_helpers = scans["probes.py"].helpers
     assert probe_helpers
     assert all(shown == ["False"] for shown in probe_helpers.values())  # `resolve(path, wait=False)`
+
+
+def reading_policies_made() -> set[tuple[str, str]]:
+    """Each (module, function) of the layer that calls `reading_retry()`, by the source's syntax tree."""
+    made: set[tuple[str, str]] = set()
+    for path in sorted(SRC.rglob("*.py")):
+        relative = path.relative_to(SRC).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            for node in ast.walk(function):
+                call = node.func if isinstance(node, ast.Call) else None
+                if isinstance(call, ast.Attribute) and call.attr == "reading_retry":
+                    made.add((relative, function.name))
+    return made
+
+
+def test_o29_a_readings_policy_that_retries_a_connection_failure_is_made_by_the_resets_readings_alone():
+    """O29: `reading_retry()`, the policy that also tries a connection failure again, is made only where the table
+    says, each a reset's reading, and never in a module that measures, so a provider that is down still looks down to
+    every instrument."""
+    made = reading_policies_made() - {("provision.py", "reading_retry")}
+    assert made == READING_MADE
+    assert not {module for module, _ in made} & MEASURING_MODULES
 
 
 def test_o29_the_plumbing_call_sites_name_a_policy_of_their_owner():
@@ -474,6 +530,26 @@ def test_o29_a_measuring_module_that_calls_a_retrying_provisioner_helper_breache
     is a site, and breaches in a measuring module unless its instrument's switch is a literal False."""
     scan = scan_source(f"def f(self, path, node, a):\n    return self._provisioner.{call}\n", "probes.py")
     assert measuring_breaches(scan) != []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "mutate('DELETE', '/x', gate_retry=policy)",
+        "schedule_transfer('eviction', node, a, gate_retry=policy)",
+        "verify_space(retry=policy)",
+        "root(retry=policy)",
+        "resolve_many([path], retry=policy)",
+        "walk(node, retry=policy)",
+        "await_visible(a, [node], retry=policy)",
+    ],
+)
+def test_o46_a_measuring_module_that_hands_a_helper_a_resets_policy_breaches(call):
+    """O46: the gate's reads, the space's name, the root, the eviction's listings and the visibility wait take a
+    reset's policy, which tries a connection failure again (`gate_retry=`, `retry=`); a measuring module that hands one
+    over breaches, so a provider that is down still looks down to every instrument."""
+    text = f"def f(self, path, node, a, policy):\n    return self._provisioner.{call}\n"
+    assert measuring_breaches(scan_source(text, "probes.py")) != []
 
 
 @pytest.mark.parametrize(

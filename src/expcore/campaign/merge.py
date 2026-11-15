@@ -8,7 +8,9 @@
     OUT/merge.json                              `expcore-merge/1`: what was merged, and each snapshot's SHA-256
 
 A shard's snapshot is made from its store with the online backup (`take_snapshot`), so a shard with attempts still
-running is refused, and everything the checks read is read from the copy the batch keeps.
+running is refused, and everything the checks read is read from the copy the batch keeps. A shard's `out/` is only
+read: its store is backed up from a private copy of its files, under a reader's hold of its lock, so nothing is
+written beside it, a read-only `out/` is merged as it is, and a shard a dispatcher still holds is refused (R16).
 
 **What a merge refuses, naming the shard and the reason (C29).** The checks run in the order that costs least, the
 replay check (`study.merge`) last:
@@ -48,6 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.lock import CampaignLocked, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, compare_fingerprints, fingerprint_sha256
 from expcore.campaign.resume import FINGERPRINT_KEY, recorded_fingerprint
 from expcore.campaign.scheduler import STATE_FILE
@@ -139,11 +142,21 @@ def _json(meta: Mapping[str, str], key: str, where: object) -> Any:
 def read_shard(out: Path, scratch: Path, pricing: Pricing | None = None) -> ShardFacts:
     """Copy the store of the shard whose `out/` is `out` to `scratch` and read what the merge needs from the copy.
 
-    Refuses a store with attempts still running, and a store that is not a shard's (`facts_of`).
+    The shard's `out/` is only read, and may be read-only (R16): its lock is held as a reader (`ReaderLock`, which
+    never makes the file) while its store is read from a private copy (`take_snapshot`). Refuses a shard a dispatcher
+    still holds, one whose lock file is missing (copy the shard's `out/` whole) or cannot be opened or locked, a store
+    with attempts still running or that changes while it is copied, and a store that is not a shard's (`facts_of`).
     """
     store = out / STATE_FILE
     try:
-        take_snapshot(store, scratch)
+        with ReaderLock(out):
+            take_snapshot(store, scratch)
+    except CampaignLocked as error:
+        raise MergeRefused(f"{out}: {error}; a shard is merged when it has finished") from None
+    except LockMissing as error:
+        raise MergeRefused(f"{out}: {error}; copy the shard's out/ whole, with its lock file") from None
+    except LockUnavailable as error:
+        raise MergeRefused(f"{out}: {error}; the shard cannot be shown to have finished") from None
     except AttemptsRunning as error:
         raise MergeRefused(f"{out}: {error}; a shard is merged when it has finished") from None
     except SnapshotError as error:
