@@ -27,11 +27,13 @@
  * process cannot point its records elsewhere. The launcher binds the collector's directory read-only into the cell at
  * /hpcop-egress and the shim into /etc/ld.so.preload, so every dynamically linked process of the cell loads it, even
  * one started with a cleared environment, and each record travels on a fresh socket that is closed at once: nothing
- * is inherited, so a child that closes every descriptor (Python's subprocess does) still logs. A send that blocks on
- * a full collector waits. **A connect, or a send to a new address, whose record cannot be delivered is refused with
- * EACCES**: through this shim a destination is logged, or it is not reached. A result or async record that cannot be
- * delivered is counted in `dropped`, which the process's next record carries, and the collector's log is then not
- * intact.
+ * is inherited, so a child that closes every descriptor (Python's subprocess does) still logs. A record waits for
+ * room in a full collector's queue for at most DELIVER_WAIT_MS (2 s), never longer, so a collector that stops reading
+ * fails the agent's calls instead of hanging them. **A connect, or a send to a new address, whose record cannot be
+ * delivered is refused with EACCES**: through this shim a destination is logged, or it is not reached. A result or
+ * async record that cannot be delivered is counted in `dropped`, which the process's next record carries, and the
+ * collector's log is then not intact. A non-blocking call waits the same: refusing it at once would fail a burst of an
+ * asynchronous client's connects whenever the collector's queue is momentarily full.
  *
  * What bypasses it (the static scan of the agent's code cells is the second line of detection; neither prevents
  * egress): a statically linked program or a Go binary, raw system calls (syscall(2), inline assembly), io_uring,
@@ -62,7 +64,7 @@
 _Static_assert(sizeof HPCOP_EGRESS_SOCKET <= sizeof(((struct sockaddr_un *)0)->sun_path),
                "the collector's socket path does not fit a sockaddr_un");
 
-enum { SEEN_MAX = 128, LOCK_SPINS = 1000, RECORD_MAX = 256 };
+enum { SEEN_MAX = 128, LOCK_SPINS = 1000, RECORD_MAX = 256, DELIVER_WAIT_MS = 2000, DELIVER_NAP_NS = 1000000 };
 #ifndef SIN6_LEN_RFC2133
 #define SIN6_LEN_RFC2133 24   /* the shortest IPv6 address the kernel accepts (net/ipv6: no sin6_scope_id) */
 #endif
@@ -110,8 +112,15 @@ static int dest_of(const struct sockaddr *addr, socklen_t len, struct dest *d) {
     return 0;
 }
 
-/* Send one record on a fresh socket; 0 when the collector's socket took it, -1 otherwise. A full collector blocks the
- * caller until it drains. `result` is "-" for an attempt. errno is the caller's to restore. */
+static long long monotonic_ms(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Send one record on a fresh socket; 0 when the collector's socket took it, -1 otherwise. A full collector's queue is
+ * waited on, a millisecond at a time, for at most DELIVER_WAIT_MS: never an unbounded block. `result` is "-" for an
+ * attempt. errno is the caller's to restore. */
 static int deliver(const char *op, int fd, const struct dest *d, const char *type, const char *result) {
     static const struct sockaddr_un to = {AF_UNIX, HPCOP_EGRESS_SOCKET};
     char line[RECORD_MAX];
@@ -127,8 +136,14 @@ static int deliver(const char *op, int fd, const struct dest *d, const char *typ
         __atomic_add_fetch(&dropped, owed, __ATOMIC_ACQ_REL);
         return -1;
     }
-    do sent = syscall(SYS_sendto, s, line, (size_t)n, MSG_NOSIGNAL, &to, sizeof to);
-    while (sent < 0 && errno == EINTR);
+    for (long long deadline = monotonic_ms() + DELIVER_WAIT_MS;;) {
+        sent = syscall(SYS_sendto, s, line, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT, &to, sizeof to);
+        if (sent >= 0 || (errno != EAGAIN && errno != EINTR) || monotonic_ms() >= deadline) break;
+        if (errno == EAGAIN) {
+            struct timespec nap = {0, DELIVER_NAP_NS};
+            nanosleep(&nap, NULL);
+        }
+    }
     syscall(SYS_close, s);
     if (sent == n) return 0;
     __atomic_add_fetch(&dropped, owed, __ATOMIC_ACQ_REL);   /* still owed: the next record carries them */

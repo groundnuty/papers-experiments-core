@@ -209,6 +209,47 @@ def test_a_connect_the_shim_cannot_log_is_refused(run):
     assert out["connect-loopback"] == f"-1 {13}"  # EACCES
 
 
+@needs_gcc
+@needs_unix
+def test_a_stalled_collector_never_blocks_a_connect_past_the_shims_deadline(run):
+    """O52: a collector that stops reading fills its queue; the shim waits a bounded time for room, then refuses the
+    connect with EACCES, as it refuses any connect it cannot log, rather than hanging the agent's call."""
+    path = str(run["root"] / "s" / "sock")  # the path compiled into the run's shim; its collector has stopped
+    stalled = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    stalled.bind(path)
+    senders = []
+    try:
+        # Fill the receiving queue: each sender until its own buffer is full, until a fresh socket cannot add one.
+        for _ in range(256):
+            sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sender.setblocking(False)
+            senders.append(sender)
+            sent = 0
+            try:
+                while sent < 100000:
+                    sender.sendto(b"x" * 200, path)
+                    sent += 1
+            except BlockingIOError:
+                pass
+            if sent == 0:
+                break
+        else:
+            pytest.skip("the collector's queue never filled on this host")
+        try:
+            probed = subprocess.run(
+                [str(run["probe"]), "connect"], capture_output=True, text=True, timeout=20, env=run["env"]
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("the probe's connect hung on a collector that stopped reading")
+        out = dict(line.split(" ", 1) for line in probed.stdout.splitlines())
+        assert out["connect-loopback"] == f"-1 {13}"  # EACCES
+    finally:
+        for sender in senders:
+            sender.close()
+        stalled.close()
+        os.unlink(path)
+
+
 @needs_unix
 def test_a_malformed_datagram_is_kept_as_its_size_and_hash_only():
     """A datagram that is no record (the agent's own, say) is never written as it came: its length and SHA-256."""
