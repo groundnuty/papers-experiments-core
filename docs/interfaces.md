@@ -416,7 +416,7 @@ class Instrument(Protocol):
     def finish(self) -> Mapping[str, Any]
 ```
 
-The study's executor calls them; nothing in the loop does. Two more methods are optional, `at_first_turn` and `check`, and let an instrument refuse the attempt ([below](#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check)); an instrument without them is called exactly as before. `expcore.records.instruments` has the two helpers an executor uses:
+The study's executor calls them; nothing in the loop does. Two more methods are optional, `at_first_turn` and `check`, and let an instrument refuse the attempt ([below](#refusing-an-attempt-the-first-turn-hook-and-the-post-run-check)); an instrument without them is called exactly as before. The core finds them by name, so a class that wraps an instrument [passes them on](#a-class-that-wraps-an-instrument). `expcore.records.instruments` has the two helpers an executor uses:
 
 ```python
 def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, Any]) -> None
@@ -547,6 +547,19 @@ record.write(request.run_dir)  # the record that holds the snapshots and, if a c
 - **Where the scheduler sets it aside.** In the one place a finished attempt can still be set aside (`AttemptRunner._judge`): the post-run health check first (C11), then the refusal, then the endpoint's identity (C16). An attempt the store would score, a cap or an answer or a fault its condition declares as its treatment, becomes infrastructure of the refusal's kind with the instrument and the detail, and an event `instrument_refused` says so; the run is tried again. That holds when an outage flag is on the attempt too: the treatment rule is checked before the outage flag (C01), so such an attempt is scored until the refusal rewrites it, and once rewritten to a kind that is never treatment it is not. A result that still carries the outage's kind is then classified `outage_discarded` and not charged, as any attempt an outage overlapped is; any other is `infra_fail` and charged. The result no longer claims the treatment the record flagged, so the store and the record do not disagree about it. An attempt the store would not score, one set aside by the health check, an outage, or its own infrastructure failure or defect, keeps its outcome, and the event says the outcome stands, except for a refusal of a hold kind (`register_infra_kind(..., charged=False)`, C33): an instrument whose start was held back, so nothing the run did counts, always decides, and the attempt is set aside as that hold, uncharged, whatever set it aside first, a charged post-run failure and a fault injector's unverified restore included (O11: it is still never scored).
 - **Replay and fixtures.** Replay runs no instrument. It serves the recorded `instrument_first_turn` reading and `instrument_refusal` back, so the replayed record has the stored bytes; the reading is not the loop's, so the replay clock does not serve it to the loop. `tests/data/record-v3/04-instrument-refusal.json` pins both.
 - **Without hooks.** A study whose instruments have neither method takes no reading, writes no `instrument_refusal` (the key is absent, never null) and calls `finish_instruments` as before: the example study's records are what they were.
+
+#### A class that wraps an instrument
+
+The core looks for the two optional methods by name, with `getattr` on the object it is given, and calls one when it is callable. A study's class that wraps an instrument (to add a label, a retry, a log) and passes `start` and `finish` on but not `at_first_turn` or `check` drops them without a word: the wrapped instrument's refusal is never asked for, and the attempt is scored as if the manipulation had held. The names are one list, and a helper checks a wrapper against it:
+
+```python
+OPTIONAL_HOOKS: tuple[str, ...] = ("at_first_turn", "check")  # expcore.records.instruments
+def missing_hooks(wrapper: Instrument, wrapped: Instrument) -> tuple[str, ...]
+```
+
+- **The wrapper rule.** A wrapper passes each name in `OPTIONAL_HOOKS` on, as a method that calls the wrapped instrument's or through `__getattr__`, or leaves one out on purpose and says so in its test. `namespace`, `start` and `finish` are not optional, are not in the list, and a wrapper must have them.
+- **The list is the core's discovery.** `_method`, the one lookup of an optional hook, refuses a name that is not in `OPTIONAL_HOOKS`, and a test compares the list with every name the module looks an instrument up by, and fails on a lookup outside `_method` whose name it cannot read, so a hook the core gains later is in the list, and so in the rule, or its tests fail.
+- **`missing_hooks` is for a study's own test.** It returns the names the wrapped instrument has and the wrapper does not, in the list's order: `assert missing_hooks(wrapper, wrapped) == ()` for a wrapper that passes everything on, or the tuple a wrapper that drops one on purpose expects. A hook counts as the core counts it when it looks it up: an attribute that is callable. A property that answers None is no hook (the progressive ingest's `at_first_turn` is one outside its preallocated mode), so a wrapper around it misses nothing then, and a hook only the wrapper has is not missing. Test the wrapper around each instrument it wraps, in each mode that changes which hooks the instrument has.
 
 
 ### Side files of a record
