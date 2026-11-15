@@ -1249,6 +1249,42 @@ class DescriptiveResult:  # AnalysisResult.descriptives, in declared order
 
 **In the outputs.** `analysis.json` gives every contrast `arm_runs` and the analysis `descriptives`. `report.md` has a table "Runs of each arm" after the missing pairs, one row per contrast and arm, with the finish rate (`n/a` for an arm with none planned), and, only when one is declared, a section "One-arm estimates (descriptive)"; the terminal summary prints each one-arm estimate as descriptive, with its interval.
 
+### Several Holm families
+
+`expcore.stats.prereg` and `expcore.stats.analysis` (S17, #76). A preregistration whose confirmatory hypotheses form distinct families, such as one per outcome or one per phase, declares them by name in place of `holm_family`:
+
+```toml
+[holm_families]                # each key a family's name, each value its contrasts; a family of one is a stand-alone test
+phase1 = ["h1a", "h1b", "h1c"]
+phase2 = ["h2a", "h2b"]
+```
+
+```python
+# expcore.stats.prereg
+Preregistration.holm_families: Mapping[str, tuple[str, ...]]  # the named families in declared order; {} for one flat family
+Preregistration.holm_family: tuple[str, ...]  # every family's members, the families in order: the confirmatory set
+Preregistration.families() -> tuple[tuple[str | None, tuple[str, ...]], ...]  # (name, members); one flat family's name is None
+Preregistration.family_of(name) -> tuple[str | None, tuple[str, ...]] | None  # the family a contrast is in, None outside all
+
+# expcore.stats.analysis
+@dataclass(frozen=True)
+class HolmStep:      # step (1 for the smallest p-value), name, p_value, p_holm, level, reject
+@dataclass(frozen=True)
+class HolmFamily:    # name, members (declared order), steps (Holm's order), equivalence (its TOST decisions, S15)
+AnalysisResult.holm_families: tuple[HolmFamily, ...]  # the named families; () for one flat family
+def equivalence_groups(prereg) -> tuple[tuple[str | None, tuple[str, ...]], ...]  # the equivalence family split by Holm family
+```
+
+**Each family on its own.** Holm runs over each family apart, at the preregistration's one `alpha`: a family of m compares its k-th smallest p-value with alpha / (m - k + 1) and stops at the first that misses, so a member's level, adjusted p-value and decision are its own family's and no family's size or p-values move another's. Families of three and two start at alpha / 3 and alpha / 2; one flat family of the same five would start at alpha / 5 and can reject other contrasts. An untestable member counts as p = 1 in its own family (S02). `AnalysisResult.holm` still holds every member's decision, the families one after the other, so whatever reads a decision by name finds its own family's; `holm_families` adds each family's members and its steps. Everything a member's family size enters follows the member's own family: its minimum detectable effect is judged at alpha over its family's size, the refusals of S10 and S13 apply to every family's members, and `power_study`'s corrected row is at alpha over the largest family's size, the hardest first step any family has, so the figure is conservative for the smaller ones.
+
+**Equivalence under several families (S15).** `equivalence_family` stays one list, and each member must be in a Holm family (refused naming `[holm_families]` otherwise). Holm over the TOST p-values runs within each Holm family, over the members of the equivalence family it holds (`equivalence_groups`), so an equivalence claim is adjusted with the other claims of its own Holm family only; `equivalence_holm` keeps the equivalence family's declared order, and each `HolmFamily.equivalence` holds its own claims' decisions. `equivalence_feasibility` judges each claim at alpha over the claims of its own Holm family. With one flat family there is one group, the whole equivalence family, as before.
+
+**What is refused.** `holm_family` and `[holm_families]` together; `[holm_families]` beside `exploratory_only = true` (S12); an empty table, an empty family or a blank family name; a family naming an undeclared contrast, or one contrast twice; a contrast in two families; and a value that is not an array of contrast names (a list of lists among them). Each refusal names the file, `[holm_families]` and the family. A `Preregistration` built in code is held to the same rules, and its `holm_family`, when given beside `holm_families`, must be exactly their union (left empty, it is filled in). `max_unscored_treatment` on a contrast in no family is refused naming `holm_families`.
+
+**The hash.** The families are in `preregistration.toml`, so in its SHA-256, which every output manifest carries (P04) and the campaign fingerprint takes with the other configuration files: the same contrasts grouped otherwise are another preregistration, and a copy made with `with_override(holm_families=...)` is marked `+override`.
+
+**In the outputs.** `analysis.json` keeps `holm` and, only for named families, adds `holm_families`: per family its `name`, its `members`, its `steps` (`step`, `name`, `p_value`, `p_holm`, `level`, `reject`) and its `equivalence` decisions. `report.md` heads the confirmatory contrasts "Preregistered contrasts (n Holm families, each adjusted on its own at alpha = ...)" and gives each family a table of its own, "Holm family <name> (k contrasts)", followed by "Holm steps of <name>" (each step's contrast, raw p, level as alpha / k, Holm p and verdict) and notes on what each family's adjustment means; the exploratory contrasts are "outside every Holm family", the equivalence table has a "Holm family" column, and the terminal summary writes a member's Holm p as `Holm p 0.0240 (family phase1)`. The report refuses a result whose families and Holm decisions disagree (a member in no family or in two, or a step that is not its member's decision). One flat `holm_family` has no named family: its `analysis.json` and `report.md` are byte for byte what they were before families were named (`tests/data/tiny_study_analysis.json` and `tests/data/tiny_study_report.md` pin them).
+
 ## The platform layer's spaces and reset
 
 `expcore_onedata.spaces`, `provision`, `eviction` and `reset`. A federation study has one space per data owner, each supported by its owner's provider, by the agent's local provider and sometimes by a mirror. `platform.toml` declares them as an array of tables, in place of `[space]` and `[support]` (one form or the other, never both):
