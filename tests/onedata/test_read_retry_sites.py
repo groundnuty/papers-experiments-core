@@ -257,12 +257,13 @@ HELPER_USERS = {
         "provisioner.read_through",
     },
     "reset.py": {
-        "provisioner.verify_space",
         "provisioner.mutate",
         "provisioner.resolve_many",
         "layer.evict_ids",
         "layer.evict_tree",
     },
+    "resetspaces.py": {"provisioner.verify_space"},  # the driver verifies each space before any stage
+    "resetplan.py": {"provisioner.verify_space"},  # the planner's reading verifies its space before it reads
     "resetqos.py": {"provisioner.children"},
     "resetremove.py": {"provisioner.mutate"},
     "storageimport.py": {  # the check of a space provisioned by storage import (O41): plumbing, as a baseline's

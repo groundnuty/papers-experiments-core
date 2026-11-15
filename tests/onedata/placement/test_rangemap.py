@@ -120,6 +120,16 @@ def test_o07_the_transfer_listing_is_waited_out_by_default_for_30_s_and_up_to_4_
     assert (custom.transfer_settle_s, custom.transfer_settle_polls) == (60.0, 6)
 
 
+def test_o11_a_reset_of_several_spaces_works_on_4_at_once_by_default_and_at_least_one(tmp_path):
+    """O51: `reset_concurrency` bounds the spaces a reset of several spaces works on at once (`resetspaces.py`): 4 by
+    default, settable, a whole number of at least one."""
+    assert load(tmp_path).settings.reset_concurrency == 4
+    assert load(tmp_path, reset_concurrency=1).settings.reset_concurrency == 1
+    for bad in (0, 2.5, True):
+        with pytest.raises(ConfigError, match=r"key 'reset_concurrency'.*integer"):
+            load(tmp_path, reset_concurrency=bad)
+
+
 def test_o08_the_allowance_for_clock_skew_defaults_to_5_s_and_cannot_be_negative(tmp_path):
     """O08: the run's window is widened by the providers' estimated clock offsets plus an allowance of 5 s by
     default, which can be set and is never negative."""
@@ -195,7 +205,8 @@ def test_o25_a_positional_construction_from_before_the_connection_threshold_stil
     assert (settings.clock_skew_allowance_s, settings.concurrency) == (5.0, 16)
     assert settings.fresh_connection_bytes == 16 << 20  # not given: the default
     assert isinstance(settings.probe_attempts, int)
-    assert dataclasses.fields(PlacementSettings)[-1].name == "fresh_connection_bytes"
+    names = [field.name for field in dataclasses.fields(PlacementSettings)]  # each field added later goes last
+    assert names[names.index("fresh_connection_bytes") :] == ["fresh_connection_bytes", "reset_concurrency"]
 
 
 def test_o25_the_threshold_for_a_new_connection_can_be_set(tmp_path):
