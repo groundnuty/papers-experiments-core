@@ -251,21 +251,30 @@ class _Pipe(threading.Thread):
         self.marks: list[bytes] = []
         self._held = b""
         self._abandoned = False
+        self._lock = threading.Lock()  # what was read is decided and counted whole, before or after an abandonment
 
     def abandon(self) -> None:
         """The runner has taken its result and stopped waiting for this stream (a process that outlived its command
-        holds it open): from now on what is read is dropped, so a writer that goes on never grows what is held (O43)."""
-        self._abandoned = True
+        holds it open): from now on what is read is dropped, so a writer that goes on never grows what is held (O43).
+        Bytes held back as the possible start of a marker line are output, kept and counted first (O55)."""
+        with self._lock:
+            self._release_held()
+            self._abandoned = True
 
     def run(self) -> None:
         try:
             while chunk := self._stream.read1(READ_BYTES):
-                if self._marker is not None:
-                    chunk, self._held = marks.take(self._held + chunk, self._marker, self.marks, final=False)
-                self._count(chunk)
+                with self._lock:
+                    if self._marker is not None:
+                        chunk, self._held = marks.take(self._held + chunk, self._marker, self.marks, final=False)
+                    self._count(chunk)
         except (OSError, ValueError):  # the stream was closed under it: what it read stands
             pass
-        if self._marker is not None and self._held:  # nothing more can complete a marker line: what is held is output
+        with self._lock:  # nothing more can complete a marker line: what is held is output
+            self._release_held()
+
+    def _release_held(self) -> None:
+        if self._marker is not None and self._held:
             held, self._held = self._held, b""
             self._count(marks.take(held, self._marker, self.marks, final=True)[0])
 

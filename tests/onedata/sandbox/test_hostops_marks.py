@@ -8,7 +8,11 @@ it, or close it cleanly (`CmdResult.input_error`): a command that stopped readin
 run it. Real child processes here are the Python interpreter running one-line programs.
 """
 
+import contextlib
+import os
+import signal
 import sys
+import threading
 
 import pytest
 
@@ -129,3 +133,56 @@ def test_o55_the_in_memory_cut_takes_marker_lines_out_as_the_runner_does():
     assert (got.stderr, got.stderr_count, got.stderr_marks) == ("", Counted(0, 0), ("{}",))
     kept = hostops.apply_output_cap(CmdResult(1, "", "", input_error="1 of 2 bytes written (BrokenPipeError)"), 10)
     assert kept.input_error == "1 of 2 bytes written (BrokenPipeError)"
+
+
+class Held:
+    """A stream that gives its first bytes, then blocks until released, as a pipe a lingering worker holds open does."""
+
+    def __init__(self, first: bytes) -> None:
+        self._first, self.release, self.blocked = first, threading.Event(), threading.Event()
+
+    def read1(self, n: int) -> bytes:
+        if self._first:
+            first, self._first = self._first, b""
+            return first
+        self.blocked.set()
+        self.release.wait(10)
+        return b"late"
+
+
+def test_o55_a_reader_given_up_on_keeps_the_bytes_it_held_back_as_output_and_counts_them():
+    """O55 with O43: bytes held back as the possible start of a marker line, when the runner gives up on the stream (a
+    worker holds the pipe past the time), are the command's output: they are kept and counted, never dropped, and
+    nothing read after the abandonment is kept."""
+    stream = Held(b"head\x1e")
+    pipe = hostops._Pipe(stream, None, MARK)
+    pipe.start()
+    assert stream.blocked.wait(10)
+    pipe.abandon()
+    assert pipe.snapshot() == (b"head\x1e", 5)
+    stream.release.set()
+    pipe.join(10)
+    kept, produced = pipe.snapshot()
+    assert kept == b"head\x1e"
+    assert produced >= 5
+
+
+def test_o55_a_timed_out_command_keeps_the_bytes_it_held_back_whole(tmp_path):
+    """O55: through the runner, a command that wrote a byte that may begin a marker line and left a worker holding the
+    pipe past its time keeps that byte in the timed-out result's output."""
+    pid_file = tmp_path / "worker.pid"
+    code = (
+        "import os, subprocess, sys\n"
+        "os.write(1, b'head\\x1e')\n"
+        "w = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "open(sys.argv[1], 'w').write(str(w.pid))\n"
+    )
+    try:
+        got = run_bounded([PY, "-c", code, str(pid_file)], 0.5, marker=MARK, output_cap=100)
+        assert got.returncode == hostops.TIMED_OUT
+        assert got.stdout == "head\x1e"
+        assert got.stdout_count == Counted(produced=5, kept=5)
+    finally:
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
