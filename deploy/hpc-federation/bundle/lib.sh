@@ -375,17 +375,27 @@ redact_stream() {  # <workdir>: stdin to stdout with every plain and base64 form
   rm -f -- "$pat"
 }
 
+# The status codes behind the guard's verdict, as data: the guard (in the container) prints one `hpcop-evidence`
+# line per request into run.log, and this copies them, unchanged, into the batch job's log on stdout, where the run's
+# driver reads them back (run/evidence.py). The lines hold a check, a moment, a request and two numbers: no secret.
+CB_EVIDENCE_LABEL='hpcop-evidence '
+guard_evidence() {  # <run.log>
+  grep -F "$CB_EVIDENCE_LABEL" "$1" 2>/dev/null | grep -E '^hpcop-evidence \{[ -~]{1,300}\}$' || true
+}
+
 wait_ready() {  # <workdir> <service pid> [timeout s]: until the stock launcher reports a fresh deployment
   local W=$1 log=$1/run.log end=$((SECONDS + ${3:-1800}))
   while (( SECONDS < end )); do
     # Polled every second: the guard's verdict ends the start at once (the batch script then stops the service).
     if grep -qF "$CB_GUARD_FAILED" "$log" 2>/dev/null; then
+      guard_evidence "$log"
       die "$(grep -m1 -F "$CB_GUARD_FAILED" "$log" | cut -c8-400 | tr -cd '[:print:]')"
     fi
     if [[ -e $W/rootfs/root/service-ready.lock ]]; then
       grep -q 'Congratulations! New' "$log" || die "the service marked itself ready without a fresh deployment (see $log)"
       grep -qF "$CB_GUARD_PASSED" "$log" \
         || die "the deployment finished, but the Couchbase guard never confirmed this launch's administrator (no '$CB_GUARD_PASSED' line in $log)"
+      guard_evidence "$log"
       ok "deployment finished; $(grep -m1 -F "$CB_GUARD_PASSED" "$log" | cut -c8-300 | tr -cd '[:print:]')"; return 0
     fi
     if grep -qE 'ERROR: (Starting the container failed|Failed to start the container)' "$log" 2>/dev/null; then
@@ -413,17 +423,29 @@ cb_status() {  # <tmpdir> <user> <password>: HTTP status of an authenticated GET
 # password-less bucket, which the onedata bucket is, and that role reads [pools] (so GET /pools/default answers
 # it) but not [settings]; it is then refused with 401 (menelaus_auth.erl:321-336). The reply names the
 # administrator (menelaus_web.erl:2373), which must be ours.
+# One request's status as data, on stdout (the job's log): `hpcop-evidence {...}` in the guard's own format
+# (hpcop-cb-init.py), read back by the run driver. <when> is one of the callers' fixed phrases, never a value.
+cb_evidence() {  # <when> <request> <status> <expected>
+  local when=$1 request=$2 code=$3 expected=$4
+  [[ $when =~ ^[A-Za-z0-9\ \'.,-]+$ && $request =~ ^[A-Za-z0-9\ \(\)/-]+$ && $code =~ ^[0-9]{3}$ && $expected =~ ^[0-9]{3}$ ]] \
+    || die "cb_evidence: a field is not in the shape of the guard's evidence line"
+  printf 'hpcop-evidence {"check": "cb_guard", "when": "%s", "request": "%s", "status": %d, "expected": %d}\n' \
+    "$when" "$request" "$((10#$code))" "$((10#$expected))"
+}
+
 cb_guard() {  # <tmpdir> <user> <password> <when>: fail unless both hold
-  local code who
+  local code who anon
   curl_auth_file "$1/cb.cfg" "$2" "$3"
   code=$(http GET http://127.0.0.1:8091/settings/web "$1/cb-guard.out" -K "$1/cb.cfg")
   rm -f -- "$1/cb.cfg"
+  cb_evidence "$4" "GET /settings/web (administrator)" "$code" 200
   [[ $code == 200 ]] || die "Couchbase guard ($4): GET /settings/web as this launch's administrator answered HTTP $code, not 200"
   who=$(jsonget "$1/cb-guard.out" username --default '')
   [[ -n $who ]] || die "Couchbase guard ($4): Couchbase has no administrator (GET /settings/web names none): anyone can act as one"
   [[ $who == "$2" ]] || die "Couchbase guard ($4): Couchbase's administrator is '$who', not this launch's"
-  code=$(http GET http://127.0.0.1:8091/settings/web "$1/cb-guard.out")
-  [[ $code == 401 ]] || die "Couchbase guard ($4): an anonymous GET /settings/web answered HTTP $code, not 401: Couchbase lets anyone act as its administrator"
+  anon=$(http GET http://127.0.0.1:8091/settings/web "$1/cb-guard.out")
+  cb_evidence "$4" "GET /settings/web (anonymous)" "$anon" 401
+  [[ $anon == 401 ]] || die "Couchbase guard ($4): an anonymous GET /settings/web answered HTTP $anon, not 401: Couchbase lets anyone act as its administrator"
   rm -f -- "$1/cb-guard.out"
   ok "Couchbase guard ($4): this launch's administrator answers, and anonymous admin REST is refused (401)"
 }
