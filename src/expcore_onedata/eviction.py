@@ -41,9 +41,15 @@ one: unknown is never zero.
 The wait for the transfers to end polls each one's record, and a poll that times out ends the eviction, so those polls
 are tried again under the provisioner's policy (O29, `readretry.py`), within the wait's own bound. The block-map reads
 of the verification are inside a poll that counts a failed read as one that did not match, and stay one attempt.
+
+**A caller can watch.** `scheduled` is told each attempt's transfer ids when they are sent, `ended` the same ids once
+their records have reported an ended state on the evicting provider (before `quiet` runs), and a `consistency.WaitLog`
+given as `waits` logs every wait the eviction takes, by why: `transfers_ending` (the records' polls), `block_maps` (the
+verification's polls) and `retry_pause` (before an attempt again). The reset records them (`reset.py`).
 """
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from expcore_onedata import consistency
@@ -86,8 +92,17 @@ def sum_counts(results: Iterable[Mapping[str, Any]]) -> dict[str, int | None]:
     return {key: None if any(r.get(key) is None for r in rows) else sum(r[key] for r in rows) for key in COUNTERS}
 
 
+def _sleep(provisioner: Provisioner, waits: consistency.WaitLog | None, why: str) -> Callable[[float], None]:
+    """The provisioner's sleep, each wait logged under `why` when the caller keeps a log of them."""
+    return provisioner.sleep if waits is None else waits.sleeper(why, provisioner.sleep)
+
+
 def _converge_empty(
-    provisioner: Provisioner, provider: str, ids: Sequence[str], timeout_s: float
+    provisioner: Provisioner,
+    provider: str,
+    ids: Sequence[str],
+    timeout_s: float,
+    waits: consistency.WaitLog | None = None,
 ) -> consistency.EachConvergence:
     """Poll the files' block maps on `provider` together until each shows nothing held on consecutive polls."""
     settings = provisioner.settings
@@ -99,7 +114,7 @@ def _converge_empty(
         poll_s=settings.poll_s,
         consecutive=settings.consecutive_polls,
         workers=settings.concurrency,
-        sleep=provisioner.sleep,
+        sleep=_sleep(provisioner, waits, "block_maps"),
         clock=provisioner.clock,
     )
 
@@ -158,7 +173,9 @@ def require_empty_each(provisioner: Provisioner, provider: str, file_ids: Iterab
     return {"files": len(ids), "polls": result.polls}
 
 
-def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]) -> consistency.TransferReport:
+def _wait_ended(
+    provisioner: Provisioner, provider: str, transfer_ids: list[str], waits: consistency.WaitLog | None = None
+) -> consistency.TransferReport:
     """Wait for the transfers to end, together; raise WaitTimeout when one has not ended at the bound."""
     settings = provisioner.settings
     return consistency.require_ended(
@@ -170,11 +187,22 @@ def _wait_ended(provisioner: Provisioner, provider: str, transfer_ids: list[str]
             poll_s=settings.poll_s,
             workers=settings.concurrency,
             clock=provisioner.clock,
-            sleep=provisioner.sleep,
+            sleep=_sleep(provisioner, waits, "transfers_ending"),
             retry=provisioner.retry,
         ),
         f"{provisioner.where}eviction",
     )
+
+
+@dataclass(frozen=True)
+class _Watch:
+    """What a caller is told of an eviction's jobs and waits: `scheduled` gets each attempt's transfer ids when they
+    are sent, `ended` the same ids once each record has reported an ended state on the evicting provider, and `waits`
+    logs every wait the eviction takes, by why (`transfers_ending`, `block_maps`, `retry_pause`)."""
+
+    scheduled: Callable[[Sequence[str]], None] | None = None
+    ended: Callable[[Sequence[str]], None] | None = None
+    waits: consistency.WaitLog | None = None
 
 
 def _evict_verified(
@@ -183,21 +211,24 @@ def _evict_verified(
     files: Sequence[str],
     schedule: Callable[[Sequence[str]], list[str]],
     quiet: Callable[[], None] | None,
-    scheduled: Callable[[Sequence[str]], None] | None = None,
+    watch: _Watch,
 ) -> dict[str, Any]:
     """Schedule the evictions (`schedule` takes the files still holding bytes and returns the transfer ids, which
-    `scheduled` is given when set), wait for them to end, and judge them by the block maps alone, scheduling again
-    what still holds bytes after `EVICTION_CHECK_S`, up to `EVICTION_ATTEMPTS` in all; the last attempt waits the whole
-    settle bound. Return the transfers, their end states, the last attempt's counters, the polls and the attempts;
-    raise `EvictionIncomplete` when files still hold bytes then."""
+    `watch.scheduled` is given when set, and `watch.ended` once they have ended), wait for them to end, and judge them
+    by the block maps alone, scheduling again what still holds bytes after `EVICTION_CHECK_S`, up to
+    `EVICTION_ATTEMPTS` in all; the last attempt waits the whole settle bound. Return the transfers, their end states,
+    the last attempt's counters, the polls and the attempts; raise `EvictionIncomplete` when files still hold bytes
+    then."""
     pending, transfers, polls = list(files), 0, 0
     states: dict[str, int] = {}
     for attempt in range(1, EVICTION_ATTEMPTS + 1):
         tids = schedule(pending)
-        if scheduled is not None:
-            scheduled(tids)
+        if watch.scheduled is not None:
+            watch.scheduled(tids)
         transfers += len(tids)
-        done = _wait_ended(provisioner, provider, tids)
+        done = _wait_ended(provisioner, provider, tids, watch.waits)
+        if watch.ended is not None:
+            watch.ended(tids)
         for state, count in done.states().items():
             states[state] = states.get(state, 0) + count
         counts = _counted(done.records.values())  # only the last attempt's are kept: an earlier gap is what it retried
@@ -205,7 +236,7 @@ def _evict_verified(
             quiet()  # before each round of block-map reads: a running job could still change a map
         last = attempt == EVICTION_ATTEMPTS
         bound = provisioner.settings.settle_timeout_s if last else EVICTION_CHECK_S
-        result = _converge_empty(provisioner, provider, pending, bound)
+        result = _converge_empty(provisioner, provider, pending, bound, watch.waits)
         polls += result.polls
         if result.converged:
             return {"transfers": transfers, "transfer_states": states, **counts, "polls": polls, "attempts": attempt}
@@ -214,7 +245,7 @@ def _evict_verified(
                 provisioner, files, result, provider=provider, last=counts, transfers=transfers, attempts=attempt
             )
         pending = list(result.pending)  # completed, and these still hold bytes: never evicted; schedule them again
-        provisioner.sleep(EVICTION_RETRY_PAUSE_S)
+        _sleep(provisioner, watch.waits, "retry_pause")(EVICTION_RETRY_PAUSE_S)
     raise AssertionError("unreachable")  # pragma: no cover - the loop returns or raises
 
 
@@ -225,11 +256,14 @@ def evict_ids(
     *,
     quiet: Callable[[], None] | None = None,
     scheduled: Callable[[Sequence[str]], None] | None = None,
+    ended: Callable[[Sequence[str]], None] | None = None,
+    waits: consistency.WaitLog | None = None,
 ) -> dict[str, Any]:
     """Evict files, given by id, from a provider, at most `concurrency` requests at once, and return a record once
     every file's block map there shows nothing held. Never from the data provider; no id means nothing to do.
     `scheduled`, when given, is called with the ids of each attempt's transfers: the reset tells its own jobs from
-    others' by them (O46)."""
+    others' by them (O46); `ended` with the same ids once their records have reported an ended state on the evicting
+    provider, before `quiet` is called; `waits` logs every wait the eviction takes, by why."""
     provisioner.check_eviction(from_provider)
     ids = list(dict.fromkeys(file_ids))
     if not ids:
@@ -255,7 +289,8 @@ def evict_ids(
             provisioner.settings.concurrency,
         )
 
-    done = _evict_verified(provisioner, from_provider, ids, schedule, quiet, scheduled)
+    watch = _Watch(scheduled, ended, waits)
+    done = _evict_verified(provisioner, from_provider, ids, schedule, quiet, watch)
     return {"files": len(ids), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 
 
@@ -267,13 +302,15 @@ def evict_tree(
     quiet: Callable[[], None] | None = None,
     listed: Callable[[Sequence[str]], None] | None = None,
     scheduled: Callable[[Sequence[str]], None] | None = None,
+    ended: Callable[[Sequence[str]], None] | None = None,
+    waits: consistency.WaitLog | None = None,
 ) -> dict[str, Any]:
     """Evict every file under a directory from a provider with one transfer, then verify all of them together, the
     tree listed once; return the record. Never from the data provider; `path` (or the entry a caller resolved
     already) must be a directory. An attempt that left bytes schedules the directory's eviction again. `listed`, when
     given, is called with the ids of the files the listing found, before the transfer: the reset's quiet check holds
     those files' block maps on this provider to the empty map the eviction verified (O33), so it never lists the tree a
-    second time. `scheduled`, when given, is called with each attempt's transfer id (O46), as `evict_ids` does."""
+    second time. `scheduled`, `ended` and `waits` are as `evict_ids` takes them."""
     provisioner.check_eviction(from_provider)
     began = provisioner.clock()
     provisioner.verify_space()
@@ -289,7 +326,7 @@ def evict_tree(
         files,
         lambda _pending: [provisioner.schedule_transfer("eviction", directory.file_id, from_provider)],
         quiet,
-        scheduled,
+        _Watch(scheduled, ended, waits),
     )
     return {"files": len(files), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 

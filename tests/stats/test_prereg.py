@@ -553,6 +553,74 @@ def test_s13_a_ratio_key_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
         load(write(tmp_path, text))
 
 
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "spend_high"'),
+        ('numerator = "spend"', 'numerator_a = "spend_high"\nnumerator_b = "spend"'),
+        ('numerator = "spend"', 'numerator = "spend_high"\nnumerator_b = "spend"'),
+    ],
+)
+def test_s13_a_ratio_contrast_may_declare_a_numerator_column_per_arm(tmp_path, old, new):
+    """S13: `numerator_a` and `numerator_b` each default to `numerator`; however the arms' columns are written, the
+    contrast holds them as arm A's and arm B's, and its outcome names both."""
+    spec = load(write(tmp_path, with_ratio(old, new))).contrasts["spend-per-win"]
+    assert spec.ratio == RatioForm(None, "wins", "exclude", numerator_a="spend_high", numerator_b="spend")
+    assert (spec.ratio.columns(0), spec.ratio.columns(1)) == (("spend_high", "wins"), ("spend", "wins"))
+    assert spec.outcome == "spend_high/wins vs spend/wins"
+
+
+def test_s13_a_ratio_contrast_may_declare_a_denominator_column_per_arm(tmp_path):
+    """S13: the denominator takes per-arm columns by the same rule."""
+    text = with_ratio('denominator = "wins"', 'denominator = "wins"\ndenominator_b = "wins_strict"')
+    spec = load(write(tmp_path, text)).contrasts["spend-per-win"]
+    assert (spec.ratio.columns(0), spec.ratio.columns(1)) == (("spend", "wins"), ("spend", "wins_strict"))
+
+
+def test_s13_per_arm_columns_that_restate_the_shared_one_load_as_the_one_column_contrast_exactly(tmp_path):
+    """S13: a per-arm key naming the shared column declares nothing new, so the contrast is the one without it."""
+    plain = load(write(tmp_path, with_ratio())).contrasts["spend-per-win"]
+    text = with_ratio('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "spend"\ndenominator_b = "wins"')
+    assert load(write(tmp_path, text)).contrasts["spend-per-win"] == plain
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "message"),
+    [
+        (
+            'numerator = "spend"',
+            'numerator = "spend"\nnumerator_a = "hi"\nnumerator_b = "lo"',
+            "numerator",
+            "is read by neither arm: numerator_a and numerator_b name both arms' columns",
+        ),
+        ('numerator = "spend"', 'numerator_a = "hi"', "numerator", "is required: arm B has no column"),
+        ('numerator = "spend"', 'numerator_b = "lo"', "numerator", "is required: arm A has no column"),
+        ('denominator = "wins"', 'denominator_a = "wins"', "denominator", "is required: arm B has no column"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = ""', "numerator_a", "non-empty string"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_b = 3', "numerator_b", "non-empty string"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "wins"', "numerator_a", "make arm A read 'wins'"),
+        ('denominator = "wins"', 'denominator = "wins"\ndenominator_b = "spend"', "denominator_b", "make arm B read"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_c = "hi"', "numerator_c", "is not a known key"),
+    ],
+)
+def test_s13_per_arm_columns_that_leave_an_arm_or_a_column_unread_are_refused_naming_the_key(
+    tmp_path, old, new, key, message
+):
+    """S13: the shared column beside both arms' own is read by no arm; an arm with no column of a role has no ratio;
+    an arm's numerator and denominator are two outcomes; and no third arm has a key."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_ratio(old, new)))
+
+
+@pytest.mark.parametrize("key", ["numerator_a", "numerator_b", "denominator_a", "denominator_b"])
+def test_s13_a_per_arm_column_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
+    """S13: a difference estimator reads one outcome, so an arm's column beside it would be silently ignored."""
+    text = edited('outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n',
+                  f'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n{key} = "spend"\n')  # fmt: skip
+    with pytest.raises(ConfigError, match=rf"\[contrasts.a-vs-b\]: key '{key}' belongs to a ratio contrast"):
+        load(write(tmp_path, text))
+
+
 def test_s13_a_ratio_contrast_may_declare_an_equivalence_margin_on_the_log_scale(tmp_path):
     """S13: its margin, like its estimate, is a natural-log ratio (ln 1.25: within a factor of 1.25 either way)."""
     text = with_ratio('cluster = "group"', 'cluster = "group"\nequivalence_margin = 0.2231')
@@ -754,3 +822,55 @@ def test_s14_a_one_arm_estimate_may_not_share_a_contrasts_name_or_join_the_holm_
     family = edited('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["a-vs-b", "waited-in-a"]')
     with pytest.raises(ConfigError, match="names 'waited-in-a', which is not a declared contrast"):
         load(write(tmp_path, family + DESCRIPTIVES))
+
+
+# --- a smallest effect of interest (S16) -----------------------------------------------------------------------------
+
+
+def with_smallest(difference="", ratio=""):
+    """The base text with the ratio contrast appended, `difference` declared on a-vs-b and `ratio` on the ratio."""
+    head = 'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"\n'
+    return edited(head, f"{head}{difference}\n") + RATIO + ratio + "\n"
+
+
+def test_s16_a_smallest_effect_and_a_smallest_ratio_load_with_their_direction(tmp_path):
+    """S16: a difference on the outcome's scale, a ratio as written, compared as its natural log."""
+    text = with_smallest('smallest_effect = 0.1\ndirection = "higher"', "smallest_ratio = 2")
+    contrasts = load(write(tmp_path, text)).contrasts
+    assert (contrasts["a-vs-b"].smallest_effect, contrasts["a-vs-b"].direction) == (0.1, "higher")
+    assert (contrasts["spend-per-win"].smallest_ratio, contrasts["spend-per-win"].direction) == (2, None)
+    assert contrasts["spend-per-win"].smallest_rule.threshold == pytest.approx(0.693147, abs=1e-6)
+    assert contrasts["gate-effect"].smallest_rule is None
+
+
+@pytest.mark.parametrize(
+    ("difference", "ratio", "contrast", "key", "message"),
+    [
+        ("smallest_ratio = 2", "", "a-vs-b", "smallest_ratio", "belongs to a ratio contrast"),
+        ("", "smallest_effect = 0.5", "spend-per-win", "smallest_effect", "belongs to a contrast of one outcome"),
+        ("", "smallest_ratio = 1.0", "spend-per-win", "smallest_ratio", "a factor of one"),
+        ("", "smallest_ratio = 0", "spend-per-win", "smallest_ratio", "positive ratio"),
+        ("", "smallest_ratio = -2", "spend-per-win", "smallest_ratio", "positive ratio"),
+        ("smallest_effect = 0", "", "a-vs-b", "smallest_effect", "must be positive"),
+        ("smallest_effect = -0.1", "", "a-vs-b", "smallest_effect", "must be positive"),
+        ('smallest_effect = "0.1"', "", "a-vs-b", "smallest_effect", "finite number"),
+        ('direction = "higher"', "", "a-vs-b", "direction", "without smallest_effect or smallest_ratio"),
+        ('smallest_effect = 0.1\ndirection = "up"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
+        ('smallest_effect = 0.1\ndirection = "either"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
+        ("", 'smallest_ratio = 0.5\ndirection = "higher"', "spend-per-win", "smallest_ratio", "below 1"),
+    ],
+)
+def test_s16_a_smallest_effect_of_the_wrong_form_or_value_is_refused_naming_the_contrast_and_the_key(
+    tmp_path, difference, ratio, contrast, key, message
+):
+    """S16: the loader refuses what the rule refuses, naming the file, the table and the key."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.{contrast}\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_smallest(difference, ratio)))
+
+
+def test_s16_the_preregistration_hash_covers_a_smallest_effect(tmp_path):
+    """S16, P04: the declaration is in the file, so in the hash every output carries; changing it is another file."""
+    first = load(write(tmp_path, with_smallest("smallest_effect = 0.1")))
+    second = load(write(tmp_path, with_smallest("smallest_effect = 0.2")))
+    third = load(write(tmp_path, with_smallest('smallest_effect = 0.1\ndirection = "lower"')))
+    assert len({first.sha256, second.sha256, third.sha256}) == 3

@@ -38,12 +38,20 @@ never shows down is `stop_unsettled` after the first, and `never_down` after the
 whole bound showed it running with its identity. Beside the journal,
 whoever holds the federation exclusively keeps a holder record (`federation.holder`, written whole and fsynced by
 `write_holder`; `expcore_onedata.admission`): its pid and boot id, its purpose, the target's label and the time it took
-the lock.
+the lock. A tool outside a campaign that holds the federation shared records who it is in `shared-holds.jsonl` beside
+the journal (`expcore_onedata.shared_holds`), through `append_to`, under the same journal-wide lock; the journal itself
+keeps to injection events.
+
+A third file, `federation.drain`, holds the wall-clock time before which no run is admitted: an outage run's sessions
+may still be draining on the local provider (`expcore_onedata.fault_drain`). `raise_drain` only ever moves it later,
+whole and fsynced under the journal-wide lock, and `read_drain` reads it; every admission checks it after it holds the
+lock (`expcore_onedata.admission`), so the wait outlives the process that began it, a crash and an interrupt included.
 """
 
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import weakref
@@ -57,6 +65,7 @@ from expcore.errors import TARGET_LABEL
 JOURNAL = "injections.jsonl"
 JOURNAL_LOCK = "journal.lock"
 HOLDER = "federation.holder"  # who holds the federation exclusively: written by the holder, read when a wait runs out
+DRAIN = "federation.drain"  # the wall-clock time before which no admission is granted (`raise_drain`, `read_drain`)
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 _HELD: dict[int, weakref.finalize] = {}  # the lock descriptors this process holds, with the finalizer of each
 
@@ -155,6 +164,25 @@ def make_directories(directory: Path) -> None:
         _fsync_directory(made.parent)
 
 
+def _cut_tail(path: Path) -> None:
+    """Cut off the last line of a file a crash left without its newline, and make the cut durable."""
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return
+    if size == 0:
+        return
+    with open(path, "r+b") as handle:
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return
+        handle.seek(0)
+        keep = handle.read().rfind(b"\n") + 1
+        handle.truncate(keep)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 class InjectionJournal:
     """Append-only record of every injection and its clear: the target's label, its service, its identity's digest and
     its holder.
@@ -185,43 +213,48 @@ class InjectionJournal:
         make_directories(self.directory)
         with self._section():
             self._cut_incomplete_line()
-            new_file = not self.path.exists()
-            with open(self.path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(dict(line), sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            if new_file:
-                _fsync_directory(self.directory)
+            self._write_line(self.path, line)
+
+    def append_to(self, name: str, line: Mapping[str, Any]) -> None:
+        """`append` to a record file of its own beside the journal (`name`), under the same journal-wide lock."""
+        make_directories(self.directory)
+        path = self.directory / name
+        with self._section():
+            _cut_tail(path)
+            self._write_line(path, line)
+
+    def _write_line(self, path: Path, line: Mapping[str, Any]) -> None:
+        """Under the section: append one line to `path`, fsynced, and the directory too when the line made the file."""
+        new_file = not path.exists()
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(line), sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if new_file:
+            _fsync_directory(self.directory)
+
+    def complete_text(self, name: str = JOURNAL) -> str:
+        """The complete lines of a file beside the journal, read under the journal-wide lock: an incomplete final line
+        is left out, and a missing file has none."""
+        path = self.directory / name
+        if not path.exists():
+            return ""
+        with self._section(fcntl.LOCK_SH):
+            data = path.read_bytes()
+        return data[: data.rfind(b"\n") + 1].decode("utf-8")
 
     def _cut_incomplete_line(self) -> None:
         """Cut off a last line a crash left without its newline, and make the cut durable."""
-        try:
-            size = self.path.stat().st_size
-        except FileNotFoundError:
-            return
-        if size == 0:
-            return
-        with open(self.path, "r+b") as handle:
-            handle.seek(-1, os.SEEK_END)
-            if handle.read(1) == b"\n":
-                return
-            handle.seek(0)
-            keep = handle.read().rfind(b"\n") + 1
-            handle.truncate(keep)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _cut_tail(self.path)
 
     def open_entries(self) -> list[dict[str, Any]]:
         """Return the open injections, each with `injected` set when it was seen down, `stop_unknown` when the stop was
         asked for (`stopping`, or a stop command that raised) and the target was not then seen down, and
-        `stop_unrecorded` when no line says the stop was asked for and the target was not seen down either; raise
-        ValueError when a complete line is not an injection event. Only an incomplete final line is ignored: it was
-        never acted on."""
-        if not self.path.exists():
-            return []
-        with self._section(fcntl.LOCK_SH):
-            data = self.path.read_bytes()
-        complete = data[: data.rfind(b"\n") + 1].decode("utf-8")
+        `stop_unrecorded` when no line says the stop was asked for and the target was not seen down either, and
+        `healed` when a `clear_failed` line says a link heal ran for it (`healing`, O35), and `healing` when that marker
+        is its latest `clear_failed` line (the heal is under way, or was cut short); raise ValueError when a
+        complete line is not an injection event. Only an incomplete final line is ignored: it was never acted on."""
+        complete = self.complete_text()
         entries: dict[str, dict[str, Any]] = {}
         for number, text in enumerate(complete.splitlines(), 1):
             try:
@@ -241,6 +274,13 @@ class InjectionJournal:
                 entries[key]["stop_unknown"] = True  # the stop was asked for: the daemon may still be stopping it
             elif event == "clear_failed" and key in entries:
                 entries[key]["clear_failed"] = str(line.get("how"))  # still open: its restore failed
+                # the heal's own marker as the latest line: a heal under way, or cut short, not yet a failed restore
+                entries[key]["healing"] = line.get("healing") is True
+                if line.get("healing") is True:  # a link heal ran for it (O35): no process heals it again
+                    entries[key]["healed"] = True
+                held = line.get("settle_until")  # a heal's settle (O35): no process reads through the links before it
+                if isinstance(held, int | float) and not isinstance(held, bool):
+                    entries[key]["settle_until"] = max(held, entries[key].get("settle_until", held))
             elif event == "cleared":
                 entries.pop(key, None)
             else:
@@ -316,6 +356,45 @@ class InjectionJournal:
             record["stuck_since"] = since
             self._replace_holder(record)
         return record
+
+    # --- the federation's drain record ----------------------------------------------------------------------------
+
+    def raise_drain(self, until: float) -> None:
+        """Make sure no admission is granted before `until`, on the wall clock: the record is written whole and
+        fsynced, renamed over the old one and the rename made durable, under the journal-wide lock, and only when
+        `until` is later than what it holds, so no writer can move it earlier."""
+        make_directories(self.directory)
+        with self._section():
+            held = self._drain_unlocked()
+            if held is not None and held >= until:
+                return
+            draft = self.directory / f"{DRAIN}.draft"  # one writer at a time: the section is held
+            with open(draft, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"until": until}))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(draft, self.directory / DRAIN)
+            _fsync_directory(self.directory)
+
+    def read_drain(self) -> float | None:
+        """The wall-clock time before which no admission is granted, or None when no record exists. A record that is not
+        one (not JSON, no finite number `until`) raises ValueError: an admission cannot tell it is safe to grant."""
+        if not (self.directory / DRAIN).exists():
+            return None
+        with self._section(fcntl.LOCK_SH):
+            return self._drain_unlocked()
+
+    def _drain_unlocked(self) -> float | None:
+        try:
+            record = json.loads((self.directory / DRAIN).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except ValueError:
+            raise ValueError("the federation's drain record is not JSON") from None
+        until = record.get("until") if isinstance(record, dict) else None
+        if isinstance(until, bool) or not isinstance(until, int | float) or not math.isfinite(until):
+            raise ValueError("the federation's drain record holds no finite time")
+        return float(until)
 
     def try_lock(self, target: str) -> HeldLock | None:
         """Take the target's exclusive lock without waiting; return it, or None when another holds it."""

@@ -73,12 +73,17 @@ class StudyPlugin:
       differ.
     - `prompts`, `tools`: for each condition, the SHA-256 of its prompt template and of its tool manifest
       (`tools_sha256`); they go into the campaign fingerprint, so a resume cannot change either unnoticed.
-    - `health`: the platform's quick look at whether runs can start; None when it has no such check.
+    - `health`: the platform's quick look at whether runs can start; None when it has no such check. A platform whose
+      `admission` declares that it needs one (`campaign.health_required`; the Onedata layer's does with `[faults]`)
+      refuses a campaign without it, when the scheduler is built.
     - `probe`, `lease_group`, `lease_keys`: the platform's resources. `lease_group` maps a run's factor values to the
       group of leases it needs (None: no lease) and `lease_keys` the keys of a group; `probe` answers for holders and
       resources. Leave them out for a study that shares nothing.
     - `admission`: the platform's hold on a resource every run shares (`campaign.attempt.RunAdmission`): entered before
       an attempt starts and left after its post-run check, so the check sees what the run left; None when it has none.
+      It may also have a method `declared_deferral_s()` answering the longest the platform's health check may stay
+      deferred (a `DeferralBound` or None, read from the platform's settings), which the core holds `health` to: a
+      health check that exposes no `max_deferral_s`, or a smaller bound, is refused when the campaign starts.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
       listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign

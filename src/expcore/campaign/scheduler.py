@@ -44,7 +44,15 @@ from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, def
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
-from expcore.campaign.healthgate import HealthCheck, HealthGate
+from expcore.campaign.health_required import refuse_without_health_check
+from expcore.campaign.healthgate import (
+    ADMISSION_OWNER,
+    DECLARED_HOOK,
+    HealthCheck,
+    HealthGate,
+    deferral_bound,
+    exposes_deferral,
+)
 from expcore.campaign.holds import ALL, Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import LeasePool
@@ -149,12 +157,15 @@ class Scheduler:
             else ()
         )
         self.settings.check_kinds(schema)
+        if health is not None:  # before the lock or the store: the platform's own wait must fit under max_defer_s
+            self._check_deferral(health, admission)
         exclusive = [name for name, value in schema.exclusive.items() if value]
         if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
             raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(
                 EXCLUSIVE_KEY,
                 "declares an exclusive run, but the platform gives the campaign no run admission to hold exclusively",
             )
+        refuse_without_health_check(admission, health)  # an admission that reads the pre-run check's note: never blind
         self.store: Store | None = None
         self._campaign: str | None = None  # the store's key for the attempts' liveness (`liveness.register`)
         self.recovery: Recovery | None = None
@@ -172,6 +183,15 @@ class Scheduler:
         self._workers: list[threading.Thread] = []
         self._run_thread: threading.Thread | None = None  # the thread inside `run`, while there is one
         self._fatal: BaseException | None = None
+
+    def _check_deferral(self, health: HealthCheck, admission: RunAdmission | None) -> None:
+        """Refuse a campaign the platform's own deferral outlasts: first one whose health check does not carry what the
+        platform declares through its admission (a wrapper that hid `max_deferral_s`), then a `max_defer_s` shorter than
+        what the check declares (`SchedulerConfig.check_declared_deferral`, `check_deferral_bound`)."""
+        declared = deferral_bound(admission, DECLARED_HOOK, ADMISSION_OWNER)
+        reported = deferral_bound(health)
+        self.settings.check_declared_deferral(declared, reported, exposed=exposes_deferral(health))
+        self.settings.check_deferral_bound(reported)
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
 
@@ -491,11 +511,14 @@ class Scheduler:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
             return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+        reason = None if self.gate is None else self.gate.operator_reason  # what only an operator can end, said first
+        said = "" if reason is None else f": {reason}"
         if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
-            why = "the health gate is closed: the platform's check stayed deferred past max_defer_s"
+            why = f"the health gate is closed: the platform's check stayed deferred past max_defer_s{said}"
             return Hold("health_gate", why, temporary=False)
         if self.gate is not None and self.gate.closed:
-            return Hold("health_gate", "the health gate is closed: no run starts until a check passes", temporary=True)
+            why = f"the health gate is closed: no run starts until a check passes{said}"
+            return Hold("health_gate", why, temporary=True)
         return None
 
     def _model_hold(self, model: str, stopped: frozenset[str], budget: Any) -> Hold | None:
