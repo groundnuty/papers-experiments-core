@@ -154,8 +154,9 @@ def killed_on_tmpfs(tmp_path) -> Iterator[Path]:
 
 
 def rewrite_a_page_in_place(store: Path) -> None:
-    """Commit as a writer could within one tick of the clock: change bytes of the store in place, then put its
-    modification time back, so its size, time and inode are what they were and only its contents differ."""
+    """Write the store as a writer that ignores the lock could within one tick of the clock: change 16 of its bytes in
+    place, then put its modification time back, so its size, modification time and inode are what they were (its
+    change time moves, which no writer can put back, unless within the same tick)."""
     was = os.stat(store)
     with open(store, "r+b") as handle:
         handle.seek(was.st_size - 16)
@@ -168,8 +169,8 @@ def rewrite_a_page_in_place(store: Path) -> None:
 
 
 def write_during_copies(monkeypatch, store: Path, *, when: str, times: int | None) -> list[str]:
-    """Rewrite a page of the store in place just before (`when="before"`) or just after (`"after"`) each of its
-    copies, the first `times` times (every time with None); return the names copied, in order."""
+    """Write the store in place (`rewrite_a_page_in_place`) just before (`when="before"`) or just after (`"after"`)
+    each of its copies, the first `times` times (every time with None); return the names copied, in order."""
     copied: list[str] = []
     real = storecopy._copy_file
     rewrites = 0
@@ -193,9 +194,9 @@ def write_during_copies(monkeypatch, store: Path, *, when: str, times: int | Non
 def test_r16_on_tmpfs_a_writer_that_keeps_size_time_and_inode_during_every_copy_is_refused(
     killed_on_tmpfs, tmp_path, monkeypatch, quick
 ):
-    """R16: a commit during every copy that leaves the store's size, modification time and inode as they were is
-    seen in its contents, which the signature before and after the copy hashes: the copy is never accepted, and
-    after the bounded attempts it is refused, naming the store, with nothing left where it was made."""
+    """R16: on tmpfs, a write during every copy that leaves the store's size, modification time and inode as they
+    were is never accepted: after the bounded attempts the copy is refused, naming the store, with nothing left where
+    it was made. (That the content hash alone catches it, with no stat field to help, is the next test.)"""
     copied = write_during_copies(monkeypatch, killed_on_tmpfs, when="after", times=None)
     into = tmp_path / "copy"
     into.mkdir()
@@ -205,13 +206,26 @@ def test_r16_on_tmpfs_a_writer_that_keeps_size_time_and_inode_during_every_copy_
     assert list(into.iterdir()) == []
 
 
+def test_r16_a_write_no_stat_field_shows_is_caught_by_the_content_hash_alone(killed, tmp_path, monkeypatch, quick):
+    """R16: within one tick of the clock every stat field may stay as it was, the change time too; with all of them
+    frozen, a write in place during every copy is still caught, by the SHA-256 of the contents the signature holds,
+    and the copy is refused."""
+    monkeypatch.setattr(storecopy, "_stat", lambda path: (0, 0, 0, 0, 0) if path.exists() else None)
+    copied = write_during_copies(monkeypatch, killed, when="after", times=None)
+    into = tmp_path / "copy"
+    into.mkdir()
+    with pytest.raises(StoreChanged, match=f"{killed}: it changed while it was copied"):
+        copy_store(killed, into)
+    assert copied == ["state.sqlite", "state.sqlite-wal"] * COPY_ATTEMPTS
+
+
 @pytest.mark.parametrize("when", ["before", "after"])
-def test_r16_on_tmpfs_a_page_rewritten_once_around_the_copy_is_copied_again_never_torn(
+def test_r16_on_tmpfs_a_write_once_around_the_copy_is_copied_again_never_torn(
     killed_on_tmpfs, tmp_path, monkeypatch, quick, when
 ):
-    """R16: the bytes copied must equal the contents hashed both before and after the copy, so a store rewritten in
-    place just before its copy is read (after the signature was taken) or just after, size, time and inode kept, is
-    copied again; what is accepted is one state of both files."""
+    """R16: the bytes copied must equal the contents hashed both before and after the copy, so a store written in
+    place just before its copy is read (after the signature was taken) or just after, size, modification time and
+    inode kept, is copied again; what is accepted is one state of both files."""
     copied = write_during_copies(monkeypatch, killed_on_tmpfs, when=when, times=1)
     into = tmp_path / "copy"
     into.mkdir()
