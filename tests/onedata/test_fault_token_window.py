@@ -16,7 +16,7 @@ import sys
 
 import pytest
 from campaign_support import LATER, NOW, keys_under, make_manifest, make_schema, open_store
-from heal_support import TARGET, four_providers, heal_injector, stale
+from heal_support import HEAL_TIMEOUT_S, TARGET, four_providers, heal_injector, stale
 from mcp import StdioServerParameters
 from record_support import record_run
 
@@ -32,7 +32,6 @@ from expcore_onedata.admission import FederationLock
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import (
-    DEFAULT_HEAL_TIMEOUT_S,
     DEFAULT_SESSION_DRAIN_S,
     TOKEN_MARGIN_BASE_S,
     heal_token_margin_s,
@@ -45,8 +44,8 @@ from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
 from expcore_onedata.tokens import TokenIssuer, tool_server_spec
 from expcore_onedata.toolserver import ENV_TOOLS, ToolServerLauncher
 
-# 900 + 2 x 4,200 + 320 = 9,620 s
-LEAST_MARGIN_S = int(TOKEN_MARGIN_BASE_S + 2 * DEFAULT_HEAL_TIMEOUT_S + DEFAULT_SESSION_DRAIN_S)
+# 900 + 2 x 4,200 + 320 = 9,620 s, at the bound the fixture declares
+LEAST_MARGIN_S = int(TOKEN_MARGIN_BASE_S + 2 * HEAL_TIMEOUT_S + DEFAULT_SESSION_DRAIN_S)
 
 
 def platform_with(tmp_path, margin_s, **faults):
@@ -223,8 +222,8 @@ def test_o35_with_the_margin_load_demands_a_run_whose_heals_take_their_whole_bou
     schema, store, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     assert outage.config.tokens.margin_s == heal_token_margin_s(settings_of(outage.platform))
-    outage.services.on_stop = lambda service: outage.wall.__setitem__(0, outage.wall[0] + DEFAULT_HEAL_TIMEOUT_S)
-    outage.heal_s = DEFAULT_HEAL_TIMEOUT_S
+    outage.services.on_stop = lambda service: outage.wall.__setitem__(0, outage.wall[0] + HEAL_TIMEOUT_S)
+    outage.heal_s = HEAL_TIMEOUT_S
     record = outage.run(schema, key)
     assert outage.steps == [
         "record_run",
@@ -235,7 +234,7 @@ def test_o35_with_the_margin_load_demands_a_run_whose_heals_take_their_whole_bou
         "tool_server_stopped",
         "sandbox_stop",
     ]
-    assert outage.wall[0] - WALL_START == 2 * DEFAULT_HEAL_TIMEOUT_S + CEILING_S
+    assert outage.wall[0] - WALL_START == 2 * HEAL_TIMEOUT_S + CEILING_S
     assert outage.wall[0] < outage.token.expires_at
     assert record.instruments["fault_injector"]["restore_verified"] is True
     begun = store.begin_attempt(key.text, NOW, 1, "")
