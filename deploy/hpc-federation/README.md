@@ -147,6 +147,10 @@ repository.
 
 ## Steps
 
+The steps below start one zone and one provider by hand. A whole run (a zone, three providers, the agent's cell with
+its egress log, teardown and release, each step writing raw evidence that `run/evidence.py` turns into the run's
+summary), and the steps planned for the next live run, are in [`run/README.md`](run/README.md).
+
 Nothing secret is typed, set in the environment or passed as an argument by these steps or the bundle's scripts:
 every secret is generated on the node, inside the job, and moves only through 0600 files and stdin (the image's
 own exceptions are listed under "What stays exposed"). Every `srun` uses `--export=PATH` and, except a step
