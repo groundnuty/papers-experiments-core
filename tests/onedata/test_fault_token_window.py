@@ -7,8 +7,10 @@ the steps of the run that use its tokens (the tool server's launch, to the end o
 sandbox's, to the end of its stop), which each launch counts on the run's admission. With one still running and no long
 margin declared, the heal is skipped and the reading says why; a pair that stays stuck leaves the restore unverified,
 never scored, for a later start with no step running to heal. An executor that stops both before the restore heals
-with the default margin. At load, the margin must outlive the restore and its gate. The tests run each order on fakes,
-with the token's wall clock moved by each phase.
+with the default margin. At load, the margin must outlive the restore and its gate, one restore of it: a failed restore
+is tried again only once no such step runs, and is otherwise left open for the next start's recovery, and a step that
+uses a token is refused without the run's admission. The tests run each order on fakes, with the token's wall clock
+moved by each phase.
 """
 
 import asyncio

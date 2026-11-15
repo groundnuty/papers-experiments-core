@@ -107,12 +107,16 @@ that holds an admission of its own, taken at its start or for the clear, waits o
 (nothing with the defaults). `session_drain_s = 0` adds nothing: a clear then takes no admission and waits for no
 drain. Not counted: a start's recovery of an injection an earlier run left, which the health gate settles before a run
 is dispatched; a start's waits for the federation (its admission, the drain record and the drain a recovery owes,
-`FaultInjector._wait_owed`), which a run's admission has passed before its attempt starts (`FederationLock.held`); in
-the clear's own admission, the wait for the lock itself and a drain record another holder raises during it, bounded by
-`admission_timeout_s` and brief while an injection is open (a shared admission refuses an unsettled journal, and
-another outage run's start fails on a target a live injector holds); a second restore, when `finish` retries a clear
-that failed at `running`'s exit; and the session drain of the run's own admission, which it publishes after the
-post-run check.
+`FaultInjector._wait_owed`), which a run's admission has passed before its attempt starts (`FederationLock.held`), and
+which an injector that takes an admission of its own waits before any token of its run exists, since a step that uses
+a token (the tool server's checks, the sandbox's mint and start) is refused without the run's admission
+(`admission.begin_token_step`); in the clear's own admission, the wait for the lock itself and a drain record another
+holder raises during it, bounded by `admission_timeout_s` and brief while an injection is open (a shared admission
+refuses an unsettled journal, and another outage run's start fails on a target a live injector holds); and the session
+drain of the run's own admission, which it publishes after the post-run check. A second restore never falls inside the
+window: a failed one is tried again only once no step of the run that uses its tokens runs, and is otherwise left open
+for the next start's recovery, the run set aside (`FaultInjector._retry_now`), so the derivation's one restore is
+exact.
 
 **A heal is skipped while a step of the run that uses its tokens runs.** A heal may take `heal_timeout_s` more, so at
 its start the injector reads the steps of the run that use its tokens (the tool server's launch and the sandbox's,

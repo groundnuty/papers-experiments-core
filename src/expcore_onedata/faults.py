@@ -78,7 +78,8 @@ margin; its default, 180 s, does for the federation's 120 s, and platform.toml d
 that raises it raises this too (`expcore_onedata.fault_settings`). `clear` never raises: a failed restore is in the
 snapshot (`verified: false`), stays open in the journal, journalled `clear_failed`, and stays pending, with the target's
 lock held, so a later `clear`, `finish` or `start` tries again, and the health gate and every other injector's start
-refuse the provider until then.
+refuse the provider until then. A later try runs only while no step of the run that uses its tokens runs; while one
+does, the injection is handed to recovery instead, open (see "The token's window").
 
 **A restore that is not verified is never passed silently (O11).** `clear` and `finish` answer it as data (`False`, the
 snapshot's `ok` false), which a caller that handles only a raising exit never reads, so every other way out either
@@ -175,6 +176,20 @@ start), by the long margin, or by hand. The long margin, `[tokens] margin_s` of 
 that stops its sandbox and tool server before `running`'s exit heals with the default margin. A tool server or sandbox
 the study starts itself, which no launch counts, is not seen.
 
+**One restore inside the window, and every token step under the run's admission.** The least margin counts one restore,
+so a restore that failed is tried again (by `finish`, a later `clear`, or a reused injector's next `start`) only when no
+step of the run that uses its tokens still runs, decided at once and never waited for (`_retry_now`): in an executor
+that stops its sandbox and tool server before `running`'s exit, `finish` retries at once, the window closed. While one
+runs, as at `finish` in the order above, the injection is handed to recovery (`_hand_over`): it stays open in the
+journal, its target's lock let go, the record keeps `restore_verified` false with the injection open and is never
+scored, and once the run's admission has ended the next start's recovery, or the health gate's, restores it. A
+`restore_retry` step records the path (`after_steps` or `left_open`), why, and the steps that ran. The steps are
+counted where the injector reads them because, on a platform with `[faults]`, each worker that uses a token (the tool
+server's two checks, the sandbox's mint and start) starts only under the run's admission held then, and is refused
+before it starts otherwise (`admission.begin_token_step`, `TokenStepRefused`, naming it). So a token is minted only
+once the run's admission and its waits are behind it, and an injector that takes an admission of its own, and waits
+for the lock, does so while no run's admission is held, which no token step can run without.
+
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
 so on cancellation it waits for it (shielded, bounded), clears however the block ends and raises the cancellation again.
 A restore that is not verified does not raise at the block's exit: the record, built inside the block, is kept, and
@@ -190,7 +205,8 @@ running in its thread. `finish_instruments` puts the snapshot into the record an
 list. Probes listed after the injector therefore finish before the restore and read the state the outage left; probes
 listed before it finish after the restore. `running` clears when its block exits, so a `finish_instruments` called
 after the block runs after the restore the block's exit made, whatever the order (a restore that was not verified is
-tried again by `finish`, and then the order decides again): call it inside the block for the probes to read first.
+tried again by `finish` once no step of the run that uses its tokens runs, and then the order decides again; while one
+runs it is handed to recovery, see "The token's window"): call it inside the block for the probes to read first.
 
 **Names (O12).** Outside the driver and the journal the provider is known only by its label: in the snapshot, in every
 message and in every failure. Identities are recorded as SHA-256 digests. The settings are `[faults]` of
@@ -457,7 +473,10 @@ class FaultInjector:
 
     def _admit(self) -> None:
         """Hold the federation exclusively for the whole injection: the run's own admission, which must then be
-        exclusive, or one taken here and kept until the restore is verified."""
+        exclusive, or one taken here and kept until the restore is verified. The wait for the lock in the second case
+        is in no token's window: on a platform with `[faults]` no step that uses a token runs without the run's
+        admission (`admission.begin_token_step`), so this context has minted none, and no run's step can start while
+        the admission taken here is held (O35)."""
         held = current_admission()
         if held is not None:
             require_same_federation(held, self._federation.federation)  # another federation's admission is none
@@ -723,10 +742,12 @@ class FaultInjector:
         """Bring the target back and verify its identity changed; record the outcome and never raise for it.
 
         Returns True when this injector leaves nothing down. Until a restore is verified the injection stays pending,
-        with the target's lock held, so a later `clear`, `finish` or `start` tries again; a verified one makes calling
-        it again harmless. A target the injection never took down is found running with its old identity, unless the
-        stop's outcome is unknown: then the clear first waits for the target to show not running. An injector discarded
-        with its restore still unverified lets the lock go when it is collected, so recovery can settle it.
+        with the target's lock held, so a later `clear`, `finish` or `start` tries again, but only while no step of the
+        run that uses its tokens runs: with one running, the injection is handed to recovery open, its lock let go, and
+        this returns False (`_retry_now`); a verified one makes calling it again harmless. A target the injection never
+        took down is found running with its old identity, unless the stop's outcome is unknown: then the clear first
+        waits for the target to show not running. An injector discarded with its restore still unverified lets the lock
+        go when it is collected, so recovery can settle it.
         """
         with self._mutex:
             # a share of the run's admission for the whole clear: a cancelled run whose context lets its admission go
@@ -866,7 +887,9 @@ class FaultInjector:
         inside `admission_timeout_s`, which `cancel_wait_s` does not count: inside `running` the run's or the injector's
         own admission is always held, so only a later retry of `clear` or `finish` takes that branch. The least token
         margin counts the drain record that branch waits out before it restores, and the drain `_drain` waits after it
-        (`fault_settings.restore_drain_s`); the wait for the lock itself it does not. The holder record of an admission
+        (`fault_settings.restore_drain_s`); the wait for the lock itself it does not, since no exclusive admission is
+        then held for this context and no step that uses a token runs without the run's (`admission.begin_token_step`;
+        a retry while one runs is handed to recovery first, `_retry_now`). The holder record of an admission
         taken for a restore names this injector's own target, not the one recovered.
         """
         if self._settings.session_drain_s <= 0:
