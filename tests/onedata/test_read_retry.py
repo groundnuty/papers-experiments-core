@@ -245,7 +245,14 @@ def test_o29_a_readings_policy_tries_a_connection_failure_again_and_tallies_it(
     assert (reading.retries, policy.retries) == (1, 1)
     facts = reading.facts()
     assert facts["providers"] == {
-        "zone": {"reads": 1, "retries": 1, "errors": {failure.__name__: 1}, "failed": 0, "slot_wait_s": 0.0}
+        "zone": {
+            "reads": 1,
+            "retries": 1,
+            "errors": {failure.__name__: 1},
+            "failed": 0,
+            "answers": {},
+            "slot_wait_s": 0.0,
+        }
     }
     assert (facts["reads"], facts["retries"], facts["errors"], facts["failed"]) == (1, 1, {failure.__name__: 1}, 0)
     assert lines(caplog)[0].startswith("zone: a GET ")
@@ -267,12 +274,15 @@ def test_o29_a_readings_read_that_never_connects_fails_after_four_attempts_and_i
 
 @pytest.mark.parametrize("status", [404, 400, 500, 503])
 def test_o29_a_readings_policy_never_asks_again_for_an_answer(status, config, fake, ticker, reading):
-    """O29: an answer is an answer under a reading's policy too: one request, no pause, its status kept."""
+    """O29: an answer is an answer under a reading's policy too: one request, no pause, its status kept; the tally
+    counts it apart from the failed attempts (`answers`), so a reading that failed on one says so."""
     client, script = scripted(config, ticker, status, status)
     with pytest.raises(PlatformError) as caught:
         client.get("/spaces", retry=reading)
     assert (caught.value.status, caught.value.transport) == (status, False)
     assert (len(script.seen), ticker.slept, reading.retries) == (1, [], 0)
+    facts = reading.facts()
+    assert (facts["answers"], facts["errors"], facts["failed"]) == ({str(status): 1}, {}, 0)
 
 
 class CutBody(httpx.SyncByteStream):

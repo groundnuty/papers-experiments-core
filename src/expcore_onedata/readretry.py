@@ -118,7 +118,7 @@ class ReadRetry:
         self._owner = owner
         self._retries = 0
         self._lock = threading.Lock()
-        self._per: dict[str, dict[str, Any]] = {}  # provider label -> its reads, retries, errors by type, failed, waits
+        self._per: dict[str, dict[str, Any]] = {}  # provider label -> reads, retries, errors, failed, answers, waits
 
     @property
     def retries(self) -> int:
@@ -127,7 +127,9 @@ class ReadRetry:
             return self._retries
 
     def _at(self, label: str) -> dict[str, Any]:
-        return self._per.setdefault(label, {"reads": 0, "retries": 0, "errors": {}, "failed": 0, "slot_wait_s": 0.0})
+        return self._per.setdefault(
+            label, {"reads": 0, "retries": 0, "errors": {}, "failed": 0, "answers": {}, "slot_wait_s": 0.0}
+        )
 
     def count(self, label: str | None = None) -> None:
         """Count one retry, at the provider `label` when given; the loop does, as it commits to it. The owner, if any,
@@ -155,6 +157,14 @@ class ReadRetry:
         with self._lock:
             self._at(label)["failed"] += 1
 
+    def answered(self, label: str, kind: str) -> None:
+        """Count one answer at `label` that was no plain success, by its kind: an error status (`"404"`, `"500"`), which
+        the caller decides on (a 404 may be an absence), or `"unreadable"`, an answer not in its shape. An answer is
+        never tried again, so it is no failed attempt: it is tallied apart (`answers`)."""
+        with self._lock:
+            answers = self._at(label)["answers"]
+            answers[kind] = answers.get(kind, 0) + 1
+
     def waited(self, label: str, seconds: float) -> None:
         """Add the seconds a read waited for its provider's slot (`Provisioner.reading_slot`)."""
         with self._lock:
@@ -163,21 +173,30 @@ class ReadRetry:
 
     def facts(self) -> dict[str, Any]:
         """The tally, for a record: the policy (with the per-provider bound it was made under, if any), the reads, the
-        retries, the failed attempts by error type, the reads that failed for good, and each of those per provider
-        label with the seconds its reads waited for a slot."""
+        retries, the failed attempts by error type, the reads that failed for good on them, the answers that were no
+        plain success by kind (`answers`), and each of those per provider label with the seconds its reads waited for
+        a slot."""
         with self._lock:
-            per = {label: {**entry, "errors": dict(entry["errors"])} for label, entry in sorted(self._per.items())}
-        errors: dict[str, int] = {}
-        for entry in per.values():
-            for name, n in entry["errors"].items():
-                errors[name] = errors.get(name, 0) + n
+            per = {
+                label: {**entry, "errors": dict(entry["errors"]), "answers": dict(entry["answers"])}
+                for label, entry in sorted(self._per.items())
+            }
+
+        def total(key: str) -> dict[str, int]:
+            summed: dict[str, int] = {}
+            for entry in per.values():
+                for name, n in entry[key].items():
+                    summed[name] = summed.get(name, 0) + n
+            return dict(sorted(summed.items()))
+
         policy = {"attempts": self.attempts, "pauses_s": list(self.pauses_s), "transport": self.transport}
         return {
             "policy": policy if self.cap is None else {**policy, "provider_concurrency": self.cap},
             "reads": sum(entry["reads"] for entry in per.values()),
             "retries": sum(entry["retries"] for entry in per.values()),
-            "errors": dict(sorted(errors.items())),
+            "errors": total("errors"),
             "failed": sum(entry["failed"] for entry in per.values()),
+            "answers": total("answers"),
             "providers": per,
         }
 

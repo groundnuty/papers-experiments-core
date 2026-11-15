@@ -104,8 +104,8 @@ class PlacementSettings:
     # showed held and those a transfer touched since (`resetgrant.py`, O51); off, every file is read.
     reset_shortcut: bool = False
     reset_exclusive_wait_s: float = 60.0  # the bounded wait for that hold; past it the reset reads every file
-    # The most of a reset's per-file reads (block maps, QoS summaries and records) in flight at one provider, every
-    # space and planner reading of the process together (`readslots.py`, O46, O51).
+    # The most reads of a reset's readings (block maps; the QoS scans' root, pages, summaries and records) in flight at
+    # one provider, every space and planner reading of the process together (`readslots.py`, O46, O51).
     provider_concurrency: int = 16
 
     def reset_settings(self) -> dict[str, Any]:

@@ -202,7 +202,7 @@ def tree(p: Provisioner, provider: str, reads: ReadRetry) -> tuple[str, list[tup
     """The space root on one provider and every leaf under it, a file or an empty directory, as `(id, kind, depth)`:
     the tree `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth. The
     root is read under the reading's policy, the listings under the provisioner's (`Provisioner.children`)."""
-    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=reads)
+    root = _root(p, provider, reads)
     listings: Listings = {}
     found: list[tuple[str, str, int]] = []
     pending = [(root, 0)]
@@ -270,8 +270,15 @@ def _listing_page(
         "limit": LISTING_PAGE,
         **({"token": token} if token else {}),
     }
-    answer = p.client.get(f"/data/{root}/files", provider=provider, params=params, retry=reads)
+    with p.reading_slot(provider, reads):
+        answer = p.client.get(f"/data/{root}/files", provider=provider, params=params, retry=reads)
     return _entries_of(answer)
+
+
+def _root(p: Provisioner, provider: str, reads: ReadRetry) -> str:
+    """The space root on one provider, read under one of its slots and the reading's policy."""
+    with p.reading_slot(provider, reads):
+        return consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=reads)
 
 
 def _entries_of(answer: Any) -> tuple[list[Listed], str | None]:
@@ -318,7 +325,7 @@ def listed(p: Provisioner, provider: str, reads: ReadRetry | None = None) -> tup
     """Every entry of the space root's recursive listing on `provider`, by id, and how many pages were read, under
     `reads` (a reading's policy; by default one made for this listing, `Provisioner.reading_retry`)."""
     reads = reads if reads is not None else p.reading_retry()
-    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=reads)
+    root = _root(p, provider, reads)
     entries: dict[str, Listed] = {}
     token: str | None = None
     pages = 0

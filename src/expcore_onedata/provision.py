@@ -950,6 +950,8 @@ class Provisioner:
         try:
             return provider_blocks(answer, self.provider_id(provider))
         except ValueError as error:
+            if retry.attempts > 1:  # an answer not in its shape, a failed storage entry among them: in the tally
+                retry.answered(self._client.provider_label(reader or provider), "unreadable")
             raise PlatformError(f"the block map is unreadable ({error})") from None
 
     def placement_report(self, provider: str, wanted: Mapping[str, list[Range]]) -> PlacementReport:

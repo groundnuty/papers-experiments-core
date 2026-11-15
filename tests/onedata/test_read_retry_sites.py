@@ -77,8 +77,7 @@ PLUMBING = {
 READING = {
     ("occupancy.py", "_held", "provisioner.blocks"): ["budget.retry"],
     ("resetqos.py", "_summary", "client.get"): ["reads"],
-    ("resetqos.py", "tree", "consistency.space_root"): ["reads"],
-    ("resetqos.py", "listed", "consistency.space_root"): ["reads"],
+    ("resetqos.py", "_root", "consistency.space_root"): ["reads"],
     ("resetqos.py", "_listing_page", "client.get"): ["reads"],
     ("resetqos.py", "_requirement_entry", "client.get"): ["reads"],
     ("resetqos.py", "_pair_map", "provisioner.blocks"): ["reads"],

@@ -40,7 +40,8 @@ again, four attempts with pauses of 2, 5 and 15 s, each retry on a fresh connect
 `READ_BOUND_S`. An answer decides at once: a 404 or a POSIX absence counts 0, any other error answer, a map that cannot
 be read or a provider's failed entry is unknown and fails the reading. A read still failing after its retries is
 unknown too, and fails the reading closed, as one failed read always did. The reading's record (`read_retry`, a failed
-reading's too) gives its reads, retries, failed attempts by error type and the reads that failed, per provider.
+reading's too) gives its reads, retries, failed attempts by error type, the reads that failed for good and the answers
+that were no plain success (`answers`: error statuses, a 404 among them, and unreadable maps), per provider.
 
 The counter is read only once no transfer runs on any provider (the caller makes sure, `reset.py`). Anything unknown
 raises, never a zero: a provider the answer leaves out or marks failed, a backend that failed (directory statistics

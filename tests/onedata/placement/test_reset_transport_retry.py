@@ -177,6 +177,7 @@ def test_o46_a_connection_failure_on_one_block_map_read_is_tried_again_and_the_r
         "retries": 1,
         "errors": {"ConnectError": 1},
         "failed": 0,
+        "answers": {},
     }
     assert tally["policy"] == {"attempts": 4, "pauses_s": PAUSES, "transport": True, "provider_concurrency": 16}
     assert 2.0 in ticker.slept
@@ -308,30 +309,39 @@ def test_o46_a_404_counts_nothing_and_is_never_asked_again(p, fake, broken):
     reading = holdings(p, fake)
     assert sorted(reading.files["beta"].values()) == [0] + [len(DATA)] * (len(FILES) - 1)
     assert (reading.read_retry["retries"], reading.read_retry["errors"]) == (0, {})
+    assert reading.read_retry["answers"] == {"404": 1}  # an answer, tallied apart: the provider has no such file
     assert broken.count(BLOCK_MAPS) == len(FILES)
 
 
 @pytest.mark.parametrize(
-    "outcome",
+    ("outcome", "tallied"),
     [
-        answering(500),
-        answering(400, {"error": {"id": "posix", "details": {"errno": "eacces"}}}),
-        answering(200, {"distributionPerProvider": {BETA_ID: {"success": False}}}),  # a failed storage entry
-        lambda request: httpx.Response(500, stream=CutBody()),  # an error answer cut in its body
+        (answering(500), {"answers": {"500": len(FILES)}}),
+        (answering(400, {"error": {"id": "posix", "details": {"errno": "eacces"}}}), {"answers": {"400": len(FILES)}}),
+        (  # a provider's failed storage entry
+            answering(200, {"distributionPerProvider": {BETA_ID: {"success": False}}}),
+            {"answers": {"unreadable": len(FILES)}},
+        ),
+        (  # an error answer cut in its body: no retry, a failed read
+            lambda request: httpx.Response(500, stream=CutBody()),
+            {"errors": {"ReadError": len(FILES)}, "failed": len(FILES)},
+        ),
     ],
     ids=["500", "posix-eacces", "failed-entry", "500-cut"],
 )
 def test_o46_an_error_answer_a_failed_entry_or_a_cut_error_answer_fails_at_once_and_is_never_asked_again(
-    outcome, p, fake, broken, ticker
+    outcome, tallied, p, fake, broken, ticker
 ):
     """O46: an answer decides at once: an error status, a POSIX error that is no absence, a provider's failed storage
     entry and an error answer whose body was cut short each leave the map unknown after one request, no pause taken,
-    and the reading fails closed; none is retried into a pass."""
+    and the reading fails closed; none is retried into a pass, and the failed reading's tally says which it was."""
     broken.on(BLOCK_MAPS, outcome, times=None)
     with pytest.raises(Unreadable) as caught:
         holdings(p, fake)
+    tally = caught.value.facts["read_retry"]
     assert ticker.slept == []
-    assert caught.value.facts["read_retry"]["retries"] == 0
+    assert tally["retries"] == 0
+    assert {key: tally[key] for key in tallied} == tallied
     assert broken.count(BLOCK_MAPS) == len(FILES)  # one request per file, every one of them failed
 
 
@@ -376,6 +386,18 @@ def test_o51_two_readings_at_once_never_have_more_reads_in_flight_at_one_provide
     assert 1 <= broken.peak <= bound
     assert all(r.held("beta") == HELD for r in readings)
     assert {r.read_retry["policy"]["provider_concurrency"] for r in readings} == {bound}
+
+
+def test_o51_two_qos_scans_at_once_hold_the_bound_in_their_root_and_listing_reads_too(
+    fake, broken, client, config, platform_file, ticker, tmp_path
+):
+    """O51: every read of a reading takes its provider's slot, the space root's and the listing pages' included: two
+    scans at once never have more than one read in flight at beta under a bound of one."""
+    first, second = (bounded(client, config, platform_file, ticker, tmp_path, 1) for _ in range(2))
+    broken.hold_s = 0.02
+    found = consistency.bounded_map(lambda one: resetqos.by_listing(one, ["alpha", "beta"]), [first, second], 2)
+    assert broken.peak == 1
+    assert all(len(f.listing.regular) == len(FILES) for f in found)
 
 
 def test_o51_without_a_tight_bound_the_same_readings_do_overlap_at_one_provider(

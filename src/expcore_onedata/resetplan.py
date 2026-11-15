@@ -66,7 +66,7 @@ class Holdings:
     def facts(self, label: Callable[[str], str]) -> dict[str, Any]:
         """The figures, every provider by its position: the files listed, per provider read the files read, the files
         held and the bytes, the reads of the scan, the seconds, and the tally of every read (`read_retry`: reads,
-        retries, failed attempts by error type, per provider)."""
+        retries, failed attempts by error type, the answers that were no plain success, per provider)."""
         per = {
             label(q): {
                 "files_read": len(held),

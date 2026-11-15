@@ -949,6 +949,8 @@ class OnezoneClient:
         except httpx.HTTPError as error:
             failed = f"{label}: {method} failed ({type(error).__name__})"
         else:
+            if method == "GET" and retry.attempts > 1 and response.status_code >= 300:
+                retry.answered(label, str(response.status_code))  # an answer, decided by the caller: tallied apart
             return _checked(response, method, label)
         # Raised here, with the handlers over: an error raised inside one has the httpx error as its context, and that
         # holds the request, its body and the frames the failure passed through, for as long as the error lives (#259).
