@@ -14,6 +14,7 @@ scanned); the provisioner's helpers and the layer's functions that retry by defa
 under a constant name. A call the scanner cannot classify fails the test, naming it.
 """
 
+import ast
 import functools
 from pathlib import Path
 
@@ -53,16 +54,7 @@ PLUMBING = {
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
     # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): the counter, and every file's block
     # map at each provider that can hold the space's bytes
-    ("reset.py", "SpaceReset._holdings", "holdings"): ["self._p.retry"],
-    ("occupancy.py", "_held", "provisioner.blocks"): ["p.retry"],
-    # the reset's QoS stages (O33): the scans, each requirement's record, and the settle's and the quiet stage's
-    # block maps, whose failure fails the stage (a read that fails is no poll that did not match)
-    ("resetqos.py", "_summary", "client.get"): ["p.retry"],
-    ("resetqos.py", "tree", "consistency.space_root"): ["p.retry"],
-    ("resetqos.py", "listed", "consistency.space_root"): ["p.retry"],
-    ("resetqos.py", "_listing_page", "client.get"): ["p.retry"],
-    ("resetqos.py", "_requirement_entry", "client.get"): ["p.retry"],
-    ("resetqos.py", "read_pairs", "provisioner.blocks"): ["p.retry"],
+    ("reset.py", "SpaceReset._holdings", "holdings"): ["self._p.retry"],  # the counter; the files' maps are READING's
     # the check of a space provisioned by storage import (O41): its block maps are read by the harness, as a baseline's
     ("storageimport.py", "SpaceCheck._check_blocks.whole", "provisioner.blocks"): ["self._p.retry"],
     ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["provisioner.retry"],
@@ -76,6 +68,32 @@ PLUMBING = {
     # day-0's outage check, before anything is taken down: the proof of who holds what is part of setting the scenario
     # up, and a stall there ends the preparation (the helpers it calls, below, read under the provisioner's own policy)
     ("day0/outage_run.py", "Run.prove_holdings", "provisioner.blocks"): ["self.provisioner.retry"],
+}
+
+# A reset's per-file reads (O29, O46, O51): the occupancy's block maps (the occupancy and quiet stages', the shortcut's
+# and the planner's), the QoS scans' root, listing pages, summaries and records, and the settle's and the quiet stage's
+# maps, whose failure fails the stage. Each goes under a policy made for its reading by the provisioner
+# (`reading_retry()`), which also retries a connection failure, never an answer; its tally is the reading's record.
+READING = {
+    ("occupancy.py", "_held", "provisioner.blocks"): ["budget.retry"],
+    ("resetqos.py", "_summary", "client.get"): ["reads"],
+    ("resetqos.py", "tree", "consistency.space_root"): ["reads"],
+    ("resetqos.py", "listed", "consistency.space_root"): ["reads"],
+    ("resetqos.py", "_listing_page", "client.get"): ["reads"],
+    ("resetqos.py", "_requirement_entry", "client.get"): ["reads"],
+    ("resetqos.py", "_pair_map", "provisioner.blocks"): ["reads"],
+}
+
+# Where a reading's policy is made (`Provisioner.reading_retry()`): the reset's readings alone, never a measuring one.
+READING_MADE = {
+    ("occupancy.py", "holdings"),
+    ("resetplan.py", "plan_scan"),
+    ("resetqos.py", "listed"),
+    ("resetqos.py", "by_listing"),
+    ("resetqos.py", "scan"),
+    ("resetqos.py", "settle"),
+    ("resetqos.py", "quiet_maps"),
+    ("resetremove.py", "remove"),
 }
 
 # A read whose policy is its caller's: a parameter that the caller names, so each caller is a row above or below.
@@ -351,8 +369,8 @@ def test_o29_every_read_names_its_policy_and_the_table_lists_each_choice():
     """O29: no read, wait, gate call or occupancy read leaves a module without naming its policy, the client's own
     calls included, and the choice of each is the one this table records: a plumbing read with the policy of its
     owner, a caller's pass-through, an instrument's read, or one attempt."""
-    expected = {**PLUMBING, **CALLER_CHOOSES, **INSTRUMENT_AWARE, **ONE_ATTEMPT_SITES, **CLIENT_INTERNAL}
-    tables = (PLUMBING, CALLER_CHOOSES, INSTRUMENT_AWARE, ONE_ATTEMPT_SITES, CLIENT_INTERNAL)
+    expected = {**PLUMBING, **READING, **CALLER_CHOOSES, **INSTRUMENT_AWARE, **ONE_ATTEMPT_SITES, **CLIENT_INTERNAL}
+    tables = (PLUMBING, READING, CALLER_CHOOSES, INSTRUMENT_AWARE, ONE_ATTEMPT_SITES, CLIENT_INTERNAL)
     assert len(expected) == sum(len(table) for table in tables)
     found = every_read()
     assert not [site for site, named in found.items() if MISSING in named], "a read names no policy"
@@ -387,6 +405,31 @@ def test_o29_the_measuring_modules_keep_one_attempt_in_every_read_and_every_help
     probe_helpers = scans["probes.py"].helpers
     assert probe_helpers
     assert all(shown == ["False"] for shown in probe_helpers.values())  # `resolve(path, wait=False)`
+
+
+def reading_policies_made() -> set[tuple[str, str]]:
+    """Each (module, function) of the layer that calls `reading_retry()`, by the source's syntax tree."""
+    made: set[tuple[str, str]] = set()
+    for path in sorted(SRC.rglob("*.py")):
+        relative = path.relative_to(SRC).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            for node in ast.walk(function):
+                call = node.func if isinstance(node, ast.Call) else None
+                if isinstance(call, ast.Attribute) and call.attr == "reading_retry":
+                    made.add((relative, function.name))
+    return made
+
+
+def test_o29_a_readings_policy_that_retries_a_connection_failure_is_made_by_the_resets_readings_alone():
+    """O29: `reading_retry()`, the policy that also tries a connection failure again, is made only where the table
+    says, each a reset's reading, and never in a module that measures, so a provider that is down still looks down to
+    every instrument."""
+    made = reading_policies_made() - {("provision.py", "reading_retry")}
+    assert made == READING_MADE
+    assert not {module for module, _ in made} & MEASURING_MODULES
 
 
 def test_o29_the_plumbing_call_sites_name_a_policy_of_their_owner():

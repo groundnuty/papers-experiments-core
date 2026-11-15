@@ -182,8 +182,8 @@ def test_o33_the_block_maps_are_read_at_t_and_the_occupancy_at_t_plus_the_quiet_
         seen.append((node.file_id, ticker.now))
         return original(node)
 
-    def read_at_t(p, keys):
-        found = pairs(p, keys)
+    def read_at_t(p, keys, reads):
+        found = pairs(p, keys, reads)
         at_t.append(ticker.now)
         return found
 
@@ -272,9 +272,9 @@ def test_o33_on_a_large_space_the_quiet_stage_reads_only_the_maps_of_the_evicted
         fake.add_file(f"bulk/f-{i:04d}.bin", b"x")
     read, original = [], resetqos.read_pairs
 
-    def counted(p, pairs):
+    def counted(p, pairs, reads):
         before = len(calls(fake, "/distribution"))
-        found = original(p, pairs)
+        found = original(p, pairs, reads)
         read.append(len(calls(fake, "/distribution")) - before)
         return found
 
@@ -291,9 +291,9 @@ def test_o33_a_plan_of_file_paths_bounds_the_quiet_stage_to_those_files(scanned,
     beta alone, once, and beta keeps the four it was allowed."""
     read, original = [], resetqos.read_pairs
 
-    def counted(p, pairs):
+    def counted(p, pairs, reads):
         read.append(sorted(pairs))
-        return original(p, pairs)
+        return original(p, pairs, reads)
 
     monkeypatch.setattr(resetqos, "read_pairs", counted)
     plan = {"beta": FILES[:2]}

@@ -41,7 +41,9 @@ configured name or lies outside the prefixes. On top of that gate:
   placement's own reads pass), three attempts with pauses of 2 s and 5 s. `reads_retried` counts the retries. Never
   retried: a mutation, a streamed or range read itself, a block map read as a probe reads it (one attempt unless the
   caller names a policy), and what is read inside a poll that already counts a failed read as a poll that did not match.
-  An instrument's own read (`resolve(wait=False)`) is one attempt.
+  An instrument's own read (`resolve(wait=False)`) is one attempt. A reset's per-file reads go under a policy made for
+  each reading (`reading_retry`), which also retries a connection failure, never an answer, and under a per-provider
+  bound on the reads in flight (`reading_slot`, `[placement] provider_concurrency`, `readslots.py`).
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
 no token and no credential. A last line a crash cut short (no newline after it, and not a whole line) is no line, and
@@ -57,6 +59,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -66,7 +69,8 @@ from expcore_onedata.client import OnezoneClient, OutOfScope, PlatformError, ans
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.placement import Range, held_bytes, provider_blocks, uncovered
 from expcore_onedata.rangemap import PlacementSettings, safe_path
-from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
+from expcore_onedata.readretry import ONE_ATTEMPT, TRANSPORT_ATTEMPTS, TRANSPORT_PAUSES_S, ReadRetry
+from expcore_onedata.readslots import slots
 from expcore_onedata.streamed import OCTET_STREAM, Digest, ReadOutcome, Upload, chunks, media_type
 
 LISTING_LIMIT = 1000
@@ -334,9 +338,36 @@ class Provisioner:
         the ingest that work through it pass to their own reads too, so one count says how many were retried (O29)."""
         return self._retry
 
+    def reading_retry(self) -> ReadRetry:
+        """A policy for one reading of a reset's per-file reads (O29, O46, O51): four attempts, 2, 5 and 15 s apart, a
+        connection failure tried again as a timeout is (`transport`), on this provisioner's clock and sleep. Its retries
+        count in `reads_retried` too, and its own tally is that reading's record (`ReadRetry.facts`), with the
+        per-provider bound its reads are made under (`reading_slot`). Never for a read that measures the platform."""
+        return ReadRetry(
+            TRANSPORT_ATTEMPTS,
+            TRANSPORT_PAUSES_S,
+            transport=True,
+            clock=self._clock,
+            sleep=self._sleep,
+            owner=self._retry,
+            cap=self._settings.provider_concurrency,
+        )
+
+    @contextmanager
+    def reading_slot(self, provider: str, reads: ReadRetry) -> Iterator[None]:
+        """Hold one of `provider`'s slots for a reset's per-file read, its retries included: at most `[placement]
+        provider_concurrency` such reads are in flight at one provider in the process (`readslots.py`). The seconds
+        waited for it are tallied by `reads`, at the provider's label."""
+        gate = slots(self._config.providers[provider].url, self._settings.provider_concurrency)
+        began = self._clock()
+        with gate:
+            reads.waited(self._client.provider_label(provider), self._clock() - began)
+            yield
+
     @property
     def reads_retried(self) -> int:
-        """How many reads that timed out were tried again under `retry`, for the record of what this provisioner did."""
+        """How many reads were tried again under `retry` and the policies made from it (`reading_retry`), for the
+        record of what this provisioner did."""
         return self._retry.retries
 
     def clock(self) -> float:
@@ -894,15 +925,23 @@ class Provisioner:
 
     # -- block maps ------------------------------------------------------------
     def blocks(
-        self, file_id: str, provider: str, *, reader: str | None = None, retry: ReadRetry = ONE_ATTEMPT
+        self,
+        file_id: str,
+        provider: str,
+        *,
+        reader: str | None = None,
+        retry: ReadRetry = ONE_ATTEMPT,
+        deadline_s: float | None = None,
     ) -> list[Range]:
         """Return the blocks a provider holds of a file, read from the block map as the `reader` provider sees it.
 
         One attempt unless the caller names a policy: the probes record what the map shows and the polls that judge a
         placement count a failed read as a poll that did not match, so a stall there stays the stall it is. A caller
         whose failure would end its operation (the placement's read before it begins) passes the provisioner's
-        (`retry`), and a read that timed out is tried again (O29)."""
-        answer = self._client.get(f"/data/{_segment(file_id)}/distribution", provider=reader or provider, retry=retry)
+        (`retry`), and a read that timed out is tried again (O29), within `deadline_s` when given."""
+        answer = self._client.get(
+            f"/data/{_segment(file_id)}/distribution", provider=reader or provider, retry=retry, deadline_s=deadline_s
+        )
         try:
             return provider_blocks(answer, self.provider_id(provider))
         except ValueError as error:

@@ -32,6 +32,7 @@ qos_fulfil_timeout_s = 120      # the longest the reset waits for a run's QoS re
 reset_concurrency = 4           # the spaces a reset of several spaces works on at once (`resetspaces.py`)
 reset_shortcut = false          # re-read only held and transferred files after the eviction (`resetgrant.py`; needs [faults])
 reset_exclusive_wait_s = 60     # the longest a shortcut reset waits for the reset lock before it does the full reads
+provider_concurrency = 16       # the most of a reset's per-file reads in flight at one provider, every space together
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -103,6 +104,9 @@ class PlacementSettings:
     # showed held and those a transfer touched since (`resetgrant.py`, O51); off, every file is read.
     reset_shortcut: bool = False
     reset_exclusive_wait_s: float = 60.0  # the bounded wait for that hold; past it the reset reads every file
+    # The most of a reset's per-file reads (block maps, QoS summaries and records) in flight at one provider, every
+    # space and planner reading of the process together (`readslots.py`, O46, O51).
+    provider_concurrency: int = 16
 
     def reset_settings(self) -> dict[str, Any]:
         """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
@@ -312,6 +316,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "reset_concurrency",
             "reset_shortcut",
             "reset_exclusive_wait_s",
+            "provider_concurrency",
         )
     )
     holder = table.string("holder")
@@ -351,6 +356,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         reset_concurrency=_number(table, "reset_concurrency", 4, minimum=1, integer=True),
         reset_shortcut=shortcut,
         reset_exclusive_wait_s=_number(table, "reset_exclusive_wait_s", 60.0, minimum=0),
+        provider_concurrency=_number(table, "provider_concurrency", 16, minimum=1, integer=True),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))

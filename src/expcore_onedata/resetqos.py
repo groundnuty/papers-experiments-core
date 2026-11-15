@@ -113,6 +113,7 @@ from expcore_onedata import consistency
 from expcore_onedata.occupancy import Listing, Reading
 from expcore_onedata.placement import Range, held_bytes, merged
 from expcore_onedata.provision import Listings, Provisioner, ProvisionError
+from expcore_onedata.readretry import ReadRetry, recorded
 from expcore_onedata.transferrecord import Unreadable
 
 _PLAIN_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a requirement or entry id the client accepts as one path segment
@@ -174,9 +175,12 @@ def _ids(p: Provisioner, providers: Sequence[str]) -> tuple[tuple[str, str], ...
     return tuple((provider, p.provider_id(provider)) for provider in providers)
 
 
-def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:
-    """The ids of the QoS requirements on an entry and its ancestors, from its summary on one provider."""
-    return requirements_of(p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=p.retry))
+def _summary(p: Provisioner, file_id: str, provider: str, reads: ReadRetry) -> set[str]:
+    """The ids of the QoS requirements on an entry and its ancestors, from its summary on one provider, read under one
+    of its slots and the reading's policy."""
+    with p.reading_slot(provider, reads):
+        answer = p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=reads)
+    return requirements_of(answer)
 
 
 def requirements_of(answer: Any) -> set[str]:
@@ -194,10 +198,11 @@ def plain_id(value: str) -> bool:
     return _PLAIN_ID.fullmatch(value) is not None
 
 
-def tree(p: Provisioner, provider: str) -> tuple[str, list[tuple[str, str, int]]]:
+def tree(p: Provisioner, provider: str, reads: ReadRetry) -> tuple[str, list[tuple[str, str, int]]]:
     """The space root on one provider and every leaf under it, a file or an empty directory, as `(id, kind, depth)`:
-    the tree `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth."""
-    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=p.retry)
+    the tree `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth. The
+    root is read under the reading's policy, the listings under the provisioner's (`Provisioner.children`)."""
+    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=reads)
     listings: Listings = {}
     found: list[tuple[str, str, int]] = []
     pending = [(root, 0)]
@@ -214,21 +219,23 @@ def tree(p: Provisioner, provider: str) -> tuple[str, list[tuple[str, str, int]]
     return root, found
 
 
-def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
+def by_summaries(p: Provisioner, providers: Sequence[str], reads: ReadRetry) -> Found:
     """Every requirement any provider's summaries show: on each provider, the root's and every leaf's."""
     where: dict[str, str] = {}
     files: dict[str, dict[str, int]] = {}
     listing = Listing()
     read, deepest = 0, 0
     for provider in providers:
-        root, leaves = tree(p, provider)
+        root, leaves = tree(p, provider, reads)
         deepest = max([deepest, *(depth for _, kind, depth in leaves if kind != "DIR")])
         listing |= Listing(
             frozenset(file_id for file_id, kind, _ in leaves if kind == "REG"),
             frozenset(file_id for file_id, kind, _ in leaves if kind == "LNK"),
         )
         entries = [root, *(file_id for file_id, _, _ in leaves)]
-        summaries = consistency.bounded_map(lambda f, q=provider: _summary(p, f, q), entries, p.settings.concurrency)
+        summaries = consistency.bounded_map(
+            lambda f, q=provider: _summary(p, f, q, reads), entries, p.settings.concurrency
+        )
         for qid in sorted(set().union(*summaries)):
             where.setdefault(qid, provider)
         for (file_id, kind, depth), held in zip(leaves, summaries[1:], strict=True):
@@ -252,16 +259,18 @@ class Listed:
     kind: str = ""
 
 
-def _listing_page(p: Provisioner, provider: str, root: str, token: str | None) -> tuple[list[Listed], str | None]:
-    """One page of the space root's recursive listing with the QoS attributes; its entries and the next token. The
-    first page sends no token at all: a null one would be read as the text "null"."""
+def _listing_page(
+    p: Provisioner, provider: str, root: str, token: str | None, reads: ReadRetry
+) -> tuple[list[Listed], str | None]:
+    """One page of the space root's recursive listing with the QoS attributes, under the reading's policy; its entries
+    and the next token. The first page sends no token at all: a null one would be read as the text "null"."""
     params: dict[str, Any] = {
         "attributes": ["fileId", "path", "type", "effQosInheritancePath"],
         "include_directories": "true",
         "limit": LISTING_PAGE,
         **({"token": token} if token else {}),
     }
-    answer = p.client.get(f"/data/{root}/files", provider=provider, params=params, retry=p.retry)
+    answer = p.client.get(f"/data/{root}/files", provider=provider, params=params, retry=reads)
     return _entries_of(answer)
 
 
@@ -290,9 +299,11 @@ def _entries_of(answer: Any) -> tuple[list[Listed], str | None]:
     return entries, token
 
 
-def _requirement_entry(p: Provisioner, qid: str, provider: str) -> str:
-    """The id of the entry a requirement is on, from its record's `fileId`."""
-    record = p.client.get(f"/qos_requirements/{qid}", provider=provider, retry=p.retry)
+def _requirement_entry(p: Provisioner, qid: str, provider: str, reads: ReadRetry) -> str:
+    """The id of the entry a requirement is on, from its record's `fileId`, read under one of the provider's slots and
+    the reading's policy."""
+    with p.reading_slot(provider, reads):
+        record = p.client.get(f"/qos_requirements/{qid}", provider=provider, retry=reads)
     file_id = record.get("fileId") if isinstance(record, dict) else None
     if not isinstance(file_id, str) or not file_id:
         raise Unreadable("a QoS requirement's record names no fileId")
@@ -303,21 +314,23 @@ def _under(path: str, top: str) -> bool:
     return top == "." or path == top or path.startswith(f"{top}/")
 
 
-def listed(p: Provisioner, provider: str) -> tuple[dict[str, Listed], int]:
-    """Every entry of the space root's recursive listing on `provider`, by id, and how many pages were read."""
-    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=p.retry)
+def listed(p: Provisioner, provider: str, reads: ReadRetry | None = None) -> tuple[dict[str, Listed], int]:
+    """Every entry of the space root's recursive listing on `provider`, by id, and how many pages were read, under
+    `reads` (a reading's policy; by default one made for this listing, `Provisioner.reading_retry`)."""
+    reads = reads if reads is not None else p.reading_retry()
+    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=reads)
     entries: dict[str, Listed] = {}
     token: str | None = None
     pages = 0
     while True:
-        page, token = _listing_page(p, provider, root, token)
+        page, token = _listing_page(p, provider, root, token, reads)
         pages += 1
         entries.update((e.file_id, e) for e in page)
         if token is None:
             return entries, pages
 
 
-def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
+def by_listing(p: Provisioner, providers: Sequence[str], reads: ReadRetry | None = None) -> Found:
     """Every requirement any of `providers` shows, from the recursive listing of each, the summaries of the entries a
     requirement is on (each read on the provider whose listing marked the entry), and each requirement's record (read
     on the provider whose summary showed it first).
@@ -328,8 +341,10 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
     provider that marks it so, since two providers can hold different requirements on one entry. The calls it makes:
     one listing of the space root per provider (a read of its root and `listing_pages` pages of `LISTING_PAGE`
     entries), one summary per entry per provider that marks it, one record per requirement. The providers' listings
-    are read at once, each provider's pages in turn: they are independent reads."""
-    read = consistency.bounded_map(lambda provider: listed(p, provider), list(providers), len(providers) or 1)
+    are read at once, each provider's pages in turn: they are independent reads. Every read goes under `reads`, the
+    reading's policy (by default one made for this scan, `Provisioner.reading_retry`)."""
+    reads = reads if reads is not None else p.reading_retry()
+    read = consistency.bounded_map(lambda provider: listed(p, provider, reads), list(providers), len(providers) or 1)
     listings = [(provider, found, pages) for provider, (found, pages) in zip(providers, read, strict=True)]
     entries: dict[str, Listed] = {}
     hits: list[tuple[str, str]] = []  # (entry id, the provider that marks it as having a requirement on itself)
@@ -338,13 +353,13 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
             entries.setdefault(entry.file_id, entry)
             if entry.inheritance in DIRECT:
                 hits.append((entry.file_id, provider))
-    summaries = consistency.bounded_map(lambda hit: _summary(p, hit[0], hit[1]), hits, p.settings.concurrency)
+    summaries = consistency.bounded_map(lambda hit: _summary(p, hit[0], hit[1], reads), hits, p.settings.concurrency)
     where: dict[str, str] = {}
     for (_, provider), held in zip(hits, summaries, strict=True):
         for qid in sorted(held):
             where.setdefault(qid, provider)
     qids = sorted(where)
-    on = consistency.bounded_map(lambda q: _requirement_entry(p, q, where[q]), qids, p.settings.concurrency)
+    on = consistency.bounded_map(lambda q: _requirement_entry(p, q, where[q], reads), qids, p.settings.concurrency)
     files: dict[str, dict[str, int]] = {}
     for qid, entry_id in zip(qids, on, strict=True):
         top = entries.get(entry_id)
@@ -352,7 +367,7 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
             raise Unreadable("a QoS requirement is on an entry the recursive listing does not hold")
         under = (e for e in entries.values() if not e.directory and _under(e.path, top.path))
         files[qid] = {e.file_id: len(e.path.split("/")) for e in under}
-    reads = {
+    made = {
         "listings": len(listings),
         "listing_pages": sum(pages for *_, pages in listings),
         "summaries": len(hits),
@@ -364,32 +379,38 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
         frozenset(e.file_id for e in entries.values() if e.kind == "LNK"),
     )
     paths = {e.file_id: e.path for e in entries.values() if e.kind == "REG"}
-    return Found(where, files, reads, deepest, listing, p.space_id, _ids(p, providers), paths)
+    return Found(where, files, made, deepest, listing, p.space_id, _ids(p, providers), paths)
 
 
-def scan(p: Provisioner, providers: Sequence[str]) -> Found:
-    """Find every requirement of the space, on every provider that supports it, as `[placement] qos_scan` says."""
+def scan(p: Provisioner, providers: Sequence[str], reads: ReadRetry | None = None) -> Found:
+    """Find every requirement of the space, on every provider that supports it, as `[placement] qos_scan` says, under
+    `reads`, the reading's policy (by default one made for this scan, `Provisioner.reading_retry`)."""
+    reads = reads if reads is not None else p.reading_retry()
     if p.settings.qos_scan == "listing":
-        return by_listing(p, providers)
-    return by_summaries(p, providers)
+        return by_listing(p, providers, reads)
+    return by_summaries(p, providers, reads)
 
 
 Pair = tuple[str, str]  # (file id, provider)
 Maps = dict[Pair, tuple[Range, ...]]  # (file id, provider) -> the merged blocks that provider holds
 
 
-def read_pairs(p: Provisioner, pairs: Iterable[Pair]) -> Maps:
-    """The block map of each (file, provider) pair, read on that provider, under the provisioner's policy."""
+def _pair_map(p: Provisioner, key: Pair, reads: ReadRetry) -> tuple[Range, ...]:
+    """One (file, provider) pair's merged block map, read on that provider under one of its slots and `reads`."""
+    with p.reading_slot(key[1], reads):
+        return tuple(merged(p.blocks(key[0], key[1], retry=reads)))
+
+
+def read_pairs(p: Provisioner, pairs: Iterable[Pair], reads: ReadRetry) -> Maps:
+    """The block map of each (file, provider) pair, read on that provider, under the reading's policy `reads`."""
     keys = list(dict.fromkeys(pairs))
-    maps = consistency.bounded_map(
-        lambda key: tuple(merged(p.blocks(key[0], key[1], retry=p.retry))), keys, p.settings.concurrency
-    )
+    maps = consistency.bounded_map(lambda key: _pair_map(p, key, reads), keys, p.settings.concurrency)
     return dict(zip(keys, maps, strict=True))
 
 
-def read_maps(p: Provisioner, files: Iterable[str], providers: Sequence[str]) -> Maps:
+def read_maps(p: Provisioner, files: Iterable[str], providers: Sequence[str], reads: ReadRetry) -> Maps:
     """Each provider's block map of each file."""
-    return read_pairs(p, [(file_id, provider) for file_id in sorted(files) for provider in providers])
+    return read_pairs(p, [(file_id, provider) for file_id in sorted(files) for provider in providers], reads)
 
 
 def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -> tuple[dict[str, Any], Maps]:
@@ -397,23 +418,26 @@ def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -
     `SETTLE_STABLE_S`; raise ProvisionError when they are still changing after `SETTLE_BOUND_S` of waiting. Return the
     stage's facts and the maps it ended on, which the quiet stage holds the files to. The bound counts the waits alone,
     never the reads: a requirement on a large directory makes one reading of every file's map on every provider take
-    long, and that is no change."""
+    long, and that is no change. Every poll's reads go under one policy made for the stage
+    (`Provisioner.reading_retry`), whose tally is in the facts (`read_retry`), a failure's included."""
     if not files:
         return {"files": 0, "polls": 0}, {}
-    last, since, polls, waited = read_maps(p, files, providers), p.clock(), 1, 0.0
-    while p.clock() - since < SETTLE_STABLE_S:
-        if waited >= SETTLE_BOUND_S:
-            raise ProvisionError(
-                f"the block maps of {len(files)} file(s) a removed QoS requirement applied to were still changing "
-                f"after {SETTLE_BOUND_S:.0f} s of waiting"
-            )
-        p.sleep(SETTLE_POLL_S)
-        waited += SETTLE_POLL_S
-        current = read_maps(p, files, providers)
-        polls += 1
-        if current != last:
-            last, since = current, p.clock()
-    return {"files": len(files), "polls": polls}, last
+    reads = p.reading_retry()
+    with recorded(reads):
+        last, since, polls, waited = read_maps(p, files, providers, reads), p.clock(), 1, 0.0
+        while p.clock() - since < SETTLE_STABLE_S:
+            if waited >= SETTLE_BOUND_S:
+                raise ProvisionError(
+                    f"the block maps of {len(files)} file(s) a removed QoS requirement applied to were still changing "
+                    f"after {SETTLE_BOUND_S:.0f} s of waiting"
+                )
+            p.sleep(SETTLE_POLL_S)
+            waited += SETTLE_POLL_S
+            current = read_maps(p, files, providers, reads)
+            polls += 1
+            if current != last:
+                last, since = current, p.clock()
+    return {"files": len(files), "polls": polls, "read_retry": reads.facts()}, last
 
 
 def grown(before: Maps, after: Maps) -> list[Pair]:
@@ -434,16 +458,25 @@ def quiet_maps(p: Provisioner, expected: Maps) -> dict[str, Any]:
 
     What the two prove, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The
     occupancy read at T + `quiet_wait_s` or later shows every placement that landed by T. A landing after T is not
-    proved absent: it may not show in the occupancy yet, and no map is read again."""
-    maps = read_pairs(p, expected)
-    more = grown(expected, maps)
-    if more:
-        where = ", ".join(sorted({p.client.provider_label(provider) for _, provider in more}))
-        raise ProvisionError(
-            f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to "
-            f"hold more than the eviction or the settle left them, on {where}: a replica had landed by the quiet stage"
-        )
-    return {"files": len({file_id for file_id, _ in expected}), "block_maps": len(maps)}
+    proved absent: it may not show in the occupancy yet, and no map is read again. The maps are read under one policy
+    made for the reading (`Provisioner.reading_retry`), whose tally is in the facts (`maps_read_retry`), a failure's
+    included."""
+    reads = p.reading_retry()
+    with recorded(reads, "maps_read_retry"):
+        maps = read_pairs(p, expected, reads)
+        more = grown(expected, maps)
+        if more:
+            where = ", ".join(sorted({p.client.provider_label(provider) for _, provider in more}))
+            raise ProvisionError(
+                f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to "
+                f"hold more than the eviction or the settle left them, on {where}: a replica had landed by the quiet "
+                "stage"
+            )
+    return {
+        "files": len({file_id for file_id, _ in expected}),
+        "block_maps": len(maps),
+        "maps_read_retry": reads.facts(),
+    }
 
 
 def quiet_grown(p: Provisioner, sizes: Reading, before: Reading) -> dict[str, Any]:
