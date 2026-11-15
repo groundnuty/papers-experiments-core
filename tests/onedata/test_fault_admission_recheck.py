@@ -14,7 +14,6 @@ import threading
 
 import pytest
 from campaign_support import make_schema
-from expcore_onedata.fault_epoch import GATE_NOTE, LinkEpoch
 from gate_support import CRASHED, EVERY, READER, Federation, gate_of
 from heal_support import heal_injector, stale
 from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings_for
@@ -24,6 +23,7 @@ from expcore.campaign.factors import FactorSchema
 from expcore.errors import uncharged_kinds
 from expcore_onedata.admission import FederationBusy, run_admission
 from expcore_onedata.config import load_platform
+from expcore_onedata.fault_epoch import GATE_NOTE, LinkEpoch, noted_of
 from expcore_onedata.fault_gate_heal import GateHeals
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
@@ -172,7 +172,7 @@ def test_o35_a_restores_heal_raises_the_link_epoch_so_a_run_checked_before_it_is
     injector, _ = heal_injector(tmp_path, stale(), heal="all_links")
     platform = tmp_path / "platform.toml"
     journal = load_faults(platform, load_platform(platform, require_secrets=False)).journal
-    before = LinkEpoch(journal).read()["epoch"]
+    before = noted_of(LinkEpoch(journal).ensure())
     injector.start(RUN)
     assert injector.clear() is True
     assert LinkEpoch(journal).read()["event"] == "heal"
@@ -219,3 +219,101 @@ def test_o35_a_campaign_run_refused_for_a_heal_uses_no_attempt_and_runs_after_a_
     assert len(unstarted) == 1
     assert "no attempt used" in unstarted[0]
     assert "a heal began" in unstarted[0]
+
+
+def test_o35_a_failing_pair_whose_epoch_cannot_be_raised_still_refuses_the_waiting_run(tmp_path, monkeypatch):
+    """O35: another check finds a pair failing, but the link epoch's record cannot be written: the record is removed
+    instead of left at its old count, so the waiting run is refused, uncharged, and a later check makes the record
+    anew, under which a run checked afresh is admitted."""
+    gate, federation, _, settings = gate_of(tmp_path, heal="off")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+
+    def unwritable(self, record):
+        raise OSError("the journal's disk is full")
+
+    with prerun.opened():
+        assert gate().ok
+        federation.stuck = {(READER, CRASHED)}
+        with monkeypatch.context() as patched:
+            patched.setattr(LinkEpoch, "_write", unwritable)
+            failing = elsewhere(gate)
+        assert failing.ok is False
+        assert "could not be raised" in failing.detail
+        assert LinkEpoch(settings.journal).read() is None
+        with pytest.raises(FederationBusy, match="missing"):
+            admitted(admit)
+    federation.stuck = set()
+    with prerun.opened():
+        assert gate().ok
+        assert admitted(admit) == "shared"
+
+
+def test_o35_an_admission_waits_for_a_link_check_under_way_and_is_refused_when_it_finds_a_pair_failing(tmp_path):
+    """O35: another check is reading the pairs when the run's admission re-reads the epoch; the admission waits for
+    that check to end, so a pair it finds failing refuses the run instead of slipping in between the finding and the
+    raise of the epoch."""
+    gate, federation, check, _ = gate_of(tmp_path, heal="off")
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    checked, refused = [], []
+
+    def held_open():
+        entered.set()
+        release.wait(10)
+
+    with prerun.opened():
+        assert gate().ok
+        try_context = contextvars.copy_context()  # the try's own: it refers to the note the check just wrote
+    federation.stuck = {(READER, CRASHED)}
+    check.on_check = held_open
+    checker = threading.Thread(target=lambda: checked.append(elsewhere(gate)))
+    checker.start()
+    try:
+        assert entered.wait(10)
+
+        def admission():
+            try:
+                admitted(admit)
+            except FederationBusy as error:
+                refused.append(error)
+
+        admitting = threading.Thread(target=try_context.run, args=(admission,))
+        admitting.start()
+        admitting.join(0.3)
+        assert admitting.is_alive()  # it waits for the check under way
+    finally:
+        release.set()
+        checker.join(10)
+    admitting.join(10)
+    assert checked[0].ok is False
+    assert len(refused) == 1
+    assert "found a pair failing" in str(refused[0])
+
+
+def test_o35_a_link_check_under_way_past_the_admissions_bound_refuses_the_run_uncharged(tmp_path):
+    """O35: a check under way outlasts the admission's bound (`admission_timeout_s`): the run is refused, uncharged,
+    instead of waiting for ever or being admitted on a count the check may still raise."""
+    gate, federation, check, _ = gate_of(tmp_path, heal="off", admission_timeout_s=0.2)
+    federation.stuck = set()
+    admit = admission_in(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def held_open():
+        entered.set()
+        release.wait(10)
+
+    with prerun.opened():
+        assert gate().ok
+        check.on_check = held_open
+        checker = threading.Thread(target=lambda: elsewhere(gate))
+        checker.start()
+        try:
+            assert entered.wait(10)
+            with pytest.raises(FederationBusy, match="under way") as refused:
+                admitted(admit)
+        finally:
+            release.set()
+            checker.join(10)
+    assert refused.value.kind == FEDERATION_BUSY

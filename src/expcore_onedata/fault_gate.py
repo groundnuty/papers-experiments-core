@@ -83,7 +83,7 @@ from expcore_onedata.admission import (
     current_admission,
     require_same_federation,
 )
-from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch
+from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, noted_of
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
@@ -184,8 +184,8 @@ class FaultGate:
         self._links, self._relink = links, relink
         self._heals = GateHeals(settings.journal)
         self._epoch = LinkEpoch(settings.journal)
-        self._fresh_guard = threading.Lock()  # the link epoch the latest link check this gate took answers for
-        self._fresh_epoch: int | None = None
+        self._fresh_guard = threading.Lock()  # the link epoch (`id`, count) the latest link check it took answers for
+        self._fresh: dict[str, Any] | None = None
         declared = settings.heal != "off" and self._may_recover
         heals = declared and links is not None and relink is not None and bool(labels)
         self._exiting = threading.Event()  # a clean exit asked the heal to start no further step (`stop_heal`)
@@ -310,47 +310,54 @@ class FaultGate:
     def _taken(self) -> Any:
         return None if self._links is None else self._links()
 
-    def _noted(self) -> int:
-        """Under the shared hold of a check that holds no run's admission: the federation's link epoch, noted for the
-        run's admission in the try's note (`admission_recheck`, `prerun`; a dispatcher's check has none). A link report
-        made before the epoch last moved is no answer (a heal, or a failing pair, maybe in another process), so the
-        link check is then made afresh (`relink`). A record that cannot be read fails the check."""
+    def _noted(self) -> dict[str, Any]:
+        """Under the shared hold of a check that holds no run's admission: the federation's link epoch (made when there
+        is none), its `id` and count noted for the run's admission in the try's note (`admission_recheck`, `prerun`; a
+        dispatcher's check has none). A link report made before the epoch last moved, or before it was made anew, is no
+        answer (a heal, or a failing pair, maybe in another process), so the link check is then made afresh (`relink`).
+        A record that cannot be read or made fails the check."""
         try:
-            epoch = int(self._epoch.read()["epoch"])
+            noted = noted_of(self._epoch.ensure())
         except (OSError, ValueError) as error:  # its type only (O12)
             raise failure(f"the federation's link epoch cannot be read ({type(error).__name__})") from None
         with self._fresh_guard:
-            stale = self._fresh_epoch is None or self._fresh_epoch < epoch
+            fresh = self._fresh
+            stale = fresh is None or fresh["id"] != noted["id"] or fresh["epoch"] < noted["epoch"]
         if stale and self._relink is not None:
             self._relink()
-        prerun.note(GATE_NOTE, epoch)
-        return epoch
+        prerun.note(GATE_NOTE, noted)
+        return noted
 
-    def _judged(self, epoch: int | None = None) -> tuple[Health, LinkMatrix | None]:
+    def _judged(self, noted: dict[str, Any] | None = None) -> tuple[Health, LinkMatrix | None]:
         """With the federation held: the check (`_checked`), and the matrix of the link check it made in this call, in
         this thread (None when it made none: a report another call made is never this call's). A link check of this
         call that passed lets a later stuck pair be healed again (`GateHeals.passed`), while the federation is held;
-        one that found a pair failing raises the federation's link epoch (`fault_epoch`). `epoch` is what `_noted`
-        read for this call: a link check it made answers for that epoch."""
-        self._taken()  # whatever this thread's earlier calls left untaken is not this call's
-        verdict = self._checked()
-        report = self._taken()
-        if report is None:
-            return verdict, None
-        matrix = report if isinstance(report, LinkMatrix) else LinkMatrix.from_report(report)
-        if matrix.ok:
-            with contextlib.suppress(OSError, ValueError):  # the latch then stays, and no heal runs: closed
-                self._heals.passed()
-        else:
-            verdict = self._counted(verdict)
-        if epoch is not None:
+        one that found a pair failing raises the federation's link epoch (`fault_epoch`), the check and the raise one
+        step for an admission (`LinkEpoch.checking`). `noted` is what `_noted` read for this call: a link check it made
+        answers for that epoch."""
+        with self._epoch.checking():
+            self._taken()  # whatever this thread's earlier calls left untaken is not this call's
+            verdict = self._checked()
+            report = self._taken()
+            if report is None:
+                return verdict, None
+            matrix = report if isinstance(report, LinkMatrix) else LinkMatrix.from_report(report)
+            if matrix.ok:
+                with contextlib.suppress(OSError, ValueError):  # the latch then stays, and no heal runs: closed
+                    self._heals.passed()
+            else:
+                verdict = self._counted(verdict)
+        if noted is not None:
             with self._fresh_guard:
-                self._fresh_epoch = epoch if self._fresh_epoch is None else max(self._fresh_epoch, epoch)
+                fresh = self._fresh
+                if fresh is None or fresh["id"] != noted["id"] or fresh["epoch"] < noted["epoch"]:
+                    self._fresh = noted
         return verdict, matrix
 
     def _counted(self, verdict: Health) -> Health:
         """A link check of this call found a pair failing: raise the federation's link epoch, so a run whose pre-run
-        check came before it is refused at its admission. One that cannot be raised is said in the detail."""
+        check came before it is refused at its admission. One that cannot be raised is said in the detail; its record
+        is then removed (`LinkEpoch.raise_for`), which refuses such a run too."""
         try:
             self._epoch.raise_for(LINKS_FAILED)
         except (OSError, ValueError) as error:  # its type only (O12)

@@ -515,7 +515,7 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
         ) as admission:
             # under the lock, so no heal begins while it decides: a heal or a failing pair since the run's pre-run check
             # refuses it, uncharged, and the campaign checks it again (`admission_recheck`)
-            refused = refusal(settings.journal, prerun.current())
+            refused = refusal(settings.journal, prerun.current(), timeout_s, cancel)
             if refused is not None:
                 raise FederationBusy(refused)
             yield "exclusive" if admission.exclusive else "shared"  # what it took, never what was asked
