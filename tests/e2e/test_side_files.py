@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import shutil
+import stat
 from pathlib import Path
 
 import pytest
@@ -34,8 +35,9 @@ from side_file_support import (
     unpack,
 )
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish
+from tree_support import read_only, tree_of, without
 
-from expcore.campaign.lock import DispatchLock
+from expcore.campaign.lock import LOCK_NAME, DispatchLock
 from expcore.package import build as package_build
 from expcore.package.archive import SUMS_FILE, render_sums
 from expcore.package.build import PACKAGE_FILE, build_package, verify_package
@@ -293,12 +295,32 @@ def test_r15_check_removes_nothing_while_a_dispatcher_holds_the_campaign_lock_an
     stray = temporary_of(records_without_side_file(copy.runs)[0].parent / SIDE)  # before `placed` joins that list
     placed.rename(temporary_of(placed))
     stray.write_bytes(b"an attempt that is staging its file")
-    with DispatchLock(copy.runs.parent):
-        code, output = cli(clean_environment, "check", str(copy.runs))
+    with DispatchLock(copy.runs.parent):  # a held store is checked only as it stands (R16)
+        code, output = cli(clean_environment, "check", str(copy.runs), "--partial")
     assert code == 0, (output, stored_check(copy.runs)["failures"])
     assert placed.is_file()
     assert not temporary_of(placed).exists()
     assert stray.exists()
+
+
+def test_r15_r16_a_finished_campaign_fetched_read_only_is_checked_as_it_is(copy, clean_environment):
+    """R15, R16: a finished campaign fetched from another host with its out/ and its lock file read-only is checked
+    as it is: the settle of its side files cannot open the campaign's lock for writing, so it takes none and removes
+    no temporary file, and every byte outside the batch stays as it was."""
+    out = copy.runs.parent
+    lock_file = out / LOCK_NAME
+    before = tree_of(out)
+    mode = stat.S_IMODE(lock_file.stat().st_mode)
+    lock_file.chmod(0o444)
+    try:
+        with read_only(out):
+            code, output = cli(clean_environment, "check", str(copy.runs))
+    finally:
+        lock_file.chmod(mode)
+    assert code == 0, output
+    after = tree_of(out)
+    assert without(after, "runs/") == without(before, "runs/")
+    assert set(after) == set(before)
 
 
 def test_r15_check_removes_nothing_in_a_batch_that_is_not_the_study_s_own(copy, clean_environment, tmp_path):
