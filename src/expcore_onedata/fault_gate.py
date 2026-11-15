@@ -37,8 +37,11 @@ campaign's `health_timeout_s` never reads as down and a pair it mends charges no
 (`heal_timeout_s` and `heal_settle_s` since it began) a heal still running closes the gate, uncharged. That bound, after
 a session drain and with the core's waits between and around them (a recheck and the check that starts the heal, and
 a recheck and the check that makes the link check afresh after it), is the longest the gate declares it may defer
-(`max_deferral_s`), and the core refuses a campaign whose `max_defer_s` is shorter at its start, so a heal never turns
-into a blocking hold that stops the campaign. A check that found the pair too and meets a heal under way (this gate's,
+(`max_deferral_s`), and the core refuses a campaign whose `max_defer_s` is shorter at its start, so a heal that mends
+its pairs never turns into a blocking hold that stops the campaign. A heal that fails with a container restart left
+open leaves the gate closed for an operator, and the next check's recovery of that restart owes a session drain (and
+holds a settle when none is journalled) before the gate closes, which can run the deferral past the bound, so it
+closes blocking. A check that found the pair too and meets a heal under way (this gate's,
 or another check's holding the federation) waits the same way, never taking the latch the heal set for a closed
 episode, and so does another process's check that meets a heal's container restart journalled `clear_failed` during
 its settle. Whatever the heal did, the next check makes the link
@@ -235,8 +238,10 @@ class FaultGate:
         reset holding the reset lock, `federation.reset`) counts from its first answer, and so does a heal that waits
         for another holder of the federation (the hold `federation_busy`), and so does a heal cut short by its
         process's end, after which the next process settles what it left (`RestoreSettling`) and heals once more
-        (`GateHeals.latched`) on the same deferral, whose age the store keeps across the restart; so each adds to
-        its age."""
+        (`GateHeals.latched`) on the same deferral, whose age the store keeps across the restart, and so does a heal
+        that fails with a container restart left open, which the next check recovers, owing a session drain and
+        holding a settle when none is journalled, before the gate closes on the stuck pair; so each adds to its
+        age."""
         settings = self._settings
         if settings.heal == "off":
             return None
@@ -253,7 +258,8 @@ class FaultGate:
             f"heal_settle_s ({settings.heal_settle_s:g} s), then another wait between two checks and the check that "
             "makes the link check afresh after the heal (its health_timeout_s), each check assumed to end within its "
             "health_timeout_s and the heal within its own bound, and no deferral begun earlier or for another reason, "
-            "nor a wait for another holder of the federation, counted; lower heal_timeout_s or session_drain_s, or set "
+            "nor a wait for another holder of the federation, nor the recovery of a failed heal's container restart, "
+            "counted; lower heal_timeout_s or session_drain_s, or set "
             'heal = "off", to shorten it'
         )
         return DeferralBound(
