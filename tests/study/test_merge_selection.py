@@ -368,6 +368,24 @@ def test_r16_after_reads_an_earlier_selection_in_a_read_only_out_and_leaves_it_b
     assert (later.root / "out" / "state.sqlite").is_file()
 
 
+def test_r16_after_refuses_an_earlier_out_with_no_lock_file_naming_it_and_writes_nothing_there(
+    base, clean_environment, now
+):
+    """R16: a finished selection's dispatcher made its lock file; an out/ without one never had a dispatcher, so it is
+    not a finished selection: refused, naming it, before its store is read, and no lock file is made there."""
+    earlier = copy_campaign(now, base, "r16-no-lock")
+    out = earlier.root / "out"
+    (out / "campaign.lock").unlink()
+    before = tree_of(out)
+    root = make_selection_study(base, "r16-after-no-lock")
+    code, errors = run_refused(clean_environment, root, *select_args([RELAY], "next", sequential=True, after=[out]))
+    assert code == 1, errors
+    assert "no dispatcher ever ran there" in errors, errors
+    assert str(out) in errors, errors
+    assert tree_of(out) == before
+    assert not (root / "out" / "state.sqlite").exists()
+
+
 def test_r16_after_given_a_sealed_snapshot_refuses_it_and_writes_nothing_beside_it(base, clean_environment, whole):
     """R16: --after takes a file as the store it names, a package's sealed snapshot say; the reader never makes a
     lock file and reads a copy, so the package's directory keeps every byte (its checksums refuse an unlisted file)

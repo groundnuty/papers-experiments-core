@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.lock import CampaignLocked, ReaderLock
+from expcore.campaign.lock import CampaignLocked, LockMissing, ReaderLock
 from expcore.campaign.manifest import Manifest
 from expcore.campaign.merge import MergeRefused, ShardFacts, facts_of_bytes
 from expcore.campaign.scheduler import STATE_FILE
@@ -41,15 +41,22 @@ def store_of(path: Path) -> Path:
 
 
 def _read(path: Path, scratch: Path, pricing: Pricing) -> ShardFacts:
-    """A snapshot of the store an `--after` names, read as the merge reads one: under a reader's hold of its dispatch
-    lock (`ReaderLock`, which never makes the file), from a private copy of its files, so nothing is written beside it
-    and its directory may be read-only (R16)."""
+    """A snapshot of the store an `--after` names, read as the merge reads one, and nothing written beside it (R16).
+
+    The earlier selection must have stopped: its existing lock file is opened read-only and locked shared
+    (`ReaderLock`, required), which is refused while its dispatcher runs, and refused where there is no lock file,
+    since a finished selection's dispatcher made one. The lock is held across the copy of the store, so that
+    selection cannot start again mid-copy; the store is backed up from a private copy of its files, so its
+    directory may be read-only.
+    """
     store = store_of(path)
-    lock = ReaderLock(store.parent)
+    lock = ReaderLock(store.parent, required=True)
     try:
         lock.acquire()
     except CampaignLocked as error:
         raise ShardError(f"--after {path}: {error}; an earlier selection is given once it has stopped") from None
+    except LockMissing as error:
+        raise ShardError(f"--after {path}: {error}; not a finished selection") from None
     try:
         take_snapshot(store, scratch)
     except AttemptsRunning as error:

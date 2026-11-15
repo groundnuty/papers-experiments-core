@@ -11,6 +11,7 @@ from tree_support import read_only, tree_of
 from expcore.campaign.lock import (
     CampaignLocked,
     DispatchLock,
+    LockMissing,
     NetworkFilesystemWarning,
     ReaderLock,
     filesystem_type,
@@ -108,22 +109,33 @@ def test_r16_a_reader_never_creates_the_lock_file_and_where_there_is_none_holds_
     assert list(tmp_path.iterdir()) == []
 
 
+def test_r16_a_reader_that_requires_the_lock_file_is_refused_where_there_is_none(tmp_path):
+    """R16: `--after` names a finished selection, whose dispatcher made the lock file; a store with none beside it
+    never had one, so a reader that requires the file is refused, naming it, and makes none."""
+    with pytest.raises(LockMissing, match="no dispatcher ever ran there"):
+        ReaderLock(tmp_path, required=True).acquire()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_r16_a_reader_is_refused_while_a_dispatcher_holds_the_store_and_keeps_one_off_while_it_reads(tmp_path):
-    """R16: a reader is refused while a dispatcher holds the store, and a dispatcher cannot start while a reader
-    holds it, so what the reader copies has no writer."""
+    """R16: a reader's shared lock is refused while a dispatcher holds the exclusive one, and a dispatcher cannot
+    start while a reader holds it, so what the reader copies has no writer; two readers may read at once."""
     with DispatchLock(tmp_path), pytest.raises(CampaignLocked, match="one dispatcher per store"):
         ReaderLock(tmp_path).acquire()
-    with ReaderLock(tmp_path) as lock:
+    with ReaderLock(tmp_path) as lock, ReaderLock(tmp_path) as other:
         assert lock.held
+        assert other.held
         with pytest.raises(CampaignLocked, match="one dispatcher per store"):
             DispatchLock(tmp_path).acquire()
     DispatchLock(tmp_path).acquire().release()  # released on exit
 
 
 def test_r16_a_reader_holds_the_lock_of_a_read_only_directory_and_changes_nothing_there(tmp_path):
-    """R16: the lock file of a finished campaign copied read-only is locked as it is; no file is made or changed."""
+    """R16: the lock file of a finished campaign copied read-only, the file itself without write permission, is
+    opened for reading only and locked as it is; no file is made or changed."""
     DispatchLock(tmp_path).acquire().release()
+    (tmp_path / "campaign.lock").chmod(0o444)
     before = tree_of(tmp_path)
-    with read_only(tmp_path), ReaderLock(tmp_path) as lock:
+    with read_only(tmp_path), ReaderLock(tmp_path, required=True) as lock:
         assert lock.held
     assert tree_of(tmp_path) == before
