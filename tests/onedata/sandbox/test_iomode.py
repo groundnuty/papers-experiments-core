@@ -1,4 +1,4 @@
-"""O48: the run's record carries the mount's declared I/O mode and the one oneclient's own start lines show, and a run
+"""O49: the run's record carries the mount's declared I/O mode and the one oneclient's own start lines show, and a run
 whose two differ, or whose log cannot say, is refused and never scored as the declared mode.
 
 The pure part reads invented log text; the instrument part runs `DockerSandbox` over the in-memory host, whose sidecar
@@ -99,7 +99,7 @@ def finished(world, tmp_path, text, **options):
 
 
 def test_o48_a_proxy_run_whose_start_lines_force_proxy_agrees_with_its_declared_proxy():
-    """O48: oneclient's start lines say forced proxy 1 and forced direct 0: the effective mode is proxy, and the record
+    """O49: oneclient's start lines say forced proxy 1 and forced direct 0: the effective mode is proxy, and the record
     of the run says both modes and that they agree."""
     assert judge("proxy", PROXY) == {
         "declared": "proxy",
@@ -113,7 +113,7 @@ def test_o48_a_proxy_run_whose_start_lines_force_proxy_agrees_with_its_declared_
 
 
 def test_o48_a_direct_run_whose_start_lines_force_direct_agrees_with_its_declared_direct():
-    """O48: forced direct 1 and forced proxy 0, and no line of a detection or a fallback: effective direct."""
+    """O49: forced direct 1 and forced proxy 0, and no line of a detection or a fallback: effective direct."""
     got = judge("direct", DIRECT)
     assert (got["declared"], got["effective"], got["agree"]) == ("direct", "direct", True)
     assert (got["forced_direct"], got["forced_proxy"], got["lines"], got["problems"]) == ("1", "0", [], [])
@@ -124,7 +124,7 @@ def test_o48_a_direct_run_whose_start_lines_force_direct_agrees_with_its_declare
     [("proxy", DIRECT, "direct"), ("direct", PROXY, "proxy"), ("proxy", NEITHER, "auto"), ("direct", NEITHER, "auto")],
 )
 def test_o48_a_log_that_shows_another_mode_than_the_declared_one_disagrees_and_names_both(declared, log, effective):
-    """O48: the declared mode against what the start lines show, in every combination: the other forced mode, and no
+    """O49: the declared mode against what the start lines show, in every combination: the other forced mode, and no
     forced mode at all (oneclient's own detection, the mode #227 forbids). The first problem names both modes, and the
     record never says they agree."""
     got = judge(declared, log)
@@ -133,7 +133,7 @@ def test_o48_a_log_that_shows_another_mode_than_the_declared_one_disagrees_and_n
 
 
 def test_o48_both_options_forced_is_not_a_mode_and_never_agrees():
-    """O48: a log that says forced direct 1 and forced proxy 1 contradicts itself: `mixed`, whatever was declared."""
+    """O49: a log that says forced direct 1 and forced proxy 1 contradicts itself: `mixed`, whatever was declared."""
     for declared in ("proxy", "direct"):
         got = judge(declared, BOTH)
         assert (got["effective"], got["agree"]) == ("mixed", False)
@@ -142,7 +142,7 @@ def test_o48_both_options_forced_is_not_a_mode_and_never_agrees():
 
 @pytest.mark.parametrize("line", sorted(FALLBACKS))
 def test_o48_a_direct_run_with_a_fallback_or_a_detection_line_is_mixed_and_never_agrees(line):
-    """O48: forced direct at the start, but a line shows that a read did not go to the storage itself (a read refused
+    """O49: forced direct at the start, but a line shows that a read did not go to the storage itself (a read refused
     for permissions and made again through the provider, oneclient's own detection, a switch to the provider's helper):
     the run did not run in the declared mode. The names of the lines found are in the record."""
     got = judge("direct", DIRECT + FALLBACKS[line])
@@ -153,7 +153,7 @@ def test_o48_a_direct_run_with_a_fallback_or_a_detection_line_is_mixed_and_never
 
 
 def test_o48_a_proxy_run_that_ran_oneclients_automatic_detection_is_mixed():
-    """O48: forced proxy at the start, yet a detection that did not force proxy (`forced proxy io mode: 0`) ran: the
+    """O49: forced proxy at the start, yet a detection that did not force proxy (`forced proxy io mode: 0`) ran: the
     mode was not left unchanged. A detection that itself forced proxy (`1`) is the declared mode and is not a
     disagreement."""
     mixed = judge("proxy", PROXY + DETECTION.format(mode=0))
@@ -165,7 +165,7 @@ def test_o48_a_proxy_run_that_ran_oneclients_automatic_detection_is_mixed():
 @pytest.mark.parametrize("name", sorted(UNKNOWN_LOGS))
 @pytest.mark.parametrize("declared", ["proxy", "direct"])
 def test_o48_a_log_that_cannot_be_parsed_fails_closed_as_unknown_never_as_agreement(declared, name):
-    """O48: no log, an empty one, one without the start lines or with a start line that has no 0 or 1, and garbage: the
+    """O49: no log, an empty one, one without the start lines or with a start line that has no 0 or 1, and garbage: the
     effective mode is `unknown`, the record says so with the reason, and `agree` is false."""
     got = judge(declared, UNKNOWN_LOGS[name])
     assert (got["effective"], got["agree"]) == ("unknown", False)
@@ -179,7 +179,7 @@ def test_o48_a_log_that_cannot_be_parsed_fails_closed_as_unknown_never_as_agreem
     ids=["proxy then direct", "direct then proxy", "proxy then neither", "direct then both"],
 )
 def test_o48_a_start_line_logged_again_with_another_value_is_never_agreement(declared, log):
-    """O48: every logged occurrence of a start line counts, not the first alone: a log whose first start lines say the
+    """O49: every logged occurrence of a start line counts, not the first alone: a log whose first start lines say the
     declared mode and whose later ones say another (a sidecar started again with other options, a line the log was
     given) is `mixed` and never agrees, whichever came first."""
     got = judge(declared, log)
@@ -189,7 +189,7 @@ def test_o48_a_start_line_logged_again_with_another_value_is_never_agreement(dec
 
 @pytest.mark.parametrize("declared", ["proxy", "direct"])
 def test_o48_a_start_line_logged_again_with_a_value_that_is_no_flag_is_unknown(declared):
-    """O48: a later occurrence that is not a 0 or a 1 is not ignored because an earlier one was: unknown, never
+    """O49: a later occurrence that is not a 0 or a 1 is not ignored because an earlier one was: unknown, never
     agree."""
     first = PROXY if declared == "proxy" else DIRECT
     got = judge(declared, first + "I1113 10:05:00.000000     1 logging.cc:84] Forced proxy IO: yes\n")
@@ -198,14 +198,14 @@ def test_o48_a_start_line_logged_again_with_a_value_that_is_no_flag_is_unknown(d
 
 @pytest.mark.parametrize("declared", ["proxy", "direct"])
 def test_o48_a_start_line_logged_again_with_the_same_value_is_still_the_declared_mode(declared):
-    """O48: the same start lines again (a sidecar started again with the same options) say the same mode: agreement."""
+    """O49: the same start lines again (a sidecar started again with the same options) say the same mode: agreement."""
     log = PROXY * 2 if declared == "proxy" else DIRECT * 2
     got = judge(declared, log)
     assert (got["effective"], got["agree"]) == (declared, True)
 
 
 def test_o48_a_value_the_log_holds_where_a_flag_belongs_is_never_copied_into_the_reading():
-    """O48: a start line whose value is a path, a token or any other text is `unknown`, and the reading says that it was
+    """O49: a start line whose value is a path, a token or any other text is `unknown`, and the reading says that it was
     not a 0 or a 1 without repeating a character of it: the reading reaches the sandbox's metadata, the instrument's
     snapshot and a refusal's detail, which hold nothing the log holds."""
     secret = "/private/tok-0123456789"
@@ -220,7 +220,7 @@ def test_o48_a_value_the_log_holds_where_a_flag_belongs_is_never_copied_into_the
 
 
 def test_o48_a_declared_mode_that_is_neither_proxy_nor_direct_never_agrees():
-    """O48: the declared mode is read from the settings, which only take the two words; anything else fails closed."""
+    """O49: the declared mode is read from the settings, which only take the two words; anything else fails closed."""
     got = judge(None, PROXY)
     assert (got["effective"], got["agree"]) == ("proxy", False)
     assert "declared" in got["problems"][0]
@@ -230,7 +230,7 @@ def test_o48_a_declared_mode_that_is_neither_proxy_nor_direct_never_agrees():
 
 
 def test_o48_agrees_recomputes_the_flag_and_reads_anything_but_a_matching_mount_snapshot_as_no():
-    """O48: a reader of a record never takes the `agree` flag alone: a snapshot whose flag says true but whose two modes
+    """O49: a reader of a record never takes the `agree` flag alone: a snapshot whose flag says true but whose two modes
     differ, one that is not a snapshot of version 1, one of a run with no mount, and a value that is no mapping are
     all not agreement."""
     good = {"version": 1, "mount": True, **judge("proxy", PROXY)}
@@ -245,7 +245,7 @@ def test_o48_agrees_recomputes_the_flag_and_reads_anything_but_a_matching_mount_
 
 
 def test_o48_the_record_of_the_reading_holds_no_text_of_the_log():
-    """O48: only the two start values, the names of the lines found and sentences of the module's own: nothing of the
+    """O49: only the two start values, the names of the lines found and sentences of the module's own: nothing of the
     log, however long, reaches the record (a provider or a mountpoint line, a path, a token in a line)."""
     secret = "tok-test-0123456789 /mnt/invented provider.invented.test"
     log = PROXY + f"I1113 10:00:00.200000     1 logging.cc:90] Mountpoint: {secret}\n" + FALLBACKS["proxy_fallback"]
@@ -258,7 +258,7 @@ def test_o48_the_record_of_the_reading_holds_no_text_of_the_log():
 
 
 def test_o48_a_proxy_mount_run_records_both_modes_agreeing_and_is_not_refused(world, tmp_path):
-    """O48: the proxy run's record holds the instrument's snapshot, declared proxy against effective proxy, agreeing;
+    """O49: the proxy run's record holds the instrument's snapshot, declared proxy against effective proxy, agreeing;
     the check passes, so the run is not refused and is scored as the proxy run it was; the sandbox's metadata beside
     the campaign holds the same reading."""
     record, log = finished(world, tmp_path, PROXY)
@@ -274,7 +274,7 @@ def test_o48_a_proxy_mount_run_records_both_modes_agreeing_and_is_not_refused(wo
 
 
 def test_o48_a_run_whose_log_shows_the_other_mode_is_refused_as_infrastructure_naming_both_modes(world, tmp_path):
-    """O48: declared proxy, oneclient's start lines say forced direct: the instrument's snapshot says they disagree, and
+    """O49: declared proxy, oneclient's start lines say forced direct: the instrument's snapshot says they disagree, and
     its check refuses with the kind of the mount's I/O mode, which no condition can have as its treatment. The record's
     `instrument_refusal` names the instrument, the kind and both modes; the attempt is set aside, so it is never scored
     as the declared mode, and it keeps its snapshot and its record."""
@@ -293,7 +293,7 @@ def test_o48_a_run_whose_log_shows_the_other_mode_is_refused_as_infrastructure_n
 def test_o48_a_run_whose_log_cannot_be_parsed_is_refused_as_unknown_never_taken_as_the_declared_mode(
     world, tmp_path, name
 ):
-    """O48: an unparsable log, a log that cannot be read at all and one with no start lines are not agreement: the
+    """O49: an unparsable log, a log that cannot be read at all and one with no start lines are not agreement: the
     snapshot says `unknown`, the attempt is refused and set aside, and the detail says what is unknown."""
     sbx, log = mounted_run(world, UNKNOWN_LOGS[name] or "")
     log.readable = UNKNOWN_LOGS[name] is not None
@@ -310,7 +310,7 @@ def test_o48_a_run_whose_log_cannot_be_parsed_is_refused_as_unknown_never_taken_
 
 
 def test_o48_a_snapshot_taken_before_the_collection_is_unknown_and_the_run_is_refused(world, tmp_path):
-    """O48: the sandbox reads the log when it collects, so a `finish` before the collection has no reading: unknown, and
+    """O49: the sandbox reads the log when it collects, so a `finish` before the collection has no reading: unknown, and
     refused, never the declared mode taken for the effective one."""
     sbx, _ = mounted_run(world, PROXY)
     instrument = MountIoMode(sbx)
@@ -323,7 +323,7 @@ def test_o48_a_snapshot_taken_before_the_collection_is_unknown_and_the_run_is_re
 
 
 def test_o48_an_instrument_whose_finish_failed_is_refused_by_its_check_since_unknown_is_not_a_pass(world, tmp_path):
-    """O48: `finish_instruments` records a failed `finish` as `{"ok": False}`, and then still asks the check, which
+    """O49: `finish_instruments` records a failed `finish` as `{"ok": False}`, and then still asks the check, which
     refuses: the mode was never shown to be the declared one."""
 
     class Broken:
@@ -340,7 +340,7 @@ def test_o48_an_instrument_whose_finish_failed_is_refused_by_its_check_since_unk
 
 @pytest.mark.parametrize("level", ["via-gate", "isolated"])
 def test_o48_a_run_without_a_mount_records_that_it_has_none_and_is_never_refused(world, tmp_path, level):
-    """O48: a REST run and a run with no data path have no oneclient: the snapshot says `mount: false`, with no mode
+    """O49: a REST run and a run with no data path have no oneclient: the snapshot says `mount: false`, with no mode
     and no `agree`, and the check passes. A study may list the instrument for every run."""
     sbx = DockerSandbox.start(world.host, world.s, make_spec(world, level), **start_options(world))
     instrument = MountIoMode(sbx)
@@ -353,7 +353,7 @@ def test_o48_a_run_without_a_mount_records_that_it_has_none_and_is_never_refused
 
 
 def test_o48_a_study_that_declares_no_refusal_keeps_the_disagreement_in_the_record_and_is_not_refused(world, tmp_path):
-    """O48: `refuse=False` is the study's own choice not to set such an attempt aside: the record still says the modes
+    """O49: `refuse=False` is the study's own choice not to set such an attempt aside: the record still says the modes
     disagree (`agree` false), the check passes, and `agrees` still reads it as not the declared mode, so a scorer that
     asks for a confirmed mode never takes it for one."""
     record, _ = finished(world, tmp_path, DIRECT, refuse=False)
@@ -364,7 +364,7 @@ def test_o48_a_study_that_declares_no_refusal_keeps_the_disagreement_in_the_reco
 
 
 def test_o48_the_kind_of_the_refusal_is_registered_and_no_condition_can_declare_it():
-    """O48: a treatable kind would let the refused attempt be scored as the manipulation, which the refusal mechanism
+    """O49: a treatable kind would let the refused attempt be scored as the manipulation, which the refusal mechanism
     itself refuses; the kind is registered untreatable, with the platform's others (`expcore_onedata.sandbox.kinds`)."""
     assert IO_MODE_INTEGRITY in infra_kinds()
     assert is_treatable(IO_MODE_INTEGRITY) is False
@@ -372,7 +372,7 @@ def test_o48_the_kind_of_the_refusal_is_registered_and_no_condition_can_declare_
 
 
 def test_o48_the_instrument_takes_no_reading_before_the_run_and_has_the_modules_namespace():
-    """O48: `start` takes no reading (the log is read by the collection), and the namespace is the module's."""
+    """O49: `start` takes no reading (the log is read by the collection), and the namespace is the module's."""
     assert MountIoMode.namespace == iomode.NAMESPACE == "mount_io_mode"
     assert MountIoMode(object()).start({"run_key": "k", "factors": {}, "attempt": 1}) is None
 
@@ -382,7 +382,7 @@ def test_o48_the_instrument_takes_no_reading_before_the_run_and_has_the_modules_
 
 @pytest.mark.parametrize("path", FIXTURES, ids=lambda p: p.name)
 def test_o48_a_record_of_a_run_without_a_mount_has_no_such_field_and_replays_byte_for_byte(path):
-    """O48 and R03: the fixtures of version 3 written before the instrument hold nothing under its namespace, and replay
+    """O49 and R03: the fixtures of version 3 written before the instrument hold nothing under its namespace, and replay
     to their own bytes under the code that has it: a record of a run without a mount gains nothing."""
     stored = path.read_bytes()
     assert iomode.NAMESPACE not in decode(stored)["instruments"]
@@ -390,7 +390,7 @@ def test_o48_a_record_of_a_run_without_a_mount_has_no_such_field_and_replays_byt
 
 
 def test_o48_a_refused_mount_run_writes_validates_and_replays_byte_for_byte(world, tmp_path):
-    """O48 and R01: the record of a run the instrument refused (its snapshot and the refusal naming both modes) is a
+    """O49 and R01: the record of a run the instrument refused (its snapshot and the refusal naming both modes) is a
     valid record of version 3, written and read back to its own bytes, and replays to them: the field is additive."""
     record, _ = finished(world, tmp_path, DIRECT)
     text = record.dumps(environ={})

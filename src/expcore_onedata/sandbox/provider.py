@@ -71,10 +71,21 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
-from expcore_onedata.admission import require_admission, retain_admission
+from expcore_onedata.admission import (
+    SANDBOX_STEP,
+    begin_token_step,
+    count_token_step,
+    current_admission,
+    require_admission,
+    retain_admission,
+    retain_to_act,
+    token_step,
+)
+from expcore_onedata.admission_share import ThreadShare
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
+from expcore_onedata.fault_drain import SessionTicket
 from expcore_onedata.sandbox import gatelog, kinds
 from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
 from expcore_onedata.sandbox.gatepolicy import PAGED
@@ -138,34 +149,25 @@ class _Recorded:
         )
 
 
-class _Share:
-    """A start thread's share of the run's admission (`admission.retain_admission`): the thread gives it up when it
-    ends, never the launch that may stop waiting for it; a thread that never began has it given up for it."""
+def _counted(ended: Callable[[], None], config: PlatformConfig, what: str) -> Callable[[], None]:
+    """`ended` (a mint or start thread's end, `_StartThreads.began`), which also ends a count of the run's sandbox step
+    taken now (`admission.begin_token_step`): such a thread uses the run's tokens and may outlive a cancelled launch,
+    so the step stays counted until it has ended (O35). Once only, however often it is called. On a platform with
+    `[faults]` and no run's admission held the step is refused before its thread is dispatched (`what` names it in the
+    refusal), and `ended` is called first, since no thread will."""
+    try:
+        step_ended = begin_token_step(SANDBOX_STEP, config, what)
+    except BaseException:
+        ended()  # no thread is dispatched: its note as a start thread of the key ends with the refusal
+        raise
 
-    def __init__(self, give_up: Callable[[], None]) -> None:
-        self._give_up, self._state, self._lock = give_up, "pending", threading.Lock()
+    def both() -> None:
+        try:
+            ended()
+        finally:
+            step_ended()
 
-    def begin(self) -> bool:
-        """In the thread, first: whether it may run, holding its share."""
-        with self._lock:
-            if self._state != "pending":
-                return False
-            self._state = "running"
-            return True
-
-    def end(self) -> None:
-        """In the thread, last: give the share up."""
-        with self._lock:
-            self._state = "ended"
-        self._give_up()
-
-    def never_ran(self) -> None:
-        """When the thread's task is done: give the share up if the thread never began; one that runs gives up its own."""
-        with self._lock:
-            if self._state != "pending":
-                return
-            self._state = "ended"
-        self._give_up()
+    return both
 
 
 class _StartThreads:
@@ -344,6 +346,7 @@ class SandboxPlatform:
         self._declared = {item for items in (read_only_inputs or {}).values() for item in items}
         self._planes: weakref.WeakKeyDictionary[DockerSandbox, _ToolPlane] = weakref.WeakKeyDictionary()
         self._revocable: weakref.WeakKeyDictionary[DockerSandbox, _Revocable] = weakref.WeakKeyDictionary()
+        self._sessions: weakref.WeakKeyDictionary[DockerSandbox, SessionTicket] = weakref.WeakKeyDictionary()
         self._serving: weakref.WeakSet[DockerSandbox] = weakref.WeakSet()  # sandboxes whose tool server runs
 
     def _slots_needed(self, what: str) -> Slots:
@@ -403,7 +406,7 @@ class SandboxPlatform:
         return SlotProbe(self._journal, sandbox_gone=self.sandbox_probe().resource_gone, clock=self._clock)
 
     @staticmethod
-    def _begin(sandbox: DockerSandbox, ended: Callable[[], None], share: _Share) -> None:
+    def _begin(sandbox: DockerSandbox, ended: Callable[[], None], share: ThreadShare) -> None:
         """Blocking, in the start thread: begin the sandbox, and note that the thread has ended, however it ended; then
         give up the thread's share of the run's admission, last, so the federation stays held while it runs (O11)."""
         running = share.begin()
@@ -569,7 +572,40 @@ class SandboxPlatform:
         check, so it covers the start, the run, the teardown and the check. Its wait is before the agent's clock starts. Without it `launch` raises `AdmissionRefused` before
         it mints a token or enters a wait (O11). An injector's own admission, taken when its run holds none, is not
         the run's: the run must be admitted before it launches.
+
+        From its start to the end of its stop (the slot's revocation included) the launch is a step of the run that
+        uses its tokens, counted on the run's admission (`admission.token_step`), so the fault injector's restore can
+        tell that it still runs (O35). Its mint and start threads each start only under the run's admission, held
+        then (`admission.begin_token_step`): one that is not held refuses the thread before it is dispatched, naming it
+        (`admission.TokenStepRefused`); the stop is never refused.
         """
+        with token_step(SANDBOX_STEP):  # ended only once the stop below has ended, however the launch ends
+            async with self._launch(
+                ctx,
+                run_key=run_key,
+                level=level,
+                ceiling_s=ceiling_s,
+                lease=lease,
+                condition=condition,
+                inputs=inputs,
+                inputs_record=inputs_record,
+            ) as sandbox:
+                yield sandbox
+
+    @contextlib.asynccontextmanager
+    async def _launch(
+        self,
+        ctx: CallContext,
+        *,
+        run_key: str,
+        level: str,
+        ceiling_s: float,
+        lease: Lease | None = None,
+        condition: str | None = None,
+        inputs: Sequence[ReadOnlyInput] = (),
+        inputs_record: InputsRecord | None = None,
+    ) -> AsyncIterator[DockerSandbox]:
+        """The launch itself (see `launch`)."""
         if lease is not None:  # a lease-less platform has no slot for it (O38): refused before anything else
             self._slots_needed("take a lease")
         if condition is not None:
@@ -580,13 +616,17 @@ class SandboxPlatform:
             raise StartRefused("a read-only input passed to launch was not declared to the platform (inputs.declare)")
         if inputs and inputs_record is None:
             raise ValueError("a run with read-only inputs needs the instrument that keeps them in its record")
+        # held from the admission check until the start thread holds a share of its own, so no shortcut section of the
+        # run can seal the admission while the sandbox is authorised and started (O11)
+        authorised = retain_to_act()
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None
         minting: asyncio.Future[RunTokens | None] | None = None
         revoking = lease if mode is not DataPathMode.NONE or condition is not None else None  # its slot's, at the end
         try:
             async with ctx.infrastructure_wait(WAIT_KIND):
-                minted = self._threads.began(lease.key if lease is not None else None)  # before the thread exists
+                key = lease.key if lease is not None else None
+                minted = _counted(self._threads.began(key), self._config, "the sandbox's mint")  # before the thread
                 minting = asyncio.ensure_future(
                     asyncio.to_thread(self._mint_tracked, mode, lease, ceiling_s, condition, minted)
                 )
@@ -595,8 +635,9 @@ class SandboxPlatform:
                 sandbox = self._prepare(run_key, level, lease, tokens, condition, inputs)
                 if revoking is not None:  # from here the sandbox's stop revokes them (`_stop`)
                     self._revocable[sandbox] = _Revocable(revoking, tokens)
-                ended = self._threads.began(lease.key if lease is not None else None)
-                share = _Share(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
+                self._begin_sessions(sandbox)  # its mount and gate are drained after, when the run is an outage's
+                ended = _counted(self._threads.began(key), self._config, "the sandbox's start")
+                share = ThreadShare(retain_admission())  # the thread, not this coroutine, lets the federation go (O11)
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
                 started.add_done_callback(lambda _: share.never_ran())
@@ -613,6 +654,8 @@ class SandboxPlatform:
             elif revoking is not None and minting is not None:  # a mint that may have left a token, and no start
                 await self._revoke_unstarted(ctx, revoking, minting, sandbox)
             raise
+        finally:
+            authorised()  # the start thread holds its own share by now, or the start was undone
         try:
             yield sandbox
         except Exception as error:
@@ -701,7 +744,7 @@ class SandboxPlatform:
             began = time.monotonic()
             try:
                 try:
-                    await _complete(_in_daemon_thread(sandbox.stop), within=self._teardown_s)
+                    await _complete(_in_daemon_thread(_counted_stop(sandbox)), within=self._teardown_s)
                 except SandboxError as error:
                     self._record_teardown(sandbox, "failed", began)
                     if not quiet:
@@ -727,9 +770,27 @@ class SandboxPlatform:
                 else:
                     self._record_teardown(sandbox, "completed", began)
             finally:
+                self._report_sessions(sandbox)  # whatever the stop did: an end it could not show is not told
                 revocable = self._revocable.pop(sandbox, None)
                 if revocable is not None:
                     await _complete(asyncio.to_thread(self._revoke_now, revocable, sandbox))
+
+    def _begin_sessions(self, sandbox: DockerSandbox) -> None:
+        """Tell the drain of the exclusive admission the run holds which sessions this sandbox will end (its mount, its
+        gate, none), so that an end never reported is known to be missing and the drain waits in full for it
+        (`expcore_onedata.fault_drain`). A shared admission has no drain: nothing is told."""
+        admission = current_admission()
+        if admission is not None and admission.drain is not None:
+            self._sessions[sandbox] = admission.drain.begin(*sandbox.session_kinds())
+
+    def _report_sessions(self, sandbox: DockerSandbox) -> None:
+        """After the sandbox's stop, whatever it did: report to the drain each end the sandbox showed (a gate whose stop
+        was confirmed, a mount whose sidecar was shown gone). A stop that failed, was cut or left the mount live shows
+        none of what it did not, and that end stays unknown."""
+        ticket = self._sessions.pop(sandbox, None)
+        if ticket is not None:
+            for kind, at in sandbox.session_ends().items():
+                ticket.ended(kind, at)
 
     def _record_teardown(
         self, sandbox: DockerSandbox, outcome: str, began: float, left: Mapping[str, Any] | None = None
@@ -821,6 +882,22 @@ class TeardownCut(Exception):
     def __init__(self, deadline_s: float, *, cancelled: bool = False) -> None:
         super().__init__(f"the teardown was cut at its deadline of {deadline_s:g} s")
         self.cancelled = cancelled
+
+
+def _counted_stop(sandbox: DockerSandbox) -> Callable[[], None]:
+    """The sandbox's stop, counted as the run's sandbox step from now (`admission.count_token_step`) until the stop
+    itself has ended: one cut at its deadline goes on in its thread after the launch has left, its mount or gate maybe
+    still up, so no heal may begin until it ends (O35). A stop is never refused: it tears down what the run started,
+    and it is counted when the run's admission is held."""
+    step_ended = count_token_step(SANDBOX_STEP)
+
+    def stop() -> None:
+        try:
+            sandbox.stop()
+        finally:
+            step_ended()
+
+    return stop
 
 
 def _in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future[Any]:

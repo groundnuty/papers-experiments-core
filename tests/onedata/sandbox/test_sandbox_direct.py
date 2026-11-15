@@ -247,7 +247,7 @@ def test_o40_a_read_only_input_from_a_storage_directory_is_refused(direct, tmp_p
 
 
 def test_o48_a_direct_run_records_both_modes_agreeing_through_the_instrument(direct, tmp_path):
-    """O48: a direct mount's collection reads the log once more and keeps the reading with the metadata; the instrument
+    """O49: a direct mount's collection reads the log once more and keeps the reading with the metadata; the instrument
     records declared direct against effective direct, and its check passes."""
     from expcore_onedata.sandbox.iomode import MountIoMode
 
@@ -265,7 +265,7 @@ def test_o48_a_direct_run_records_both_modes_agreeing_through_the_instrument(dir
 
 
 def test_o48_a_direct_run_whose_collection_is_refused_for_a_fallback_still_keeps_the_mixed_reading(direct, tmp_path):
-    """O48 and O40: the collection of a direct run that fell back to the provider fails as `output_collection`, and the
+    """O49 and O40: the collection of a direct run that fell back to the provider fails as `output_collection`, and the
     reading it took before that says the run was mixed, with the line's name, so the evidence is not lost with the
     refusal."""
     from expcore.errors import InfraError

@@ -33,6 +33,8 @@ from expcore.campaign.merge import (
     merge_document,
     shard_snapshot_path,
 )
+from expcore.campaign.selection import SelectionSpec
+from expcore.campaign.selection_ledger import Pricing
 from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 
@@ -44,10 +46,10 @@ def snapshot_rel(index: int) -> str:
     return f"{SHARDS_DIR}/{index}/{SNAPSHOT_FILE}"
 
 
-def read_held(out: Path, document: Mapping[str, Any]) -> dict[int, ShardFacts]:
+def read_held(out: Path, document: Mapping[str, Any], pricing: Pricing | None = None) -> dict[int, ShardFacts]:
     """What the snapshot of each shard merge.json lists says of itself, by index; each is read once and its bytes are
     compared with the hash the file names. Refuses a snapshot missing or changed, naming the shard, and anything under
-    `shards/` the file does not list."""
+    `shards/` the file does not list. `pricing` counts a selection's spend (C38)."""
     held: dict[int, ShardFacts] = {}
     for shard in document["shards"]:
         index = shard["index"]
@@ -59,7 +61,7 @@ def read_held(out: Path, document: Mapping[str, Any]) -> dict[int, ShardFacts]:
             raise MergeRefused(
                 f"{name}: its snapshot changed since the merge ({MERGE_FILE} names another SHA-256); merge again"
             )
-        held[index] = facts_of_bytes(data, snapshot_rel(index), out=out, snapshot=path)
+        held[index] = facts_of_bytes(data, snapshot_rel(index), out=out, snapshot=path, pricing=pricing)
     listed = {str(index) for index in held}
     stray = sorted(p.name for p in (out / SHARDS_DIR).iterdir() if not p.name.startswith(".") and p.name not in listed)
     if stray:
@@ -67,32 +69,54 @@ def read_held(out: Path, document: Mapping[str, Any]) -> dict[int, ShardFacts]:
     return held
 
 
-def verify_queried(document: Mapping[str, Any], queries: Mapping[int, Query], out: Path, plan: Manifest) -> None:
+def verify_queried(
+    document: Mapping[str, Any],
+    queries: Mapping[int, Query],
+    out: Path,
+    plan: Manifest,
+    pricing: Pricing | None = None,
+) -> None:
     """Rebuild merge.json from the snapshots of a merged batch already read and verified against the hashes it names,
     each read through its `query`, and refuse a document that differs (`verify_merged`)."""
     hashes = {shard["index"]: shard["snapshot_sha256"] for shard in document["shards"]}
     held = {
         index: facts_of(
-            query, snapshot_rel(index), out=out, snapshot=shard_snapshot_path(out, index), sha256=hashes[index]
+            query,
+            snapshot_rel(index),
+            out=out,
+            snapshot=shard_snapshot_path(out, index),
+            sha256=hashes[index],
+            pricing=pricing,
         )
         for index, query in queries.items()
     }
-    verify_merged(document, held, plan)
+    verify_merged(document, held, plan, pricing)
 
 
-def verify_merged(document: Mapping[str, Any], held: Mapping[int, ShardFacts], plan: Manifest) -> None:
+def verify_merged(
+    document: Mapping[str, Any], held: Mapping[int, ShardFacts], plan: Manifest, pricing: Pricing | None = None
+) -> None:
     """Refuse merge.json unless it is the document a merge of the snapshots `held` (by the index of the directory each
     lies in) writes for `plan`: a snapshot under another shard's index, shards that are not one whole campaign of the
-    plan, or a field that differs, each named."""
+    plan, or a field that differs, each named. Selections are numbered by the merge (C38), so a selection's snapshot
+    must lie under the index the merge gives it; with `pricing`, their spend together is checked against the budget."""
     if not held:
         raise MergeRefused(f"{SHARDS_DIR}/ holds no shard's snapshot; merge the shards again")
+    selections = any(isinstance(shard.spec, SelectionSpec) for shard in held.values())
     for index, shard in sorted(held.items()):
-        if shard.spec.index != index:
+        if not selections and shard.spec.index != index:
             raise MergeRefused(f"{snapshot_rel(index)}: is the snapshot of {shard.name}, not of shard {index}")
     try:
-        expected = merge_document(check_shards([held[index] for index in sorted(held)], plan))
+        ordered = check_shards([held[index] for index in sorted(held)], plan, pricing)
+        expected = merge_document(ordered)
     except MergeRefused as error:
         raise MergeRefused(f"the merged batch's snapshots are not one whole campaign of the plan: {error}") from None
+    for shard in ordered if selections else ():
+        if held.get(shard.spec.index) is None or held[shard.spec.index].snapshot_sha256 != shard.snapshot_sha256:
+            raise MergeRefused(
+                f"{snapshot_rel(shard.spec.index)}: is not the snapshot of {shard.name}, which a merge numbers "
+                f"{shard.spec.index}"
+            )
     differing = _differences(expected, document)
     if differing:
         shown = ", ".join(differing[:_SHOWN]) + (" and more" if len(differing) > _SHOWN else "")

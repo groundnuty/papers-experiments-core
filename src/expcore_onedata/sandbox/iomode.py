@@ -1,5 +1,5 @@
 # Provenance: new
-"""The mount's declared and effective I/O mode, per run, in the run's record (O48).
+"""The mount's declared and effective I/O mode, per run, in the run's record (O49).
 
 A mount's I/O mode is declared, `proxy` or `direct`, and never left to oneclient's own detection (O36). A study that
 compares the two modes has to show, from each run's record, that every mount run ran in the mode it declares. The
