@@ -379,6 +379,8 @@ Your `output_cap_chars` (`[agent]` in `campaign.toml`) then applies to that whol
 
 The same text, the same cap and the same cut give the same text for the model every time.
 
+A cell whose exec did not complete never reaches the model as an empty success (O55). The code tool checks each cell's completion record, which the sandbox takes out of the output before anything is counted, cut or shown: the program arrived whole, and its exit was recorded with the status `docker exec` reported. A cell that fails the check, with no timeout or kill to explain it, ends the attempt as `sandbox` infrastructure, retried within the attempt limit, with the cause in the outcome's detail ("the exec's exit was not recorded: ...", "the cell's source did not arrive whole in the container ...: its program did not run"). Each code call in the run record carries `exec_check` (`source_whole`, `exit_status`, `nonce_matched`), so a report can show that every scored cell was verified. What the model reads is unchanged.
+
 ### Collecting a run's evidence
 
 **Never run `docker cp` from a running sidecar or gate.** `docker cp` re-mounts a running container's binds. A bind written `-v` makes a missing source as a directory owned by root, so after the host's copy of a data-path token was removed, one such copy left an empty directory at the token's path, and the run's teardown refused to finish. The sandbox now binds each secret with `--mount type=bind,...,readonly`, which refuses a missing source, but a copy out of a running container is still the wrong way to read its files. Read them on the host instead, under the run's directory (`sandbox.work_root`, the directory whose name ends in the run's id):
