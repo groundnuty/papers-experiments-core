@@ -45,11 +45,15 @@ and the spawn) and around the stop. What the agent triggers through the tools, a
 is the agent's own time and is never an infrastructure wait. Health polling before dispatch is the scheduler's
 (C11, `PlatformHealth`) and is not a wait either.
 
+The checks (`_prepare` before the spawn, `_recheck` after the stop) read Onezone in worker threads, and each holds a share
+of the run's federation admission while it runs (`expcore_onedata.admission_share`, O11): a launch cancelled while one
+runs stops waiting for it, and its run may leave its admission, but the federation stays held until the thread has ended,
+so nothing of a run acts on the federation after its admission ends.
+
 `ctx` is anything with `infrastructure_wait(kind)`: the `CallContext` of a tool call, or the attempt's timer, which an
 executor has before the loop starts.
 """
 
-import asyncio
 import contextlib
 import dataclasses
 import os
@@ -62,6 +66,7 @@ from expcore.errors import TOOL_PLANE_INTEGRITY, InfraError
 from expcore.plugin import CallContext
 from expcore.tools.mcp_client import McpToolProvider
 from expcore_onedata.admission import require_admission
+from expcore_onedata.admission_share import to_thread_holding_admission
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, ToolServer
 from expcore_onedata.credentials import Principal
@@ -222,7 +227,7 @@ class ToolServerLauncher:
         """Re-verify the tool plane after the server stopped; raise InfraError of kind tool_plane_integrity unless it held."""
         label = self._config.condition_label(condition)
         try:
-            await asyncio.to_thread(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
+            await to_thread_holding_admission(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
         except PrivilegesMismatch as changed:
             detail = f"{label}: the tool plane's rights changed during the run: {changed}"
             error = InfraError(INTEGRITY_KIND, detail)
@@ -277,7 +282,7 @@ class ToolServerLauncher:
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:
-                    await asyncio.to_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
+                    await to_thread_holding_admission(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
                 except TokenRefused as refused:
                     label = self._config.condition_label(condition)
                     raise _integrity_failure(label, "before the start", refused) from None
