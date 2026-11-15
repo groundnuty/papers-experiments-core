@@ -22,7 +22,7 @@ import time
 
 import pytest
 from campaign_support import LATER, NOW, keys_under, make_manifest, make_schema, open_store
-from fault_support import injector_for
+from fault_support import OUTAGE_TARGET, FakeClock, FakeServices, injector_for, write_faults
 from heal_support import TARGET, HealServices, four_providers, heal_injector, stale
 from mcp import StdioServerParameters
 from record_support import record_run
@@ -732,8 +732,9 @@ def test_o35_o11_in_the_documented_order_a_failed_exit_clear_is_left_open_for_th
     """O35, O11: in the documented order the tool server and the sandbox still run at `finish`, inside the token's
     window, so a restore that failed at `running`'s exit is not tried again there: one restore ran in the window, as
     the least margin counts. The reading names the path and the steps that ran, the injection stays open in the
-    journal with its target's lock let go, the record is refused as `injector_failure` and never scored (#245), and the
-    tool server's stop finds its token valid. Once the run has ended, the next start's recovery restores it."""
+    journal, its target's lock passed to the run's admission, the record is refused as `injector_failure` and never
+    scored (#245), and the tool server's stop finds its token valid. Once the run has ended, the next start's recovery
+    restores it."""
     schema, _, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests, services=HealServices())
     serving_only_after_finish(outage)
@@ -749,7 +750,7 @@ def test_o35_o11_in_the_documented_order_a_failed_exit_clear_is_left_open_for_th
     assert restore_refusal(record.instruments)["infra_kind"] == INJECTOR_FAILURE  # the campaign sets it aside
     assert record.instrument_refusal["infra_kind"] == INJECTOR_FAILURE
     assert "stays open in the journal" in record.instrument_refusal["detail"]
-    assert outage.injector._lock is None  # handed over: recovery may take the target
+    assert outage.injector._lock is None  # handed over: its lock went with the run's admission, so recovery may act
     (entry,) = outage.injector._journal.open_entries()
     assert (entry["target"], entry["clear_failed"]) == (TARGET, "not_serving")
     following = injector_for(outage.platform, outage.services, target=TARGET, clock=outage.services.clock)
@@ -759,6 +760,41 @@ def test_o35_o11_in_the_documented_order_a_failed_exit_clear_is_left_open_for_th
         assert following.clear() is True
     assert (recovered["ok"], recovered["how"]) == (True, "found_restored")
     assert outage.injector._journal.open_entries() == []
+
+
+def test_o35_o11_an_injection_handed_to_recovery_is_restored_by_nothing_of_its_run_while_a_token_step_runs(tmp_path):
+    """O35, O11: an injection handed to recovery is not restored inside its run's token window by any other path: its
+    target's lock goes only with the run's admission, so while the run's tool server still runs, a later `clear`
+    reports it still down, `recover` restores nothing and a second `start` of the injector fails closed as
+    `injector_failure`, with no start or serving read of the provider. Once the run's admission has ended, the next
+    start's recovery restores it."""
+    services = FakeServices()
+    platform = write_faults(tmp_path)
+    clock = FakeClock()
+    injector = injector_for(platform, services, clock=clock)
+    lock = FederationLock(load_faults(platform, load_platform(platform, require_secrets=False)))
+    with lock.held(exclusive=True, timeout_s=5), token_step(TOOL_SERVER_STEP):
+        injector.start({"run_key": "the-run", "attempt": 1})
+        services.knobs["never_serves"] = True
+        assert injector.clear() is False  # the restore at the exit: back, never serving
+        services.knobs["never_serves"] = False
+        assert injector.clear() is False  # handed to recovery: the tool server still runs
+        assert injector.clear() is False  # and still down, as far as this injector knows
+        acted_before = [call for call in services.calls if call[0] in ("start", "serves")]
+        assert injector.recover() == [OUTAGE_TARGET]  # held for its run: nothing restored
+        with pytest.raises(InfraError) as caught:
+            injector.start({"run_key": "the-run", "attempt": 2})
+        assert caught.value.kind == INJECTOR_FAILURE
+        assert [call for call in services.calls if call[0] in ("start", "serves")] == acted_before
+    (entry,) = injector._journal.open_entries()
+    assert entry["clear_failed"] == "not_serving"
+    following = injector_for(platform, services, clock=clock)
+    with lock.held(exclusive=True, timeout_s=5):
+        following.start({"run_key": "the-next-run", "attempt": 1})
+        (recovered,) = [step for step in following.snapshot()["steps"] if step["step"] == "recovered"]
+        assert following.clear() is True
+    assert (recovered["ok"], recovered["how"]) == (True, "found_restored")
+    assert injector._journal.open_entries() == []
 
 
 def test_o35_the_least_margin_counts_one_restore_since_none_is_retried_inside_the_window(tmp_path):
