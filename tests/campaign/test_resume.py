@@ -1,6 +1,7 @@
 """Resume: a campaign never continues into another experiment (C06) and keeps its order (C08)."""
 
 import json
+import os
 import sqlite3
 from dataclasses import replace
 
@@ -15,12 +16,21 @@ from campaign_support import (
     sha,
     treatment_schema,
 )
+from tree_support import added, read_only, tree_of
 
 from expcore.campaign.attempts import PinMismatch, ResumeRefused, SchemaMismatch
 from expcore.campaign.factors import FactorSchema, PlanError
 from expcore.campaign.recovery import Recovery
-from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, RunSetMismatch, open_campaign
+from expcore.campaign.resume import (
+    FINGERPRINT_KEY,
+    FingerprintMismatch,
+    RunSetMismatch,
+    open_campaign,
+    read_fingerprint,
+)
+from expcore.campaign.scheduler import STATE_FILE
 from expcore.campaign.store import Store
+from expcore.package.spec import never_selected
 
 LIMIT = 3
 
@@ -409,3 +419,34 @@ def test_c06_a_manifest_that_runs_the_subset_condition_on_every_task_is_refused_
             max_attempts=LIMIT,
         )
     assert not (tmp_path / "campaign.db").exists()
+
+
+# --- reading the fingerprint of a finished store (R16) ---------------------------------------------------------------
+
+
+def test_r16_reading_a_finished_stores_fingerprint_in_a_read_only_out_leaves_it_byte_for_byte(tmp_path):
+    """R16: the fingerprint of a finished store is read from a copy in a directory of the reader's own, so its out/
+    may be read-only and keeps every byte: no -shm or -wal is made beside the store."""
+    store, _ = start(tmp_path)
+    store.close()
+    out = tmp_path / "out"
+    (out / "runs").mkdir(parents=True)
+    (out / "runs" / "record.json").write_text("{}", encoding="utf-8")
+    os.replace(tmp_path / "campaign.db", out / STATE_FILE)
+    before = tree_of(out)
+    with read_only(out):
+        assert read_fingerprint(out / STATE_FILE) == make_fingerprint(make_schema())
+    assert tree_of(out) == before
+
+
+def test_r16_in_place_reads_the_fingerprint_from_the_store_itself(tmp_path):
+    """R16: `in_place`, which `check --partial` uses for a store a dispatcher holds, reads the store itself over a
+    read-only connection rather than a copy: it leaves the -shm and -wal a live store has beside it anyway, never
+    selected for a package."""
+    store, _ = start(tmp_path)
+    store.close()
+    before = tree_of(tmp_path)
+    assert read_fingerprint(tmp_path / "campaign.db", in_place=True) == make_fingerprint(make_schema())
+    assert added(before, tree_of(tmp_path)) == ["campaign.db-shm", "campaign.db-wal"]
+    assert never_selected(f"out/{STATE_FILE}-shm")
+    assert never_selected(f"out/{STATE_FILE}-wal")

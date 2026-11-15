@@ -61,10 +61,18 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.campaign.executor import default_backend_factory
-from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.export import (
+    EXPORT_FINGERPRINT,
+    NOT_RECORDED,
+    ExportError,
+    export_run_state,
+    export_text,
+    stored_fingerprint_sha256,
+    verify_export_fingerprint,
+)
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
-from expcore.campaign.lock import CampaignLocked, DispatchLock
+from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
@@ -82,6 +90,7 @@ from expcore.campaign.shard_run import (
     share_settings_by_model,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
@@ -476,18 +485,27 @@ def _check_batch_of(
                 f"{out_dir(study)}: holds a merged batch ({MERGE_FILE}) and a campaign store; use one or the other"
             )
         return _check_merged(study, directory, code, env, partial)
-    if store.is_file():  # without a store, take_snapshot refuses below
-        changed = differences(campaign_environment(read_fingerprint(store)), env)
+    if not store.is_file():
+        raise Refused(f"{store}: no campaign store here; run the study first")
+    lock, in_place = _hold_for_check(store, partial)
+    try:
+        try:
+            recorded = read_fingerprint(store, in_place=in_place)
+        except StoreChanged as error:
+            raise Refused(str(error)) from None
+        changed = differences(campaign_environment(recorded), env)
         if changed:
             raise Refused(
                 f"{store}: the campaign ran under another environment than this check would; check under the "
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
-    import_what_the_records_need(study, directory)
-    try:
-        running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
-    except SnapshotError as error:
-        raise Refused(str(error)) from None
+        import_what_the_records_need(study, directory)
+        try:
+            running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial, in_place=in_place)
+        except SnapshotError as error:
+            raise Refused(str(error)) from None
+    finally:
+        lock.release()
     _settle_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
@@ -497,21 +515,50 @@ def _check_batch_of(
     return check
 
 
+def _hold_for_check(store: Path, partial: bool) -> tuple[ReaderLock, bool]:
+    """How the check reads the store: a reader's hold of its lock and whether to read it in place (R16).
+
+    A finished store (no dispatcher holds it, its directory read-only too) is held as a reader, so no dispatcher
+    starts while it is read, and read from a private copy (False). A store a dispatcher holds is being written, so no
+    copy of its files is one state: the check is refused unless `partial`, and then the store is backed up in place
+    over a read-only connection (True), the one consistent read of a live store. A store whose lock file is missing
+    or cannot be opened or locked cannot be shown to have no writer, so it is refused, `partial` or not.
+    """
+    lock = ReaderLock(store.parent)
+    try:
+        return lock.acquire(), False
+    except CampaignLocked as error:
+        if not partial:
+            raise Refused(
+                f"{store}: {error}; a dispatcher holds the store while it runs: check it once the dispatcher has "
+                "stopped, or pass --partial to check the store as it stands"
+            ) from None
+        return lock, True
+    except LockMissing as error:
+        raise Refused(
+            f"{store}: {error}; a campaign's out/ keeps the lock file its dispatcher made: copy out/ whole"
+        ) from None
+    except LockUnavailable as error:
+        raise Refused(f"{store}: {error}; the store cannot be shown to have no dispatcher") from None
+
+
 def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
     """Finish or remove what a kill left of the placement of a declared side file in the batch (R15), and say so.
 
-    A temporary file no record names is removed only while this process holds the lock of the campaign the batch
-    belongs to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with
-    no dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released.
-    A lock that cannot be taken (a campaign runs, or the file system refuses `flock`), or a batch that is not the
-    study's own, leaves such a file where it is; a rename that a record names is finished either way. A study that
-    declares no side file is not touched at all.
+    A temporary file no record names is removed only while this process holds the lock of the campaign the batch belongs
+    to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with no
+    dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released. A lock
+    that cannot be taken (a campaign runs, the file system refuses `flock`, or the lock file is read-only, as in a
+    campaign fetched read-only), or a batch that is not the study's own, leaves such a file where it is; a rename that a
+    record names is finished either way. A study that declares no side file is not touched at all.
     """
     if not study.side_files:
         return
     lock = DispatchLock(out_dir(study))
     if Path(batch).resolve().is_relative_to(out_dir(study).resolve()):
-        with contextlib.suppress(CampaignLocked):  # a dispatcher is alive: only what the records name is finished
+        # a dispatcher is alive, or the lock file cannot be opened for writing (a campaign fetched read-only, R16):
+        # either way only what the records name is finished
+        with contextlib.suppress(CampaignLocked, PermissionError):
             lock.acquire()
     try:
         for settled in settle_side_files(batch, study.side_files, remove_unnamed=lock.held):
@@ -723,6 +770,7 @@ def _analyse_loaded(
     plugin = load_plugin(StudyContext(study, code))
     try:
         export = _export_of(verified, study.manifest)
+        _require_campaign(export, verified)
     finally:
         verified.close()
     rows, scores = [], {}
@@ -755,6 +803,21 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
         own = export_run_state(snapshot, excluded={key: why for key, why in left_out.items() if key in held})
         parts[index] = timed_export(own, walls_of(snapshot), verified.record_for)  # the merged export's only (#154)
     return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
+
+
+def _require_campaign(export: Mapping[str, Any], verified: VerifiedBatch) -> None:
+    """Refuse an export that is not of the campaign the analysis read: its campaign fingerprint's hash must be that of
+    every snapshot, and, for a merged batch, the `fingerprint` merge.json names (C36). A snapshot that records no
+    fingerprint has nothing to compare with."""
+    held = [stored_fingerprint_sha256(snapshot) for snapshot in verified.snapshots.values()]
+    if verified.merge is not None:
+        held.append(verified.merge["fingerprint"])
+    try:
+        for expected in held:
+            if expected is not None:
+                verify_export_fingerprint(export, expected)
+    except ExportError as error:
+        raise Refused(str(error)) from None
 
 
 def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
@@ -848,5 +911,24 @@ def regenerate(
         if not target.is_file():
             problems.append(f"{name}: missing")
         elif target.read_bytes() != made:
-            problems.append(f"{name}: differs from what the records give")
+            why = _export_difference(analysis.export, target.read_bytes()) if name == EXPORT_FILE else None
+            problems.append(f"{name}: {why or 'differs from what the records give'}")
     return problems
+
+
+def _export_difference(derived: Mapping[str, Any], held: bytes) -> str | None:
+    """Say how a saved export that differs from the derived one differs in the campaign fingerprint, if it does: it is
+    of another campaign (or its entry is not the hash of its fingerprint), or it records none (an export from before the
+    key, which is read as it was and only said so, C36). None when the fingerprint is not what differs."""
+    try:
+        saved = json.loads(held)
+    except ValueError:
+        return None
+    if not isinstance(saved, dict):
+        return None
+    expected = derived.get(EXPORT_FINGERPRINT)
+    try:
+        said = verify_export_fingerprint(saved, None if expected is None else expected["sha256"])
+    except ExportError as error:
+        return str(error)
+    return f"differs from what the records give ({NOT_RECORDED})" if said == NOT_RECORDED and expected else None
