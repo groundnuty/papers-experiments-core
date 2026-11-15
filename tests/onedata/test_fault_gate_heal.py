@@ -20,6 +20,8 @@ from fault_support import SERVICES, FakeClock, FakeServices, faults_table
 from heal_support import NAMES, STORES, four_providers, heal_margin_s
 
 from expcore.campaign.healthgate import DEFER, FOUND, GO, Health, HealthGate
+from expcore.errors import InfraError
+from expcore_onedata import fault_gate_heal
 from expcore_onedata import health as platform_health
 from expcore_onedata.admission import OUTAGE_RUN, RECOVERY, FederationLock
 from expcore_onedata.client import OnezoneClient
@@ -28,6 +30,7 @@ from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_gate_heal import GateHeals
 from expcore_onedata.fault_journal import InjectionJournal, holder
 from expcore_onedata.fault_matrix import LinkMatrix, PairState
+from expcore_onedata.fault_recovery import Recovery
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.linkcheck import REMEDY, LinkReport, PairResult
@@ -36,6 +39,11 @@ from expcore_onedata.tokens import TokenIssuer
 
 CRASHED, OTHER, READER, SECOND = (f"providers[{index}]" for index in range(4))
 EVERY = (CRASHED, OTHER, READER, SECOND)
+
+
+class ProcessEnded(BaseException):  # what a kill does to the healing thread, not an error it handles
+    """The healing process ending where it stands: nothing in the heal catches it, so its thread unwinds as a killed
+    process's would leave things (its locks let go, no line journalled past the point it reached)."""
 
 
 class Federation(FakeServices):
@@ -59,9 +67,13 @@ class Federation(FakeServices):
         self.on_ping = None  # called with the provider's label while it is pinged
         self.on_read = None  # called before each of the heal's own reads of every pair
         self.on_restart = None  # called at each link restart, before it mends anything
+        self.on_restart_of = None  # called with the provider's label at each link restart, before `on_restart`
         self.restart_s = 0.0  # real seconds a link restart takes: a heal that outlasts the core's wait for a check
+        self.end_before_start: set[str] = set()  # providers whose start ends the healing process (`ProcessEnded`)
+        self.on_start = None  # called with the provider's label at each start, before it takes effect
         self.actions: list[tuple[str, str, float]] = []
         self.reads: list[tuple[str, float]] = []
+        self.gates: list[tuple[str, str | None, float]] = []  # each session gate reading: provider, probe, time
 
     def now(self) -> float:
         return self.clock.now if self.clock is not None else 0.0
@@ -91,6 +103,7 @@ class Federation(FakeServices):
         return 0
 
     def sessions_ready(self, service, gate_probe):
+        self.gates.append((self.label[service], gate_probe, self.now()))
         return None
 
     def arm_gate(self, service):
@@ -107,6 +120,8 @@ class Federation(FakeServices):
 
     def restart_link(self, service):
         self._note("restart_link", service)
+        if self.on_restart_of is not None:
+            self.on_restart_of(self.label[service])
         if self.on_restart is not None:
             self.on_restart()
         time.sleep(self.restart_s)
@@ -122,6 +137,10 @@ class Federation(FakeServices):
 
     def start(self, service):
         self._note("start", service)
+        if self.on_start is not None:
+            self.on_start(self.label[service])
+        if self.label[service] in self.end_before_start:  # the process ends here: after the stop, before the start
+            raise ProcessEnded
         super().start(service)
         if self.label[service] in self.container_fixes:
             self.stuck = {pair for pair in self.stuck if pair[0] != self.label[service]}
@@ -397,6 +416,422 @@ def test_o35_a_failed_heal_never_reopens_the_gate_on_a_pass_cached_before_it(tmp
     assert "until a link check passes" in reading.detail
 
 
+GONE = {"pid": 999999, "boot_id": "a boot that is over"}  # a holder record's process that has ended
+GONE_PROCESS = "a-boot-that-is-over:999999:1"  # `liveness.this_process` of a process of a boot that is over
+
+
+def left_by_a_killed_process(settings) -> None:
+    """What a killed healing process leaves beside the federation's lock: its holder record (the kernel let its lock
+    go with it, and no line was journalled past the point it reached)."""
+    since = datetime.now(UTC).isoformat(timespec="seconds")
+    InjectionJournal(settings.journal).write_holder(
+        {"token": "killed", **GONE, "purpose": RECOVERY, "target": None, "since_utc": since}
+    )
+
+
+def next_process(settings, federation) -> tuple[FaultGate, GateCheck]:
+    """The next process's fault gate, a gate and a check of its own, on the same federation, journal and clock."""
+    check = GateCheck(federation)
+    labels = {f"providers[{index}]": STORES[name] for index, name in enumerate(NAMES)}
+    clock = federation.clock
+    gate = FaultGate(
+        settings,
+        federation,
+        check,
+        labels=labels,
+        links=check.take,
+        relink=check.expire,
+        clock=clock,
+        sleep=clock.sleep,
+        wall=clock,
+    )
+    return gate, check
+
+
+def no_run_is_admitted(settings) -> None:
+    with pytest.raises(InfraError), FederationLock(settings).held(exclusive=False, timeout_s=0.2):
+        pass
+
+
+def killed_between_stop_and_start(tmp_path, monkeypatch, federation):
+    """A heal of `federation` whose process ends after READER's container stopped and before it started: the daemon
+    thread stops where it stands, the restart journalled and unfinished, and the process's holder record left."""
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)  # the ended thread's unwinding is the point
+    monkeypatch.setattr(fault_gate_heal, "this_process", lambda: GONE_PROCESS)
+    federation.link_fixes = dict.fromkeys(EVERY, ())  # the link restarts mend nothing: the fallback restarts READER
+    federation.end_before_start = {READER}
+    gate, federation, _, settings = gate_of(tmp_path, federation, heal="all_links")
+    first = gate()
+    assert (first.ok, first.deferred, first.charge) == UNCHARGED_WAIT
+    assert gate.wait_for_heal(10)
+    left_by_a_killed_process(settings)
+    federation.end_before_start = set()
+    return settings
+
+
+@pytest.mark.parametrize("mended", [True, False])
+def test_o35_a_heal_killed_between_a_containers_stop_and_its_start_is_restored_settled_and_verified_first(
+    tmp_path, monkeypatch, mended
+):
+    """O35: the healing process ends after a reader's container stopped and before it started. The next process's
+    checks, inside the hold the restart wrote before its stop, wait uncharged and admit no run; then one, under the
+    gate's own exclusive admission, starts the container, verified (a new identity, serving), holds the enforced settle
+    (journalled on the restart's entry and in the drain record) and answers the uncharged wait, reading nothing through
+    the links; every check inside the settle waits the same way, a tool's shared hold included; once it has passed,
+    the next check reads the reader's session gate with the journalled probe, clears the restart, and makes the gate's
+    own link check of every pair: it opens only when they pass; when they do not, it heals again (the killed heal is
+    forgiven once), never opening, and once that heal ends with the pair still stuck the gate stays closed. No provider
+    but the reader is stopped or started."""
+    federation = Federation()
+    federation.container_fixes = {READER} if mended else set()
+    settings = killed_between_stop_and_start(tmp_path, monkeypatch, federation)
+    service, journal, clock = STORES["gamma"], InjectionJournal(settings.journal), federation.clock
+    assert federation.running(service) is False  # stopped, and its start never came
+    (unfinished,) = journal.open_entries()
+    assert (unfinished["target"], unfinished["heal"], unfinished["gate_probe"]) == (READER, True, "gate-probe-id")
+    identity, purposes = federation.identity(service), []
+    federation.on_start = lambda label: purposes.append((journal.read_holder() or {}).get("purpose"))
+    nxt, _ = next_process(settings, federation)
+    during = nxt()  # inside the hold the killed restart wrote before its stop
+    assert (during.ok, during.deferred, during.charge) == UNCHARGED_WAIT, during.detail
+    assert federation.running(service) is False
+    no_run_is_admitted(settings)
+    clock.sleep(600)
+    reads, gates = len(federation.reads), len(federation.gates)
+    restoring = nxt()
+    assert (restoring.ok, restoring.deferred, restoring.charge) == UNCHARGED_WAIT, restoring.detail
+    assert federation.running(service) is True
+    assert federation.identity(service) != identity  # a new identity: the restore is verified, not assumed
+    assert purposes == [RECOVERY]  # started under the gate's own exclusive admission
+    (settling,) = journal.open_entries()
+    started = [at for verb, label, at in federation.actions if (verb, label) == ("start", READER)][-1]
+    assert (settling["clear_failed"], settling["settle_until"]) == ("settling", started + settings.heal_settle_s)
+    assert journal.read_drain() >= settling["settle_until"]
+    meanwhile = nxt()
+    assert (meanwhile.ok, meanwhile.deferred, meanwhile.charge) == UNCHARGED_WAIT, meanwhile.detail
+    no_run_is_admitted(settings)
+    clock.sleep(settings.heal_settle_s)
+    tool = FederationLock(settings).acquire(exclusive=False)  # a tool's shared hold keeps the recovery out
+    try:
+        shared = nxt()
+    finally:
+        tool.close()
+    assert (shared.ok, shared.deferred, shared.charge) == UNCHARGED_WAIT, shared.detail
+    assert (len(federation.reads), len(federation.gates)) == (reads, gates)  # nothing read inside the settle
+    after = nxt()
+    assert federation.gates[gates] == (READER, "gate-probe-id", settling["settle_until"])
+    assert federation.reads[reads] == ("gate", settling["settle_until"])  # every pair, after the reader's gate
+    assert federation.running(service) is True
+    assert journal.open_entries() == []
+    if mended:
+        assert after.ok is True, after.detail
+    else:
+        assert (after.ok, after.deferred, after.charge) == UNCHARGED_WAIT, after.detail
+        assert "begun healing" in after.detail
+        assert nxt.wait_for_heal(10)
+        clock.sleep(600)
+        assert nxt().deferred is True  # the fresh heal's restarted reader: found back, its settle held once more
+        clock.sleep(settings.heal_settle_s)
+        closed = nxt()
+        assert (closed.ok, closed.deferred) == (False, False)
+        assert "until a link check passes" in closed.detail
+        assert acted(federation, "stop") == [("stop", READER), ("stop", READER)]  # one per heal
+    assert {label for verb, label in acted(federation, "stop", "start")} == {READER}
+
+
+def test_o35_a_killed_heals_container_that_does_not_start_again_fails_the_gate_closed(tmp_path, monkeypatch):
+    """O35: the next process's recovery cannot start the reader a killed heal stopped: the check fails closed, not
+    deferred, reading nothing through the links, the restart stays open in the journal, and no run is admitted."""
+    federation = Federation()
+    settings = killed_between_stop_and_start(tmp_path, monkeypatch, federation)
+    federation.knobs["start_fails"] = True
+    nxt, _ = next_process(settings, federation)
+    federation.clock.sleep(600)
+    reads, gates = len(federation.reads), len(federation.gates)
+    reading = nxt()
+    assert (reading.ok, reading.deferred) == (False, False), reading.detail
+    assert federation.running(STORES["gamma"]) is False
+    assert (len(federation.reads), len(federation.gates)) == (reads, gates)
+    (still,) = InjectionJournal(settings.journal).open_entries()
+    assert (still["target"], still["clear_failed"]) == (READER, "start_failed")
+    no_run_is_admitted(settings)
+
+
+def test_o35_a_recovery_killed_after_its_start_leaves_a_settle_the_next_process_holds(tmp_path, monkeypatch):
+    """O35: the next process's recovery starts the reader a killed heal stopped and is killed itself before it holds
+    the settle (its start took effect, nothing more was journalled). The process after it finds the reader back with no
+    settle journalled, so it holds one and waits, uncharged, reading nothing through the links, and only a check after
+    the settle reads the reader's gate."""
+    federation = Federation()
+    federation.container_fixes = {READER}
+    settings = killed_between_stop_and_start(tmp_path, monkeypatch, federation)
+    clock = federation.clock
+    second, _ = next_process(settings, federation)
+    clock.sleep(600)
+
+    def ends_once_started(service):
+        if federation.label.get(service) == READER:
+            raise ProcessEnded
+
+    federation.on_serves = ends_once_started
+    with pytest.raises(ProcessEnded):
+        second()
+    federation.on_serves = None
+    left_by_a_killed_process(settings)
+    assert federation.running(STORES["gamma"]) is True  # started, and killed before its settle was held
+    (started,) = InjectionJournal(settings.journal).open_entries()
+    assert "settle_until" not in started
+    reads, gates = len(federation.reads), len(federation.gates)
+    third, _ = next_process(settings, federation)
+    settling = third()
+    assert (settling.ok, settling.deferred, settling.charge) == UNCHARGED_WAIT, settling.detail
+    assert (len(federation.reads), len(federation.gates)) == (reads, gates)
+    (held,) = InjectionJournal(settings.journal).open_entries()
+    assert held["settle_until"] == clock.now + settings.heal_settle_s
+    clock.sleep(settings.heal_settle_s)
+    assert third().ok is True
+    assert federation.gates[gates][2] >= held["settle_until"]
+
+
+def test_o35_a_recovery_that_may_wait_sleeps_out_a_restarted_readers_settle_before_its_gate(tmp_path, monkeypatch):
+    """O35: a recovery outside the fault gate's check (the injector's start, which may wait) that brings back a reader
+    a killed heal stopped holds the same settle, journalled, and sleeps it out before it reads the reader's gate."""
+    federation = Federation()
+    federation.container_fixes = {READER}
+    settings = killed_between_stop_and_start(tmp_path, monkeypatch, federation)
+    clock = federation.clock
+    clock.sleep(600)
+    labels = {f"providers[{index}]": STORES[name] for index, name in enumerate(NAMES)}
+    recovery = Recovery(settings, federation, clock=clock, sleep=clock.sleep, labels=labels, wall=clock)
+    assert recovery.recover() == []
+    started = [at for verb, label, at in federation.actions if (verb, label) == ("start", READER)][-1]
+    assert federation.gates[-1][:2] == (READER, "gate-probe-id")
+    assert federation.gates[-1][2] >= started + settings.heal_settle_s
+    assert InjectionJournal(settings.journal).open_entries() == []
+
+
+def test_o35_a_heal_killed_before_its_second_readers_stop_leaves_nothing_a_fresh_heal_cannot_mend(
+    tmp_path, monkeypatch
+):
+    """O35: the link restarts mend nothing, and the fallback restarts the first stuck reader's container (mending its
+    pair), then the process ends between journalling the second reader's stop and the stop taking effect. The next
+    process finds the first back, settles and gates it, finds the second never went down
+    (`never_down`, one reading after the heal's hold, instead of a stop that never settles) and clears both, so its own
+    link check, finding the second pair stuck, heals again (the killed heal forgiven once): the second reader's
+    container is restarted then, and the gate opens. No provider gets more than one container restart per heal."""
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)  # the ended thread's unwinding is the point
+    real = fault_gate_heal.this_process
+    monkeypatch.setattr(fault_gate_heal, "this_process", lambda: GONE_PROCESS)
+    federation = Federation()
+    federation.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
+    federation.link_fixes = dict.fromkeys(EVERY, ())
+    federation.container_fixes = {READER, SECOND}
+
+    def ends_before_the_seconds_stop(service):
+        if federation.label[service] == SECOND:
+            raise ProcessEnded
+
+    federation.on_stop = ends_before_the_seconds_stop
+    gate, federation, _, settings = gate_of(tmp_path, federation, heal="all_links")
+    assert gate().deferred is True
+    assert gate.wait_for_heal(10)
+    left_by_a_killed_process(settings)
+    federation.on_stop = None
+    monkeypatch.setattr(fault_gate_heal, "this_process", real)
+    journal, clock = InjectionJournal(settings.journal), federation.clock
+    assert {entry["target"] for entry in journal.open_entries()} == {READER, SECOND}
+    assert federation.running(STORES["delta"]) is True  # its stop was journalled, and never took effect
+    nxt, _ = next_process(settings, federation)
+    clock.sleep(600)
+    settling = nxt()  # the first found back, with no settle journalled: one is held, and nothing is read
+    assert (settling.ok, settling.deferred, settling.charge) == UNCHARGED_WAIT, settling.detail
+    clock.sleep(settings.heal_settle_s)
+    healing = nxt()  # the first gated, the second found never down: both cleared
+    assert journal.open_entries() == []
+    assert (healing.ok, healing.deferred, healing.charge) == UNCHARGED_WAIT, healing.detail
+    assert nxt.wait_for_heal(10)
+    clock.sleep(600)
+    reading = nxt()
+    assert reading.ok is True, reading.detail
+    assert acted(federation, "start") == [("start", READER), ("start", SECOND)]
+    assert Counter(label for _, label in acted(federation, "restart_link")) == Counter(dict.fromkeys(EVERY, 2))
+
+
+def test_o35_a_clean_exit_after_a_container_step_charges_no_check_while_its_settle_closes_the_federation(
+    tmp_path, monkeypatch
+):
+    """O35: a clean exit stops the heal after a reader's container restart, which it leaves open (`clear_failed`
+    `heal_interrupted`) under the settle its hold wrote to the drain record. Another process's check meanwhile cannot
+    take the federation, and waits, uncharged, instead of failing for a restore that is the heal's own; once the drain
+    has passed it finds that restart back, settles, gates and clears it, and heals again."""
+    real = fault_gate_heal.this_process
+    monkeypatch.setattr(fault_gate_heal, "this_process", lambda: GONE_PROCESS)  # read once this process is gone
+    federation = Federation()
+    federation.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
+    federation.link_fixes = {READER: (), SECOND: ()}
+    federation.container_fixes = {READER}
+    gate, federation, _, settings = gate_of(tmp_path, federation, heal="link_then_container")
+    stopping = threading.Thread(target=gate.stop_heal, args=(10,))
+
+    def the_exit_comes_during_the_readers_start(label):
+        if label == READER and not stopping.is_alive():
+            stopping.start()
+            time.sleep(0.1)  # the exit has asked the heal to stop while this step is under way
+
+    federation.on_start = the_exit_comes_during_the_readers_start
+    assert gate().deferred is True
+    assert gate.wait_for_heal(10)
+    stopping.join(10)
+    monkeypatch.setattr(fault_gate_heal, "this_process", real)
+    assert gate.last_heal["outcome"] == "heal_interrupted"
+    assert [line["event"] for line in heal_lines(settings)] == ["healing"]
+    journal = InjectionJournal(settings.journal)
+    (left,) = journal.open_entries()
+    assert (left["target"], left["clear_failed"]) == (READER, "heal_interrupted")
+    nxt, _ = next_process(settings, federation)
+    meanwhile = nxt()  # inside the settle the finished container step held, in the drain record
+    assert (meanwhile.ok, meanwhile.deferred, meanwhile.charge) == UNCHARGED_WAIT, meanwhile.detail
+    federation.clock.sleep(1200)
+    assert nxt().deferred is True  # found back, with no settle journalled: one is held
+    federation.clock.sleep(settings.heal_settle_s)
+    again = nxt()  # gated and cleared, then the gate's own link check finds the other pair stuck
+    assert journal.open_entries() == []
+    assert (again.ok, again.deferred, again.charge) == UNCHARGED_WAIT, again.detail
+    assert "begun healing" in again.detail
+    assert nxt.wait_for_heal(10)
+
+
+def kill_at(at: str):
+    """A hook of `Federation.restart_link` that ends the healing process as `at`'s link restart is sent."""
+
+    def end(label: str) -> None:
+        if label == at:
+            raise ProcessEnded
+
+    return end
+
+
+def killed_mid_sequence(tmp_path, monkeypatch, federation, at: str):
+    """An `all_links` heal of `federation` whose process ends as it restarts `at`'s link (the restart sent, nothing
+    mended by it), after the earlier providers' links were restarted and before the later ones': its holder record
+    left, its `healing` line unended, its process gone."""
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)  # the ended thread's unwinding is the point
+    real = fault_gate_heal.this_process
+    monkeypatch.setattr(fault_gate_heal, "this_process", lambda: GONE_PROCESS)
+
+    federation.on_restart_of = kill_at(at)
+    gate, federation, _, settings = gate_of(tmp_path, federation, heal="all_links")
+    first = gate()
+    assert (first.ok, first.deferred, first.charge) == UNCHARGED_WAIT
+    assert gate.wait_for_heal(10)
+    left_by_a_killed_process(settings)
+    federation.on_restart_of = None
+    monkeypatch.setattr(fault_gate_heal, "this_process", real)
+    return settings
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_o35_an_all_links_heal_killed_mid_sequence_is_healed_again_once_within_the_bounds(tmp_path, monkeypatch, stale):
+    """O35: an `all_links` heal's process ends after two providers' links were restarted and as the stuck reader's is
+    sent, leaving the pair stuck (and, with `stale`, a pair the partial sequence left stale): its `healing` line has no
+    `ended` line and its process is gone, so the latch is not set by it. The next process's checks wait, uncharged,
+    inside the settle the restart in flight held; then one finds the pairs stuck and heals again, once, restarting each
+    link once more, so no provider gets more than two link restarts, and the gate opens on its own link check."""
+    federation = Federation()
+    if stale:  # a pair the partial sequence left stale: worse than before, and a fresh heal mends it
+        federation.on_restart = lambda: federation.stuck.add((SECOND, OTHER))
+    settings = killed_mid_sequence(tmp_path, monkeypatch, federation, at=READER)
+    federation.on_restart = None
+    assert acted(federation, "restart_link") == [("restart_link", label) for label in (CRASHED, OTHER, READER)]
+    assert [line["event"] for line in heal_lines(settings)] == ["healing"]
+    assert (READER, CRASHED) in federation.stuck
+    nxt, _ = next_process(settings, federation)
+    during = nxt()  # inside the settle the restart in flight held, in the drain record
+    assert (during.ok, during.deferred, during.charge) == UNCHARGED_WAIT, during.detail
+    assert len(acted(federation, "restart_link")) == 3
+    federation.clock.sleep(600)
+    reading = healed(nxt, federation)
+    assert reading.ok is True, reading.detail
+    counted = Counter(label for _, label in acted(federation, "restart_link"))
+    assert counted == Counter({CRASHED: 2, OTHER: 2, READER: 2, SECOND: 1})
+    assert [line["event"] for line in heal_lines(settings)] == ["healing", "healing", "ended", "links_passed"]
+
+
+def test_o35_an_all_links_heal_killed_after_mending_the_pair_leaves_a_gate_that_opens_and_ends_the_episode(
+    tmp_path, monkeypatch
+):
+    """O35: the heal's process ends at the last provider's link restart, after the stuck reader's was restarted and
+    mended it: the next process's check finds every pair passing, opens with no heal, and ends the episode
+    (`links_passed`), so a pair that sticks later starts a heal of its own episode."""
+    federation = Federation()
+    settings = killed_mid_sequence(tmp_path, monkeypatch, federation, at=SECOND)
+    assert federation.stuck == set()
+    nxt, _ = next_process(settings, federation)
+    federation.clock.sleep(600)
+    assert nxt().ok is True
+    assert len(acted(federation, "restart_link")) == 4
+    assert [line["event"] for line in heal_lines(settings)] == ["healing", "links_passed"]
+    assert GateHeals(settings.journal).latched() is False
+
+
+def test_o35_a_second_heal_cut_short_in_one_episode_latches_the_gate_closed(tmp_path, monkeypatch):
+    """O35: the heal that followed a heal cut short is cut short too (its process killed mid-sequence again): two
+    interrupted heals in one stuck episode latch, so the next process's check finds the pair stuck and fails closed
+    with no third heal, and link restarts cannot pile up against the supervisor's bound."""
+    federation = Federation()
+    settings = killed_mid_sequence(tmp_path, monkeypatch, federation, at=READER)
+    second, _ = next_process(settings, federation)
+    monkeypatch.setattr(fault_gate_heal, "this_process", lambda: GONE_PROCESS)
+    federation.on_restart_of = kill_at(READER)
+    federation.clock.sleep(600)
+    began = second()
+    assert (began.ok, began.deferred, began.charge) == UNCHARGED_WAIT, began.detail
+    assert second.wait_for_heal(10)
+    left_by_a_killed_process(settings)
+    federation.on_restart_of = None
+    assert len(acted(federation, "restart_link")) == 6
+    third, _ = next_process(settings, federation)
+    federation.clock.sleep(600)
+    reading = third()
+    assert (reading.ok, reading.deferred) == (False, False), reading.detail
+    assert "until a link check passes" in reading.detail
+    assert len(acted(federation, "restart_link")) == 6
+    assert [line["event"] for line in heal_lines(settings)] == ["healing", "healing"]
+
+
+def test_o35_a_clean_exit_lets_the_heal_finish_its_step_and_leaves_what_a_kill_leaves(tmp_path, monkeypatch):
+    """O35: at a clean exit (`atexit`, `stop_heal`) the heal finishes the step under way (the first reader's link
+    restart and its settle), starts no other, and ends `heal_interrupted` with no `ended` line: the record a kill
+    leaves. Once its process is gone, the next process's check finds the other reader still stuck and heals again,
+    once, as after a kill."""
+    reached, release = threading.Event(), threading.Event()
+    real = fault_gate_heal.this_process
+    monkeypatch.setattr(fault_gate_heal, "this_process", lambda: GONE_PROCESS)  # read once this process is gone
+    federation = Federation()
+    federation.stuck = {(READER, CRASHED), (SECOND, CRASHED)}
+    federation.on_restart = lambda: (reached.set(), release.wait(10))  # the first link restart takes its time
+    gate, federation, _, settings = gate_of(tmp_path, federation, heal="link")
+    first = gate()
+    assert (first.ok, first.deferred, first.charge) == UNCHARGED_WAIT
+    assert reached.wait(10)
+    stopping = threading.Thread(target=gate.stop_heal, args=(10,))
+    stopping.start()
+    time.sleep(0.1)  # the exit has asked the heal to stop while its first step is under way
+    federation.on_restart = None
+    release.set()
+    stopping.join(10)
+    assert gate.wait_for_heal(1)
+    assert acted(federation, "restart_link") == [("restart_link", READER)]
+    assert (gate.last_heal["outcome"], "exiting" in gate.last_heal["why"]) == ("heal_interrupted", True)
+    assert [line["event"] for line in heal_lines(settings)] == ["healing"]
+    nxt, _ = next_process(settings, federation)
+    monkeypatch.setattr(fault_gate_heal, "this_process", real)
+    federation.clock.sleep(600)  # past the settle the finished step held, in the drain record
+    reading = healed(nxt, federation)
+    assert reading.ok is True, reading.detail
+    assert acted(federation, "restart_link") == [("restart_link", READER), ("restart_link", SECOND)]
+
+
 def test_o35_a_heal_in_progress_defers_within_its_bound_and_closes_past_it(tmp_path):
     """O35: every check while the heal runs answers the uncharged deferral, at once, until the heal's own bound
     (`heal_timeout_s` and `heal_settle_s`) has passed since it began; a heal still running then closes the gate,
@@ -518,19 +953,27 @@ def test_o35_the_gate_heal_never_restarts_the_container_of_a_stuck_pairs_source(
 
 def test_o35_the_gate_heal_acts_at_most_once_per_provider(tmp_path):
     """O35: one link restart and at most one container restart per provider in a recovery, in two passes, and a later
-    check of the closed gate acts on nothing: the reader's restarted container stays open in the journal until every
-    pair passes, and the recovery that settles it only checks."""
+    check of the closed gate acts on nothing: the reader's restarted container stays open in the journal while the heal
+    runs and after it ends with a pair failing, and the recovery that settles it, once the heal is over, only checks:
+    it finds the container back, settles, gates and clears it, and the gate's own link check keeps the gate closed."""
     federation = Federation()
     federation.link_fixes = dict.fromkeys(EVERY, ())
     gate, federation, _, settings = gate_of(tmp_path, federation, heal="all_links")
-    assert healed(gate, federation).ok is False
+    assert gate().deferred is True
+    assert gate.wait_for_heal(10)
     counted = Counter(acted(federation, "restart_link", "stop"))
     assert counted == Counter({("restart_link", label): 1 for label in EVERY} | {("stop", READER): 1})
+    journal = InjectionJournal(settings.journal)
+    (still_open,) = journal.open_entries()
+    assert (still_open["target"], still_open["heal"], still_open["clear_failed"]) == (READER, True, "links_stuck")
     federation.clock.sleep(600)
-    assert gate().ok is False
+    assert gate().deferred is True  # found back, its settle held once more before its gate is read
+    for _ in range(2):
+        federation.clock.sleep(600)
+        reading = gate()
+        assert (reading.ok, reading.deferred) == (False, False), reading.detail
+        assert journal.open_entries() == []
     assert Counter(acted(federation, "restart_link", "stop")) == counted
-    (still_open,) = InjectionJournal(settings.journal).open_entries()
-    assert (still_open["target"], still_open["heal"]) == (READER, True)
 
 
 def test_o35_a_gate_heal_that_left_a_pair_failing_is_not_run_again_until_a_check_passes(tmp_path):

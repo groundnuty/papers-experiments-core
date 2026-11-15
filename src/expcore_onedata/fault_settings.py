@@ -117,8 +117,9 @@ leaves can defer a check later still), and every check ends within `health_timeo
 too: keep it above `visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but
 its thread runs on and can still start the heal later than the figure counts. A deferral that began before the drain
 (an outage run still running, and another worker's check deferred on it) or for another reason (a run on an ingest
-baseline), and a heal that waits for another holder of the federation (the hold `federation_busy`), count from the
-deferral's first answer, so its age holds that wait too, which no setting here bounds.
+baseline, or a run's shortcut reset holding the reset lock), a heal that waits for another holder of the federation
+(the hold `federation_busy`), and a heal cut short by its process's end, which the next process settles and heals
+once more, count from the deferral's first answer, so its age holds that wait too, which no setting here bounds.
 """
 
 import hashlib

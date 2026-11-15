@@ -71,7 +71,7 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
-from expcore_onedata.admission import current_admission, require_admission, retain_admission
+from expcore_onedata.admission import current_admission, require_admission, retain_admission, retain_to_act
 from expcore_onedata.client import PlatformError
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
@@ -582,6 +582,9 @@ class SandboxPlatform:
             raise StartRefused("a read-only input passed to launch was not declared to the platform (inputs.declare)")
         if inputs and inputs_record is None:
             raise ValueError("a run with read-only inputs needs the instrument that keeps them in its record")
+        # held from the admission check until the start thread holds a share of its own, so no shortcut section of the
+        # run can seal the admission while the sandbox is authorised and started (O11)
+        authorised = retain_to_act()
         sandbox: DockerSandbox | None = None
         started: asyncio.Future[None] | None = None
         minting: asyncio.Future[RunTokens | None] | None = None
@@ -616,6 +619,8 @@ class SandboxPlatform:
             elif revoking is not None and minting is not None:  # a mint that may have left a token, and no start
                 await self._revoke_unstarted(ctx, revoking, minting, sandbox)
             raise
+        finally:
+            authorised()  # the start thread holds its own share by now, or the start was undone
         try:
             yield sandbox
         except Exception as error:

@@ -18,6 +18,19 @@ gate probe of the injection it heals, under the reader's lock, restored and wait
 word and stays open, and recovery (which settles such entries first, `Recovery.recover`) brings it back and checks it.
 The gate's and the heal's readings go into `restore_record`, for the injector's snapshot.
 
+**The settle of a recovered container restart.** A recovery that finds a heal's container restart open (its heal was cut
+short, or ended with a pair failing) first waits out every hold its heal left (one reading then decides: a reader the
+heal never stopped is `never_down` and cleared), brings the reader back, verified (a new identity, serving), and reads
+its session gate only once a settle journalled on that entry has passed: when it started the container itself, or when
+none is journalled (who started it, and when, is not known), it holds one of `heal_settle_s` from the moment the reader
+serves, in the federation's drain record first when it has one (`hold_for`), then on the entry (`settle_until`), a
+`clear_failed` line `settling` marked `healing`, which no reader takes for a failed restore. A recovery that may not
+wait (the fault gate's, whose check the core bounds by `health_timeout_s`: `recover(defer=True)`) never sleeps out a
+held settle: it raises `RestoreSettling`, which the gate answers as a wait that charges no run; a later check, once the
+settle has passed, reads the gate and clears the entry when it passes, and the gate's own link check, next in that
+check, judges every pair (an entry left open would keep every later heal out). Any other recovery (the injector's start)
+waits the settle out and clears the entry only when the gate and every pair pass.
+
 **The fault gate's heal** (`heal_stuck`, `fault_gate_heal`) runs the same heal on stuck pairs the gate's own check
 found, with no injection to journal it on: its holds are the caller's, and its container restarts are cleared or left
 open as a restore's are.
@@ -30,6 +43,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from expcore.errors import InfraError
 from expcore_onedata.compose import DriverError, Observation
 from expcore_onedata.fault_heal import HealResult, LinkHeal
 from expcore_onedata.fault_journal import InjectionJournal, holder
@@ -41,8 +55,24 @@ from expcore_onedata.fault_settings import (
     heal_container_reserve,
     heal_link_reserve,
 )
+from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE
 
 log = logging.getLogger("expcore_onedata.fault_recovery")
+
+
+class RestoreSettling(InfraError):
+    """A recovery that may not wait (`recover(defer=True)`, the fault gate's) met a held settle before a gate read or
+    a link check: nothing was read, the entry stays open, and a later recovery reads once `left_s` has passed. The fault
+    gate answers it as a wait that charges no run. The detail names the target by its label only (O12)."""
+
+    def __init__(self, left_s: float, target: str | None = None) -> None:
+        self.left_s = max(0.0, left_s)
+        whose = f"the restore of {target}" if target is not None else "a restore"
+        detail = (
+            f"{whose} waits {self.left_s:.0f} s more for a heal's settle before its session gate and every pair are "
+            "read: the check waits"
+        )
+        super().__init__(INJECTOR_FAILURE, detail, target=target)
 
 
 def digest(identity: str) -> str:
@@ -76,6 +106,8 @@ class LinkSettling:
     _quiet_until: float | None
     _wall: Callable[[], float]
     _waited_wall: float
+    _hold_for: Callable[[float], None] | None
+    _defer: bool
     journal: InjectionJournal
     links_detail: str | None
     restore_record: dict[str, Any]
@@ -97,16 +129,52 @@ class LinkSettling:
 
     def _await_quiet(self) -> None:
         """Wait out what is left of the latest held settle, this recovery's own and every one the journal holds for
-        an open injection, before any gate read or link check. A journal that cannot be read raises (fail closed)."""
+        an open injection, before any gate read or link check; a recovery that may not wait (`_defer`) raises
+        `RestoreSettling` instead, having read nothing. A journal that cannot be read raises (fail closed)."""
         until = self._quiet_until
         if until is not None and self._clock() < until:
-            self._sleep(until - self._clock())
+            self._wait_out(until - self._clock())
         journalled = [entry.get("settle_until") for entry in self.journal.open_entries()]
         latest = max((value for value in journalled if isinstance(value, int | float)), default=None)
         if latest is not None and latest > self._waited_wall:  # another's hold, or one this recovery has not waited
             if self._wall() < latest:
-                self._sleep(latest - self._wall())
+                self._wait_out(latest - self._wall())
             self._waited_wall = latest
+
+    def _wait_out(self, seconds: float) -> None:
+        """Sleep out what is left of a held settle, or, in a recovery that may not wait, raise `RestoreSettling`."""
+        if self._defer:
+            raise RestoreSettling(seconds)
+        self._sleep(seconds)
+
+    def _settle_child(self, entry: Mapping[str, Any], how: str) -> None:
+        """A heal's container restart this recovery has just verified serving: when this recovery started the container
+        (`restored`), or no settle is journalled on its entry (who started it, and when, is not known: a recovery killed
+        after its start and before its hold leaves exactly that), hold a settle of `heal_settle_s` from now, in the
+        federation's drain record first (`hold_for`, when this recovery has one), then on the entry, so that its gate
+        and pairs are read, in any process, only once it has passed (`_await_quiet`). A record that cannot be written
+        raises, and nothing is read."""
+        until = entry.get("settle_until")
+        if how != "restored" and isinstance(until, int | float) and not isinstance(until, bool):
+            return  # held already, by the recovery that started it: `_await_quiet` waits for it, or defers
+        seconds = self._settings.heal_settle_s
+        until = self._wall() + seconds  # read before the drain record's own: the record never ends before the line
+        if self._hold_for is not None:
+            self._hold_for(seconds)
+        line = {"event": "clear_failed", "id": entry["id"], "how": "settling", "healing": True, "settle_until": until}
+        self.journal.append(line)  # `healing`: a recovery under way, never taken for a failed restore
+
+    def _child_settled(self, entry: Mapping[str, Any], heal: bool) -> str | None:
+        """A heal's container restart once its settle has passed: None when it may be cleared, else the word it fails
+        with. In a recovery that may not wait (`_defer`, the fault gate's) its session gate alone decides: the gate's
+        own link check of every pair comes next in the same check, keeps every run out until each passes, and heals a
+        stuck pair again when the latch allows, which an entry left open would forbid for ever. In any other (the
+        injector's start, which injects next) the gate and every pair decide (`_links_settled`)."""
+        if not self._defer:
+            return self._links_settled(entry, heal)
+        gate = self._gate(entry["service"], entry.get("gate_probe"))
+        self.restore_record["gate"] = gate
+        return None if gate["ok"] is True else "sessions_not_ready"
 
     def _gate(self, service: str, gate_probe: str | None, timeout_s: float | None = None) -> dict[str, Any]:
         """The session gate for a provider's service, polled within `gate_timeout_s`, or `timeout_s` when shorter;
@@ -165,15 +233,22 @@ class LinkSettling:
         return result.how
 
     def heal_stuck(
-        self, service: str, first: LinkMatrix, *, hold: Callable[[float], None], gate_probe: str | None
+        self,
+        service: str,
+        first: LinkMatrix,
+        *,
+        hold: Callable[[float], None],
+        gate_probe: str | None,
+        stopping: Callable[[], bool] | None = None,
     ) -> tuple[HealResult, LinkMatrix]:
         """The fault gate's heal of the stuck pairs its own link check found (`first`), with no injection open and no
         restored provider (`expcore_onedata.fault_gate_heal`): the same heal, its bounds, settle and fallback, by the
-        caller's `hold`, never restarting the container of a provider that was ever the source of a failing pair.
-        `service` is any declared service, which the driver's link check takes. The container restarts it made are
-        cleared when every pair passes, else left open, journalled `clear_failed`. Return how it ended and the latest
-        link check that answered."""
-        result, latest, children = self._run_heal(service, None, gate_probe, hold, first, sources=first.sources())
+        caller's `hold`, never restarting the container of a provider that was ever the source of a failing pair, and
+        starting no step once `stopping()` (a clean exit) says so. `service` is any declared service, which the
+        driver's link check takes. The container restarts it made are cleared when every pair passes, else left open,
+        journalled `clear_failed`. Return how it ended and the latest link check that answered."""
+        sources = first.sources()
+        result, latest, children = self._run_heal(service, None, gate_probe, hold, first, sources, stopping)
         self._close_children(result, children)
         return result, latest
 
@@ -185,6 +260,7 @@ class LinkSettling:
         hold: Callable[[float], None],
         first: LinkMatrix,
         sources: set[str] | None = None,
+        stopping: Callable[[], bool] | None = None,
     ) -> tuple[HealResult, LinkMatrix, list[str]]:
         """Run one heal (`fault_heal.LinkHeal`); return how it ended, the latest link check that answered (`first`, or
         the heal's last that did) and the journal ids of the container restarts it made."""
@@ -226,6 +302,7 @@ class LinkSettling:
             sleep=self._sleep,
             sources_seen=sources,
             only_stuck=sources is not None,  # the fault gate's heal: nothing is done unless a fetch failed
+            stopping=stopping,
         ).run()
         return result, answered[-1], children
 

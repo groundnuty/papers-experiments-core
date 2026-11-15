@@ -45,14 +45,31 @@ its settle. Whatever the heal did, the next check makes the link
 check afresh (`relink`), so no pass from before the heal's end opens the gate: a heal that left a pair failing leaves it
 to the next check, which finds it stuck and fails closed, and none runs again until the gate's link check passes. A
 check under a run's admission keeps a share of it until it ends, so one that outlives its caller's wait still holds the
-federation.
+federation and no shortcut section of the run begins while it reads; while the run's own shortcut reset holds the
+federation's reset lock (`federation.reset`) the check is deferred, uncharged.
+
+**The heal takes no reset lock.** Its exclusive admission of `federation.lock` waits for the turnstile holding nothing
+and for the main lock holding the turnstile, as every exclusive admission does (`admission`, the lock order), and so it
+already excludes every shared holder, each with its share of `federation.reset`, and every shortcut reset, whose run
+keeps its share of `federation.lock` for the whole section. No section runs while the heal restarts links and reads the
+links again, and no holder of `federation.reset` waits for what the heal holds, so the heal never deadlocks with one:
+a section under way keeps the heal out until `health_wait_s` runs out, and the gate stays closed, uncharged.
+
+**A heal cut short** (its process killed, or a clean exit that stopped it between two steps, `stop_heal`) leaves no
+`ended` line, and the first one of a stuck episode is forgiven (`GateHeals.latched`): the next check that finds a pair
+stuck heals again. A reader's container it stopped and never started is an open injection, which the check's recovery
+brings back, verified, and then settles before reading its gate and pairs: it never sleeps the settle out inside the
+check (`recover(defer=True)`), answering the uncharged deferral instead (`RestoreSettling`), and a check after the
+settle reads the gate and every pair and clears the entry only when they pass.
 """
 
+import atexit
 import contextlib
 import logging
 import re
 import threading
 import time
+import weakref
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -73,8 +90,14 @@ from expcore_onedata.admission import (
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
-from expcore_onedata.fault_recovery import FaultDriver, Recovery
-from expcore_onedata.fault_settings import FaultSettings, heal_deferral_s, heal_wait_s
+from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling
+from expcore_onedata.fault_settings import (
+    FaultSettings,
+    heal_all_links_reserve,
+    heal_container_reserve,
+    heal_deferral_s,
+    heal_wait_s,
+)
 
 _PURPOSES = {
     OUTAGE_RUN: "an outage run",
@@ -99,6 +122,13 @@ def _named(record: Mapping[str, Any] | None) -> str:
     return f"{who}{of}{at}"
 
 
+def _stop_heal_at_exit(gate: "weakref.ref[FaultGate]") -> None:
+    """At a clean exit of the process: the gate's heal finishes its step and starts no other (`FaultGate.stop_heal`)."""
+    alive = gate()
+    if alive is not None:
+        alive.stop_heal()
+
+
 def _held_for(record: Mapping[str, Any]) -> float | None:
     """The seconds since a holder record's `since_utc`, on the wall clock; None when it holds no readable time."""
     since = record.get("since_utc")
@@ -112,7 +142,16 @@ def _held_for(record: Mapping[str, Any]) -> float | None:
 
 
 def _unsettled(entries: list[dict[str, Any]]) -> Health:
-    """The failure of a journal with open injections: a failed restore by its target's label and how it failed."""
+    """The failure of a journal with open injections: a failed restore by its target's label and how it failed. A
+    journal whose only open injections are heals' container restarts that a recovery brought back and that settle before
+    their gate and pairs are read (`settling`) is a wait that charges no run, never a pass."""
+    if entries and all(entry.get("clear_failed") == "settling" for entry in entries):
+        settling = ", ".join(sorted({entry["target"] for entry in entries}))
+        detail = (
+            f"the heal's container restart of {settling} was brought back and settles before its session gate and "
+            "every pair are read: the check waits"
+        )
+        return Health(False, detail, deferred=True, charge=False)
     failed = sorted({(entry["target"], entry["clear_failed"]) for entry in entries if "clear_failed" in entry})
     if failed:
         hows = ", ".join(f"{target} ({how if _WORD.fullmatch(how) else 'failed'})" for target, how in failed)
@@ -144,7 +183,9 @@ class FaultGate:
         sanctioned heal, the gate heals the stuck pairs its own check finds (see the module docstring)."""
         self._clock, self._sleep, self._drain_s = clock, sleep, settings.session_drain_s
         self._lock = FederationLock(settings, clock=clock, sleep=sleep, wall=wall)
-        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep, labels=labels, wall=wall)
+        self._recovery = Recovery(
+            settings, driver, clock=clock, sleep=sleep, labels=labels, wall=wall, hold_for=self._lock.hold_for
+        )
         self._journal = self._recovery.journal
         self._may_recover = settings.sanctioned is True
         self._wait_s = settings.health_wait_s
@@ -153,10 +194,10 @@ class FaultGate:
         self._heals = GateHeals(settings.journal)
         declared = settings.heal != "off" and self._may_recover
         heals = declared and links is not None and relink is not None and bool(labels)
+        self._exiting = threading.Event()  # a clean exit asked the heal to start no further step (`stop_heal`)
+        hold_for, stopping = self._lock.hold_for, self._exiting.is_set
         self._healer = (
-            GateHeal(settings, driver, self._recovery, labels or {}, self._lock.hold_for, self._heals)
-            if heals
-            else None
+            GateHeal(settings, driver, self._recovery, labels or {}, hold_for, self._heals, stopping) if heals else None
         )
         self._last_heal: dict[str, Any] | None = None
         self._heal_guard = threading.Lock()  # the heal running in the background, and when it began
@@ -164,6 +205,9 @@ class FaultGate:
         self._heal_began = 0.0
         self._heal_bound_s = heal_wait_s(settings)  # the longest a heal defers the gate
         self._settings = settings
+        # the longest one step of a heal can take, its settle included: what a clean exit waits for it at most
+        self._step_bound_s = max(heal_container_reserve(settings), heal_all_links_reserve(settings))
+        self._exit_hooked = False
 
     def max_deferral_s(self) -> DeferralBound | None:
         """The longest this gate's checks may stay deferred, for the core to hold the campaign's `max_defer_s` to at
@@ -185,11 +229,14 @@ class FaultGate:
         check), ends within the campaign's `health_timeout_s`, the check's own contract (`docs/interfaces.md`,
         HealthCheck; the link check too, `linkcheck`: keep it above `visible_timeout_s + timeout_s + evict_timeout_s`).
         The core gives up on a check that outlives it, reads it as down and throws its answer away, but the check's
-        thread runs on and can still start the heal later than the bound counts. And three waits are not in it: a
+        thread runs on and can still start the heal later than the bound counts. And these waits are not in it: a
         deferral that began before the drain (an outage run still running, another worker's check deferred on it) or
-        for another reason (a run on an ingest baseline, which `PlatformHealth` checks first) counts from its first
-        answer, and so does a heal that waits for another holder of the federation (the hold `federation_busy`), so
-        each adds to its age."""
+        for another reason (a run on an ingest baseline, which `PlatformHealth` checks first, or a run's shortcut
+        reset holding the reset lock, `federation.reset`) counts from its first answer, and so does a heal that waits
+        for another holder of the federation (the hold `federation_busy`), and so does a heal cut short by its
+        process's end, after which the next process settles what it left (`RestoreSettling`) and heals once more
+        (`GateHeals.latched`) on the same deferral, whose age the store keeps across the restart; so each adds to
+        its age."""
         settings = self._settings
         if settings.heal == "off":
             return None
@@ -227,6 +274,20 @@ class FaultGate:
             thread.join(timeout_s)
         return thread is None or not thread.is_alive()
 
+    def stop_heal(self, timeout_s: float | None = None) -> bool:
+        """Ask the heal running in the background to start no further step, and wait for it to end: the step under way
+        finishes, its settle included (a container it stopped is started and verified), at most `timeout_s`, by
+        default the longest step's reserve. What a clean exit of the process does (`atexit`); whether no heal runs now.
+        A heal stopped this way ends `heal_interrupted` and writes no `ended` line, so it leaves what a kill leaves: a
+        `healing` line that latches while this process lives and is forgiven once it is gone (`GateHeals.latched`).
+        A heal that does not end in time is left to the daemon thread's end, and the next process settles what it
+        left: its journalled container restart, restored, settled and verified before any run is admitted."""
+        self._exiting.set()
+        done = self.wait_for_heal(self._step_bound_s if timeout_s is None else timeout_s)
+        if done:
+            self._exiting.clear()
+        return done
+
     def _healing(self) -> Health | None:
         """While this gate's heal runs: the uncharged deferral, within the heal's own bound (`heal_timeout_s` and
         `heal_settle_s` since it began), and past it a closed gate, still uncharged, so a hung heal never defers for
@@ -263,7 +324,9 @@ class FaultGate:
                             # before anything is restored: a provider it brings back went down in a run it knows nothing
                             # of, and the release below publishes the drain whatever interrupts the recovery
                             exclusive.drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)
-                        self._recovery.recover()
+                        self._recovery.recover(defer=True)  # a held settle is a wait, never slept here
+                        if self._relink is not None:  # the pairs of what it restored: the link check made afresh next
+                            self._relink()
                     finally:
                         exclusive.close()
             try:
@@ -276,17 +339,32 @@ class FaultGate:
                 shared.close()
             stuck = made is not None and not verdict.ok and any(pair.stuck for pair in made.pairs)
             return self._heal(verdict, made) if stuck and made is not None else verdict
+        except RestoreSettling as settling:  # a recovered container restart settles before its gate and pairs
+            return Health(False, settling.detail, deferred=True, charge=False)
         except InfraError as error:
             return Health(False, error.detail)
 
     def _held_check(self, held: Admission) -> Health:
         """The check under the caller's admission, a share of it kept until the check ends: a check that outlives its
         caller's wait (the core gives up on it, and the run lets its admission go) still holds the federation while it
-        reads, so no heal's admission is granted under it. An admission already being let go fails it closed."""
+        reads, so no heal's admission is granted under it, and no shortcut section of the run can seal the admission
+        while the check reads a study's file. An admission already let go fails it closed; one still held of which no
+        share may act (the run's own shortcut section sealed it, or its share of the reset lock is given up, or its
+        last share is being given up) defers the check, uncharged. Whether it is held is read after the refusal, and
+        a lock let go is never held again, so a section that ends meanwhile never turns the deferral into a failure."""
         give_up = held.try_retain()
-        if give_up is None:
+        if give_up is None and not held.held:
             return Health(
                 False, "the run's admission was let go before its check could hold it, so nothing was checked"
+            )
+        if give_up is None or not held.may_act:
+            if give_up is not None:
+                give_up()
+            return Health(
+                False,
+                "the run's own shortcut reset holds the federation's reset lock: the check waits for it",
+                deferred=True,
+                charge=False,
             )
         try:
             return self._judged()[0]
@@ -335,7 +413,9 @@ class FaultGate:
         """The check's own link check found a stuck pair, and the check holds no run's admission: take an exclusive
         admission of the gate's own and hand it to a heal in the background, answering the uncharged deferral, so the
         heal never runs past the core's wait for this check (`health_timeout_s`) and no run is charged for it; fail
-        closed whenever it cannot begin."""
+        closed whenever it cannot begin. The admission takes no reset lock (see the module docstring): the check's own
+        shared hold, with its share of `federation.reset`, is let go before it, and the exclusive hold of
+        `federation.lock` already keeps every shortcut reset out."""
         if self._healer is None or self._relink is None:  # no heal declared, or no sanction, services or reports
             return verdict
         refused = self._refused(verdict)  # read first, so a latched gate waits for nobody
@@ -363,6 +443,9 @@ class FaultGate:
             if refused is not None:
                 return refused
             with self._heal_guard:
+                if not self._exit_hooked:  # a clean exit lets the heal finish its step first (`stop_heal`)
+                    atexit.register(_stop_heal_at_exit, weakref.ref(self))
+                    self._exit_hooked = True
                 self._heal_began = self._clock()
                 thread = threading.Thread(
                     target=self._heal_on, args=(exclusive, trigger), name="fault-gate-heal", daemon=True
@@ -447,10 +530,15 @@ class FaultGate:
         record = self._journal.read_holder()  # read once: who holds the federation, as every branch below judges it
         recovering = self._recovering(record)  # a health check's recovery or heal: its bounded wait, or None
         failed = [entry for entry in entries if "clear_failed" in entry and not entry.get("healing")]
-        if failed and recovering is not None and all(entry.get("heal") is True for entry in failed):
+        heals_own = bool(failed) and all(entry.get("heal") is True for entry in failed)
+        if heals_own and recovering is not None:
             # only a heal's own container restarts failed, and the health check that heals still holds the
             # federation for their settle: a heal not over yet, a wait that charges no run (closed past its bound)
             return recovering
+        if heals_own and self._lock.drain_left() > 0:
+            # a heal that ended (or was cut short) left its container restarts open, and its settle still closes the
+            # federation: the recovery that settles them waits for it, and so does this check, charging no run
+            return Health(False, "a heal's settle still closes the federation: the check waits", True, False)
         if failed:
             return _unsettled(entries)  # a restore failed: a fault of the federation, whoever still holds it
         if recovering is not None:
@@ -490,7 +578,7 @@ class FaultGate:
                     # still held, by a holder that is gone: nobody else is admitted while it is, and the record is
                     # written first, so an admission that finds the journal settled after it finds the record
                     self._lock.hold_for(self._drain_s)
-                self._recovery.recover()  # raises InfraError naming the target when one cannot be settled
+                self._recovery.recover(defer=True)  # raises InfraError naming the target when one cannot be settled
             finally:
                 if exclusive is not None:
                     exclusive.close()

@@ -440,6 +440,42 @@ def test_s12_an_exploratory_only_preregistration_runs_through_analyze_and_report
     assert all(line.endswith("(exploratory)") for line in summary)
 
 
+NAMED_FAMILIES = '[holm_families]\nextended = ["extended-vs-baseline"]\nrelay = ["relay-vs-baseline"]'
+
+
+def test_s17_named_holm_families_run_through_analyze_and_report_each_adjusted_on_its_own(
+    resumed, tmp_path, clean_environment, capsys
+):
+    """S17: through the command line: the two confirmatory contrasts declared as two families of one, check, analyze
+    and report succeed; analysis.json gives each family its one step at alpha / 1, where the flat family of two
+    adjusted them together, and the report and the terminal show each family apart, the exploratory contrast outside
+    every family."""
+    copy = copy_campaign(resumed, tmp_path, "named-families")
+    edit_once(copy.root / "preregistration.toml", FAMILY, NAMED_FAMILIES)
+    write_stamp(copy.root, HEAD, load_study(copy.root).scope)
+    steps = {"check": str(copy.runs), "analyze": str(copy.root), "report": str(copy.root)}
+    assert {name: cli(clean_environment, name, target)[0] for name, target in steps.items()} == dict.fromkeys(steps, 0)
+    analysis = copy.read("analysis.json")
+    assert [(f["name"], f["members"]) for f in analysis["holm_families"]] == [
+        ("extended", ["extended-vs-baseline"]),
+        ("relay", ["relay-vs-baseline"]),
+    ]
+    for family in analysis["holm_families"]:
+        [step] = family["steps"]
+        assert (step["step"], step["level"], step["p_holm"]) == (1, 0.05, step["p_value"])  # m = 1: unadjusted
+    flat = {d["name"]: d for d in resumed.read("analysis.json")["holm"]}
+    assert {d["level"] for d in flat.values()} == {0.05 / 2, 0.05}  # one flat family of two
+    assert {d["name"]: d["level"] for d in analysis["holm"]} == dict.fromkeys(flat, 0.05)
+    report = (copy.root / "out" / "report.md").read_text(encoding="utf-8")
+    assert "### Holm family extended (1 contrast)" in report
+    assert "Holm steps of relay:" in report
+    assert set(table(report, "## Exploratory contrasts (outside every Holm family)")) == {"tools-effect-on-rounds"}
+    capsys.readouterr()
+    assert main(["analyze", str(copy.root)]) == 0
+    summary = {line.split(":")[0]: line for line in capsys.readouterr().out.splitlines() if "estimate" in line}
+    assert "(family relay)" in summary["relay-vs-baseline"]
+
+
 def test_c25_a_budgeted_study_without_context_windows_still_analyses_reports_and_regenerates_but_does_not_run(
     resumed, tmp_path, clean_environment
 ):
@@ -556,6 +592,18 @@ def test_c29_the_report_of_an_unsharded_campaign_is_the_bytes_it_was_before_shar
     report = re.sub(r"^- (Code|Core version): .*$", r"- \1: (not pinned)", clean_pair.first.report, flags=re.M)
     assert report == golden
     assert "Shards" not in clean_pair.first.report
+
+
+def test_s17_the_analysis_json_of_one_holm_family_is_the_bytes_it_was_before_named_families(clean_pair):
+    """S17: a preregistration with one flat `holm_family` gets the analysis.json the core wrote before several named
+    families existed: `tests/data/tiny_study_analysis.json` was made by the code of that time. Only the core version
+    and the example's tree hash are masked, as the report's pin masks them; every other byte is pinned, so a key
+    the families added to a single family's output (a null family name, a steps table) fails here."""
+    golden = (ROOT / "tests" / "data" / "tiny_study_analysis.json").read_text(encoding="utf-8")
+    written = (clean_pair.first.root / "out" / "analysis.json").read_text(encoding="utf-8")
+    masked = re.sub(r'^( *"(?:core_version|tree_sha256)": )"[^"]*"', r'\1"(not pinned)"', written, flags=re.M)
+    assert masked == golden
+    assert "holm_families" not in written
 
 
 def test_every_output_regenerates_from_the_records_byte_for_byte_and_regenerating_writes_nothing(clean_pair, tmp_path):

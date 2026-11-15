@@ -79,11 +79,14 @@ def test_o11_a_job_both_providers_list_is_cancelled_and_waited_for_on_each(provi
     assert reads == {ALPHA_ID, BETA_ID}
 
 
-def test_o07_the_transfer_stage_needs_the_settle_count_of_clean_observations_in_a_row(provisioner, stocked, ticker):
-    """O07: a quiet space still takes `transfer_settle_polls` observations (three here), each of both providers'
-    waiting and ongoing listings, before the transfer stage passes."""
+def test_o07_a_quiet_space_still_takes_a_second_observation_one_settle_after_the_first(provisioner, stocked, ticker):
+    """O07: a space with nothing waiting or ongoing, and nothing cancelled, still takes two observations of both
+    providers' waiting and ongoing listings, `transfer_settle_s` apart, before the transfer stage passes: one could
+    miss a job the listing shows late. It no longer takes `transfer_settle_polls` (three here) of them
+    (`test_reset_settle.py`)."""
     record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
-    assert record["stages"]["transfers"]["observations"] == 3
+    assert (record["stages"]["transfers"]["observations"], record["stages"]["transfers"]["fast"]) == (2, True)
+    assert record["stages"]["transfers"]["seconds"] == provisioner.settings.transfer_settle_s
 
 
 def test_o01_a_job_that_starts_during_the_eviction_fails_the_reset_before_any_block_map_is_read(
