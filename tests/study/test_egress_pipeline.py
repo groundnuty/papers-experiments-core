@@ -82,7 +82,7 @@ def analysed(tmp_path, clean_environment):
 
 
 def test_every_analysed_run_of_a_checked_study_is_judged_from_its_record(analysed):
-    """`lake`'s runs connected outside, `hill`'s logs were never closed, the rest are clean."""
+    """O52: `lake`'s runs connected outside, `hill`'s logs were never closed, the rest are clean."""
     flags = {run.flags for run in analysed.egress.runs}
     assert ("outside",) in flags
     assert ("log_unknown",) in flags

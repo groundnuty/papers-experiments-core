@@ -59,7 +59,7 @@ def test_a_log_with_no_outside_destination_is_intact_with_zero_outside():
 
 @pytest.mark.parametrize("data", [None, b"", log(RUN, end=False), log(RUN)[:-9]])
 def test_a_missing_or_damaged_log_is_unknown_with_no_counts(data):
-    """Unknown is never zero: the counts are None, never a count of nothing."""
+    """O52: unknown is never zero: the counts are None, never a count of nothing."""
     snap = finish(data)
     assert snap["log"] == UNKNOWN
     assert snap["unknown"]

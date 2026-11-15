@@ -77,8 +77,8 @@ def damaged(kind: str) -> bytes:
     ],
 )
 def test_a_damaged_log_is_unknown_with_the_reason(kind, reason):
-    """Cut, out of order, past its end, a record that is not one, an end that does not count what came before, no
-    start line: each is unknown, never intact."""
+    """O52: cut, out of order, past its end, a record that is not one, an end that does not count what came before,
+    no start line: each is unknown, never intact."""
     reading = read_log(damaged(kind), NONCE)
     assert not reading.intact
     assert reason in reading.problems

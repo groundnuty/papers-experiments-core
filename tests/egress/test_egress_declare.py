@@ -24,8 +24,8 @@ DECLARED = declaration([("127.0.0.1", GATE_PORT)], ("127.0.0.1", GATE_PORT), hos
     ],
 )
 def test_each_destination_is_the_gate_loopback_or_outside(address, port, expected):
-    """The gate by address and port; loopback by the declared ranges; everything else, the unspecified address and
-    the node's own addresses included, outside."""
+    """O52: the gate by address and port; loopback by the declared ranges; everything else, the unspecified address
+    and the node's own addresses included, outside."""
     assert DECLARED.classify(address, port) == expected
 
 

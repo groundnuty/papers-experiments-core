@@ -31,6 +31,7 @@ def hits(code: str, declared=DECLARED) -> list[tuple[str, str, bool]]:
     ],
 )
 def test_each_kind_of_hit_is_found_and_flags(code, expected):
+    """O52: a URL off the platform, each download command and each network module."""
     assert expected in hits(code)
 
 

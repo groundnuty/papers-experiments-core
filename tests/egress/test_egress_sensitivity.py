@@ -87,7 +87,7 @@ def test_with_no_run_flagged_there_is_no_second_analysis(prereg):
 
 
 def test_the_sensitivity_analysis_is_the_analysis_without_the_flagged_runs(prereg):
-    """Two flagged runs, each in its own pair: the rerun uses the other pairs and counts the two as left out."""
+    """O52: two flagged runs, each in its own pair: the rerun uses the other pairs and counts the two as left out."""
     rows = rows_of_pairs(8)
     flagged = {0, 3}
     done = egress_analysis(runs_for(rows, lambda i: outside() if i in flagged else clean()), rows, [], prereg)

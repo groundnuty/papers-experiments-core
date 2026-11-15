@@ -147,8 +147,8 @@ def test_a_connect_to_loopback_is_logged_with_its_destination_pid_and_result(run
 @needs_gcc
 @needs_unix
 def test_a_connect_to_an_outside_address_is_logged_whatever_it_returns(run):
-    """TEST-NET-1 is never routed: the non-blocking attempt is logged before the call, and its result after it (an
-    errno that depends on the host's network, so not asserted here)."""
+    """O52: TEST-NET-1 is never routed: the non-blocking attempt is logged before the call, and its result after it
+    (an errno that depends on the host's network, so not asserted here)."""
     attempts = [r for r in _records(run, "connect") if r["address"] == "192.0.2.1"]
     results = [r for r in _records(run, "result") if r["address"] == "192.0.2.1"]
     assert [(r["port"], r["type"], r["family"]) for r in attempts] == [(9, "tcp", "inet")]

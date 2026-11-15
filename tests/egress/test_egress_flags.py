@@ -58,6 +58,7 @@ def test_a_run_without_a_readable_snapshot_is_flagged_as_unknown(instruments, re
     "data", [None, b"", log(GATE_ONLY, end=False), log(GATE_ONLY)[:-5], log(GATE_ONLY, malformed=1)]
 )
 def test_a_run_whose_log_is_missing_or_damaged_is_flagged_as_unknown_never_clean(data):
+    """O52: missing, empty, unclosed, cut or holding a malformed datagram: flagged as unknown."""
     verdict = judge(record(instruments={NAMESPACE: snapshot_of(data)}), "cond-a")
     assert verdict.log == "unknown"
     assert LOG_UNKNOWN in verdict.flags

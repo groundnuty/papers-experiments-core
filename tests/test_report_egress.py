@@ -114,8 +114,8 @@ def checked(**changes) -> EgressAnalysis:
 
 
 def test_a_report_without_an_egress_analysis_is_the_text_it_was():
-    """A batch not checked for egress (a Docker host) gets no section: the same bytes as a report rendered before
-    egress detection existed."""
+    """O52: a batch not checked for egress (a Docker host) gets no section: the same bytes as a report rendered
+    before egress detection existed."""
     result = analysis(contrast("a-vs-b", "difference"))
     assert render(result) == render(result, egress=None)
     assert "Egress" not in render(result)

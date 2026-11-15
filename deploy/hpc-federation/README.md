@@ -6,10 +6,8 @@ issue #179's one-node proof. It is built for batch nodes where users get no netw
 below 1024, and where the node's `/tmp` may be shared with other users. The images are the pinned builds of `deploy/compose-federation`
 (`docker.onedata.org/oneprovider:ID-765309c84f`, `docker.onedata.org/onezone:ID-ba7a778696`).
 
-Status: a zone and a provider came up on two shared batch nodes in the seventh live run (13 Nov 2026). Both passed
-the Couchbase guard and the live port check, the provider registered and showed online, and a file written through
-REST read back with the same SHA-256. A whole federation (a zone and five providers) and the agent sandbox on HPC
-have not run yet. The live-run notes are kept privately, since they name the site.
+Status: what has run live, and what has not, is in the dated facts files under `facts/` (the live-run notes
+themselves are kept privately, since they name the site). The agent's egress detection (below) has not run live.
 
 **This file names no site.** Everything site-specific comes from `site.env`, a local file that is never committed
 (see "Site configuration").
@@ -65,6 +63,48 @@ node that hosts an Onedata service.**
   of ours on that node removes it.
 - **8443 and 6665** are open to the cluster network under Onedata's own authentication, with the Onedata test CA,
   whose key is public, so a client on the path cannot tell our zone from an impostor.
+
+## The agent's egress: detected, not prevented
+
+On these nodes the agent's network cannot be restricted: it reaches the internet (the standing run of 14 Nov reached a
+public host from the agent's cell). The study's PI ruled that egress is acceptable here if it is detected, so every
+run's outbound connections are logged and reported, and the analysis is run again without the flagged runs
+(`expcore.egress`; `docs/interfaces.md`, "Egress where it cannot be blocked").
+
+- **`egresslog.c`**, the agent's shim, loaded through the cell's `/etc/ld.so.preload` (a read-only bind), so every
+  dynamically linked process loads it, a child started with a cleared environment included. The services' port shim
+  is not loaded there: the agent's network behaves as without a shim. It sends one record per `connect()` (before the
+  call), its result (after), each non-blocking connect's outcome (`getsockopt(SO_ERROR)`) and each `sendto`,
+  `sendmsg` or `sendmmsg` to an address the process has not sent to: operation, pid, descriptor, time, socket type,
+  family, address, port and result. **Never a payload.** Each record goes on a fresh Unix datagram socket to a path
+  compiled in (`/hpcop-egress/sock`), so a child that closes every inherited descriptor still logs, and nothing the
+  agent writes can be mistaken for the log. A connect, or a send to a new address, whose record cannot be delivered is
+  refused with `EACCES`: through the shim, a destination is logged or not reached.
+- **`egress-collector.py`**, outside the cell in the run's sandbox step: it binds the socket in an empty 0700
+  directory that the cell sees read-only, and writes every record, with the sender's pid and uid as the kernel attests
+  them, to a log it creates in a directory the cell never sees. Each line is numbered; the first holds the run's nonce,
+  the last the counts, written when the collector is stopped. A datagram that is no record is kept as its size and
+  SHA-256 only.
+- **The canary.** Before the agent runs, the run driver connects once to the gate from inside the cell, under the same
+  binds. The log's first record must be that connect, or the core reads the log as unknown: a shim that never loaded
+  would otherwise leave an empty log that reads as clean.
+
+**The limits.** Detection, not prevention, and the log is evidence, not a barrier:
+
+- **What passes the shim:** a statically linked program or a Go binary, raw system calls (`syscall(2)`, inline
+  assembly), io_uring, the C library's own DNS queries (glibc's resolver calls the kernel through internal aliases a
+  preload cannot interpose; the connect that follows a lookup is logged), and a process that never loads the shim.
+  The static scan of the agent's code cells is the second line of detection, and it reads text: a name or a call built
+  at run time passes it. Neither line prevents egress.
+- **Under one uid,** the agent cannot see or signal the collector (the cell has its own PID namespace,
+  `--containall`) or reach its log, but it can send forged datagrams to the socket. They add lines and never remove
+  one, and a malformed one makes the log unknown.
+- **A collector that dies mid-run** makes every later connect of the agent fail with `EACCES`, its data path's too, and
+  leaves a log without an end line, which reads as unknown.
+
+`tests/deploy/test_hpc_egress_shim.py` builds the shim with the host's gcc and runs it against
+`tests/egress_probe.c`, which connects to a loopback listener and, non-blocking, to 192.0.2.1 (TEST-NET-1, never
+routed), so no test sends outside traffic. It needs Unix sockets, which some sandboxes forbid; it skips there.
 
 ## The Couchbase administrator and its guard
 
@@ -162,11 +202,14 @@ the whole node for the job.
 | `zone.sbatch`, `provider.sbatch` | batch | hold the service for the job's life; `--no-requeue` and a `--time` |
 | `supervise.py`, `scrub.py`, `onboard.py`, `jsonget.py`, `tokenbody.py`, `probe.sh` | node | the service process and its signals, redaction, space support, JSON helpers, read-only node checks |
 | `baked.py` | node | finds the Couchbase cookies and memcached password the images ship, by the SHA-256 that `lib.sh` lists (never the values) |
+| `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
+| `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
 
 ## What the repository's tests cover
 
 `tests/deploy/test_hpc_*.py` run the Couchbase guard against the stand-in, the password rules, a 3.8 parse of every
 Python file (the guard runs on the images' Python 3.8), the batch jobs' `--no-requeue` and `--time`, the shim's
 public ports against `ports.sh`, the hash check for the images' shipped Couchbase values (on a stand-in value), and, where `gcc` exists, the shim's build with every warning an error and its unit
-test (`tests/shim_unit.c`). The bundle's wider offline suite reads files copied out of the two pinned images
+test (`tests/shim_unit.c`), and the egress shim and collector against `tests/egress_probe.c` (where Unix sockets are
+allowed). The bundle's wider offline suite reads files copied out of the two pinned images
 (patch drift, the images' binaries under the shim) and is not in the repository; neither are those files.
