@@ -15,7 +15,9 @@ The order is fixed, and each step is decided by what a kill at that point must l
    wait for it before anything starts (outside the agent's clock), and is left only after the post-run check and the
    store's record, so what the post-run check sees is what the run left; refused (`InfraError`), the run is left
    unstarted and uses no attempt. Its wait can be long too, so once admitted the run **looks at the gates again**, as
-   after its lease: if one is closed now the admission is let go and the run stays pending, uncharged;
+   after its lease: if one is closed now the admission is let go and the run stays pending, uncharged. What the run's
+   pre-run check noted for its admission is in the try's note (`expcore.campaign.prerun`), open from step 1 to the end
+   of the try whenever a pre-run check is asked;
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
    under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26). From the
@@ -47,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign import liveness
+from expcore.campaign import liveness, prerun
 from expcore.campaign.attempts import classify, is_charged, unverified
 from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
@@ -137,7 +139,13 @@ class AttemptRunner:
         return self.p.schema.treatment_targets[self.p.schema.condition_named(factors, run_key)]
 
     def work(self, row: Any) -> float:
-        """Run one attempt of the row's run, end to end. Return the seconds before the run may start again."""
+        """Run one attempt of the row's run, end to end. Return the seconds before the run may start again. A try
+        that asks a pre-run check has a note of its own (`prerun`), which its check writes and its admission reads."""
+        with prerun.opened() if self.p.health is not None else contextlib.nullcontext():
+            return self._tried(row)
+
+    def _tried(self, row: Any) -> float:
+        """One try of the row's run, from the gates to the store (see the module docstring)."""
         p = self.p
         key, factors = row["run_key"], json.loads(row["factors"])
         if p.health is not None:
