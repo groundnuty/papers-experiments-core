@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fault_support import OUTAGE_TARGET, FakeServices, write_faults
@@ -26,6 +27,7 @@ from reset_lock_support import hold_and_fork, run_and_hang
 from shared_support import hold_and_die
 
 from expcore.errors import InfraError
+from expcore_onedata import resetgrant, resetshortcut
 from expcore_onedata.admission import (
     FEDERATION_LOCK,
     AdmissionRefused,
@@ -38,6 +40,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import _HELD, boot_id
 from expcore_onedata.faults import load_faults
+from expcore_onedata.occupancy import Listing
 from expcore_onedata.rangemap import PlacementSettings
 from expcore_onedata.resetgrant import (
     EXCLUSIVE,
@@ -45,10 +48,12 @@ from expcore_onedata.resetgrant import (
     HOLDER_GONE,
     NO_ADMISSION,
     OFF,
+    SHARES_RETAINED,
     UNAVAILABLE,
     exclusive,
+    federation_for,
 )
-from expcore_onedata.resetlock import FEDERATION_RESET, RESET_HOLDS
+from expcore_onedata.resetlock import FEDERATION_RESET, OUTSIDE_CAMPAIGN, RESET_HOLDS
 from expcore_onedata.shared_holds import SharedHolds
 from expcore_onedata.testing import write_platform
 from expcore_onedata.tool_admission import shared_admission
@@ -323,6 +328,92 @@ def test_o11_the_runs_share_of_the_federation_lock_is_held_throughout_the_shortc
         watcher.join(WAIT_S)
         tool.join(WAIT_S)
     assert got == [], "the run's share of federation.lock lapsed during its shortcut reset"
+
+
+def test_o11_a_worker_that_holds_a_share_keeps_the_shortcut_off_and_nothing_is_given_up(tmp_path):
+    """O11: a worker of the run that holds a share of its admission (a sandbox's start thread, a task reusing the
+    admission through a tool's hold) may be reading, which the section cannot rule out: no shortcut
+    (`shares_retained`), and the run's share of the reset lock is never given up."""
+    config, settings, lock = federation(tmp_path)
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        give_up = admission.retain()
+        with exclusive(config, shortcut()) as grant:
+            assert (grant.why, grant.shortcut, grant.mode) == (SHARES_RETAINED, False, None)
+            assert admission.reset.shared
+            assert not free(settings, FEDERATION_RESET)
+        give_up()
+
+
+def test_o11_no_worker_takes_a_share_while_a_section_is_held(tmp_path):
+    """O11: once the section is entered, the admission is sealed: no worker of the run takes a share, and nothing of the
+    run may act; both are open again once it ends."""
+    config, _, lock = federation(tmp_path)
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        with exclusive(config, shortcut()) as grant:
+            assert grant.shortcut
+            assert admission.try_retain() is None
+            assert not admission.may_act
+        give_up = admission.try_retain()
+        assert give_up is not None
+        give_up()
+        assert admission.may_act
+
+
+def test_o11_a_dead_holder_keeps_refusing_the_shortcut_for_its_quiet_window(tmp_path, monkeypatch):
+    """O11: what a dead holder left behind (a tool server in a session of its own, a read the provider still serves)
+    may outlive the section that found it: the next sections refuse the shortcut too, naming it, until
+    `DEAD_HOLDER_QUIET_S` has passed since it was found."""
+    config, _, lock = federation(tmp_path)
+    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(config.file), "a killed tool"))
+    child.start()
+    child.join(120)
+    with lock.held(exclusive=False, timeout_s=PROBE_S):
+        for _ in range(2):
+            with exclusive(config, shortcut()) as grant:
+                assert grant.why == HOLDER_GONE
+                assert [holder["pid"] for holder in grant.facts()["holders"]] == [child.pid]
+        monkeypatch.setattr(resetgrant, "DEAD_HOLDER_QUIET_S", 0.0)
+        with exclusive(config, shortcut()) as grant:
+            assert grant.shortcut
+
+
+def test_o11_a_live_process_whose_end_was_not_recorded_refuses_no_shortcut(tmp_path):
+    """O11: a line left open by a live process that let the lock go (its end could not be written) is ended as
+    `lock_free`, not `holder_gone`, and refuses no shortcut now or later."""
+    config, settings, lock = federation(tmp_path)
+    SharedHolds(settings.journal, name=RESET_HOLDS).begin(OUTSIDE_CAMPAIGN)  # this live process holds no lock
+    with lock.held(exclusive=False, timeout_s=PROBE_S):
+        for _ in range(2):
+            with exclusive(config, shortcut()) as grant:
+                assert grant.shortcut
+    first = reset_holds(settings)[0]
+    assert first["how"] == "lock_free"
+
+
+def test_o11_a_section_of_one_federation_stands_for_none_of_another(tmp_path):
+    """O11: a nested section for another federation's configuration is refused, not given the outer grant, and a
+    reading made in one federation's section gives the full reads to a reset of another (`other_federation`)."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    config_a, _, lock_a = federation(tmp_path / "a")
+    config_b, _, _ = federation(tmp_path / "b")
+    with lock_a.held(exclusive=False, timeout_s=PROBE_S), exclusive(config_a, shortcut()) as grant:
+        assert grant.shortcut
+        with pytest.raises(AdmissionRefused, match="another federation"), exclusive(config_b, shortcut()):
+            pass
+        reading = SimpleNamespace(grant=grant, read_epoch=1.0, scan=SimpleNamespace(listing=Listing()), held={})
+        assert resetshortcut.initial(shortcut(), reading, federation_for(config_b))["why"] == "other_federation"
+        assert resetshortcut.initial(shortcut(), reading, federation_for(config_a))["mode"] == "shortcut"
+
+
+def test_o11_a_health_check_in_the_resetting_runs_own_context_is_deferred(tmp_path):
+    """O11: a health check that inherits the resetting run's admission (a task of the run) reads a study's file, so it
+    is deferred, uncharged, while the run's own section holds the federation."""
+    config, settings, lock = federation(tmp_path)
+    with lock.held(exclusive=False, timeout_s=PROBE_S), exclusive(config, shortcut()) as grant:
+        assert grant.shortcut
+        health = FaultGate(settings, FakeServices())()
+        assert (health.ok, health.deferred, health.charge) == (False, True, False), health.detail
 
 
 def test_o11_a_health_check_during_a_shortcut_reset_is_deferred_uncharged_and_passes_after_it(tmp_path):

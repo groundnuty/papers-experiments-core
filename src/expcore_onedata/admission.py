@@ -79,8 +79,10 @@ neither holds what the other waits for, one is granted, and the other's wait is 
 windows the shortcut must not have: **an outage run never gets in during it**, since the resetting run's share of
 `federation.lock`, which the exclusive admission conflicts with, is never let go (so it never lapses either); **no other
 run's agent, no tool and no health check acts during it**, since each acts only under its share of `federation.reset`,
-which conflicts with the exclusive hold, and the resetting run's own infrastructure is refused while its share is given
-up (`require_admission`, `require_reset_share`); a health check that meets the hold is deferred, uncharged.
+which conflicts with the exclusive hold; and nothing of the resetting run's own does, since the section seals its
+admission (`seal`: granted only while no worker holds a share, and no worker takes one until it ends) and refuses its
+infrastructure (`require_admission`, `require_reset_share`, `may_act`); a health check that meets the hold, or runs
+in the resetting run's own context, is deferred, uncharged.
 
 **No lock outlives its holder.** The kernel drops a dead process's flocks. Every lock file is opened `O_CLOEXEC`, so an
 exec'd child never inherits one, and every held lock is a `HeldLock`, which the fork hook closes in a forked child
@@ -89,8 +91,9 @@ server never holds a lock: the attempt holds it for it. The MCP client starts th
 (`start_new_session`), so it survives its parent's death; `PR_SET_PDEATHSIG` is not set, since the client gives no hook
 to set it, it would reach only the direct child (a configured launcher such as `uv run` leaves the server a
 grandchild), and it would fire with the forking thread rather than the process. Instead a shortcut reset that finds a
-holder line whose process is gone takes no shortcut (`resetgrant.HOLDER_GONE`): a read it sent may still be placing
-bytes, and a server it started may still run.
+holder line whose process is gone takes no shortcut (`resetgrant.HOLDER_GONE`), and neither does any for
+`resetgrant.DEAD_HOLDER_QUIET_S` after: a read it sent may still be placing bytes, and a server it started may still
+run.
 """
 
 import asyncio
@@ -163,6 +166,7 @@ class _Shares:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.count, self.owner_left = 1, False
+        self.sealed = False  # a shortcut reset's section: no worker may take a share, and nothing of the run may act
 
 
 @dataclass(frozen=True)
@@ -191,16 +195,32 @@ class Admission:
 
     @property
     def may_act(self) -> bool:
-        """Whether the holder may act on the federation: held, and, shared, with its share of the reset lock held, not
-        given up for its own shortcut reset (`resetlock.py`)."""
-        return self.held and (self.reset is None or self.reset.shared)
+        """Whether the holder may act on the federation: held, not sealed for its own shortcut reset (`seal`), and,
+        shared, with its share of the reset lock held, not given up for that reset (`resetlock.py`)."""
+        return self.held and not self.shares.sealed and (self.reset is None or self.reset.shared)
+
+    def seal(self) -> bool:
+        """For a shortcut reset's section (`resetgrant.py`): refuse every worker a share from now on, and return True,
+        when the admission is held and no worker holds a share (its owner's alone); else False, sealing nothing. A
+        worker that already holds a share may be reading, which the section must rule out."""
+        with self.shares.lock:
+            if not self.held or self.shares.count != 1 or self.shares.sealed:
+                return False
+            self.shares.sealed = True
+            return True
+
+    def unseal(self) -> None:
+        """End the section's seal: workers may take shares again."""
+        with self.shares.lock:
+            self.shares.sealed = False
 
     def try_retain(self) -> Callable[[], None] | None:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
         counts), or None when there is no share to take: the admission is no longer held, or its last share is already
-        given up and its release is under way, so it cannot be kept for the worker (a tool reusing it refuses then)."""
+        given up and its release is under way, or a shortcut reset's section has sealed it (`seal`), so it cannot be
+        kept for the worker (a tool reusing it refuses then)."""
         with self.shares.lock:
-            if not self.held or self.shares.count == 0:
+            if not self.held or self.shares.count == 0 or self.shares.sealed:
                 return None
             self.shares.count += 1
         once = threading.Lock()  # never released: the first non-blocking acquire, in any thread, is the one that counts
@@ -678,11 +698,11 @@ def require_admission(config: PlatformConfig) -> None:
 
 
 def require_reset_share(admission: Admission) -> None:
-    """Refuse to act under a shared admission whose share of the reset lock is not held: given up for its own shortcut
-    reset, or not taken back after it (`resetlock.py`). Nothing of the run may then reach the federation, since a reset
-    that holds the lock exclusively counts on no reader placing bytes."""
+    """Refuse to act under an admission its own shortcut reset holds (`Admission.may_act`): sealed for the reset's
+    section, or, shared, with its share of the reset lock given up for it or not taken back after it (`resetlock.py`).
+    Nothing of the run may then reach the federation, since the reset counts on no reader placing bytes."""
     if not admission.may_act:
         raise AdmissionRefused(
-            "the run's share of the reset lock is given up for a shortcut reset, or was not taken back after it: "
-            "nothing of the run may act on the federation until it is held again"
+            "the run's own shortcut reset holds the federation (its share of the reset lock is given up, or was not "
+            "taken back after it): nothing of the run may act on the federation until the reset has ended"
         )

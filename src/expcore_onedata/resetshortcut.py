@@ -36,6 +36,7 @@ from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
 from expcore_onedata import consistency
+from expcore_onedata.admission import Federation
 from expcore_onedata.client import PlatformError
 from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import ProvisionError
@@ -47,14 +48,15 @@ if TYPE_CHECKING:  # the reset imports this module; only the interfaces are used
     from expcore_onedata.resetplan import Holdings
 
 SHORTCUT, FULL = "shortcut", "full"  # the mode of the occupancy and quiet stages' reads
-OFF, NOT_PLANNED, OUTSIDE_GRANT = "off", "not_planned", "outside_grant"
+OFF, NOT_PLANNED, OUTSIDE_GRANT, OTHER_FEDERATION = "off", "not_planned", "outside_grant", "other_federation"
 GRANT_LAPSED, NOT_ON_A_FILE, TRANSFERS_UNREAD = "grant_lapsed", "transfer_not_on_a_file", "transfers_unread"
 UNREAD = (Unreadable, PlatformError, consistency.WaitTimeout)  # a walk that cannot be read: the full reads
 
 
-def initial(settings: PlacementSettings, planned: "Holdings | None") -> dict[str, Any]:
+def initial(settings: PlacementSettings, planned: "Holdings | None", federation: Federation | None) -> dict[str, Any]:
     """The mode a reset starts with, and the record of it: the shortcut only with the setting on and a planner's reading
-    made inside an exclusive section that still holds (`resetgrant.ResetGrant.shortcut`)."""
+    made inside an exclusive section of this reset's `federation` that still holds (`resetgrant.ResetGrant.shortcut`);
+    a section of another federation's lock excludes none of this one's readers (`other_federation`)."""
     grant = None if planned is None else planned.grant
     reads: dict[str, Any] = {
         "mode": FULL,
@@ -70,6 +72,8 @@ def initial(settings: PlacementSettings, planned: "Holdings | None") -> dict[str
         reads["why"] = OUTSIDE_GRANT
     elif grant.why is not None:
         reads["why"] = grant.why
+    elif not grant.is_for(federation):
+        reads["why"] = OTHER_FEDERATION
     elif not grant.held:
         reads["why"] = OUTSIDE_GRANT
     else:

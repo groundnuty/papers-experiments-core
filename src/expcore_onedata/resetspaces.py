@@ -66,7 +66,7 @@ from typing import Any
 from expcore_onedata import consistency, occupancy, resetheld, resetshortcut
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, SpaceReset
-from expcore_onedata.resetgrant import ResetGrant
+from expcore_onedata.resetgrant import ResetGrant, federation_for
 from expcore_onedata.resetplan import Holdings, given_scan
 
 
@@ -127,7 +127,7 @@ class _Space:
             # the shortcut (`resetshortcut.py`): the planner's reading, the reads' mode and its record, the jobs the
             # transfers stage cancelled and when it ended, and the ids the occupancy reads (None: every listed file)
             "planned": plan.planned,
-            "reads": resetshortcut.initial(self.p.settings, plan.planned),
+            "reads": resetshortcut.initial(self.p.settings, plan.planned, federation_for(self.p.config)),
             "cancelled": set(),
             "transfers_at": None,
             "only": None,
