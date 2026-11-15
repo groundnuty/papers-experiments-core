@@ -225,8 +225,9 @@ async def _in_counted_thread(config: PlatformConfig, what: str, check: Callable[
     """Run one of the plane's checks (`what`, in words), which examine the run's token and read Onezone, in a worker
     thread that, for its whole life, is counted as the tool server's step on the run's admission
     (`admission.begin_token_step`) and holds a share of that admission (`admission_share.ThreadShare`). Both are taken
-    here, before the thread exists, and the thread gives both up when the check ends, on success or an exception, the
-    share last; a thread that never began has its share given up when its task is done.
+    here, before the thread exists, the share first, so the admission the count is taken on stays held, and the
+    thread gives both up when the check ends, on success or an exception, the share last; a thread that never began
+    has its share given up when its task is done.
 
     On a platform with `[faults]` a check is refused before its thread starts, holding nothing, when the run's admission
     is not held or no share of it can be taken (it is being let go, or the run's shortcut section has sealed it):
@@ -235,13 +236,18 @@ async def _in_counted_thread(config: PlatformConfig, what: str, check: Callable[
     token (O35), and the federation stays held until it has ended (O11); the thread's failure is then never
     unretrieved. A thread the event loop's shutdown kept from ever starting leaves the count open, so the restore fails
     closed. Without `[faults]` there is no admission: nothing is counted, shared or refused."""
-    end = begin_token_step(TOOL_SERVER_STEP, config, what)
-    admission = current_admission()
-    give_up = admission.try_retain() if admission is not None else (lambda: None)
-    if give_up is None:  # held, but being let go or sealed: no share for the thread, so it never starts
+    admission = current_admission()  # read once: the share is taken from it before the count, so it stays held
+    give_up = admission.try_retain() if admission is not None else None
+    try:  # refuses when the run's admission is not held, and then any share taken is given back
+        end = begin_token_step(TOOL_SERVER_STEP, config, what)
+    except BaseException:
+        if give_up is not None:
+            give_up()
+        raise
+    if admission is not None and give_up is None:  # held, but being let go or sealed: no share, so it never starts
         end()
         raise TokenStepRefused(config, TOOL_SERVER_STEP, what)
-    share = ThreadShare(give_up)  # the thread, not this coroutine, lets the federation go (O11)
+    share = ThreadShare(give_up or (lambda: None))  # the thread, not this coroutine, lets the federation go (O11)
 
     def work() -> None:
         if not share.begin():  # its share was given up for it already: the check never runs
