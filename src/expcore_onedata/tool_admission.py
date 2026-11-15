@@ -13,8 +13,10 @@ It takes the same lock a campaign attempt takes, shared, so tools and attempts h
 outage run, which needs it exclusively, never overlaps one; and the same turnstile, so a stream of tools cannot keep an
 outage run out for ever. What it does around that:
 
-- **It waits for an outage run in progress, within a bound** (`timeout_s`, by default `[faults] admission_timeout_s`;
-  `timeout_s=0` tries once), and past the bound is refused as `FederationBusy`, the hold `federation_busy`.
+- **It waits for an outage run in progress, and for its session drain, within a bound** (`timeout_s`, by default
+  `[faults] admission_timeout_s`; `timeout_s=0` tries once), and past the bound is refused as `FederationBusy`, the
+  hold `federation_busy`, which charges nothing: it is admitted through `FederationLock.held` (`admitted`), the path a
+  campaign run takes, so it meets the same lock, turnstile, journal check and drain record (`federation.drain`).
 - **It is refused, under the lock, when the federation is not in its baseline state:** an injection the fault journal
   holds open (a provider may be down), a fault journal or a record of the tools' holds that cannot be read, and, for
   the `ingest_journals` it is given, a preallocated ingest's baseline that is not whole
@@ -38,7 +40,9 @@ must outlive the body takes a share first (`expcore_onedata.admission.retain_adm
 threads do) and gives it up when it ends; the lock, and the record's end, wait for it. A `with` inside a hold of the
 same federation, shared (a warm-up that a smoke driver calls), uses that hold and records nothing more, taking a
 share of it for as long as it lasts, so a task that inherited the owner's context and outlives the owner keeps the
-federation held; inside an exclusive one, or one of another federation, it is `AdmissionRefused`. A platform without
+federation held. It is checked as any admission is once it holds the lock (`FederationLock.require_open`): an open
+injection refuses it, and it waits for a drain recorded since the outer hold began, within its own bound. Inside an
+exclusive admission, or one of another federation, it is `AdmissionRefused`. A platform without
 `[faults]` has no injector and no lock: the tool is admitted with no admission (`None`), its ingest journals still
 checked.
 
@@ -46,8 +50,10 @@ checked.
 cancellation, and `waits` (a timer or a call context) marks it a `lease_queue` wait as for a run.
 """
 
+import asyncio
 import contextlib
 import math
+import threading
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,6 +141,25 @@ def _begin(plan: _Plan, settings: FaultSettings, admission: Admission) -> None:
     admission.endings.append(lambda: holds.end(token))
 
 
+async def _require_open_async(
+    lock: FederationLock, share: Callable[[], None], timeout_s: float | None, waits: Any
+) -> None:
+    """`FederationLock.require_open` off the event loop, inside `waits` (a `lease_queue` wait) when given; a
+    cancellation, or anything else that ends the wait, stops it and gives the share up (only the first give-up
+    counts)."""
+    cancel = threading.Event()
+    try:
+        if waits is None:
+            await asyncio.to_thread(lock.require_open, share, timeout_s, cancel)
+        else:
+            async with waits.infrastructure_wait("lease_queue"):
+                await asyncio.to_thread(lock.require_open, share, timeout_s, cancel)
+    except BaseException:
+        cancel.set()
+        share()
+        raise
+
+
 @contextlib.contextmanager
 def shared_admission(
     config: PlatformConfig,
@@ -147,9 +172,10 @@ def shared_admission(
     (see the module docstring). `reason` is the tool's own words, one printable line of at most 200 characters, which
     goes into the record and nowhere else. Yields the admission, or None for a platform without `[faults]`.
 
-    Raises `ValueError` for a reason or a bound that is not valid, `FederationBusy` when an outage run held the
-    federation past the bound, `InfraError` of kind `injector_failure` when it is refused, `AdmissionRefused` inside
-    an exclusive admission or one of another federation."""
+    Raises `ValueError` for a reason or a bound that is not valid, `FederationBusy` (kind `federation_busy`) when an
+    outage run held the federation, or its session drain kept it closed, past the bound, `InfraError` of kind
+    `injector_failure` when it is refused, `AdmissionRefused` inside an exclusive admission or one of another
+    federation."""
     plan = _plan(config, reason, timeout_s, ingest_journals)
     settings = plan.settings
     if settings is None:
@@ -160,6 +186,7 @@ def shared_admission(
     reused = _reusable(plan, lock)
     if reused is not None:
         admission, share = reused
+        lock.require_open(share, plan.timeout_s)  # as any admission: no open injection, and the drain waited out
         try:
             yield admission
         finally:
@@ -191,6 +218,7 @@ async def shared_admission_async(
     reused = _reusable(plan, lock)
     if reused is not None:
         admission, share = reused
+        await _require_open_async(lock, share, plan.timeout_s, waits)
         try:
             yield admission
         finally:

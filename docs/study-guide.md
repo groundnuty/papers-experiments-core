@@ -891,7 +891,7 @@ with shared_admission(smoke_config, reason="smoke: warm-up of the first space", 
     # start the sandbox and the tool server here, read, write: both accept this admission as a run's
 ```
 
-- It waits for an outage run in progress, at most `timeout_s` (`[faults] admission_timeout_s` when you pass none; `0` tries once), then raises `FederationBusy`.
+- It waits for an outage run in progress, its restore, heal and session drain included (below), at most `timeout_s` (`[faults] admission_timeout_s` when you pass none; `0` tries once), then raises `FederationBusy`, of kind `federation_busy`: the same uncharged hold a campaign run's wait ends in.
 - It refuses, naming why, while an injection is open or the fault journal cannot be read, so a tool never starts on a federation with a provider down. Pass `ingest_journals=[...]`, the journals of the preallocated ingests, and it also refuses while a baseline is not whole or a live run is resetting it.
 - It releases when the block ends, on an exception too, and the kernel drops it with a tool that dies. Everything the tool does on the federation belongs inside the block: a thread or a subprocess that outlives it is not held back from an outage, and a worker that must outlive it takes `retain_admission()` first and gives it up when it ends.
 - A warm-up that a smoke driver calls inside its own block takes none of its own: it uses the driver's. A driver in an event loop uses `shared_admission_async`. On a platform without `[faults]` it yields `None`.

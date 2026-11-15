@@ -217,9 +217,9 @@ class Admission:
 
     def try_retain(self) -> Callable[[], None] | None:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
-        counts), or None when there is no share to take: the admission is no longer held, or its last share is already
-        given up and its release is under way, or a shortcut reset's section has sealed it (`seal`), so it cannot be
-        kept for the worker (a tool reusing it refuses then)."""
+        counts, in any thread), or None when there is no share to take: the admission is no longer held, or its last
+        share is already given up and its release is under way, or a shortcut reset's section has sealed it (`seal`),
+        so it cannot be kept for the worker (a tool reusing it refuses then)."""
         with self.shares.lock:
             if not self.held or self.shares.count == 0 or self.shares.sealed:
                 return None
@@ -268,13 +268,13 @@ class Admission:
         whatever mode it is held, then the main lock, the reverse of the order they were taken in. A forked child's copy
         of the admission holds nothing (the fork hook closed its descriptors), so it ends and clears nothing of its
         parent's."""
-        owned = self.held
         try:
-            if self.drain is not None and owned:
+            if self.drain is not None and self.held:
                 self.drain.close_out()
         except BaseException:
             _STRANDED.append(self.lock)  # a held lock is closed by its finalizer once nothing refers to it
             raise
+        owned = self.held
         try:
             if owned:
                 for ending in reversed(self.endings):
@@ -611,6 +611,20 @@ class FederationLock:
         finally:
             _ADMISSION.reset(token)
             await _close_off_the_loop(admission)
+
+    def require_open(
+        self, release: Callable[[], None], timeout_s: float | None, cancel: threading.Event | None = None
+    ) -> None:
+        """What every admission checks once it holds the lock, for a use of one already held (a tool reusing its
+        context's, `expcore_onedata.tool_admission`): the journal holds no unsettled injection, and the drain record
+        has passed, waited for at most `timeout_s` (`FederationBusy`, the hold `federation_busy`, when it runs out).
+        `release` is called when either refuses."""
+        try:
+            self._require_settled()
+        except BaseException:
+            release()
+            raise
+        self._await_drain(release, None if timeout_s is None else time.monotonic() + timeout_s, cancel)
 
     def _require_settled(self) -> None:
         """Under the lock: refuse the run while the journal holds an unsettled injection, or cannot be read."""
