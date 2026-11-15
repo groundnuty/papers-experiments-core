@@ -106,14 +106,22 @@ class FaultGate:
             held = current_admission()
             if held is not None:  # a run's own post-run check, under its admission: no injection but its own can start
                 require_same_federation(held, self._lock.federation)
-                if not held.may_act:  # its own shortcut reset holds the federation: the check reads a study's file
+                # a share held for the whole check, so no shortcut section of the run can seal the admission while the
+                # check reads a study's file; none to take, or one that may not act, is the run's own reset holding it
+                share = held.try_retain()
+                if share is None or not held.may_act:
+                    if share is not None:
+                        share()
                     return Health(
                         False,
                         "the run's own shortcut reset holds the federation's reset lock: the check waits for it",
                         deferred=True,
                         charge=False,
                     )
-                return self._checked()
+                try:
+                    return self._checked()
+                finally:
+                    share()
             if self._recovery.entries() and self._may_recover:
                 exclusive = self._lock.try_acquire(exclusive=True, purpose=RECOVERY)
                 if exclusive is not None:  # no run is on the federation: settle what is left

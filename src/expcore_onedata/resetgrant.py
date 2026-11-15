@@ -211,20 +211,24 @@ def _sealed(
     assert share is not None  # a shared admission's, checked by `_take`
     began = time.monotonic()
     share.give_up()
-    try:
+    holders: list[dict[str, Any]] | None = None
+    epoch, why, gone = None, None, []
+    try:  # until the grant exists: the wait, and the record of the holders read (and settled, once held)
         granted = _wait(share, settings.reset_exclusive_wait_s)
-    except BaseException:  # an interrupt: the run must not be left without its share
+        waited = time.monotonic() - began
+        if granted:
+            epoch = share.exclusive_epoch()
+            why, gone = _settled(holds)
+        else:
+            holders = _holders(holds)
+    except BaseException:  # an interrupt: no exclusive hold outlives it, and the run must not be left without its share
         share.end_exclusive()
         share.take_shared()
         raise
-    waited = time.monotonic() - began
     if not granted:
-        holders = _holders(holds)
         share.take_shared()
         why = UNAVAILABLE if holders is not None else HOLDERS_UNREAD
         return ResetGrant(why, None, waited, holders or [], federation=federation)
-    epoch = share.exclusive_epoch()
-    why, gone = _settled(holds)
     if why is not None:
         share.end_exclusive()
         share.take_shared()

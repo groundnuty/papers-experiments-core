@@ -316,6 +316,30 @@ def retain_admission() -> Callable[[], None]:
     return admission.retain() if admission is not None else (lambda: None)
 
 
+def retain_to_act() -> Callable[[], None]:
+    """A share of the running context's admission for work that acts on the federation and must not start without it
+    (a sandbox's start, from its admission check until its start thread holds a share of its own): `retain_admission`,
+    but `AdmissionRefused`, keeping no share, when the context holds an admission of which no share can be taken (it is
+    being given up, or the run's shortcut section has sealed it) or which may not act (`require_reset_share`). Held,
+    the share keeps any shortcut section of the run from beginning (`Admission.seal`). A call that gives up nothing
+    when the context holds no admission."""
+    admission = current_admission()
+    if admission is None:
+        return lambda: None
+    share = admission.try_retain()
+    if share is None:
+        raise AdmissionRefused(
+            "the run's admission is being given up, or its own shortcut reset holds the federation: nothing may start "
+            "under it until the reset has ended"
+        )
+    try:
+        require_reset_share(admission)
+    except BaseException:
+        share()
+        raise
+    return share
+
+
 class FederationLock:
     """The reader-writer lock of one federation, on `federation.lock` in the fault journal's directory of `[faults]`;
     each admission it grants names that federation (`Federation`)."""

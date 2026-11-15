@@ -27,6 +27,7 @@ from reset_lock_support import hold_and_fork, run_and_hang
 from shared_support import hold_and_die
 
 import expcore_onedata.admission as admission_module
+from expcore.campaign.healthgate import Health
 from expcore.errors import InfraError
 from expcore_onedata import resetgrant, resetshortcut
 from expcore_onedata.admission import (
@@ -36,6 +37,7 @@ from expcore_onedata.admission import (
     FederationLock,
     current_admission,
     require_admission,
+    retain_to_act,
 )
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
@@ -435,6 +437,67 @@ def test_o11_a_health_check_in_the_resetting_runs_own_context_is_deferred(tmp_pa
         assert grant.shortcut
         health = FaultGate(settings, FakeServices())()
         assert (health.ok, health.deferred, health.charge) == (False, True, False), health.detail
+
+
+def test_o11_a_health_check_in_the_runs_own_context_holds_a_share_so_no_section_begins_while_it_reads(tmp_path):
+    """O11: a health check that inherits the run's admission (a thread or task of the run) holds a share of it for as
+    long as it reads, so the run's own shortcut section, which seals the admission only while no worker holds a share,
+    cannot begin while the check reads a study's file; the share is given back once the check has answered."""
+    _, settings, lock = federation(tmp_path)
+    sealed: list[bool] = []
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+
+        def reading():
+            sealed.append(admission.seal())
+            return Health(True, "read")
+
+        health = FaultGate(settings, FakeServices(), reading)()
+        assert health.ok, health.detail
+        assert sealed == [False]
+        assert admission.seal() is True  # the check's share is given back
+        admission.unseal()
+
+
+def test_o11_a_start_under_the_runs_admission_is_refused_while_a_section_holds_it_or_its_share_is_given_up(tmp_path):
+    """O11: a start that acts on the federation (a sandbox's) takes a share of the run's admission it must have: it is
+    refused while the run's section seals the admission, and while the run's share of the reset lock is given up after
+    the section, and a refused start keeps no share."""
+    config, _, lock = federation(tmp_path)
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        with exclusive(config, shortcut()) as grant:
+            assert grant.shortcut
+            with pytest.raises(AdmissionRefused, match="reset"):
+                retain_to_act()
+        admission.reset.give_up()  # a share that was not taken back after a section; the admission is unsealed
+        with pytest.raises(AdmissionRefused, match="reset"):
+            retain_to_act()
+        assert admission.seal() is True  # the refused start gave its share back
+        admission.unseal()
+    assert retain_to_act()() is None  # no admission in the context: nothing to hold
+
+
+def test_o11_an_interrupt_while_the_section_reads_its_holders_lets_the_exclusive_hold_go_and_takes_the_share_back(
+    tmp_path, monkeypatch
+):
+    """O11: an interrupt after the exclusive hold is taken and before the grant exists (while the record of the holders
+    is read and settled) lets the exclusive hold go and takes the run's share back: no reader is kept out and the run
+    may act."""
+    config, settings, lock = federation(tmp_path)
+
+    def interrupted(holds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(resetgrant, "_settled", interrupted)
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        with pytest.raises(KeyboardInterrupt), exclusive(config, shortcut()):
+            pass
+        assert admission.reset.shared
+        assert admission.may_act
+        descriptor = os.open(Path(settings.journal) / FEDERATION_RESET, os.O_RDWR | os.O_CLOEXEC)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)  # BlockingIOError while it is held exclusively
+        finally:
+            os.close(descriptor)
 
 
 def test_o11_a_health_check_during_a_shortcut_reset_is_deferred_uncharged_and_passes_after_it(tmp_path):
