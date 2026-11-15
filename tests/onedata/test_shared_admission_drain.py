@@ -182,3 +182,25 @@ def test_o48_a_nested_async_tool_waits_out_a_drain_recorded_since_the_outer_hold
     busy, shares = asyncio.run(drive())
     assert busy.kind == FEDERATION_BUSY
     assert shares == 1
+
+
+def test_o48_a_nested_async_tool_whose_wait_cannot_start_gives_its_share_back(tmp_path, monkeypatch):
+    """O48: a nested async hold whose check cannot even start (the event loop's executor refuses it) gives back the
+    share it took, so the outer hold still lets the federation go when its owner leaves."""
+    config, _settings = federation(tmp_path)
+
+    async def refused_thread(*_args, **_kwargs):
+        raise RuntimeError("the executor is shut down")
+
+    async def drive():
+        async with shared_admission_async(config, reason=REASON, timeout_s=WAIT_S) as outer:
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "to_thread", refused_thread)
+                with pytest.raises(RuntimeError):
+                    async with shared_admission_async(config, reason=REASON, timeout_s=PROBE_S):
+                        raise AssertionError("a nested tool was admitted without its check")
+            return outer, outer.shares.count
+
+    outer, shares = asyncio.run(drive())
+    assert shares == 1
+    assert not outer.held

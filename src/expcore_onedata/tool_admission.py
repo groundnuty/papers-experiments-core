@@ -140,7 +140,8 @@ async def _require_open_async(
     lock: FederationLock, share: Callable[[], None], timeout_s: float | None, waits: Any
 ) -> None:
     """`FederationLock.require_open` off the event loop, inside `waits` (a `lease_queue` wait) when given; a
-    cancellation stops the wait and gives the share up."""
+    cancellation, or anything else that ends the wait, stops it and gives the share up (only the first give-up
+    counts)."""
     cancel = threading.Event()
     try:
         if waits is None:
@@ -148,7 +149,7 @@ async def _require_open_async(
         else:
             async with waits.infrastructure_wait("lease_queue"):
                 await asyncio.to_thread(lock.require_open, share, timeout_s, cancel)
-    except asyncio.CancelledError:
+    except BaseException:
         cancel.set()
         share()
         raise
