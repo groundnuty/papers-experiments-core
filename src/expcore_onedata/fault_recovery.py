@@ -92,23 +92,18 @@ class FaultDriver(Protocol):
 
 log = logging.getLogger(__name__)
 
+RESTORED = ("restored", "found_restored")  # how a settling ends when a provider that went down is verified back
+
 _WORD = re.compile(r"[A-Za-z_]{1,40}")  # how a settling ended, as a word: nothing else goes into a message
-RUN_NOT_STOPPED = "run_not_stopped"  # a restore the injector did not start: a step using the run's tokens still ran
-_NOT_STARTED = {  # how a restore that was never started ended, in words: nothing of the provider was checked
-    RUN_NOT_STOPPED: (
-        "the restore was not started, since a step of the run that uses its tokens (its tool server or its sandbox) "
-        "still ran, and a heal could outlast the token that step examines: stop both before FaultInjector.running's "
-        "exit, or declare [tokens] margin_s of at least heal_token_margin_s"
-    ),
-}
 _TRIED = re.compile(r"[A-Za-z_ ,()\[\]0-9]{1,2000}")  # the heal's actions: words and provider labels, nothing else
 
 _WHY = {  # how a settling failed, in words, where the bare word would not say it
     "serves_unconfigured": "its service has no provider declared in [faults.services], so no read can show it serving",
-    "links_stuck": (
-        "it serves, but a provider link transferred no probe within the link check's bound (O35), and no heal of "
-        "[faults] mended it: restart the rtransfer link of the stuck pair's reader (rtransfer_config:restart_link()), "
-        "or that reader's container alone"
+    "links_stuck": (  # the link check tests every ordered pair, so the stuck link need not be the restored provider's
+        "it serves, but the link check (O35) found a pair of providers that transferred no probe within its bound, "
+        "and no heal of [faults] mended it: restart the rtransfer link on the reading provider each failed pair names "
+        "(rtransfer_config:restart_link() in its op-worker) or that provider's container alone (docker restart, never "
+        "a compose down), one at a time, re-checking every pair after each"
     ),
     "sessions_not_ready": (
         "it serves, but its peers did not show their sessions to it ready within gate_timeout_s (O35), so its links "
@@ -161,7 +156,7 @@ class RestoreNotVerified(InfraError):
         self.how = how if _WORD.fullmatch(how) else "failed"
         self.identity_changed, self.serving, self.still_open = identity_changed, serving, still_open
         self.tried = tried if tried is not None and _TRIED.fullmatch(tried) else None
-        checked = _NOT_STARTED.get(self.how) or (
+        checked = (
             f"its identity {'changed' if identity_changed else 'did not change to a running one'} and it "
             f"{'served' if serving else 'did not serve'}"
         )
@@ -187,9 +182,15 @@ class Recovery(LinkSettling):
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         labels: Mapping[str, str] | None = None,
+        wall: Callable[[], float] = time.time,
+        heal_skip: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> None:
-        """`labels` maps each provider's label to its service, which the heal needs to act on a reader by its label."""
+        """`labels` maps each provider's label to its service, which the heal needs to act on a reader by its label;
+        `wall` is the clock a settle is journalled on, which every process shares; `heal_skip`, asked at a heal's start,
+        says why the heal must be skipped (`FaultInjector._heal_skipped`: a step of the run that uses its tokens still
+        runs), or None to let it run."""
         self._settings, self._driver, self._clock, self._sleep = settings, driver, clock, sleep
+        self._wall, self._heal_skip = wall, heal_skip
         self.journal = InjectionJournal(settings.journal)
         self.last: Observation | None = None  # the latest reading `wait` took
         self.unreadable = 0  # the readings of the latest `wait` that failed and counted as no answer
@@ -198,6 +199,7 @@ class Recovery(LinkSettling):
         self._labels = dict(labels or {})
         self._deadline: float | None = None  # while a heal's container restart runs: the clock time it must end by
         self._quiet_until: float | None = None  # the end of the latest settle a heal held: no gate read or check before
+        self._waited_wall = 0.0  # the latest journalled settle (wall clock) this recovery has waited for or set itself
         self._healed: set[str] = set()  # the injections this recovery healed once already: never twice
 
     def entries(self, target: str | None = None) -> list[dict[str, Any]]:
@@ -209,18 +211,29 @@ class Recovery(LinkSettling):
         except OSError as error:  # an OS error's text holds the journal's path: only its type is told (O12)
             raise failure(f"the injection journal cannot be read ({type(error).__name__})", target) from None
 
-    def recover(self, on_step: Callable[..., None] | None = None, *, heal: bool = False) -> list[str]:
+    def recover(
+        self,
+        on_step: Callable[..., None] | None = None,
+        *,
+        heal: bool = False,
+        before: Callable[[list[dict[str, Any]]], None] | None = None,
+    ) -> list[str]:
         """Settle every open injection whose target's lock is free; raise InfraError of kind `injector_failure` when one
         cannot be settled or its lock is stuck. Return the targets of those live injectors hold, sorted. `heal` lets a
         stuck link be healed, which only a caller holding the federation exclusively may ask for.
 
         `on_step("recovered", ok, target=..., how=..., ...)` is told of every injection it settled or failed to, with
         the seconds the restored service took to serve (`ready_after_s`) and the gate's and the heal's records.
+        `before(entries)` is called once with the open injections it has just read, when there are any, and before it
+        settles one: whatever must be done before something is restored is done for exactly what it will settle.
         """
         step = on_step or (lambda *args, **kwargs: None)
         held: list[str] = []
         # a heal's container restart of a reader first: while it is down, the injection it healed cannot pass its gate
-        for entry in sorted(self.entries(), key=lambda entry: entry.get("heal") is not True):
+        open_entries = self.entries()
+        if before is not None and open_entries:
+            before(open_entries)
+        for entry in sorted(open_entries, key=lambda entry: entry.get("heal") is not True):
             target = entry["target"]
             lock = self.journal.try_lock(target)
             if lock is None:
@@ -244,9 +257,20 @@ class Recovery(LinkSettling):
                 **record,
             )
             if not done:
-                why = _WHY.get(how, how)
+                why = self._why(how)
                 raise failure(f"an injection of {target} that an earlier run left open was not cleared ({why})", target)
         return sorted(set(held))
+
+    def _why(self, how: str) -> str:
+        """How a settling failed, in words. A stuck link adds what the link check found, which names each failed pair's
+        reading provider by position (`links_detail` is set by the settling that just ended with `links_stuck`, so it is
+        used for that word alone, never for another failure's message): the check's own detail, or, after a heal that
+        left a pair failing, why the heal ended and each pair its last check found failing, by reader
+        (`LinkSettling._heal`)."""
+        why = _WHY.get(how, how)
+        if how == "links_stuck" and self.links_detail:
+            why = f"{why}; the link check found: {self.links_detail}"
+        return why
 
     def settle(
         self, entry: Mapping[str, Any], *, heal: bool = False, links: bool = True, clear: bool = True

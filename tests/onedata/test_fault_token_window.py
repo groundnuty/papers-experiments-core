@@ -1,14 +1,14 @@
-"""O35, O06: no step that uses the run's token runs after a heal the token may not outlive.
+"""O35, O06: no heal runs while a step that uses the run's token may need it after the heal.
 
 The tool server's stop re-verifies the tool plane and examines the run's token, which must then be unexpired
-(`toolserver._recheck`); a heal takes up to `heal_timeout_s`. So the injector checks at the start of its restore, and of
-its start's recovery, that every step of the run that uses its tokens (the tool server's launch, to the end of that
-re-verification, and the sandbox's, to the end of its stop) has ended: each launch notes its step on the run's
-admission. The documented executor runs the agent's launches inside `FaultInjector.running`, so they have ended when
-its exit restores, and no longer margin is needed. A restore that would begin while one still runs is not started, and
-the run is set aside, never scored, unless platform.toml declares the long margin (`[tokens] margin_s` at least
-`heal_token_margin_s`: 900 s plus two heals), which proceeds as before. The tests run each order on fakes, with the
-token's wall clock moved by each phase.
+(`toolserver._recheck`); a heal takes up to `heal_timeout_s`. So the restore always runs (its container start and its
+session gate use no run token), and at the start of a heal, the restore's or the start's recovery's, the injector reads
+the steps of the run that use its tokens (the tool server's launch, to the end of that re-verification, and the
+sandbox's, to the end of its stop), which each launch counts on the run's admission. With one still running and no long
+margin declared, the heal is skipped and the reading says why; a pair that stays stuck leaves the restore unverified,
+never scored, for a later start with no step running to heal. An executor that stops both before the restore heals
+with the default margin. At load, the margin must outlive the restore and its gate. The tests run each order on fakes,
+with the token's wall clock moved by each phase.
 """
 
 import asyncio
@@ -28,6 +28,7 @@ from record_support import record_run
 from expcore.campaign.attempts import is_charged
 from expcore.campaign.executor import result_from_record
 from expcore.campaign.factors import FactorSchema
+from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.records.build import RunIdentity
 from expcore.records.injections import restore_refusal
@@ -39,9 +40,10 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import (
     DEFAULT_HEAL_TIMEOUT_S,
-    TOKEN_MARGIN_BASE_S,
+    TOKEN_SLACK_S,
     heal_token_margin_s,
     load_faults,
+    restore_token_margin_s,
 )
 from expcore_onedata.faults import INJECTOR_FAILURE, PROVIDER_OUTAGE
 from expcore_onedata.testing import CEILING_S, TOOL_SERVER_ARGS, write_platform
@@ -50,9 +52,14 @@ from expcore_onedata.testing import TOOL_SERVER_USER as TOOLS
 from expcore_onedata.tokens import TokenIssuer, tool_server_spec
 from expcore_onedata.toolserver import ENV_TOOLS, ToolServerLauncher
 
-LONG_MARGIN_S = int(TOKEN_MARGIN_BASE_S + 2 * DEFAULT_HEAL_TIMEOUT_S)  # 900 + 2 x 4,200 = 9,300 s
-STOPPED_FIRST = "stopped_first"  # the documented order: the launches inside `running`, stopped before its exit
-NESTED = "nested"  # the earlier pattern: `running` inside both launches, so its exit restores while they run
+DEFAULT_MARGIN_S = 900  # `[tokens] margin_s` by default
+# The four-provider fixture's restore and gate: a stop of unknown outcome waited out (5 s), two starts each with its
+# wait (2 x (10 s + 5 s)), the wait to serve (5 s) and the session gate (240 s), and the slack (300 s): 580 s. The
+# long margin adds two heals of 4,200 s.
+FIXTURE_RESTORE_MARGIN_S = 580
+LONG_MARGIN_S = FIXTURE_RESTORE_MARGIN_S + 2 * int(DEFAULT_HEAL_TIMEOUT_S)  # 8,980 s
+NESTED = "nested"  # the documented order: `running` inside both launches, so its exit restores while they run
+STOPPED_FIRST = "stopped_first"  # the other study's order: both launches stopped before `running`'s exit
 SANDBOX_OPEN = "sandbox_open"  # the tool server stopped before the restore, the sandbox not
 TOOL_SERVER_OPEN = "tool_server_open"  # the sandbox stopped before the restore, the tool server not
 
@@ -65,16 +72,43 @@ def settings_of(platform):
     return load_faults(platform, load_platform(platform, require_secrets=False))
 
 
-def test_o35_a_declared_heal_loads_with_the_base_token_margin_and_the_long_margin_is_opt_in(tmp_path):
-    """O35, O06: the token's window is checked when the restore begins, not at load: a declared heal loads with the
-    default margin (900 s), and the long margin a study may declare to restore while its launches run is the base and
-    two heals of `heal_timeout_s`, 9,300 s with the default, and less with a shorter bound; a heal that is off asks
-    nothing of the margin."""
-    assert settings_of(platform_with(tmp_path, heal="all_links")).heal == "all_links"
+def at_default_bounds(data, heal, margin_s):
+    """The four-provider federation with `[faults]` at its default bounds (the fixture shortens them)."""
+    four_providers(data, heal=heal)
+    for key in ("settle_timeout_s", "ready_timeout_s", "clear_attempts", "command_timeout_s"):
+        data["faults"].pop(key, None)
+    data["tokens"] = {"margin_s": margin_s}
+
+
+@pytest.mark.parametrize("heal", ["off", "all_links"])
+def test_o35_a_restore_and_gate_that_could_outlast_the_token_margin_are_refused_at_load_naming_the_numbers(
+    tmp_path, heal
+):
+    """O35, O06: the restore always runs, inside the run's token window in the documented order, so `[tokens]
+    margin_s` must outlive it: a stop of unknown outcome waited out (settle_timeout_s 180 s), three starts each with its
+    wait for the new identity (3 x (command_timeout_s 120 s + settle_timeout_s 180 s)), the wait to serve
+    (ready_timeout_s 180 s) and the session gate (gate_timeout_s 240 s), 1,500 s at the defaults, and 300 s of slack:
+    1,800 s. The default margin (900 s) is refused, naming every number, heal declared or not; 1,800 s loads."""
+    expected = (
+        r"\[tokens\] margin_s must be at least 1800 s, not 900 s.*settle_timeout_s 180 s.*3 starts.*"
+        r"command_timeout_s 120 s.*ready_timeout_s 180 s.*gate_timeout_s 240 s.*300 s of slack"
+    )
+    with pytest.raises(ConfigError, match=expected):
+        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, DEFAULT_MARGIN_S)))
+    settings = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 1800)))
+    assert (restore_token_margin_s(settings), TOKEN_SLACK_S) == (1800, 300)
+
+
+def test_o35_the_fixtures_restore_fits_the_default_margin_and_the_long_margin_adds_two_heals(tmp_path):
+    """O35: the four-provider fixture's shorter bounds fit the default margin, so a declared heal loads with it; the
+    long margin is that restore's margin plus two heals of `heal_timeout_s` and the session drain the start's recovery
+    waits out (the fixture declares none), and nothing for a heal that is off."""
+    settings = settings_of(platform_with(tmp_path, heal="all_links"))
     assert load_platform(platform_with(tmp_path, heal="all_links"), require_secrets=False).tokens.margin_s == 900
-    assert heal_token_margin_s(settings_of(platform_with(tmp_path, heal="all_links"))) == LONG_MARGIN_S == 9300
-    shorter = settings_of(platform_with(tmp_path, heal="all_links", heal_timeout_s=1000))
-    assert heal_token_margin_s(shorter) == TOKEN_MARGIN_BASE_S + 2 * 1000
+    assert restore_token_margin_s(settings) == FIXTURE_RESTORE_MARGIN_S
+    assert heal_token_margin_s(settings) == LONG_MARGIN_S == 580 + 2 * 4200
+    drained = settings_of(platform_with(tmp_path, heal="all_links", session_drain_s=320))
+    assert heal_token_margin_s(drained) == LONG_MARGIN_S + 320
     assert heal_token_margin_s(settings_of(platform_with(tmp_path))) == 0.0
 
 
@@ -144,7 +178,7 @@ class Outage:
             yield
         self.steps.append("tool_server_stopped")
 
-    def run(self, schema, key, order=STOPPED_FIRST):
+    def run(self, schema, key, order=NESTED):
         """The attempt, in `order`, under the outage run's exclusive admission; returns the record, or raises."""
         identity = RunIdentity(key.text, key.factors, 1)
         injector = self.injector
@@ -236,15 +270,15 @@ def acted(services, *verbs):
     return [action for action in services.actions if action[0] in verbs]
 
 
-def test_o35_an_executor_that_stops_the_tool_server_and_sandbox_before_the_restore_needs_no_long_margin(
+def test_o35_an_executor_that_stops_the_tool_server_and_sandbox_before_the_restore_heals_with_the_default_margin(
     tmp_path, fake, frozen_manifests, outage_condition
 ):
-    """O35, O06: the documented order with the default margin (900 s): the tool server's stop, its re-verification
+    """O35, O06: the other study's order with the default margin (900 s): the tool server's stop, its re-verification
     included, and the sandbox's end before `running`'s exit, so the token may expire as the restore begins; the heal
-    then takes its whole bound, the restore is verified, and the store keeps the attempt done and uncharged."""
+    then runs for its whole bound, the restore is verified, and the store keeps the attempt done and uncharged."""
     schema, store, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
-    assert outage.config.tokens.margin_s == TOKEN_MARGIN_BASE_S
+    assert outage.config.tokens.margin_s == DEFAULT_MARGIN_S
     outage.at_restore = lambda: outage.wall.__setitem__(0, outage.token.expires_at + 1)
     outage.heal_s = DEFAULT_HEAL_TIMEOUT_S
     record = outage.run(schema, key, STOPPED_FIRST)
@@ -258,6 +292,8 @@ def test_o35_an_executor_that_stops_the_tool_server_and_sandbox_before_the_resto
     ]
     assert outage.wall[0] > outage.token.expires_at  # expired before the heal, examined by nothing after it
     assert acted(outage.services, "restart_link")  # the heal ran
+    steps = [step["step"] for step in record.instruments["fault_injector"]["steps"]]
+    assert "heal_skipped" not in steps
     assert record.instruments["fault_injector"]["restore_verified"] is True
     assert record.instrument_refusal is None
     assert stored(store, key, record) == ("done", 0, None)
@@ -271,49 +307,60 @@ def test_o35_an_executor_that_stops_the_tool_server_and_sandbox_before_the_resto
         (TOOL_SERVER_OPEN, [TOOL_SERVER_STEP]),
     ],
 )
-def test_o35_a_restore_that_would_begin_while_a_token_step_runs_is_not_started_and_never_scored(
+def test_o35_while_a_token_step_runs_the_restore_runs_its_heal_is_skipped_and_recorded_and_it_stays_unverified(
     tmp_path, fake, frozen_manifests, outage_condition, order, running
 ):
-    """O35, O06: without the long margin, a restore that would begin while the run's tool server or its sandbox still
-    runs is not started: the provider is not brought back and nothing heals, the injection stays open in the journal
-    (`clear_failed`, `run_not_stopped`), and the record says the restore is not verified, so the attempt is set aside as
-    `injector_failure`, never scored; the tool server's stop that follows finds its token valid."""
+    """O35, O06: without the long margin, a heal that would begin while the run's tool server or its sandbox still
+    runs is skipped: the provider is brought back and passes its gate, the reading records the skip with the steps
+    that ran, the margin and the long margin, nothing heals, and the stuck pair leaves the restore unverified
+    (`links_stuck`): the record is kept and refused as `injector_failure`, never scored, the injection stays open for
+    the health gate, and the tool server's stop that follows finds its token valid."""
     schema, _, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     record = outage.run(schema, key, order)
-    assert acted(outage.services, "start", "ping", "restart_link") == []
+    assert ("start", TARGET) in acted(outage.services, "start")  # the restore ran
+    assert outage.services.running(outage.injector._service)  # and the provider is back up
+    assert acted(outage.services, "ping", "restart_link") == []
     assert "heal" not in outage.steps
     reading = record.instruments["fault_injector"]
-    assert (reading["restore_verified"], reading["how"]) == (False, "run_not_stopped")
-    refused = [(step["how"], step["steps"]) for step in reading["steps"] if step["step"] == "cleared"]
-    assert refused == [("run_not_stopped", running)] * 2  # `running`'s exit, then `finish`: neither started it
+    assert (reading["restore_verified"], reading["how"]) == (False, "links_stuck")
+    skipped = [step for step in reading["steps"] if step["step"] == "heal_skipped"]
+    assert skipped  # `running`'s exit, and again `finish` while the step still ran
+    for step in skipped:
+        assert (step["steps"], step["margin_s"], step["long_margin_s"]) == (running, DEFAULT_MARGIN_S, LONG_MARGIN_S)
     assert restore_refusal(record.instruments)["infra_kind"] == INJECTOR_FAILURE
     assert record.instrument_refusal["infra_kind"] == INJECTOR_FAILURE
-    assert "not started" in record.instrument_refusal["detail"]
     assert is_charged(INJECTOR_FAILURE)
     (entry,) = outage.injector._journal.open_entries()
-    assert (entry["target"], entry["clear_failed"]) == (TARGET, "run_not_stopped")
-    assert not outage.services.running(outage.injector._service)
+    assert (entry["target"], entry["clear_failed"], entry.get("healed")) == (TARGET, "links_stuck", None)
 
 
-def test_o35_a_restore_refused_while_a_step_ran_starts_once_every_step_has_ended(
+def test_o35_the_next_start_with_no_token_step_running_heals_what_a_skipped_heal_left(
     tmp_path, fake, frozen_manifests, outage_condition
 ):
-    """O35: the check is made at every restore's start, so a later `finish` of the same injector, once the run's tool
-    server and sandbox have both ended, brings the provider back, heals and verifies it."""
+    """O35: after a skipped heal the injection stays open with its pair stuck; once the run has ended, the next start
+    under a fresh exclusive admission with no step of its run running recovers it, heals it and verifies it, and its
+    own outage then goes ahead."""
     schema, _, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     outage.run(schema, key, NESTED)
+    outage.injector._unlock()  # the run's process ends: the kernel drops its injector's lock on the target
+    outage.services.actions.clear()
+    following = injector_for(outage.platform, outage.services, target=TARGET, clock=outage.services.clock)
     with FederationLock(load_faults(outage.platform, outage.config)).held(exclusive=True, timeout_s=5):
-        assert outage.injector.finish()["restore_verified"] is True
-    assert acted(outage.services, "restart_link")
+        following.start({"run_key": "the-next-run", "attempt": 1})
+        (recovered,) = [step for step in following.snapshot()["steps"] if step["step"] == "recovered"]
+        assert following.clear() is True
+    assert recovered["ok"] is True
+    assert "heal_skipped" not in recovered
+    assert acted(outage.services, "restart_link")  # the heal ran, with no step of a run counted
     assert outage.injector._journal.open_entries() == []
 
 
-def test_o35_with_the_long_margin_declared_a_restore_inside_the_launches_proceeds_and_its_heals_fit(
+def test_o35_with_the_long_margin_declared_a_heal_inside_the_launches_runs_and_its_heals_fit(
     tmp_path, fake, frozen_manifests, outage_condition
 ):
-    """O35, O06: the earlier order with the long margin declared (9,300 s) proceeds as before: a heal of its whole
+    """O35, O06: the documented order with the long margin declared heals as before: a heal of its whole
     `heal_timeout_s` while the run starts (the recovery of an injection an earlier run left), the agent's loop at its
     whole ceiling, then the restore's heal of its whole bound: the tool server's stop still finds the token valid, the
     record carries the verified restore, and the store keeps the attempt done and uncharged."""
@@ -337,11 +384,11 @@ def test_o35_with_the_long_margin_declared_a_restore_inside_the_launches_proceed
     assert stored(store, key, record) == ("done", 0, None)
 
 
-def test_o35_the_long_margin_rests_on_the_token_outliving_the_restore_since_the_tool_servers_stop_reads_it(
+def test_o35_the_long_margin_rests_on_the_token_outliving_the_heal_since_the_tool_servers_stop_reads_it(
     tmp_path, fake, frozen_manifests, outage_condition
 ):
-    """O35, O06: the dependence the check guards: in the earlier order, with the long margin, a token that expired as
-    the restore began fails the tool server's stop that follows as `tool_plane_integrity`, a charged kind, though the
+    """O35, O06: the dependence the skip guards: in the documented order, with the long margin, a token that expired
+    as the restore began fails the tool server's stop that follows as `tool_plane_integrity`, a charged kind, though the
     restore and its heal were verified."""
     schema, _, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests, margin_s=LONG_MARGIN_S)
@@ -364,37 +411,37 @@ def left_open(outage):
     outage.services.actions.clear()
 
 
-def test_o35_a_starts_recovery_does_not_heal_while_the_runs_launches_run_without_the_long_margin(
+def test_o35_a_starts_recovery_skips_its_heal_while_the_runs_launches_run_without_the_long_margin(
     tmp_path, fake, frozen_manifests, outage_condition
 ):
-    """O35, O06: the start recovers an injection an earlier run left, and may heal it; in the earlier order the run's
-    tool server and sandbox already run then, so without the long margin the recovery restores without healing: a link
-    that stays stuck fails the start closed as `injector_failure`, with no link restarted and the withheld heal in the
-    reading."""
+    """O35, O06: the start recovers an injection an earlier run left, and may heal it; in the documented order the
+    run's tool server and sandbox already run then, so without the long margin the recovery restores and skips its
+    heal: the provider is back up, the skip is in the reading, and the pair that stays stuck fails the start closed as
+    `injector_failure`, with no link restarted."""
     schema, _, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     left_open(outage)
     with pytest.raises(InfraError) as caught:
         outage.run(schema, key, NESTED)
     assert caught.value.kind == INJECTOR_FAILURE
-    assert "links_stuck" in caught.value.detail or "earlier run left open" in caught.value.detail
+    assert "earlier run left open" in caught.value.detail
+    assert outage.services.running(outage.injector._service)
     assert acted(outage.services, "ping", "restart_link") == []
-    withheld = [step for step in outage.injector.snapshot()["steps"] if step["step"] == "heal_withheld"]
-    assert [step["steps"] for step in withheld] == [[SANDBOX_STEP, TOOL_SERVER_STEP]]
+    (recovered,) = [step for step in outage.injector.snapshot()["steps"] if step["step"] == "recovered"]
+    assert recovered["how"] == "links_stuck"
+    assert recovered["heal_skipped"]["steps"] == [SANDBOX_STEP, TOOL_SERVER_STEP]
 
 
-def test_o35_in_the_documented_order_the_starts_recovery_heals_before_any_token_step_begins(
-    tmp_path, fake, frozen_manifests, outage_condition
-):
-    """O35: in the documented order the injector starts before the sandbox and the tool server, so its recovery of an
+def test_o35_a_starts_recovery_with_no_token_step_begun_heals(tmp_path, fake, frozen_manifests, outage_condition):
+    """O35: in the other study's order the injector starts before the sandbox and the tool server, so its recovery of an
     injection an earlier run left heals with no step of the run begun, and the run completes, done and uncharged."""
     schema, store, key = outage_condition
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     left_open(outage)
     record = outage.run(schema, key, STOPPED_FIRST)
     assert acted(outage.services, "restart_link")
-    steps = [step["step"] for step in record.instruments["fault_injector"]["steps"]]
-    assert "heal_withheld" not in steps
+    (recovered,) = [step for step in record.instruments["fault_injector"]["steps"] if step["step"] == "recovered"]
+    assert "heal_skipped" not in recovered
     assert record.instruments["fault_injector"]["restore_verified"] is True
     assert stored(store, key, record) == ("done", 0, None)
 
@@ -405,7 +452,7 @@ def test_o35_a_cancelled_tool_server_launch_counts_its_step_until_its_check_thre
 ):
     """O35: a cancellation does not stop the worker thread that examines the run's token, before the start or at the
     stop, so the tool server's step stays counted on the run's admission until that thread has ended, though the
-    launch has already left: no restore heals while the token is still being examined."""
+    launch has already left: no heal starts while the token is still being examined."""
     outage = Outage(tmp_path / "federation", fake, frozen_manifests)
     entered, release = threading.Event(), threading.Event()
     real = getattr(toolserver, check)

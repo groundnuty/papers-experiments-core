@@ -37,10 +37,14 @@ Version 3 also says, in two optional fields of the totals, whether the attempt w
 `reserved_capped`, the bound the budget gate reserved the run by, the value the campaign store keeps for the attempt
 (True: by the reply maximum, False: by the window), and `reply_cap_unheld`, whether the campaign had taken the
 attempt's model off the reply maximum when the loop ended. A run that no gate decided has neither.
-Version 3 also carries the per-call tool bound a study may declare (L17), in two optional places: the agent
-configuration's `tool_call_bound_s`, left out when the study declares none (`TOOL_CALL_BOUND_FROM`), and `elapsed_s` of
-each tool call that started, the wall seconds from the reading before the call to the one that ended it, left out of a
-call that never started. A replay writes `elapsed_s` only when the stored record holds it.
+Version 3 also carries the per-call bound a study may declare for its tool servers (L17), in three optional places:
+the agent configuration's `tool_server_call_bound_s`, left out when the study declares none
+(`TOOL_SERVER_CALL_BOUND_FROM`); beside it and only with it, `tool_server_tools`, the names of the tools the bound
+reached (a code tool is never one), which the replay judges a cut call by; and `elapsed_s` of each tool call that
+started, the wall seconds from the reading before the call to the one that ended it, left out of a call that never
+started. A replay writes `elapsed_s` only when the stored record holds it. The bound was first merged as
+`tool_call_bound_s`, capping every call; it was renamed before any release, and the old name is unknown to every
+version.
 Until v0.1.0 is tagged every extension of version 3 is strictly additive: optional fields only, no existing field
 changes meaning or validation, the fields version 3 had at its first merge point keep the shape frozen in
 `tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one per merge point, keep validating
@@ -60,7 +64,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore.config.models import Limits
-from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable
+from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable, targeted_kinds
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
@@ -310,8 +314,12 @@ REPLY_COUNT_RULE_FROM = f"{SCHEMA_PREFIX}3"
 
 # The first version whose agent configuration may declare the per-call tool bound (L17): an optional setting that a
 # record leaves out when the study declared none, so a record of an earlier version never holds it.
-TOOL_CALL_BOUND = "tool_call_bound_s"
-TOOL_CALL_BOUND_FROM = f"{SCHEMA_PREFIX}3"
+TOOL_SERVER_CALL_BOUND = "tool_server_call_bound_s"
+TOOL_SERVER_CALL_BOUND_FROM = f"{SCHEMA_PREFIX}3"
+# The names of the tools that bound reached, written beside it and only with it: the loop adds them to the configuration
+# the record keeps, as it adds the terminal tools, and the replay judges a call by them, since the one provider of a
+# replay cannot say which tools were a tool server's.
+TOOL_SERVER_TOOLS = "tool_server_tools"
 
 
 def reply_count_rule(version: str) -> bool:
@@ -526,6 +534,21 @@ def _check_treatment_kinds(kinds: Any) -> None:
         raise RecordError("treatment_kinds: the kinds are written sorted, each once")
 
 
+def check_required_targets(kinds: Collection[str], targets: Mapping[str, Any]) -> None:
+    """Refuse treatment kinds that are a fault on one target (`expcore.errors.targeted_kinds`) with no declared target.
+
+    Such a condition's treatment is the failure of its target while the injector held it down; with none declared the
+    plain kind would score any target's failure as the manipulation, so the record that carries it is refused, when it
+    is built and when it is read back, and never left to `Outcome.is_treatment` alone."""
+    held = targeted_kinds()
+    missing = [kind for kind in kinds if kind in held and kind not in targets]
+    if missing:
+        raise RecordError(
+            f"treatment_kinds: {missing[0]!r} is declared with no target; a condition names the target it manipulates "
+            "in treatment_targets, or any target's failure would be scored as its treatment"
+        )
+
+
 def _check_treatment_targets(targets: Any, kinds: list[str]) -> None:
     """Check the declared targets: each names a declared treatment kind and a position label, written sorted by kind.
 
@@ -568,21 +591,28 @@ def _check_refusal(refusal: Any) -> None:
 def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVersion]) -> None:
     """Check the agent configuration against the loop's own fields, less the settings a later version added.
 
-    `tool_call_bound_s` is optional in a record of version 3 or later, and unknown to an earlier one: absent when the
-    study declared none, never a null, and a number above nothing and finite when it did (L17).
+    `tool_server_call_bound_s` is optional in a record of version 3 or later, and unknown to an earlier one: absent when
+    the study declared none, never a null, and a number above nothing and finite when it did (L17). The names of the
+    tools it reached, `tool_server_tools`, are written with it and only with it, as a list of tool names.
     """
     later = set(config_defaults(version, schemas))
-    allowed = ({f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools"}) - later
-    if _number(version) < _number(TOOL_CALL_BOUND_FROM):
-        allowed.discard(TOOL_CALL_BOUND)
-    _check_keys("agent_config", config, allowed, required=allowed - {TOOL_CALL_BOUND})
-    bound = config.get(TOOL_CALL_BOUND)
-    if TOOL_CALL_BOUND in config and not (_fits(bound, NUM) and bound > 0):
-        raise RecordError(f"agent_config.{TOOL_CALL_BOUND}: expected a number of seconds above nothing, got {bound!r}")
+    optional = {TOOL_SERVER_CALL_BOUND, TOOL_SERVER_TOOLS}
+    allowed = ({f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools", TOOL_SERVER_TOOLS}) - later
+    if _number(version) < _number(TOOL_SERVER_CALL_BOUND_FROM):
+        allowed -= optional
+    _check_keys("agent_config", config, allowed, required=allowed - optional)
+    bound = config.get(TOOL_SERVER_CALL_BOUND)
+    if TOOL_SERVER_CALL_BOUND in config and not (_fits(bound, NUM) and bound > 0):
+        raise RecordError(
+            f"agent_config.{TOOL_SERVER_CALL_BOUND}: expected a number of seconds above nothing, got {bound!r}"
+        )
+    if (TOOL_SERVER_TOOLS in config) != (TOOL_SERVER_CALL_BOUND in config):
+        raise RecordError(f"agent_config.{TOOL_SERVER_TOOLS}: held when {TOOL_SERVER_CALL_BOUND} is, and only then")
     _check_keys("agent_config.limits", config["limits"], {f.name for f in dataclasses.fields(Limits)})
-    tools = config["terminal_tools"]
-    if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
-        raise RecordError("agent_config.terminal_tools: a list of tool names")
+    for key in ("terminal_tools", *([TOOL_SERVER_TOOLS] if TOOL_SERVER_TOOLS in config else [])):
+        tools = config[key]
+        if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
+            raise RecordError(f"agent_config.{key}: a list of tool names")
 
 
 def _check_route(route: Any) -> None:
@@ -637,6 +667,7 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
     _check_treatment_kinds(body["treatment_kinds"])
     if "treatment_targets" in body:  # optional, from version 3: absent when the condition declares no target
         _check_treatment_targets(body["treatment_targets"], body["treatment_kinds"])
+    check_required_targets(body["treatment_kinds"], body.get("treatment_targets", {}))
     check_section("outcome", body["outcome"], version, "outcome", schemas)
     for place in ("instruments", "scores"):
         held = body.get(place, {})  # absent from a record of a version that predates it

@@ -22,6 +22,8 @@ service entry, its position, never by a provider's or a service's name. The serv
     heal = "off"                     # optional: "off", "all_links", "link_then_container" or "link"; see below
     heal_timeout_s = 4200            # optional, provisional: the longest the heal of a stuck link may take in all
     heal_settle_s = 180              # optional, provisional: the no-fetch wait after a heal's restarts
+    session_drain_s = 320            # optional: how long an outage run's admission outlives its sessions; see below
+    heal_container_fallback = true   # optional: false, and "all_links" restarts links only, never a container
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
@@ -47,6 +49,18 @@ injection open and the federation's exclusive admission held, as a failed restor
 the injection, its block map read through each peer, has no error entry for the restored provider. Its default, 240 s,
 is the 180 s cap of a peer's session renewal backoff (op-worker f118ed9) and a margin.
 
+`session_drain_s` is how long the federation admits no run after an outage run's mount disconnected and its REST
+gate stopped, whichever is later (`expcore_onedata.fault_drain`). During an outage an agent's
+read of a file only the stopped provider holds leaves an on-demand sync job on the local provider that nothing calls
+back, and a later read of the same file and range, from any session, joins it and hangs. The job is cancelled when the
+run's callers end: a REST read's seconds after its client closes the connection, a mount's about 300 s after oneclient's
+last connection closes (op-worker's `fuse_session_grace_period_seconds`), plus about 15 s when the removal retries
+(`DEFAULT_SESSION_DRAIN_S`, 320 s; source-read of op-worker f118ed9, not measured). Eviction, a transfer cancel,
+deleting the file and a link restart do not cancel it. The wait is the remainder after whatever the restore already
+took, so it overlaps the heal's settle; times that are missing mean the whole drain from the restore's start, never
+zero. It applies only after an outage run: every other run is let go at once. `0` declares no drain, which only a
+federation whose agents never read a file a stopped provider alone holds may choose.
+
 `heal` says what the restore does when a link is stuck after it (`links_stuck`, O35; `expcore_onedata.fault_heal`):
 `"off"` (the default) fails the restore closed, as before. `"all_links"`, the primary mode, restarts the rtransfer link
 of every provider in quick succession, settles with no fetch, checks every pair, and falls back to restarting a stuck
@@ -62,20 +76,34 @@ link restart: three commands at `command_timeout_s`, the RPC's bound and its mar
 restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice, `ready_timeout_s`
 and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one
 settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in
-`"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it. **Both
-durations are provisional,** to be tuned as live heals are measured.
+`"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it.
+`heal_container_fallback = false` keeps `"all_links"` to link restarts: a pair they do not mend fails the restore
+closed, for an operator to decide, and no container is restarted; its least `heal_timeout_s` then holds no container
+restart (2,220 s for four providers, 2,730 s for five, with the other defaults). `"link_then_container"` with it false
+is refused. **Both durations are provisional,** to be tuned as live heals are measured.
 
-**The long token margin is opt-in.** A heal may take `heal_timeout_s`, and a run's token outlives its whole-time
-ceiling by `[tokens] margin_s` only, counted from its mint. The tool server's stop examines the run's token
-(`toolserver._recheck`) and fails the run as `tool_plane_integrity` once it has expired, so no heal may run while a
-step of the run that uses its tokens (its tool server, its sandbox) has not ended. The injector checks that at the
-start of each restore and of its start's recovery (`faults.py`, "The token's window"); a heal is never refused at load
-for the margin. A study whose executor restores while its launches still run declares the long margin instead:
-`margin_s` of at least `heal_token_margin_s`, the base margin a platform without a heal relies on
-(`TOKEN_MARGIN_BASE_S`, the default 900 s, a heuristic for the start and the teardown, never a worst case of the
-restore) plus two heals of `heal_timeout_s`, one in the run's own restore and one in its start, which recovers and may
-heal an injection an earlier run left (as the injector's `cancel_wait_s` counts). With the default 4,200 s that is
-9,300 s; every run's tokens then live that much longer past the ceiling.
+**The restore must fit the run's token margin.** The restore runs inside the outage run's attempt, at the injector's
+`running` exit, which the executor's pattern places inside the tool server's launch (`faults.py`, "Use"): after the
+restore come the collection, `finish_instruments` and the tool server's stop, whose re-verification of the tool plane
+examines the run's token and fails the run as `tool_plane_integrity` once it has expired (`toolserver._recheck`). A
+run's token outlives its whole-time ceiling by `[tokens] margin_s` only, counted from its mint. The restore always runs
+(its container start and its session gate use no run token), so a platform.toml with `[faults]` is refused at load,
+heal declared or not, unless `margin_s` is at least `restore_token_margin_s`, naming every number: the restore's bound
+(`restore_bound_s`: a stop of unknown outcome waited out, `settle_timeout_s`; `clear_attempts` starts, each with its
+command and its wait for the new identity, `command_timeout_s` and `settle_timeout_s`; the wait to serve,
+`ready_timeout_s`; and the session gate, `gate_timeout_s`), 1,500 s with the defaults, plus `TOKEN_SLACK_S`, 300 s,
+for what that bound does not hold (the injector's start after the mint, the link check after the gate, the steps
+before the tool server's check): 1,800 s with the defaults, so the default 900 s must be raised. Not counted: a
+start's recovery of an injection an earlier run left, which the health gate settles before a run is dispatched, and
+the session drain, which the run's admission publishes after the post-run check.
+
+**A heal is skipped while a step of the run that uses its tokens runs.** A heal may take `heal_timeout_s` more, so at
+its start the injector reads the steps of the run that use its tokens (the tool server's launch and the sandbox's,
+counted on the run's admission) and skips the heal while one still runs (`faults.py`, "The token's window"), unless the
+study declares the long margin: `margin_s` of at least `heal_token_margin_s`, the restore's margin above, two heals of
+`heal_timeout_s` (the restore's and the start's recovery's, as the injector's `cancel_wait_s` counts them) and one
+session drain of `session_drain_s`, which that start waits out after it restored a provider an earlier run left down
+(`FaultInjector._wait_owed`): 10,520 s with the defaults. A heal is never refused at load for the margin.
 """
 
 import hashlib
@@ -89,7 +117,7 @@ from typing import Any
 
 from expcore.config.loading import Section, load_toml
 from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
-from expcore_onedata.config import PlatformConfig, TokenSettings
+from expcore_onedata.config import PlatformConfig
 
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # A Compose project name as Compose accepts it. Required, because Compose would otherwise take the name from the
@@ -102,7 +130,8 @@ DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48
 DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
 DEFAULT_HEAL_TIMEOUT_S = 4200.0  # provisional: four providers' all-links sequence and one container restart fit it
 DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measurement tunes it
-TOKEN_MARGIN_BASE_S = TokenSettings().margin_s  # the token margin a platform without a heal relies on: the default
+DEFAULT_SESSION_DRAIN_S = 320.0  # op-worker's 300 s mount-session grace, 15 s for a removal that retries, a margin
+TOKEN_SLACK_S = 300.0  # what the token margin keeps beyond the restore's bound: the start, the link check, the teardown
 HEAL_MODES = ("off", "all_links", "link_then_container", "link")
 _KEYS = (
     "sanctioned",
@@ -122,6 +151,8 @@ _KEYS = (
     "heal",
     "heal_timeout_s",
     "heal_settle_s",
+    "session_drain_s",
+    "heal_container_fallback",
     "services",
 )
 
@@ -149,6 +180,8 @@ class FaultSettings:
     heal: str = "off"
     heal_timeout_s: float = DEFAULT_HEAL_TIMEOUT_S
     heal_settle_s: float = DEFAULT_HEAL_SETTLE_S
+    session_drain_s: float = DEFAULT_SESSION_DRAIN_S
+    heal_container_fallback: bool = True
     config_sha256: str = ""  # the digest of the platform.toml it was read from: part of the federation's identity
 
 
@@ -190,6 +223,9 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     heal = table.data.get("heal", "off")
     if heal not in HEAL_MODES:
         raise table.fail("heal", "must be one of " + ", ".join(f'"{mode}"' for mode in HEAL_MODES))
+    fallback = table.data.get("heal_container_fallback", True)
+    if not isinstance(fallback, bool):
+        raise table.fail("heal_container_fallback", "must be true or false")
     words = {}
     for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
         words[key] = tuple(table.strings(key)) or default
@@ -213,8 +249,12 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         heal=heal,
         heal_timeout_s=_number(table, "heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S, 0),
         heal_settle_s=_number(table, "heal_settle_s", DEFAULT_HEAL_SETTLE_S, 0),
+        session_drain_s=_number(table, "session_drain_s", DEFAULT_SESSION_DRAIN_S, 0),
+        heal_container_fallback=fallback,
         config_sha256=config.sha256,
     )
+    if heal == "link_then_container" and not fallback:  # a mode of container restarts, declared to make none
+        raise table.fail("heal_container_fallback", 'is false, which "link_then_container" contradicts: use "link"')
     uncovered = sorted(heal_participants(config) - set(settings.services))
     if heal == "all_links" and uncovered:  # a partial sequence is what leaves pairs stale
         shown = config.provider_labels(uncovered)
@@ -225,17 +265,49 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             "heal_timeout_s",
             f'must be at least {least:g} for heal = "{heal}": one round of its actions at their declared bounds',
         )
+    margin, needed = config.tokens.margin_s, restore_token_margin_s(settings)
+    if margin < needed:
+        s = settings
+        raise table.fail(
+            None,
+            f"its restore could outlast the run's token: [tokens] margin_s must be at least {needed:g} s, not "
+            f"{margin:g} s: a stop of unknown outcome waited out (settle_timeout_s {s.settle_timeout_s:g} s), "
+            f"{s.clear_attempts} starts each with its wait for the new identity ({s.clear_attempts} x "
+            f"(command_timeout_s {s.command_timeout_s:g} s + settle_timeout_s {s.settle_timeout_s:g} s)), the wait to "
+            f"serve (ready_timeout_s {s.ready_timeout_s:g} s), the session gate (gate_timeout_s "
+            f"{s.gate_timeout_s:g} s) and {TOKEN_SLACK_S:g} s of slack, since the tool server's stop after the restore "
+            "examines the run's token",
+        )
     return settings
+
+
+def restore_bound_s(settings: FaultSettings) -> float:
+    """The longest the run's own restore may take without a heal, by its declared bounds: a stop of unknown outcome
+    waited out (`settle_timeout_s`), `clear_attempts` starts, each with its command and its wait for the new identity
+    (`command_timeout_s` and `settle_timeout_s`), the wait to serve (`ready_timeout_s`) and the session gate
+    (`gate_timeout_s`). 1,500 s with the defaults."""
+    return (
+        settings.settle_timeout_s
+        + settings.clear_attempts * (settings.command_timeout_s + settings.settle_timeout_s)
+        + settings.ready_timeout_s
+        + settings.gate_timeout_s
+    )
+
+
+def restore_token_margin_s(settings: FaultSettings) -> float:
+    """The least `[tokens] margin_s` of a platform with `[faults]`, refused at load below it: the restore's bound and
+    `TOKEN_SLACK_S` (see the module docstring). 1,800 s with the defaults."""
+    return restore_bound_s(settings) + TOKEN_SLACK_S
 
 
 def heal_token_margin_s(settings: FaultSettings) -> float:
     """The long token margin: the least `[tokens] margin_s` with which the injector heals while a step of the run that
-    uses its tokens still runs, since the token then outlives the heals and the tool server's stop after them (see the
-    module docstring): the base margin and two heals of `heal_timeout_s`; 0 with the heal off, which asks nothing of
-    the margin."""
+    uses its tokens still runs (see the module docstring): the restore's margin, two heals of `heal_timeout_s` and one
+    session drain of `session_drain_s`, 10,520 s with the defaults; 0 with the heal off, which asks nothing of the
+    margin."""
     if settings.heal == "off":
         return 0.0
-    return TOKEN_MARGIN_BASE_S + 2 * settings.heal_timeout_s
+    return restore_token_margin_s(settings) + 2 * settings.heal_timeout_s + settings.session_drain_s
 
 
 def heal_link_reserve(settings: FaultSettings) -> float:
@@ -278,7 +350,8 @@ def heal_round_s(settings: FaultSettings) -> float:
     if settings.heal == "off":
         return 0.0
     if settings.heal == "all_links":
-        return heal_all_links_reserve(settings) + heal_container_reserve(settings)
+        container = heal_container_reserve(settings) if settings.heal_container_fallback else 0.0
+        return heal_all_links_reserve(settings) + container
     container = heal_container_reserve(settings) if settings.heal == "link_then_container" else 0.0
     return heal_link_reserve(settings) + container
 

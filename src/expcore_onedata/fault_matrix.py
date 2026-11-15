@@ -49,7 +49,7 @@ class LinkMatrix:
     def from_report(cls, report: Any) -> "LinkMatrix":
         """From a `linkcheck.LinkReport`: a pair is stuck when its fetch failed (its result names the remedy)."""
         pairs = tuple(
-            PairState(p.local, p.source, p.ok, p.seconds, not p.ok and p.remedy is not None) for p in report.pairs
+            PairState(p.reader, p.source, p.ok, p.seconds, not p.ok and p.remedy is not None) for p in report.pairs
         )
         return cls(bool(report.ok), str(report.detail), pairs)
 

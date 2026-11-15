@@ -39,11 +39,7 @@ absence is verified (O11).
 (`outage_fault`, over `expcore_onedata.faults.FaultInjector`): journalled before the stop, recovered if an earlier
 process left it open, restored only with a changed identity and once the provider serves, a stop of unknown outcome
 waited out. The check holds the federation's lock exclusively (`admission.FederationLock`) for a whole space's
-scenario, the scratch's teardown included, and the injector takes that admission as its own. The check reads through
-its sandbox and tool server after the restore, so both still run when the injector restores: with `[faults] heal`
-declared, the injector starts no restore and its recovery heals nothing while they run unless `[tokens] margin_s` is
-the long margin (`fault_settings.heal_token_margin_s`, `faults`, "The token's window"), and the check then fails with
-the restore not verified (`run_not_stopped`).
+scenario, the scratch's teardown included, and the injector takes that admission as its own.
 
 **Verdict.** Passed: the target was seen down and restored, every cell measured, the re-reads right, the scratch gone.
 Failed: the target answered while it was down, it could not be restored or did not answer or read back after the

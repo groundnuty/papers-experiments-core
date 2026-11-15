@@ -43,6 +43,7 @@ from expcore.records.schema import (
     SCHEMAS,
     RecordError,
     SchemaVersion,
+    check_required_targets,
     fields_of,
     first_turn_rule,
     optional_in,
@@ -400,6 +401,7 @@ def _build_record(
     secrets, secret_env = tuple(secrets), tuple(secret_env)
     kinds = treatment_list(treatment_kinds)
     targets = target_table(treatment_targets, kinds)
+    check_required_targets(kinds, targets)
     if targets and not target_rule(schema_version, schemas):
         raise RecordError(f"treatment_targets: {schema_version} predates declared targets")
     sys_prompt, user_prompt = PromptText.of(system), PromptText.of(user)

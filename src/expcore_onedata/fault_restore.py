@@ -4,7 +4,10 @@
 `LinkSettling` is a part of `fault_recovery.Recovery`, kept in a module of its own. Once a restored provider serves,
 `_links_settled` polls the session gate (`fault_sessions.await_sessions`) within `gate_timeout_s`, then checks every
 ordered pair through the driver (`ComposeDriver.link_matrix`, or the detail alone, `restored_links`), and, only when the
-caller holds the federation exclusively and `[faults] heal` allows, runs the heal (`fault_heal.LinkHeal`).
+caller holds the federation exclusively and `[faults] heal` allows, runs the heal (`fault_heal.LinkHeal`). At the
+heal's start it asks `heal_skip` (the injector's: a step of the run that uses its tokens still runs and the long token
+margin is not declared): a skipped heal is recorded in `restore_record` (`heal_skipped`) and the restore fails
+`links_stuck`, the injection not marked healed, so a later settling with no such step may heal it.
 
 **Once per injection, durably.** Before its first action the heal journals that it heals the injection: a `clear_failed`
 line (`links_stuck`, which the restore is at that moment) marked `healing`, which `InjectionJournal.open_entries` reads
@@ -46,6 +49,19 @@ def digest(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def unhealed_detail(record: Mapping[str, Any], latest: LinkMatrix, before: str | None) -> str:
+    """Why a heal left the links stuck, for the restore's failure: the heal's own why (else the check's detail before
+    it), then each pair failing at the latest link check that answered, named by its reading provider, the one whose
+    link the remedy restarts, and its source, by label (O35, O12). `latest` is that check: the heal's last one, or,
+    when a later one could not run, the last that answered (the restore's own check when none of the heal's did), so
+    the failure always names the readers the last answer found failing."""
+    why = str(record.get("why") or before)
+    failing = [f"{pair.reader} reading from {pair.source}" for pair in latest.failing()]
+    if failing:
+        return f"{why}; failing at the latest link check that answered, by reading provider: {', '.join(failing)}"
+    return why
+
+
 class LinkSettling:
     """The link half of `Recovery` (see the module docstring); `Recovery` provides every attribute it reads."""
 
@@ -57,23 +73,40 @@ class LinkSettling:
     _healed: set[str]
     _deadline: float | None
     _quiet_until: float | None
+    _wall: Callable[[], float]
+    _waited_wall: float
+    _heal_skip: Callable[[], Mapping[str, Any] | None] | None  # asked at a heal's start: why to skip it, or None
     journal: InjectionJournal
     links_detail: str | None
     restore_record: dict[str, Any]
     settle: Callable[..., Any]
     wait: Callable[..., Observation | None]
 
-    def hold(self, seconds: float) -> None:
+    def hold(self, seconds: float, entry: str | None = None) -> None:
         """Mark that nothing may read through the links for `seconds` from now: a heal sends it before and after every
-        restart, so a later gate read or link check of this recovery, even one after an interrupted heal, waits until
-        the settle could have ended (`_await_quiet`)."""
+        restart, so a later gate read or link check, even one after an interrupted heal, waits until the settle could
+        have ended (`_await_quiet`). With `entry`, the healed injection's journal id, the hold is also journalled
+        durably (`settle_until`, on the wall clock, on a `clear_failed` line), so a recovery in another process, after
+        this one died or exited mid-settle, waits for it too. A journal that cannot take it raises: no restart is then
+        sent."""
         self._quiet_until = self._clock() + seconds
+        if entry is not None:
+            until = self._wall() + seconds
+            self.journal.append({"event": "clear_failed", "id": entry, "how": "links_stuck", "settle_until": until})
+            self._waited_wall = max(self._waited_wall, until)  # its own: the clock's wait above covers it
 
     def _await_quiet(self) -> None:
-        """Wait out what is left of the latest held settle, before any gate read or link check."""
+        """Wait out what is left of the latest held settle, this recovery's own and every one the journal holds for
+        an open injection, before any gate read or link check. A journal that cannot be read raises (fail closed)."""
         until = self._quiet_until
         if until is not None and self._clock() < until:
             self._sleep(until - self._clock())
+        journalled = [entry.get("settle_until") for entry in self.journal.open_entries()]
+        latest = max((value for value in journalled if isinstance(value, int | float)), default=None)
+        if latest is not None and latest > self._waited_wall:  # another's hold, or one this recovery has not waited
+            if self._wall() < latest:
+                self._sleep(latest - self._wall())
+            self._waited_wall = latest
 
     def _gate(self, service: str, gate_probe: str | None, timeout_s: float | None = None) -> dict[str, Any]:
         """The session gate for a provider's service, polled within `gate_timeout_s`, or `timeout_s` when shorter;
@@ -111,6 +144,11 @@ class LinkSettling:
         log.warning("a restored provider's link check failed: %s", self.links_detail)
         if matrix is None or not self._may_heal(entry, heal, matrix):
             return "links_stuck"
+        skipped = self._heal_skip() if self._heal_skip is not None else None
+        if skipped is not None:  # a step of the run that uses its tokens still runs: no heal may outlast its token
+            self.restore_record["heal_skipped"] = dict(skipped)
+            log.warning("a restored provider's heal was skipped: a step of the run that uses its tokens still runs")
+            return "links_stuck"  # not marked healed: a later settling with no such step may heal it
         self._healed.add(entry["id"])  # one heal per injection: a later settling of it only checks
         try:  # durable before any action, so no process heals this injection again
             self.journal.append({"event": "clear_failed", "id": entry["id"], "how": "links_stuck", "healing": True})
@@ -129,6 +167,13 @@ class LinkSettling:
                 children.append(done["entry"])
             return done
 
+        answered = [matrix]  # the latest link check that answered: the restore's own, then each of the heal's
+
+        def read() -> LinkMatrix:
+            latest = self._matrix(service)  # one that cannot be read raises, and the heal reads it as unreadable
+            answered.append(latest)
+            return latest
+
         result = LinkHeal(
             mode=settings.heal,
             driver=self._driver,
@@ -142,11 +187,12 @@ class LinkSettling:
             link_s=heal_link_reserve(settings),
             all_links_s=heal_all_links_reserve(settings),
             container_s=heal_container_reserve(settings),
-            matrix=lambda: self._matrix(service),
+            matrix=read,
             gate=lambda reader, timeout_s: self._gate(reader, gate_probe, timeout_s),
             transfers=self._active_transfers,
             restart_container=restart,
-            hold=self.hold,
+            hold=lambda seconds: self.hold(seconds, str(entry["id"])),
+            container_fallback=settings.heal_container_fallback,
             clock=self._clock,
             sleep=self._sleep,
         ).run()
@@ -154,7 +200,7 @@ class LinkSettling:
         for child in children:  # a restarted reader is restored only with every pair passing
             line = {"event": "cleared", "how": "restored"} if result.healed else {"event": "clear_failed"}
             self.journal.append({**line, "id": child, **({} if result.healed else {"how": result.how})})
-        self.links_detail = None if result.healed else str(result.record.get("why") or self.links_detail)
+        self.links_detail = None if result.healed else unhealed_detail(result.record, answered[-1], self.links_detail)
         return result.how
 
     def _active_transfers(self) -> int | None:

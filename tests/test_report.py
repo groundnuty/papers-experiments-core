@@ -8,7 +8,9 @@ import pytest
 from expcore.report import render_report, summary_lines
 from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision
 from expcore.stats.armruns import LOST_CAUSES, ArmRuns
+from expcore.stats.estimators import ModelEstimate
 from expcore.stats.onearm import DescriptiveResult
+from expcore.stats.ratio import RatioForm
 
 CODE = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
 MANIFEST = {"preregistration_sha256": "e" * 64, "factor_schema_sha256": "f" * 64}
@@ -685,6 +687,135 @@ def test_c26_a_campaign_without_a_budget_hold_has_a_row_of_zeros_for_every_condi
     holds = render(analysis(contrast("primary", "difference")), data).split("### Budget holds by condition", 1)[1]
     for name in ("cond-a", "cond-b", "cond-c"):
         assert f"| {name} | model-a | 0 |" in holds
+
+
+# --- a ratio contrast in the report -----------------------------------------------------------------------------------
+
+NO_CELL_LOST = {"no_pair": 0, "zero_denominator": 0, "zero_numerator": 0}
+RATIO_MISSING = {
+    **NO_PAIR,
+    "exhausted": 0,
+    "unpaired_or_left_out": 0,
+    "numerator_none_at_zero": 1,
+    "zero_denominator": 3,
+    "zero_numerator": 0,
+}
+
+
+EXCLUDE = RatioForm("spend", "wins", "exclude")
+
+
+def ratio_contrast(name="spend-per-win", form=EXCLUDE, conclusion="difference", **changes) -> ContrastResult:
+    """A ratio contrast's result: its estimate ln 2 with the interval [ln 1.5, ln 3], and the pairs its rule took."""
+    numbers = {"estimate": math.log(2.0), "ci_low": math.log(1.5), "ci_high": math.log(3.0), "n_pairs": 20}
+    units = {"estimation_unit": ("group",), "independent_unit": "group", "n_cells": 12, "cells_lost": NO_CELL_LOST}
+    base = {"outcome": form.label, "estimator": "ratio", "ratio": form, "pairs_missing": RATIO_MISSING, **numbers}
+    base |= units
+    return contrast(name, conclusion, **{**base, **changes})
+
+
+def test_s13_a_ratio_contrasts_row_names_its_outcome_on_the_log_scale():
+    """S13: the estimate and its interval are natural-log ratios, and the outcome cell says so."""
+    cells = row(render(analysis(ratio_contrast())), "spend-per-win")
+    assert cells[2:5] == ["ln(spend/wins)", "0.6931", "[0.4055, 1.099]"]
+
+
+def test_s13_the_ratio_contrasts_table_gives_the_rule_and_the_ratio_itself():
+    """S13: each ratio contrast's two outcomes, its declared zero rule, and exp of the estimate and of its interval."""
+    continuity = ratio_contrast("spend-per-win-c", RatioForm("spend", "wins", "continuity", 0.5))
+    report = render(analysis(ratio_contrast(), continuity))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["Contrast"] == [
+        "Contrast",
+        "Numerator",
+        "Denominator",
+        "Estimation unit",
+        "Independent unit",
+        "Cells",
+        "Zero total",
+        "Ratio (A / B)",
+        "Ratio interval",
+    ]
+    assert table["spend-per-win"][1:] == ["spend", "wins", "group", "group", "12", "exclude", "2", "[1.5, 3]"]
+    assert table["spend-per-win-c"][6] == "continuity correction 0.5"
+    assert "the cell is excluded from the contrast" in report.split("## Ratio contrasts")[1]
+
+
+def test_s13_the_terminal_summary_says_a_ratio_contrasts_estimate_is_a_log_ratio():
+    """S13: a log ratio printed bare could be read as a difference of ratios."""
+    line = next(line for line in summary_lines(analysis(ratio_contrast())) if line.startswith("spend-per-win:"))
+    assert line.startswith("spend-per-win: estimate 0.6931 (ln ratio), p ")
+    assert summary_lines(analysis(contrast("plain", "difference")))[0].startswith("plain: estimate 0.25, p ")
+
+
+def test_s13_the_pairs_table_shows_the_ratio_causes_when_a_ratio_contrast_is_in_it():
+    """S13: the ratio contrast's counts under its three causes; a difference contrast beside it has none of them."""
+    report = render(analysis(ratio_contrast(), contrast("plain", "difference")))
+    table = table_of(report, "### Pairs of the family's contrasts")
+    assert table["Contrast"][-3:] == ["Numerator None at denominator 0", "Zero denominator", "Zero numerator"]
+    assert table["spend-per-win"][-3:] == ["1", "3", "0"]
+    assert table["plain"][-3:] == ["-", "-", "-"]
+    assert "*Zero denominator*" in report.split("## Missing pairs by cause")[1]
+
+
+def test_s13_a_report_with_no_ratio_contrast_has_none_of_its_columns_notes_or_sections():
+    """S13, C29: a study without a ratio contrast gets the report it got before ratio contrasts existed."""
+    report = render(analysis(contrast("plain", "difference")))
+    assert not [word for word in ("Ratio", "Zero denominator", "Numerator None", "ln(") if word in report]
+    assert table_of(report, "### Pairs of the family's contrasts")["Contrast"][-1] == "Outcome None (other)"
+
+
+def test_s13_an_untestable_ratio_contrast_names_the_rule_that_took_its_pairs():
+    """S13, S11: every cell excluded is untestable, and the row says the zero rule took the pairs."""
+    nothing = {"estimate": math.nan, "p_value": math.nan, "ci_low": math.nan, "ci_high": math.nan, "n_clusters": 0}
+    dry = ratio_contrast(conclusion="untestable", n_pairs=0, **nothing)
+    report = render(analysis(dry))
+    assert row(report, "spend-per-win")[11] == "0 (missing: numerator None at denominator 0 1, zero denominator 3)"
+    assert table_of(report, "## Ratio contrasts")["spend-per-win"][7:] == ["n/a", "[n/a, n/a]"]
+
+
+BY_MODEL = (
+    ModelEstimate("model-a", math.log(4.0), math.log(2.0), math.log(8.0), 0),
+    ModelEstimate("model-b", math.log(1.25), math.log(0.8), math.log(2.0), 3),
+)
+
+
+def by_model_contrast(name="spend-per-win") -> ContrastResult:
+    """A ratio contrast estimated per (model, group) cell and tested over groups, with each model's estimate from the
+    same draws of the groups; one cell lost to a zero denominator."""
+    lost = {**NO_CELL_LOST, "zero_denominator": 1}
+    return ratio_contrast(name, estimation_unit=("model", "group"), per_model=BY_MODEL, n_cells=23, cells_lost=lost)
+
+
+def test_s13_the_ratio_contrasts_table_names_each_contrasts_estimation_and_independent_units():
+    """S13: the estimation unit decides the estimand and the independent unit what Clusters, the test and the
+    resampling count, so the report names both, with the cells used and lost."""
+    report = render(analysis(by_model_contrast(), ratio_contrast("pooled-per-win")))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["spend-per-win"][3:6] == ["model, group", "group", "23 (lost: zero denominator 1)"]
+    assert table["pooled-per-win"][3:6] == ["group", "group", "12"]
+    notes = report.split("## Ratio contrasts")[1]
+    assert "never counted as independent" in notes
+    assert "each model weighing the same" in notes
+
+
+def test_s13_a_ratio_contrast_by_model_shows_each_models_ratio_as_an_exploratory_breakdown():
+    """S13: each model's log ratio, its ratio and its interval, under a heading that says it is no test."""
+    report = render(analysis(by_model_contrast()))
+    table = table_of(report, "### Ratio contrasts by model (exploratory)")
+    assert table["Contrast"] == ["Contrast", "Model", "Estimate", "Ratio (A / B)", "Ratio interval"]
+    lines = report.split("### Ratio contrasts by model (exploratory)")[1].splitlines()
+    first, second = ([cell.strip() for cell in line.strip("|").split(" | ")] for line in lines if "| spend" in line)
+    assert first == ["spend-per-win", "model-a", "1.386", "4", "[2, 8]"]
+    assert second[1:3] == ["model-b", "0.2231"]
+    assert "no test of its own" in report.split("### Ratio contrasts by model (exploratory)")[1]
+
+
+def test_s13_a_report_whose_ratio_contrasts_pool_the_models_has_no_breakdown_by_model():
+    """S13: a pooled key has no estimate by model, so the report has no section for one."""
+    report = render(analysis(ratio_contrast()))
+    assert "## Ratio contrasts" in report
+    assert "### Ratio contrasts by model" not in report
 
 
 # --- an equivalence family (S15) --------------------------------------------------------------------------------------

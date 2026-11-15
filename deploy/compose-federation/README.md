@@ -341,6 +341,9 @@ command_timeout_s = 300                # a stop waits for its grace period, 120 
 
 [faults.services]
 pine = "pine"                          # provider name -> Compose service
+
+[tokens]
+margin_s = 4020                        # outlives the restore and its gate, which load_faults requires: 600 + 3 x (300 + 600) + 180 + 240 + 300
 ```
 
 ```sh

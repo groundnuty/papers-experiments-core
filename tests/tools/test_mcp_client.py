@@ -387,3 +387,37 @@ def test_l16_inside_the_loop_the_bound_does_not_extend_the_loops_time_cap(frozen
     assert limits.time_cap_s <= elapsed < limits.time_cap_s + 30
     assert (result.outcome.name, result.outcome.infra_kind) == ("time_cap", None)
     assert [t.status for t in result.tool_calls] == ["cut"]
+
+
+def test_l17_the_mcp_provider_says_it_is_a_tool_server(frozen):
+    """L17: the declared per-call bound is for a tool server's tools, and this is the provider that says it is one."""
+    assert McpToolProvider.tool_server is True
+    assert provider(frozen).tool_server is True
+
+
+def test_l17_a_tool_server_that_hangs_ends_the_run_at_the_declared_bound_as_knowledge_infrastructure(
+    frozen_with_stall,
+):
+    """L17: the real client, in the loop, under a declared bound of 1 s with 60 s of the agent's time: the call is
+    handed the bound, the server never answers, and the run ends within a few seconds as `knowledge` infrastructure
+    naming the tool and the bound, not at the agent's cap. The record names the tools the bound reached."""
+    limits = Limits(
+        max_tool_rounds=5, time_cap_s=60.0, token_budget=100_000, output_cap_chars=2000, max_output_tokens=512
+    )
+    config = AgentConfig(limits, tool_server_call_bound_s=1.0)
+
+    async def go():
+        async with provider(frozen_with_stall, "echo,stall") as p:
+            box = ToolBox([p], cap_chars=limits.output_cap_chars)
+            backend = StubAdapter([[("stall", {})], "never"])
+            began = time.monotonic()
+            result = await run_agent(backend, box, "system", "task", config)
+            return result, time.monotonic() - began
+
+    result, elapsed = asyncio.run(go())
+    assert elapsed < 30
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "knowledge")
+    assert "'stall'" in result.outcome.detail
+    assert "within 1 s" in result.outcome.detail
+    assert [t.status for t in result.tool_calls] == ["failed"]
+    assert result.config["tool_server_tools"] == ["echo", "stall"]

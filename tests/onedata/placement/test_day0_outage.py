@@ -176,6 +176,23 @@ def test_o28_the_provider_is_taken_down_seen_down_and_restored_and_nothing_is_le
     assert entry.facts["cleanup_verified"] is True
 
 
+def test_o35_with_a_heal_declared_the_check_passes_on_the_default_token_margin_when_no_pair_is_stuck(
+    tmp_path, context, fake, relay, tools_manifest, services, world
+):
+    """O35, O28: the check reads through its sandbox and tool server after the restore, so both still run while the
+    injector restores. The restore always runs, and only a heal is skipped while they run, so with a heal declared, the
+    default token margin and no pair stuck the check passes as it does without a heal."""
+    target = write_target(
+        tmp_path / "healing", fake, relay, tools_manifest, extra=lambda data: data["faults"].update(heal="link")
+    )
+    assert load_platform(target).tokens.margin_s == 900
+    entry = outage_check(context, target=target)
+    assert entry.ok is True, entry.summary
+    assert services.verbs() == ["stop", "start"]
+    assert world.down == set()
+    assert entry.facts["restore"]["verified"] is True
+
+
 def test_o28_the_outage_is_the_fault_injectors_journalled_held_exclusively_and_settled(context, platform, services):
     """O28: the provider is taken down by the fault injector of #27, not a copy of it: the injection is journalled
     before the stop and cleared after the restore, and while it is down the federation is held exclusively by an
@@ -957,9 +974,12 @@ def test_o28_the_agents_tokens_are_minted_for_the_scenarios_worst_case(
     """O28: the sandbox's and the tool server's tokens are minted for the longest the scenario can need them (the
     injector's waits, and a settle of 600 s for the wait for the target and for each re-read among them) plus a margin,
     never for a fixed 1800 s that a slow restore outlasts."""
-    target = write_target(
-        tmp_path / "slow", fake, relay, tools_manifest, lambda data: data["faults"].update(settle_timeout_s=600)
-    )
+
+    def slow(data):
+        data["faults"].update(settle_timeout_s=600)
+        data["tokens"] = {"margin_s": 2600}  # a restore of these bounds outgrows the default margin (2,585 s)
+
+    target = write_target(tmp_path / "slow", fake, relay, tools_manifest, slow)
     seen = []
     real_launch, real_server = SandboxPlatform.launch, SandboxPlatform.tool_server
 

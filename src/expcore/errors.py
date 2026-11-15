@@ -34,7 +34,9 @@ nothing sent. Such a kind is never treatable, and an attempt that ends in it cos
 
 A failure may name its target, what failed, by a position label from the platform's configuration (`providers[1]`,
 `TARGET_LABEL`). A condition whose manipulation takes one target down declares the kind with that target, and only a
-failure of that target, while the run's fault injector held it down, is its treatment (`Outcome.is_treatment`).
+failure of that target, while the run's fault injector held it down, is its treatment (`Outcome.is_treatment`). A kind
+that is a fault on one target is registered with `requires_target=True` (`targeted_kinds`): a condition cannot declare
+it without the target, and it is never scored as a treatment without one (C34).
 """
 
 from __future__ import annotations
@@ -68,6 +70,11 @@ CORE_KINDS = (
 TOOL_PLANE_INTEGRITY = "tool_plane_integrity"
 BUDGET_HOLD = "budget_hold"
 POST_CHECK_UNVERIFIED = "post_check_unverified"
+# The fault injector's outage: a fault on one target, held to its declared target by the core whoever registers the kind.
+# The name is the core's, as the injector's reading is (`expcore.records.injections`), so a study that declares a kind of
+# this name of its own (`[study.kinds]`) in a process that never imported a platform is held to it too.
+PROVIDER_OUTAGE = "provider_outage"
+TARGETED_NAMES = frozenset({PROVIDER_OUTAGE})
 # The core's kinds that no condition may declare as its treatment, and why.
 CORE_UNTREATABLE: dict[str, str] = {
     TOOL_PLANE_INTEGRITY: "a run whose tool plane failed its integrity checks says nothing about the manipulation",
@@ -82,6 +89,7 @@ TARGET_LABEL = re.compile(r"[a-z][a-z0-9_]*\[(0|[1-9][0-9]*)\]")
 _platform_kinds: dict[str, str] = {}  # process-wide: a platform registers its kinds once, when its module is imported
 _platform_untreatable: dict[str, str] = {}
 _platform_uncharged: dict[str, str] = {}  # a platform's holds: kinds that cost a run no attempt (`charged=False`)
+_platform_targeted: dict[str, str] = {}  # a platform's faults on one target: kinds that need one (`requires_target`)
 
 
 class StudyKind(NamedTuple):
@@ -199,7 +207,9 @@ def _leave_scope(declared: Mapping[str, StudyKind]) -> None:
         _study_kinds = held
 
 
-def register_infra_kind(kind: str, description: str, *, treatable: bool = True, charged: bool = True) -> None:
+def register_infra_kind(
+    kind: str, description: str, *, treatable: bool = True, charged: bool = True, requires_target: bool = False
+) -> None:
     """Add a platform's infrastructure kind to the vocabulary, for the whole process; doing so again is harmless.
 
     A platform calls it once, when its module is imported. A study that declares one of the kinds as a treatment lists
@@ -211,10 +221,24 @@ def register_infra_kind(kind: str, description: str, *, treatable: bool = True, 
     attempt, as `budget_hold` does (`uncharged_kinds`); it must be untreatable, since a held start is never a
     manipulation, and it cannot be made charged, or uncharged, by registering it again. A kind of the study in scope
     (`study_kinds`) is refused: the two would be one kind with two owners.
+
+    A kind registered with `requires_target=True` is a fault on one target (a provider taken down), listed by
+    `targeted_kinds`. Its failure names a target and a condition cannot declare it as its treatment without naming the
+    target it manipulates: the plain name would score any target's failure as the manipulation, so the factor schema
+    refuses it and `Outcome.is_treatment` never scores such a kind that has no declared target. It must be treatable,
+    since a kind that is never a treatment has no declaration to name a target in, and it cannot be made targetless,
+    or a plain kind targeted, by registering it again. The name `provider_outage` is held to a target whoever registers
+    it, and is refused without `requires_target=True`.
     """
     _check_name(kind, description)
     if not charged and treatable:
         raise ValueError(f"infrastructure kind {kind!r} costs no attempt, so it must be registered treatable=False")
+    if requires_target and not treatable:
+        raise ValueError(f"infrastructure kind {kind!r} is never a treatment, so it names no target to require")
+    if kind in TARGETED_NAMES and not requires_target:
+        raise ValueError(
+            f"infrastructure kind {kind!r} is a fault on one target, so it must be registered requires_target=True"
+        )
     with _scope_lock:
         if kind in _study_kinds:
             raise ValueError(f"infrastructure kind {kind!r} is declared by the study in scope ([study.kinds])")
@@ -224,9 +248,12 @@ def register_infra_kind(kind: str, description: str, *, treatable: bool = True, 
         if kind in _platform_kinds and (kind in _platform_uncharged) == charged:
             held = "costing no attempt" if kind in _platform_uncharged else "charged"
             raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
+        if kind in _platform_kinds and (kind in _platform_targeted) != requires_target:
+            held = "requiring a target" if kind in _platform_targeted else "not requiring a target"
+            raise ValueError(f"infrastructure kind {kind!r} is already registered as {held}")
         if kind not in _platform_kinds:
-            # whether it is treatable, and whether it is charged, are written first, so a reader without the lock never
-            # sees the kind without them
+            # whether it is treatable, whether it is charged and whether it requires a target are written first, so a
+            # reader without the lock never sees the kind without them
             if treatable:
                 _platform_untreatable.pop(kind, None)
             else:
@@ -235,6 +262,10 @@ def register_infra_kind(kind: str, description: str, *, treatable: bool = True, 
                 _platform_uncharged.pop(kind, None)
             else:
                 _platform_uncharged[kind] = description
+            if requires_target:
+                _platform_targeted[kind] = description
+            else:
+                _platform_targeted.pop(kind, None)
             _platform_kinds[kind] = description
 
 
@@ -246,12 +277,13 @@ def uncharged_kinds() -> frozenset[str]:
 
 
 class _View(NamedTuple):
-    """The vocabulary at one moment: the platforms' kinds, those of them that are untreatable, and the study kinds in
-    scope. Readers compute from one view, so they never mix two moments."""
+    """The vocabulary at one moment: the platforms' kinds, those of them that are untreatable or require a target, and
+    the study kinds in scope. Readers compute from one view, so they never mix two moments."""
 
     platform: Mapping[str, str]
     untreatable: Mapping[str, str]
     study: Mapping[str, _HeldKind]
+    targeted: frozenset[str] = frozenset()
 
     def kinds(self) -> tuple[str, ...]:
         return (*CORE_KINDS, *self.platform, *self.study)
@@ -267,7 +299,8 @@ class _View(NamedTuple):
 def _view() -> _View:
     """Take one view of the vocabulary under the lock: registration and scopes change it under the same lock."""
     with _scope_lock:
-        return _View(dict(_platform_kinds), dict(_platform_untreatable), _study_kinds)
+        targeted = frozenset(k for k in _platform_targeted if k in _platform_kinds) | TARGETED_NAMES
+        return _View(dict(_platform_kinds), dict(_platform_untreatable), _study_kinds, targeted)
 
 
 def infra_kinds() -> tuple[str, ...]:
@@ -284,6 +317,30 @@ def vocabulary() -> tuple[tuple[str, ...], dict[str, str]]:
     """Return every kind and the untreatable ones with their reasons, from one view, for a caller that needs both."""
     view = _view()
     return view.kinds(), view.untreatable_kinds()
+
+
+class Vocabulary(NamedTuple):
+    """The vocabulary a condition's treatment is checked against, from one view: every kind, the ones that can never be
+    a treatment with their reasons, and the ones that need a declared target (`register_infra_kind(requires_target)`)."""
+
+    kinds: tuple[str, ...]
+    untreatable: dict[str, str]
+    targeted: frozenset[str]
+
+
+def treatment_vocabulary() -> Vocabulary:
+    """Return what a condition's treatment declaration is checked against, all from one view: a scope leaving between
+    two reads cannot let an untreatable kind through, and a kind cannot be known in one moment and targeted in another."""
+    view = _view()
+    return Vocabulary(view.kinds(), view.untreatable_kinds(), view.targeted)
+
+
+def targeted_kinds() -> frozenset[str]:
+    """Return the kinds that are a fault on one target: a condition declares them as its treatment only with the target
+    it manipulates (`register_infra_kind(..., requires_target=True)`), and `Outcome.is_treatment` never scores one that
+    has none. They are the platforms' registered with `requires_target=True` and the names the core holds to a target
+    whoever registers them (`TARGETED_NAMES`, the provider outage), a study's own kind of such a name included."""
+    return _view().targeted
 
 
 def is_treatable(kind: str) -> bool:
@@ -369,8 +426,9 @@ class CallTimedOut(InfraError):
     It is its own class so that a caller that bounds a call itself, as the day-0 outage check does, can tell the bound's
     expiry from a server that closed or failed, and so that the loop can tell it from a failure it has no other
     explanation for: inside the loop the bound is the agent's time left, so an expiry that arrives with the agent's
-    time used up is the loop's own cut and is judged as one (`Watcher`), unless the study declared a per-call bound
-    (L17) and it is the shorter, which is then the call's own failure. `tool` and `bound_s` are what the detail says.
+    time used up is the loop's own cut and is judged as one (`Watcher`), unless the call is to a tool server and the
+    study declared a per-call bound for those (L17) that is the shorter, which is then the call's own failure. `tool`
+    and `bound_s` are what the detail says.
     """
 
     def __init__(self, tool: str, bound_s: float):

@@ -96,7 +96,7 @@ from expcore.replay.check import (
 )
 from expcore.replay.native import has_native_parser
 from expcore.report import render_report
-from expcore.stats.analysis import AnalysisResult, TreatmentOutcomesRefused, analyse
+from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 from expcore.study.config import (
     MODELS_FILE,
@@ -639,7 +639,7 @@ def _analyse_loaded(
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
     try:
         result = analyse(rows, study.prereg, _absent_runs(export))
-    except TreatmentOutcomesRefused as error:
+    except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)

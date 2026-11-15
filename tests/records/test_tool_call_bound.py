@@ -7,7 +7,7 @@ started (never a null), and from every call of a record that predates the field.
 """
 
 import pytest
-from loop_support import FakeClock
+from loop_support import FakeClock, FakeProvider
 from record_support import record_run
 
 from expcore.records.record import RunRecord, decode
@@ -112,9 +112,9 @@ def test_l17_an_undeclared_bound_leaves_agent_config_as_it_was_and_a_declared_on
     """L17: absent when the study declared none, never a null; present, as the number, when it declared one. The digest
     of the configuration covers it, and the record loads and writes back to its bytes."""
     plain = record_run(["hello"], {})
-    assert "tool_call_bound_s" not in plain.agent_config
-    declared = record_run(["hello"], {}, tool_call_bound_s=60.0)
-    assert declared.agent_config["tool_call_bound_s"] == 60.0
+    assert "tool_server_call_bound_s" not in plain.agent_config
+    declared = record_run(["hello"], {}, tool_server_call_bound_s=60.0)
+    assert declared.agent_config["tool_server_call_bound_s"] == 60.0
     assert declared.agent_config_sha256 != plain.agent_config_sha256
     text = declared.dumps()
     assert validate(decode(text)) == V3
@@ -128,9 +128,9 @@ def test_l17_an_undeclared_bound_leaves_agent_config_as_it_was_and_a_declared_on
 def test_l17_a_declared_bound_in_a_record_is_a_positive_finite_number(bad):
     """L17: the same rule the configuration holds, checked when a record is loaded. A null is refused: the writer leaves
     the key out when nothing was declared."""
-    data = decode(record_run(["hello"], {}, tool_call_bound_s=60.0).dumps())
-    data["agent_config"]["tool_call_bound_s"] = bad
-    with pytest.raises(RecordError, match=r"agent_config\.tool_call_bound_s"):
+    data = decode(record_run(["hello"], {}, tool_server_call_bound_s=60.0).dumps())
+    data["agent_config"]["tool_server_call_bound_s"] = bad
+    with pytest.raises(RecordError, match=r"agent_config\.tool_server_call_bound_s"):
         validate(data)
 
 
@@ -138,6 +138,60 @@ def test_l17_a_record_of_version_two_that_holds_a_bound_is_refused():
     """L17: the setting is version 3's, so a record that names version 2 and holds it is unknown to its own version."""
     data = decode(record_run(["hello"], {}, record_options={"schema_version": V2}).dumps())
     assert validate(data) == V2
+    data["agent_config"]["tool_server_call_bound_s"] = 60.0
+    with pytest.raises(RecordError, match=r"agent_config: unknown field\(s\) \['tool_server_call_bound_s'\]"):
+        validate(data)
+
+
+def test_l17_a_declared_bound_is_recorded_with_the_tools_it_reached_and_an_undeclared_one_with_none():
+    """L17: `agent_config.tool_server_tools` names the tools of the tool servers, the ones the bound reached, so a
+    reader can see that the code tool was not among them. It is written beside the bound and only with it."""
+    server = FakeProvider({"search": lambda args: "found"}, tool_server=True)
+    code = FakeProvider({"python": lambda args: "42"})
+    declared = record_run(["hello"], {}, providers=[code, server], tool_server_call_bound_s=60.0)
+    assert declared.agent_config["tool_server_tools"] == ["search"]
+    assert list(declared.agent_config)[-2:] == ["terminal_tools", "tool_server_tools"]
+    alone = record_run(["hello"], {}, providers=[code], tool_server_call_bound_s=60.0)
+    assert alone.agent_config["tool_server_tools"] == []  # a bound that reached no tool says so
+    plain = record_run(["hello"], {}, providers=[code, server])
+    assert "tool_server_tools" not in plain.agent_config  # no bound: no list, and the configuration is what it was
+    for record in (declared, alone):
+        text = record.dumps()
+        assert validate(decode(text)) == V3
+        assert replay_record(RunRecord.from_json(decode(text))).dumps() == text
+
+
+def test_l17_the_old_name_of_the_bound_is_unknown_to_a_record():
+    """L17: `tool_call_bound_s` is not a field of any version: a record that holds it is refused, never read as the
+    new one."""
+    data = decode(record_run(["hello"], {}).dumps())
     data["agent_config"]["tool_call_bound_s"] = 60.0
     with pytest.raises(RecordError, match=r"agent_config: unknown field\(s\) \['tool_call_bound_s'\]"):
+        validate(data)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda c: c.pop("tool_server_tools"), r"agent_config\.tool_server_tools: held when"),
+        (lambda c: c.pop("tool_server_call_bound_s"), r"agent_config\.tool_server_tools: held when"),
+        (lambda c: c.update(tool_server_tools="search"), r"agent_config\.tool_server_tools: a list of tool names"),
+        (lambda c: c.update(tool_server_tools=[None]), r"agent_config\.tool_server_tools: a list of tool names"),
+    ],
+    ids=["missing", "without-a-bound", "text", "not-names"],
+)
+def test_l17_the_list_of_tool_servers_is_a_list_of_names_written_with_the_bound_and_only_with_it(change, message):
+    """L17: the replay judges a cut call by the list, so a record whose list is missing under a bound, held without
+    one, or not a list of names is refused when it is loaded."""
+    data = decode(record_run(["hello"], {}, tool_server_call_bound_s=60.0).dumps())
+    change(data["agent_config"])
+    with pytest.raises(RecordError, match=message):
+        validate(data)
+
+
+def test_l17_a_record_of_version_two_that_holds_the_list_is_refused():
+    """L17: the list is version 3's, as the bound it belongs to is."""
+    data = decode(record_run(["hello"], {}, record_options={"schema_version": V2}).dumps())
+    data["agent_config"]["tool_server_tools"] = []
+    with pytest.raises(RecordError, match=r"agent_config: unknown field\(s\) \['tool_server_tools'\]"):
         validate(data)
