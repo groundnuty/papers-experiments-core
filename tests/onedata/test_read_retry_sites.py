@@ -240,6 +240,7 @@ HELPER_USERS = {
     },
     "eviction.py": {
         "provisioner.verify_space",
+        "provisioner.await_visible",  # before each eviction, apart: a read that fails there is no lost eviction
         "provisioner.schedule_transfer",
         "provisioner.resolve",
         "provisioner.walk",

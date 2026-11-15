@@ -17,6 +17,7 @@ import pytest
 from qos_world import FILES, federation, provisioner_with, two_providers
 
 from expcore_onedata.client import OnezoneClient, PlatformError
+from expcore_onedata.eviction import evict_ids
 from expcore_onedata.reset import ResetFailed, SpaceReset
 from expcore_onedata.testing import BETA_ID, DATA, write_platform
 
@@ -427,3 +428,29 @@ def test_o29_an_instruments_read_of_the_root_or_a_path_takes_no_policy(p, broken
     with pytest.raises(ValueError, match=r"takes no policy"):
         p.resolve(FILES[0], wait=False, retry=p.reading_retry())
     assert broken.sent == []
+
+
+VISIBILITY_SIZE = route("GET", r"/data/[^/]+", "alpha.test", query="attribute=name&attribute=size&attribute=parent_id")
+
+
+def test_o09_a_read_that_fails_before_the_eviction_is_sent_is_a_failed_read_never_a_lost_eviction(
+    p, fake, broken, ticker
+):
+    """O09: the size read of the visibility wait before an eviction fails to connect. Nothing was sent, so it is a
+    failed read and fails the stage, never an eviction whose answer was lost: beta holds nothing of the file, and the
+    stage does not pass on the empty map as though an eviction had gone out."""
+    fake.blocks.pop((fake.id_of(FILES[0]), BETA_ID))
+    broken.on(VISIBILITY_SIZE, CONNECT, times=None)
+    with pytest.raises(ResetFailed, match=r"GET failed \(ConnectError\)") as caught:
+        run(p, ticker, evict={"beta": [FILES[0]]})
+    assert caught.value.stage == "eviction"
+    assert broken.count(EVICTIONS) == 0
+
+
+def test_o09_an_eviction_without_a_quiet_check_raises_a_lost_answer_as_before(p, fake, broken):
+    """O09: only a caller that checks no transfer is running before the block maps are read (the reset's `quiet`) can
+    judge a lost eviction by the maps; without one, a lost answer is raised as before, after one request."""
+    broken.on(EVICTIONS, applied_then_lost(fake))
+    with pytest.raises(PlatformError, match=r"POST failed \(ReadError\)"):
+        evict_ids(p, [fake.id_of(FILES[0])], "beta")
+    assert broken.count(EVICTIONS) == 1

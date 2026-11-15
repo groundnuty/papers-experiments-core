@@ -52,6 +52,9 @@ schedules its files (or its tree) again: with no transfer id there is no record 
 check, which waits for every job listed waiting or ongoing, the lost one among them, and then the block maps decide,
 the same verification as for any other attempt. An eviction already applied counts as done; one that never was leaves
 bytes the last attempt's bound fails closed on. The record counts such evictions (`unanswered`) when there was one.
+Only a caller that gives a `quiet` check judges a lost eviction so; without one the failure is raised, as it always
+was. The reads before the request (the visibility wait) are made apart, so one that fails is a failed read, never a
+lost eviction.
 
 **A caller can watch.** `scheduled` is told each attempt's transfer ids when they are sent, `ended` the same ids once
 their records have reported an ended state on the evicting provider (before `quiet` runs), and a `consistency.WaitLog`
@@ -229,14 +232,22 @@ class _Watch:
     reads: ReadRetry | None = None
 
 
-def _sent(provisioner: Provisioner, provider: str, send: Callable[[], str]) -> str | None:
-    """Send one eviction (`send` returns its transfer id); None when it went past the gate and its answer was lost
-    (`client.sent_unanswered`), which is never sent again: the block maps decide. Any other failure propagates, a
-    request the gate refused unsent (`NotSent`) among them."""
+def _sent(
+    provisioner: Provisioner, provider: str, entry_id: str, *, judged: bool, reads: ReadRetry | None
+) -> str | None:
+    """Send one eviction of a file or a directory (`entry_id`) from `provider`, its gate's reads under `reads`, and
+    return its transfer id. What must hold before it goes is read first and apart: the space was verified by the caller,
+    and the entry's visibility there (`Provisioner.await_visible`) is waited for here, so a read that fails before the
+    request is sent propagates as the failed read it is; `schedule_transfer` then finds both kept and reads neither
+    again. Only the request itself can come back unanswered (`client.sent_unanswered`): when the caller judges every
+    eviction by the block maps once no transfer is listed running (`judged`, the reset's `quiet`), that is None, and it
+    is never sent again; otherwise it is raised, as it always was. Any other failure propagates, a request the gate
+    refused unsent (`NotSent`, `ScopeUnread`) among them."""
+    provisioner.await_visible(provider, [entry_id])
     try:
-        return send()
+        return provisioner.schedule_transfer("eviction", entry_id, provider, gate_retry=reads)
     except PlatformError as error:
-        if not sent_unanswered(error):
+        if not judged or not sent_unanswered(error):
             raise
         log.warning(
             "%s%s: an eviction was sent and its answer was lost (%s); it is never sent again, the block maps decide",
@@ -349,13 +360,9 @@ def evict_ids(
     provisioner.verify_space(retry=reads)
 
     def send(fid: str) -> str | None:
-        return _sent(
-            provisioner,
-            from_provider,
-            lambda: provisioner.schedule_transfer("eviction", fid, from_provider, gate_retry=reads),
-        )
+        return _sent(provisioner, from_provider, fid, judged=quiet is not None, reads=reads)
 
-    def schedule(pending: Sequence[str]) -> tuple[list[str], list[str]]:
+    def schedule(pending: Sequence[str]) -> tuple[list[str], list[str], int]:
         sent = consistency.bounded_map(send, list(pending), provisioner.settings.concurrency)
         lost = [fid for fid, tid in zip(pending, sent, strict=True) if tid is None]
         return [tid for tid in sent if tid is not None], lost, len(lost)
@@ -394,12 +401,8 @@ def evict_tree(
     if listed is not None:
         listed(files)
 
-    def schedule(pending: Sequence[str]) -> tuple[list[str], list[str]]:
-        tid = _sent(
-            provisioner,
-            from_provider,
-            lambda: provisioner.schedule_transfer("eviction", directory.file_id, from_provider, gate_retry=reads),
-        )
+    def schedule(pending: Sequence[str]) -> tuple[list[str], list[str], int]:
+        tid = _sent(provisioner, from_provider, directory.file_id, judged=quiet is not None, reads=reads)
         return ([tid], [], 0) if tid is not None else ([], list(pending), 1)
 
     done = _evict_verified(provisioner, from_provider, files, schedule, quiet, _Watch(scheduled, ended, waits, reads))
