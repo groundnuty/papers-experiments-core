@@ -50,6 +50,7 @@ from typing import Any
 
 from expcore_onedata import consistency, resetqos
 from expcore_onedata.client import PlatformError, answered_absent
+from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import Provisioner, ProvisionError
 from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferrecord import Unreadable
@@ -156,20 +157,23 @@ def barrier(p: Provisioner, providers: Sequence[str], entries: dict[str, str]) -
 
 
 def remove(
-    p: Provisioner, providers: Sequence[str], baseline: Iterable[str]
-) -> tuple[dict[str, Any], dict[str, int], int]:
+    p: Provisioner, providers: Sequence[str], baseline: Iterable[str], found: resetqos.Found | None = None
+) -> tuple[dict[str, Any], dict[str, int], int, Listing]:
     """Find every requirement, and remove each one not in `baseline`: wait until it is fulfilled on every provider,
     delete it through the gate, wait until every provider has processed the deletion, and show by a second scan that
     none is left but the baseline's. Return the stage's facts, the affected files (those the removed requirements
-    applied to, each with its depth) and the depth of the deepest regular file of the space, from the first scan."""
+    applied to, each with its depth), the depth of the deepest regular file of the space, from the first scan, and the
+    files and hard links any provider's listing showed, in either scan. `found`, when given, is the first scan, made by
+    the caller (a planner's, `resetplan.py`) on the same space and providers; the second scan is always made here."""
     kept = frozenset(baseline)
-    found = resetqos.scan(p, providers)
+    scanned = found is not None
+    found = found if found is not None else resetqos.scan(p, providers)
     added = {qid: where for qid, where in found.where.items() if qid not in kept}
-    facts: dict[str, Any] = {"scan": p.settings.qos_scan, "found": len(found.where)}
+    facts: dict[str, Any] = {"scan": "given" if scanned else p.settings.qos_scan, "found": len(found.where)}
     facts["kept"] = len(found.where) - len(added)
     affected = {file_id: depth for qid in added for file_id, depth in found.files[qid].items()}
     waits: dict[str, Any] = {"fulfil_s": 0.0, "fulfil_polls": 0, "impossible": 0, "barrier_s": 0.0, "barrier_polls": 0}
-    reads = dict(found.reads)
+    reads, listing = dict(found.reads), found.listing
     if added:
         waits, entries = fulfilled(p, providers, sorted(added))
         for qid, provider in added.items():
@@ -180,8 +184,9 @@ def remove(
         if left:
             raise ProvisionError(f"the scan after the removals still finds {len(left)} QoS requirement(s) not kept")
         reads = {k: reads.get(k, 0) + again.reads.get(k, 0) for k in reads.keys() | again.reads.keys()}
+        listing |= again.listing
     facts.update(removed=len(added), affected_files=len(affected), **waits, reads=reads)
-    return facts, affected, found.deepest
+    return facts, affected, found.deepest, listing
 
 
 __all__ = ["BARRIER_BOUND_S", "SETTLED", "STATUSES", "barrier", "fulfilled", "remove"]

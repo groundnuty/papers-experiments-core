@@ -36,7 +36,14 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import shard_accounting
-from expcore.report_notes import NO_KIND, SHARD_KIND_NOTES, SHARD_NOTES, SHARD_TIME_NOTES, UNKNOWN
+from expcore.report_notes import (
+    NO_KIND,
+    SELECTION_NOTES,
+    SHARD_KIND_NOTES,
+    SHARD_NOTES,
+    SHARD_TIME_NOTES,
+    UNKNOWN,
+)
 
 NOT_RECORDED = "not recorded"
 UNKNOWN_KIND = "unknown"  # a kind an attempt did not record (a database from before the column)
@@ -69,18 +76,35 @@ def _shards_by_index(export: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return sorted(export["shards"], key=lambda shard: shard["index"])
 
 
+def _selections(export: Mapping[str, Any]) -> dict[int, str]:
+    """Each selection of a batch merged from selections of its campaign (C38), by index: its label with its levels,
+    as `run --select` gave them (`first (stage=early,mid)`); empty for a batch merged from shards."""
+    shards = export["shards"]
+    named = {}
+    for shard in shards if isinstance(shards, list) else ():
+        if isinstance(shard, Mapping) and isinstance(shard.get("selection"), Mapping):
+            levels = sorted(shard["selection"].items())
+            text = " ".join(f"{name}={','.join(map(str, values))}" for name, values in levels)
+            named[shard.get("index")] = f"{shard.get('label')} ({text})"
+    return named
+
+
 def _runs_table(export: Mapping[str, Any], table: Table) -> list[str]:
-    """One row per shard and condition: the runs by how they ended, and the rates of the first three."""
-    header = ["Shard", "Started (UTC)", "Condition", "Planned", "Analysed", "Exhausted", "Unfinished", "Left out"]
+    """One row per shard and condition: the runs by how they ended, and the rates of the first three. A merge of
+    selections names each selection with its levels, so the report says which batch ran which runs."""
+    cells = shard_accounting(export)  # refuses a `shards` that cannot account for the runs, first
+    named = _selections(export)
+    header = ["Selection" if named else "Shard", "Started (UTC)", "Condition", "Planned", "Analysed", "Exhausted"]
+    header += ["Unfinished", "Left out"]
     rows = [
         [
-            cell["label"],
+            named.get(cell["shard"], cell["label"]),
             cell["started_utc"] or UNKNOWN,
             cell["condition"],
             *(cell[field] for field in RUN_COUNTS),
             *(_rate(cell[field], cell["planned"]) for field in RATES),
         ]
-        for cell in shard_accounting(export)
+        for cell in cells
     ]
     return table([*header, "Analysed %", "Exhausted %", "Unfinished %"], rows)
 
@@ -190,7 +214,7 @@ def shard_lines(export: Mapping[str, Any], table: Table) -> list[str]:
         "",
         *_runs_table(export, table),
         "",
-        *SHARD_NOTES,
+        *(SELECTION_NOTES if _selections(export) else SHARD_NOTES),
         "",
         "### Infrastructure attempts by shard and kind",
         "",

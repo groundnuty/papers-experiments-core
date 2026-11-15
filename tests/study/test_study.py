@@ -289,6 +289,25 @@ def test_c06_the_plugins_platform_settings_reach_the_campaign_fingerprint(study_
         load_plugin(context(study_dir))
 
 
+def test_c35_the_plugins_reset_settings_are_no_part_of_the_fingerprint_and_a_bad_value_is_refused_at_load(study_dir):
+    """C35: the settings the platform keeps out of the fingerprint ride on the plugin as `reset_settings`, empty by
+    default; they change no fingerprint, and a value that is no flat mapping of plain data is refused when the plugin
+    is loaded, naming the file and the key."""
+    study, plugin = load_study(study_dir), load_plugin(context(study_dir))
+    assert plugin.reset_settings == {}
+    given = dataclasses.replace(plugin, reset_settings={"placement.qos_scan": "listing"})
+    assert fingerprint_of(study, given) == fingerprint_of(study, plugin)
+    for bad, fragment in (
+        ('["placement.qos_scan"]', r"the plugin's reset_settings must be a mapping"),
+        ('{"placement.x": {"nested": 1}}', r"the plugin's reset_settings: .*placement\.x"),
+    ):
+        source = STUB_PLUGIN.replace("SCORERS", "[Scorer()]").replace("PROMPTS", "None")
+        source = source.replace("tools=hashes)", f"tools=hashes, reset_settings={bad})")
+        (study_dir / "plugin.py").write_text(source, encoding="utf-8")
+        with pytest.raises(ConfigError, match=rf"plugin\.py: {fragment}"):
+            load_plugin(context(study_dir))
+
+
 def test_a_tool_set_hashes_by_what_the_model_sees_and_not_by_the_order_it_was_listed_in():
     a = ToolSpec("a", "first")
     b = ToolSpec("b", "second", terminal=True)
