@@ -159,6 +159,37 @@ def test_up_runs_the_layers_check_and_writes_its_report_beside_the_facts(fed, fe
     assert record["pairs"][0]["seconds"] == 0.25
 
 
+@pytest.mark.parametrize("ok", [True, False])
+def test_up_writes_its_record_in_the_text_it_always_has_through_the_layers_writer(
+    fed, fedlinks, tmp_path, monkeypatch, ok
+):
+    """O35: the record is `json.dumps(report.to_json(), indent=2, sort_keys=True)` and a newline, as before the
+    restore's and the heal's checks began to write it; `up` writes it through `expcore_onedata.linkrecord`, the one
+    writer (atomic: a draft and a rename), and a failing report is written before up fails."""
+    layout = layout_with(fed, tmp_path, monkeypatch, two_providers)
+    pair = PairResult("providers[0]", "providers[1]", ok, 0.25, 65536 if ok else None, reason=None if ok else "stuck")
+    report = LinkReport(ok, "ok" if ok else "a provider link is stuck", (pair,), 1.0, 2.0)
+    monkeypatch.setattr(fedlinks, "check_links", lambda config, client: report)
+    written = []
+    real = fedlinks.write_record
+
+    def spy(made, path):
+        written.append((made, path))
+        real(made, path)
+
+    monkeypatch.setattr(fedlinks, "write_record", spy)
+    if ok:
+        fedlinks.check_after_up(layout, {"link-probes": "sp-probe-0009"})
+    else:
+        with pytest.raises(RuntimeError, match="not ready"):
+            fedlinks.check_after_up(layout, {"link-probes": "sp-probe-0009"})
+    assert written == [(report, tmp_path / "link-check.json")]
+    assert fedlinks.REPORT == "link-check.json"
+    expected = json.dumps(report.to_json(), indent=2, sort_keys=True) + "\n"
+    assert (tmp_path / "link-check.json").read_text(encoding="utf-8") == expected
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []  # no draft is left
+
+
 def test_a_stuck_pair_fails_up_naming_it(fed, fedlinks, tmp_path, monkeypatch):
     """O35: A stuck pair fails up naming it."""
     layout = layout_with(fed, tmp_path, monkeypatch, two_providers)

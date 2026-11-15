@@ -20,9 +20,19 @@ declared for raises ConfigError, naming the file and the table, never the servic
 injection stays open and the fault gate fails, as for a restore that never served, until a later clear finds every link
 transferring. `ServingProbe.matrix` is the same check pair by pair, which the heal of `[faults] heal` reads, and `arm`
 and `sessions` are the session gate that comes before it (`expcore_onedata.fault_sessions`).
+
+**Every one of those checks is recorded (O35, `expcore_onedata.linkrecord`).** The restore's check and each read of
+the pairs a heal makes, its re-check after the settle among them, write `link-check.json` beside platform.toml (the
+federation's root, beside `facts.json`, under `deploy/compose-federation`), atomically and in the format `up` writes, so
+the record on disk is the latest check's verdict and time: a passing re-check after a heal leaves a pass, a check that
+finds a pair stuck leaves its failing verdict over an older pass, and a check that raises removes the older record, as
+does one whose record cannot be written (logged, never failing the restore or the heal). The gate's own routine link
+check (`PlatformHealth`) writes none, and the record is read by no admission: it takes no lock and touches no epoch.
 """
 
+import logging
 from collections.abc import Callable
+from pathlib import Path
 
 from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient, PlatformError
@@ -30,10 +40,12 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import SessionGate
 from expcore_onedata.fault_settings import FaultSettings
-from expcore_onedata.linkcheck import check_links
+from expcore_onedata.linkcheck import LinkReport, check_links
+from expcore_onedata.linkrecord import RECORD, discard_record, write_record
 from expcore_onedata.readretry import ONE_ATTEMPT
 
 PROBE_TIMEOUT_S = 10.0
+log = logging.getLogger(__name__)
 
 
 def _path(config: PlatformConfig, provider: str) -> str:
@@ -85,11 +97,40 @@ class ServingProbe:
 
     def matrix(self, service: str) -> LinkMatrix | None:
         """The same check as a matrix of every pair by label, which the heal reads (`fault_heal`); None without a
-        `[link_check]`."""
+        `[link_check]`. Every check made here, a restore's and each read of the pairs a heal makes, is recorded as
+        `link-check.json` beside platform.toml, in the format `up` writes (`_checked`)."""
         self._provider(service)
         if self._config.link_check is None:
             return None
-        return LinkMatrix.from_report(check_links(self._config, self._client))
+        return LinkMatrix.from_report(self._checked())
+
+    def _checked(self) -> LinkReport:
+        """The platform layer's all-pairs check, and its record (`expcore_onedata.linkrecord`), pass or fail: the record
+        on disk is always the latest check's verdict, never an older one. A check that raises answers nothing, so the
+        older record is removed before the error goes on to the caller; a record that cannot be written is removed
+        too, and logged (its error's type only), and the check's answer is returned as made: the record is advisory,
+        and neither the restore's verdict nor the heal's depends on it. It touches no lock and no epoch
+        (`fault_epoch`)."""
+        path = self._config.file.parent / RECORD
+        try:
+            report = check_links(self._config, self._client)
+        except Exception:
+            self._discarded(path)
+            raise
+        try:
+            write_record(report, path)
+        except OSError as error:
+            log.warning("the link check's record could not be written (%s)", type(error).__name__)
+            self._discarded(path)
+        return report
+
+    @staticmethod
+    def _discarded(path: Path) -> None:
+        """Remove the record so that no older verdict stands; a removal that fails is logged, its type only."""
+        try:
+            discard_record(path)
+        except OSError as error:
+            log.warning("the older link check record could not be removed (%s)", type(error).__name__)
 
     def arm(self, service: str) -> str | None:
         """Before an injection: the session gate's probe file, found or written and seen by every provider of the probe
