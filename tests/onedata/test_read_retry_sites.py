@@ -281,6 +281,7 @@ NOT_THE_PROVISIONERS = {
     # the agent's tool `schedule_file_replication` through the tool server (MCP), which reaches no Onezone read of ours
     ("day0/outage_run.py", "Run.agent_baseline", "self.tools"),
     ("day0/outage_run.py", "Run.during", "tools"),
+    ("shared_holds.py", "SharedHolds.open_holds", "self"),  # the record of the tools' shared holds (O48)
 }
 
 # Modules whose every read measures: no site in them may ever name another policy, or call a helper that retries.
