@@ -29,9 +29,19 @@ space between its stages (`consistency.guard`), so a file created after the scan
 shows, the trash and a deleted file still open (the space's tmp directory), is not read; the counter may count it
 (the trash's, not the tmp directory's, by the source), and the event then shows the gap.
 
-**Bounded.** The reads go `[placement] concurrency` at a time, at most `READS_MAX` in one reading, its calls together,
-within `READ_BOUND_S`, looked at after every batch; past either the reading fails, closed, with the figures, never
-falling back on the counter.
+**Bounded.** The reads go `[placement] concurrency` at a time, at most `[placement] provider_concurrency` in flight at
+one provider for the whole process (`readslots.py`), at most `READS_MAX` in one reading, its calls together, within
+`READ_BOUND_S`, looked at after every batch; past either the reading fails, closed, with the figures, never falling
+back on the counter.
+
+**A connection failure is tried again, an answer never** (O29, O46). Each block-map read goes under the reading's own
+policy (`Provisioner.reading_retry`): a timeout or a connection that failed or was cut before its answer is tried
+again, four attempts with pauses of 2, 5 and 15 s, each retry on a fresh connection and within what is left of
+`READ_BOUND_S`. An answer decides at once: a 404 or a POSIX absence counts 0, any other error answer, a map that cannot
+be read or a provider's failed entry is unknown and fails the reading. A read still failing after its retries is
+unknown too, and fails the reading closed, as one failed read always did. The reading's record (`read_retry`, a failed
+reading's too) gives its reads, retries, failed attempts by error type, the reads that failed for good and the answers
+that were no plain success (`answers`: error statuses, a 404 among them, and unreadable maps), per provider.
 
 The counter is read only once no transfer runs on any provider (the caller makes sure, `reset.py`). Anything unknown
 raises, never a zero: a provider the answer leaves out or marks failed, a backend that failed (directory statistics
@@ -48,7 +58,7 @@ from expcore_onedata import consistency
 from expcore_onedata.client import PlatformError, answered_absent
 from expcore_onedata.placement import held_bytes, merged
 from expcore_onedata.provision import Provisioner, ProvisionError
-from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry
+from expcore_onedata.readretry import ONE_ATTEMPT, ReadRetry, recorded
 from expcore_onedata.transferrecord import Unreadable
 
 COUNTER_DISAGREES = "occupancy_counter_disagrees"  # the event of a counter that is not its files' sum
@@ -139,6 +149,7 @@ class Reading:
     files: dict[str, dict[str, int]]
     links: frozenset[str] = frozenset()
     carried: dict[str, int] = field(default_factory=dict)  # per provider, the files carried as empty, not read
+    read_retry: dict[str, Any] = field(default_factory=dict)  # the tally of its block-map reads (`ReadRetry.facts`)
 
     @property
     def reads(self) -> int:
@@ -159,13 +170,16 @@ class Reading:
 
     def facts(self, label: Label) -> dict[str, Any]:
         """The record's figures: the counter (`physical_bytes`, every provider), the files' sums, the reads, the
-        events; and the files carried as empty (`files_carried`) when a shortcut carried any."""
-        facts = {
+        events, the tally of the block-map reads (`read_retry`) when there is one; and the files carried as empty
+        (`files_carried`) when a shortcut carried any."""
+        facts: dict[str, Any] = {
             "physical_bytes": {label(q): n for q, n in self.counter.items()},
             "files_bytes": {label(q): self.held(q) for q in self.files},
             "files_read": self.reads,
             "events": self.events(label),
         }
+        if self.read_retry:
+            facts["read_retry"] = self.read_retry
         return {**facts, "files_carried": sum(self.carried.values())} if self.carried else facts
 
 
@@ -179,11 +193,13 @@ class OccupancyExceeded(ProvisionError):
 
 @dataclass
 class Budget:
-    """What one reading has spent of its bounds: when it began, and the block-map reads it has made, every call
-    together. Mutable on purpose: the calls of one reading share it."""
+    """What one reading has spent of its bounds: when it began, the block-map reads it has made, every call together,
+    and the reading's policy for them (`Provisioner.reading_retry`), whose tally is its record. Mutable on purpose: the
+    calls of one reading share it."""
 
     began: float
     reads: int = field(default=0)
+    retry: ReadRetry = field(kw_only=True)
 
 
 def read_files(
@@ -204,7 +220,7 @@ def read_files(
     held: dict[str, dict[str, int]] = {provider: {} for provider in wanted}  # filled in place: the reading it returns
     for start in range(0, len(pairs), step):
         chunk = pairs[start : start + step]
-        sizes = consistency.bounded_map(lambda key: _held(p, key, label), chunk, p.settings.concurrency)
+        sizes = consistency.bounded_map(lambda key: _held(p, key, label, budget), chunk, p.settings.concurrency)
         for (file_id, provider, _), size in zip(chunk, sizes, strict=True):
             held[provider][file_id] = size
         if p.clock() - budget.began > READ_BOUND_S:
@@ -215,13 +231,15 @@ def read_files(
     return held
 
 
-def _held(p: Provisioner, key: tuple[str, str, int], label: Label) -> int:
-    """The bytes one file's block map holds at one provider, read there. A map that cannot be read, an error or a
-    missing provider in the answer included, is unknown and raises, naming the provider and the file's position: it
-    never counts as 0."""
+def _held(p: Provisioner, key: tuple[str, str, int], label: Label, budget: Budget) -> int:
+    """The bytes one file's block map holds at one provider, read there, under one of its slots and the reading's
+    policy, within what is left of `READ_BOUND_S`. A map that cannot be read, an error or a missing provider in the
+    answer included, is unknown and raises, naming the provider and the file's position: it never counts as 0."""
     file_id, provider, index = key
     try:
-        return held_bytes(merged(p.blocks(file_id, provider, retry=p.retry)))
+        with p.reading_slot(provider, budget.retry):
+            left = READ_BOUND_S - (p.clock() - budget.began)
+            return held_bytes(merged(p.blocks(file_id, provider, retry=budget.retry, deadline_s=left)))
     except PlatformError as error:
         if answered_absent(error):
             return 0  # the provider has no such file, as one another listing showed but this one has not met yet
@@ -238,7 +256,7 @@ def holdings(
     *,
     providers: Sequence[str],
     label: Label,
-    retry: ReadRetry = ONE_ATTEMPT,
+    retry: ReadRetry | None = None,
     only: Mapping[str, Collection[str]] | None = None,
 ) -> Reading:
     """Read the occupancy: the block map of every listed file at each provider of the space other than the data
@@ -246,21 +264,27 @@ def holdings(
     it refused), then the files of every other provider but those in `never_holds` whose counter reads an explicit 0:
     one the counter leaves out, or credits with bytes, is read too. One budget covers the reading. `only`, from a
     reset's shortcut (`resetshortcut.py`), names for some of the first providers the ids to read there; every other
-    listed id is carried as holding nothing (`Reading.carried`), and a provider it does not name is read whole."""
-    holder, ids, budget = p.settings.holder, listing.ids(), Budget(p.clock())
+    listed id is carried as holding nothing (`Reading.carried`), and a provider it does not name is read whole. Every
+    read, the block maps and the counter, goes under `retry`, the reading's policy (`Provisioner.reading_retry`, which
+    the reset passes; a new one by default) and one of its provider's slots; the reading holds its tally
+    (`Reading.read_retry`), and a failed reading's error carries it (`readretry.recorded`)."""
+    reads = retry if retry is not None else p.reading_retry()
+    holder, ids, budget = p.settings.holder, listing.ids(), Budget(p.clock(), retry=reads)
     support = [q for q in p.space.support.providers if q != holder]
     first = [q for q in support if q not in never_holds]
     narrowed = only or {}
     wanted = {q: [i for i in ids if i in narrowed[q]] if q in narrowed else ids for q in first}
-    files = read_files(p, wanted, label, budget)
-    carried = {q: len(ids) - len(wanted[q]) for q in first if q in narrowed}
-    for q in carried:
-        files[q].update((i, 0) for i in ids if i not in narrowed[q])  # in place: the reading's own table
-    counter = physical_sizes(p, providers, retry=retry, undeclared_ok=False)
-    skipped = {q for q in never_holds if counter.get(q) == 0}  # the only fast path: a 0 read, never a gap
-    rest = [q for q in dict.fromkeys([*support, *counter]) if q != holder and q not in files and q not in skipped]
-    reading = {**files, **read_files(p, dict.fromkeys(rest, ids), label, budget)}
-    return Reading(counter, reading, listing.links, carried)
+    with recorded(budget.retry):
+        files = read_files(p, wanted, label, budget)
+        carried = {q: len(ids) - len(wanted[q]) for q in first if q in narrowed}
+        for q in carried:
+            files[q].update((i, 0) for i in ids if i not in narrowed[q])  # in place: the reading's own table
+        with p.reading_slot(holder, reads):  # the counter is read on the data provider
+            counter = physical_sizes(p, providers, retry=reads, undeclared_ok=False)
+        skipped = {q for q in never_holds if counter.get(q) == 0}  # the only fast path: a 0 read, never a gap
+        rest = [q for q in dict.fromkeys([*support, *counter]) if q != holder and q not in files and q not in skipped]
+        reading = {**files, **read_files(p, dict.fromkeys(rest, ids), label, budget)}
+    return Reading(counter, reading, listing.links, carried, budget.retry.facts())
 
 
 def judge(reading: Reading, allowed: Mapping[str, int], label: Label) -> None:
