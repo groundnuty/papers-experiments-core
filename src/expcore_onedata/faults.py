@@ -157,7 +157,8 @@ the tool server, builds the injector for the target its condition declares and r
 server still run, and the tool server's stop after it re-verifies the tool plane and examines the run's token, failing
 the run as `tool_plane_integrity` once it has expired (`toolserver._recheck`). The token outlives the run's ceiling by
 `[tokens] margin_s` only. The restore always runs, the provider brought back and its session gate passed, since none
-of it uses a run token, and `load_faults` refuses a margin it could outlast (`fault_settings.restore_token_margin_s`). A
+of it uses a run token, and `load_faults` refuses a margin it could outlast, with the session drain a clear that takes
+the federation itself may wait (`fault_settings.restore_token_margin_s`, `restore_drain_s`). A
 heal may take `heal_timeout_s` more, so at a heal's start, the restore's and the start's recovery's alike, the
 injector reads the steps of the run that use its tokens: the tool server's launch (to the end of that
 re-verification) and the sandbox's (from its mint to the end of its stop), which each launch counts on the run's
@@ -170,7 +171,7 @@ running heals it, under its own exclusive admission. **In this order that is no 
 run before it too, and the health gate, whose recovery never heals, holds the campaign meanwhile: a stuck pair is healed
 only by a start with no step running (an executor that starts the injector before its launches, or a bare injector
 start), by the long margin, or by hand. The long margin, `[tokens] margin_s` of at least
-`fault_settings.heal_token_margin_s` (10,534 s with the defaults), heals as before whatever still runs. An executor
+`fault_settings.heal_token_margin_s` (10,854 s with the defaults), heals as before whatever still runs. An executor
 that stops its sandbox and tool server before `running`'s exit heals with the default margin. A tool server or sandbox
 the study starts itself, which no launch counts, is not seen.
 
@@ -827,8 +828,10 @@ class FaultInjector:
 
         Declared limits. A restore that holds no admission waits for the federation (and for a drain still standing)
         inside `admission_timeout_s`, which `cancel_wait_s` does not count: inside `running` the run's or the injector's
-        own admission is always held, so only a later retry of `clear` or `finish` takes that branch. The holder record
-        of an admission taken for a restore names this injector's own target, not the one recovered.
+        own admission is always held, so only a later retry of `clear` or `finish` takes that branch. The least token
+        margin counts the drain record that branch waits out before it restores, and the drain `_drain` waits after it
+        (`fault_settings.restore_drain_s`); the wait for the lock itself it does not. The holder record of an admission
+        taken for a restore names this injector's own target, not the one recovered.
         """
         if self._settings.session_drain_s <= 0:
             yield None, False, None
