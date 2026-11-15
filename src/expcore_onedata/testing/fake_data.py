@@ -132,6 +132,40 @@ class Transfer:
         return "ended" if self.ended else "waiting" if self.waiting else "ongoing"
 
 
+def status_fields(kind: str, status: str) -> dict[str, str]:
+    """A record's two halves for a job of `kind` whose own status is `status`, as op-worker f118ed9 gives them: the half
+    a job does not do is `skipped` from its creation (`transfer.erl:157-166`), and a migration replicates first, so its
+    eviction is still `scheduled` while it replicates, and ends with its replication when that is cancelled
+    (`replication_status.erl:264-279`)."""
+    if kind == "eviction":
+        return {"replicationStatus": "skipped", "evictionStatus": status}
+    if kind == "replication":
+        return {"replicationStatus": status, "evictionStatus": "skipped"}
+    waiting = status in ("scheduled", "enqueued", "active")
+    return {"replicationStatus": status, "evictionStatus": "scheduled" if waiting else status}
+
+
+def summary_of(body: dict) -> str | None:
+    """The `transferStatus` op-worker f118ed9 gives a record, from its halves and provider ids, clause by clause of
+    `transfer:status/1` (`transfer.erl:474-495`): a migration (both providers named) whose replication completed reads
+    its eviction, `evicting` while that has not ended; a record whose replication is `skipped` (an eviction) reads its
+    eviction, `active` as `evicting`; any other reads its replication, `active` as `replicating`."""
+    replication, eviction = body.get("replicationStatus"), body.get("evictionStatus")
+    if replication == "completed" and body.get("replicatingProviderId") and body.get("evictingProviderId"):
+        return "evicting" if eviction in ("scheduled", "enqueued", "active") else eviction
+    if replication == "skipped":
+        return "evicting" if eviction == "active" else eviction
+    return "replicating" if replication == "active" else replication
+
+
+def summarised(body: dict, *, kept: Iterable[str] = ()) -> dict:
+    """A record with its `transferStatus` and `effectiveJobStatus` derived from its halves as op-worker derives them
+    (a job the fake never reruns is its own effective job, `transfer_rest_translator.erl:78-88,119-124`), but for the
+    fields in `kept`, which a test set on purpose."""
+    derived = summary_of(body)
+    return {**body, **{key: derived for key in ("transferStatus", "effectiveJobStatus") if key not in kept}}
+
+
 @dataclass
 class _Deleting:
     """A delete that was answered and has not landed: the entry, where it stood, the provider the DELETE went to and
@@ -1519,7 +1553,7 @@ class FakeData(FakeQos, FakeFederation):
         moved = transfer.bytes_replicated if transfer.bytes_replicated is not None else size
         files = 0 if transfer.deleted else 1  # a job for a file that was deleted processed none
         answer = {
-            "evictionStatus" if transfer.kind == "eviction" else "replicationStatus": state,
+            **status_fields(transfer.kind, state),
             "type": transfer.kind,
             "fileId": transfer.file_id,
             "replicatingProviderId": transfer.provider_id if transfer.replicates else None,
@@ -1535,9 +1569,10 @@ class FakeData(FakeQos, FakeFederation):
         }
         view = self._view(tid, provider)
         if "state" in view:  # this provider lists the job in another state, and its record says so
-            status = "evictionStatus" if transfer.kind == "eviction" else "replicationStatus"
-            answer[status] = {"ended": "completed", "ongoing": "active", "waiting": "scheduled"}[view["state"]]
+            listed = {"ended": "completed", "ongoing": "active", "waiting": "scheduled"}[view["state"]]
+            answer.update(status_fields(transfer.kind, listed))
         answer.update({k: v for k, v in view.items() if k != "state"})
+        answer = summarised(answer, kept=view)  # the summary follows the halves a test changed, unless it set one too
         return httpx.Response(200, json={k: v for k, v in answer.items() if k not in self.transfer_omit})
 
     @staticmethod
