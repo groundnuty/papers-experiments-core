@@ -33,7 +33,6 @@ from expcore_onedata.fault_recovery import Recovery, RestoreNotVerified
 from expcore_onedata.fault_settings import (
     DEFAULT_GATE_TIMEOUT_S,
     DEFAULT_HEAL_SETTLE_S,
-    DEFAULT_HEAL_TIMEOUT_S,
     load_faults,
 )
 from expcore_onedata.testing import write_platform
@@ -59,12 +58,13 @@ def journal_lines(tmp_path):
 
 
 def test_o35_the_heal_is_off_by_default_and_its_bounds_default_to_the_designed_ones(tmp_path):
-    """O35: without `heal`, a stuck link fails the restore closed as before; the gate waits 240 s, the heal at most
-    4,200 s, and its settle is 180 s (both provisional)."""
+    """O35: without `heal`, a stuck link fails the restore closed as before; the gate waits 240 s and the heal's
+    settle is 180 s (provisional); a heal that is off has no round, so no bound (a declared heal's is derived:
+    `test_fault_heal_default`)."""
     platform = write_platform(tmp_path, four_providers)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
-    assert (settings.heal, settings.gate_timeout_s, settings.heal_timeout_s) == ("off", 240.0, 4200.0)
-    assert (DEFAULT_GATE_TIMEOUT_S, DEFAULT_HEAL_TIMEOUT_S, DEFAULT_HEAL_SETTLE_S) == (240.0, 4200.0, 180.0)
+    assert (settings.heal, settings.gate_timeout_s, settings.heal_timeout_s) == ("off", 240.0, 0.0)
+    assert (DEFAULT_GATE_TIMEOUT_S, DEFAULT_HEAL_SETTLE_S) == (240.0, 180.0)
 
 
 @pytest.mark.parametrize(

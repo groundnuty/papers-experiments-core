@@ -21,6 +21,7 @@ service entry, its position, never by a provider's or a service's name. The serv
     gate_timeout_s = 240             # optional: the longest a restored provider's peers may take to reach it; see below
     heal = "off"                     # optional: "off", "all_links", "link_then_container" or "link"; see below
     heal_timeout_s = 4200            # optional, provisional: the longest the heal of a stuck link may take in all
+                                     # (left out, it is derived from the providers and the mode; see below)
     heal_settle_s = 180              # optional, provisional: the no-fetch wait after a heal's restarts
     session_drain_s = 320            # optional: how long an outage run's admission outlives its sessions; see below
     heal_container_fallback = true   # optional: false, and "all_links" restarts links only, never a container
@@ -72,16 +73,26 @@ after every link or container restart: no probe, no gate read, no check and no r
 through a provider soon after its link restarts can leave the pair stale (seen live 23 s after a restart; a clean
 3-minute settle left every pair healthy). `heal_timeout_s` bounds the heal: no step starts whose declared bounds would
 carry the heal past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming
-the key and the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a
-ping and a link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one
-container restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice,
-`ready_timeout_s` and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link
-restart, and one settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four
-providers in `"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it.
-`heal_container_fallback = false` keeps `"all_links"` to link restarts: a pair they do not mend fails the restore
-closed, for an operator to decide, and no container is restarted; its least `heal_timeout_s` then holds no container
-restart (2,220 s for four providers, 2,730 s for five, with the other defaults). `"link_then_container"` with it false
-is refused. **Both durations are provisional,** to be tuned as live heals are measured.
+the key, the least it may be and the value declared: for `"all_links"`, `heal_all_links_reserve` (per provider of
+`[faults.services]`, a ping and a link restart: three commands at `command_timeout_s`, the RPC's bound and its margin;
+and one settle) and one container restart (`heal_container_reserve`: four commands and a margin of three,
+`settle_timeout_s` twice, `ready_timeout_s` and one settle); for `"link_then_container"`, `heal_link_reserve` (one
+provider's ping and link restart, and one settle) and one container restart; for `"link"`, `heal_link_reserve`. With the
+other defaults, four providers in `"all_links"` need 3,780 s and five need 4,290 s.
+
+**An undeclared `heal_timeout_s` is derived, never fixed.** A fixed default would be refused by the loader's own check
+for some common size (it was: 4,200 s against the 4,290 s five providers need), so a declared heal that leaves the key
+out gets `default_heal_timeout_s`: `heal_round_s`, the very least the load check holds a declared value to, counted
+from the declared providers, mode, `heal_container_fallback`, `command_timeout_s`, `settle_timeout_s`,
+`ready_timeout_s` and `heal_settle_s`, plus `HEAL_TIMEOUT_HEADROOM_PCT` (10 %), rounded up to a whole minute
+(`HEAL_TIMEOUT_STEP_S`). With the other defaults: `"all_links"` takes 4,200 s for four providers and 4,740 s for five;
+without the container fallback 2,460 s and 3,060 s; `"link_then_container"` 2,520 s and `"link"` 780 s. With the heal
+off there is no round and no bound, so `heal_timeout_s` is 0 and nothing reads it. A declared value is never derived or
+raised: it is held to the least and refused below it. `heal_container_fallback = false` keeps `"all_links"` to link
+restarts: a pair they do not mend fails the restore closed, for an operator to decide, and no container is restarted;
+its least `heal_timeout_s` then holds no container restart (2,220 s for four providers, 2,730 s for five, with the
+other defaults). `"link_then_container"` with it false is refused. **Both durations are provisional,** to be tuned as
+live heals are measured.
 
 **The restore must fit the run's token margin.** The restore runs inside the outage run's attempt, at the injector's
 `running` exit, which the executor's pattern places inside the tool server's launch (`faults.py`, "Use"): after the
@@ -125,7 +136,9 @@ counted on the run's admission) and skips the heal while one still runs (`faults
 study declares the long margin: `margin_s` of at least `heal_token_margin_s`, the restore's margin above, two heals of
 `heal_timeout_s` (the restore's and the start's recovery's, as the injector's `cancel_wait_s` counts them) and one
 session drain of `session_drain_s`, which that start waits out after it restored a provider an earlier run left down
-(`FaultInjector._wait_owed`): 10,854 s with the defaults. A heal is never refused at load for the margin.
+(`FaultInjector._wait_owed`). It counts the effective `heal_timeout_s`, declared or derived, so it follows the derived
+bound: with the other defaults, four providers in `"all_links"` (4,200 s) need 10,854 s, and five (4,740 s) 11,934 s. A
+heal is never refused at load for the margin.
 
 **A declared heal needs a campaign `max_defer_s` that outlives it.** While the fault gate heals, every check answers the
 uncharged deferral, for up to `heal_timeout_s` plus `heal_settle_s` from the heal's start (`heal_wait_s`), and after an
@@ -138,10 +151,11 @@ when blocked stops. So the check declares the sum of its own times (`heal_deferr
 `heal_timeout_s` and `heal_settle_s`; none with the heal off) as its longest deferral (`FaultGate.max_deferral_s`,
 `PlatformHealth.max_deferral_s`), with how many of the core's waits it includes, and the core, which alone knows its own
 settings, adds them: the campaign's `max_defer_s` must be at least that total, or it is refused at its start. With the
-defaults (`recheck_s` 30 s, `poll_interval_s` 1 s, `health_timeout_s` 60 s) that is 4,700 s and 182 s, 4,882 s, for
-four providers, and 4,790 s and 182 s, 4,972 s, for five at the 4,290 s they need; with `session_drain_s = 0` the first
-deferral is the check that starts the heal, and only the waits after the heal are added (the 4,470 s of five providers
-and 91 s, 4,561 s). A `health_timeout_s` of 150 s, as the link check needs, makes them 5,062 s, 5,152 s and 4,651 s.
+defaults (`recheck_s` 30 s, `poll_interval_s` 1 s, `health_timeout_s` 60 s) that is 4,700 s and 182 s, 4,882 s, for four
+providers, and 4,790 s and 182 s, 4,972 s, for five at the 4,290 s they need (5,240 s and 182 s, 5,422 s, at the 4,740 s
+derived when `heal_timeout_s` is left out); with `session_drain_s = 0` the first deferral is the check that starts the
+heal, and only the waits after the heal are added (the 4,470 s of five providers and 91 s, 4,561 s). A
+`health_timeout_s` of 150 s, as the link check needs, makes them 5,062 s, 5,152 s and 4,651 s.
 
 The figure assumes the heal ends within its own bound (a heal that overruns it closes the gate, and the settle's hold it
 leaves can defer a check later still), and every check ends within `health_timeout_s`, as a check must (the link check
@@ -160,7 +174,7 @@ import math
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -177,7 +191,8 @@ SETTLE_MARGIN_S = 60.0  # what the default settle timeout adds to it, for the da
 DEFAULT_SETTLE_TIMEOUT_S = STOP_GRACE_S + SETTLE_MARGIN_S
 DEFAULT_READY_TIMEOUT_S = 180.0  # the federation's restored providers served 48 to 52 s after their restart (measured)
 DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (inference from source), plus a margin
-DEFAULT_HEAL_TIMEOUT_S = 4200.0  # provisional: four providers' all-links sequence and one container restart fit it
+HEAL_TIMEOUT_HEADROOM_PCT = 10  # what an undeclared heal_timeout_s adds to the least a round needs (provisional)
+HEAL_TIMEOUT_STEP_S = 60.0  # and it is rounded up to a whole multiple of this: a minute
 DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measurement tunes it
 DEFAULT_SESSION_DRAIN_S = 320.0  # op-worker's 300 s mount-session grace, 15 s for a removal that retries, a margin
 TOKEN_SLACK_S = 300.0  # what the token margin keeps beyond the restore's bound: the start, the link check, the teardown
@@ -227,7 +242,7 @@ class FaultSettings:
     health_wait_s: float = 30.0
     gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
     heal: str = "off"
-    heal_timeout_s: float = DEFAULT_HEAL_TIMEOUT_S
+    heal_timeout_s: float = 0.0  # `load_faults` derives it (`default_heal_timeout_s`) when the table leaves it out
     heal_settle_s: float = DEFAULT_HEAL_SETTLE_S
     session_drain_s: float = DEFAULT_SESSION_DRAIN_S
     heal_container_fallback: bool = True
@@ -296,12 +311,15 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         health_wait_s=_number(table, "health_wait_s", 30.0, 0),
         gate_timeout_s=_number(table, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S, 0),
         heal=heal,
-        heal_timeout_s=_number(table, "heal_timeout_s", DEFAULT_HEAL_TIMEOUT_S, 0),
+        heal_timeout_s=_number(table, "heal_timeout_s", 0.0, 0),  # derived below when undeclared
         heal_settle_s=_number(table, "heal_settle_s", DEFAULT_HEAL_SETTLE_S, 0),
         session_drain_s=_number(table, "session_drain_s", DEFAULT_SESSION_DRAIN_S, 0),
         heal_container_fallback=fallback,
         config_sha256=config.sha256,
     )
+    declared = "heal_timeout_s" in table.data
+    if not declared:  # never a fixed number: one the loader's own check would refuse for some size is wrong
+        settings = replace(settings, heal_timeout_s=default_heal_timeout_s(settings))
     if heal == "link_then_container" and not fallback:  # a mode of container restarts, declared to make none
         raise table.fail("heal_container_fallback", 'is false, which "link_then_container" contradicts: use "link"')
     uncovered = sorted(heal_participants(config) - set(settings.services))
@@ -309,10 +327,11 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         shown = config.provider_labels(uncovered)
         raise table.fail("heal", f'"all_links" restarts every provider\'s link, and no service is declared for {shown}')
     least = heal_round_s(settings)
-    if settings.heal_timeout_s < least:
+    if settings.heal_timeout_s < least:  # only a declared value can be: the derived one is above the least
         raise table.fail(
             "heal_timeout_s",
-            f'must be at least {least:g} for heal = "{heal}": one round of its actions at their declared bounds',
+            f'must be at least {least:g} for heal = "{heal}", not {settings.heal_timeout_s:g}: one round of its '
+            f"actions at their declared bounds; leave it out for the default, {default_heal_timeout_s(settings):g}",
         )
     _require_token_margin(table, load_toml(file), settings)
     return settings
@@ -485,6 +504,16 @@ def heal_all_links_reserve(settings: FaultSettings) -> float:
     `[faults.services]`, and one settle."""
     each = heal_link_reserve(settings) - settings.heal_settle_s
     return len(settings.services) * each + settings.heal_settle_s
+
+
+def default_heal_timeout_s(settings: FaultSettings) -> float:
+    """The `heal_timeout_s` a table that leaves it out gets: the least one round of the declared heal needs
+    (`heal_round_s`, the figure the load check holds a declared value to, so the two cannot drift) plus
+    `HEAL_TIMEOUT_HEADROOM_PCT` percent, rounded up to a multiple of `HEAL_TIMEOUT_STEP_S`; 0 with the heal off.
+    Integer percentages keep an exact minute exact (a float tenth would round 3,000 s up to 3,360 s)."""
+    least = heal_round_s(settings)
+    scaled = least * (100 + HEAL_TIMEOUT_HEADROOM_PCT) / (100 * HEAL_TIMEOUT_STEP_S)
+    return math.ceil(scaled) * HEAL_TIMEOUT_STEP_S
 
 
 def heal_round_s(settings: FaultSettings) -> float:

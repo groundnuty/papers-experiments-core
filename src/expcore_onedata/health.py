@@ -227,7 +227,9 @@ class PlatformHealth:
     def max_deferral_s(self) -> DeferralBound | None:
         """The longest this check may stay deferred, which the core holds the campaign's `max_defer_s` to at its start
         (`healthgate.deferral_bound`): the fault gate's (`FaultGate.max_deferral_s`), None without `[faults]`. A study
-        that wraps this check in its own passes the method on, or the campaign is held to nothing."""
+        that wraps this check in its own passes the method on: the platform's run admission declares the same bound
+        (`admission.RunAdmit.declared_deferral_s`), and a wrapper that leaves it out is refused at the campaign's start
+        (`SchedulerConfig.check_declared_deferral`)."""
         return None if self._faults is None else self._faults.max_deferral_s()
 
     def wait_for_gate_heal(self, timeout_s: float | None = None) -> bool:

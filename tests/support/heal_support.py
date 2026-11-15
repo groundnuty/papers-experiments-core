@@ -17,6 +17,7 @@ LABEL = {STORES[name]: f"providers[{index}]" for index, name in enumerate(NAMES)
 SERVICE = {label: service for service, label in LABEL.items()}
 CRASHED, RESTORED, READER, SECOND = (f"providers[{index}]" for index in range(4))
 TARGET = RESTORED
+HEAL_TIMEOUT_S = 4200  # the bound these tests run a declared heal at; a test of the derived default declares none
 
 
 class HealServices(FakeServices):
@@ -137,11 +138,15 @@ class HealServices(FakeServices):
 
 
 def four_providers(data, tokens=None, **faults):
-    """Four providers, each with a service; short commands and settles, so a declared heal fits its default bound.
+    """Four providers, each with a service; short commands and settles, and a declared heal bounded at
+    `HEAL_TIMEOUT_S` unless the test says otherwise (the loader would derive a much shorter one from these settles).
     `tokens` replaces keys of `[tokens]` (a study's long margin, say)."""
     for name, index in (("gamma", 3), ("delta", 4)):
         data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
-    data["faults"] = faults_table(**{"services": dict(STORES), "command_timeout_s": 10, "heal_settle_s": 30, **faults})
+    pinned = {"heal_timeout_s": HEAL_TIMEOUT_S} if faults.get("heal", "off") != "off" else {}
+    data["faults"] = faults_table(
+        **{"services": dict(STORES), "command_timeout_s": 10, "heal_settle_s": 30, **pinned, **faults}
+    )
     if tokens is not None:
         data["tokens"] = {**data.get("tokens", {}), **tokens}
 
