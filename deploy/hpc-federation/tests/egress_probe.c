@@ -3,7 +3,8 @@
  *   egress_probe all      a blocking TCP connect to a loopback listener of its own; a non-blocking TCP connect to
  *                         192.0.2.1:9 (TEST-NET-1, RFC 5737: never routed), its SO_ERROR read after up to 200 ms, then
  *                         closed; two UDP sendto()s to one loopback receiver and one sendmsg() to another, each
- *                         carrying PAYLOAD, which must never reach the log
+ *                         carrying PAYLOAD, which must never reach the log; a non-blocking IPv6 connect to [::1]:9
+ *                         with the 24-byte address length the kernel also accepts
  *   egress_probe connect  the blocking loopback connect only (the test of a connect the shim cannot log) */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -66,6 +67,22 @@ static void connect_testnet(void) {
     close(c);
 }
 
+/* A non-blocking IPv6 connect to [::1]:9 whose address length is the RFC 2133 one (24 bytes, no scope id), which the
+ * kernel accepts: the shim must log it as it logs a full-length one. */
+static void connect_short_v6(void) {
+    int c = socket(AF_INET6, SOCK_STREAM, 0), r;
+    struct sockaddr_in6 a;
+    if (c < 0) { printf("connect-short-v6 skipped %d\n", errno); return; }
+    memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    a.sin6_port = htons(9);
+    a.sin6_addr = in6addr_loopback;
+    fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
+    r = connect(c, (struct sockaddr *)&a, 24);
+    printf("connect-short-v6 %d %d\n", r, r == 0 ? 0 : errno);
+    close(c);
+}
+
 static void send_udp(void) {
     int r1 = socket(AF_INET, SOCK_DGRAM, 0), r2 = socket(AF_INET, SOCK_DGRAM, 0), s = socket(AF_INET, SOCK_DGRAM, 0);
     unsigned short first = bound(r1), second = bound(r2);
@@ -95,6 +112,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "all") == 0) {
         connect_testnet();
         send_udp();
+        connect_short_v6();
     }
     return 0;
 }

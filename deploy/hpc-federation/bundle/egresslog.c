@@ -63,6 +63,9 @@ _Static_assert(sizeof HPCOP_EGRESS_SOCKET <= sizeof(((struct sockaddr_un *)0)->s
                "the collector's socket path does not fit a sockaddr_un");
 
 enum { SEEN_MAX = 128, LOCK_SPINS = 1000, RECORD_MAX = 256 };
+#ifndef SIN6_LEN_RFC2133
+#define SIN6_LEN_RFC2133 24   /* the shortest IPv6 address the kernel accepts (net/ipv6: no sin6_scope_id) */
+#endif
 
 /* One destination, as a record names it and as the new-address table compares it. */
 struct dest {
@@ -95,9 +98,10 @@ static int dest_of(const struct sockaddr *addr, socklen_t len, struct dest *d) {
         memcpy(d->a, &s.sin_addr, 4);
         return inet_ntop(AF_INET, &s.sin_addr, d->text, sizeof d->text) != NULL;
     }
-    if (addr->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
-        struct sockaddr_in6 s;
-        memcpy(&s, addr, sizeof s);
+    if (addr->sa_family == AF_INET6 && len >= (socklen_t)SIN6_LEN_RFC2133) {
+        struct sockaddr_in6 s;   /* the kernel takes the RFC 2133 length too: an address without its scope id */
+        memset(&s, 0, sizeof s);
+        memcpy(&s, addr, len < (socklen_t)sizeof s ? (size_t)len : sizeof s);
         d->family = AF_INET6;
         d->port = ntohs(s.sin6_port);
         memcpy(d->a, &s.sin6_addr, 16);

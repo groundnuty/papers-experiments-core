@@ -158,6 +158,16 @@ def test_a_connect_to_an_outside_address_is_logged_whatever_it_returns(run):
 
 @needs_gcc
 @needs_unix
+def test_an_ipv6_connect_with_the_short_address_length_the_kernel_accepts_is_logged(run):
+    """A 24-byte IPv6 address (no scope id) is one the kernel takes: the shim logs it rather than passing it by."""
+    if run["out"]["connect-short-v6"].startswith("skipped"):
+        pytest.skip("no IPv6 sockets on this host")
+    attempts = [r for r in _records(run, "connect") if r["family"] == "inet6"]
+    assert [(r["address"], r["port"]) for r in attempts] == [("::1", 9)]
+
+
+@needs_gcc
+@needs_unix
 def test_a_udp_send_is_logged_once_for_each_new_address(run):
     """Two sendto()s to one address give one record; a sendmsg() to another address gives its own."""
     first, second = (int(p) for p in run["out"]["udp"].split())
@@ -253,6 +263,7 @@ def test_the_cores_reader_reads_the_real_collectors_log_as_intact_and_classifies
 
     listener = ("127.0.0.1", int(run["out"]["listener"]))
     snap = EgressLog(Source(), declaration([listener], listener), NONCE).finish()
+    v6 = 0 if run["out"]["connect-short-v6"].startswith("skipped") else 1  # [::1]:9, where the host has IPv6
     assert (snap["log"], snap["unknown"], snap["canary"]) == ("intact", [], True)
-    assert snap["counts"] == {"gate": 0, "loopback": 2, "outside": 1}
+    assert snap["counts"] == {"gate": 0, "loopback": 2 + v6, "outside": 1}
     assert [(d["address"], d["port"]) for d in snap["outside"]] == [("192.0.2.1", 9)]
