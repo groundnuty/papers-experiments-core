@@ -344,6 +344,57 @@ def test_b18_c32_shards_none_of_which_export_deployment_shares_join_into_an_expo
     assert "deployment_shares" not in joined
 
 
+# --- the platform settings outside the fingerprint, which a store records and a resume compares (C35) --------------
+
+
+def settings_of(changes=(), unknown=()) -> dict:
+    """A shard's `reset_settings` key as `export_run_state` writes it."""
+    return {"changes": list(changes), "unknown_before": list(unknown)}
+
+
+SCAN = {"at": "2026-03-01T11:00:00Z", "key": "placement.qos_scan", "old": "listing", "new": "summaries"}
+EARLIER = {"at": "2026-03-02T11:00:00Z"}
+
+
+def test_c35_the_settings_changes_of_the_shards_join_in_shard_order_each_tagged_with_its_shard():
+    """C35: each shard's store records its own platform's settings, so the join keeps every change and every unknown
+    earlier start, in shard order, with the shard that saw it added last."""
+    one = settings_of([SCAN])
+    two = settings_of([SCAN, {**SCAN, "key": "placement.poll_s", "old": 2.0}], [EARLIER])
+    joined = join_exports(
+        {2: export(analysed=[entry("b")], reset_settings=two), 1: export(analysed=[entry("a")], reset_settings=one)},
+        plan("a", "b"),
+        SHARDS,
+    )
+    assert joined["reset_settings"] == {
+        "changes": [
+            {**SCAN, "shard": 1},
+            {**SCAN, "shard": 2},
+            {**SCAN, "key": "placement.poll_s", "old": 2.0, "shard": 2},
+        ],
+        "unknown_before": [{**EARLIER, "shard": 2}],
+    }
+    assert list(joined["reset_settings"]["changes"][0])[-1] == "shard"
+
+
+def test_c35_a_shard_that_exports_no_settings_adds_none_and_the_key_stands_where_the_export_puts_it():
+    """C35: a shard whose store recorded none has no key; in either order the others' changes are kept and the key is
+    after `kinds` (and after `deployment_shares`) when the first shard lacks it; shards none of which have it join
+    into an export without it."""
+    with_key = export(analysed=[entry("a")], reset_settings=settings_of([SCAN]))
+    without = export(analysed=[entry("b")])
+    for exports, shard in (({1: with_key, 2: without}, 1), ({1: without, 2: with_key}, 2)):
+        joined = join_exports(exports, plan("a", "b"), SHARDS)
+        assert joined["reset_settings"] == settings_of([{**SCAN, "shard": shard}])
+    keys = list(join_exports({1: without, 2: with_key}, plan("a", "b"), SHARDS))
+    assert keys.index("reset_settings") == keys.index("kinds") + 1
+    shares = deployment_shares(declared({"fp-east": PROBE}), ONE)
+    both = {1: with_shares("a", shares), 2: export(analysed=[entry("b")], reset_settings=settings_of())}
+    keys = list(join_exports(both, plan("a", "b"), SHARDS))
+    assert keys.index("reset_settings") == keys.index("deployment_shares") + 1
+    assert "reset_settings" not in join_exports({1: export(analysed=[entry("a")]), 2: without}, plan("a", "b"), SHARDS)
+
+
 def hold(start: str, **more) -> dict:
     """One entry of a shard's `operator_holds` (C11), as `export_run_state` lists it."""
     held = {"start_utc": start, "end_utc": None, "blocking": False, "charged": True, "checks": 2, "reason": "a reason"}
@@ -385,3 +436,19 @@ def test_c11_shards_none_of_which_met_such_a_hold_join_into_an_export_without_th
     """C11: the merged export of a campaign no hold of an operator touched is the export it was."""
     joined = join_exports({1: export(analysed=[entry("a")]), 2: export(analysed=[entry("b")])}, plan("a", "b"), SHARDS)
     assert "operator_holds" not in joined
+
+
+def test_c11_c35_the_holds_and_the_settings_stand_where_the_export_puts_them_whichever_shard_has_them():
+    """C11, C35: a merged export whose first shard has neither `operator_holds` nor `reset_settings` puts them where
+    `export_run_state` does, after `kinds` and `deployment_shares`, the holds before the settings; and a first shard
+    with the holds keeps the settings after them."""
+    shares = deployment_shares(declared({"fp-east": PROBE}), ONE)
+    every = with_holds(with_shares("b", shares), [hold("2026-03-01T10:00:00Z")])
+    every["reset_settings"] = settings_of([SCAN])
+    keys = list(join_exports({1: export(analysed=[entry("a")]), 2: every}, plan("a", "b"), SHARDS))
+    at = keys.index("kinds")
+    assert keys[at + 1 : at + 4] == ["deployment_shares", "operator_holds", "reset_settings"]
+    held = with_holds(with_shares("a", shares), [hold("2026-03-01T10:00:00Z")])
+    settled = export(analysed=[entry("b")], reset_settings=settings_of([SCAN]))
+    keys = list(join_exports({1: held, 2: settled}, plan("a", "b"), SHARDS))
+    assert keys.index("reset_settings") == keys.index("operator_holds") + 1

@@ -63,6 +63,13 @@ latest `reason` an answer of the outage led with (the gate keeps it apart from i
 starts no run and leaves no attempt, so the run lists do not say it. A campaign with none, or whose record cannot be
 read, has no such key, and its export is the one it had before it.
 
+A campaign whose platform supplied settings that are in no fingerprint (`campaign.reset_settings`, C35) also exports
+`reset_settings`, after `deployment_shares` and `operator_holds`: `changes`, one entry for each setting a resume found
+changed (`at`, the start's time; `key`; `old` and `new`, each absent where that side lacked the key), and
+`unknown_before`, one entry (`at`) for each start that found a store with no record, whose earlier settings are
+unknown. Both lists are written out when empty, so the key says the settings were recorded. A campaign whose platform
+supplied none has no such key.
+
 A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
@@ -83,6 +90,8 @@ from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, d
 from expcore.campaign.factors import FactorSchema, RunKey
 from expcore.campaign.healthgate import META as HEALTH_META
 from expcore.campaign.healthgate import parse as parse_outages
+from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
+from expcore.campaign.reset_settings import exported as exported_settings
 from expcore.campaign.shard import EXPORT_KEY, META_ENVIRONMENT, META_SHARD, META_SHARES, META_STARTED
 from expcore.errors import BUDGET_HOLD, CORE_KINDS
 
@@ -148,6 +157,10 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         declared = store.q("SELECT value FROM meta WHERE key=?", (ACCEPTED_META,))
         shard = _shard_facts(store)
         outages = store.q("SELECT value FROM meta WHERE key=?", (HEALTH_META,))
+        try:
+            settings = exported_settings(store)
+        except ValueError as error:
+            raise ExportError(f"the store's {SETTINGS_KEY} cannot be exported: {error}") from None
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
     scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
@@ -218,6 +231,8 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
     holds = _operator_holds(outages[0]["value"] if outages else None)
     if holds:  # only a campaign an operator's hold touched has the key (C11)
         data["operator_holds"] = holds
+    if settings is not None:  # only a campaign whose platform supplied settings has the key (C35)
+        data[SETTINGS_KEY] = settings
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)
