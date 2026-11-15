@@ -44,20 +44,8 @@ PLUMBING = {
     ("ingestsparse.py", "SparseBaseline._complete", "provisioner.blocks"): ["self._p.retry"],
     ("ingestsparse.py", "SparseBaseline.check_holdings", "provisioner.blocks"): ["self._p.retry"],  # before a removal
     ("ingestsparse.py", "SparseBaseline._restore_replicas", "provisioner.blocks"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._page", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._dated_page", "client.get_dated"): ["self._p.retry"],  # the history's, with its Date
-    ("reset.py", "SpaceReset._zone_clock", "client.get_dated"): [
-        "self._p.retry"
-    ],  # the global clock, Onezone's reading
-    ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._job", "client.get"): ["self._p.retry"],
-    ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
-    # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): the counter, and every file's block
-    # map at each provider that can hold the space's bytes
-    ("reset.py", "SpaceReset._holdings", "holdings"): ["self._p.retry"],  # the counter; the files' maps are READING's
     # the check of a space provisioned by storage import (O41): its block maps are read by the harness, as a baseline's
     ("storageimport.py", "SpaceCheck._check_blocks.whole", "provisioner.blocks"): ["self._p.retry"],
-    ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["provisioner.retry"],
     # the placement's block-map reads outside a poll: a stall there ends the placement
     ("ranges.py", "_held", "provisioner.blocks"): ["provisioner.retry"],
     ("ranges.py", "place_ranges", "provisioner.holds"): ["provisioner.retry"],
@@ -75,7 +63,16 @@ PLUMBING = {
 # maps, whose failure fails the stage. Each goes under a policy made for its reading by the provisioner
 # (`reading_retry()`), which also retries a connection failure, never an answer; its tally is the reading's record.
 READING = {
+    # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): its counter and every file's map
+    ("reset.py", "SpaceReset._holdings", "holdings"): ["self._p.reading_retry()"],
     ("occupancy.py", "_held", "provisioner.blocks"): ["budget.retry"],
+    # each stage's own transfer reads, under the stage's policy (`SpaceReset.stage_reads`, `transfer_read_retry`)
+    ("reset.py", "SpaceReset._page", "client.get"): ["self._reads"],
+    ("reset.py", "SpaceReset._dated_page", "client.get_dated"): ["self._reads"],  # the history's, with its Date
+    ("reset.py", "SpaceReset._zone_clock", "client.get_dated"): ["self._reads"],  # the global clock, Onezone's reading
+    ("reset.py", "SpaceReset._finish", "client.get"): ["self._reads"],
+    ("reset.py", "SpaceReset._job", "client.get"): ["self._reads"],
+    ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._reads"],
     ("resetqos.py", "_summary", "client.get"): ["reads"],
     ("resetqos.py", "_root", "consistency.space_root"): ["reads"],
     ("resetqos.py", "_listing_page", "client.get"): ["reads"],
@@ -85,7 +82,10 @@ READING = {
 
 # Where a reading's policy is made (`Provisioner.reading_retry()`): the reset's readings alone, never a measuring one.
 READING_MADE = {
-    ("occupancy.py", "holdings"),
+    ("occupancy.py", "holdings"),  # a new one when its caller names none
+    ("reset.py", "__init__"),  # SpaceReset's first stage policy, for reads made outside a stage
+    ("reset.py", "stage_reads"),
+    ("reset.py", "_holdings"),
     ("resetplan.py", "plan_scan"),
     ("resetqos.py", "listed"),
     ("resetqos.py", "by_listing"),
@@ -104,6 +104,8 @@ CALLER_CHOOSES = {
     ("provision.py", "Provisioner._list_pages", "client.get"): ["reads"],  # `children` decides, below
     ("provision.py", "Provisioner.blocks", "client.get"): ["retry"],  # one attempt unless the caller says: place_ranges
     ("provision.py", "Provisioner.holds", "provisioner.blocks"): ["retry"],
+    # the bulk eviction's waits: the provisioner's policy, or the reset's eviction stage's (`evict_ids(reads=)`)
+    ("eviction.py", "_wait_ended", "consistency.wait_transfers"): ["reads"],
     ("ingestsparse.py", "SparseBaseline.layout", "client.get"): ["retry"],  # a poll's one attempt, or the part's check
 }
 

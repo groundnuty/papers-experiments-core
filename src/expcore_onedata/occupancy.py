@@ -256,7 +256,7 @@ def holdings(
     *,
     providers: Sequence[str],
     label: Label,
-    retry: ReadRetry = ONE_ATTEMPT,
+    retry: ReadRetry | None = None,
     only: Mapping[str, Collection[str]] | None = None,
 ) -> Reading:
     """Read the occupancy: the block map of every listed file at each provider of the space other than the data
@@ -264,10 +264,12 @@ def holdings(
     it refused), then the files of every other provider but those in `never_holds` whose counter reads an explicit 0:
     one the counter leaves out, or credits with bytes, is read too. One budget covers the reading. `only`, from a
     reset's shortcut (`resetshortcut.py`), names for some of the first providers the ids to read there; every other
-    listed id is carried as holding nothing (`Reading.carried`), and a provider it does not name is read whole. The
-    block-map reads go under one policy made for the reading (`Provisioner.reading_retry`), whose tally the reading
-    holds (`Reading.read_retry`), and a failed reading's error carries (`readretry.recorded`)."""
-    holder, ids, budget = p.settings.holder, listing.ids(), Budget(p.clock(), retry=p.reading_retry())
+    listed id is carried as holding nothing (`Reading.carried`), and a provider it does not name is read whole. Every
+    read, the block maps and the counter, goes under `retry`, the reading's policy (`Provisioner.reading_retry`, which
+    the reset passes; a new one by default) and one of its provider's slots; the reading holds its tally
+    (`Reading.read_retry`), and a failed reading's error carries it (`readretry.recorded`)."""
+    reads = retry if retry is not None else p.reading_retry()
+    holder, ids, budget = p.settings.holder, listing.ids(), Budget(p.clock(), retry=reads)
     support = [q for q in p.space.support.providers if q != holder]
     first = [q for q in support if q not in never_holds]
     narrowed = only or {}
@@ -277,7 +279,8 @@ def holdings(
         carried = {q: len(ids) - len(wanted[q]) for q in first if q in narrowed}
         for q in carried:
             files[q].update((i, 0) for i in ids if i not in narrowed[q])  # in place: the reading's own table
-        counter = physical_sizes(p, providers, retry=retry, undeclared_ok=False)
+        with p.reading_slot(holder, reads):  # the counter is read on the data provider
+            counter = physical_sizes(p, providers, retry=reads, undeclared_ok=False)
         skipped = {q for q in never_holds if counter.get(q) == 0}  # the only fast path: a 0 read, never a gap
         rest = [q for q in dict.fromkeys([*support, *counter]) if q != holder and q not in files and q not in skipped]
         reading = {**files, **read_files(p, dict.fromkeys(rest, ids), label, budget)}

@@ -112,7 +112,7 @@ from typing import Any
 from expcore_onedata import consistency
 from expcore_onedata.occupancy import Listing, Reading
 from expcore_onedata.placement import Range, held_bytes, merged
-from expcore_onedata.provision import Listings, Provisioner, ProvisionError
+from expcore_onedata.provision import Entry, Listings, Provisioner, ProvisionError
 from expcore_onedata.readretry import ReadRetry, recorded
 from expcore_onedata.transferrecord import Unreadable
 
@@ -198,21 +198,30 @@ def plain_id(value: str) -> bool:
     return _PLAIN_ID.fullmatch(value) is not None
 
 
+def _children(
+    p: Provisioner, directory_id: str, provider: str, listings: Listings, reads: ReadRetry
+) -> dict[str, Entry]:
+    """One directory's entries on one provider (`Provisioner.children`, its pages in turn), under one of the provider's
+    slots and the reading's policy; one the cache holds is not read again."""
+    with p.reading_slot(provider, reads):
+        return p.children(directory_id, provider, listings=listings, retry=reads)
+
+
 def tree(p: Provisioner, provider: str, reads: ReadRetry) -> tuple[str, list[tuple[str, str, int]]]:
     """The space root on one provider and every leaf under it, a file or an empty directory, as `(id, kind, depth)`:
     the tree `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth. The
-    root is read under the reading's policy, the listings under the provisioner's (`Provisioner.children`)."""
+    root and every listing are read under the reading's policy, each under one of the provider's slots."""
     root = _root(p, provider, reads)
     listings: Listings = {}
     found: list[tuple[str, str, int]] = []
     pending = [(root, 0)]
     while pending:
         current, depth = pending.pop(0)
-        for entry in p.children(current, provider, listings=listings).values():
+        for entry in _children(p, current, provider, listings, reads).values():
             if entry.kind != "DIR":
                 found.append((entry.file_id, entry.kind, depth + 1))
                 continue
-            if not p.children(entry.file_id, provider, listings=listings):
+            if not _children(p, entry.file_id, provider, listings, reads):
                 found.append((entry.file_id, entry.kind, depth + 1))
             pending.append((entry.file_id, depth + 1))
         listings.pop((provider, current), None)  # entered: no longer needed

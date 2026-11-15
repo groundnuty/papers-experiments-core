@@ -529,18 +529,24 @@ class Provisioner:
 
     # -- listing and creation --------------------------------------------------
     def children(
-        self, directory_id: str, provider: str | None = None, *, listings: Listings | None = None, retry: bool = True
+        self,
+        directory_id: str,
+        provider: str | None = None,
+        *,
+        listings: Listings | None = None,
+        retry: bool | ReadRetry = True,
     ) -> dict[str, Entry]:
         """Return every entry of a directory by name, following the pages to the end.
 
         `listings` is one operation's cache: a directory it holds is not listed again, and one listed whole is added to
         it, so an operation over many files lists each directory once. A listing that fails adds nothing. A page read
         that timed out is tried again under the provisioner's policy (O29), unless `retry` is False, an instrument's
-        read."""
+        read, or under the policy `retry` names, a reset reading's (`reading_retry`, O46)."""
         provider = provider or self._settings.holder
         if listings is not None and (provider, directory_id) in listings:
             return listings[(provider, directory_id)]
-        entries = self._list_pages(directory_id, provider, self._retry if retry else ONE_ATTEMPT)
+        reads = retry if isinstance(retry, ReadRetry) else (self._retry if retry else ONE_ATTEMPT)
+        entries = self._list_pages(directory_id, provider, reads)
         if listings is not None:
             listings[(provider, directory_id)] = entries
         return entries

@@ -27,18 +27,21 @@ from expcore_onedata.transferrecord import Unreadable
 
 PAUSES = [2.0, 5.0, 15.0]
 HELD = len(FILES) * len(DATA)  # what beta holds of the space: every file of `study`
+LATCH_WAIT_S = 10.0  # the most a latched request waits for the others; reached only when no overlap can happen
 
 
 class Broken:
     """The fake behind rules: a request a rule matches gets the rule's outcome, `times` times (None: always), an
     exception raised or an answer returned; every other request is the fake's. `peak` is the most requests to beta in
-    flight at once, when `hold_s` keeps each one open that long."""
+    flight at once, when `hold_s` keeps each one open that long, or when `latch_at` holds each one until that many are
+    in flight together (`latch`, set then; each waits at most `LATCH_WAIT_S`): an overlap proved without timing."""
 
     def __init__(self, respond):
         self.respond = respond
         self.rules: list[list] = []
         self.sent: list[httpx.Request] = []
         self.hold_s, self.peak, self._now = 0.0, 0, 0
+        self.latch_at, self.latch = 0, threading.Event()
         self._lock = threading.Lock()
 
     def on(self, matches, outcome, times=1):
@@ -52,14 +55,20 @@ class Broken:
                 rule[2] -= 1
         if rule is not None:
             return rule[1](request)
-        return self._held(request) if self.hold_s and request.url.host == "beta.test" else self.respond(request)
+        held = (self.hold_s or self.latch_at) and request.url.host == "beta.test"
+        return self._held(request) if held else self.respond(request)
 
     def _held(self, request):
         with self._lock:
             self._now += 1
             self.peak = max(self.peak, self._now)
+            if self.latch_at and self._now >= self.latch_at:
+                self.latch.set()
         try:
-            time.sleep(self.hold_s)  # a real wait, short: the bound is on real threads
+            if self.latch_at:
+                self.latch.wait(LATCH_WAIT_S)  # returns at once when enough requests are in flight together
+            else:
+                time.sleep(self.hold_s)  # a real wait, short: an upper bound holds whatever the timing
             return self.respond(request)
         finally:
             with self._lock:
@@ -112,8 +121,17 @@ class CutBody(httpx.SyncByteStream):
 
 
 BLOCK_MAPS = gets(r"/data/[^/]+/distribution", "beta.test")
+COUNTER = gets(r"/data/[^/]+/distribution", "alpha.test")  # the space root's, on the data provider
 PAGES = gets(r"/data/[^/]+/files")
+CHILDREN = gets(r"/data/[^/]+/children")  # `summaries` mode's directory listings
+LISTINGS = gets(r"/spaces/[^/]+/transfers")
+RECORDS = gets(r"/transfers/[^/]+")
 CONNECT = raising(httpx.ConnectError)
+
+
+def zone_clock(request):
+    """Onezone's public current-time read, the history's reading of the global clock."""
+    return request.method == "GET" and request.url.path.endswith("/provider/public/get_current_time")
 
 
 @pytest.fixture
@@ -146,8 +164,15 @@ def listing_of(fake) -> occupancy.Listing:
 
 
 def holdings(p, fake, **options) -> occupancy.Reading:
+    """A reading of the occupancy as the reset makes one: under a policy made for it."""
     return occupancy.holdings(
-        p, listing_of(fake), (), providers=["alpha", "beta"], label=p.client.provider_label, retry=p.retry, **options
+        p,
+        listing_of(fake),
+        (),
+        providers=["alpha", "beta"],
+        label=p.client.provider_label,
+        retry=p.reading_retry(),
+        **options,
     )
 
 
@@ -171,7 +196,7 @@ def test_o46_a_connection_failure_on_one_block_map_read_is_tried_again_and_the_r
     tally = record["stages"]["occupancy"]["read_retry"]
     assert record["ok"] is True
     assert (tally["retries"], tally["errors"], tally["failed"]) == (1, {"ConnectError": 1}, 0)
-    assert tally["reads"] == len(FILES)
+    assert tally["reads"] == len(FILES) + 1  # every file's map at beta, and the counter at the data provider
     assert {k: v for k, v in beta(tally).items() if k != "slot_wait_s"} == {
         "reads": len(FILES),
         "retries": 1,
@@ -403,8 +428,107 @@ def test_o51_two_qos_scans_at_once_hold_the_bound_in_their_root_and_listing_read
 def test_o51_without_a_tight_bound_the_same_readings_do_overlap_at_one_provider(
     fake, broken, client, config, platform_file, ticker, tmp_path
 ):
-    """O51: the check above can fail: with the default bound the two readings' eight workers do overlap at beta."""
+    """O51: the check above can fail: with the default bound the two readings' eight workers do overlap at beta. Each
+    read at beta is held until three are in flight together (a latch, no timing): the latch opens, so three were."""
     first, second = (bounded(client, config, platform_file, ticker, tmp_path, 16) for _ in range(2))
-    broken.hold_s = 0.02
+    broken.latch_at = 3
     consistency.bounded_map(lambda one: holdings(one, fake), [first, second], 2)
-    assert broken.peak > 2
+    assert broken.latch.is_set()
+    assert broken.peak >= 3
+
+
+# -- the occupancy's counter, each stage's transfer reads, and `summaries` mode's listings ----------------------------
+
+
+def test_o46_the_occupancy_counter_read_tries_a_connection_failure_again(p, fake, broken):
+    """O46: the space root's distribution, read on the data provider beside the files, fails to connect once and is
+    asked again, under the reading's policy: the reading passes and its tally holds the retry at the data provider."""
+    broken.on(nth(COUNTER, 1), CONNECT)
+    reading = holdings(p, fake)
+    assert reading.held("beta") == HELD
+    assert reading.read_retry["providers"]["providers[0]"]["errors"] == {"ConnectError": 1}
+
+
+def test_o46_an_occupancy_counter_that_never_connects_fails_the_reading_closed(p, fake, broken):
+    """O46: a counter read that fails on every attempt leaves the reading without its counter: it raises, with the
+    tally, and is never taken for a zero."""
+    broken.on(COUNTER, CONNECT, times=None)
+    with pytest.raises(PlatformError, match=r"after 4 attempts") as caught:
+        holdings(p, fake)
+    assert caught.value.facts["read_retry"]["providers"]["providers[0]"]["failed"] == 1
+
+
+def test_o46_the_transfers_stages_listing_tries_a_connection_failure_again(p, broken, ticker):
+    """O46: the first transfer listing the transfers stage reads fails to connect once; it is asked again, the reset
+    passes, and the stage's record tallies its own transfer reads (`transfer_read_retry`)."""
+    broken.on(nth(LISTINGS, 1), CONNECT)
+    record = run(p, ticker)
+    tally = record["stages"]["transfers"]["transfer_read_retry"]
+    assert (tally["errors"], tally["retries"], tally["failed"]) == ({"ConnectError": 1}, 1, 0)
+
+
+def test_o46_a_transfer_listing_that_never_connects_fails_the_reset_closed(p, broken, ticker):
+    """O46: a listing that never connects shows nothing the stage can trust: the transfers stage fails, never settles,
+    and its record holds the tally."""
+    broken.on(LISTINGS, CONNECT, times=None)
+    with pytest.raises(ResetFailed) as caught:
+        run(p, ticker)
+    assert caught.value.stage == "transfers"
+    assert caught.value.record["stages"]["transfers"]["transfer_read_retry"]["failed"] >= 1
+
+
+def test_o46_the_eviction_stages_wait_for_its_transfer_tries_a_connection_failure_again(p, broken, ticker):
+    """O46: the eviction stage's wait for its own job polls the job's record; one read that fails to connect is asked
+    again, the eviction is verified and the reset passes; the stage's record tallies it."""
+    broken.on(nth(RECORDS, 1), CONNECT)
+    record = run(p, ticker, evict={"beta": [FILES[0]]})
+    assert record["ok"] is True
+    assert record["stages"]["eviction"]["transfer_read_retry"]["errors"] == {"ConnectError": 1}
+
+
+def test_o46_an_eviction_whose_transfer_record_never_connects_fails_the_reset_closed(p, broken, ticker):
+    """O46: a job whose record never answers is not known to have ended: the eviction stage fails, with its tally."""
+    broken.on(RECORDS, CONNECT, times=None)
+    with pytest.raises(ResetFailed) as caught:
+        run(p, ticker, evict={"beta": [FILES[0]]})
+    assert caught.value.stage == "eviction"
+    assert caught.value.record["stages"]["eviction"]["transfer_read_retry"]["failed"] >= 1
+
+
+def test_o46_the_historys_reading_of_the_global_clock_tries_a_connection_failure_again(p, broken, ticker):
+    """O46: Onezone's current-time read, which places the history's window on the global clock, fails to connect once
+    and is asked again: the history stage passes and tallies it."""
+    broken.on(nth(zone_clock, 1), CONNECT)
+    record = run(p, ticker)
+    assert record["stages"]["history"]["transfer_read_retry"]["errors"] == {"ConnectError": 1}
+
+
+def test_o46_a_global_clock_that_never_connects_fails_the_history_stage(p, broken, ticker):
+    """O46: a clock that cannot be read places nothing: the history stage fails, as it did, now after the retries."""
+    broken.on(zone_clock, CONNECT, times=None)
+    with pytest.raises(ResetFailed) as caught:
+        run(p, ticker)
+    assert caught.value.stage == "history"
+    assert caught.value.record["stages"]["history"]["transfer_read_retry"]["failed"] >= 1
+
+
+@pytest.fixture
+def summaries(client, config, platform_file, ticker, tmp_path, fake):
+    return provisioner_with(client, config, platform_file, ticker, tmp_path, scan="summaries")
+
+
+def test_o33_a_summaries_scans_directory_listing_tries_a_connection_failure_again(summaries, broken, ticker):
+    """O33: with `qos_scan = "summaries"` the scan walks the space by its directory listings; the first fails to
+    connect once and is asked again, under the scan's policy, and the qos stage's record tallies it."""
+    broken.on(nth(CHILDREN, 1), CONNECT)
+    record = run(summaries, ticker)
+    assert record["stages"]["qos"]["read_retry"]["errors"] == {"ConnectError": 1}
+
+
+def test_o33_a_summaries_scan_whose_listing_never_connects_fails_the_reset_closed(summaries, broken, ticker):
+    """O33: a directory listing that never connects leaves the walk incomplete: the qos stage fails, with the tally."""
+    broken.on(CHILDREN, CONNECT, times=None)
+    with pytest.raises(ResetFailed) as caught:
+        run(summaries, ticker)
+    assert caught.value.stage == "qos"
+    assert caught.value.record["stages"]["qos"]["read_retry"]["failed"] >= 1
