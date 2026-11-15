@@ -147,6 +147,8 @@ def platform_document(directory: Path) -> dict[str, Any]:
         },
         "space": {"name": SPACE_NAME, "id": "spmock0001", "prefixes": [SPACE_PREFIX]},
         "support": {"providers": ["alpha"], "local": "alpha"},
+        # declared, as a platform with [faults] must (fault_settings.restore_token_margin_s); the value is the default
+        "tokens": {"margin_s": 900},
         "credentials": {"admin": {"env": ADMIN_ENV}, "users": {"directory": CREDENTIALS_DIR}},
         "principals": {
             "data_path": {"username": DATA_PATH_USER.username, "user_id": DATA_PATH_USER.user_id},
