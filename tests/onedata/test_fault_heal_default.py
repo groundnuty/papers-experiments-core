@@ -82,6 +82,15 @@ def test_o35_the_derivation_follows_the_other_declared_bounds(tmp_path):
     assert settings.heal_timeout_s == 1200
 
 
+def test_o35_a_least_that_is_a_whole_number_of_minutes_is_not_rounded_up_a_minute_too_far(tmp_path):
+    """O35: the margin is counted in integer percent, so a least of exactly 3,000 s (one link restart: three 100 s
+    commands, the RPC's 120 s and 30 s margin, and a 2,550 s settle) derives 3,300 s, not 3,360 s, which a float
+    tenth would give."""
+    settings = load(tmp_path, 4, heal="link", command_timeout_s=100, heal_settle_s=2550)
+    assert heal_round_s(settings) == 3000
+    assert settings.heal_timeout_s == 3300
+
+
 @pytest.mark.parametrize("declared", [4289, 4200])
 def test_o35_a_declared_heal_timeout_below_the_least_is_still_refused_naming_both_numbers(tmp_path, declared):
     """O35: a declared value is never derived or raised: five providers in `"all_links"` need 4,290 s, so 4,289 s and
