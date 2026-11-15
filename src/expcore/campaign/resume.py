@@ -22,6 +22,7 @@ on the whole plan.
 import json
 import sqlite3
 from collections.abc import Mapping
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -35,6 +36,7 @@ from expcore.campaign.reset_settings import checked as checked_settings
 from expcore.campaign.reset_settings import say as say_settings
 from expcore.campaign.shard_run import GROWTH_HINT, ShardStart, pin_shard
 from expcore.campaign.store import Store
+from expcore.campaign.storecopy import store_copy
 
 FINGERPRINT_KEY = "fingerprint"
 
@@ -66,15 +68,24 @@ def recorded_fingerprint(rows: list[Any]) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def read_fingerprint(path: Path) -> dict | None:
-    """The fingerprint the store at `path` records, read over a read-only connection; None when it records none."""
-    connection = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=30.0)
-    try:
-        return recorded_fingerprint(
-            connection.execute("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,)).fetchall()
-        )
-    finally:
-        connection.close()
+def read_fingerprint(path: Path, *, in_place: bool = False) -> dict | None:
+    """The fingerprint the store at `path` records; None when it records none.
+
+    A finished store is read from a private copy (`storecopy.store_copy`, which raises StoreChanged for a store that
+    changes while it is copied), so nothing is written beside it and its directory may be read-only (R16). With
+    `in_place`, for a store a dispatcher holds, the store itself is read over a read-only connection.
+    """
+    with ExitStack() as stack:
+        if in_place:
+            connection = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=30.0)
+        else:
+            connection = sqlite3.connect(stack.enter_context(store_copy(path)), timeout=30.0)
+        try:
+            return recorded_fingerprint(
+                connection.execute("SELECT value FROM meta WHERE key=?", (FINGERPRINT_KEY,)).fetchall()
+            )
+        finally:
+            connection.close()
 
 
 def open_campaign(

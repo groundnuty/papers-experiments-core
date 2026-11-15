@@ -236,6 +236,21 @@ def test_o36_the_config_file_and_the_environment_cannot_be_set_through_the_extra
         load(tmp_path, edit)
 
 
+@pytest.mark.parametrize("mode", ["proxy", "direct"])
+def test_o54_the_log_buffering_switch_cannot_be_set_through_the_extra_arguments_in_either_mode(tmp_path, mode):
+    """O54: the sidecar passes `--disable-log-buffering` with every mount, and oneclient refuses a switch given twice,
+    so a study's own is refused at load, with proxy as with direct I/O."""
+
+    def edit(data):
+        mount = data["sandbox"]["mount"]
+        mount["extra_args"] = ["--disable-log-buffering"]
+        if mode == "direct":
+            mount.update(io_mode="direct", storages={"0a1b2c": "/srv/invented"}, direct_check_file="space-x/f")
+
+    with pytest.raises(ConfigError, match="disable-log-buffering"):
+        load(tmp_path, edit)
+
+
 def test_the_tls_flag_cannot_be_smuggled_through_the_extra_arguments(tmp_path):
     def edit(data):
         data["sandbox"]["mount"]["extra_args"] = ["--insecure"]

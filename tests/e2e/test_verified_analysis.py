@@ -5,15 +5,28 @@ One finished campaign is built for the module; each test changes a copy of it an
 what they make of it.
 """
 
+import errno
+import hashlib
 import json
+import os
 import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
+from tree_support import read_only, tree_of, without
 
-from expcore.campaign.export import read_export
+from expcore.campaign import lock as lock_module
+from expcore.campaign.export import (
+    EXPORT_FINGERPRINT,
+    NOT_RECORDED,
+    export_text,
+    fingerprint_entry,
+    read_export,
+    verify_export_fingerprint,
+)
+from expcore.campaign.lock import DispatchLock
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.replay.check import inputs_sha256
 from expcore.study import pipeline
@@ -172,6 +185,94 @@ def test_r04_the_analysis_reads_the_snapshot_and_never_the_live_store(copy, clea
         leftover.unlink()
     assert cli(clean_environment, "report", str(copy.root))[0] == 0
     assert (copy.root / "out" / "report.md").read_text(encoding="utf-8") == finished.report
+
+
+def test_r16_analyze_report_and_regenerate_leave_the_sealed_batch_and_out_byte_for_byte_as_they_were(
+    copy, clean_environment
+):
+    """R16: the readers of a checked batch read the sealed snapshot's bytes, never the file in place, and never open
+    the live store: every file of out/, the hashed batch with its snapshot among them, keeps its bytes (the outputs
+    are written again with the same ones), and no file is added, no side file of the snapshot or of the store."""
+    out = copy.root / "out"
+    for leftover in out.glob("state.sqlite-*"):  # what the check's read-only opens of the store left
+        leftover.unlink()
+    sealed = tree_of(out)
+    assert f"runs/{SNAPSHOT_FILE}" in sealed
+    assert cli(clean_environment, "analyze", str(copy.root))[0] == 0
+    assert cli(clean_environment, "report", str(copy.root))[0] == 0
+    assert pipeline.regenerate(copy.root) == []
+    assert tree_of(out) == sealed
+
+
+def drop_side_files(campaign: Campaign) -> Path:
+    """Remove what earlier in-place reads left beside the store, so a new one would show; return out/."""
+    out = campaign.root / "out"
+    for leftover in out.glob("state.sqlite-*"):
+        leftover.unlink()
+    return out
+
+
+def test_r16_check_reads_a_finished_store_in_a_read_only_out_and_leaves_it_byte_for_byte(copy, clean_environment):
+    """R16: no dispatcher holds a finished campaign, so check reads its store from a copy: out/ may be read-only (a
+    campaign fetched from another host) and keeps every byte outside the batch, which gains only the check and the
+    snapshot."""
+    out = drop_side_files(copy)
+    before = tree_of(out)
+    with read_only(out):
+        code, errors = cli(clean_environment, "check", str(copy.runs))
+    assert code == 0, errors
+    after = tree_of(out)
+    assert without(after, "runs/") == without(before, "runs/")
+    assert set(after) == set(before)  # the batch's check and snapshot were rewritten; no file was added anywhere
+
+
+def test_r16_check_of_a_live_store_backs_it_up_in_place_under_partial_and_is_refused_without(copy, clean_environment):
+    """R16: a store a dispatcher holds is being written, so no copy of its files is one state. Without --partial the
+    check is refused, naming the dispatcher; with it, the store is backed up in place over a read-only connection,
+    which leaves the -shm and -wal a live store has anyway."""
+    out = drop_side_files(copy)
+    with DispatchLock(out):
+        code, errors = cli(clean_environment, "check", str(copy.runs))
+        assert code == 1
+        assert "a dispatcher holds" in errors, errors
+        assert "--partial" in errors, errors
+        assert sorted(p.name for p in out.glob("state.sqlite-*")) == []
+        assert cli(clean_environment, "check", str(copy.runs), "--partial")[0] == 0
+    assert sorted(p.name for p in out.glob("state.sqlite-*")) == ["state.sqlite-shm", "state.sqlite-wal"]
+    assert stored_check(copy)["snapshot"] == {"file": SNAPSHOT_FILE, "attempts_running": 0, "partial": True}
+
+
+def test_r16_check_refuses_a_store_whose_lock_file_is_missing_partial_or_not_and_writes_nothing(
+    copy, clean_environment
+):
+    """R16: without its lock file nothing keeps a dispatcher off the store while it is read, so it is never copied
+    as a finished store nor read in place as a live one: refused, naming the file, with or without --partial."""
+    out = drop_side_files(copy)
+    (out / "campaign.lock").unlink()
+    before = tree_of(out)
+    for extra in ((), ("--partial",)):
+        code, errors = cli(clean_environment, "check", str(copy.runs), *extra)
+        assert code == 1
+        assert "no dispatcher ever ran there" in errors, errors
+    assert tree_of(out) == before
+
+
+def test_r16_check_refuses_a_lock_the_file_system_cannot_take_and_never_reads_the_store_in_place(
+    copy, clean_environment, monkeypatch
+):
+    """R16: a lock that cannot be taken for another reason than a dispatcher (a file system without flock) is not
+    a live store, so even --partial does not read the store in place: refused, naming the lock, nothing written."""
+    out = drop_side_files(copy)
+    before = tree_of(out)
+
+    def unsupported(fd, operation):
+        raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+
+    monkeypatch.setattr(lock_module.fcntl, "flock", unsupported)
+    code, errors = cli(clean_environment, "check", str(copy.runs), "--partial")
+    assert code == 1
+    assert "cannot be locked" in errors, errors
+    assert tree_of(out) == before
 
 
 @pytest.mark.parametrize(
@@ -389,3 +490,63 @@ def test_r04_partial_check_records_that_attempts_were_running_and_analysis_then_
     for name in ("export.json", "analysis.json"):
         saved = running.read(name)
         assert (saved["partial"], saved["running_attempts"], saved["excluded_attempts"]) == (True, 1, [])
+
+
+# --- the campaign fingerprint in the export (#243, C36) --------------------------------------------------------------
+
+
+def snapshot_fingerprint(campaign: Campaign) -> str:
+    """The text of the fingerprint the check's snapshot of the store holds."""
+    snapshot = sqlite3.connect(campaign.runs / SNAPSHOT_FILE)
+    try:
+        return snapshot.execute("SELECT value FROM meta WHERE key = 'fingerprint'").fetchone()[0]
+    finally:
+        snapshot.close()
+
+
+def test_c36_the_saved_export_carries_the_fingerprint_the_live_store_and_the_snapshot_record(finished):
+    """C36: `export.json` holds the fingerprint as the store keeps it and its hash, so a report can read a setting that
+    holds for the whole campaign (the platform's data paths, the caps) without opening state.sqlite."""
+    text = snapshot_fingerprint(finished)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert finished.sql("SELECT value FROM meta WHERE key = 'fingerprint'")[0]["value"] == text
+    export = read_export(finished.root / "out" / "export.json")
+    assert export[EXPORT_FINGERPRINT] == {"sha256": digest, "fingerprint": json.loads(text)}
+    assert list(export)[-1] == EXPORT_FINGERPRINT
+    assert {"tasks", "caps", "environment"} <= set(export[EXPORT_FINGERPRINT]["fingerprint"])
+    assert digest in verify_export_fingerprint(export, digest)
+
+
+def test_c36_package_check_names_an_export_that_is_another_campaigns(copy):
+    """C36: an export whose fingerprint hash is not the snapshot's is named for what it is, not only as a difference."""
+    path = copy.root / "out" / "export.json"
+    export = json.loads(path.read_text(encoding="utf-8"))
+    export[EXPORT_FINGERPRINT] = fingerprint_entry({**export[EXPORT_FINGERPRINT]["fingerprint"], "seeds": [999]})
+    path.write_text(export_text(export), encoding="utf-8")
+    (problem,) = pipeline.regenerate(copy.root)
+    assert problem.startswith("export.json: the export is of another campaign")
+    assert export[EXPORT_FINGERPRINT]["sha256"] in problem
+
+
+def test_c36_an_export_from_before_the_key_reads_and_is_said_not_to_record_a_fingerprint(copy):
+    """C36: an old export without the key is still read; the check says 'fingerprint not recorded' and does not refuse
+    it for that, though the file is not what the records now give."""
+    path = copy.root / "out" / "export.json"
+    export = json.loads(path.read_text(encoding="utf-8"))
+    del export[EXPORT_FINGERPRINT]
+    path.write_text(export_text(export), encoding="utf-8")
+    digest = hashlib.sha256(snapshot_fingerprint(copy).encode("utf-8")).hexdigest()
+    assert verify_export_fingerprint(read_export(path), digest) == NOT_RECORDED
+    assert pipeline.regenerate(copy.root) == [f"export.json: differs from what the records give ({NOT_RECORDED})"]
+
+
+def test_c36_the_analysis_refuses_an_export_whose_fingerprint_is_not_that_of_the_snapshot_it_read(copy, monkeypatch):
+    """C36: the export the analysis builds is checked against the fingerprint of every snapshot it read."""
+    built = pipeline.export_run_state
+
+    def of_another_campaign(store, **kwargs):
+        return {**built(store, **kwargs), EXPORT_FINGERPRINT: fingerprint_entry({"seeds": [999]})}
+
+    monkeypatch.setattr(pipeline, "export_run_state", of_another_campaign)
+    with pytest.raises(pipeline.Refused, match="another campaign"):
+        pipeline.analyse_study(copy.root)

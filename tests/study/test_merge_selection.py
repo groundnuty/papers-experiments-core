@@ -25,6 +25,7 @@ from selection_support import (
 )
 from shard_support import MERGE_TIMES, MERGED_ONLY, merge_into, meta_of, without_shard_section
 from study_support import HEAD, Campaign, clean_environment, cli, copy_campaign, finish
+from tree_support import read_only, tree_of
 
 from expcore.campaign.lock import DispatchLock
 from expcore.campaign.selection import RULE_SELECTION
@@ -347,6 +348,57 @@ def test_c38_after_refuses_an_earlier_selection_still_running(base, clean_enviro
     assert code == 1, errors
     assert "has stopped" in errors, errors
     assert not (root / "out" / "state.sqlite").exists()
+
+
+def test_r16_after_reads_an_earlier_selection_in_a_read_only_out_and_leaves_it_byte_for_byte(
+    base, clean_environment, now
+):
+    """R16: an earlier selection copied read-only is read from a copy of its store: the later selection starts, and
+    the earlier one's out/ gains no -shm, -wal or lock file and keeps every byte."""
+    earlier = copy_campaign(now, base, "r16-now")
+    out = earlier.root / "out"
+    for leftover in out.glob("state.sqlite-*"):  # what earlier in-place reads left, so a new one would show
+        leftover.unlink()
+    before = tree_of(out)
+    with read_only(out):
+        later = run_selection(
+            base, "r16-later", clean_environment, [RELAY], "r16-later", sequential=True, after=[earlier]
+        )
+    assert tree_of(out) == before
+    assert (later.root / "out" / "state.sqlite").is_file()
+
+
+def test_r16_after_refuses_an_earlier_out_with_no_lock_file_naming_it_and_writes_nothing_there(
+    base, clean_environment, now
+):
+    """R16: a finished selection's dispatcher made its lock file; an out/ without one never had a dispatcher, so it is
+    not a finished selection: refused, naming it, before its store is read, and no lock file is made there."""
+    earlier = copy_campaign(now, base, "r16-no-lock")
+    out = earlier.root / "out"
+    (out / "campaign.lock").unlink()
+    before = tree_of(out)
+    root = make_selection_study(base, "r16-after-no-lock")
+    code, errors = run_refused(clean_environment, root, *select_args([RELAY], "next", sequential=True, after=[out]))
+    assert code == 1, errors
+    assert "no dispatcher ever ran there" in errors, errors
+    assert str(out) in errors, errors
+    assert tree_of(out) == before
+    assert not (root / "out" / "state.sqlite").exists()
+
+
+def test_r16_after_given_a_sealed_snapshot_refuses_it_and_writes_nothing_beside_it(base, clean_environment, whole):
+    """R16: --after takes a file as the store it names, a package's sealed snapshot say; the reader never makes a
+    lock file and reads a copy, so the package's directory keeps every byte (its checksums refuse an unlisted file)
+    and the snapshot, which is not a selection's store, is refused."""
+    sealed = base / "r16-package" / "out" / "runs"
+    sealed.mkdir(parents=True)
+    shutil.copyfile(whole.runs / "campaign-snapshot.sqlite", sealed / "campaign-snapshot.sqlite")
+    before = tree_of(sealed)
+    root = make_selection_study(base, "r16-after-sealed")
+    args = select_args([RELAY], "next", sequential=True, after=[sealed / "campaign-snapshot.sqlite"])
+    code, errors = run_refused(clean_environment, root, *args)
+    assert code == 1, errors
+    assert tree_of(sealed) == before
 
 
 def test_c38_a_later_selection_resumed_after_its_earlier_one_spent_more_is_refused(base, clean_environment, now, later):

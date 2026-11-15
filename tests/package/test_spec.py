@@ -59,6 +59,19 @@ def test_a_directory_takes_every_file_below_it_but_never_caches_or_the_live_camp
     ]
 
 
+def test_r16_the_live_stores_side_files_are_never_selected_whatever_the_patterns_say(tree):
+    """R16: a read-only open of the live store makes its -shm and -wal beside it, and a writer may leave a -journal;
+    none of them reaches a package, by a pattern that names the directory or the file itself."""
+    side = ["out/state.sqlite-shm", "out/state.sqlite-wal", "out/state.sqlite-journal"]
+    write(tree, dict.fromkeys(side, ""))
+    for pattern in ("out", "out/**", "**/*"):
+        chosen = select(tree, spec_with(tree, ["study.toml", pattern]))
+        assert not [path for path in chosen if path.startswith("out/state.sqlite")], pattern
+    for pattern in ("out/state.sqlite*", *side):  # a pattern that names only the live store names nothing
+        with pytest.raises(PackageError, match="selects no file"):
+            select(tree, spec_with(tree, ["study.toml", pattern]))
+
+
 def test_l08_the_harness_defect_log_is_never_selected_whatever_the_patterns_say(tree):
     """L08: the redacted tracebacks stay on the author's machine: "out", "out/logs" or "**/*.log" never take them."""
     try:
