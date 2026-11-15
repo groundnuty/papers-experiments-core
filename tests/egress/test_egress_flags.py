@@ -76,13 +76,28 @@ def test_a_damaged_log_that_shows_an_outside_connection_says_both():
         lambda s: s.update(log="intact", unknown=["not_closed"]),
         lambda s: s.update(counts=None),
         lambda s: s.update(declared={"gate": []}),
+        lambda s: s.update(canary=False),
+        lambda s: s.update(canary="yes"),
+        lambda s: s.update(records=-1),
+        lambda s: s.update(records=True),
+        lambda s: s.update(records=0),
+        lambda s: s.update(outside_complete=False),
+        lambda s: s.update(outside_complete="yes"),
     ],
 )
 def test_a_snapshot_that_contradicts_itself_is_unknown(tamper):
-    """An intact log whose counts disagree with its list, or that names a reason, or has no counts: not read."""
+    """O52: an intact log whose counts disagree with its list, or that names a reason, or has no counts, or says it
+    had no canary, or counts fewer records than destinations, or calls its own list incomplete: not read."""
     snap = snapshot_of(log(GATE_ONLY))
     tamper(snap)
     assert judge(record(instruments={NAMESPACE: snap}), "cond-a").flags == (LOG_UNKNOWN,)
+
+
+def test_an_unknown_logs_snapshot_that_calls_its_outside_list_complete_is_not_read():
+    """O52: a lower bound is never complete; a snapshot that says so contradicts itself."""
+    snap = snapshot_of(log(GATE_ONLY, end=False))
+    snap["outside_complete"] = True
+    assert judge(record(instruments={NAMESPACE: snap}), "cond-a").unknown == ("not_a_snapshot",)
 
 
 def test_a_run_without_a_snapshot_is_scanned_with_no_platform_names():

@@ -15,13 +15,12 @@ with every reason found, and the records read before the first damaged line are 
 or damaged log is never read as one without outside connections.**
 """
 
+import ipaddress
 import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-
-from expcore.egress.declare import address_of
 
 FORMAT = "hpcop-egress/1"
 MAX_BYTES = 256 * 1024 * 1024  # a log past this is not read: unknown (`log_too_large`)
@@ -78,7 +77,10 @@ def _record(rec: Any) -> bool:
     if rec["address"] == "-":
         return rec["op"] == "async"
     try:
-        return isinstance(rec["address"], str) and address_of(rec["address"]).version == FAMILIES[rec["family"]]
+        # The family against the address as the shim gave it, as the collector checks it: an IPv4-mapped IPv6 address
+        # is an inet6 record (classifying it as its IPv4 address is the declaration's job, declare.address_of).
+        address = rec["address"]
+        return isinstance(address, str) and ipaddress.ip_address(address).version == FAMILIES[rec["family"]]
     except ValueError:
         return False
 

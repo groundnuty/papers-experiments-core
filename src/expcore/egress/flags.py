@@ -70,14 +70,26 @@ def _readable(data: Any) -> tuple[Mapping[str, Any] | None, Declaration | None, 
     listed = sum_attempts(outside)
     if listed is None or not isinstance(data["outside_cut"], bool):
         return None, None, NOT_A_SNAPSHOT
-    if data["log"] == INTACT and not (
+    intact, canary, records, complete = data["log"] == INTACT, data["canary"], data["records"], data["outside_complete"]
+    if not isinstance(canary, bool) or not isinstance(complete, bool) or not _whole(records):
+        return None, None, NOT_A_SNAPSHOT
+    # An intact log opened with the canary (instrument.py: no canary is a reason), and its outside list is complete
+    # unless it was cut; an unknown log's list is a lower bound, never complete.
+    if (intact and not canary) or complete != (intact and not data["outside_cut"]):
+        return None, None, NOT_A_SNAPSHOT
+    if intact and not (
         isinstance(counts, Mapping)
         and set(counts) == set(CLASSES)
-        and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts.values())
+        and all(_whole(n) for n in counts.values())
         and (counts["outside"] >= listed if data["outside_cut"] else counts["outside"] == listed)
+        and records >= sum(counts.values())  # each counted destination is a record of its own
     ):
         return None, None, NOT_A_SNAPSHOT
     return data, declared, None
+
+
+def _whole(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def sum_attempts(outside: Sequence[Any]) -> int | None:

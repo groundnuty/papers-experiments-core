@@ -134,3 +134,10 @@ def test_a_log_that_does_not_open_with_the_canarys_connect_is_unknown(first):
 def test_a_canary_that_comes_after_another_record_is_no_canary():
     snap = finish(log([rec("connect", "192.0.2.1", 443), *RUN[:2]], canary=False))
     assert egress_instrument.NO_CANARY in snap["unknown"]
+
+
+def test_an_ipv4_mapped_connect_to_the_gate_counts_as_the_gate():
+    """O52: read as the inet6 record it is, then classified by its IPv4 address."""
+    mapped = [rec("connect", "::ffff:127.0.0.1", GATE_PORT, fd=7), rec("result", "::ffff:127.0.0.1", GATE_PORT, fd=7)]
+    snap = finish(log(mapped))
+    assert (snap["log"], snap["counts"]) == (INTACT, {"gate": 1, "loopback": 0, "outside": 0})

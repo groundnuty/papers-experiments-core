@@ -132,3 +132,18 @@ def test_the_records_before_the_first_damaged_line_are_kept_as_a_lower_bound():
 def test_a_line_that_is_not_an_object_is_unparseable():
     data = log(RECORDS).replace(b'{"event": "end"', json.dumps([1]).encode() + b"\n" + b'{"event": "end"', 1)
     assert egress_log.UNPARSEABLE in read_log(data, NONCE).problems
+
+
+def test_an_ipv4_mapped_ipv6_record_is_read_as_the_inet6_record_the_collector_wrote():
+    """O52: the collector checks the family against the address as the shim gave it; so does the reader, before any
+    normalising, so an IPv4-mapped IPv6 connect is a record, never damage."""
+    mapped = [rec("connect", "::ffff:127.0.0.1", 41234), rec("result", "::ffff:127.0.0.1", 41234)]
+    reading = read_log(log(mapped), NONCE)
+    assert reading.problems == ()
+    assert [r["family"] for r in reading.records] == ["inet6", "inet6"]
+
+
+def test_an_ipv4_mapped_address_under_the_inet_family_is_unparseable():
+    out = lines(RECORDS)
+    out[1]["rec"]["address"] = "::ffff:127.0.0.1"
+    assert egress_log.UNPARSEABLE in read_log(encode(out), NONCE).problems
