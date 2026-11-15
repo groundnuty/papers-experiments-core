@@ -56,11 +56,18 @@ cancellation of the launch does not hasten. The fault injector reads them at the
 or of its start's recovery, either of which may heal for up to `heal_timeout_s`: a step still running then could find
 its token expired after the heal (`expcore_onedata.faults`, "The token's window"). A copy of the context (a worker
 thread, a task) sees the same admission, and so the same count.
+
+A tool outside a campaign (a smoke driver, a warm-up) holds the shared admission too, through
+`expcore_onedata.tool_admission.shared_admission`, so no outage can overlap it. Whoever takes the lock exclusively
+knows that no such tool holds it, and ends the record of any a dead one left open (`expcore_onedata.shared_holds`); a
+wait for it that runs out says that tools outside a campaign hold the federation. An admission's `endings` are what
+runs, last first, when the last share lets the lock go.
 """
 
 import asyncio
 import contextlib
 import fcntl
+import logging
 import os
 import threading
 import time
@@ -82,6 +89,9 @@ from expcore_onedata.fault_journal import HeldLock, InjectionJournal, holder, ma
 from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings, load_faults
 from expcore_onedata.sandbox.kinds import FEDERATION_BUSY, PROVIDER_OUTAGE
+from expcore_onedata.shared_holds import SharedHolds
+
+log = logging.getLogger(__name__)
 
 FEDERATION_LOCK = "federation.lock"
 FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock
@@ -140,7 +150,9 @@ class Admission:
     the holder record it wrote beside the lock (`record`), which it removes before it lets the lock go.
 
     The owner's `close` gives up its share; the lock goes when the last share is given up, so a worker the owner
-    handed a share (`retain`) keeps the federation held until it ends, even after the owner has left."""
+    handed a share (`retain`) keeps the federation held until it ends, even after the owner has left. `endings` are
+    what to call, last first, just before the lock goes: a tool outside a campaign ends its record of the hold there
+    (`expcore_onedata.tool_admission`), so the record ends with the lock, never before a worker that still holds it."""
 
     exclusive: bool
     lock: HeldLock
@@ -150,6 +162,7 @@ class Admission:
     shares: _Shares = field(default_factory=_Shares, compare=False, repr=False)
     drain: SessionDrain | None = field(default=None, compare=False, repr=False)  # exclusive only (`fault_drain`)
     steps: _Steps = field(default_factory=_Steps, compare=False, repr=False)
+    endings: list[Callable[[], None]] = field(default_factory=list, compare=False, repr=False)
 
     @property
     def held(self) -> bool:
@@ -177,17 +190,17 @@ class Admission:
 
     def try_retain(self) -> Callable[[], None] | None:
         """Take one more share of the admission for a worker; return the call that gives it up (only the first call
-        counts), or None when there is no share to take: the admission is no longer held, or its last share is already
-        given up and its release is under way, so it cannot be kept for the worker."""
+        counts, in any thread), or None when there is no share to take: the admission is no longer held, or its last
+        share is already given up and its release is under way, so it cannot be kept for the worker (a tool reusing it
+        refuses then)."""
         with self.shares.lock:
             if not self.held or self.shares.count == 0:
                 return None
             self.shares.count += 1
-        given_up = threading.Event()
+        once = threading.Lock()  # never released: the first non-blocking acquire, in any thread, is the one that counts
 
         def give_up() -> None:
-            if not given_up.is_set():
-                given_up.set()
+            if once.acquire(blocking=False):
                 self._give_up()
 
         return give_up
@@ -218,22 +231,33 @@ class Admission:
         self._give_up()
 
     def _release(self) -> None:
-        """Let the lock go, its holder record first, so no record outlives a lock let go this way. An armed drain is
+        """Let the lock go, its records first, so no record outlives a lock let go this way. An armed drain is
         written to the federation's drain record first (`fault_drain`), so that no admission is granted inside it; when
-        it cannot be written the drain is waited out here, the lock held. When that fails too (an interrupt of the wait,
-        or anything else) the lock is not let go: it is kept for as long as this process lives (`_STRANDED`), with its
-        holder record, and the failure is raised. The federation then stays closed until the process ends, which is the
-        kernel's to settle, instead of opening inside the drain."""
+        it cannot be written the drain is waited out here, the lock held. When that fails too (an interrupt of the
+        wait, or anything else) the lock is not let go: it is kept for as long as this process lives (`_STRANDED`), with
+        its holder record, and the failure is raised. The federation then stays closed until the process ends, which is
+        the kernel's to settle, instead of opening inside the drain. Past the drain, the lock goes whatever a record's
+        end (`endings`, then the holder record) does, an interrupt included. A forked child's copy of the admission
+        holds nothing (the fork hook closed its descriptor), so it ends and clears nothing of its parent's."""
         try:
             if self.drain is not None and self.held:
                 self.drain.close_out()
         except BaseException:
             _STRANDED.append(self.lock)  # a held lock is closed by its finalizer once nothing refers to it
             raise
-        if self.journal is not None and self.record is not None and self.held:
-            with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
-                self.journal.clear_holder(self.record["token"])
-        self.lock.close()
+        owned = self.held
+        try:
+            if owned:
+                for ending in reversed(self.endings):
+                    try:
+                        ending()
+                    except Exception:  # the record of a hold only says who held it
+                        log.exception("the end of a hold could not be recorded")
+                if self.journal is not None and self.record is not None:
+                    with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
+                        self.journal.clear_holder(self.record["token"])
+        finally:
+            self.lock.close()
 
 
 async def _close_off_the_loop(admission: Admission) -> None:
@@ -385,8 +409,18 @@ class FederationLock:
         except BaseException:
             main.close()
             raise
+        self._settle_tools()
         drain = SessionDrain(self._drain_s, clock=self._clock, sleep=self._sleep, journal=journal, wall=self._wall)
         return Admission(True, main, self.federation, journal, record, drain=drain)
+
+    def _settle_tools(self) -> None:
+        """Under the exclusive lock, no tool outside a campaign holds the federation shared: end the record of any that
+        a dead one left open (`SharedHolds.settle`). It only says who held, so a record that cannot be read or written
+        is told of and never keeps an outage run out."""
+        try:
+            SharedHolds(self.directory).settle(proven=True)
+        except (OSError, ValueError):
+            log.warning("the record of the tools' holds could not be settled", exc_info=True)
 
     def try_acquire(self, *, exclusive: bool, purpose: str = OUTAGE_RUN, target: str | None = None) -> Admission | None:
         """Pass the turnstile and take the lock without waiting; None when either is held against it, or while an outage
@@ -425,13 +459,27 @@ class FederationLock:
         `injector_failure` when it was cancelled or the holder record failed. `purpose` and `target` go into the holder
         record of an exclusive admission."""
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
-        intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
         try:
-            main = self._wait(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, deadline, cancel)
-        finally:
-            intent.close()  # whoever waits behind it may now queue for the main lock
+            intent = self._wait(FEDERATION_INTENT, fcntl.LOCK_EX, deadline, cancel)
+            try:
+                main = self._wait(FEDERATION_LOCK, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, deadline, cancel)
+            finally:
+                intent.close()  # whoever waits behind it may now queue for the main lock
+        except FederationBusy as busy:
+            if exclusive:
+                raise self._explained(busy) from None
+            raise
         self._await_drain(main.close, deadline, cancel)
         return self._admit(main, exclusive, purpose, target)
+
+    def _explained(self, busy: FederationBusy) -> FederationBusy:
+        """An exclusive wait that ran out, with the tools outside a campaign that hold the federation shared named,
+        when any do (their reasons are their own text and stay in the record)."""
+        try:
+            tools = SharedHolds(self.directory).waiting_on()
+        except (OSError, ValueError):
+            return busy  # the record only explains the wait
+        return FederationBusy(f"{busy.detail}; {tools}") if tools else busy
 
     @contextlib.contextmanager
     def held(
@@ -500,6 +548,20 @@ class FederationLock:
         finally:
             _ADMISSION.reset(token)
             await _close_off_the_loop(admission)
+
+    def require_open(
+        self, release: Callable[[], None], timeout_s: float | None, cancel: threading.Event | None = None
+    ) -> None:
+        """What every admission checks once it holds the lock, for a use of one already held (a tool reusing its
+        context's, `expcore_onedata.tool_admission`): the journal holds no unsettled injection, and the drain record
+        has passed, waited for at most `timeout_s` (`FederationBusy`, the hold `federation_busy`, when it runs out).
+        `release` is called when either refuses."""
+        try:
+            self._require_settled()
+        except BaseException:
+            release()
+            raise
+        self._await_drain(release, None if timeout_s is None else time.monotonic() + timeout_s, cancel)
 
     def _require_settled(self) -> None:
         """Under the lock: refuse the run while the journal holds an unsettled injection, or cannot be read."""
