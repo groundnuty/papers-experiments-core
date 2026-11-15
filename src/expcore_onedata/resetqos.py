@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from expcore_onedata import consistency
+from expcore_onedata.occupancy import Listing, Reading
 from expcore_onedata.placement import Range, held_bytes, merged
 from expcore_onedata.provision import Listings, Provisioner, ProvisionError
 from expcore_onedata.transferrecord import Unreadable
@@ -149,13 +150,16 @@ def occupancy_wait_s(depth: int) -> float:
 @dataclass(frozen=True)
 class Found:
     """What a scan found: each requirement with the provider that showed it first, the regular files each applies to,
-    each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, and the
-    depth of the deepest regular file of the space it saw (0 when it saw none), which costs no read of its own."""
+    each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, the
+    depth of the deepest regular file of the space it saw (0 when it saw none), and the ids of the regular files
+    (`REG`) and hard links (`LNK`) any provider's listing showed, the files the occupancy reads the block maps of at
+    every provider (O46); the last two cost no read of their own."""
 
     where: dict[str, str]
     files: dict[str, dict[str, int]]
     reads: dict[str, int] = field(default_factory=dict)
     deepest: int = 0
+    listing: Listing = field(default_factory=Listing)
 
 
 def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:
@@ -202,10 +206,15 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
     """Every requirement any provider's summaries show: on each provider, the root's and every leaf's."""
     where: dict[str, str] = {}
     files: dict[str, dict[str, int]] = {}
+    listing = Listing()
     read, deepest = 0, 0
     for provider in providers:
         root, leaves = tree(p, provider)
         deepest = max([deepest, *(depth for _, kind, depth in leaves if kind != "DIR")])
+        listing |= Listing(
+            frozenset(file_id for file_id, kind, _ in leaves if kind == "REG"),
+            frozenset(file_id for file_id, kind, _ in leaves if kind == "LNK"),
+        )
         entries = [root, *(file_id for file_id, _, _ in leaves)]
         summaries = consistency.bounded_map(lambda f, q=provider: _summary(p, f, q), entries, p.settings.concurrency)
         for qid in sorted(set().union(*summaries)):
@@ -214,18 +223,19 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
             for qid in held if kind != "DIR" else ():
                 files.setdefault(qid, {})[file_id] = depth
         read += len(entries)
-    return Found(where, {q: files.get(q, {}) for q in where}, {"summaries": read}, deepest)
+    return Found(where, {q: files.get(q, {}) for q in where}, {"summaries": read}, deepest, listing)
 
 
 @dataclass(frozen=True)
 class _Listed:
     """One entry of the recursive listing: its id, its path relative to the space root ("." for the root), whether
-    it is a directory, and its `effQosInheritancePath`."""
+    it is a directory, its `effQosInheritancePath`, and its type (`REG`, `LNK`, ...)."""
 
     file_id: str
     path: str
     directory: bool
     inheritance: str
+    kind: str = ""
 
 
 def _listing_page(p: Provisioner, provider: str, root: str, token: str | None) -> tuple[list[_Listed], str | None]:
@@ -262,7 +272,7 @@ def _entries_of(answer: Any) -> tuple[list[_Listed], str | None]:
             raise Unreadable("an entry of the recursive listing has no plain fileId or no path")
         if inheritance not in INHERITANCE or not isinstance(kind, str):
             raise Unreadable("an entry of the recursive listing has no effQosInheritancePath or no type")
-        entries.append(_Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance))
+        entries.append(_Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance, kind))
     return entries, token
 
 
@@ -333,7 +343,11 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
         "records": len(qids),
     }
     deepest = max((len(e.path.split("/")) for e in entries.values() if not e.directory), default=0)
-    return Found(where, files, reads, deepest)
+    listing = Listing(
+        frozenset(e.file_id for e in entries.values() if e.kind == "REG"),
+        frozenset(e.file_id for e in entries.values() if e.kind == "LNK"),
+    )
+    return Found(where, files, reads, deepest, listing)
 
 
 def scan(p: Provisioner, providers: Sequence[str]) -> Found:
@@ -397,17 +411,18 @@ def _held(maps: Maps, key: Pair) -> int:
 def quiet(
     p: Provisioner,
     expected: Maps,
-    occupancy: Callable[[], Mapping[str, int]],
-    before: Mapping[str, int],
+    occupancy: Callable[[], Reading],
+    before: Reading,
     *,
     depth: int,
 ) -> dict[str, Any]:
     """Read the block map of each (file, provider) pair of `expected`, wait `quiet_wait_s(depth)` from T, the instant
     the last was read, and read the occupancy. Raise ProvisionError when a map holds more than `expected` says it should
     (nothing, for a pair the eviction emptied; what the settle saw, for a file a removed requirement applied to), or
-    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`). The
-    occupancy is read whatever `expected` holds, none included: a replication on a file nothing here names shows in no
-    block map read, and only the occupancy shows it.
+    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`), by its
+    files' block maps summed, never by the counter (`occupancy.py`, O46). The occupancy is read whatever `expected`
+    holds, none included: a replication on a file nothing here names shows in no block map read, and only the
+    occupancy shows it.
 
     What this proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The occupancy
     read at T + the lag + a margin shows every placement that landed by T. A landing after T is not proved absent: it
@@ -422,14 +437,21 @@ def quiet(
         )
     wait = quiet_wait_s(depth)
     p.sleep(wait)
+    label = p.client.provider_label
     sizes = occupancy()
-    over = [q for q, size in sizes.items() if q != p.settings.holder and size > before.get(q, 0)]
+    over = [q for q in sizes.files if sizes.held(q) > before.held(q)]
     if over:
-        where = ", ".join(p.client.provider_label(q) for q in over)
-        raise ProvisionError(f"{where} hold(s) more of the space after the quiet wait than at the occupancy stage")
-    physical = {p.client.provider_label(q): n for q, n in sizes.items()}
+        figures = "; ".join(
+            f"{label(q)}: its files hold {sizes.held(q)} bytes, {before.held(q)} at the occupancy stage (the "
+            f"directory statistics read {sizes.counter.get(q)} bytes)"
+            for q in over
+        )
+        raise ProvisionError(
+            f"{', '.join(label(q) for q in over)} hold(s) more of the space after the quiet wait than at the "
+            f"occupancy stage: {figures}"
+        )
     files = {file_id for file_id, _ in expected}
-    return {"files": len(files), "block_maps": len(maps), "waited_s": wait, "physical_bytes": physical}
+    return {"files": len(files), "block_maps": len(maps), "waited_s": wait, **sizes.facts(label)}
 
 
 __all__ = [

@@ -47,11 +47,11 @@ def key_of(reader, source):
     return probe_key(PROVIDERS[source], PROVIDERS[reader], ALPHA_ID)
 
 
-def pair_of(report, local, source):
-    """The result of the pair read through `local` from `source`, both by provider name, by position in the report."""
+def pair_of(report, reader, source):
+    """The result of the pair read through `reader` from `source`, both by provider name, by position in the report."""
     names = list(PROVIDERS)
-    found = [p for p in report.pairs if (p.local, p.source) == (f"providers[{names.index(local)}]", _label(source))]
-    assert len(found) == 1, f"the report holds exactly one pair {local} <- {source}"
+    found = [p for p in report.pairs if (p.reader, p.source) == (f"providers[{names.index(reader)}]", _label(source))]
+    assert len(found) == 1, f"the report holds exactly one pair {reader} <- {source}"
     return found[0]
 
 
