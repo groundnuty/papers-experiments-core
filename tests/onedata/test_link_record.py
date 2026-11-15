@@ -283,6 +283,18 @@ def test_o35_a_lock_file_another_user_made_read_only_is_still_taken(tmp_path):
         assert held is True
 
 
+def test_o35_a_lock_file_made_under_a_strict_umask_is_readable_to_every_process_that_may_take_part(tmp_path):
+    """O35: the lock file's owner makes it 0644 whatever its umask, so a process of another user that opens it
+    read-only can lock it and is ordered with the owner's checks, never run unserialized beside them."""
+    previous = os.umask(0o077)
+    try:
+        with recording(tmp_path / RECORD) as held:
+            assert held is True
+    finally:
+        os.umask(previous)
+    assert (tmp_path / LOCK).stat().st_mode & 0o777 == 0o644
+
+
 def test_o35_a_lock_that_cannot_be_taken_is_said_by_a_false_and_never_raises(tmp_path):
     """O35: a directory that cannot hold the lock file is no reason to skip a check: the caller is told it runs
     unserialized."""

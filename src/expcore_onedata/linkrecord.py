@@ -20,11 +20,14 @@ record, exclusively around a check and the writing of its record, so a check tha
 waits for it to end and writes after it, and the record is the latest-started check's, never an older one's that
 finished late. Under a restore's and a heal's exclusive admission the lock is never contended; it orders what the
 admission does not (`up` run on a federation another process is checking, say). No clock is read for the order. The
-lock is a leaf of the federation's lock order (`admission`). The lock file is opened read-only, which `flock` needs no
-write permission for, so every process that can write the directory can take part. A lock that still cannot be taken
-is no reason to skip the check: `recording` yields False, and a caller that cannot serialize publishes no verdict (the
-probe removes the older record instead), so an unordered write never leaves an old pass standing; `up`, which
-alone runs while nothing else does, writes and says so.
+lock is a leaf of the federation's lock order (`admission`). The lock file is opened read-only and its owner makes it
+0644, so every process that can write the directory can take part: `flock` needs no write permission. A lock that still
+cannot be taken is no reason to skip the check: `recording` yields False, and a caller that cannot serialize publishes
+no verdict (the probe removes the older record instead), so an unordered write never leaves an old pass standing; `up`,
+which alone runs while nothing else does, writes and says so. The residual: a lock file that something other than
+`recording` made unreadable to a process (not 0644, another user's), while a process that holds it is mid-write. The
+first runs unserialized, publishes nothing and removes the older record, which the second can still replace with its
+older pass. No lock the first cannot take orders it; the file's mode is the operator's to fix.
 
 **An older verdict never stands.** `discard_record` removes the record, or, when the directory refuses that, empties it
 in place (which needs only the file's own write permission) and dates it to the epoch, so that no reader takes it, by
@@ -113,12 +116,16 @@ def recording(path: Path) -> Iterator[bool]:
     """Hold the record's lock (`LOCK`, beside `path`) exclusively, waiting for any other check under way to end, for a
     check and the writing of its record; yield whether it is held. False means the lock file could not be opened or
     locked, and the caller must not publish a verdict that is not ordered. The file is opened read-only (created when
-    it is not there): `flock` needs no write permission, so a lock file another user made is taken all the same. The
-    lock is let go when the block ends, and by the kernel with a process that dies."""
+    it is not there) and its owner makes it readable to all (0644, whatever the umask): `flock` needs no write
+    permission, so a lock file another user made through this function is taken all the same. A lock file made some
+    other way and unreadable to this process leaves it unserialized (the module's residual). The lock is let go when
+    the block ends, and by the kernel with a process that dies."""
     descriptor = None
     held = False
     try:
         descriptor = os.open(Path(path).parent / LOCK, os.O_RDONLY | os.O_CREAT, 0o666)
+        with contextlib.suppress(OSError):  # the file's owner makes it readable to all, whatever its umask was
+            os.fchmod(descriptor, 0o644)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         held = True
     except OSError:
