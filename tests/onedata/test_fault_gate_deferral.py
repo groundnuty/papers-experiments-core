@@ -11,6 +11,10 @@ The bound also holds the waits between those, which are the core's own settings:
 `recheck_s` and the check that makes the link check afresh (`health_timeout_s`), which a call meeting it waits for,
 uncharged (the last deferred answer before the heal ends is followed by a check one recheck later). The platform
 declares how many of each (`DeferralBound.rechecks`, `checks`) and the core adds its own figures.
+
+The platform declares the bound twice: its health check (`max_deferral_s`) and its run admission
+(`declared_deferral_s`, from the same `[faults]`), so a study's check around the platform's that hides the method, or
+declares less, is refused at the start instead of holding the campaign to nothing.
 """
 
 from functools import partial
@@ -242,7 +246,7 @@ def test_o35_a_study_check_that_wraps_the_platforms_and_hides_the_method_is_refu
         "pass the method on",
     ):
         assert part in text, text
-    assert not (tmp_path / "campaign" / "dispatch.lock").exists()
+    assert [path.name for path in (tmp_path / "campaign").iterdir()] == ["state.sqlite"]  # no campaign.lock
 
 
 def test_o35_a_study_check_that_passes_the_method_on_starts_under_a_max_defer_s_that_covers_the_bound(tmp_path, fake):
