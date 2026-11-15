@@ -25,7 +25,7 @@ from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_gate_heal import GateHeals
-from expcore_onedata.fault_journal import InjectionJournal
+from expcore_onedata.fault_journal import InjectionJournal, holder
 from expcore_onedata.fault_matrix import LinkMatrix, PairState
 from expcore_onedata.fault_settings import load_faults
 from expcore_onedata.health import PlatformHealth
@@ -274,6 +274,54 @@ def test_o35_a_failed_heal_still_closes_the_gate(tmp_path):
     assert "until a link check passes" in after.detail
     assert core.closed is True
     assert len(acted(federation, "restart_link")) == 4
+
+
+def test_o35_a_check_that_meets_another_checks_heal_waits_uncharged_instead_of_the_latch(tmp_path):
+    """O35: this check found the stuck pair too, and by the time it would heal, another check's heal holds the
+    federation (its holder record, alive) and has set the latch: it answers the uncharged deferral, not the latch's
+    charged refusal."""
+    gate, federation, check, settings = gate_of(tmp_path, heal="all_links")
+    journal = InjectionJournal(settings.journal)
+
+    def another_heal_begins():  # while this check reads its pairs: another check's heal takes the federation
+        GateHeals(settings.journal).append({"event": "healing", "id": "another-check", "mode": "all_links"})
+        journal.write_holder({"token": "another-check", **holder(), "purpose": RECOVERY, "target": None})
+
+    check.on_check = another_heal_begins
+    reading = gate()
+    journal.clear_holder("another-check")
+    assert (reading.ok, reading.deferred, reading.charge) == UNCHARGED_WAIT, reading.detail
+    assert acted(federation, *ANY_ACTION) == []
+
+
+def test_o35_another_process_waits_uncharged_while_a_heals_container_restart_is_unverified(tmp_path):
+    """O35: a heal's container restart that was not verified is journalled `clear_failed` while the heal still holds
+    the federation for its settle; another process's check that times out on the federation then waits, uncharged,
+    instead of failing for a restore that is the heal's own and not over yet."""
+    gate, _, _, settings = gate_of(tmp_path, heal="all_links")
+    journal = InjectionJournal(settings.journal)
+    line = {"target": READER, "service": STORES["gamma"], "identity_sha256": "0" * 64, "heal": True}
+    journal.append({"event": "injecting", "id": "a-heals-restart", **line})
+    journal.append({"event": "clear_failed", "id": "a-heals-restart", "how": "heal_restart_failed"})
+    healing = FederationLock(settings).acquire(exclusive=True, purpose=RECOVERY)
+    try:
+        reading = gate()
+    finally:
+        healing.close()
+    assert (reading.ok, reading.deferred, reading.charge) == UNCHARGED_WAIT, reading.detail
+
+
+def test_o35_a_failed_heal_never_reopens_the_gate_on_a_pass_cached_before_it(tmp_path):
+    """O35: another check cached a passing report before the heal took the federation, and the heal then failed: the
+    gate's link check is made afresh after any heal, so the next check finds the pair still stuck and stays closed."""
+    federation = Federation()
+    federation.link_fixes = dict.fromkeys(EVERY, ())
+    gate, federation, check, _ = gate_of(tmp_path, federation, heal="all_links", heal_container_fallback=False)
+    check.cache = True
+    federation.on_ping = lambda label: setattr(check, "report", LinkMatrix(True, "every pair passed", ()))
+    reading = healed(gate, federation)
+    assert (reading.ok, reading.deferred) == (False, False)
+    assert "until a link check passes" in reading.detail
 
 
 def test_o35_a_heal_in_progress_defers_within_its_bound_and_closes_past_it(tmp_path):

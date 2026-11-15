@@ -34,11 +34,14 @@ closed, uncharged, as the hold `federation_busy` when either outlasts it, and ha
 with no provider restored, **in the background** (`_heal_on`). The check that began it, and every check while it runs,
 answers the uncharged deferral (`Health(..., deferred=True, charge=False)`) at once, so a heal longer than the
 campaign's `health_timeout_s` never reads as down and a pair it mends charges no run; past the heal's own bound
-(`heal_timeout_s` and `heal_settle_s` since it began) a heal still running closes the gate, uncharged. A heal that
-mended every pair makes the gate's own link check afresh under the admission, so the next check opens the gate only on a
-report made after the heal; a heal that left a pair failing leaves it to the next check, which finds it stuck and fails
-closed, and none runs again until the gate's link check passes. A check under a run's admission keeps a share of it
-until it ends, so one that outlives its caller's wait still holds the federation.
+(`heal_timeout_s` and `heal_settle_s` since it began) a heal still running closes the gate, uncharged. A check that
+found the pair too and meets a heal under way (this gate's, or another check's holding the federation) waits the same
+way, never taking the latch the heal set for a closed episode, and so does another process's check that meets a heal's
+container restart journalled `clear_failed` during its settle. Whatever the heal did, the next check makes the link
+check afresh (`relink`), so no pass from before the heal's end opens the gate: a heal that left a pair failing leaves it
+to the next check, which finds it stuck and fails closed, and none runs again until the gate's link check passes. A
+check under a run's admission keeps a share of it until it ends, so one that outlives its caller's wait still holds the
+federation.
 """
 
 import contextlib
@@ -270,7 +273,7 @@ class FaultGate:
         closed whenever it cannot begin."""
         if self._healer is None or self._relink is None:  # no heal declared, or no sanction, services or reports
             return verdict
-        refused = self._latched(verdict)  # read first, so a latched gate waits for nobody
+        refused = self._refused(verdict)  # read first, so a latched gate waits for nobody
         if refused is not None:
             return refused
         try:  # waits, inside the bound, for every shared holder and then for the drain record, as any admission does
@@ -311,6 +314,22 @@ class FaultGate:
         )
         return Health(False, f"{verdict.detail}; {why}", deferred=True, charge=False)
 
+    def _refused(self, verdict: Health) -> Health | None:
+        """Before this check's heal takes the federation: a heal that runs (this gate's, or another check's that holds
+        the federation) answers its uncharged wait, never the latch it set; with no heal running, a latch set since the
+        gate's link check last passed refuses the heal, charged as any stuck link is; None when the heal may go on.
+        A heal running is asked about before the latch and again after it, and the latch read once more, so a heal that
+        began, or one that ended with a pass, between the readings is never taken for a closed episode."""
+        waiting = self._healing() or self._healing_elsewhere()
+        if waiting is not None:
+            return waiting
+        if self._latched(verdict) is None:
+            return None
+        waiting = self._healing() or self._healing_elsewhere()
+        if waiting is not None:
+            return waiting
+        return self._latched(verdict)
+
     def _healing_elsewhere(self) -> Health | None:
         """The uncharged deferral while another process's health check holds the federation for its recovery or heal
         (its holder record, alive); None otherwise."""
@@ -323,27 +342,40 @@ class FaultGate:
 
     def _heal_on(self, exclusive: Admission, trigger: LinkMatrix) -> None:
         """The heal, in the background, under the exclusive admission it was handed, which it lets go at its end. A
-        heal that mended every pair makes the gate's own link check afresh under the admission (`relink`), so the next
-        check answers on a report made after the heal: open when it passed, else closed, with the latch keeping a
-        second heal out. A heal that failed leaves the pairs to the next check, which finds them still stuck."""
+        heal that mended every pair makes the gate's own link check afresh under the admission (`relink`), and a pass
+        lifts the latch. Whatever the heal did, the rest of the check's last link report is then expired before the
+        admission goes (`relink`), so the next check checks the links afresh and no pass made before the end of the
+        heal, by any check, opens the gate: after a heal that failed it finds the pairs still stuck and fails closed,
+        the latch keeping a second heal out."""
         try:
             result, said = self._healer.run(trigger) if self._healer is not None else (None, "no heal is declared")
             if result is not None:
                 self._last_heal = result.record
             if result is not None and result.healed and self._relink is not None:
                 self._relink()
-                self._judged()  # its report becomes the rest of the check's latest, and a pass lifts the latch
+                self._judged()  # under the admission: a pass lifts the latch
             else:
                 log.warning("the fault gate's heal left the gate closed: %s", said)
         except Exception as error:  # the next check finds the pairs as they are, and fails closed on them
             log.warning("the fault gate's heal raised %s; the gate stays closed", type(error).__name__)
         finally:
-            exclusive.close()
+            try:
+                if self._relink is not None:
+                    self._relink()  # the next check checks the links afresh, whatever any check found before
+            finally:
+                exclusive.close()
 
     def _busy(self) -> Health:
         """The wait for the federation ran out: tell a failed restore, a stuck holder and an outage run on it apart."""
         entries = self._recovery.entries()
-        if any("clear_failed" in entry and not entry.get("healing") for entry in entries):
+        failed = [entry for entry in entries if "clear_failed" in entry and not entry.get("healing")]
+        if failed and all(entry.get("heal") is True for entry in failed):
+            # only a heal's own container restarts failed, and the health check that heals may still hold the
+            # federation for their settle: a heal not over yet, a wait that charges no run
+            waiting = self._healing_elsewhere()
+            if waiting is not None:
+                return waiting
+        if failed:
             return _unsettled(entries)  # a restore failed: a fault of the federation, whoever still holds it
         draining = self._lock.drain_left()
         if draining > 0:  # nobody holds it: it is closed while an outage run's sessions drain (or a heal's settle
