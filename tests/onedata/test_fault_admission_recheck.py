@@ -37,6 +37,7 @@ SCHEMA = make_schema()
 ONE = FactorSchema(SCHEMA.declared, SCHEMA.order, {"api-none": SCHEMA.conditions["api-none"]})  # a plan of one run
 ONE_KEY = key_of(ONE, "api-none")
 HEAL_WAITS = (False, True, False)  # (ok, deferred, charge): the answer of the check that begins a heal
+LONG_DEFERRAL_S = 10_000.0  # above the longest wait a declared heal can defer a check (`max_deferral_s`, #293)
 
 
 def admission_in(directory):
@@ -202,7 +203,7 @@ def test_o35_a_campaign_run_refused_for_a_heal_uses_no_attempt_and_runs_after_a_
         with admit(kinds, targets, cancel, exclusive) as mode:
             yield mode
 
-    settings = settings_for(max_attempts=1)
+    settings = settings_for(max_attempts=1, max_defer_s=LONG_DEFERRAL_S)
     with build(
         tmp_path / "campaign",
         schema=ONE,
@@ -413,7 +414,7 @@ def test_o35_a_faults_campaign_with_the_platforms_health_check_starts_and_runs(t
         schema=ONE,
         executor=FakeExecutor(),
         plan=SMALL,
-        settings=settings_for(),
+        settings=settings_for(max_defer_s=LONG_DEFERRAL_S),
         health=gate,
         admission=admission_in(federation_dir),
     ) as scheduler:
