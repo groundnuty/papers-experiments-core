@@ -977,7 +977,7 @@ def test_o28_the_agents_tokens_are_minted_for_the_scenarios_worst_case(
 
     def slow(data):
         data["faults"].update(settle_timeout_s=600)
-        data["tokens"] = {"margin_s": 2600}  # a restore of these bounds outgrows the default margin (2,585 s)
+        data["tokens"] = {"margin_s": 2600}  # a restore of these bounds outgrows the default margin (2,590 s)
 
     target = write_target(tmp_path / "slow", fake, relay, tools_manifest, slow)
     seen = []

@@ -840,7 +840,8 @@ def test_o35_a_heals_container_restart_ends_its_waits_at_its_budget_with_the_sta
     left stopped, and a restart cut short is unverified with its entry open for recovery."""
     services = HealServices()
     services.never_serving = {READER}
-    platform = write_platform(tmp_path, lambda data: four_providers(data, ready_timeout_s=60, poll_s=poll_s))
+    tokens = {"margin_s": 6000}  # a restore whose waits end one long pause past their bounds outgrows 900 s (5,635 s)
+    platform = write_platform(tmp_path, lambda data: four_providers(data, tokens, ready_timeout_s=60, poll_s=poll_s))
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     clock = FakeClock()
     services.clock = clock

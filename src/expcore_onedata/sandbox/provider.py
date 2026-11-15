@@ -757,7 +757,7 @@ class SandboxPlatform:
             began = time.monotonic()
             try:
                 try:
-                    await _complete(_in_daemon_thread(sandbox.stop), within=self._teardown_s)
+                    await _complete(_in_daemon_thread(_counted_stop(sandbox)), within=self._teardown_s)
                 except SandboxError as error:
                     self._record_teardown(sandbox, "failed", began)
                     if not quiet:
@@ -895,6 +895,21 @@ class TeardownCut(Exception):
     def __init__(self, deadline_s: float, *, cancelled: bool = False) -> None:
         super().__init__(f"the teardown was cut at its deadline of {deadline_s:g} s")
         self.cancelled = cancelled
+
+
+def _counted_stop(sandbox: DockerSandbox) -> Callable[[], None]:
+    """The sandbox's stop, counted as the run's sandbox step from now (`admission.begin_token_step`) until the stop
+    itself has ended: one cut at its deadline goes on in its thread after the launch has left, its mount or gate maybe
+    still up, so no heal may begin until it ends (O35)."""
+    step_ended = begin_token_step(SANDBOX_STEP)
+
+    def stop() -> None:
+        try:
+            sandbox.stop()
+        finally:
+            step_ended()
+
+    return stop
 
 
 def _in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future[Any]:

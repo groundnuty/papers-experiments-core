@@ -50,7 +50,7 @@ from expcore_onedata.testing import write_platform
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
 DRAIN_S = 320.0
-SLOW_READY_MARGIN_S = 1000  # a 200 s wait to serve takes the fixture's restore past the default token margin (995 s)
+SLOW_READY_MARGIN_S = 1100  # a 200 s wait to serve takes the fixture's restore past the default token margin (1,000 s)
 
 
 def settings_of(platform):

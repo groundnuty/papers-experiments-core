@@ -53,11 +53,11 @@ from expcore_onedata.tokens import TokenIssuer, tool_server_spec
 from expcore_onedata.toolserver import ENV_TOOLS, ToolServerLauncher
 
 DEFAULT_MARGIN_S = 900  # `[tokens] margin_s` by default
-# The four-provider fixture's restore and gate: a stop of unknown outcome waited out (5 s), two starts each with its
-# wait (2 x (10 s + 5 s)), the wait to serve (5 s) and the session gate (240 s), and the slack (300 s): 580 s. The
-# long margin adds two heals of 4,200 s.
-FIXTURE_RESTORE_MARGIN_S = 580
-LONG_MARGIN_S = FIXTURE_RESTORE_MARGIN_S + 2 * int(DEFAULT_HEAL_TIMEOUT_S)  # 8,980 s
+# The four-provider fixture's restore and gate: a stop of unknown outcome waited out (5 s, and a pause of 1 s past it),
+# two starts each with its wait (2 x (10 s + 5 s + 1 s)) and a pause between them (1 s), the wait to serve (5 s + 1 s)
+# and the session gate (240 s), and the slack (300 s): 585 s. The long margin adds two heals of 4,200 s.
+FIXTURE_RESTORE_MARGIN_S = 585
+LONG_MARGIN_S = FIXTURE_RESTORE_MARGIN_S + 2 * int(DEFAULT_HEAL_TIMEOUT_S)  # 8,985 s
 NESTED = "nested"  # the documented order: `running` inside both launches, so its exit restores while they run
 STOPPED_FIRST = "stopped_first"  # the other study's order: both launches stopped before `running`'s exit
 SANDBOX_OPEN = "sandbox_open"  # the tool server stopped before the restore, the sandbox not
@@ -72,11 +72,12 @@ def settings_of(platform):
     return load_faults(platform, load_platform(platform, require_secrets=False))
 
 
-def at_default_bounds(data, heal, margin_s):
+def at_default_bounds(data, heal, margin_s, **faults):
     """The four-provider federation with `[faults]` at its default bounds (the fixture shortens them)."""
     four_providers(data, heal=heal)
-    for key in ("settle_timeout_s", "ready_timeout_s", "clear_attempts", "command_timeout_s"):
+    for key in ("settle_timeout_s", "ready_timeout_s", "clear_attempts", "command_timeout_s", "poll_s"):
         data["faults"].pop(key, None)
+    data["faults"].update(faults)
     data["tokens"] = {"margin_s": margin_s}
 
 
@@ -86,17 +87,28 @@ def test_o35_a_restore_and_gate_that_could_outlast_the_token_margin_are_refused_
 ):
     """O35, O06: the restore always runs, inside the run's token window in the documented order, so `[tokens]
     margin_s` must outlive it: a stop of unknown outcome waited out (settle_timeout_s 180 s), three starts each with its
-    wait for the new identity (3 x (command_timeout_s 120 s + settle_timeout_s 180 s)), the wait to serve
-    (ready_timeout_s 180 s) and the session gate (gate_timeout_s 240 s), 1,500 s at the defaults, and 300 s of slack:
-    1,800 s. The default margin (900 s) is refused, naming every number, heal declared or not; 1,800 s loads."""
+    wait for the new identity (3 x (command_timeout_s 120 s + settle_timeout_s 180 s)) and two pauses between them, the
+    wait to serve (ready_timeout_s 180 s), each wait one pause (poll_s 2 s) past its bound, and the session gate
+    (gate_timeout_s 240 s), 1,514 s at the defaults, and 300 s of slack: 1,814 s. The default margin (900 s) is refused,
+    naming every number, heal declared or not; 1,814 s loads."""
     expected = (
-        r"\[tokens\] margin_s must be at least 1800 s, not 900 s.*settle_timeout_s 180 s.*3 starts.*"
-        r"command_timeout_s 120 s.*ready_timeout_s 180 s.*gate_timeout_s 240 s.*300 s of slack"
+        r"\[tokens\] margin_s must be at least 1814 s, not 900 s.*settle_timeout_s 180 s.*3 starts.*"
+        r"command_timeout_s 120 s.*2 pause.*ready_timeout_s 180 s.*poll_s 2 s.*gate_timeout_s 240 s.*300 s of slack"
     )
     with pytest.raises(ConfigError, match=expected):
         settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, DEFAULT_MARGIN_S)))
-    settings = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 1800)))
-    assert (restore_token_margin_s(settings), TOKEN_SLACK_S) == (1800, 300)
+    settings = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 1814)))
+    assert (restore_token_margin_s(settings), TOKEN_SLACK_S) == (1814, 300)
+
+
+def test_o35_a_long_pause_counts_against_the_token_margin_since_each_wait_ends_one_pause_past_its_bound(tmp_path):
+    """O35, O06: each wait checks its bound only after a reading, so a restore can end one pause past each bound: with
+    `poll_s` of 2,000 s, a margin of 1,814 s, enough for the default pause, is refused, and the figure counts the pause
+    after the stop's wait, after each start's wait and between them, and after the wait to serve."""
+    with pytest.raises(ConfigError, match=r"margin_s must be at least .* s, not 1814 s.*poll_s 2000 s"):
+        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 1814, poll_s=2000)))
+    slow = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 20000, poll_s=2000)))
+    assert restore_token_margin_s(slow) == 1814 - 7 * 2 + 7 * 2000  # seven pauses with three starts
 
 
 def test_o35_the_fixtures_restore_fits_the_default_margin_and_the_long_margin_adds_two_heals(tmp_path):
@@ -106,7 +118,7 @@ def test_o35_the_fixtures_restore_fits_the_default_margin_and_the_long_margin_ad
     settings = settings_of(platform_with(tmp_path, heal="all_links"))
     assert load_platform(platform_with(tmp_path, heal="all_links"), require_secrets=False).tokens.margin_s == 900
     assert restore_token_margin_s(settings) == FIXTURE_RESTORE_MARGIN_S
-    assert heal_token_margin_s(settings) == LONG_MARGIN_S == 580 + 2 * 4200
+    assert heal_token_margin_s(settings) == LONG_MARGIN_S == 585 + 2 * 4200
     drained = settings_of(platform_with(tmp_path, heal="all_links", session_drain_s=320))
     assert heal_token_margin_s(drained) == LONG_MARGIN_S + 320
     assert heal_token_margin_s(settings_of(platform_with(tmp_path))) == 0.0

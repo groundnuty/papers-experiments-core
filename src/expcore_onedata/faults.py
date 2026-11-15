@@ -170,7 +170,7 @@ running heals it, under its own exclusive admission. **In this order that is no 
 run before it too, and the health gate, whose recovery never heals, holds the campaign meanwhile: a stuck pair is healed
 only by a start with no step running (an executor that starts the injector before its launches, or a bare injector
 start), by the long margin, or by hand. The long margin, `[tokens] margin_s` of at least
-`fault_settings.heal_token_margin_s` (10,520 s with the defaults), heals as before whatever still runs. An executor
+`fault_settings.heal_token_margin_s` (10,534 s with the defaults), heals as before whatever still runs. An executor
 that stops its sandbox and tool server before `running`'s exit heals with the default margin. A tool server or sandbox
 the study starts itself, which no launch counts, is not seen.
 

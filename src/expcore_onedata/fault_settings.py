@@ -90,12 +90,13 @@ run's token outlives its whole-time ceiling by `[tokens] margin_s` only, counted
 (its container start and its session gate use no run token), so a platform.toml with `[faults]` is refused at load,
 heal declared or not, unless `margin_s` is at least `restore_token_margin_s`, naming every number: the restore's bound
 (`restore_bound_s`: a stop of unknown outcome waited out, `settle_timeout_s`; `clear_attempts` starts, each with its
-command and its wait for the new identity, `command_timeout_s` and `settle_timeout_s`; the wait to serve,
-`ready_timeout_s`; and the session gate, `gate_timeout_s`), 1,500 s with the defaults, plus `TOKEN_SLACK_S`, 300 s,
-for what that bound does not hold (the injector's start after the mint, the link check after the gate, the steps
-before the tool server's check): 1,800 s with the defaults, so the default 900 s must be raised. Not counted: a
-start's recovery of an injection an earlier run left, which the health gate settles before a run is dispatched, and
-the session drain, which the run's admission publishes after the post-run check.
+command and its wait for the new identity, `command_timeout_s` and `settle_timeout_s`, and a pause between two; the
+wait to serve, `ready_timeout_s`; each of those waits one pause, `poll_s`, past its bound, which it checks only after a
+reading; and the session gate, `gate_timeout_s`), 1,514 s with the defaults, plus `TOKEN_SLACK_S`, 300 s, for what
+that bound does not hold (the readings' own time, the injector's start after the mint, the link check after the gate,
+the steps before the tool server's check): 1,814 s with the defaults, so the default 900 s must be raised. Not
+counted: a start's recovery of an injection an earlier run left, which the health gate settles before a run is
+dispatched, and the session drain, which the run's admission publishes after the post-run check.
 
 **A heal is skipped while a step of the run that uses its tokens runs.** A heal may take `heal_timeout_s` more, so at
 its start the injector reads the steps of the run that use its tokens (the tool server's launch and the sandbox's,
@@ -103,7 +104,7 @@ counted on the run's admission) and skips the heal while one still runs (`faults
 study declares the long margin: `margin_s` of at least `heal_token_margin_s`, the restore's margin above, two heals of
 `heal_timeout_s` (the restore's and the start's recovery's, as the injector's `cancel_wait_s` counts them) and one
 session drain of `session_drain_s`, which that start waits out after it restored a provider an earlier run left down
-(`FaultInjector._wait_owed`): 10,520 s with the defaults. A heal is never refused at load for the margin.
+(`FaultInjector._wait_owed`): 10,534 s with the defaults. A heal is never refused at load for the margin.
 """
 
 import hashlib
@@ -273,8 +274,10 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             f"its restore could outlast the run's token: [tokens] margin_s must be at least {needed:g} s, not "
             f"{margin:g} s: a stop of unknown outcome waited out (settle_timeout_s {s.settle_timeout_s:g} s), "
             f"{s.clear_attempts} starts each with its wait for the new identity ({s.clear_attempts} x "
-            f"(command_timeout_s {s.command_timeout_s:g} s + settle_timeout_s {s.settle_timeout_s:g} s)), the wait to "
-            f"serve (ready_timeout_s {s.ready_timeout_s:g} s), the session gate (gate_timeout_s "
+            f"(command_timeout_s {s.command_timeout_s:g} s + settle_timeout_s {s.settle_timeout_s:g} s)) and "
+            f"{s.clear_attempts - 1} pause(s) between them, the wait to serve (ready_timeout_s "
+            f"{s.ready_timeout_s:g} s), each wait one pause (poll_s {s.poll_s:g} s) past its bound, the session gate "
+            "(gate_timeout_s "
             f"{s.gate_timeout_s:g} s) and {TOKEN_SLACK_S:g} s of slack, since the tool server's stop after the restore "
             "examines the run's token",
         )
@@ -282,28 +285,34 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
 
 
 def restore_bound_s(settings: FaultSettings) -> float:
-    """The longest the run's own restore may take without a heal, by its declared bounds: a stop of unknown outcome
-    waited out (`settle_timeout_s`), `clear_attempts` starts, each with its command and its wait for the new identity
-    (`command_timeout_s` and `settle_timeout_s`), the wait to serve (`ready_timeout_s`) and the session gate
-    (`gate_timeout_s`). 1,500 s with the defaults."""
+    """The longest the run's own restore may take without a heal, by its declared bounds and its pauses: a stop of
+    unknown outcome waited out (`settle_timeout_s`), `clear_attempts` starts, each with its command and its wait for
+    the new identity (`command_timeout_s` and `settle_timeout_s`) and a pause between two (`poll_s`), the wait to
+    serve (`ready_timeout_s`), each of those waits one pause (`poll_s`) past its bound, since it checks the bound only
+    after a reading, and the session gate (`gate_timeout_s`, whose pauses end at its bound). 1,514 s with the
+    defaults. A reading's own time and the link check after the gate are the slack's (`TOKEN_SLACK_S`)."""
+    poll, attempts = settings.poll_s, settings.clear_attempts
+    identity_wait = settings.settle_timeout_s + poll
     return (
-        settings.settle_timeout_s
-        + settings.clear_attempts * (settings.command_timeout_s + settings.settle_timeout_s)
+        identity_wait
+        + attempts * (settings.command_timeout_s + identity_wait)
+        + (attempts - 1) * poll
         + settings.ready_timeout_s
+        + poll
         + settings.gate_timeout_s
     )
 
 
 def restore_token_margin_s(settings: FaultSettings) -> float:
     """The least `[tokens] margin_s` of a platform with `[faults]`, refused at load below it: the restore's bound and
-    `TOKEN_SLACK_S` (see the module docstring). 1,800 s with the defaults."""
+    `TOKEN_SLACK_S` (see the module docstring). 1,814 s with the defaults."""
     return restore_bound_s(settings) + TOKEN_SLACK_S
 
 
 def heal_token_margin_s(settings: FaultSettings) -> float:
     """The long token margin: the least `[tokens] margin_s` with which the injector heals while a step of the run that
     uses its tokens still runs (see the module docstring): the restore's margin, two heals of `heal_timeout_s` and one
-    session drain of `session_drain_s`, 10,520 s with the defaults; 0 with the heal off, which asks nothing of the
+    session drain of `session_drain_s`, 10,534 s with the defaults; 0 with the heal off, which asks nothing of the
     margin."""
     if settings.heal == "off":
         return 0.0
