@@ -902,6 +902,20 @@ assert all(len(modes) == 1 for modes in held.values())  # each condition ran und
 assert held == dict.fromkeys(held, {"none"})  # the example study has no run admission
 ```
 
+A setting that holds for the whole campaign (a mount level's declared `io_mode`, the bound on a tool server's calls, the caps) is in the campaign fingerprint, and `export.json` carries it as `campaign_fingerprint`, with its SHA-256, exactly as the store records it. A report reads it from there and need not open `state.sqlite`. Before it trusts the export, it checks which campaign it is of, against the hash of the snapshot the check made (or `merge.json`'s `fingerprint`, for a merged batch). An export of another campaign is refused naming both hashes; an export from before the key says `fingerprint not recorded` and is not refused, so a report that must have the fingerprint tests for that line:
+
+```python
+from expcore.campaign.export import NOT_RECORDED, read_export, stored_fingerprint_sha256, verify_export_fingerprint
+from expcore.campaign.snapshot import StoreSnapshot
+
+snapshot = StoreSnapshot(Path("my-study/out/runs/campaign-snapshot.sqlite").read_bytes(), load_study("my-study").schema)
+saved = read_export(Path("my-study/out/export.json"))
+assert verify_export_fingerprint(saved, stored_fingerprint_sha256(snapshot)) != NOT_RECORDED
+fingerprint = saved["campaign_fingerprint"]["fingerprint"]
+assert set(fingerprint["caps"]) and fingerprint["environment"]["distributions"]  # what the report may read from it
+snapshot.close()
+```
+
 ### Tools outside a campaign: hold the federation shared
 
 A smoke driver, a warm-up or a `verify` is no campaign attempt, so it holds no run admission, and on a platform with `[faults]` nothing keeps an outage from taking a provider down or bringing it back while the tool reads and writes through it. Take the federation's shared admission around everything such a tool does on it, the same one a campaign attempt takes, so an outage run waits for the tool and the tool waits for an outage run. Give the reason, in your own words: it goes into the record of who held the federation, `shared-holds.jsonl` beside the fault journal, with the process (boot id, pid and start time) and the start and end, and nowhere else.

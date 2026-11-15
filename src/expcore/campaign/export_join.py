@@ -24,7 +24,10 @@ snapshot and this module joins the results:
 - `shard_retries_by_kind` keeps what the sum of `retries_by_kind` loses: every row of every shard's own table, in shard
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
-- `shards` is merge.json's list of shards, as it is.
+- `shards` is merge.json's list of shards, as it is;
+- `campaign_fingerprint` (C36) is the fingerprint every shard shares, once, where the shards have it: a merge refuses
+  shards of different fingerprints, and a join of exports whose fingerprints differ, or of which only some carry one,
+  is refused too. Its hash is the `fingerprint` merge.json names.
 - In a merge of selections (C38), each run entry also gains `"selection"`, the label of the selection that ran it,
   and `shards` lists each selection's levels; a merge of shards has neither.
 
@@ -42,7 +45,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.campaign.deployments import fingerprint_order
-from expcore.campaign.export import RUN_LISTS, ExportError, none_last
+from expcore.campaign.export import EXPORT_FINGERPRINT, RUN_LISTS, ExportError, none_last
 from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.shard import EXPORT_KEY
 from expcore.errors import CORE_KINDS
@@ -101,6 +104,8 @@ def join_exports(
             joined[key] = _sum_table(key, _TABLES[key], parts)
         elif key == "partial":
             joined[key] = any(parts)
+        elif key == EXPORT_FINGERPRINT:
+            joined[key] = _shared_fingerprint(parts)
         elif key == "kinds":
             seen = {kind for part in parts for kind in part}
             joined[key] = [*CORE_KINDS, *sorted(seen - set(CORE_KINDS))]
@@ -115,6 +120,19 @@ def join_exports(
     ]
     joined[SHARDS_KEY] = [dict(shard) for shard in shards]
     return joined
+
+
+def _shared_fingerprint(parts: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    """The campaign fingerprint every shard's export carries (C36): one, or the shards are of other campaigns. A merge
+    refuses such shards already (C29); a join that is handed exports of them refuses them too."""
+    first = parts[0]
+    for part in parts[1:]:
+        if part != first:
+            raise ExportError(
+                "the shards' exports are of other campaigns: their campaign fingerprints differ "
+                f"({first['sha256']} and {part['sha256']})"
+            )
+    return first
 
 
 def _require_the_plan(joined: Mapping[str, Any], seq_of: Mapping[str, int]) -> None:

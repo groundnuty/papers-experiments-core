@@ -48,6 +48,7 @@ EXPORT_KEYS_OF_AN_ANALYSIS = [  # what `analyze` has always written, in this ord
     "partial",
     "running_attempts",
     "excluded_attempts",
+    "campaign_fingerprint",  # since C36, after every other and before a shard's `shard`
 ]
 RUN_FIELDS = ("run_key", "digest", "condition", "factors", "attempt", "treatment", "infra_kind")
 
