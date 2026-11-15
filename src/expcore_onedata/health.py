@@ -161,19 +161,21 @@ def _fault_gate(
     driver: FaultDriver | None,
     inner: HealthCheck,
     links: Callable[[], LinkReport | None],
+    relink: Callable[[], None],
 ) -> FaultGate | None:
     """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
     not valid raises ConfigError here, so a platform with an injector never runs without the gate. The Compose driver
-    it recovers through finds a restored provider serving by reading through the check's own client. `links` is the
-    check's latest link report and the providers' services are those of `[faults.services]`, by label, so the gate
-    heals the stuck pairs its own link check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
+    it recovers through finds a restored provider serving by reading through the check's own client. `links` takes the
+    link report the check made in the calling thread, `relink` makes its next call check the links again, and the
+    providers' services are those of `[faults.services]`, by label, so the gate heals the stuck pairs its own link
+    check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
     settings = fault_settings_of(config)
     if settings is None:
         return None
     if driver is None:
         driver = compose_driver(settings, probe=provider_serves(config, settings, client))
     labels = {config.provider_label(name): service for name, service in settings.services.items()}
-    return FaultGate(settings, driver, inner, labels=labels, links=links)
+    return FaultGate(settings, driver, inner, labels=labels, links=links, relink=relink)
 
 
 class PlatformHealth:
@@ -205,13 +207,15 @@ class PlatformHealth:
         self._links_at = 0.0  # when the last link check ended, on `monotonic`
         self._links_passed = False  # whether any link check of this campaign passed
         self._links_lock = threading.Lock()
+        self._links_expired = False  # set by the fault gate after a heal: the next call checks the links again
+        self._made = threading.local()  # the link report each thread's call made, which only that thread takes
         self._with_links = links
         self._ingest_journals = tuple(Path(journal) for journal in ingest_journals)  # read at every call (O44)
         # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
         # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
         self._gate = PreCampaignHealth(self._regular, self._measure)
         # outermost: it holds the federation, and heals the stuck pairs the link check finds (`fault_gate_heal`)
-        self._faults = _fault_gate(config, client, fault_driver, self._gate, lambda: self._links)
+        self._faults = _fault_gate(config, client, fault_driver, self._gate, self._take_links, self._expire_links)
 
     @property
     def gate_heal(self) -> dict | None:
@@ -239,6 +243,19 @@ class PlatformHealth:
         self._links = check_links(self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock)
         self._links_at = self._monotonic()
         self._links_passed = self._links_passed or self._links.ok
+        self._made.report = self._links  # this thread's own: another thread's call never takes it
+
+    def _take_links(self) -> LinkReport | None:
+        """The link report this thread's calls made since it last took one, None when they made none (for the fault
+        gate: only a report its own call made is one it acts on)."""
+        report = getattr(self._made, "report", None)
+        self._made.report = None
+        return report
+
+    def _expire_links(self) -> None:
+        """Make the next call check the links again, whatever the last verdict and its age (the fault gate, after a
+        heal: a pass another call made before the heal is no pass of the healed links)."""
+        self._links_expired = True
 
     def _regular(self) -> Health:
         """Every call once the content type passed: the space, then the links (O35), at the first call and again
@@ -253,7 +270,9 @@ class PlatformHealth:
         if self._links_lock.acquire(blocking=self._links is None):
             try:
                 last = self._links
-                if last is None or not last.ok or self._monotonic() - self._links_at >= every_s:
+                stale = self._links_expired or self._monotonic() - self._links_at >= every_s
+                if last is None or not last.ok or stale:
+                    self._links_expired = False
                     self._check_links()
             finally:
                 self._links_lock.release()

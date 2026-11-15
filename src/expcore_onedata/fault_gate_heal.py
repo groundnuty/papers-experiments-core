@@ -6,14 +6,19 @@ skipped while a run's tokens are in play. Stuck pairs that no restore heals (its
 restored) then wait. The platform's health check runs before any attempt launches anything, so the fault gate
 (`fault_gate.FaultGate`) heals them there, with the restore heal's own rules:
 
-- **Only on stuck pairs.** It acts only when the gate's own all-pairs link check, in the call that is answering, found
-  a pair whose fetch failed (a stuck pair, `fault_matrix.PairState.stuck`), never as routine: a check whose pairs pass,
-  one whose only failure is an untested pair, or one that failed before its link check (the space) heals nothing.
+- **Only on stuck pairs.** It acts only when the gate's own all-pairs link check, in the call that is answering and in
+  its thread (the report the rest of the check made there, never one another call made), found a pair whose fetch
+  failed (a stuck pair, `fault_matrix.PairState.stuck`), never as routine: a check whose pairs pass, one whose only
+  failure is an untested pair, or one that failed before its link check (the space) heals nothing; and a heal whose own
+  fresh matrix shows no stuck pair (it recovered meanwhile, or only an untested pair fails) does nothing either.
 - **Only between runs, under an exclusive admission of the gate's own.** Never inside a run's admission (a post-run
-  check, when the run's tokens may still be in play). The gate lets its shared hold go and takes the federation
-  exclusively (`admission.RECOVERY`), waiting at most `health_wait_s` for every shared holder: a campaign run, and a
-  tool outside the campaign, which takes the same shared lock. One that does not let go fails the check closed, with
-  nothing done. While it holds the federation no run is admitted, so no run's tokens exist during the heal.
+  check, when the run's tokens may still be in play), and a check under a run's admission keeps a share of it until it
+  ends, so one that outlives its caller still holds the federation. The gate lets its shared hold go and takes the
+  federation exclusively (`admission.RECOVERY`), waiting at most `health_wait_s` for every shared holder (a campaign
+  run, and a tool outside the campaign, which takes the same shared lock) and then for the drain record, as any
+  admission does. When either outlasts the wait the check fails closed with nothing done, as the hold
+  `federation_busy`, which charges no run. Once it holds the admission it reads the latch again (below). While it
+  holds the federation no run is admitted, so no run's tokens exist during the heal.
 - **The same heal.** `[faults] heal` names the mode (`"off"`: none here either), and the heal is the restore's
   (`Recovery.heal_stuck` over `fault_heal.LinkHeal`, no provider restored): its bounds (one `restart_link` and one
   container restart per provider, 2 passes, `heal_timeout_s`), its enforced no-fetch settle and its fresh reads of
@@ -29,7 +34,8 @@ restored) then wait. The platform's health check runs before any attempt launche
   a pair failing keeps the gate closed for an operator, and the link restarts never pile up against the supervisor's
   bound of 10 restarts of the link in 3,600 s.
 - **Fail closed.** A heal that does not end `healed` fails the check, naming why and each pair still failing by its
-  reader; the gate opens only once its own check, run again under the exclusive admission after the heal, passes.
+  reader; the gate opens only once its own link check, made afresh under the exclusive admission after the heal (a
+  recent pass another call made before it is not reused), passes.
 
 **The record** is `gate-heals.jsonl` beside the fault journal, by label only (O12): a `healing` line (`id`,
 `start_utc`, `mode`, `trigger`: the gate's check as a matrix), an `ended` line (the heal's record, `fault_heal`:

@@ -112,7 +112,9 @@ class LinkHeal:
     the declared bounds of a ping with a link restart, of the whole all-links sequence and of a container restart.
     `sources_seen`, when given, are providers whose container is never restarted (the sources of the stuck pairs the
     fault gate's check found), and the source of every failing pair of every matrix the heal reads joins them, so a
-    provider that was ever the source of a failing pair is never restarted, even once that pair passes."""
+    provider that was ever the source of a failing pair is never restarted, even once that pair passes. With
+    `only_stuck` (the fault gate's heal), a fresh matrix that shows no stuck pair (none failed a fetch, or it could not
+    be read) ends the heal at once, with nothing done."""
 
     def __init__(
         self,
@@ -139,8 +141,10 @@ class LinkHeal:
         sleep: Callable[[float], None],
         utc: Callable[[], str] = _utc,
         sources_seen: Iterable[str] | None = None,
+        only_stuck: bool = False,
     ) -> None:
         self._mode, self._driver, self._services, self._restored = mode, driver, dict(services), restored
+        self._only_stuck = only_stuck  # act only when the fresh matrix shows a stuck pair (the fault gate's heal)
         self._kept = (
             None if sources_seen is None else set(sources_seen)
         )  # never restarted: ever a failing pair's source
@@ -421,6 +425,9 @@ class LinkHeal:
         current = before = self._read()
         if current.ok:
             return self._end("healed", current, before)
+        if self._only_stuck and not current.stuck_readers():  # no failed fetch: no link to heal, so nothing is done
+            why = "the heal's fresh link check could not run" if not current.pairs else "no pair failed a fetch"
+            return self._end("links_stuck", current, before, f"{why} in the heal's fresh matrix, so nothing was done")
         if self._mode == "all_links":
             stop, current, why = self._all_links(before)
             if stop is not None:

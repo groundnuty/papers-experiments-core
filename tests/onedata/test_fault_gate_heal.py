@@ -7,7 +7,10 @@ attempt launches anything, with the restore heal's rules: the modes of `[faults]
 no-fetch settle, fresh pair reads around each action, its record, and failing closed.
 """
 
+import contextvars
 import json
+import threading
+import time
 from collections import Counter
 
 import pytest
@@ -16,10 +19,11 @@ from heal_support import NAMES, STORES, four_providers, heal_margin_s
 
 from expcore.campaign.healthgate import Health
 from expcore_onedata import health as platform_health
-from expcore_onedata.admission import OUTAGE_RUN, FederationLock
+from expcore_onedata.admission import OUTAGE_RUN, RECOVERY, FederationLock
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
+from expcore_onedata.fault_gate_heal import GateHeals
 from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_matrix import LinkMatrix, PairState
 from expcore_onedata.fault_settings import load_faults
@@ -50,6 +54,8 @@ class Federation(FakeServices):
         self.container_fixes: set[str] = set()
         self.clock: FakeClock | None = None
         self.ping_s = 0.0
+        self.on_ping = None  # called with the provider's label while it is pinged
+        self.on_read = None  # called before each of the heal's own reads of every pair
         self.actions: list[tuple[str, str, float]] = []
         self.reads: list[tuple[str, float]] = []
 
@@ -73,6 +79,8 @@ class Federation(FakeServices):
 
     def link_matrix(self, service):
         self.reads.append(("heal", self.now()))
+        if self.on_read is not None:
+            self.on_read()
         return self.matrix()
 
     def active_transfers(self):
@@ -89,6 +97,8 @@ class Federation(FakeServices):
         self._note("ping", service)
         if self.clock is not None:
             self.clock.sleep(self.ping_s)
+        if self.on_ping is not None:
+            self.on_ping(self.label[service])
         return True
 
     def restart_link(self, service):
@@ -112,24 +122,39 @@ class Federation(FakeServices):
 
 class GateCheck:
     """The rest of the platform's health check as `PlatformHealth` runs it inside the gate: the space (`space_ok`),
-    then its own link check of every pair, whose latest report `links` returns. `grow` adds stuck pairs before the
-    check of that number, as a pair that sticks between two checks."""
+    then its own link check of every pair. `take` hands the gate the report a call made (once), `expire` makes the next
+    call check the links again. With `cache`, as `PlatformHealth` within `every_s`, a call whose last report passed and
+    was not expired answers with it and checks nothing. `grow` adds stuck pairs before the check of that number, as a
+    pair that sticks between two checks; `report` is the latest report, whoever made it."""
 
     def __init__(self, federation: Federation) -> None:
-        self.federation, self.report, self.runs = federation, None, 0
-        self.space_ok = True
+        self.federation, self.report, self.made, self.runs = federation, None, None, 0
+        self.space_ok, self.cache, self.expired = True, False, False
         self.grow: dict[int, set[tuple[str, str]]] = {}
         self.unlinked_from: int | None = None  # from this check on it answers healthy without running its link check
+        self.on_check = None  # called at each check, while the gate holds the federation for it
+
+    def take(self) -> LinkMatrix | None:
+        made, self.made = self.made, None
+        return made
+
+    def expire(self) -> None:
+        self.expired = True
 
     def __call__(self) -> Health:
         self.runs += 1
+        if self.on_check is not None:
+            self.on_check()
         if not self.space_ok:
             return Health(False, "the providers supporting the space differ from the declared set")
         if self.unlinked_from is not None and self.runs >= self.unlinked_from:
             return Health(True, "the space is supported by its declared set")
+        if self.cache and self.report is not None and self.report.ok and not self.expired:
+            return Health(True, "every provider pair transferred (the last check, still recent)")
+        self.expired = False
         self.federation.stuck |= self.grow.get(self.runs, set())
         self.federation.reads.append(("gate", self.federation.now()))
-        self.report = self.federation.matrix()
+        self.report = self.made = self.federation.matrix()
         if self.report.ok:
             return Health(True, "every provider pair transferred")
         return Health(False, f"no run is admitted until every provider link transfers: {self.report.detail}")
@@ -153,7 +178,8 @@ def gate_of(tmp_path, federation=None, **faults):
         federation,
         check,
         labels=labels,
-        links=lambda: check.report,
+        links=check.take,
+        relink=check.expire,
         clock=clock,
         sleep=clock.sleep,
         wall=clock,
@@ -241,7 +267,7 @@ def test_o35_the_gate_heals_nothing_unless_its_own_check_finds_a_stuck_pair(tmp_
     federation.untested = {(READER, CRASHED)} if found == "an untested pair" else set()
     gate, federation, check, settings = gate_of(tmp_path, federation, heal="all_links")
     if found == "a space that fails first":
-        check.report = federation.matrix()  # a stuck pair an earlier call found
+        check.report = check.made = federation.matrix()  # a stuck pair an earlier call found, left untaken
         check.space_ok = False
     reading = gate()
     assert reading.ok is (found == "every pair passing")
@@ -329,18 +355,36 @@ def test_o35_a_gate_heal_that_left_a_pair_failing_is_not_run_again_until_a_check
 def test_o35_a_shared_holder_that_does_not_release_fails_the_gate_heal_closed(tmp_path):
     """O35: the heal's exclusive admission waits, within `health_wait_s`, for every shared holder (a campaign run, a
     tool outside the campaign through the same shared lock); one that does not let go fails the check closed, not
-    deferred, with nothing done and nothing recorded, and the next check after it has let go heals."""
+    deferred, as the hold `federation_busy` that charges no run, with nothing done and nothing recorded, and the next
+    check after it has let go heals."""
     gate, federation, _, settings = gate_of(tmp_path, heal="all_links")
     holder = FederationLock(settings).acquire(exclusive=False)
     try:
         reading = gate()
     finally:
         holder.close()
-    assert (reading.ok, reading.deferred) == (False, False)
-    assert "did not run" in reading.detail
+    assert (reading.ok, reading.deferred, reading.charge) == (False, False, False)
+    assert "did not run (federation_busy)" in reading.detail
     assert acted(federation, *ANY_ACTION) == []
     assert gate.last_heal is None
     assert heal_lines(settings) == []
+    assert gate().ok is True
+    assert len(acted(federation, "restart_link")) == 4
+
+
+def test_o35_the_gate_heals_only_once_the_federations_drain_has_passed(tmp_path):
+    """O35: the heal's admission waits for the federation's drain record like any admission: an outage run's drain
+    that outlasts `health_wait_s` (begun after the check took the federation shared) leaves the heal undone, closed and
+    uncharged (`federation_busy`), and once it has passed the next check heals."""
+    gate, federation, check, settings = gate_of(tmp_path, heal="all_links")
+    journal = InjectionJournal(settings.journal)
+    check.on_check = lambda: journal.raise_drain(federation.now() + 300)  # an outage run's drain, published meanwhile
+    reading = gate()
+    assert (reading.ok, reading.deferred, reading.charge) == (False, False, False)
+    assert "did not run (federation_busy)" in reading.detail
+    assert acted(federation, *ANY_ACTION) == []
+    check.on_check = None
+    federation.clock.sleep(301)
     assert gate().ok is True
     assert len(acted(federation, "restart_link")) == 4
 
@@ -366,6 +410,79 @@ def test_o35_the_gate_never_opens_with_a_pair_its_own_check_still_finds_stuck(tm
     assert reading.ok is False
     assert "providers[1]->providers[3]" in reading.detail
     assert len(acted(federation, "restart_link")) == 4
+
+
+def test_o35_a_pass_another_check_made_before_the_heal_never_opens_the_gate(tmp_path):
+    """O35: while the heal runs, another check publishes a recent passing report, which the rest of the check would
+    reuse; the gate makes its own check run the link check afresh after the heal, so a pair stuck by then keeps it
+    closed."""
+    gate, federation, check, _ = gate_of(tmp_path, heal="all_links")
+    check.cache = True
+    federation.on_ping = lambda label: setattr(check, "report", LinkMatrix(True, "every pair passed", ()))
+    check.grow[2] = {(SECOND, OTHER)}
+    reading = gate()
+    assert reading.ok is False
+    assert "providers[1]->providers[3]" in reading.detail
+    assert [who for who, _ in federation.reads].count("gate") == 2
+
+
+def test_o35_the_gate_heals_nothing_when_the_heals_fresh_matrix_shows_no_stuck_pair(tmp_path):
+    """O35: the gate's check found a stuck pair, but by the heal's own fresh read it passes and only an untested pair
+    fails: no link fetch failed, so nothing is pinged or restarted and the gate stays closed."""
+    federation = Federation()
+
+    def recovered():
+        federation.stuck, federation.untested = set(), {(SECOND, OTHER)}
+
+    federation.on_read = recovered
+    gate, federation, _, _ = gate_of(tmp_path, federation, heal="all_links")
+    reading = gate()
+    assert reading.ok is False
+    assert acted(federation, "ping", "restart_link", "stop", "start") == []
+    assert "no pair failed a fetch" in gate.last_heal["why"]
+
+
+def test_o35_the_latch_is_read_again_once_the_heals_admission_is_held(tmp_path):
+    """O35: the latch read before the wait for the admission found no heal, but another check healed while this one
+    waited: read again under the admission, the latch keeps this heal out."""
+    gate, federation, check, settings = gate_of(tmp_path, heal="all_links", health_wait_s=10)
+    holder = FederationLock(settings).acquire(exclusive=False)
+    checked = threading.Event()
+    check.on_check = checked.set
+
+    def other_check_heals():
+        checked.wait(10)
+        time.sleep(0.3)  # this check now waits for the federation, past its own reading of the latch
+        GateHeals(settings.journal).append({"event": "healing", "id": "another-check", "mode": "all_links"})
+        holder.close()
+
+    other = threading.Thread(target=other_check_heals)
+    other.start()
+    reading = gate()
+    other.join(10)
+    assert reading.ok is False
+    assert "until a link check passes" in reading.detail
+    assert acted(federation, *ANY_ACTION) == []
+
+
+def test_o35_a_post_run_check_that_outlives_its_caller_still_holds_the_federation(tmp_path):
+    """O35: a post-run check keeps a share of its run's admission until it ends: when the run lets its admission go
+    while the check still reads (the core gave up on it), no heal's exclusive admission is granted under it."""
+    gate, _, check, settings = gate_of(tmp_path, heal="all_links")
+    reading, release = threading.Event(), threading.Event()
+    check.on_check = lambda: (reading.set(), release.wait(10))
+    with FederationLock(settings).held(exclusive=False):
+        late = threading.Thread(target=contextvars.copy_context().run, args=(gate,))
+        late.start()
+        assert reading.wait(10)
+    try:  # the run's admission is let go, and its check still reads
+        assert FederationLock(settings).try_acquire(exclusive=True, purpose=RECOVERY) is None
+    finally:
+        release.set()
+        late.join(10)
+    after = FederationLock(settings).try_acquire(exclusive=True, purpose=RECOVERY)
+    assert after is not None
+    after.close()
 
 
 def test_o35_the_gate_never_opens_on_a_recheck_whose_link_check_did_not_pass(tmp_path):

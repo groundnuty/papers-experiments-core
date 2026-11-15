@@ -225,6 +225,7 @@ class LinkSettling:
             clock=self._clock,
             sleep=self._sleep,
             sources_seen=sources,
+            only_stuck=sources is not None,  # the fault gate's heal: nothing is done unless a fetch failed
         ).run()
         return result, answered[-1], children
 
