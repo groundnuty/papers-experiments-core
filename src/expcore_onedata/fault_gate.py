@@ -255,6 +255,8 @@ class FaultGate:
                             # of, and the release below publishes the drain whatever interrupts the recovery
                             exclusive.drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)
                         self._recovery.recover(defer=True)  # a held settle is a wait, never slept here
+                        if self._relink is not None:  # the pairs of what it restored: the link check made afresh next
+                            self._relink()
                     finally:
                         exclusive.close()
             try:
@@ -443,10 +445,15 @@ class FaultGate:
         record = self._journal.read_holder()  # read once: who holds the federation, as every branch below judges it
         recovering = self._recovering(record)  # a health check's recovery or heal: its bounded wait, or None
         failed = [entry for entry in entries if "clear_failed" in entry and not entry.get("healing")]
-        if failed and recovering is not None and all(entry.get("heal") is True for entry in failed):
+        heals_own = bool(failed) and all(entry.get("heal") is True for entry in failed)
+        if heals_own and recovering is not None:
             # only a heal's own container restarts failed, and the health check that heals still holds the
             # federation for their settle: a heal not over yet, a wait that charges no run (closed past its bound)
             return recovering
+        if heals_own and self._lock.drain_left() > 0:
+            # a heal that ended (or was cut short) left its container restarts open, and its settle still closes the
+            # federation: the recovery that settles them waits for it, and so does this check, charging no run
+            return Health(False, "a heal's settle still closes the federation: the check waits", True, False)
         if failed:
             return _unsettled(entries)  # a restore failed: a fault of the federation, whoever still holds it
         if recovering is not None:

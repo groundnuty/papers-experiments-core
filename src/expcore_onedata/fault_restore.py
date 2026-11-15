@@ -18,16 +18,18 @@ gate probe of the injection it heals, under the reader's lock, restored and wait
 word and stays open, and recovery (which settles such entries first, `Recovery.recover`) brings it back and checks it.
 The gate's and the heal's readings go into `restore_record`, for the injector's snapshot.
 
-**The settle of a recovered container restart.** A recovery that finds a heal's container restart open (its heal was
-cut short, or ended with a pair failing) brings the reader back, verified (a new identity, serving), and reads its
-session gate and every pair only once a settle journalled on that entry has passed (`settle_until`): when it started the
-container itself, or when no settle is journalled, it holds one of `heal_settle_s` from the moment the reader serves, in
-the federation's drain record first when it has one (`hold_for`), then on the entry, a `clear_failed` line `settling`
-marked `healing`, which no reader takes for a failed restore. A recovery that may not wait (the fault gate's, whose
-check the core bounds by `health_timeout_s`: `recover(defer=True)`) never sleeps out a held settle: it raises
-`RestoreSettling`, which the gate answers as a wait that charges no run, and a later check, once the settle has passed,
-reads the gate and the pairs and clears the entry only when they pass. Any other recovery (the injector's start) waits
-it out, as for every held settle.
+**The settle of a recovered container restart.** A recovery that finds a heal's container restart open (its heal was cut
+short, or ended with a pair failing) first waits out every hold its heal left (one reading then decides: a reader the
+heal never stopped is `never_down` and cleared), brings the reader back, verified (a new identity, serving), and reads
+its session gate only once a settle after the container's start has passed: when it started the container itself, it
+holds one of `heal_settle_s` from the moment the reader serves, in the federation's drain record first when it has one
+(`hold_for`), then on the entry (`settle_until`), a `clear_failed` line `settling` marked `healing`, which no reader
+takes for a failed restore; a container found back was started by its heal, whose holds covered that settle. A recovery
+that may not wait (the fault gate's, whose check the core bounds by `health_timeout_s`: `recover(defer=True)`) never
+sleeps out a held settle: it raises `RestoreSettling`, which the gate answers as a wait that charges no run; a later
+check, once the settle has passed, reads the gate and clears the entry when it passes, and the gate's own link check,
+next in that check, judges every pair (an entry left open would keep every later heal out). Any other recovery (the
+injector's start) waits the settle out and clears the entry only when the gate and every pair pass.
 
 **The fault gate's heal** (`heal_stuck`, `fault_gate_heal`) runs the same heal on stuck pairs the gate's own check
 found, with no injection to journal it on: its holds are the caller's, and its container restarts are cleared or left
@@ -146,13 +148,13 @@ class LinkSettling:
         self._sleep(seconds)
 
     def _settle_child(self, entry: Mapping[str, Any], how: str) -> None:
-        """A heal's container restart this recovery has just verified serving: unless a settle is journalled on its
-        entry already and the container was not started now (`how` is not `restored`), hold one of `heal_settle_s`
-        from now, in the federation's drain record first (`hold_for`, when this recovery has one), then on the entry,
-        so that its gate and pairs are read, in any process, only once it has passed (`_await_quiet`). A record that
-        cannot be written raises, and nothing is read."""
-        until = entry.get("settle_until")
-        if how != "restored" and isinstance(until, int | float) and not isinstance(until, bool):
+        """A heal's container restart this recovery has just verified serving: when this recovery started the container
+        (`restored`), hold a settle of `heal_settle_s` from now, in the federation's drain record first (`hold_for`,
+        when this recovery has one), then on the entry, so that its gate and pairs are read, in any process, only once
+        it has passed (`_await_quiet`). A container found back was started by its heal, whose holds (the drain record
+        every admission waits for, or the journalled ones `_settle` waited out first) covered the settle after that
+        start. A record that cannot be written raises, and nothing is read."""
+        if how != "restored":
             return
         seconds = self._settings.heal_settle_s
         until = self._wall() + seconds  # read before the drain record's own: the record never ends before the line
@@ -160,6 +162,18 @@ class LinkSettling:
             self._hold_for(seconds)
         line = {"event": "clear_failed", "id": entry["id"], "how": "settling", "healing": True, "settle_until": until}
         self.journal.append(line)  # `healing`: a recovery under way, never taken for a failed restore
+
+    def _child_settled(self, entry: Mapping[str, Any], heal: bool) -> str | None:
+        """A heal's container restart once its settle has passed: None when it may be cleared, else the word it fails
+        with. In a recovery that may not wait (`_defer`, the fault gate's) its session gate alone decides: the gate's
+        own link check of every pair comes next in the same check, keeps every run out until each passes, and heals a
+        stuck pair again when the latch allows, which an entry left open would forbid for ever. In any other (the
+        injector's start, which injects next) the gate and every pair decide (`_links_settled`)."""
+        if not self._defer:
+            return self._links_settled(entry, heal)
+        gate = self._gate(entry["service"], entry.get("gate_probe"))
+        self.restore_record["gate"] = gate
+        return None if gate["ok"] is True else "sessions_not_ready"
 
     def _gate(self, service: str, gate_probe: str | None, timeout_s: float | None = None) -> dict[str, Any]:
         """The session gate for a provider's service, polled within `gate_timeout_s`, or `timeout_s` when shorter;

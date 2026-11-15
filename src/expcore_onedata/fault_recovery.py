@@ -320,6 +320,12 @@ class Recovery(LinkSettling):
     def _settle(self, entry: Mapping[str, Any], *, heal: bool, links: bool, clear: bool) -> Settled:
         before, injected = entry["identity_sha256"], entry["injected"]
         asked, unrecorded = bool(entry.get("stop_unknown")), bool(entry.get("stop_unrecorded"))
+        child = links and entry.get("heal") is True  # a heal's container restart that its heal left open
+        if child:  # every hold of its heal has passed first (`_await_quiet`; the fault gate's heal held the drain
+            # record, which every admission waits for), each covering the stop's grace twice: a stop it sent has ended,
+            # and one reading decides, so a reader the heal never stopped is `never_down` instead of `stop_unsettled`
+            self._await_quiet()
+            asked = unrecorded = False
         seen: Observation | None
         if asked or unrecorded:  # the daemon may still be stopping it: a reading now proves nothing
             seen, steady = self._await_down(entry["service"], before)
@@ -358,9 +364,11 @@ class Recovery(LinkSettling):
                 return Settled(False, "serves_unconfigured", after)
             if ready_after_s is None:
                 return Settled(False, "not_serving", after)  # fail closed: the injection stays open, the identity known
-            if links and entry.get("heal") is True:  # a heal's container restart: its gate and pairs after a settle
+            if child:  # its gate (and pairs) only after a settle held on its entry
                 self._settle_child(entry, how)
-            stuck = self._links_settled(entry, heal) if links else None
+                stuck = self._child_settled(entry, heal)
+            else:
+                stuck = self._links_settled(entry, heal) if links else None
             if stuck is not None:  # it serves, and its peers or a link do not: not restored yet (O35)
                 return Settled(False, stuck, after, ready_after_s)
         if clear:

@@ -38,7 +38,7 @@ restored) then wait. The platform's health check runs before any attempt launche
   process that is gone; the first such heal of an episode does not latch, so the next check that finds a pair stuck
   heals again, within the same bounds; a second one latches, so a process killed again and again never piles link
   restarts up (at most two heals, two link restarts per provider, per episode). A `healing` line whose process lives,
-  or cannot be told gone (none recorded, another host), latches.
+  or cannot be told gone (none recorded, or no process table to read), latches.
 - **In the background, a wait that charges no run.** The gate hands its admission to the heal in a thread of its own
   and answers the uncharged deferral, as every check does while the heal runs, so a heal longer than the campaign's
   `health_timeout_s` is never counted as down and a pair it mends charges no run; a heal still running past
