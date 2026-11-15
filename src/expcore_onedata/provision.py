@@ -357,8 +357,13 @@ class Provisioner:
     def reading_slot(self, provider: str, reads: ReadRetry) -> Iterator[None]:
         """Hold one of `provider`'s slots for a reset's per-file read, its retries included: at most `[placement]
         provider_concurrency` such reads are in flight at one provider in the process (`readslots.py`). The seconds
-        waited for it are tallied by `reads`, at the provider's label."""
-        gate = slots(self._config.providers[provider].url, self._settings.provider_concurrency)
+        waited for it are tallied by `reads`, at the provider's label. A provider that is not declared has no slots: the
+        read goes on unbounded, and the client refuses it before anything is sent (`OutOfScope`), as it always did."""
+        declared = self._config.providers.get(provider)
+        if declared is None:
+            yield
+            return
+        gate = slots(declared.url, self._settings.provider_concurrency)
         began = self._clock()
         with gate:
             reads.waited(self._client.provider_label(provider), self._clock() - began)
