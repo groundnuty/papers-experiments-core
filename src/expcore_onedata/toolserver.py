@@ -73,6 +73,8 @@ from expcore_onedata.tokens import MintedToken, Plane, TokenIssuer, token_window
 WAIT_KIND = "toolserver_lifecycle"
 INTEGRITY_KIND = TOOL_PLANE_INTEGRITY  # the kind of every failure of the plane's integrity checks; not treatable
 EVENT_RIGHTS_CHANGED = "tool_plane_rights_changed"
+# the plane's two checks, each a step that uses the run's token (`admission.begin_token_step`), as a refusal names them
+CHECK_BEFORE_START, CHECK_AT_STOP = "the tool server's check before its start", "the tool server's check at its stop"
 
 # Where the platform records an event: called with the event's kind and a detail that holds no configured name, token or
 # id (a condition or a slot is named by its position). The launcher and the slots' minting (`users.SlotTokens`) share
@@ -206,13 +208,15 @@ def _recheck(
     issuer.check_clusters(spec, token.reveal())
 
 
-async def _in_counted_thread(check: Callable[..., None], *args: object) -> None:
-    """Run one of the plane's checks, which examine the run's token, in a worker thread counted as the tool server's
-    step on the run's admission until the thread itself has ended (`admission.begin_token_step`). A cancellation of
-    the await does not stop the thread, so the count outlives a launch that leaves without it, and no restore heals
-    while it still examines the token (O35); the thread's failure is then never unretrieved. A thread the event loop's
-    shutdown kept from ever starting leaves the count open, so the restore fails closed."""
-    end = begin_token_step(TOOL_SERVER_STEP)
+async def _in_counted_thread(config: PlatformConfig, what: str, check: Callable[..., None], *args: object) -> None:
+    """Run one of the plane's checks (`what`, in words), which examine the run's token, in a worker thread counted as
+    the tool server's step on the run's admission until the thread itself has ended (`admission.begin_token_step`). On
+    a platform with `[faults]` a check is refused before its thread starts when the run's admission is not held
+    (`TokenStepRefused`, naming it), failing closed (O35). A cancellation of the await does not stop the thread, so
+    the count outlives a launch that leaves without it, and no restore heals while it still examines the token (O35);
+    the thread's failure is then never unretrieved. A thread the event loop's shutdown kept from ever starting leaves
+    the count open, so the restore fails closed."""
+    end = begin_token_step(TOOL_SERVER_STEP, config, what)
 
     def work() -> None:
         try:
@@ -241,7 +245,9 @@ class ToolServerLauncher:
         """Re-verify the tool plane after the server stopped; raise InfraError of kind tool_plane_integrity unless it held."""
         label = self._config.condition_label(condition)
         try:
-            await _in_counted_thread(_recheck, self._issuer, self._config, chosen, token, ceiling_s)
+            await _in_counted_thread(
+                self._config, CHECK_AT_STOP, _recheck, self._issuer, self._config, chosen, token, ceiling_s
+            )
         except PrivilegesMismatch as changed:
             detail = f"{label}: the tool plane's rights changed during the run: {changed}"
             error = InfraError(INTEGRITY_KIND, detail)
@@ -282,7 +288,9 @@ class ToolServerLauncher:
 
         From before its first check to the end of that last one, the launch is a step of the run that uses its token,
         counted on the run's admission (`admission.token_step`), so the fault injector's restore can tell that it
-        still runs and that a heal might outlast the token (O35).
+        still runs and that a heal might outlast the token (O35). On a platform with `[faults]` each check starts only
+        under the run's admission, held then: one that is not held refuses the check before it starts, naming it
+        (`admission.TokenStepRefused`), and that refusal is raised, at the start or at the stop.
         """
         if principal is not None and token.subject != principal.user_id:
             raise ValueError("the tool-server token was not minted for the leased slot's tool-server user")
@@ -303,7 +311,9 @@ class ToolServerLauncher:
             )
             async with ctx.infrastructure_wait(WAIT_KIND):
                 try:
-                    await _in_counted_thread(_prepare, self._issuer, self._config, chosen, token, ceiling_s)
+                    await _in_counted_thread(
+                        self._config, CHECK_BEFORE_START, _prepare, self._issuer, self._config, chosen, token, ceiling_s
+                    )
                 except TokenRefused as refused:
                     label = self._config.condition_label(condition)
                     raise _integrity_failure(label, "before the start", refused) from None
