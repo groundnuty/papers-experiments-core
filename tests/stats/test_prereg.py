@@ -553,6 +553,74 @@ def test_s13_a_ratio_key_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
         load(write(tmp_path, text))
 
 
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "spend_high"'),
+        ('numerator = "spend"', 'numerator_a = "spend_high"\nnumerator_b = "spend"'),
+        ('numerator = "spend"', 'numerator = "spend_high"\nnumerator_b = "spend"'),
+    ],
+)
+def test_s13_a_ratio_contrast_may_declare_a_numerator_column_per_arm(tmp_path, old, new):
+    """S13: `numerator_a` and `numerator_b` each default to `numerator`; however the arms' columns are written, the
+    contrast holds them as arm A's and arm B's, and its outcome names both."""
+    spec = load(write(tmp_path, with_ratio(old, new))).contrasts["spend-per-win"]
+    assert spec.ratio == RatioForm(None, "wins", "exclude", numerator_a="spend_high", numerator_b="spend")
+    assert (spec.ratio.columns(0), spec.ratio.columns(1)) == (("spend_high", "wins"), ("spend", "wins"))
+    assert spec.outcome == "spend_high/wins vs spend/wins"
+
+
+def test_s13_a_ratio_contrast_may_declare_a_denominator_column_per_arm(tmp_path):
+    """S13: the denominator takes per-arm columns by the same rule."""
+    text = with_ratio('denominator = "wins"', 'denominator = "wins"\ndenominator_b = "wins_strict"')
+    spec = load(write(tmp_path, text)).contrasts["spend-per-win"]
+    assert (spec.ratio.columns(0), spec.ratio.columns(1)) == (("spend", "wins"), ("spend", "wins_strict"))
+
+
+def test_s13_per_arm_columns_that_restate_the_shared_one_load_as_the_one_column_contrast_exactly(tmp_path):
+    """S13: a per-arm key naming the shared column declares nothing new, so the contrast is the one without it."""
+    plain = load(write(tmp_path, with_ratio())).contrasts["spend-per-win"]
+    text = with_ratio('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "spend"\ndenominator_b = "wins"')
+    assert load(write(tmp_path, text)).contrasts["spend-per-win"] == plain
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "message"),
+    [
+        (
+            'numerator = "spend"',
+            'numerator = "spend"\nnumerator_a = "hi"\nnumerator_b = "lo"',
+            "numerator",
+            "is read by neither arm: numerator_a and numerator_b name both arms' columns",
+        ),
+        ('numerator = "spend"', 'numerator_a = "hi"', "numerator", "is required: arm B has no column"),
+        ('numerator = "spend"', 'numerator_b = "lo"', "numerator", "is required: arm A has no column"),
+        ('denominator = "wins"', 'denominator_a = "wins"', "denominator", "is required: arm B has no column"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = ""', "numerator_a", "non-empty string"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_b = 3', "numerator_b", "non-empty string"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "wins"', "numerator_a", "make arm A read 'wins'"),
+        ('denominator = "wins"', 'denominator = "wins"\ndenominator_b = "spend"', "denominator_b", "make arm B read"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_c = "hi"', "numerator_c", "is not a known key"),
+    ],
+)
+def test_s13_per_arm_columns_that_leave_an_arm_or_a_column_unread_are_refused_naming_the_key(
+    tmp_path, old, new, key, message
+):
+    """S13: the shared column beside both arms' own is read by no arm; an arm with no column of a role has no ratio;
+    an arm's numerator and denominator are two outcomes; and no third arm has a key."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_ratio(old, new)))
+
+
+@pytest.mark.parametrize("key", ["numerator_a", "numerator_b", "denominator_a", "denominator_b"])
+def test_s13_a_per_arm_column_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
+    """S13: a difference estimator reads one outcome, so an arm's column beside it would be silently ignored."""
+    text = edited('outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n',
+                  f'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n{key} = "spend"\n')  # fmt: skip
+    with pytest.raises(ConfigError, match=rf"\[contrasts.a-vs-b\]: key '{key}' belongs to a ratio contrast"):
+        load(write(tmp_path, text))
+
+
 def test_s13_a_ratio_contrast_may_declare_an_equivalence_margin_on_the_log_scale(tmp_path):
     """S13: its margin, like its estimate, is a natural-log ratio (ln 1.25: within a factor of 1.25 either way)."""
     text = with_ratio('cluster = "group"', 'cluster = "group"\nequivalence_margin = 0.2231')

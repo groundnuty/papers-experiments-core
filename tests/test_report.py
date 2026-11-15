@@ -818,6 +818,25 @@ def test_s13_a_report_whose_ratio_contrasts_pool_the_models_has_no_breakdown_by_
     assert "### Ratio contrasts by model" not in report
 
 
+ADVERSE = RatioForm(None, "wins", "exclude", numerator_a="spend_high", numerator_b="spend_low")
+
+
+def test_s13_a_contrast_whose_arms_read_different_columns_names_each_arms_column_in_the_ratio_table():
+    """S13: the Numerator cell names arm A's column and arm B's, each with its arm, and the shared denominator stays
+    one name; the outcome cell names both arms' ratios."""
+    report = render(analysis(ratio_contrast("adverse-per-win", ADVERSE), ratio_contrast()))
+    table = table_of(report, "## Ratio contrasts")
+    assert table["adverse-per-win"][1:3] == ["cond-a: spend_high; cond-b: spend_low", "wins"]
+    assert table["spend-per-win"][1:3] == ["spend", "wins"]
+    assert row(report, "adverse-per-win")[2] == "ln(spend_high/wins vs spend_low/wins)"
+    assert "reads its own columns" in report.split("## Ratio contrasts")[1]
+
+
+def test_s13_a_report_whose_ratio_contrasts_share_their_columns_has_no_note_on_arm_columns():
+    """S13: the note on per-arm columns comes only with a contrast that has them, so earlier reports are unchanged."""
+    assert "reads its own columns" not in render(analysis(ratio_contrast(), by_model_contrast("by-model")))
+
+
 # --- an equivalence family (S15) --------------------------------------------------------------------------------------
 
 

@@ -50,7 +50,9 @@ minimum detectable effect are natural-log ratios. With an estimation unit that n
 and `per_model` holds each model's estimate over its own cells, from the same draws of the clusters, with no test of
 its own. A member of the Holm family that loses a pair because a run's numerator is None while its denominator is 0
 is refused (`RatioNumeratorRefused`): its ratio would count the cost of successful runs alone. An exploratory one
-reports the count. Both refusals are `ContrastRefused`.
+reports the count. Both refusals are `ContrastRefused`. A ratio contrast whose arms read different columns (arm A at
+an upper bound, arm B at a lower one) is a declared contrast of its own, and each arm's runs are read, and refused,
+in that arm's columns only.
 
 A preregistration may declare an equivalence family (S15): members of the Holm family with a margin, whose equivalence
 claims are decided together. Each member's TOST p-value comes from its estimator's own resamples, Holm adjusts them
@@ -315,16 +317,34 @@ def _refuse_lost_treatment_pairs(spec: ContrastSpec, prereg: Preregistration, pa
 
 def _refuse_unmeasured_failures(spec: ContrastSpec, prereg: Preregistration, pairing: Pairing) -> None:
     """Refuse a member of the Holm family that lost a pair holding an ordinary run whose numerator is None while its
-    denominator is 0 (S13): the ratio would then sum the cost of the runs that succeeded, and not of those that failed.
-    Such a pair may be counted under a treatment attempt's None, which a tolerance excuses, so the count is its own."""
+    denominator is 0 (S13), each in the column the run's own arm reads: the ratio would then sum the cost of the runs
+    that succeeded, and not of those that failed. Such a pair may be counted under a treatment attempt's None, which a
+    tolerance excuses, so the count is its own."""
     lost = pairing.n_unmeasured_failures
-    if spec.ratio is None or spec.name not in prereg.holm_family or not lost:
+    form = spec.ratio
+    if form is None or spec.name not in prereg.holm_family or not lost:
         return
+    if form.per_arm:  # each arm reads its own columns: name both, so the fix names the right scorer output
+        (numerator_a, denominator_a), (numerator_b, denominator_b) = form.columns(0), form.columns(1)
+        arm_a, arm_b = spec.arms
+        numerators = dict.fromkeys((numerator_a, numerator_b))
+        returned = (
+            f"{numerator_a!r} for every run"
+            if len(numerators) == 1
+            else f"{numerator_a!r} and {numerator_b!r} for every run of the arm that reads each"
+        )
+        raise RatioNumeratorRefused(
+            f"{prereg.source}: confirmatory ratio contrast {spec.name!r} drops {lost} pair(s) because a run's "
+            f"numerator is None while its denominator is 0 (arm {arm_a!r} reads {numerator_a!r} over "
+            f"{denominator_a!r}, arm {arm_b!r} {numerator_b!r} over {denominator_b!r}), so its ratio would count the "
+            "numerator of the runs with a nonzero denominator and leave out that of the others. Make the scorer "
+            f"return {returned}, a failed run's included, or take the contrast out of holm_family"
+        )
     raise RatioNumeratorRefused(
         f"{prereg.source}: confirmatory ratio contrast {spec.name!r} drops {lost} pair(s) because a run's numerator "
-        f"{spec.ratio.numerator!r} is None while its denominator {spec.ratio.denominator!r} is 0, so its ratio would "
-        f"count the {spec.ratio.numerator!r} of the runs with a nonzero {spec.ratio.denominator!r} and leave out "
-        f"that of the others. Make the scorer return {spec.ratio.numerator!r} for every run, a failed run's included, "
+        f"{form.numerator!r} is None while its denominator {form.denominator!r} is 0, so its ratio would "
+        f"count the {form.numerator!r} of the runs with a nonzero {form.denominator!r} and leave out "
+        f"that of the others. Make the scorer return {form.numerator!r} for every run, a failed run's included, "
         "or take the contrast out of holm_family"
     )
 

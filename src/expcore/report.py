@@ -66,6 +66,7 @@ from expcore.report_notes import (
     MISSING_PAIRS,
     NO_CLAIM,
     NO_KIND,
+    RATIO_ARM_COLUMNS_NOTES,
     RATIO_BY_MODEL_NOTES,
     RATIO_MISSING_PAIRS,
     RATIO_NOTES,
@@ -458,17 +459,30 @@ def _by_model(ratios: Sequence[ContrastResult]) -> list[str]:
     return ["### Ratio contrasts by model (exploratory)", "", *_table(header, rows), "", *RATIO_BY_MODEL_NOTES, ""]
 
 
+def _arm_columns(result: ContrastResult, role: int) -> str:
+    """A ratio contrast's numerator (role 0) or denominator (role 1) cell: the column both arms read, or each arm's,
+    named with its arm, arm A's first (S13)."""
+    form = result.ratio
+    if form is None:
+        raise ValueError(f"contrast {result.name!r} is not a ratio contrast")
+    columns = [form.columns(side)[role] for side in (0, 1)]
+    if columns[0] == columns[1]:
+        return columns[0]
+    return "; ".join(f"{arm}: {column}" for arm, column in zip(result.arms, columns, strict=True))
+
+
 def _ratios(results: Sequence[ContrastResult]) -> list[str]:
-    """Each ratio contrast's two outcomes, its two units, its cells, its zero rule, and its estimate and interval as
-    ratios (S13), then each model's where it is estimated per model's cell; nothing when there is no ratio contrast."""
+    """Each ratio contrast's two outcomes (each arm's when they differ), its two units, its cells, its zero rule, and
+    its estimate and interval as ratios (S13), then each model's where it is estimated per model's cell; nothing when
+    there is no ratio contrast."""
     ratios = [r for r in results if r.ratio is not None]
     if not ratios:
         return []
     rows = [
         [
             r.name,
-            r.ratio.numerator,
-            r.ratio.denominator,
+            _arm_columns(r, 0),
+            _arm_columns(r, 1),
             _estimation_unit(r),
             r.independent_unit or r.cluster,
             _cells(r),
@@ -489,7 +503,8 @@ def _ratios(results: Sequence[ContrastResult]) -> list[str]:
         "Ratio (A / B)",
         "Ratio interval",
     ]
-    return ["## Ratio contrasts", "", *_table(header, rows), "", *RATIO_NOTES, "", *_by_model(ratios)]
+    arm_notes = [*RATIO_ARM_COLUMNS_NOTES, ""] if any(r.ratio.per_arm for r in ratios) else []
+    return ["## Ratio contrasts", "", *_table(header, rows), "", *RATIO_NOTES, "", *arm_notes, *_by_model(ratios)]
 
 
 def _conditions(export: Mapping[str, Any]) -> list[str]:
