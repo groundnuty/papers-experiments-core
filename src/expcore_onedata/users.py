@@ -325,10 +325,16 @@ class TokenJournal:
             line["ceiling_s"] = ceiling_s
         self._append(line)
 
-    def record_indeterminate(self, slot: str) -> None:
+    def record_indeterminate(self, slot: str, *, ttl_s: int | None = None, ceiling_s: float | None = None) -> None:
         """Record that a slot holds a dropped token whose expiry is unknown: the slot is held until an operator
-        removes this line, having made sure the token has ended, or a later revocation caps it."""
-        self._append({"slot": slot, "plane": "refused", "indeterminate": True})
+        removes this line, having made sure the token has ended, or a later revocation caps it. `ttl_s` and
+        `ceiling_s` are what the mint asked for, as `record` writes them (O06): for a reader, never read back."""
+        line: dict[str, Any] = {"slot": slot, "plane": "refused", "indeterminate": True}
+        if ttl_s is not None:
+            line["ttl_s"] = ttl_s
+        if ceiling_s is not None:
+            line["ceiling_s"] = ceiling_s
+        self._append(line)
 
     def record_revoking(self, slot: str, *, revocation: str, started_at: float) -> None:
         """Append, durably and before the first bump of a generation, the start of the revocation named `revocation`:
@@ -559,7 +565,7 @@ class SlotTokens:
             )
         except DroppedToken as refused:  # a token exists, dropped: the slot is held until it ends or is revoked
             if refused.expires_at is None:
-                self._journal.record_indeterminate(slot.name)
+                self._journal.record_indeterminate(slot.name, **lifetime)
             else:
                 self._journal.record(slot.name, "refused", refused.expires_at, **lifetime)
                 if refused.expires_at > valid_until:

@@ -316,6 +316,28 @@ def test_o06_every_line_of_a_mint_records_the_lifetime_and_the_ceiling_it_was_mi
         assert (line["ttl_s"], line["ceiling_s"], line["expires_at"]) == (1800, 600.0, int(NOW) + 1800)
 
 
+@pytest.mark.parametrize("failure", ["indeterminate", "refused"])
+def test_o06_a_mint_that_drops_its_token_records_the_lifetime_on_its_failure_line_too(
+    slots, client, tmp_path, slot_federation, failure
+):
+    """O06 with C19: a mint whose token is dropped writes a line for it, of unknown expiry (the server created a token
+    and answered without it) or of the expiry the token has (refused for a lifetime longer than asked); that line is a
+    mint's too, so it says the lifetime and the ceiling the mint asked for, as the provisional line before it does."""
+    if failure == "indeterminate":
+        slot_federation.blank_mint_answer = True
+    else:
+        slot_federation.mint_hook = lambda user, caveats: [
+            {**c, "validUntil": c["validUntil"] + 400} if c["type"] == "time" else c for c in caveats
+        ]
+    directory = tmp_path / "leases"
+    with pytest.raises(TokenRefused):
+        mint_for(slots, client, directory, 600.0)
+    lines = [json.loads(line) for line in (directory / JOURNAL).read_text().splitlines()]
+    assert [line.get("provisional", False) for line in lines] == [True, False]
+    assert lines[1].get("indeterminate", False) is (failure == "indeterminate")
+    assert [(line["ttl_s"], line["ceiling_s"]) for line in lines] == [(1800, 600.0)] * 2
+
+
 def test_o06_a_journal_without_the_lifetime_still_reads_and_a_line_with_it_adds_nothing_to_the_end(tmp_path):
     """O06: the lifetime and the ceiling are for a reader of the journal. A line written before they existed, or by a
     caller that gives none, has neither key, and the slot's end is the same either way."""
