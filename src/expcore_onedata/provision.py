@@ -45,8 +45,8 @@ configured name or lies outside the prefixes. On top of that gate:
   each reading (`reading_retry`), which also retries a connection failure, never an answer, and under a per-provider
   bound on the reads in flight (`reading_slot`, `[placement] provider_concurrency`, `readslots.py`); so do, when the
   reset names its policy, the gate's reads (`mutate(gate_retry=)`, `schedule_transfer(gate_retry=)`), the space's name
-  (`verify_space(retry=)`), the root's first read and the listings of `resolve`, `resolve_many` and `walk` (`retry=`),
-  the last two each under a slot. The mutation is sent once whatever the policy.
+  (`verify_space(retry=)`), the root's first read, the listings of `resolve`, `resolve_many` and `walk` and the
+  visibility wait (`retry=`), the last three each under a slot. The mutation is sent once whatever the policy.
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
 no token and no credential. A last line a crash cut short (no newline after it, and not a whole line) is no line, and
@@ -62,7 +62,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -951,26 +951,32 @@ class Provisioner:
         return found
 
     # -- visibility ------------------------------------------------------------
-    def await_visible(self, provider: str, file_ids: Iterable[str]) -> float:
+    def await_visible(self, provider: str, file_ids: Iterable[str], *, retry: ReadRetry | None = None) -> float:
         """Wait, bounded, until a provider sees each file at its size on the data provider; return the seconds waited.
 
         A file written through the data provider is not visible through another at once (Onedata 25.0 answers it with
         a 404 or 400 posix enoent for some seconds), so a read or a transfer through that provider waits here first
         (`consistency.wait_visible`, bounded by `VISIBLE_TIMEOUT_S`; past it, `NotVisible` names the provider by its
         label, and any other error fails closed). The data provider, the writer, needs no wait, and a provider and file
-        seen once are not asked again. Instruments never call this: a probe records what it reads (O08)."""
+        seen once are not asked again. Instruments never call this: a probe records what it reads (O08). Its reads, the
+        size on the data provider and each of the wait's, go under this provisioner's policy, or under `retry`, a
+        reset's (`reading_retry`, which tries a connection failure again too, never an answer, O46), each then holding
+        one of its provider's slots (`reading_slot`) through its retries and none through the wait's pauses."""
         if provider == self._settings.holder:
             return 0.0
         waited = 0.0
         for file_id in file_ids:
             if (provider, file_id) in self._visible:
                 continue
-            size = self._client.get(  # with `name`, which a deleted entry refuses: `size` alone may read a tombstone
-                f"/data/{_segment(file_id)}",
-                provider=self._settings.holder,
-                params={"attribute": list(consistency.VISIBLE_ATTRIBUTES)},
-                retry=self._retry,
-            ).get("size")
+            with self._slot(self._settings.holder, retry):
+                size = (
+                    self._client.get(  # with `name`, which a deleted entry refuses: `size` alone may read a tombstone
+                        f"/data/{_segment(file_id)}",
+                        provider=self._settings.holder,
+                        params={"attribute": list(consistency.VISIBLE_ATTRIBUTES)},
+                        retry=self._retry if retry is None else retry,
+                    ).get("size")
+                )
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise PlatformError("the data provider's answer for a file's size holds no size")
             waited += consistency.wait_visible(
@@ -980,10 +986,16 @@ class Provisioner:
                 size=size,
                 clock=self._clock,
                 sleep=self._sleep,
-                retry=self._retry,
+                retry=self._retry if retry is None else retry,
+                slot=lambda: self._slot(provider, retry),
             )
             self._visible.add((provider, file_id))
         return round(waited, 3)
+
+    def _slot(self, provider: str, retry: ReadRetry | None) -> AbstractContextManager[None]:
+        """One of `provider`'s slots for a read under a reset's policy (`reading_slot`); no slot for this provisioner's
+        own reads, which were never bounded so."""
+        return nullcontext() if retry is None else self.reading_slot(provider, retry)
 
     # -- block maps ------------------------------------------------------------
     def blocks(
@@ -1106,13 +1118,13 @@ class Provisioner:
         """Schedule a replication to, or an eviction from, a provider of a file (or of a directory, which covers every
         file under it), through that provider once it sees the entry (`await_visible`), through the mutation gate; log
         it and return the transfer's id. Its end is a report, never placement (O01): a caller confirms by the block
-        map. `gate_retry` is the gate's policy (and a first `verify_space`'s), as `mutate` takes it; the request is
-        sent once."""
+        map. `gate_retry` is the gate's policy (and a first `verify_space`'s and the visibility wait's), as `mutate`
+        takes it; the request is sent once."""
         field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
         if kind == "replication" and provider == self._settings.holder:
             self._refuse_read_only("a replication onto the data provider")  # op-worker answers it EROFS
         self._verified(gate_retry)
-        self.await_visible(provider, [file_id])
+        self.await_visible(provider, [file_id], retry=gate_retry)
         answer = self.mutate(
             "POST",
             "/transfers",

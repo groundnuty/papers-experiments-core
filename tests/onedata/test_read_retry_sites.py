@@ -28,8 +28,11 @@ SKIPPED = {"sandbox/gate.py"}  # the data gate, a program of its own with no cli
 PLUMBING = {
     ("provision.py", "Provisioner._size_of", "client.get"): ["self._retry"],
     ("provision.py", "Provisioner.read_file", "client.get"): ["self._retry"],  # the metadata read, with the deadline
-    ("provision.py", "Provisioner.await_visible", "client.get"): ["self._retry"],
-    ("provision.py", "Provisioner.await_visible", "consistency.wait_visible"): ["self._retry"],
+    # the visibility wait before a transfer: a reset's policy when its stage names one (`retry`, O46)
+    ("provision.py", "Provisioner.await_visible", "client.get"): ["self._retry if retry is None else retry"],
+    ("provision.py", "Provisioner.await_visible", "consistency.wait_visible"): [
+        "self._retry if retry is None else retry"
+    ],
     ("provision.py", "Provisioner.replicate_file", "consistency.wait_transfers"): ["self._retry"],
     ("provision.py", "Provisioner.evict", "consistency.wait_transfers"): ["self._retry"],
     # the mutation gate's reads, and the gate of a range read and of a streamed read: the request itself is sent once;
@@ -538,12 +541,13 @@ def test_o29_a_measuring_module_that_calls_a_retrying_provisioner_helper_breache
         "root(retry=policy)",
         "resolve_many([path], retry=policy)",
         "walk(node, retry=policy)",
+        "await_visible(a, [node], retry=policy)",
     ],
 )
 def test_o46_a_measuring_module_that_hands_a_helper_a_resets_policy_breaches(call):
-    """O46: the gate's reads, the space's name, the root and the eviction's listings take a reset's policy, which
-    tries a connection failure again (`gate_retry=`, `retry=`); a measuring module that hands one over breaches, so a
-    provider that is down still looks down to every instrument."""
+    """O46: the gate's reads, the space's name, the root, the eviction's listings and the visibility wait take a
+    reset's policy, which tries a connection failure again (`gate_retry=`, `retry=`); a measuring module that hands one
+    over breaches, so a provider that is down still looks down to every instrument."""
     text = f"def f(self, path, node, a, policy):\n    return self._provisioner.{call}\n"
     assert measuring_breaches(scan_source(text, "probes.py")) != []
 

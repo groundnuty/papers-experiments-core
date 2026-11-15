@@ -9,8 +9,10 @@ so it is never sent again, and the reset reads the state and decides. The federa
 transport that breaks chosen requests; its clock is the test's ticker, so no pause really waits.
 """
 
+import collections
 import re
 import threading
+from contextlib import contextmanager
 
 import httpx
 import pytest
@@ -454,3 +456,83 @@ def test_o09_an_eviction_without_a_quiet_check_raises_a_lost_answer_as_before(p,
     with pytest.raises(PlatformError, match=r"POST failed \(ReadError\)"):
         evict_ids(p, [fake.id_of(FILES[0])], "beta")
     assert broken.count(EVICTIONS) == 1
+
+
+# -- 6. the visibility wait before each eviction -----------------------------------------------------------------------
+
+VISIBILITY_POLL = route("GET", r"/data/[^/]+", "beta.test", query="attribute=name&attribute=size&attribute=parent_id")
+VISIBILITY = {  # the file's size on the data provider, then the wait's reads at the evicting provider
+    "size": VISIBILITY_SIZE,
+    "wait": VISIBILITY_POLL,
+}
+
+
+@pytest.mark.parametrize("which", list(VISIBILITY))
+def test_o46_a_visibility_read_before_an_eviction_tries_a_connection_failure_again(which, p, fake, broken, ticker):
+    """O46: before each eviction the reset waits until the evicting provider sees the file at its size, two reads per
+    file, thousands in a large reset. One that fails to connect is asked again under the eviction stage's policy, the
+    eviction is sent once and verified, and the stage's record tallies the retry."""
+    broken.on(nth(VISIBILITY[which], 1), CONNECT)
+    record = run(p, ticker, evict={"beta": [FILES[0]]})
+    tally = stage_of(record, "eviction")["transfer_read_retry"]
+    assert record["ok"] is True
+    assert (tally["errors"], tally["retries"], tally["failed"]) == ({"ConnectError": 1}, 1, 0)
+    assert broken.count(EVICTIONS) == 1
+    assert fake.held(FILES[0], BETA_ID) == []
+
+
+@pytest.mark.parametrize("which", list(VISIBILITY))
+def test_o46_a_visibility_read_that_never_connects_fails_the_eviction_closed(which, p, fake, broken, ticker):
+    """O46: a visibility read that fails on every attempt is a failed read: after the fourth the eviction stage fails
+    with its tally, and no eviction is sent."""
+    broken.on(VISIBILITY[which], CONNECT, times=None)
+    with pytest.raises(ResetFailed, match=r"GET failed \(ConnectError\) after 4 attempts") as caught:
+        run(p, ticker, evict={"beta": [FILES[0]]})
+    tally = caught.value.record["stages"]["eviction"]["transfer_read_retry"]
+    assert caught.value.stage == "eviction"
+    assert (tally["failed"], tally["errors"]) == (1, {"ConnectError": 4})
+    assert broken.count(VISIBILITY[which]) == 4
+    assert broken.count(EVICTIONS) == 0
+
+
+@pytest.mark.parametrize("which", list(VISIBILITY))
+def test_o46_an_error_answer_to_a_visibility_read_fails_at_once_and_is_never_asked_again(
+    which, p, fake, broken, ticker
+):
+    """O46: an answer decides at once: a 500 to a visibility read is never asked again under the reset's policy, the
+    stage fails after one request and no pause, and nothing is sent."""
+    broken.on(VISIBILITY[which], answering(500, {"error": {"id": "internalServerError"}}), times=None)
+    with pytest.raises(ResetFailed) as caught:
+        run(p, ticker, evict={"beta": [FILES[0]]})
+    assert caught.value.stage == "eviction"
+    assert broken.count(VISIBILITY[which]) == 1
+    assert broken.count(EVICTIONS) == 0
+    assert caught.value.record["stages"]["eviction"]["transfer_read_retry"]["retries"] == 0
+
+
+def test_o51_each_visibility_read_holds_its_providers_slot(p, fake, broken, ticker, monkeypatch):
+    """O51: the visibility reads are plain reads of the reset: each is made while it holds one of its provider's slots
+    (`Provisioner.reading_slot`), the size read the data provider's and the wait's reads the evicting provider's."""
+    held: collections.Counter = collections.Counter()
+    original = p.reading_slot
+
+    @contextmanager
+    def spy(provider, reads):
+        with original(provider, reads):
+            held[provider] += 1
+            try:
+                yield
+            finally:
+                held[provider] -= 1
+
+    monkeypatch.setattr(p, "reading_slot", spy)
+    seen = []
+
+    def noting(request):
+        seen.append((request.url.host, held[request.url.host.removesuffix(".test")]))
+        return fake.respond(request)
+
+    broken.on(VISIBILITY_SIZE, noting, times=None)
+    broken.on(VISIBILITY_POLL, noting, times=None)
+    assert run(p, ticker, evict={"beta": [FILES[0]]})["ok"] is True
+    assert sorted(seen) == [("alpha.test", 1), ("beta.test", 1)]

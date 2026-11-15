@@ -139,12 +139,12 @@ provider, tallied as the stage's `read_retry`; each stage's own transfer reads (
 its jobs, the eviction stage's included, and Onezone's clock) under one per stage (`stage_reads`), tallied as the
 stage's `transfer_read_retry`; and the mutation gate's reads before a cancel, an eviction or a requirement's deletion,
 the space's name (`verify_space`; the driver's tallied as `verify_read_retry`), the eviction stage's path listings and
-the space root's first read, each under the policy of the stage it is made in. The record says how many reads were
-retried (`reads_retried`). Still timeouts only, under the provisioner's policy (three attempts, 2 s and 5 s apart): the
-visibility wait before each eviction (`Provisioner.await_visible`). Nothing else is tried again: an error answer stands
-as before, and **a mutation is sent once**: a cancel, an eviction or a deletion whose answer was lost after it went out
-(`client.sent_unanswered`) may have been applied, so it is never sent again; the job's record, the block maps or the
-deletion barrier decide, failing closed at their bounds, and the stage records `unanswered` (O09).
+visibility wait (`Provisioner.await_visible`) and the space root's first read, each under the policy of the stage it is
+made in. The record says how many reads were retried (`reads_retried`). No read is left on timeouts only. Nothing else
+is tried again: an error answer stands as before, and **a mutation is sent once**: a cancel, an eviction or a deletion
+whose answer was lost after it went out (`client.sent_unanswered`) may have been applied, so it is never sent again; the
+job's record, the block maps or the deletion barrier decide, failing closed at their bounds, and the stage records
+`unanswered` (O09).
 
 **Fail closed.** A stage that cannot verify what it did, a read that fails, an answer in another shape, a bound
 reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, with the record of the stages so far

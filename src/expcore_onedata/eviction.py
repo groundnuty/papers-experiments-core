@@ -237,13 +237,14 @@ def _sent(
 ) -> str | None:
     """Send one eviction of a file or a directory (`entry_id`) from `provider`, its gate's reads under `reads`, and
     return its transfer id. What must hold before it goes is read first and apart: the space was verified by the caller,
-    and the entry's visibility there (`Provisioner.await_visible`) is waited for here, so a read that fails before the
-    request is sent propagates as the failed read it is; `schedule_transfer` then finds both kept and reads neither
-    again. Only the request itself can come back unanswered (`client.sent_unanswered`): when the caller judges every
-    eviction by the block maps once no transfer is listed running (`judged`, the reset's `quiet`), that is None, and it
-    is never sent again; otherwise it is raised, as it always was. Any other failure propagates, a request the gate
-    refused unsent (`NotSent`, `ScopeUnread`) among them."""
-    provisioner.await_visible(provider, [entry_id])
+    and the entry's visibility there (`Provisioner.await_visible`, its reads under `reads` too, each under a slot) is
+    waited for here, so a read that fails before the request is sent propagates as the failed read it is;
+    `schedule_transfer` then finds both kept and reads neither again. Only the request itself can come back unanswered
+    (`client.sent_unanswered`): when the caller judges every eviction by the block maps once no transfer is listed
+    running (`judged`, the reset's `quiet`), that is None, and it is never sent again; otherwise it is raised, as it
+    always was. Any other failure propagates, a request the gate refused unsent (`NotSent`, `ScopeUnread`) among
+    them."""
+    provisioner.await_visible(provider, [entry_id], retry=reads)
     try:
         return provisioner.schedule_transfer("eviction", entry_id, provider, gate_retry=reads)
     except PlatformError as error:
