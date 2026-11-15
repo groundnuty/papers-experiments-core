@@ -315,14 +315,19 @@ def test_o35_another_process_waits_uncharged_while_a_heals_container_restart_is_
     assert (reading.ok, reading.deferred, reading.charge) == UNCHARGED_WAIT, reading.detail
 
 
-def test_o35_another_processs_heal_past_its_bound_closes_the_gate_uncharged(tmp_path):
+@pytest.mark.parametrize("settling", [False, True])
+def test_o35_another_processs_heal_past_its_bound_closes_the_gate_uncharged(tmp_path, settling):
     """O35: another process's health check has held the federation for its heal longer than the heal's bound
     (`heal_timeout_s` and `heal_settle_s`), its process still alive: a check that meets it closes the gate, uncharged,
-    instead of deferring for as long as that holder lives."""
-    gate, _, _, settings = gate_of(tmp_path, heal="all_links")
+    instead of deferring for as long as that holder lives, even while a settle that late heal published still
+    closes the federation (its drain record)."""
+    gate, federation, _, settings = gate_of(tmp_path, heal="all_links")
     healing = FederationLock(settings).acquire(exclusive=True, purpose=RECOVERY)
+    journal = InjectionJournal(settings.journal)
     long_ago = datetime.now(UTC) - timedelta(seconds=settings.heal_timeout_s + settings.heal_settle_s + 60)
-    InjectionJournal(settings.journal).write_holder({**healing.record, "since_utc": long_ago.isoformat()})
+    journal.write_holder({**healing.record, "since_utc": long_ago.isoformat()})
+    if settling:  # a link restart that returned late published another settle, on the gate's (fake) wall clock
+        journal.raise_drain(federation.now() + 120)
     try:
         reading = gate()
     finally:

@@ -343,11 +343,14 @@ class FaultGate:
         return self._latched(verdict)
 
     def _healing_elsewhere(self) -> Health | None:
+        """`_recovering` of the holder record as it stands now."""
+        return self._recovering(self._journal.read_holder())
+
+    def _recovering(self, record: Mapping[str, Any] | None) -> Health | None:
         """While another health check, in this process or another, holds the federation for its recovery or heal (its
         holder record, alive): the uncharged deferral within the heal's bound (`heal_timeout_s` and `heal_settle_s`
         since the record's `since_utc`), and past it, or when the record does not say since when, a closed gate,
         still uncharged, so a hung heal of a live process never defers for ever; None when no such holder holds it."""
-        record = self._journal.read_holder()
         if record is None or record.get("purpose") != RECOVERY or holder_alive(record) is False:
             return None
         held_s, bound = _held_for(record), self._heal_bound_s
@@ -388,15 +391,18 @@ class FaultGate:
     def _busy(self) -> Health:
         """The wait for the federation ran out: tell a failed restore, a stuck holder and an outage run on it apart."""
         entries = self._recovery.entries()
+        record = self._journal.read_holder()  # read once: who holds the federation, as every branch below judges it
+        recovering = self._recovering(record)  # a health check's recovery or heal: its bounded wait, or None
         failed = [entry for entry in entries if "clear_failed" in entry and not entry.get("healing")]
-        if failed and all(entry.get("heal") is True for entry in failed):
-            # only a heal's own container restarts failed, and the health check that heals may still hold the
-            # federation for their settle: a heal not over yet, a wait that charges no run
-            waiting = self._healing_elsewhere()
-            if waiting is not None:
-                return waiting
+        if failed and recovering is not None and all(entry.get("heal") is True for entry in failed):
+            # only a heal's own container restarts failed, and the health check that heals still holds the
+            # federation for their settle: a heal not over yet, a wait that charges no run (closed past its bound)
+            return recovering
         if failed:
             return _unsettled(entries)  # a restore failed: a fault of the federation, whoever still holds it
+        if recovering is not None:
+            # before the drain record, which a heal that outlived its bound may still be extending with a late settle
+            return recovering
         draining = self._lock.drain_left()
         if draining > 0:  # nobody holds it: it is closed while an outage run's sessions drain (or a heal's settle
             # runs out), and that charges no run
@@ -407,12 +413,7 @@ class FaultGate:
                 deferred=True,
                 charge=False,  # nor once it outlasts the gate's bound: the drain says nothing about the waiting run
             )
-        record = self._journal.read_holder()
         if record is None or holder_alive(record) is not False:
-            if record is not None and record.get("purpose") == RECOVERY:  # a health check's recovery or heal:
-                bounded = self._healing_elsewhere()  # its wait, closed once it outlasts the heal's bound
-                if bounded is not None:
-                    return bounded
             # contention, a heal under way included (its marker is no failed restore yet): a wait that charges no run,
             # nor the one that finds it once it outlasts the gate's bound, as an outage run with a heal can
             detail = f"{_named(record)} holds the federation: the check waits for it"
