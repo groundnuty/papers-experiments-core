@@ -31,11 +31,11 @@ def scanned(request, client, config, platform_file, ticker, tmp_path, fake):
 
 
 def file_reads_in_the_occupancy_stage(monkeypatch, fake) -> list:
-    """Collect the block-map reads of regular files on beta that the occupancy stage makes."""
+    """Collect the block-map reads of regular files on beta that the occupancy stage's reading makes."""
     seen: list = []
-    original = SpaceReset._occupancy
+    original = SpaceReset._occupancy_read
 
-    def occupancy_stage(self, *args):
+    def occupancy_reading(self, *args):
         start = len(fake.provider_calls)
         try:
             return original(self, *args)
@@ -46,7 +46,7 @@ def file_reads_in_the_occupancy_stage(monkeypatch, fake) -> list:
                 if c[0] == BETA_ID and c[2].endswith("/distribution") and ROOT_ID not in c[2]
             )
 
-    monkeypatch.setattr(SpaceReset, "_occupancy", occupancy_stage)
+    monkeypatch.setattr(SpaceReset, "_occupancy_read", occupancy_reading)
     return seen
 
 
@@ -171,14 +171,14 @@ def test_o46_with_a_stale_counter_a_growth_after_the_occupancy_stage_fails_the_q
     that, fails the quiet stage with the figures."""
     fake.counter_offset[BETA_ID] = MIB
     late = fake.add_file("other/late.bin", DATA)
-    original = SpaceReset._occupancy
+    original = SpaceReset._occupancy_kept  # the occupancy stage's last step, its reading kept
 
     def then_land(self, *args):
         facts = original(self, *args)
         fake.blocks[(late, BETA_ID)] = [[0, len(DATA)]]
         return facts
 
-    monkeypatch.setattr(SpaceReset, "_occupancy", then_land)
+    monkeypatch.setattr(SpaceReset, "_occupancy_kept", then_land)
     provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
     with pytest.raises(ResetFailed, match=r"quiet stage.*more of the space after the quiet wait") as caught:
         SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]}, qos_rights=True)

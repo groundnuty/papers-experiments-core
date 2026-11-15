@@ -387,6 +387,29 @@ def test_o11_a_launch_under_a_shared_admission_reports_nothing_and_still_runs(pl
     assert not host.containers
 
 
+def test_o11_a_launch_holds_a_share_of_the_admission_from_its_check_so_no_shortcut_section_begins(
+    platform, config, tmp_path, monkeypatch
+):
+    """O11: from its admission check until its start thread holds a share of its own, the launch holds one, so the
+    run's shortcut section, which seals the admission only while no worker holds a share, cannot begin while the
+    sandbox is authorised and started (its token minted with the launch suspended); the share is given back after."""
+    built, _, _ = platform
+    lock = draining_lock(config)
+    sealed: list[bool] = []
+    with lock.held(exclusive=False) as admission:
+        mint = built._mint_tracked
+
+        def minting(*args):
+            sealed.append(admission.seal())
+            return mint(*args)
+
+        monkeypatch.setattr(built, "_mint_tracked", minting)
+        asyncio.run(launched(built, TimedContext(), level="via-gate", lease=lease_for(built, tmp_path)))
+        assert sealed == [False]
+        assert admission.seal() is True  # the launch's share and its start thread's are both given back
+        admission.unseal()
+
+
 def test_o11_a_stop_that_fails_leaves_the_sessions_end_unknown_and_the_drain_in_full(
     platform, config, tmp_path, monkeypatch
 ):

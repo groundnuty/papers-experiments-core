@@ -105,7 +105,7 @@ directory statistics off answers no physical size at all, and the occupancy stag
 """
 
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -153,13 +153,25 @@ class Found:
     each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, the
     depth of the deepest regular file of the space it saw (0 when it saw none), and the ids of the regular files
     (`REG`) and hard links (`LNK`) any provider's listing showed, the files the occupancy reads the block maps of at
-    every provider (O46); the last two cost no read of their own."""
+    every provider (O46); the last two cost no read of their own. A scan also names the space and the providers it read
+    by their Onezone ids, never a position a configuration gives, so a reset given it refuses one of another space or of
+    other providers, and the listing gives each regular file's path relative to the root (`paths`, empty for
+    `summaries`), which a planner names its eviction plan by (`resetplan.py`)."""
 
     where: dict[str, str]
     files: dict[str, dict[str, int]]
     reads: dict[str, int] = field(default_factory=dict)
     deepest: int = 0
     listing: Listing = field(default_factory=Listing)
+    space: str = ""  # the space's Onezone id
+    providers: tuple[tuple[str, str], ...] = ()  # each provider read, (name, Onezone id), in order
+    paths: dict[str, str] = field(default_factory=dict)
+
+
+def _ids(p: Provisioner, providers: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    """Each provider a scan read as `(name, Onezone id)`: the scan's tables are keyed by the names, so a reset takes it
+    only where every name stands for the same provider."""
+    return tuple((provider, p.provider_id(provider)) for provider in providers)
 
 
 def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:
@@ -223,13 +235,15 @@ def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
             for qid in held if kind != "DIR" else ():
                 files.setdefault(qid, {})[file_id] = depth
         read += len(entries)
-    return Found(where, {q: files.get(q, {}) for q in where}, {"summaries": read}, deepest, listing)
+    found = {q: files.get(q, {}) for q in where}
+    return Found(where, found, {"summaries": read}, deepest, listing, p.space_id, _ids(p, providers))
 
 
 @dataclass(frozen=True)
-class _Listed:
+class Listed:
     """One entry of the recursive listing: its id, its path relative to the space root ("." for the root), whether
-    it is a directory, its `effQosInheritancePath`, and its type (`REG`, `LNK`, ...)."""
+    it is a directory, its `effQosInheritancePath`, and its type (`REG`, `LNK`, ...). `listed` reads them for one
+    provider; the QoS scan and a reset planner share one reading (`resetplan.py`)."""
 
     file_id: str
     path: str
@@ -238,7 +252,7 @@ class _Listed:
     kind: str = ""
 
 
-def _listing_page(p: Provisioner, provider: str, root: str, token: str | None) -> tuple[list[_Listed], str | None]:
+def _listing_page(p: Provisioner, provider: str, root: str, token: str | None) -> tuple[list[Listed], str | None]:
     """One page of the space root's recursive listing with the QoS attributes; its entries and the next token. The
     first page sends no token at all: a null one would be read as the text "null"."""
     params: dict[str, Any] = {
@@ -251,7 +265,7 @@ def _listing_page(p: Provisioner, provider: str, root: str, token: str | None) -
     return _entries_of(answer)
 
 
-def _entries_of(answer: Any) -> tuple[list[_Listed], str | None]:
+def _entries_of(answer: Any) -> tuple[list[Listed], str | None]:
     """Read one page of the recursive listing; refuse one not in its shape, never take it for the end (O26), and
     refuse a listing that could not enter a path, which is incomplete."""
     if not isinstance(answer, dict) or not isinstance(answer.get("files"), list):
@@ -272,7 +286,7 @@ def _entries_of(answer: Any) -> tuple[list[_Listed], str | None]:
             raise Unreadable("an entry of the recursive listing has no plain fileId or no path")
         if inheritance not in INHERITANCE or not isinstance(kind, str):
             raise Unreadable("an entry of the recursive listing has no effQosInheritancePath or no type")
-        entries.append(_Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance, kind))
+        entries.append(Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance, kind))
     return entries, token
 
 
@@ -289,10 +303,10 @@ def _under(path: str, top: str) -> bool:
     return top == "." or path == top or path.startswith(f"{top}/")
 
 
-def listed(p: Provisioner, provider: str) -> tuple[dict[str, _Listed], int]:
+def listed(p: Provisioner, provider: str) -> tuple[dict[str, Listed], int]:
     """Every entry of the space root's recursive listing on `provider`, by id, and how many pages were read."""
     root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=p.retry)
-    entries: dict[str, _Listed] = {}
+    entries: dict[str, Listed] = {}
     token: str | None = None
     pages = 0
     while True:
@@ -313,9 +327,11 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
     an entry a provider marks `direct` or `directAndAncestor` has its summary read on that provider, and on each other
     provider that marks it so, since two providers can hold different requirements on one entry. The calls it makes:
     one listing of the space root per provider (a read of its root and `listing_pages` pages of `LISTING_PAGE`
-    entries), one summary per entry per provider that marks it, one record per requirement."""
-    listings = [(provider, *listed(p, provider)) for provider in providers]
-    entries: dict[str, _Listed] = {}
+    entries), one summary per entry per provider that marks it, one record per requirement. The providers' listings
+    are read at once, each provider's pages in turn: they are independent reads."""
+    read = consistency.bounded_map(lambda provider: listed(p, provider), list(providers), len(providers) or 1)
+    listings = [(provider, found, pages) for provider, (found, pages) in zip(providers, read, strict=True)]
+    entries: dict[str, Listed] = {}
     hits: list[tuple[str, str]] = []  # (entry id, the provider that marks it as having a requirement on itself)
     for provider, found, _ in listings:
         for entry in found.values():
@@ -347,7 +363,8 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
         frozenset(e.file_id for e in entries.values() if e.kind == "REG"),
         frozenset(e.file_id for e in entries.values() if e.kind == "LNK"),
     )
-    return Found(where, files, reads, deepest, listing)
+    paths = {e.file_id: e.path for e in entries.values() if e.kind == "REG"}
+    return Found(where, files, reads, deepest, listing, p.space_id, _ids(p, providers), paths)
 
 
 def scan(p: Provisioner, providers: Sequence[str]) -> Found:
@@ -408,25 +425,16 @@ def _held(maps: Maps, key: Pair) -> int:
     return held_bytes(list(maps.get(key, ())))
 
 
-def quiet(
-    p: Provisioner,
-    expected: Maps,
-    occupancy: Callable[[], Reading],
-    before: Reading,
-    *,
-    depth: int,
-) -> dict[str, Any]:
-    """Read the block map of each (file, provider) pair of `expected`, wait `quiet_wait_s(depth)` from T, the instant
-    the last was read, and read the occupancy. Raise ProvisionError when a map holds more than `expected` says it should
-    (nothing, for a pair the eviction emptied; what the settle saw, for a file a removed requirement applied to), or
-    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`), by its
-    files' block maps summed, never by the counter (`occupancy.py`, O46). The occupancy is read whatever `expected`
-    holds, none included: a replication on a file nothing here names shows in no block map read, and only the
-    occupancy shows it.
+def quiet_maps(p: Provisioner, expected: Maps) -> dict[str, Any]:
+    """The quiet stage's first read, at T: the block map of each (file, provider) pair of `expected`. Raise
+    ProvisionError when a map holds more than `expected` says it should (nothing, for a pair the eviction emptied; what
+    the settle saw, for a file a removed requirement applied to). The occupancy is read after it (`quiet_grown`)
+    whatever `expected` holds, none included: a replication on a file nothing here names shows in no block map read,
+    and only the occupancy shows it.
 
-    What this proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The occupancy
-    read at T + the lag + a margin shows every placement that landed by T. A landing after T is not proved absent: it
-    may not show in the occupancy yet, and no map is read again."""
+    What the two prove, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The
+    occupancy read at T + `quiet_wait_s` or later shows every placement that landed by T. A landing after T is not
+    proved absent: it may not show in the occupancy yet, and no map is read again."""
     maps = read_pairs(p, expected)
     more = grown(expected, maps)
     if more:
@@ -435,10 +443,14 @@ def quiet(
             f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to "
             f"hold more than the eviction or the settle left them, on {where}: a replica had landed by the quiet stage"
         )
-    wait = quiet_wait_s(depth)
-    p.sleep(wait)
+    return {"files": len({file_id for file_id, _ in expected}), "block_maps": len(maps)}
+
+
+def quiet_grown(p: Provisioner, sizes: Reading, before: Reading) -> dict[str, Any]:
+    """The quiet stage's second read, the occupancy `sizes` read at least `quiet_wait_s` after T: raise ProvisionError
+    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`), by its
+    files' block maps summed, never by the counter (`occupancy.py`, O46)."""
     label = p.client.provider_label
-    sizes = occupancy()
     over = [q for q in sizes.files if sizes.held(q) > before.held(q)]
     if over:
         figures = "; ".join(
@@ -450,8 +462,7 @@ def quiet(
             f"{', '.join(label(q) for q in over)} hold(s) more of the space after the quiet wait than at the "
             f"occupancy stage: {figures}"
         )
-    files = {file_id for file_id, _ in expected}
-    return {"files": len(files), "block_maps": len(maps), "waited_s": wait, **sizes.facts(label)}
+    return sizes.facts(label)
 
 
 __all__ = [
@@ -461,10 +472,14 @@ __all__ = [
     "SETTLE_BOUND_S",
     "SETTLE_STABLE_S",
     "Found",
+    "Listed",
+    "by_listing",
+    "listed",
     "occupancy_lag_s",
     "occupancy_wait_s",
     "plain_id",
-    "quiet",
+    "quiet_grown",
+    "quiet_maps",
     "quiet_wait_s",
     "requirements_of",
     "scan",

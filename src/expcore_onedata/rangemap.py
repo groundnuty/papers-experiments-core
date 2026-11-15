@@ -29,6 +29,9 @@ clock_skew_allowance_s = 5.0    # added to the providers' clock offsets that wid
 concurrency = 16                # the most requests a bulk operation has in flight at once (eviction, block maps, reset)
 qos_scan = "listing"            # how the reset finds QoS requirements: "listing" or "summaries" (a read per leaf, O33)
 qos_fulfil_timeout_s = 120      # the longest the reset waits for a run's QoS requirement to be fulfilled before deleting it
+reset_concurrency = 4           # the spaces a reset of several spaces works on at once (`resetspaces.py`)
+reset_shortcut = false          # re-read only held and transferred files after the eviction (`resetgrant.py`; needs [faults])
+reset_exclusive_wait_s = 60     # the longest a shortcut reset waits for the reset lock before it does the full reads
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -93,6 +96,11 @@ class PlacementSettings:
     # Last, so a caller that passes the settings positionally keeps the order it had before #196 (O25): every field
     # added later goes at the end of the class.
     fresh_connection_bytes: int = DEFAULT_FRESH_CONNECTION_BYTES  # a write this large: a new connection
+    reset_concurrency: int = 4  # the spaces a reset of several works on at once (`resetspaces.py`)
+    # A reset given a planner's reading made under the reset lock's exclusive hold re-reads only the files the reading
+    # showed held and those a transfer touched since (`resetgrant.py`, O51); off, every file is read.
+    reset_shortcut: bool = False
+    reset_exclusive_wait_s: float = 60.0  # the bounded wait for that hold; past it the reset reads every file
 
 
 @dataclass(frozen=True)
@@ -256,6 +264,9 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "concurrency",
             "qos_scan",
             "qos_fulfil_timeout_s",
+            "reset_concurrency",
+            "reset_shortcut",
+            "reset_exclusive_wait_s",
         )
     )
     holder = table.string("holder")
@@ -264,6 +275,15 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
     qos_scan = table.optional_string("qos_scan") or DEFAULT_QOS_SCAN
     if qos_scan not in QOS_SCANS:
         raise table.fail("qos_scan", f"must be one of {', '.join(QOS_SCANS)}")
+    shortcut = table.data.get("reset_shortcut", False)
+    if not isinstance(shortcut, bool):
+        raise table.fail("reset_shortcut", "must be true or false")
+    if shortcut and "faults" not in root.data:
+        raise table.fail(
+            "reset_shortcut",
+            "needs a [faults] table: the shortcut rests on the federation's reset lock, which only a "
+            "federation with [faults] has",
+        )
     settings = PlacementSettings(
         holder=holder,
         poll_s=_number(table, "poll_s", 2.0, minimum=0.001),
@@ -283,6 +303,9 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         concurrency=_number(table, "concurrency", 16, minimum=1, integer=True),
         qos_scan=qos_scan,
         qos_fulfil_timeout_s=_number(table, "qos_fulfil_timeout_s", 120.0, minimum=0),
+        reset_concurrency=_number(table, "reset_concurrency", 4, minimum=1, integer=True),
+        reset_shortcut=shortcut,
+        reset_exclusive_wait_s=_number(table, "reset_exclusive_wait_s", 60.0, minimum=0),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))
