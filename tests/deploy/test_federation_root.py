@@ -130,12 +130,14 @@ def test_a_configured_parent_takes_a_root_strictly_below_it_and_the_default_keep
 # -- what up and down refuse before they touch anything ---------------------------------------------------------------
 
 
-def no_docker(fed, monkeypatch, containers=(), networks=()):
-    """Record every compose call instead of running it, and show the given containers and networks of the project."""
+def no_docker(fed, monkeypatch, containers=(), networks=(), volumes=()):
+    """Record every compose call instead of running it, and show the given containers, networks and volumes of the
+    project."""
     ran = []
     monkeypatch.setattr(fed.cli, "compose", lambda *args, **kw: ran.append(args))
     monkeypatch.setattr(fed.cli, "project_containers", lambda project: list(containers))
     monkeypatch.setattr(fed.cli, "project_networks", lambda project: list(networks))
+    monkeypatch.setattr(fed.cli, "project_volumes", lambda project: list(volumes))
     return ran
 
 

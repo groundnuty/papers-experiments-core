@@ -20,7 +20,9 @@ from pathlib import Path
 import pytest
 from package_support import stand_in_vendor
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
+from tree_support import tree_of
 
+from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.cli import main
 from expcore.package import build as package_build
 from expcore.package.archive import SUMS_FILE, render_sums
@@ -104,6 +106,18 @@ def test_k07_the_unpacked_package_of_the_example_passes_its_own_make_check(built
     assert json.loads((root / PACKAGE_FILE).read_text(encoding="utf-8"))["check"].startswith("make -f Makefile check")
     assert "`make -f Makefile check`" in (root / "Makefile").read_text(encoding="utf-8")
     assert not (root / "__pycache__").exists()  # the check leaves the package as it found it
+
+
+def test_r16_a_packages_own_check_leaves_it_byte_for_byte_so_a_second_check_passes_too(built, tmp_path):
+    """R16: the package holds the sealed snapshot and no live store, and its check reads the snapshot's bytes; the
+    unpacked package keeps every byte and gains no file (its checksums refuse an unlisted one), so it checks again."""
+    root = unpack(built, tmp_path)
+    shipped = tree_of(root)
+    assert f"out/runs/{SNAPSHOT_FILE}" in shipped
+    assert not [name for name in shipped if name.startswith("out/state.sqlite")]
+    assert verify_package(root) == []
+    assert tree_of(root) == shipped
+    assert verify_package(root) == []
 
 
 def test_k07_a_changed_table_fails_the_check_even_with_its_checksum_updated(built, tmp_path):

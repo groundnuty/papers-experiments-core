@@ -427,6 +427,30 @@ def test_o22_the_bytes_served_are_what_the_client_received_in_either_listing_mod
     }
 
 
+def test_o35_each_content_answer_says_its_status_its_range_and_its_bytes(served):
+    """O37: through a real gate, a whole read is logged as the platform's 200 with no range, a ranged read as its 206
+    with its Content-Range, and a range that runs past the end as a 206 with the range it got and the fewer bytes it
+    held, so a record tells a whole answer from a range and a range from one clipped at the file's end."""
+    data = bytes(range(256)) * 8  # 2048 bytes
+    world = served(MockOnedata({"data.bin": data}, space_name="invented-space", token=GATE_TOKEN), listing="paged")
+    target = f"/api/v3/oneprovider/data/f{b'data.bin'.hex()}/content"
+    asked = [{}, {"Range": "bytes=0-99"}, {"Range": "bytes=2000-9999"}]
+    assert [request(world, target, headers=h)[0] for h in asked] == [200, 206, 206]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:  # every line, and no handler between its line and its count
+        lines = world.log.read_text().splitlines()
+        if sum('"method"' in x for x in lines) == len(asked) and not gate._LIVE:
+            break
+        time.sleep(0.05)
+    answers = {r["body_bytes"]: r for r in map(json.loads, lines) if "method" in r}  # a different size for each
+    shown = {size: (r["status"], r["content_range"], r["bytes"]) for size, r in answers.items()}
+    assert shown == {
+        len(data): (200, None, len(data)),
+        100: (206, f"bytes 0-99/{len(data)}", 100),
+        48: (206, f"bytes 2000-2047/{len(data)}", 48),
+    }
+
+
 def test_o24_through_a_real_gate_the_count_takes_only_the_answers_after_its_run_start_mark(served):
     """O24: the harness's lookup is answered and the gate marks the run's start at once, whether or not the lookup's
     line is written yet: the mark names it when it is not. The count of the log then holds the agent's answers alone,

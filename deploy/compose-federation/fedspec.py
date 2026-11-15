@@ -7,9 +7,14 @@ The layout is a TOML file. Without --layout it is `federation.toml` beside this 
 this directory always had: one Onezone and three Oneproviders. A space's owner is the provider its data is written
 through and kept on; its mirrors are other providers that support it and may hold replicas, which the per-run reset
 evicts. A space declared `baseline = false` is made, supported and given its members like any other, but up writes
-none of the core's baseline files into it and `reset --clean` leaves it empty. Every key is checked when the file is
-read, and a refusal names the file and the key. The two images stay pinned by the deployment itself (fedlayout.IMAGES):
-a layout cannot name another.
+none of the core's baseline files into it and `reset --clean` leaves it empty. `probe_space` names the space the link
+check writes its probes into (#221): one declared `agent_visible = false`, supported by every provider of a space the
+agent may reach, in a layout with a `platform_template`; `reset --replicas` leaves it alone, since each probe is held by
+the provider that wrote it, owner or not. A space with an `import` table is held by its owner on an imported POSIX
+storage (Onedata's storage import) whose directory is a dataset the layout does not hold: the table names the
+environment variable that gives its path, never the path, since a layout is public. Every key is checked when the file
+is read, and a refusal names the file and the key. The two images stay pinned by the deployment itself
+(fedlayout.IMAGES): a layout cannot name another.
 """
 
 import hashlib
@@ -37,6 +42,7 @@ DOMAIN_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 DOMAIN_NAME = re.compile(rf"(?:{DOMAIN_LABEL}\.)+test")  # under the reserved .test, so it resolves nowhere else
 SERVICE_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?")  # a Compose service name and a domain label
 SPACE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
+IMPORT_ENV = re.compile(r"EXPCORE_FED_IMPORT_[A-Z0-9_]{1,48}")  # the variable holding an import's source directory
 USER_NAME = re.compile(r"[a-z][a-z0-9_-]{0,62}")
 PRIVILEGE = re.compile(r"space_[a-z_]+")
 MEMORY = re.compile(r"([1-9][0-9]{0,5})([mg])")
@@ -49,13 +55,15 @@ TOP_KEYS = {
     "memory_limit",
     "support_bytes",
     "platform_template",
+    "probe_space",
     "zone",
     "providers",
     "spaces",
     "principals",
 }
 SERVICE_KEYS = {"port", "memory_limit"}
-SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline"}
+SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline", "import"}
+IMPORT_KEYS = {"readonly", "source_env"}
 PRINCIPAL_KEYS = {"privileges", "spaces", "agent"}
 
 
@@ -87,6 +95,19 @@ class Service:
 
 
 @dataclass(frozen=True)
+class Import:
+    """How a space's owner holds it on an imported storage: whether the storage is read-only, and the name of the
+    environment variable that holds the absolute path of the host directory with the dataset.
+
+    Only the name is ever declared or recorded: a layout is a public file, and the path is the host's own. A read-only
+    import mounts the directory itself, so the platform never writes to it; a writable one mounts a copy of it that
+    up makes inside the root, which goes with the root."""
+
+    readonly: bool
+    source_env: str
+
+
+@dataclass(frozen=True)
 class Space:
     """A space, the provider that owns its data, the providers that mirror it, whether the agent may reach it, and
     whether up writes the core's baseline files into it.
@@ -94,7 +115,11 @@ class Space:
     A space with `agent_visible` false is for the day-0 checks alone: no user of the agent is a member of it, so no
     token the agent holds reaches it, whatever its caveats, and it is never the study space whose path the agent's
     data-path tokens name. A space with `baseline` false is made, supported and given its members like any other, but
-    up writes nothing into it and `reset --clean` leaves it empty: its content is whatever a study puts there."""
+    up writes nothing into it and `reset --clean` leaves it empty: its content is whatever a study puts there.
+
+    A space with `imported` is held by its owner alone on an imported storage, whose files the platform finds by a scan
+    of the directory; its mirrors keep their regular storage and fetch what the owner holds. Its baseline is always
+    off, since the core's baseline files would be written into the dataset."""
 
     name: str
     owner: str
@@ -102,6 +127,7 @@ class Space:
     support_bytes: int = DEFAULT_SUPPORT_BYTES
     agent_visible: bool = True
     baseline: bool = True
+    imported: Import | None = None
 
     @property
     def supporters(self) -> tuple[str, ...]:
@@ -135,6 +161,7 @@ class Spec:
     study_space: str
     principals: tuple[Principal, ...]
     platform_template: Path | None = None
+    probe_space: str | None = None  # the link check's probe space (#221): agent_visible = false, never reset per run
 
     @property
     def services(self) -> tuple[Service, ...]:
@@ -260,6 +287,24 @@ def load_spec(path: Path | None = None) -> Spec:
     return _spec(_Reader(path), data, path, hashlib.sha256(raw).hexdigest())
 
 
+def _import(read: _Reader, table: Mapping[str, Any], key: str, has_baseline: bool, earlier: list[Space]) -> Import:
+    """The `import` table of a space. Its space declares no baseline, which up would write into the dataset, and no two
+    writable imports name one variable, since each would then copy, and write into its copy of, one source. A
+    read-only import may share its source: nothing writes to it."""
+    where = f"{key}.import"
+    if has_baseline:
+        raise read.fail(where, "a space with an import must declare baseline = false, or up writes its baseline files")
+    value = read.table(table["import"], where, IMPORT_KEYS, required=IMPORT_KEYS)
+    readonly = read.boolean(value["readonly"], f"{where}.readonly")
+    variable = read.string(
+        value["source_env"], f"{where}.source_env", IMPORT_ENV, "the name of an environment variable"
+    )
+    shared = [s.name for s in earlier if s.imported and not s.imported.readonly and s.imported.source_env == variable]
+    if shared and not readonly:
+        raise read.fail(f"{where}.source_env", f"is also the source of writable {shared[0]}, which would share it")
+    return Import(readonly, variable)
+
+
 def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
     top = read.table(data, "", TOP_KEYS, required={"project", "domain", "study_space", "zone", "providers", "spaces"})
     project = read.string(top["project"], "project", PROJECT_NAME, "a Compose project name")
@@ -301,7 +346,8 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         size = read.integer(table.get("support_bytes", support), f"{key}.support_bytes", 1 << 20, 1 << 50)
         visible = read.boolean(table.get("agent_visible", True), f"{key}.agent_visible")
         has_baseline = read.boolean(table.get("baseline", True), f"{key}.baseline")
-        spaces.append(Space(name, owner, mirrors, size, visible, has_baseline))
+        imported = _import(read, table, key, has_baseline, spaces) if "import" in table else None
+        spaces.append(Space(name, owner, mirrors, size, visible, has_baseline, imported))
     space_names = {space.name for space in spaces}
     study = read.name(top["study_space"], "study_space", space_names, "space")
     hidden = {space.name for space in spaces if not space.agent_visible}
@@ -333,6 +379,7 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         principals.append(Principal(name, tuple(rights), member_of, agent))
 
     template = checked_template(read, path, top["platform_template"]) if "platform_template" in top else None
+    probe = checked_probe_space(read, top, spaces, template) if "probe_space" in top else None
     return Spec(
         source=path.name,
         digest=digest,
@@ -344,4 +391,29 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         study_space=study,
         principals=tuple(principals),
         platform_template=template,
+        probe_space=probe,
     )
+
+
+def checked_probe_space(read: _Reader, top: Mapping[str, Any], spaces: list[Space], template: Path | None) -> str:
+    """The link check's probe space (#221): a declared space no agent may reach, supported by every provider that
+    supports a space the agent may reach (each a possible local provider or source), in a layout whose platform template
+    up runs the check through. Each refusal names the key, and the space or the provider."""
+    name = read.name(top["probe_space"], "probe_space", {s.name for s in spaces}, "space")
+    probe = next(s for s in spaces if s.name == name)
+    if probe.agent_visible:
+        raise read.fail(
+            f"spaces.{name}.agent_visible",
+            "must be false for the probe space: its probe files must be where no agent can see them",
+        )
+    for space in (s for s in spaces if s.agent_visible):
+        for provider in space.supporters:
+            if provider not in probe.supporters:
+                raise read.fail(
+                    "probe_space",
+                    f"{name} is not supported by {provider}, which supports {space.name}, so a pair of {provider} "
+                    "cannot be tested: the probe space must be supported by it",
+                )
+    if template is None:
+        raise read.fail("probe_space", "needs a platform_template: up runs the link check through its platform.toml")
+    return name

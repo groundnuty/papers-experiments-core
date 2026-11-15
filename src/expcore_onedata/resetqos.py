@@ -9,12 +9,12 @@ Sources are op-worker `f118ed9` (paths below are its own) and ctool `8ae7baf` (`
 (`src/modules/qos/qos_traverse.erl:298-305,332-338`), so the transfer listing cannot show one either. `[placement]
 qos_scan` chooses how the reset finds them:
 
-- `summaries` (the default): on every provider, the space is walked, each directory listed once, and the summary of
+- `summaries`: on every provider, the space is walked, each directory listed once, and the summary of
   the root and of every leaf is read; a leaf's summary holds the requirements on it and on every ancestor
   (`file_middleware_get_handler.erl:493-500`), so together they hold every requirement. One read per leaf per
   provider: about 52,000 reads for a large tree (#209).
-- `listing`: on **every provider that supports the space**, one recursive listing of the space root, `GET
-  /data/{root}/files` with `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`,
+- `listing` (the default): on **every provider that supports the space**, one recursive listing of the space root,
+  `GET /data/{root}/files` with `attributes` `fileId`, `path`, `type` and `effQosInheritancePath`,
   `include_directories=true` and `limit`, its pages followed by `token` until `nextPageToken` is null
   (`basic_file_operations_rest_routes.erl:59-70`; the parameters, query or JSON body,
   `file_middleware_get_handler.erl:124-138`, `rest_handler.erl:313-325`; the answer, `files`, `inaccessiblePaths` and
@@ -32,12 +32,17 @@ qos_scan` chooses how the reset finds them:
   read on each provider that marks it. For N supporting providers the scan makes, besides each provider's read of the
   space root, N x ceil(E / `LISTING_PAGE`) page reads for E entries, one summary per entry per provider that marks it
   (a handful), and one record per requirement; the record gives `listings`, `listing_pages`, `summaries` and `records`.
-  **A fact it rests on is not verified live:** that the listing takes `include_directories` (the code does,
-  `file_middleware_get_handler.erl:131,404`; the REST description omits it). The gated live tests in
-  `tests/live/test_contract.py` (O33) check it, and also that a requirement added through one provider is found
-  through another once dbsync settles (each provider's QoS view is built from the synced requirement documents,
-  `src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`), which the reset itself no longer
-  needs to find a requirement; until the first has passed on the federation, `summaries` stays the default.
+  **The live facts** (the combined live slot of 14 Nov 2026, the 25.0 development build, op-worker `f118ed9`,
+  `deploy/compose-federation/day0/2026-11-14-federation-facts-slot.md`): **the recursive listing took
+  `include_directories`** (the code does, `file_middleware_get_handler.erl:131,404`; the REST description omits it):
+  1,210 entries in 2 pages of 1,000. **A requirement added through the mirror was found by the data provider's
+  recursive listing** (`effQosInheritancePath` marking the entry) after 3.89 s, two polls, measured by hand: the gated
+  test's own POST went through the mirror before the mirror knew the file and was refused (`OutOfScope`), a defect of
+  the test. Each provider's QoS view is built from the synced requirement documents
+  (`src/modules/dbsync/dbsync_events.erl:129`, `src/modules/qos/qos_logic.erl:65-70`). **Still not measured
+  separately:** that the provider a requirement is added through shows it in its own listing at once, the premise for
+  listing every provider. The quiet stage catches a replication's effect regardless, apart from the documented
+  residual (below). Both facts have their gated live test in `tests/live/test_contract.py` (O33).
 
 **The run's own** are removed by `resetremove.py`: each waited on until it is fulfilled or impossible on every
 provider, deleted, and its deletion waited on until every provider has processed it. The regular files at or under a
@@ -46,8 +51,9 @@ removed requirement's entry are the affected files.
 **Settled, then quiet.** A QoS replication has no transfer to wait for, and a cancel can still place the blocks it had
 in flight. So after the removal the affected files' block maps, on every provider, must stay the same for
 `SETTLE_STABLE_S`, read every `SETTLE_POLL_S`, within `SETTLE_BOUND_S`, or the reset fails. After the eviction and the
-occupancy the quiet stage reads, at one instant T, the block maps of the files the eviction plan evicted, on the
-providers it evicted them from, and of the files a removed requirement applied to, on every provider. Each may hold no
+occupancy, read once every eviction's change can show (below), the quiet stage reads, at one instant T, the block maps
+of the files the eviction plan evicted, on the providers it evicted them from, and of the files a removed requirement
+applied to, on every provider. Each may hold no
 more than it should: nothing where the eviction verified it empty, what the settle saw elsewhere. Then it waits
 `quiet_wait_s` from T and reads the occupancy: no provider other than the data provider may hold more of the space than
 at the occupancy stage. That check does not wait for a requirement to be found: an agent can add one and remove it
@@ -73,25 +79,41 @@ placement:
 - each directory above the parent gets it when the parent's collector flushes, 5 s after its first unflushed change
   (`FLUSH_INTERVAL_MILLIS`, `dir_stats_collector.erl:168,905-918,1037-1057`);
 - so the space root's physical size reflects a placement at most 10 + 5 x (L - 1) s later, L being the levels from the
-  file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`). An eviction flushes at once
-  (`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level above the parent.
+  file's parent up to the space root, the parts of the file's path (`occupancy_lag_s`).
 
-The quiet wait is that lag for the deepest file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest
-regular file of the space, as the scan saw it, since a replication nothing names could reach any file, or the deepest
-affected file when the caller knows the run could set no requirement. So the occupancy is read when every placement
-that landed by T shows in it. Another study measured 9.5 s for a directory after a placement and 0.05 s after an
-eviction, which this fits. A space with directory statistics off answers no physical size at all, and the occupancy
-stage already fails on it.
+**An eviction lags as long (O46).** The source suggests an eviction's change skips the location's flush
+(`fslogic_location_cache.erl:345-354`) and lags only the 5 s per level, and another study measured 0.05 s; the 14 Nov
+live slot (`deploy/compose-federation/day0/2026-11-14-federation-facts-slot.md`, item 4, op-worker f118ed9) saw a
+mirror's root size drop 20.03 s after an eviction at depth 3 was scheduled, the eviction job's own run included, where
+it grew 15.91 s after a placement at that depth (bound 20 s) and 10.76 s at depth 2 (bound 15 s). The slot cannot say
+how much of the 20.03 s was the job's run, so the reset takes **the conservative reading:** an eviction's change lags
+by the placement's bound, 10 + 5 x (L - 1) s, counted from when the reset knows every eviction had finished, the
+eviction stage's end, at or after each eviction job's finish and its block-map verification. Counted from the
+scheduling instead, the measured 20.03 s is past the bound alone and within the bound and margin, 25 s.
+
+So two reads of the occupancy wait. The occupancy stage waits `occupancy_wait_s` from the eviction stage's end, the
+lag for the deepest regular file of the space plus `QUIET_MARGIN_S`: every eviction and every transfer had ended by
+then, the reset's and an earlier run's, at any depth, and the stage keeps a reading only when the transfer listings
+show none ran or ended since (`reset.py`, waiting again otherwise), so its figure shows them all, and the quiet stage
+holds the occupancy to a figure that no longer counts bytes already evicted. Read sooner, that figure still held
+them, and the quiet stage passed a growth up to their size: a false certification. The quiet wait is the same lag for
+the deepest
+file it must cover plus `QUIET_MARGIN_S` (`quiet_wait_s`): the deepest regular file of the space, as the scan saw it,
+since a replication nothing names could reach any file, or the deepest affected file when the caller knows the run
+could set no requirement. So the occupancy is read when every placement that landed by T shows in it. A space with
+directory statistics off answers no physical size at all, and the occupancy stage already fails on it.
 """
 
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from expcore_onedata import consistency
+from expcore_onedata.occupancy import Listing, Reading
 from expcore_onedata.placement import Range, held_bytes, merged
-from expcore_onedata.provision import Listings, Provisioner, ProvisionError
+from expcore_onedata.provision import Entry, Listings, Provisioner, ProvisionError
+from expcore_onedata.readretry import ReadRetry, recorded
 from expcore_onedata.transferrecord import Unreadable
 
 _PLAIN_ID = re.compile(r"[A-Za-z0-9_=-]{1,512}")  # a requirement or entry id the client accepts as one path segment
@@ -120,21 +142,45 @@ def quiet_wait_s(depth: int) -> float:
     return occupancy_lag_s(depth) + QUIET_MARGIN_S
 
 
+def occupancy_wait_s(depth: int) -> float:
+    """The occupancy stage's wait from the eviction stage's end to its read, for files at most `depth` path parts below
+    the root: the same lag, which an eviction's change has too (O46), and `QUIET_MARGIN_S`."""
+    return occupancy_lag_s(depth) + QUIET_MARGIN_S
+
+
 @dataclass(frozen=True)
 class Found:
     """What a scan found: each requirement with the provider that showed it first, the regular files each applies to,
-    each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, and the
-    depth of the deepest regular file of the space it saw (0 when it saw none), which costs no read of its own."""
+    each by its id with its depth (the parts of its path below the root), how many reads of each kind it made, the
+    depth of the deepest regular file of the space it saw (0 when it saw none), and the ids of the regular files
+    (`REG`) and hard links (`LNK`) any provider's listing showed, the files the occupancy reads the block maps of at
+    every provider (O46); the last two cost no read of their own. A scan also names the space and the providers it read
+    by their Onezone ids, never a position a configuration gives, so a reset given it refuses one of another space or of
+    other providers, and the listing gives each regular file's path relative to the root (`paths`, empty for
+    `summaries`), which a planner names its eviction plan by (`resetplan.py`)."""
 
     where: dict[str, str]
     files: dict[str, dict[str, int]]
     reads: dict[str, int] = field(default_factory=dict)
     deepest: int = 0
+    listing: Listing = field(default_factory=Listing)
+    space: str = ""  # the space's Onezone id
+    providers: tuple[tuple[str, str], ...] = ()  # each provider read, (name, Onezone id), in order
+    paths: dict[str, str] = field(default_factory=dict)
 
 
-def _summary(p: Provisioner, file_id: str, provider: str) -> set[str]:
-    """The ids of the QoS requirements on an entry and its ancestors, from its summary on one provider."""
-    return requirements_of(p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=p.retry))
+def _ids(p: Provisioner, providers: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    """Each provider a scan read as `(name, Onezone id)`: the scan's tables are keyed by the names, so a reset takes it
+    only where every name stands for the same provider."""
+    return tuple((provider, p.provider_id(provider)) for provider in providers)
+
+
+def _summary(p: Provisioner, file_id: str, provider: str, reads: ReadRetry) -> set[str]:
+    """The ids of the QoS requirements on an entry and its ancestors, from its summary on one provider, read under one
+    of its slots and the reading's policy."""
+    with p.reading_slot(provider, reads):
+        answer = p.client.get(f"/data/{file_id}/qos/summary", provider=provider, retry=reads)
+    return requirements_of(answer)
 
 
 def requirements_of(answer: Any) -> set[str]:
@@ -152,70 +198,99 @@ def plain_id(value: str) -> bool:
     return _PLAIN_ID.fullmatch(value) is not None
 
 
-def tree(p: Provisioner, provider: str) -> tuple[str, list[tuple[str, str, int]]]:
+def _children(
+    p: Provisioner, directory_id: str, provider: str, listings: Listings, reads: ReadRetry
+) -> dict[str, Entry]:
+    """One directory's entries on one provider (`Provisioner.children`, its pages in turn), under one of the provider's
+    slots and the reading's policy; one the cache holds is not read again."""
+    with p.reading_slot(provider, reads):
+        return p.children(directory_id, provider, listings=listings, retry=reads)
+
+
+def tree(p: Provisioner, provider: str, reads: ReadRetry) -> tuple[str, list[tuple[str, str, int]]]:
     """The space root on one provider and every leaf under it, a file or an empty directory, as `(id, kind, depth)`:
-    the tree `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth."""
-    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=p.retry)
+    the tree `Provisioner.walk` enters, breadth first and each directory listed once, with each entry's depth. The
+    root and every listing are read under the reading's policy, each under one of the provider's slots."""
+    root = _root(p, provider, reads)
     listings: Listings = {}
     found: list[tuple[str, str, int]] = []
     pending = [(root, 0)]
     while pending:
         current, depth = pending.pop(0)
-        for entry in p.children(current, provider, listings=listings).values():
+        for entry in _children(p, current, provider, listings, reads).values():
             if entry.kind != "DIR":
                 found.append((entry.file_id, entry.kind, depth + 1))
                 continue
-            if not p.children(entry.file_id, provider, listings=listings):
+            if not _children(p, entry.file_id, provider, listings, reads):
                 found.append((entry.file_id, entry.kind, depth + 1))
             pending.append((entry.file_id, depth + 1))
         listings.pop((provider, current), None)  # entered: no longer needed
     return root, found
 
 
-def by_summaries(p: Provisioner, providers: Sequence[str]) -> Found:
+def by_summaries(p: Provisioner, providers: Sequence[str], reads: ReadRetry) -> Found:
     """Every requirement any provider's summaries show: on each provider, the root's and every leaf's."""
     where: dict[str, str] = {}
     files: dict[str, dict[str, int]] = {}
+    listing = Listing()
     read, deepest = 0, 0
     for provider in providers:
-        root, leaves = tree(p, provider)
+        root, leaves = tree(p, provider, reads)
         deepest = max([deepest, *(depth for _, kind, depth in leaves if kind != "DIR")])
+        listing |= Listing(
+            frozenset(file_id for file_id, kind, _ in leaves if kind == "REG"),
+            frozenset(file_id for file_id, kind, _ in leaves if kind == "LNK"),
+        )
         entries = [root, *(file_id for file_id, _, _ in leaves)]
-        summaries = consistency.bounded_map(lambda f, q=provider: _summary(p, f, q), entries, p.settings.concurrency)
+        summaries = consistency.bounded_map(
+            lambda f, q=provider: _summary(p, f, q, reads), entries, p.settings.concurrency
+        )
         for qid in sorted(set().union(*summaries)):
             where.setdefault(qid, provider)
         for (file_id, kind, depth), held in zip(leaves, summaries[1:], strict=True):
             for qid in held if kind != "DIR" else ():
                 files.setdefault(qid, {})[file_id] = depth
         read += len(entries)
-    return Found(where, {q: files.get(q, {}) for q in where}, {"summaries": read}, deepest)
+    found = {q: files.get(q, {}) for q in where}
+    return Found(where, found, {"summaries": read}, deepest, listing, p.space_id, _ids(p, providers))
 
 
 @dataclass(frozen=True)
-class _Listed:
+class Listed:
     """One entry of the recursive listing: its id, its path relative to the space root ("." for the root), whether
-    it is a directory, and its `effQosInheritancePath`."""
+    it is a directory, its `effQosInheritancePath`, and its type (`REG`, `LNK`, ...). `listed` reads them for one
+    provider; the QoS scan and a reset planner share one reading (`resetplan.py`)."""
 
     file_id: str
     path: str
     directory: bool
     inheritance: str
+    kind: str = ""
 
 
-def _listing_page(p: Provisioner, provider: str, root: str, token: str | None) -> tuple[list[_Listed], str | None]:
-    """One page of the space root's recursive listing with the QoS attributes; its entries and the next token. The
-    first page sends no token at all: a null one would be read as the text "null"."""
+def _listing_page(
+    p: Provisioner, provider: str, root: str, token: str | None, reads: ReadRetry
+) -> tuple[list[Listed], str | None]:
+    """One page of the space root's recursive listing with the QoS attributes, under the reading's policy; its entries
+    and the next token. The first page sends no token at all: a null one would be read as the text "null"."""
     params: dict[str, Any] = {
         "attributes": ["fileId", "path", "type", "effQosInheritancePath"],
         "include_directories": "true",
         "limit": LISTING_PAGE,
         **({"token": token} if token else {}),
     }
-    answer = p.client.get(f"/data/{root}/files", provider=provider, params=params, retry=p.retry)
+    with p.reading_slot(provider, reads):
+        answer = p.client.get(f"/data/{root}/files", provider=provider, params=params, retry=reads)
     return _entries_of(answer)
 
 
-def _entries_of(answer: Any) -> tuple[list[_Listed], str | None]:
+def _root(p: Provisioner, provider: str, reads: ReadRetry) -> str:
+    """The space root on one provider, read under one of its slots and the reading's policy."""
+    with p.reading_slot(provider, reads):
+        return consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=reads)
+
+
+def _entries_of(answer: Any) -> tuple[list[Listed], str | None]:
     """Read one page of the recursive listing; refuse one not in its shape, never take it for the end (O26), and
     refuse a listing that could not enter a path, which is incomplete."""
     if not isinstance(answer, dict) or not isinstance(answer.get("files"), list):
@@ -236,13 +311,15 @@ def _entries_of(answer: Any) -> tuple[list[_Listed], str | None]:
             raise Unreadable("an entry of the recursive listing has no plain fileId or no path")
         if inheritance not in INHERITANCE or not isinstance(kind, str):
             raise Unreadable("an entry of the recursive listing has no effQosInheritancePath or no type")
-        entries.append(_Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance))
+        entries.append(Listed(file_id, path.strip("/") or ".", kind == "DIR", inheritance, kind))
     return entries, token
 
 
-def _requirement_entry(p: Provisioner, qid: str, provider: str) -> str:
-    """The id of the entry a requirement is on, from its record's `fileId`."""
-    record = p.client.get(f"/qos_requirements/{qid}", provider=provider, retry=p.retry)
+def _requirement_entry(p: Provisioner, qid: str, provider: str, reads: ReadRetry) -> str:
+    """The id of the entry a requirement is on, from its record's `fileId`, read under one of the provider's slots and
+    the reading's policy."""
+    with p.reading_slot(provider, reads):
+        record = p.client.get(f"/qos_requirements/{qid}", provider=provider, retry=reads)
     file_id = record.get("fileId") if isinstance(record, dict) else None
     if not isinstance(file_id, str) or not file_id:
         raise Unreadable("a QoS requirement's record names no fileId")
@@ -253,21 +330,23 @@ def _under(path: str, top: str) -> bool:
     return top == "." or path == top or path.startswith(f"{top}/")
 
 
-def listed(p: Provisioner, provider: str) -> tuple[dict[str, _Listed], int]:
-    """Every entry of the space root's recursive listing on `provider`, by id, and how many pages were read."""
-    root = consistency.space_root(p.client, provider, p.space_id, sleep=p.sleep, retry=p.retry)
-    entries: dict[str, _Listed] = {}
+def listed(p: Provisioner, provider: str, reads: ReadRetry | None = None) -> tuple[dict[str, Listed], int]:
+    """Every entry of the space root's recursive listing on `provider`, by id, and how many pages were read, under
+    `reads` (a reading's policy; by default one made for this listing, `Provisioner.reading_retry`)."""
+    reads = reads if reads is not None else p.reading_retry()
+    root = _root(p, provider, reads)
+    entries: dict[str, Listed] = {}
     token: str | None = None
     pages = 0
     while True:
-        page, token = _listing_page(p, provider, root, token)
+        page, token = _listing_page(p, provider, root, token, reads)
         pages += 1
         entries.update((e.file_id, e) for e in page)
         if token is None:
             return entries, pages
 
 
-def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
+def by_listing(p: Provisioner, providers: Sequence[str], reads: ReadRetry | None = None) -> Found:
     """Every requirement any of `providers` shows, from the recursive listing of each, the summaries of the entries a
     requirement is on (each read on the provider whose listing marked the entry), and each requirement's record (read
     on the provider whose summary showed it first).
@@ -277,22 +356,26 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
     an entry a provider marks `direct` or `directAndAncestor` has its summary read on that provider, and on each other
     provider that marks it so, since two providers can hold different requirements on one entry. The calls it makes:
     one listing of the space root per provider (a read of its root and `listing_pages` pages of `LISTING_PAGE`
-    entries), one summary per entry per provider that marks it, one record per requirement."""
-    listings = [(provider, *listed(p, provider)) for provider in providers]
-    entries: dict[str, _Listed] = {}
+    entries), one summary per entry per provider that marks it, one record per requirement. The providers' listings
+    are read at once, each provider's pages in turn: they are independent reads. Every read goes under `reads`, the
+    reading's policy (by default one made for this scan, `Provisioner.reading_retry`)."""
+    reads = reads if reads is not None else p.reading_retry()
+    read = consistency.bounded_map(lambda provider: listed(p, provider, reads), list(providers), len(providers) or 1)
+    listings = [(provider, found, pages) for provider, (found, pages) in zip(providers, read, strict=True)]
+    entries: dict[str, Listed] = {}
     hits: list[tuple[str, str]] = []  # (entry id, the provider that marks it as having a requirement on itself)
     for provider, found, _ in listings:
         for entry in found.values():
             entries.setdefault(entry.file_id, entry)
             if entry.inheritance in DIRECT:
                 hits.append((entry.file_id, provider))
-    summaries = consistency.bounded_map(lambda hit: _summary(p, hit[0], hit[1]), hits, p.settings.concurrency)
+    summaries = consistency.bounded_map(lambda hit: _summary(p, hit[0], hit[1], reads), hits, p.settings.concurrency)
     where: dict[str, str] = {}
     for (_, provider), held in zip(hits, summaries, strict=True):
         for qid in sorted(held):
             where.setdefault(qid, provider)
     qids = sorted(where)
-    on = consistency.bounded_map(lambda q: _requirement_entry(p, q, where[q]), qids, p.settings.concurrency)
+    on = consistency.bounded_map(lambda q: _requirement_entry(p, q, where[q], reads), qids, p.settings.concurrency)
     files: dict[str, dict[str, int]] = {}
     for qid, entry_id in zip(qids, on, strict=True):
         top = entries.get(entry_id)
@@ -300,39 +383,50 @@ def by_listing(p: Provisioner, providers: Sequence[str]) -> Found:
             raise Unreadable("a QoS requirement is on an entry the recursive listing does not hold")
         under = (e for e in entries.values() if not e.directory and _under(e.path, top.path))
         files[qid] = {e.file_id: len(e.path.split("/")) for e in under}
-    reads = {
+    made = {
         "listings": len(listings),
         "listing_pages": sum(pages for *_, pages in listings),
         "summaries": len(hits),
         "records": len(qids),
     }
     deepest = max((len(e.path.split("/")) for e in entries.values() if not e.directory), default=0)
-    return Found(where, files, reads, deepest)
+    listing = Listing(
+        frozenset(e.file_id for e in entries.values() if e.kind == "REG"),
+        frozenset(e.file_id for e in entries.values() if e.kind == "LNK"),
+    )
+    paths = {e.file_id: e.path for e in entries.values() if e.kind == "REG"}
+    return Found(where, files, made, deepest, listing, p.space_id, _ids(p, providers), paths)
 
 
-def scan(p: Provisioner, providers: Sequence[str]) -> Found:
-    """Find every requirement of the space, on every provider that supports it, as `[placement] qos_scan` says."""
+def scan(p: Provisioner, providers: Sequence[str], reads: ReadRetry | None = None) -> Found:
+    """Find every requirement of the space, on every provider that supports it, as `[placement] qos_scan` says, under
+    `reads`, the reading's policy (by default one made for this scan, `Provisioner.reading_retry`)."""
+    reads = reads if reads is not None else p.reading_retry()
     if p.settings.qos_scan == "listing":
-        return by_listing(p, providers)
-    return by_summaries(p, providers)
+        return by_listing(p, providers, reads)
+    return by_summaries(p, providers, reads)
 
 
 Pair = tuple[str, str]  # (file id, provider)
 Maps = dict[Pair, tuple[Range, ...]]  # (file id, provider) -> the merged blocks that provider holds
 
 
-def read_pairs(p: Provisioner, pairs: Iterable[Pair]) -> Maps:
-    """The block map of each (file, provider) pair, read on that provider, under the provisioner's policy."""
+def _pair_map(p: Provisioner, key: Pair, reads: ReadRetry) -> tuple[Range, ...]:
+    """One (file, provider) pair's merged block map, read on that provider under one of its slots and `reads`."""
+    with p.reading_slot(key[1], reads):
+        return tuple(merged(p.blocks(key[0], key[1], retry=reads)))
+
+
+def read_pairs(p: Provisioner, pairs: Iterable[Pair], reads: ReadRetry) -> Maps:
+    """The block map of each (file, provider) pair, read on that provider, under the reading's policy `reads`."""
     keys = list(dict.fromkeys(pairs))
-    maps = consistency.bounded_map(
-        lambda key: tuple(merged(p.blocks(key[0], key[1], retry=p.retry))), keys, p.settings.concurrency
-    )
+    maps = consistency.bounded_map(lambda key: _pair_map(p, key, reads), keys, p.settings.concurrency)
     return dict(zip(keys, maps, strict=True))
 
 
-def read_maps(p: Provisioner, files: Iterable[str], providers: Sequence[str]) -> Maps:
+def read_maps(p: Provisioner, files: Iterable[str], providers: Sequence[str], reads: ReadRetry) -> Maps:
     """Each provider's block map of each file."""
-    return read_pairs(p, [(file_id, provider) for file_id in sorted(files) for provider in providers])
+    return read_pairs(p, [(file_id, provider) for file_id in sorted(files) for provider in providers], reads)
 
 
 def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -> tuple[dict[str, Any], Maps]:
@@ -340,23 +434,26 @@ def settle(p: Provisioner, files: Mapping[str, int], providers: Sequence[str]) -
     `SETTLE_STABLE_S`; raise ProvisionError when they are still changing after `SETTLE_BOUND_S` of waiting. Return the
     stage's facts and the maps it ended on, which the quiet stage holds the files to. The bound counts the waits alone,
     never the reads: a requirement on a large directory makes one reading of every file's map on every provider take
-    long, and that is no change."""
+    long, and that is no change. Every poll's reads go under one policy made for the stage
+    (`Provisioner.reading_retry`), whose tally is in the facts (`read_retry`), a failure's included."""
     if not files:
         return {"files": 0, "polls": 0}, {}
-    last, since, polls, waited = read_maps(p, files, providers), p.clock(), 1, 0.0
-    while p.clock() - since < SETTLE_STABLE_S:
-        if waited >= SETTLE_BOUND_S:
-            raise ProvisionError(
-                f"the block maps of {len(files)} file(s) a removed QoS requirement applied to were still changing "
-                f"after {SETTLE_BOUND_S:.0f} s of waiting"
-            )
-        p.sleep(SETTLE_POLL_S)
-        waited += SETTLE_POLL_S
-        current = read_maps(p, files, providers)
-        polls += 1
-        if current != last:
-            last, since = current, p.clock()
-    return {"files": len(files), "polls": polls}, last
+    reads = p.reading_retry()
+    with recorded(reads):
+        last, since, polls, waited = read_maps(p, files, providers, reads), p.clock(), 1, 0.0
+        while p.clock() - since < SETTLE_STABLE_S:
+            if waited >= SETTLE_BOUND_S:
+                raise ProvisionError(
+                    f"the block maps of {len(files)} file(s) a removed QoS requirement applied to were still changing "
+                    f"after {SETTLE_BOUND_S:.0f} s of waiting"
+                )
+            p.sleep(SETTLE_POLL_S)
+            waited += SETTLE_POLL_S
+            current = read_maps(p, files, providers, reads)
+            polls += 1
+            if current != last:
+                last, since = current, p.clock()
+    return {"files": len(files), "polls": polls, "read_retry": reads.facts()}, last
 
 
 def grown(before: Maps, after: Maps) -> list[Pair]:
@@ -368,42 +465,53 @@ def _held(maps: Maps, key: Pair) -> int:
     return held_bytes(list(maps.get(key, ())))
 
 
-def quiet(
-    p: Provisioner,
-    expected: Maps,
-    occupancy: Callable[[], Mapping[str, int]],
-    before: Mapping[str, int],
-    *,
-    depth: int,
-) -> dict[str, Any]:
-    """Read the block map of each (file, provider) pair of `expected`, wait `quiet_wait_s(depth)` from T, the instant
-    the last was read, and read the occupancy. Raise ProvisionError when a map holds more than `expected` says it should
-    (nothing, for a pair the eviction emptied; what the settle saw, for a file a removed requirement applied to), or
-    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`). The
-    occupancy is read whatever `expected` holds, none included: a replication on a file nothing here names shows in no
-    block map read, and only the occupancy shows it.
+def quiet_maps(p: Provisioner, expected: Maps) -> dict[str, Any]:
+    """The quiet stage's first read, at T: the block map of each (file, provider) pair of `expected`. Raise
+    ProvisionError when a map holds more than `expected` says it should (nothing, for a pair the eviction emptied; what
+    the settle saw, for a file a removed requirement applied to). The occupancy is read after it (`quiet_grown`)
+    whatever `expected` holds, none included: a replication on a file nothing here names shows in no block map read,
+    and only the occupancy shows it.
 
-    What this proves, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The occupancy
-    read at T + the lag + a margin shows every placement that landed by T. A landing after T is not proved absent: it
-    may not show in the occupancy yet, and no map is read again."""
-    maps = read_pairs(p, expected)
-    more = grown(expected, maps)
-    if more:
-        where = ", ".join(sorted({p.client.provider_label(provider) for _, provider in more}))
-        raise ProvisionError(
-            f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to "
-            f"hold more than the eviction or the settle left them, on {where}: a replica had landed by the quiet stage"
-        )
-    wait = quiet_wait_s(depth)
-    p.sleep(wait)
-    sizes = occupancy()
-    over = [q for q, size in sizes.items() if q != p.settings.holder and size > before.get(q, 0)]
+    What the two prove, exactly: no replica of the plan's files, and no occupancy growth, had landed by T. The
+    occupancy read at T + `quiet_wait_s` or later shows every placement that landed by T. A landing after T is not
+    proved absent: it may not show in the occupancy yet, and no map is read again. The maps are read under one policy
+    made for the reading (`Provisioner.reading_retry`), whose tally is in the facts (`maps_read_retry`), a failure's
+    included."""
+    reads = p.reading_retry()
+    with recorded(reads, "maps_read_retry"):
+        maps = read_pairs(p, expected, reads)
+        more = grown(expected, maps)
+        if more:
+            where = ", ".join(sorted({p.client.provider_label(provider) for _, provider in more}))
+            raise ProvisionError(
+                f"{len(more)} block map(s) of files the eviction plan covered or a removed QoS requirement applied to "
+                f"hold more than the eviction or the settle left them, on {where}: a replica had landed by the quiet "
+                "stage"
+            )
+    return {
+        "files": len({file_id for file_id, _ in expected}),
+        "block_maps": len(maps),
+        "maps_read_retry": reads.facts(),
+    }
+
+
+def quiet_grown(p: Provisioner, sizes: Reading, before: Reading) -> dict[str, Any]:
+    """The quiet stage's second read, the occupancy `sizes` read at least `quiet_wait_s` after T: raise ProvisionError
+    when a provider other than the data provider holds more of the space than at the occupancy stage (`before`), by its
+    files' block maps summed, never by the counter (`occupancy.py`, O46)."""
+    label = p.client.provider_label
+    over = [q for q in sizes.files if sizes.held(q) > before.held(q)]
     if over:
-        where = ", ".join(p.client.provider_label(q) for q in over)
-        raise ProvisionError(f"{where} hold(s) more of the space after the quiet wait than at the occupancy stage")
-    physical = {p.client.provider_label(q): n for q, n in sizes.items()}
-    files = {file_id for file_id, _ in expected}
-    return {"files": len(files), "block_maps": len(maps), "waited_s": wait, "physical_bytes": physical}
+        figures = "; ".join(
+            f"{label(q)}: its files hold {sizes.held(q)} bytes, {before.held(q)} at the occupancy stage (the "
+            f"directory statistics read {sizes.counter.get(q)} bytes)"
+            for q in over
+        )
+        raise ProvisionError(
+            f"{', '.join(label(q) for q in over)} hold(s) more of the space after the quiet wait than at the "
+            f"occupancy stage: {figures}"
+        )
+    return sizes.facts(label)
 
 
 __all__ = [
@@ -413,9 +521,14 @@ __all__ = [
     "SETTLE_BOUND_S",
     "SETTLE_STABLE_S",
     "Found",
+    "Listed",
+    "by_listing",
+    "listed",
     "occupancy_lag_s",
+    "occupancy_wait_s",
     "plain_id",
-    "quiet",
+    "quiet_grown",
+    "quiet_maps",
     "quiet_wait_s",
     "requirements_of",
     "scan",

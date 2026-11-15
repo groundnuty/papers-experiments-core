@@ -295,7 +295,7 @@ V2 = SchemaVersion(
     added={
         "record": ("instruments", "treatment_targets", "instrument_refusal"),
         "turn": ("request_sha256",),
-        "tool_call": ("detail",),
+        "tool_call": ("detail", "elapsed_s"),
         "usage": ("extra", "extra_cut"),  # the real table's version 3 fields, here added with this version
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld"),
@@ -306,6 +306,7 @@ V2 = SchemaVersion(
         "record": ("treatment_targets", "instrument_refusal"),
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld"),
+        "tool_call": ("elapsed_s",),
     },
 )
 TABLE = (V1, V2)
@@ -320,6 +321,7 @@ def older(data: dict) -> dict:
         del entry["request_sha256"]
     for entry in data["tool_calls"]:
         del entry["detail"]
+        entry.pop("elapsed_s", None)  # a field the current writer adds, and this table's version 2 lists
     del data["agent_config"]["cleanup_deadline_s"]
     data["agent_config_sha256"] = digest(data["agent_config"])
     return data

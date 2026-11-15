@@ -1,0 +1,20 @@
+# ONEZONE_CONFIG, filled by configure.sh (one zone per node, the node's own network and names).
+# The admin is "admin", whose password is the zone panel's emergency passphrase (a 0600 file).
+cluster:
+  domainName: "@NODE_DOMAIN@"
+  nodes:
+    n0:
+      hostname: "@NODE_SHORT@"
+  managers:
+    mainNode: "n0"
+    nodes: ["n0"]
+  workers:
+    nodes: ["n0"]
+  databases:
+    serverQuota: 256
+    bucketQuota: 256
+    nodes: ["n0"]
+onezone:
+  name: "@ZONE_NAME@"
+  domainName: "@NODE_FQDN@"
+  letsEncryptEnabled: false

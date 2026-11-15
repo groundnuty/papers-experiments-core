@@ -8,7 +8,13 @@ of a provider's answer on as it comes (`OnezoneClient.read_content`), both hashi
 - `created`: the target did not exist; it was created and every byte sent;
 - `skipped`: the target already held the same size and SHA-256; nothing was sent;
 - `resumed`: the target held a strict prefix of the file; the rest was sent from where it ended;
-- `restarted`: the target held something else; it was written again from its first byte, truncated by the first write.
+- `restarted`: the target held something else and was no longer; it was written again from its first byte, every
+  write at its offset (a longer target is refused: no write that truncates is ever sent, O44).
+
+A read also says what the platform answered, range by range (`ReadOutcome`, handed to the read's `answers`): the
+status, the `Content-Range` as it was sent (None when there was none) and the bytes of the body, so a whole answer
+(200, no range), a ranged one (206 with its range) and one clipped at the file's end (206 with a shorter range) are
+told apart by what the platform said, never by what the read asked for (O37).
 
 A write of content names its media type (`media_type`): Onedata 25.0 answers 415 to a write without one, and the
 default is `application/octet-stream`.
@@ -36,6 +42,20 @@ class Digest:
 
     def to_json(self) -> dict[str, Any]:
         return {"size": self.size, "sha256": self.sha256}
+
+
+@dataclass(frozen=True)
+class ReadOutcome:
+    """What the platform answered to one read of a file's content, as it sent it: the HTTP `status`, its
+    `Content-Range` header (None when it sent none) and the `body_bytes` it delivered. Only an answer the read accepted
+    as the bytes it asked for is reported: a refused one raises instead (O37)."""
+
+    status: int
+    content_range: str | None
+    body_bytes: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {"status": self.status, "content_range": self.content_range, "body_bytes": self.body_bytes}
 
 
 @dataclass(frozen=True)
@@ -89,4 +109,4 @@ def chunks(source: Path, chunk_bytes: int, *, start: int = 0, stop: int | None =
             offset += len(block)
 
 
-__all__ = ["ACTIONS", "OCTET_STREAM", "Digest", "Upload", "chunks", "digest_of", "media_type"]
+__all__ = ["ACTIONS", "OCTET_STREAM", "Digest", "ReadOutcome", "Upload", "chunks", "digest_of", "media_type"]

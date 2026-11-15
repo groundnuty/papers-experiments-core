@@ -23,18 +23,25 @@ and with these changes to the calls it inherits:
 
 A test bends it through plain attributes: `ignore_cancels` (a cancel answers 204 and the job goes on),
 `spawn_on_evict` (a provider id: an eviction that ends starts a replication of the same data into it, a job begun
-while a reset runs), and `dir_stats_disabled` (a directory's distribution answers its physical sizes as failed, as a
-space without directory statistics does).
+while a reset runs), `dir_stats_disabled` (a directory's distribution answers its physical sizes as failed, as a
+space without directory statistics does), `counter_offset` (provider id to bytes: what a space root's physical size
+shows for that provider beyond, or below, its files' blocks, never below 0; the directory statistics wrong for good,
+as op-worker f118ed9 showed a root crediting a provider 1,048,576 B that no file held, O46), and
+`ended_listed_ongoing_s` (seconds of `clock` after its finish during which a job that ended, not cancelled, is still
+on the first page of every provider's ongoing listing while its record says it ended: a listing that lags the record;
+0, the default, models none).
 
 A directory's distribution answers, per provider, the physical size of what that provider holds under it, as
-`distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and not an
-eviction**, as the build's does (op-worker f118ed9, the module docstring of `expcore_onedata.resetqos` traces it): bytes
-that land show in it `blocks_flush_delay_s + dir_stats_flush_s x (L - 1)` seconds later, 10 + 5 x (L - 1) by default,
-L being the parts of the file's path below the directory asked (the levels from the file's parent up to it); bytes
-that leave show at once. A test sets the two attributes (both 0: no lag). Only changes made once the fake has been
-called are dated: what a test puts in place before the first provider call, its setup, is old, and shows at once. A
-change is dated on the fake's `clock` by the write to `blocks` (a replication's landing, a hook's assignment) and an
-eviction by the removal of its entry; a list of blocks edited in place is not seen.
+`distributionPerStorageBackend.{storage}.physicalSize`, with `success` true. **That size lags a placement and an
+eviction alike** (the module docstring of `expcore_onedata.resetqos` traces the placement's lag in op-worker f118ed9,
+and the 14 Nov live slot measured an eviction's as long, O46): bytes that land or leave show in it
+`blocks_flush_delay_s + dir_stats_flush_s x (L - 1)` seconds later, 10 + 5 x (L - 1) by default, L being the parts of
+the file's path below the directory asked (the levels from the file's parent up to it). Each change shows on its own,
+so bytes that land and leave within the lag show for a while, where the build's flush may merge the two; the fake is
+no faster than the build either way. A test sets the two attributes (both 0: no lag). Only changes made once the fake
+has been called are dated: what a test puts in place before the first provider call, its setup, is old, and shows at
+once. A change is dated on the fake's `clock` by the write to `blocks` (a replication's landing, a hook's assignment)
+and an eviction by the removal of its entry; a list of blocks edited in place is not seen.
 """
 
 from __future__ import annotations
@@ -55,22 +62,22 @@ def _held(blocks: list[list[int]] | None) -> int:
 
 class _Placements(dict):
     """The fake's table of blocks, `(file id, provider id)` to `[offset, length]` lists, which dates its changes once
-    `armed()` says so: each is kept as `(when, bytes held after it, whether it grew)`, so that `reported` can say how
-    many bytes a directory's physical size shows at a later time. A growth shows `lag` seconds after it, a shrink (an
-    eviction, `pop` and `del` included) at once. Before the first change of a key the entry is old: it shows as held."""
+    `armed()` says so: each is kept as `(when, bytes held after it)`, so that `reported` can say how many bytes a
+    directory's physical size shows at a later time. A change shows `lag` seconds after it, a growth and a shrink (an
+    eviction, `pop` and `del` included) alike. Before the first change of a key the entry is old: it shows as held."""
 
     def __init__(self, clock: Callable[[], float], armed: Callable[[], bool]) -> None:
         super().__init__()
         self._clock, self._armed = clock, armed
-        self._changes: dict[tuple[str, str], list[tuple[float, int, bool]]] = {}
+        self._changes: dict[tuple[str, str], list[tuple[float, int]]] = {}
 
     def _note(self, key: tuple[str, str], now_held: int) -> None:
         if not self._armed():
             return
         before = _held(self.get(key))
         if now_held != before:
-            changes = self._changes.setdefault(key, [(-math.inf, before, False)])
-            changes.append((self._clock(), now_held, now_held > before))
+            changes = self._changes.setdefault(key, [(-math.inf, before)])
+            changes.append((self._clock(), now_held))
 
     def __setitem__(self, key: tuple[str, str], value: list[list[int]]) -> None:
         self._note(key, _held(value))
@@ -86,17 +93,17 @@ class _Placements(dict):
         return super().pop(key, *default)
 
     def reported(self, key: tuple[str, str], lag: float) -> int:
-        """The bytes of `key` a directory shows now, a growth showing `lag` seconds after it was made."""
-        now, held = self._clock(), _held(self.get(key))
-        for when, after, grew in reversed(self._changes.get(key, [])):
-            if when + (lag if grew else 0.0) <= now:
-                return min(held, after)
-        return held
+        """The bytes of `key` a directory shows now, each change showing `lag` seconds after it was made."""
+        now = self._clock()
+        for when, after in reversed(self._changes.get(key, [])):
+            if when + lag <= now:
+                return after
+        return _held(self.get(key))  # never changed since the setup: old, shown as held
 
 
 class FakeReset(FakeData):
     """FakeData with several data spaces, QoS requirements, cancels, directory evictions, a lock, and a directory
-    size that lags a placement."""
+    size that lags a placement and an eviction."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -104,6 +111,8 @@ class FakeReset(FakeData):
         self.ignore_cancels = False
         self.spawn_on_evict: str | None = None
         self.dir_stats_disabled = False
+        self.ended_listed_ongoing_s = 0.0
+        self.counter_offset: dict[str, int] = {}
         self.blocks_flush_delay_s = 10.0  # the file location's flush after its first change (rel/files/app.config:511)
         self.dir_stats_flush_s = 5.0  # each directory level's collector flush (dir_stats_collector.erl:168)
         self._called = False
@@ -244,7 +253,20 @@ class FakeReset(FakeData):
             found = self.space_of(transfer.file_id)
             return found == space or (found is None and space == self.SPACE_ID)
 
-        return self._transfer_page(query, provider, here)
+        answer = self._transfer_page(query, provider, here)
+        if query.get("state") != "ongoing" or query.get("page_token") or not self.ended_listed_ongoing_s:
+            return answer
+        body = answer.json()
+        lingering = [
+            tid
+            for tid, job in self.transfers.items()
+            if here(tid, job)
+            and job.ended
+            and not getattr(job, "cancelled", False)
+            and self.clock() < job.finished + self.ended_listed_ongoing_s
+            and tid not in body["transfers"]
+        ]
+        return httpx.Response(200, json={**body, "transfers": [*body["transfers"], *lingering]})
 
     def _finish(self, transfer: Transfer) -> None:
         """An eviction of a directory evicts every file under it; anything else ends as FakeData's does."""
@@ -284,6 +306,8 @@ class FakeReset(FakeData):
         per: dict = {}
         for provider in self.providers:
             held = sum(self.blocks.reported((f, provider), lags[f]) for f in files)
+            if node.file_id in self.space_roots.values():
+                held = max(0, held + self.counter_offset.get(provider, 0))
             backend = (
                 {"success": False, "error": {"id": "dirStatsDisabledForSpace"}}
                 if self.dir_stats_disabled

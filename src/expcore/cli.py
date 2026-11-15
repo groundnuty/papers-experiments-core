@@ -5,7 +5,8 @@ A thin shell; the logic is in the packages.
 
     run STUDY       load the configuration, open or resume the campaign, run the scheduler; with `--shard i/N
                     [--shard-label L [--shard-label-wide]]` run shard i of N of the campaign on this host (one
-                    campaign on several hosts)
+                    campaign on several hosts); with `--select FACTOR=L1,L2 --shard-label L [--sequential [--after
+                    EARLIER_OUT...]]` run only the selected runs, one batch of the campaign (one campaign in batches)
     merge OUT SHARD_OUT...
                     merge the outputs of a campaign's shards into one batch under OUT (normally STUDY/out), refusing
                     shards that are not one campaign run against one environment; check, analyze and report then read
@@ -40,6 +41,7 @@ from expcore.campaign.export import ExportError
 from expcore.campaign.factors import PlanError
 from expcore.campaign.merge import MergeRefused
 from expcore.campaign.scheduler import CampaignLocked
+from expcore.campaign.selection import Selection, SelectionSpec, Spec
 from expcore.campaign.shard import ShardError, ShardSpec
 from expcore.config.loading import ConfigError
 from expcore.package.build import build_package, default_hashes, private_hashes, verify_package
@@ -125,6 +127,26 @@ def build_parser() -> argparse.ArgumentParser:
                 "name or an address is not used by accident); a store that was started with such a label is resumed "
                 "with it",
             )
+            command.add_argument(
+                "--select",
+                action="append",
+                metavar="FACTOR=L1,L2",
+                help="run only the runs whose declared FACTOR has one of these levels, as one batch (a selection) of "
+                "the whole campaign, merged later with the others; give it once per factor; needs --shard-label",
+            )
+            command.add_argument(
+                "--sequential",
+                action="store_true",
+                help="with --select: the batches run one after another, each with the full caps; the first gets the "
+                "whole budget, each later one what the earlier ones left (name them with --after)",
+            )
+            command.add_argument(
+                "--after",
+                action="append",
+                type=Path,
+                metavar="EARLIER_OUT",
+                help="with --sequential: an earlier selection's out/ (or its store); give every earlier one",
+            )
         else:
             command.add_argument(
                 "--partial",
@@ -168,11 +190,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None) -> int:
-    shard = (
-        None if args.shard is None else ShardSpec.parse(args.shard, args.shard_label, wide_label=args.shard_label_wide)
-    )
+    refusal = _selection_refusal(args)
+    if refusal is not None:
+        raise ShardError(refusal)
+    shard: Spec | None = None
+    if args.shard is not None:
+        shard = ShardSpec.parse(args.shard, args.shard_label, wide_label=args.shard_label_wide)
+    elif args.select:
+        selection = Selection.parse(args.select)
+        shard = SelectionSpec(args.shard_label, selection, args.sequential, wide_label=args.shard_label_wide)
     summary = run_study(
-        args.study, allow_dirty=args.allow_dirty, code_root=args.code_root, crash_hook=crash_hook, shard=shard
+        args.study,
+        allow_dirty=args.allow_dirty,
+        code_root=args.code_root,
+        crash_hook=crash_hook,
+        shard=shard,
+        after=args.after or (),
     )
     runs = sum(summary.statuses.values())
     statuses = dict(sorted(summary.statuses.items()))
@@ -187,6 +220,29 @@ def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None
         print(f"{pending} runs are still pending; see the holds above", file=sys.stderr)
         return EXIT_PENDING
     return EXIT_OK
+
+
+def _check_run_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """The combinations of `run`'s shard options that are usage errors (C30); a label goes with a shard or a
+    selection."""
+    if args.shard is None and not args.select and (args.shard_label is not None or args.shard_label_wide):
+        parser.error("--shard-label and --shard-label-wide need --shard")
+    if args.shard_label_wide and args.shard_label is None:
+        parser.error("--shard-label-wide needs --shard-label")
+
+
+def _selection_refusal(args: argparse.Namespace) -> str | None:
+    """Why `run`'s selection options do not combine (C38), said as a refusal (a usage error's message is never
+    shown, and these name only options); None when they do."""
+    if args.shard is not None and args.select:
+        return "--select cannot be combined with --shard in this version: run a selection, or a shard"
+    if args.select and args.shard_label is None:
+        return "--select needs --shard-label: name the selection, with a name that names no machine"
+    if not args.select and (args.sequential or args.after):
+        return "--sequential and --after need --select"
+    if args.after and not args.sequential:
+        return "--after needs --sequential: it names the selections this one runs after"
+    return None
 
 
 def _merge(args: argparse.Namespace) -> int:
@@ -222,7 +278,7 @@ def _analyze(args: argparse.Namespace) -> int:
     analysis = _analysis(args)
     for path in write_analysis(analysis):
         print(f"wrote {path}")
-    print("\n".join(summary_lines(analysis.result)))
+    print("\n".join(summary_lines(analysis.result, analysis.egress)))
     return EXIT_OK
 
 
@@ -284,10 +340,8 @@ def main(argv: Sequence[str] | None = None, *, crash_hook: Callable[[str, str], 
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-        if args.command == "run" and args.shard is None and (args.shard_label is not None or args.shard_label_wide):
-            parser.error("--shard-label and --shard-label-wide need --shard")
-        if args.command == "run" and args.shard_label_wide and args.shard_label is None:
-            parser.error("--shard-label-wide needs --shard-label")
+        if args.command == "run":
+            _check_run_options(parser, args)
     except SystemExit as stop:
         return EXIT_USAGE if stop.code else EXIT_OK
     try:

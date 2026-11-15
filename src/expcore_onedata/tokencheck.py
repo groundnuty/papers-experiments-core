@@ -38,7 +38,8 @@ class TokenRefused(RuntimeError):
     """A token or its principal failed examination; the message holds no value.
 
     `expires_at` is the refused token's expiry when the examination could read its time caveat, else None. A token
-    is dropped, never revoked, so a caller holding a resource for it needs that expiry (or must assume the worst).
+    is dropped, not revoked on its own (only with all its user's temporary tokens, when a slot's run ends), so a caller
+    holding a resource for it needs that expiry (or must assume the worst).
     """
 
     expires_at: float | None = None

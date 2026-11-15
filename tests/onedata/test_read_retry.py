@@ -22,8 +22,11 @@ from expcore_onedata.readretry import (
     ONE_ATTEMPT,
     PLUMBING_ATTEMPTS,
     PLUMBING_PAUSES_S,
+    TRANSPORT_ATTEMPTS,
+    TRANSPORT_PAUSES_S,
     ReadRetry,
     connection_state,
+    recorded,
 )
 from expcore_onedata.testing import PROVIDER, SPACE_PREFIX, Ticker, write_platform
 from expcore_onedata.testing.fake_federation import ZONE
@@ -211,6 +214,149 @@ def test_o29_an_error_answer_after_a_timeout_is_the_answer_and_ends_the_retries(
     assert lines(caplog)[-1].startswith("zone: a GET was answered with 503 on attempt 2 of 3")
 
 
+# -- a reading's policy, which also retries a connection failure (the reset's per-file reads, O46) --------------------
+
+
+@pytest.fixture
+def reading(ticker, policy):
+    """A reading's policy as a provisioner makes one (`Provisioner.reading_retry`), counting into `policy`."""
+    return ReadRetry(
+        TRANSPORT_ATTEMPTS, TRANSPORT_PAUSES_S, transport=True, clock=ticker.clock, sleep=ticker.sleep, owner=policy
+    )
+
+
+def test_o29_a_readings_policy_is_four_attempts_with_pauses_of_two_five_and_fifteen_seconds():
+    """O29: the reset's per-file reads get four attempts, 2, 5 and 15 s apart."""
+    assert (TRANSPORT_ATTEMPTS, TRANSPORT_PAUSES_S) == (4, (2.0, 5.0, 15.0))
+
+
+@pytest.mark.parametrize(
+    "failure", [httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.ReadTimeout]
+)
+def test_o29_a_readings_policy_tries_a_connection_failure_again_and_tallies_it(
+    failure, config, fake, ticker, policy, reading, caplog
+):
+    """O29: under a reading's policy a refused, reset or cut connection is asked again, 2 s later, like a timeout; the
+    reading's tally counts the read, the retry and the error by type at the provider's label, and the owner's count
+    holds the retry too."""
+    client, script = scripted(config, ticker, failure)
+    assert client.get("/spaces", retry=reading) == {"size": 7}
+    assert (len(script.seen), ticker.slept) == (2, [2.0])
+    assert (reading.retries, policy.retries) == (1, 1)
+    facts = reading.facts()
+    assert facts["providers"] == {
+        "zone": {
+            "reads": 1,
+            "retries": 1,
+            "errors": {failure.__name__: 1},
+            "failed": 0,
+            "answers": {},
+            "slot_wait_s": 0.0,
+        }
+    }
+    assert (facts["reads"], facts["retries"], facts["errors"], facts["failed"]) == (1, 1, {failure.__name__: 1}, 0)
+    assert lines(caplog)[0].startswith("zone: a GET ")
+    assert lines(caplog)[0].endswith("on attempt 1 of 4 (connection unknown); retrying in 2 s")
+
+
+def test_o29_a_readings_read_that_never_connects_fails_after_four_attempts_and_is_tallied(
+    config, fake, ticker, reading
+):
+    """O29: a provider that is down still looks down, after the retries: four attempts, the three pauses, then the
+    transport failure that says so, and the tally holds one failed read and four errors."""
+    client, script = scripted(config, ticker, *[httpx.ConnectError] * 4)
+    with pytest.raises(PlatformError, match=r"^zone: GET failed \(ConnectError\) after 4 attempts$") as caught:
+        client.get("/spaces", retry=reading)
+    assert caught.value.transport is True
+    assert (len(script.seen), ticker.slept) == (4, [2.0, 5.0, 15.0])
+    assert (reading.facts()["errors"], reading.facts()["failed"]) == ({"ConnectError": 4}, 1)
+
+
+@pytest.mark.parametrize("status", [404, 400, 500, 503])
+def test_o29_a_readings_policy_never_asks_again_for_an_answer(status, config, fake, ticker, reading):
+    """O29: an answer is an answer under a reading's policy too: one request, no pause, its status kept; the tally
+    counts it apart from the failed attempts (`answers`), so a reading that failed on one says so."""
+    client, script = scripted(config, ticker, status, status)
+    with pytest.raises(PlatformError) as caught:
+        client.get("/spaces", retry=reading)
+    assert (caught.value.status, caught.value.transport) == (status, False)
+    assert (len(script.seen), ticker.slept, reading.retries) == (1, [], 0)
+    facts = reading.facts()
+    assert (facts["answers"], facts["errors"], facts["failed"]) == ({str(status): 1}, {}, 0)
+
+
+class CutBody(httpx.SyncByteStream):
+    """A body that breaks after its first bytes."""
+
+    def __iter__(self):
+        yield b'{"error": '
+        raise httpx.ReadError("simulated")
+
+
+def cut(status):
+    """A handler that answers `status` with a body cut short once, then 200 with a whole one."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(status, stream=CutBody()) if len(seen) == 1 else httpx.Response(200, json={"size": 7})
+
+    return handler, seen
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_o29_a_readings_policy_never_asks_again_once_an_error_status_arrived(status, config, fake, ticker, reading):
+    """O29: an error answer whose body broke off is still that answer's failure: it is not asked again, so a retry
+    can never turn it into a pass; the read fails as a transport failure, closed."""
+    handler, seen = cut(status)
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(PlatformError, match=r"GET failed \(ReadError\)$"):
+        client.get("/spaces", retry=reading)
+    assert (len(seen), ticker.slept, reading.facts()["failed"]) == (1, [], 1)
+
+
+def test_o29_a_readings_policy_asks_again_for_a_good_answer_whose_body_broke_off(config, fake, ticker, reading):
+    """O29: a 200 cut short is no answer that can be read: it is asked again, and the whole answer decides."""
+    handler, seen = cut(200)
+    client = OnezoneClient(config, http=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert client.get("/spaces", retry=reading) == {"size": 7}
+    assert (len(seen), ticker.slept) == (2, [2.0])
+
+
+def test_o29_the_plumbing_policy_still_never_retries_a_connection_failure(config, fake, ticker, policy):
+    """O29: only a policy that declares `transport` retries a connection failure; the plumbing's own does not."""
+    assert policy.transport is False
+    assert ONE_ATTEMPT.transport is False
+    client, script = scripted(config, ticker, httpx.ConnectError, httpx.ConnectError)
+    with pytest.raises(PlatformError, match=r"^zone: GET failed \(ConnectError\)$"):
+        client.get("/spaces", retry=policy)
+    assert len(script.seen) == 1
+
+
+def test_o29_a_failed_readings_tally_rides_on_its_error():
+    """O29: a reading that fails hands its tally on with the error (`recorded`), beside facts the error already had,
+    so a failed stage's record says what the reads met."""
+    reads = ReadRetry(TRANSPORT_ATTEMPTS, TRANSPORT_PAUSES_S, transport=True)
+    reads.began("providers[1]")
+    error = ValueError("unread")
+    error.facts = {"files_read": 3}
+    with pytest.raises(ValueError, match="unread") as caught, recorded(reads):
+        raise error
+    assert caught.value.facts["files_read"] == 3
+    assert caught.value.facts["read_retry"]["providers"]["providers[1]"]["reads"] == 1
+
+
+def test_o29_the_client_keeps_alive_as_many_idle_connections_as_it_may_open(config):
+    """O29: the client's own pool keeps every connection it may open alive, so a reading with more reads in flight
+    than httpx's default keep-alive bound (20) reuses its connections instead of opening one per read."""
+    client = OnezoneClient(config)
+    try:
+        pool = client._http._transport._pool
+        assert pool._max_keepalive_connections == pool._max_connections == 100
+    finally:
+        client.close()
+
+
 def test_o29_a_put_a_post_a_patch_and_a_delete_are_never_retried(fake, config, ticker, monkeypatch):
     """O29: a mutation that times out is sent once, whatever the policy of the reads around it; the client's `mutate`
     takes no policy, and so a mutation cannot be handed one."""
@@ -242,18 +388,18 @@ def test_o29_a_reading_post_is_never_retried(config, fake, ticker):
 
 
 def test_o29_only_a_read_and_the_gate_of_a_mutation_or_a_range_read_can_be_handed_a_policy():
-    """O29: by construction: `get`, the dated read `get_dated` and the reads that find a target's space
-    (`space_name`, `file_space_id`, `file_space_name`) take `retry`; `mutate`, `read_range` and `read_content` take
-    `gate_retry`, the policy of their gate's reads alone; and no other call does, so a PUT, a POST (reading POSTs
-    included), a PATCH, a DELETE, a range read, a streamed read and the head of a content read cannot be retried by a
-    caller that is later added."""
+    """O29: by construction: `get`, the dated read `get_dated`, the Onepanel read `panel_get` and the reads that find a
+    target's space (`space_name`, `file_space_id`, `file_space_name`) take `retry`; `mutate`, `read_range`,
+    `read_content` and the gated forced scan `force_scan` take `gate_retry`, the policy of their gate's reads alone; and
+    no other call does, so a PUT, a POST (reading POSTs included), a PATCH, a DELETE, a range read, a streamed read and
+    the head of a content read cannot be retried by a caller that is later added."""
     public = {name: f for name, f in inspect.getmembers(OnezoneClient, inspect.isfunction) if not name.startswith("_")}
 
     def taking(parameter):
         return sorted(name for name, f in public.items() if parameter in inspect.signature(f).parameters)
 
-    assert taking("retry") == ["file_space_id", "file_space_name", "get", "get_dated", "space_name"]
-    assert taking("gate_retry") == ["mutate", "read_content", "read_range"]
+    assert taking("retry") == ["file_space_id", "file_space_name", "get", "get_dated", "panel_get", "space_name"]
+    assert taking("gate_retry") == ["force_scan", "mutate", "read_content", "read_range"]
 
 
 class Gate:

@@ -21,6 +21,7 @@ V2 = SchemaVersion(
         "usage": ("extra", "extra_cut"),
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld"),
+        "tool_call": ("elapsed_s",),
     },
     config_before={"cleanup_deadline_s": 60.0},
     # the optional fields of the real table's version 3, here added with this one
@@ -29,6 +30,7 @@ V2 = SchemaVersion(
         "record": ("treatment_targets", "instrument_refusal"),
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld"),
+        "tool_call": ("elapsed_s",),
     },
 )
 TABLE = (V1, V2)

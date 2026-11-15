@@ -146,6 +146,7 @@ class FakeQos:
         node = self.nodes.get(landing.file_id)  # type: ignore[attr-defined]
         if node is not None and node.content:
             self.blocks[(landing.file_id, landing.provider)] = [[0, len(node.content)]]  # type: ignore[attr-defined]
+            self._note_blocks((landing.file_id, landing.provider))  # type: ignore[attr-defined]  # for a lagging view
             self.qos_landed.append((landing.when, landing.qid, landing.file_id, landing.provider))
 
 

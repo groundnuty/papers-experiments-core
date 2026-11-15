@@ -61,8 +61,9 @@ TLS context and the log.
 Every line the handler of a client connection logs carries that connection's `conn` (unique in this process), and a request's line carries
 `req_headers`: the few request headers that say what client it was (REQ_HEADERS_LOGGED), never any other. A response's line says what its body was
 (`body`): `content` (the platform's 200 or 206 to a read of a file's content), `listing` (its 200 to a listing, or the merged answer), `other` (any other
-answer of the platform's, passed on) or `gate` (the gate's own answer: a refusal, an error); the per-run count of the bytes served reads it (gatelog, O22). A 206 of a file's content
-also carries the platform's `Content-Range` (`content_range`), which says where in the file its bytes begin, for the count per file. A request's `host` is the role the
+answer of the platform's, passed on) or `gate` (the gate's own answer: a refusal, an error); the per-run count of the bytes served reads it (gatelog, O22). Every answer of a file's content
+also carries `content_range`, the platform's `Content-Range` as it sent it (a 206's, which says where in the file its bytes begin, for the count per file; null on a
+200, the whole file, which sent none), beside its `status` and the bytes it delivered (`bytes`, `body_bytes`), so a line tells a whole answer from a range and a range from one clipped at the file's end (O37). A request's `host` is the role the
 gate serves that host in (`onezone`, `oneprovider`), or `not_configured`, never the host's configured name (O12). When a connection ends after a response without a
 request following, one `conn_close` event line says how (see `Handler._peer_gone`), with the kernel's counters of that connection at that moment: a response's
 `body_bytes` counts what the gate's socket accepted, which says nothing of what the client read, and the close is what shows it. When the gate itself is stopped
@@ -1022,7 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
         if passed is None:
             return
         token, kind = CFG.get("token"), _body_kind(rec.get("tag"), resp.status)
-        if kind == "content" and resp.status == 206:  # where in the file its bytes begin, as the platform says (O22)
+        if kind == "content":  # where in the file its bytes begin (O22), as the platform says; null on a 200 (O37)
             rec["content_range"] = (resp.getheader("Content-Range") or "")[:REQ_HEADER_MAX] or None
         # the length http.client frames the body by (None: chunked, or until EOF), never the raw header; the boundary
         # never rewrites a body, so it stays true

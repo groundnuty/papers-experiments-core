@@ -14,6 +14,7 @@ providers = ["<name>", ...]     # the providers declared to support this space (
 local = "<name>"                # the agent's own provider, one of these; the same in every entry (O03)
 holder = "<name>"               # this space's data provider, one of its providers: required, never [placement]'s (O09)
 tokens = ["data_path", "tool_server"]  # optional: the token planes whose caveats reach this space; both by default
+import = { readonly = true }    # optional: the data provider holds this space on an imported storage (below)
 ```
 
 Each entry is a `StudySpace`. The one-space form reads as the single space `spaces[0]` with the label `space`. A
@@ -22,6 +23,13 @@ in this layer is named (O12). Loading refuses a label, name or id given twice, a
 entries (the agent is pinned to one, O03), an entry without its data provider or with one that does not support its
 space, and a token plane scoped to no space. Whenever the `[[spaces]]` form is used, with one entry or several, its
 entries are in the campaign fingerprint (`PlatformConfig.fingerprint`); the one-space form's fingerprint is unchanged.
+
+**An imported storage** (`import`, in `[space]` or an entry of `[[spaces]]`; O41, `storageimport.py`). The space's data
+provider holds its files on a storage Onedata imported them from (25.0's storage import), not on one they were written
+to; `readonly` (required) says whether that storage is read-only, so that Onedata never writes to, changes or deletes
+from it. A space without the key is a regular one, as every space was. The declaration is in the fingerprint: in an
+entry's digest with `[[spaces]]`, and as `storage_import` in the one-space form, whose fingerprint stays as it was
+without the key.
 """
 
 import hashlib
@@ -36,7 +44,7 @@ from expcore.config.loading import Section
 PLANES = ("data_path", "tool_server")  # the token planes (`tokens.Plane`), by the values a space's `tokens` names
 ONE_SPACE_LABEL = "space"  # the label of the one-space form's space: its table's name
 LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
-SPACE_KEYS = ("name", "id", "prefixes")
+SPACE_KEYS = ("name", "id", "prefixes", "import")
 SUPPORT_KEYS = ("providers", "local")
 SPACES_KEYS = ("label", *SPACE_KEYS, *SUPPORT_KEYS, "holder", "tokens")
 
@@ -59,6 +67,13 @@ class Support:
 
 
 @dataclass(frozen=True)
+class ImportedStorage:
+    """How the data provider holds an imported space: on a storage Onedata imported the files from, read-only or not."""
+
+    readonly: bool
+
+
+@dataclass(frozen=True)
 class StudySpace:
     """One declared space: the label code names it by, the space, the providers that support it, its data provider
     when it declares one, and the token planes whose caveats reach it. A message names it by `position`, never by its
@@ -70,19 +85,21 @@ class StudySpace:
     support: Support
     holder: str | None = None
     tokens: tuple[str, ...] = PLANES
+    imported: ImportedStorage | None = None  # None: a regular storage, the data written to it (O41)
 
     def digest(self) -> str:
-        """The SHA-256 of everything that makes this the space it is, for the fingerprint: never a value itself."""
-        text = json.dumps(
-            {
-                "label": self.label,
-                "space": [self.space.name, self.space.id, list(self.space.prefixes)],
-                "support": [list(self.support.providers), self.support.local],
-                "holder": self.holder,
-                "tokens": list(self.tokens),
-            },
-            sort_keys=True,
-        )
+        """The SHA-256 of everything that makes this the space it is, for the fingerprint: never a value itself. An
+        imported storage adds a key, so the digest of a space without one is what it always was."""
+        facts: dict[str, Any] = {
+            "label": self.label,
+            "space": [self.space.name, self.space.id, list(self.space.prefixes)],
+            "support": [list(self.support.providers), self.support.local],
+            "holder": self.holder,
+            "tokens": list(self.tokens),
+        }
+        if self.imported is not None:
+            facts["import"] = {"readonly": self.imported.readonly}
+        text = json.dumps(facts, sort_keys=True)
         return hashlib.sha256(text.encode()).hexdigest()
 
 
@@ -95,6 +112,22 @@ def parse_space(section: Section) -> Space:
     if not name.startswith(prefixes):
         raise section.fail("name", "must start with one of the prefixes")
     return Space(name, section.string("id"), prefixes)
+
+
+def parse_import(section: Section) -> ImportedStorage | None:
+    """Read a space's optional `import` table ([space], or an entry of [[spaces]]): None when it has none."""
+    if "import" not in section.data:
+        return None
+    value = section.data["import"]
+    if not isinstance(value, Mapping):
+        raise section.fail("import", "must be a table, written import = { readonly = true }")
+    table = Section(value, section.file, f"{section.where}.import")
+    table.reject_unknown(("readonly",))
+    if "readonly" not in table.data:
+        raise table.fail("readonly", "is required: say whether the imported storage is read-only")
+    if not isinstance(table.data["readonly"], bool):
+        raise table.fail("readonly", "must be true or false")
+    return ImportedStorage(readonly=table.data["readonly"])
 
 
 def parse_support(section: Section, providers: Collection[str]) -> Support:
@@ -118,7 +151,8 @@ def _one_space(root: Section, providers: Collection[str]) -> tuple[StudySpace, .
     space = parse_space(space_table)
     support_table = root.section("support")
     support_table.reject_unknown(SUPPORT_KEYS)
-    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, parse_support(support_table, providers)),)
+    support = parse_support(support_table, providers)
+    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, support, imported=parse_import(space_table)),)
 
 
 def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySpace:
@@ -134,7 +168,7 @@ def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySp
     tokens = entry.strings("tokens") if "tokens" in entry.data else PLANES
     if len(set(tokens)) != len(tokens) or any(plane not in PLANES for plane in tokens):
         raise entry.fail("tokens", f"must list token planes, each once; known: {', '.join(PLANES)}")
-    return StudySpace(label, position, parse_space(entry), support, holder, tuple(tokens))
+    return StudySpace(label, position, parse_space(entry), support, holder, tuple(tokens), parse_import(entry))
 
 
 def _several(root: Section, providers: Collection[str]) -> tuple[StudySpace, ...]:

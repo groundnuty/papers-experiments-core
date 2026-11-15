@@ -28,14 +28,23 @@ class FakeFederation(MockOnedata):
 
       POST   /api/v3/onezone/tokens/examine                           (admin credential)
       POST   /api/v3/onezone/tokens/infer_access_token_scope          (the token in the body)
+      POST   /api/v3/onezone/tokens/verify_access_token               (the token in the body)
       POST   /api/v3/onezone/user/tokens/temporary                    (HTTP Basic of the user itself)
+      GET    /api/v3/onezone/user/tokens/temporary                    (HTTP Basic: its generation of temporary tokens)
+      DELETE /api/v3/onezone/user/tokens/temporary                    (HTTP Basic: revokes all of its temporary tokens)
       GET    /api/v3/onezone/spaces/{space}                           (admin credential; the study space and more)
       GET    /api/v3/onezone/spaces/{space}/users/{user}/privileges            (direct)
       GET    /api/v3/onezone/spaces/{space}/effective_users/{user}/privileges  (effective)
       GET    /api/v3/onezone/users/{user}/effective_privileges                 (the user's Onezone admin privileges)
       GET    /api/v3/onezone/user/effective_clusters                           (as a token: its user's clusters)
 
-    A temporary token needs a time caveat, as the real one does, and is stored with the caveats the server keeps. A
+    A temporary token needs a time caveat, as the real one does, and is stored with the caveats the server keeps and
+    the generation of its user's temporary tokens when it was minted (`generations[user id]`, 1 until a revocation).
+    The user's own DELETE raises that generation by one and answers 204, with no privilege, which revokes every
+    temporary token of that user and of no other: `verify_access_token` and `infer_access_token_scope` then answer a
+    token of an older generation 400 `tokenRevoked`, before any caveat is looked at, as Onezone compares generations
+    first. `verify_access_token` refuses a token with a data-access caveat 400 `tokenCaveatUnverified`, as Onezone does
+    unless it is asked to allow them, and answers any other token 200 with its subject. A
     space besides the study space is added with `add_space(id, name, provider_ids)`: Onezone knows its name and a
     token's scope shows it supported by those providers; `grant(user, privileges, space=id)` sets a user's privileges
     in it. A user's Onezone admin privileges are `admin_privileges[user id]`, none unless a test sets them, and the
@@ -43,7 +52,9 @@ class FakeFederation(MockOnedata):
     to a token the fake issued, for that token's subject, as the real call answers the user it is sent as.
 
     Does not model: any other Onezone call (users, groups, spaces made or changed, provider registration); the expiry
-    of a token (its time caveat is stored, never enforced); the revocation of a token; how a token's other caveats
+    of a token (its time caveat is stored, never enforced); the revocation of a named token, or by an admin; the
+    propagation of a revocation to the providers (the fake's data API never checks a generation); how a token's other
+    caveats
     limit what it may read (the data API is `FakeData`'s, which enforces only the read-only caveat); which spaces a
     token's scope shows (every token's scope shows the study space and every added space, whoever its subject is and
     whatever its caveats, so a test adds a space to make a user a member of one more); the effective privileges a space
@@ -53,7 +64,9 @@ class FakeFederation(MockOnedata):
     A test bends it through plain attributes: `mint_hook` changes the caveats the fake stores for a token (what a
     server that dropped or added one would do), `examine_hook` replaces an examination's answer, `scope_hook` replaces
     a scope answer and `scope_status` makes the scope call alone fail with that status, `clusters_hook` and
-    `clusters_status` do the same for the clusters call, `status_override` makes every
+    `clusters_status` do the same for the clusters call, `revoke_status` makes a revocation fail with that status,
+    `revoke_bumps = False` makes it answer 204 and leave the generation as it was, `verify_override` (a status and an
+    error id, or None for a 200) replaces every answer of `verify_access_token`, `status_override` makes every
     call fail with that status, and `providers`/`supports` (from MockOnedata) change the federation's view of the
     space. Every request is recorded in `.requests`, so a test can assert that a refused mutation sent nothing.
     """
@@ -78,6 +91,10 @@ class FakeFederation(MockOnedata):
         self.other_spaces: dict[str, str] = {}  # id -> name of the spaces besides the study space that Onezone knows
         self.space_supports: dict[str, dict] = {}  # id -> supports of an added space, as the scope answer shows it
         self.users: dict[str, tuple[str, str]] = {}  # login name -> (password, user id)
+        self.generations: dict[str, int] = {}  # user id -> the generation of its temporary tokens (1 when absent)
+        self.revoke_status: int | None = None
+        self.revoke_bumps = True
+        self.verify_override: tuple[int, str | None] | None = None
         self._sequence = itertools.count(1)
 
     # -- setup helpers ----------------------------------------------------------
@@ -152,9 +169,15 @@ class FakeFederation(MockOnedata):
                 return self._error(self.scope_status, "internalServerError")
             if not self._accepts(sent.get("token")):
                 return self._error(401, "unauthorized")
+            if self._stale(sent.get("token")):
+                return self._error(400, "tokenRevoked")
             return httpx.Response(200, json=self.scope_hook(self._scope()) if self.scope_hook else self._scope())
+        if request.method == "POST" and route == "/tokens/verify_access_token":
+            return self._verify(sent.get("token"))
         if request.method == "POST" and route == "/user/tokens/temporary":
             return self._mint(request.headers.get("Authorization"), sent)
+        if request.method in ("GET", "DELETE") and route == "/user/tokens/temporary":
+            return self._temporary(request.method, request.headers.get("Authorization"))
         if request.method == "GET" and route == "/user/effective_clusters":
             return self._user_clusters(request.headers.get("X-Auth-Token"))
         if request.headers.get("X-Auth-Token") != self.admin_token:
@@ -219,10 +242,45 @@ class FakeFederation(MockOnedata):
             "id": f"tid-{secrets.token_hex(6)}",
             "subject": {"type": "user", "id": user},
             "caveats": stored,
+            "generation": self.generations.get(user, 1),
         }
         if self.blank_mint_answer:
             return httpx.Response(201, json={})
         return httpx.Response(200, json={"token": value})
+
+    def _stale(self, value: Any) -> bool:
+        """Whether an issued token is of an older generation than its user's: revoked."""
+        record = self.issued.get(value) if isinstance(value, str) else None
+        if record is None or "generation" not in record:
+            return False
+        return bool(record["generation"] < self.generations.get(record["subject"]["id"], 1))
+
+    def _temporary(self, method: str, authorization: str | None) -> httpx.Response:
+        """Read (GET) or raise (DELETE) the generation of the logged-in user's temporary tokens, with no privilege."""
+        user = self._login(authorization)
+        if user is None:
+            return self._error(401, "unauthorized")
+        if method == "GET":
+            return httpx.Response(200, json={"generation": self.generations.get(user, 1)})
+        if self.revoke_status is not None:
+            return self._error(self.revoke_status, "internalServerError")
+        if self.revoke_bumps:
+            self.generations[user] = self.generations.get(user, 1) + 1
+        return httpx.Response(204)
+
+    def _verify(self, value: Any) -> httpx.Response:
+        """Verify an access token: the generation first, then the data-access caveats, as Onezone does."""
+        if self.verify_override is not None:
+            status, error_id = self.verify_override
+            return httpx.Response(200, json={"subject": {}}) if error_id is None else self._error(status, error_id)
+        record = self.issued.get(value) if isinstance(value, str) else None
+        if record is None:
+            return self._error(400, "badValueToken")
+        if self._stale(value):
+            return self._error(400, "tokenRevoked")
+        if any(str(c.get("type", "")).startswith("data.") for c in record["caveats"]):
+            return self._error(400, "tokenCaveatUnverified")
+        return httpx.Response(200, json={"subject": record["subject"], "ttl": 3600})
 
     def _examine(self, value: Any) -> httpx.Response:
         """Describe an issued token, or fail the way an unknown one does."""

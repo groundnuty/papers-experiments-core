@@ -135,6 +135,12 @@ class ToolProvider(Protocol):
     this way may offer `abandoned_threads() -> int`; the loop result records the count.
 
     Every wait on infrastructure is wrapped in `ctx.infrastructure_wait(kind)` (see `CallContext`).
+
+    A provider whose tools are a tool server's (an MCP server) sets a true `tool_server` attribute, which is optional
+    and not part of the protocol, so a test double need not have it. It is how the loop knows which calls the study's
+    declared per-call bound is for (`[agent] tool_server_call_bound_s`, L17): a hang of a tool server is not the
+    agent's time. A provider without it (a code tool, a function provider) serves in-process tools, which are never
+    handed the bound and never judged by it.
     """
 
     def tools(self) -> Sequence[ToolSpec]:
@@ -142,7 +148,9 @@ class ToolProvider(Protocol):
         ...
 
     async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
-        """Run one call. `timeout_s` is the agent's time left: the call has no other limit (L05). `ctx` marks waits."""
+        """Run one call. `timeout_s` is the agent's time left (L05), or, for a provider that is a tool server and a
+        study that declares a per-call bound, that bound when it is shorter (L17): the call has no other limit. `ctx`
+        marks waits."""
         ...
 
 
@@ -165,6 +173,10 @@ class Instrument(Protocol):
     reading fails records the failure (`"ok": False`) and never a guessed value (O08). It runs outside the agent's
     time, before the loop starts and after it ends, so none of its waits is a wait kind.
 
+    Instruments nest. `start_instruments` starts them in list order and `finish_instruments` finishes them in the
+    reverse of it, so an instrument listed earlier finishes later: list an instrument whose `finish` undoes something
+    (a fault injector's restore, a progressive ingest's) before the probes that must read the state before the undo.
+
     Two more methods are optional, and an instrument that has neither is called as it always was (C31):
 
     - `at_first_turn(moment: Mapping[str, Any]) -> None`, called once by the executor after its last step of its own
@@ -177,6 +189,12 @@ class Instrument(Protocol):
       attempt is then set aside and run again like any other infrastructure failure. The same holds for
       `at_first_turn`. Any other exception, and an `InfraError` of a kind a condition may declare, is a defect of the
       instrument.
+
+    Neither method is part of the nest: the hook is one moment and the checks are a verdict taken once every snapshot
+    is in, so both run in list order, and the first listed instrument that refuses is the refusal the record keeps.
+
+    The core finds the two by name (`expcore.records.instruments.OPTIONAL_HOOKS`), so a class that wraps an instrument
+    must pass each on, or it drops it silently; `missing_hooks(wrapper, wrapped)` names what a wrapper lacks.
     """
 
     namespace: str

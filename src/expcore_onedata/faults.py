@@ -49,6 +49,15 @@ verified identity change to the first reading that showed it serving (0 for a pr
 the stop never took down is not waited for. The recovery of a crashed run's injection, by `start`, `recover` or the
 fault gate, waits the same way, and its `recovered` reading carries `ready_after_s` too.
 
+**The links after a restore (O35).** A provider that serves is not yet a federation whose links transfer: an outage
+can leave a pair between two other providers stuck. Before it stops anything, `start` makes the session gate's probe
+file and journals it with the injection (`fault_sessions`); the restore then passes the session gate (`gate_timeout_s`,
+else `sessions_not_ready`) and checks every ordered pair (`links_stuck`), and with `[faults] heal` declared heals a stuck
+link, bounded and failing closed (`fault_heal`: `all_links` restarts every provider's link at once, then a stuck
+reader's container). Only the injector's own clear and start heal, while an exclusive admission is held; the snapshot
+gains the `gate` and `heal` steps. Stuck pairs no restore heals are healed by the fault gate's health check, under an
+exclusive admission of its own, before any run's tokens exist (`fault_gate_heal`).
+
 **A stop of unknown outcome (O11).** When the stop command raises, typically at its timeout (`command_timeout_s`), the
 CLI is killed but the Docker daemon goes on stopping the container for up to the provider's `stop_grace_period`; the
 federation's is 120 s, the default command timeout. The injection is then journalled `stop_unknown`, and the clear
@@ -67,10 +76,38 @@ restores it and requires it to serve, as for any restore. Only a service that ev
 running with the identity it had, after a journal that never says the stop was asked for, is `never_down`; after a
 `stopping` line it is `stop_unsettled` instead. `settle_timeout_s` must therefore exceed the providers' `stop_grace_period` with a
 margin; its default, 180 s, does for the federation's 120 s, and platform.toml does not know the grace, so a federation
-that raises it raises this too (`expcore_onedata.fault_settings`). `clear`
-never raises: a failed restore is in the snapshot (`verified: false`), stays open in the journal and stays pending,
-with the target's lock held, so a later `clear`, `finish` or `start` tries again. `finish` calls it, `session` calls it
-in a `finally` around both `start` and the agent's run, and `start` calls it before failing.
+that raises it raises this too (`expcore_onedata.fault_settings`). `clear` never raises: a failed restore is in the
+snapshot (`verified: false`), stays open in the journal, journalled `clear_failed`, and stays pending, with the target's
+lock held, so a later `clear`, `finish` or `start` tries again, and the health gate and every other injector's start
+refuse the provider until then. A later try runs only while no step of the run that uses its tokens runs; while one
+does, the injection is handed to recovery instead, open (see "The token's window").
+
+**A restore that is not verified is never passed silently (O11).** `clear` and `finish` answer it as data (`False`, the
+snapshot's `ok` false), which a caller that handles only a raising exit never reads, so every other way out either
+raises or leaves the failure in the record, which the campaign refuses to score:
+
+- `session` clears however the start and the body end, and raises `RestoreNotVerified` at its exit when the restore is
+  not verified. It is an `InfraError` of kind `injector_failure`, so a caller keyed on that kind sees what it saw for a
+  failed start, and it names the provider by its label, how the restore ended (`how`, a word such as `not_serving`), and
+  what was checked (whether the identity changed to a running one, and whether the provider then served), never a
+  service, a path or a token. When the start or the body raised too, it is raised from that exception (`__cause__`), so
+  neither is lost; an interrupt, an exit or a cancellation (anything but an `Exception`) is raised as it was, with the
+  restore failure in its notes.
+- `running` clears the same way and **returns** when its body returned, so the executor that runs the agent inside it
+  (`record = await record_run(...)`) keeps its record. The record carries the failure itself: the snapshot, which is
+  the record's instrument reading, holds `restore_verified` (`true` once a restore of a target this injector took down
+  is verified, `false` with `how`, `identity_changed` and `serving` when it is not, absent when nothing was taken down).
+  The core never scores a record that carries it as anything but `true` (`expcore.records.injections.restore_refusal`):
+  the record is set aside, and the scheduler sets its attempt aside as `injector_failure` whatever the post-run health
+  check decides. When the body raised, no record exists to carry it, and `running` raises as `session` does.
+- `check`, the instrument's post-run check, raises the same failure, so an executor that starts the injector with
+  `start_instruments` and clears it itself gets the refusal from `finish_instruments`: the record keeps its snapshot
+  and holds the refusal (`instrument_refusal`), and the attempt is set aside as infrastructure and run again.
+- `start` already raises `injector_failure` whenever the clear it makes before or after a failure does not verify.
+
+`finish` returns the snapshot and never raises for it, as `finish_instruments` would replace a raised snapshot with a
+bare failure that loses the injections; its `check` refuses. `finish` calls `clear`, `session` and `running` call it
+around both `start` and the agent's run, and `start` calls it before failing.
 
 **Recovery (O11).** Before it injects, `start` (like `recover`) clears and verifies every injection the journal holds
 open whose target no live injector holds: each injector holds an exclusive lock on its target's lock file for as long
@@ -83,12 +120,23 @@ stuck, and fails the start the same way instead of being skipped as a live run's
 **Baseline (O11).** While an injection proceeds or is unsettled the federation is not in its baseline state, so no
 other run may be on it. An outage run holds the federation's lock exclusively for its whole run, inject and clear
 included (`expcore_onedata.admission`): the injector uses its run's exclusive admission, takes one itself when the run
-holds none, refuses a shared one, and keeps it until the restore is verified. Every other run holds it shared, so the
+holds none, refuses a shared one, and keeps it until the restore is verified. Its own wait that runs out while another
+run holds the federation, or while it stays closed for an outage run's session drain, is `federation_busy`, a hold that
+costs the run no attempt, never `injector_failure`. Every other run holds it shared, so the
 two never overlap; a turnstile in front of the lock keeps a stream of shared holders from starving an outage run. An
 injector also refuses to start, as `injector_failure`, while the journal holds an injection recovery could not
 settle, and the platform's standard health check (`PlatformHealth`), whenever platform.toml has a `[faults]` table,
 recovers what a crashed run left, holds the federation shared for the whole check, is deferred (charging no run)
 while an outage run holds it, and fails only for an injection that stays open.
+
+**The session drain (O11).** A restored federation is not yet one the next run can read from: an agent's reads of a file
+only the stopped provider holds, during the outage, leave on-demand sync jobs on the local provider that a later read of
+the same file and range would join and hang on, until the run's callers end (`expcore_onedata.fault_drain`). So once a
+restore of a provider that went down is verified, the federation admits no run for `[faults] session_drain_s` (320 s)
+after the later of the run's mount disconnecting and its REST gate stopping, and a recovery of a crashed run's injection
+owes the full drain from its own start. An injector that holds the federation by an admission of its own waits it out in
+`clear` and records a `drain` step (the times used, the wait, why); with a run's admission, whose sandbox is still up at
+the restore, the step is `deferred` and the admission closes the federation for what is left when it ends.
 
 **Readings.** Every step (`sanctioned`, `recovered`, `injected`, `cleared`, `verified`) is a reading in the snapshot,
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
@@ -98,7 +146,8 @@ The injection's own entry holds `target`, `injected`, `cleared`, `verified` and,
 schema)`, with the study's factor schema), which admits each run to the federation before anything starts (exclusive
 when its condition declares `provider_outage` or `exclusive = true`) and keeps it until after the post-run check, and
 the platform's half of the fingerprint (`platform=config.fingerprint()`), which holds the injector's sanction and
-targets. The executor, already admitted, starts the sandbox and
+targets. It passes the platform's health check too (`health=PlatformHealth(...)`): the admission declares that it needs
+one, and a campaign without one is refused when it is built. The executor, already admitted, starts the sandbox and
 the tool server, builds the injector for the target its condition declares and runs the agent inside `running`:
 
     injector = FaultInjector(config, settings, request.treatment_targets[PROVIDER_OUTAGE], sanctioned=True,
@@ -107,11 +156,61 @@ the tool server, builds the injector for the target its condition declares and r
         record = await record_run(request, ...)
     record = await asyncio.to_thread(finish_instruments, record, [injector])
 
+**The token's window (O35, O06).** In that order the restore runs at `running`'s exit, while the run's sandbox and tool
+server still run, and the tool server's stop after it re-verifies the tool plane and examines the run's token, failing
+the run as `tool_plane_integrity` once it has expired (`toolserver._recheck`). The token outlives the run's ceiling by
+`[tokens] margin_s` only. The restore always runs, the provider brought back and its session gate passed, since none
+of it uses a run token, and `load_faults` refuses a margin it could outlast, with the session drain a clear that takes
+the federation itself may wait (`fault_settings.restore_token_margin_s`, `restore_drain_s`). A
+heal may take `heal_timeout_s` more, so at a heal's start, the restore's and the start's recovery's alike, the
+injector reads the steps of the run that use its tokens: the tool server's launch (to the end of that
+re-verification) and the sandbox's (from its mint to the end of its stop), which each launch counts on the run's
+admission while it runs (`admission.token_step`), its worker threads included. With a heal declared, the federation
+held exclusively, a step still running and no long margin declared, the heal is skipped: the reading records it (the
+`heal_skipped` step, or `heal_skipped` in the start's `recovered` step: the steps that ran, `margin_s` and
+`long_margin_s`), and a pair that stays stuck leaves the restore unverified (`links_stuck`, the record kept and never
+scored) or fails the start closed, the provider up and its injection open. A later start with no step of its run
+running heals it, under its own exclusive admission. **In this order that is no outage run's start**, whose launches
+run before it too, and the health gate, whose recovery never heals, holds the campaign meanwhile: a stuck pair is healed
+only by a start with no step running (an executor that starts the injector before its launches, or a bare injector
+start), by the long margin, or by hand. The long margin, `[tokens] margin_s` of at least
+`fault_settings.heal_token_margin_s` (10,854 s with the defaults), heals as before whatever still runs. An executor
+that stops its sandbox and tool server before `running`'s exit heals with the default margin. A tool server or sandbox
+the study starts itself, which no launch counts, is not seen.
+
+**One restore inside the window, and every token step under the run's admission.** The least margin counts one restore,
+so a restore that failed is tried again (by `finish`, a later `clear`, or a reused injector's next `start`) only when no
+step of the run that uses its tokens still runs, decided at once and never waited for (`_retry_now`): in an executor
+that stops its sandbox and tool server before `running`'s exit, `finish` retries at once, the window closed. While one
+runs, as at `finish` in the order above, the injection is handed to recovery (`_hand_over`): it stays open in the
+journal, the record keeps `restore_verified` false with the injection open and is never scored, a later `clear`
+reports it still down, and its target's lock goes with the run's admission, so nothing of the run restores it inside
+the window (a recovery finds it held, and a second start fails closed); once the run's admission has ended, the next
+start's recovery, or the health gate's, restores it. A
+`restore_retry` step records the path (`after_steps` or `left_open`), why, and the steps that ran. The steps are
+counted where the injector reads them because, on a platform with `[faults]`, each worker that uses a token (the tool
+server's two checks, the sandbox's mint and start) starts only under the run's admission held then, and is refused
+before it starts otherwise (`admission.begin_token_step`, `TokenStepRefused`, naming it). So a token is minted only
+once the run's admission and its waits are behind it, and an injector that takes an admission of its own, and waits
+for the lock, does so while no run's admission is held, which no token step can run without.
+
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
-so on cancellation it waits for it (shielded, bounded), clears in `finally` and raises the cancellation again. Never
+so on cancellation it waits for it (shielded, bounded), clears however the block ends and raises the cancellation again.
+A restore that is not verified does not raise at the block's exit: the record, built inside the block, is kept, and
+`finish_instruments` puts the injector's reading into it, with `restore_verified` false, which the campaign refuses to
+score (it sets the attempt aside as `injector_failure` to run again), and `check` refuses it as well. The journal keeps
+the provider unhealthy for the gate. An executor that drives the injector through `start_instruments` and clears it
+itself gets the same from `finish_instruments`, with its record kept. Never
 await `asyncio.to_thread(injector.start, ...)` bare: cancelled, it leaves the thread stopping the provider while the
 code meant to clear it never runs. `start` and `clear` hold the injector's own lock, so a clear waits for a start still
 running in its thread. `finish_instruments` puts the snapshot into the record and derives its treatment flag again from it.
+
+**Order (C31).** `finish` is the restore, and `finish_instruments` finishes the instruments in the reverse of their
+list. Probes listed after the injector therefore finish before the restore and read the state the outage left; probes
+listed before it finish after the restore. `running` clears when its block exits, so a `finish_instruments` called
+after the block runs after the restore the block's exit made, whatever the order (a restore that was not verified is
+tried again by `finish` once no step of the run that uses its tokens runs, and then the order decides again; while one
+runs it is handed to recovery, see "The token's window"): call it inside the block for the probes to read first.
 
 **Names (O12).** Outside the driver and the journal the provider is known only by its label: in the snapshot, in every
 message and in every failure. Identities are recorded as SHA-256 digests. The settings are `[faults]` of
@@ -127,22 +226,25 @@ from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any
 
 from expcore.config.loading import ConfigError
-from expcore.errors import InfraError
+from expcore.errors import InfraError, uncharged_kinds
 from expcore.records.injections import FAULT_NAMESPACE
 from expcore_onedata.admission import (
     INJECTOR,
     Admission,
     AdmissionRefused,
+    FederationBusy,
     FederationLock,
     current_admission,
     require_same_federation,
+    retain_admission,
 )
 from expcore_onedata.compose import DriverError
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
-from expcore_onedata.fault_recovery import FaultDriver, Recovery, digest
+from expcore_onedata.fault_recovery import RESTORED, FaultDriver, Recovery, RestoreNotVerified, digest
 from expcore_onedata.fault_serves import provider_serves
-from expcore_onedata.fault_settings import FaultSettings, compose_driver, load_faults
+from expcore_onedata.fault_settings import FaultSettings, compose_driver, heal_token_margin_s, load_faults
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 __all__ = [
@@ -152,6 +254,7 @@ __all__ = [
     "FaultInjector",
     "FaultRefused",
     "FaultSettings",
+    "RestoreNotVerified",
     "SettledInjections",
     "Unsanctioned",
     "compose_driver",
@@ -178,6 +281,25 @@ def provider_outage(config: PlatformConfig, name: str, detail: str) -> InfraErro
     return InfraError(PROVIDER_OUTAGE, detail, target=config.provider_label(name))
 
 
+def heal_skipped(margin_s: float, long_margin_s: float) -> Callable[[], dict[str, Any] | None]:
+    """The question a recovery asks at a heal's start, the restore's or the start's recovery's (`LinkSettling`): why
+    the heal is skipped, the steps of the run that use its tokens and still run, with `margin_s` and `long_margin_s`,
+    when the study has not declared the long margin; None when it may run (see "The token's window"). The run's
+    admission counts the steps, and on a platform with `[faults]` none starts without it (`admission.begin_token_step`),
+    so none starts while an injector holds an admission of its own."""
+
+    def skipped() -> dict[str, Any] | None:
+        if margin_s >= long_margin_s:
+            return None
+        held = current_admission()
+        running = held.open_steps() if held is not None else ()
+        if not running:
+            return None
+        return {"steps": list(running), "margin_s": margin_s, "long_margin_s": long_margin_s}
+
+    return skipped
+
+
 class FaultInjector:
     """The instrument that takes one provider down for a run and brings it back (see the module docstring)."""
 
@@ -193,8 +315,10 @@ class FaultInjector:
         driver: FaultDriver,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        wall: Callable[[], float] = time.time,
     ) -> None:
-        """Check the sanction and the target; act on nothing yet. `target` is a provider's label (`providers[1]`)."""
+        """Check the sanction and the target; act on nothing yet. `target` is a provider's label (`providers[1]`);
+        `wall` is the clock the federation's drain record is on (`FederationLock`)."""
         self._settings, self._sanctioned = settings, sanctioned
         self._require_sanction()
         names = {config.provider_label(name): name for name in config.providers}
@@ -205,18 +329,27 @@ class FaultInjector:
             raise FaultRefused(f"{settings.file}: [faults.services]: no service is declared for {target}")
         self.target, self._service, self._driver = target, service, driver
         self._clock, self._sleep = clock, sleep
-        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep)
+        labels = {config.provider_label(name): service for name, service in settings.services.items()}
+        # holds no reference to the injector: a dropped injector's locks go when its last reference does (no cycle)
+        heal_skip = heal_skipped(config.tokens.margin_s, heal_token_margin_s(settings))
+        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep, labels=labels, heal_skip=heal_skip)
         self._journal = self._recovery.journal
+        self._gate_probe: str | None = None  # the open injection's session gate probe file (`fault_sessions`)
         self._lock: HeldLock | None = None
-        self._federation = FederationLock(settings)
+        self._federation = FederationLock(settings, clock=clock, sleep=sleep, wall=wall)
         self._admission: Admission | None = None  # the exclusive admission it took itself, when its run held none
         self._cancel = threading.Event()  # set when `running` is cancelled: an admission still awaited is given up
         self._mutex = threading.RLock()  # a start and a clear never run at once, in whichever threads
         rounds = settings.clear_attempts + 2
-        self.cancel_wait_s = (settings.settle_timeout_s + settings.command_timeout_s) * rounds + (
-            2 * settings.ready_timeout_s  # a start may wait for a recovered provider and for its own clear's
+        heal_s = settings.heal_timeout_s if settings.heal != "off" else 0.0
+        self.cancel_wait_s = (
+            (settings.settle_timeout_s + settings.command_timeout_s) * rounds
+            + 2 * (settings.ready_timeout_s + settings.gate_timeout_s + heal_s)  # a recovered provider's, and its own
+            + settings.session_drain_s  # and the drain a clear waits out before it lets its own admission go
         )  # about a start's longest
         self._pending: tuple[str, str] | None = None  # the open injection's journal id and identity digest
+        self._tried = 0  # restores of the pending injection tried so far: a later one is a retry (`_retry_now`)
+        self._left_open = False  # this run's injection, handed to recovery open (`_hand_over`): never verified here
         self._run: dict[str, Any] | None = None
         self._steps: list[dict[str, Any]] = []
         self._injection: dict[str, Any] | None = None
@@ -253,12 +386,15 @@ class FaultInjector:
         names so the treatment rule counts the injection for this attempt only.
         """
         with self._mutex:
+            give_up = retain_admission()  # the run's admission stays held until this start ends, whatever its task does
             try:
                 self._start(identity)
             except BaseException:
                 if self._pending is None:  # nothing is down: the federation goes back to the other runs
                     self._release_admission()
                 raise
+            finally:
+                give_up()
 
     def _start(self, identity: Mapping[str, Any]) -> None:
         self._require_sanction()
@@ -271,14 +407,17 @@ class FaultInjector:
         self._run = {"run_key": run_key, "attempt": attempt}
         self._admit()
         self._step("sanctioned", True)
-        unsettled = self._recover()
+        unsettled = self._recover(heal=self._holds_exclusive())  # under the exclusive admission just taken
         if unsettled:  # held down by a live injector: the federation is not in its baseline state
             raise self._fail(f"an injection of {', '.join(unsettled)} is unsettled, so no other run may start")
+        self._left_open = False  # one this injector handed to recovery is settled now: the recovery found none open
+        self._wait_owed()  # a recovery's drain is satisfied before this run takes anything down
+        self._await_drain()  # the record is read after the journal was: see `_await_drain`
         self._lock = self._journal.try_lock(self.target)
         if self._lock is None:
             raise self._fail(f"{self.target} is held by another run's fault injector")
         digest, entry = self._journal_injection()
-        self._pending, self._went_down = (entry, digest), False
+        self._pending, self._went_down, self._tried = (entry, digest), False, 0
         self._injection = {"target": self.target, "injected": False, "cleared": False, "verified": False}
         try:
             # durable before the command, so a process killed while it blocks leaves the line (a failing journal stops here)
@@ -302,6 +441,35 @@ class FaultInjector:
         self._injection["injected"] = True
         self._step("injected", True, identity_before_sha256=digest)
 
+    def _wait_owed(self) -> None:
+        """When this start's recovery restored a provider an earlier run left down, wait out the drain it owes before
+        the start goes on: that run's sessions may still hold on-demand jobs on the local provider, and this run's reads
+        must not meet them. Recorded as a `recovery_drain` step. The wait is the admission's own plan (`SessionDrain.wait`),
+        so it counts what the recovery already took."""
+        admission = self._exclusive_admission()
+        drain = None if admission is None else admission.drain
+        if drain is None or not drain.owing:
+            return
+        record = drain.wait()
+        self._step("recovery_drain", True, drain_s=record["drain_s"], waited_s=round(record["waited_s"], 3))
+
+    def _await_drain(self) -> None:
+        """Wait, inside `admission_timeout_s` and until cancelled, for the federation's drain record to pass. It is read
+        after the journal was (`_recover` read it): a restore that cleared an injection without holding this admission
+        (the health gate's recovery of a stuck holder's injection) wrote its record before it cleared, so a start that
+        finds the journal settled finds the record too, whatever it read before. A start that cannot wait it out is the
+        hold `federation_busy` (`FederationBusy`), as a wait for the lock that runs out is, with nothing taken down; a
+        cancelled wait fails as `injector_failure`."""
+        deadline = self._clock() + self._settings.admission_timeout_s
+        while (left := self._federation.drain_left()) > 0:
+            if self._cancel.is_set():
+                raise self._fail("the wait for the federation was cancelled")
+            if self._clock() >= deadline:
+                raise FederationBusy(
+                    "the federation stayed closed past the bound of the wait: an outage run's sessions drain"
+                )
+            self._sleep(min(left, 0.5))
+
     def _journal_stop_unknown(self, entry: str) -> None:
         """Journal that the stop command raised, so that a later process settling the injection waits for the target
         to show down too. The journal may be what failed: the injection stays open all the same, and this injector's
@@ -311,7 +479,10 @@ class FaultInjector:
 
     def _admit(self) -> None:
         """Hold the federation exclusively for the whole injection: the run's own admission, which must then be
-        exclusive, or one taken here and kept until the restore is verified."""
+        exclusive, or one taken here and kept until the restore is verified. The wait for the lock in the second case
+        is in no token's window: on a platform with `[faults]` no step that uses a token runs without the run's
+        admission (`admission.begin_token_step`), so this context has minted none, and no run's step can start while
+        the admission taken here is held (O35)."""
         held = current_admission()
         if held is not None:
             require_same_federation(held, self._federation.federation)  # another federation's admission is none
@@ -326,8 +497,30 @@ class FaultInjector:
                 self._admission = self._federation.acquire(
                     exclusive=True, timeout_s=timeout_s, cancel=cancel, purpose=INJECTOR, target=self.target
                 )
+            except FederationBusy:  # another run holds the federation: a hold that costs no attempt, never a failure
+                raise
             except InfraError as error:
                 raise self._fail(error.detail) from None
+
+    def _holds_exclusive(self) -> bool:
+        """Whether the federation is held exclusively for this injector now: the admission it took itself, or its run's
+        own, still held and for this federation. Only then may a restore heal a link (O35): a run's admission that has
+        ended, or none, heals nothing."""
+        return self._exclusive_admission() is not None
+
+    def _exclusive_admission(self) -> Admission | None:
+        """The exclusive admission that holds the federation for this injector now: the one it took itself, else its
+        run's, still held and for this federation; None when there is none."""
+        if self._admission is not None and self._admission.held and self._admission.exclusive:
+            return self._admission
+        held = current_admission()
+        if held is None or not held.exclusive:
+            return None
+        try:
+            require_same_federation(held, self._federation.federation)
+        except AdmissionRefused:
+            return None
+        return held
 
     def _release_admission(self) -> None:
         if self._admission is not None:
@@ -341,12 +534,14 @@ class FaultInjector:
             before = self._driver.observe(self._service)
             if not before.running or before.identity is None:
                 raise self._fail(f"{self.target} is not running before the injection, so no restore could be confirmed")
+            self._gate_probe = self._arm_gate()
             before_sha256, entry = digest(before.identity), uuid.uuid4().hex
             line = {
                 "target": self.target,
                 "service": self._service,
                 "identity_sha256": before_sha256,
                 "holder": holder(),
+                **({} if self._gate_probe is None else {"gate_probe": self._gate_probe}),
             }
             self._journal.append({"event": "injecting", "id": entry, **line})
         except InfraError:
@@ -360,16 +555,51 @@ class FaultInjector:
             raise self._fail(f"{self.target} could not be read and journalled ({type(error).__name__})") from None
         return before_sha256, entry
 
+    def _arm_gate(self) -> str | None:
+        """The session gate's probe file, made and seen by every provider of the probe space before anything stops
+        (`fault_sessions`), so a restore's gate reads a file its provider knew; None when the driver has no gate. A
+        probe that cannot be made fails the start with nothing stopped (its error's type only, O12)."""
+        arm = getattr(self._driver, "arm_gate", None)
+        if arm is None:
+            return None
+        try:
+            return arm(self._service)
+        except Exception as error:
+            why = type(error).__name__
+            raise self._fail(
+                f"the session gate's probe could not be made before {self.target}'s outage ({why})"
+            ) from None
+
+    def _record_links(self, record: Mapping[str, Any]) -> None:
+        """The session gate's reading and the heal's record of the latest restore, as steps of the snapshot (O35). A
+        driver with no session gate (`how` none) records no gate step, so its readings stay as they were."""
+        gate = record.get("gate")
+        if isinstance(gate, Mapping) and gate.get("how") != "none":
+            self._step("gate", gate.get("ok") is True, **{k: v for k, v in gate.items() if k != "ok"})
+        skipped = record.get("heal_skipped")
+        if isinstance(skipped, Mapping):
+            self._step("heal_skipped", False, **skipped)
+        heal = record.get("heal")
+        if isinstance(heal, Mapping):
+            self._step("heal", heal.get("ok") is True, **{k: v for k, v in heal.items() if k != "ok"})
+
     @contextlib.asynccontextmanager
     async def running(
         self, identity: Mapping[str, Any], *, cancel_wait_s: float | None = None
     ) -> AsyncIterator["FaultInjector"]:
-        """Start in a worker thread for the body of an `async with`, and clear in `finally` (O11).
+        """Start in a worker thread for the body of an `async with`, and clear however it ends (O11).
 
         The start's future is kept: when the body's task is cancelled while the start runs, the thread runs on, so the
         cancellation waits for it, shielded and at most `cancel_wait_s` (by default `cancel_wait_s` of the injector,
         about the longest a start takes), then the clear runs and the cancellation is raised again. The clear, in its
         own thread, waits for a start that is still running, through the injector's lock.
+
+        An exit that follows the body returning returns too, whether or not the restore is verified: the executor that
+        runs the agent inside the block (`record = await record_run(...)`) keeps its record, which carries the failure
+        itself (`snapshot`: `restore_verified` false, with `how`, `identity_changed` and `serving`) for the campaign to
+        refuse to score, and `check` refuses it as well. When the body raised, no record exists to carry it, so the
+        restore failure is raised from the body's exception as `session` does; a cancellation or any other
+        `BaseException` is raised as it was, with the failure in its notes.
         """
         bound = self.cancel_wait_s if cancel_wait_s is None else cancel_wait_s
         self._cancel = threading.Event()
@@ -382,27 +612,105 @@ class FaultInjector:
                 await _outlast(starting, bound)
                 raise
             yield self
-        finally:
-            clearing = asyncio.ensure_future(asyncio.to_thread(self.clear))
-            try:
-                await asyncio.shield(clearing)
-            except asyncio.CancelledError:
-                await _outlast(clearing, bound)
-                raise
+        except BaseException as error:
+            await self._clear_for(bound)
+            self._raise_unrestored(error)
+            raise
+        await self._clear_for(bound)
+
+    async def _clear_for(self, bound: float) -> None:
+        """Clear in a worker thread, shielded: a cancellation waits for it for at most `bound` and is raised again, with
+        in its notes what the clear found (a restore not verified), or that it was still running when the wait ended."""
+        clearing = asyncio.ensure_future(asyncio.to_thread(self.clear))
+        try:
+            await asyncio.shield(clearing)
+        except asyncio.CancelledError as cancelled:
+            await _outlast(clearing, bound)
+            self._note_clear(cancelled, clearing)
+            raise
+
+    def _note_clear(self, error: BaseException, clearing: "asyncio.Future[Any]") -> None:
+        """Add to `error`, a cancellation that interrupted the clear's wait, the restore failure the clear left, or that
+        the clear had not finished. The injector's lock is taken only for a clear that did: a cancelled task (the event
+        loop's shutdown cancels every one) says nothing of its worker thread, which may still hold the lock, and waiting
+        for it would block the loop and defeat the bound."""
+        if not clearing.done() or clearing.cancelled():
+            error.add_note(f"the clear of {self.target} had not finished when the wait for it ended: not verified")
+            return
+        with self._mutex:
+            failure = self._unrestored()
+        if failure is not None:
+            error.add_note(str(failure))
 
     def finish(self) -> dict[str, Any]:
-        """Bring the target back and verify it (`clear`), then return the snapshot of every step."""
+        """Bring the target back and verify it (`clear`), then return the snapshot of every step. It never raises for
+        a restore that is not verified, so the snapshot reaches the record whole: the instrument's `check` refuses it."""
         self.clear()
         return self.snapshot()
 
     @contextlib.contextmanager
     def session(self, identity: Mapping[str, Any]) -> Iterator["FaultInjector"]:
-        """Inject for the body of a `with` and clear in `finally`, whatever the start or the body raises (O11)."""
+        """Inject for the body of a `with`, and clear however it ends, whatever the start or the body raises (O11).
+
+        The exit raises `RestoreNotVerified` when the restore is not verified: the exit that returns normally is a
+        verified restore. When the start or the body raised too, the restore failure is raised from that exception
+        (`__cause__`) so neither is lost; an interrupt or an exit (anything but an `Exception`) is raised as it was,
+        with the restore failure in its notes. The injection stays open in the journal, so the health gate and the
+        next start refuse the provider, until a later `clear`, `finish` or `start` verifies the restore.
+        """
         try:
             self.start(identity)
             yield self
-        finally:
+        except BaseException as error:
             self.clear()
+            self._raise_unrestored(error)
+            raise
+        self.clear()
+        self.check()
+
+    def check(self) -> None:
+        """The post-run check (`finish_instruments` calls it once the snapshot is in): return when nothing this
+        injector took down is left unrestored; raise `RestoreNotVerified`, an `InfraError` of kind `injector_failure`,
+        when an injection it made is not verified restored or is still open. A start that took nothing down is not one.
+        It does not clear: `finish` or `clear` did, and a record whose restore failed keeps its snapshot and holds this
+        refusal (`instrument_refusal`), so the attempt is set aside and run again with its usage known."""
+        with self._mutex:
+            failure = self._unrestored()
+        if failure is not None:
+            raise failure
+
+    def _unrestored(self) -> RestoreNotVerified | None:
+        """The failure of a restore that is not verified, read from the injector's own steps; None when there is none."""
+        injection = self._injection
+        open_ = self._pending is not None or self._left_open  # handed to recovery, it is still open in the journal
+        if not open_ and not (injection is not None and injection["injected"] and not injection["verified"]):
+            return None
+        cleared = [step for step in self._steps if step["step"] == "cleared"]
+        verified = [step for step in self._steps if step["step"] == "verified"]
+        healed = [step for step in self._steps if step["step"] == "heal"]
+        return RestoreNotVerified(
+            self.target,
+            str(cleared[-1]["how"]) if cleared else "not_cleared",
+            identity_changed=bool(verified and verified[-1]["identity_changed"]),
+            serving=bool(verified and verified[-1]["ready_after_s"] is not None),
+            still_open=open_,
+            tried=str(healed[-1]["tried"]) if healed else None,
+        )
+
+    def _raise_unrestored(self, error: BaseException) -> None:
+        """Called after a clear, while `error` is being raised: raise the failure of a restore not verified from
+        `error`, or, when `error` is no `Exception` or is a platform's hold (an `InfraError` of a kind that costs no
+        attempt, C33: an ingest's start its baseline's mark held back), attach it as a note and return so that `error`
+        is raised as it was. A held start costs its run no attempt whatever failed after it; the restore's failure is
+        still in the journal (`clear_failed`), so the health gate fails for it and no run starts on it."""
+        with self._mutex:
+            failure = self._unrestored()
+        if failure is None:
+            return
+        held = isinstance(error, InfraError) and error.kind in uncharged_kinds()
+        if isinstance(error, Exception) and not held:
+            raise failure from error
+        error.add_note(str(failure))
 
     def snapshot(self) -> dict[str, Any]:
         """The reading the record keeps: the run, the target, the injection and every step; `ok` only when the target
@@ -415,7 +723,24 @@ class FaultInjector:
             "target": self.target,
             "injections": [] if injection is None else [injection],
             "steps": [dict(step) for step in self._steps],
+            **self._restore_reading(injection),
         }
+
+    def _restore_reading(self, injection: Mapping[str, Any] | None) -> dict[str, Any]:
+        """What the snapshot says of the restore, so that the record carries a failure itself (O11): `restore_verified`
+        true once a target this injector took down is verified restored; false, with `how` the restore ended, whether the
+        provider's `identity_changed` and whether it was `serving`, when an injection is open or was not verified. The
+        core reads it (`expcore.records.injections.restore_refusal`) and never scores the record. Nothing, when the
+        injector took nothing down and has nothing open: no restore was needed, so none is claimed verified."""
+        failure = self._unrestored()
+        if failure is not None:
+            return {
+                "restore_verified": False,
+                "how": failure.how,
+                "identity_changed": failure.identity_changed,
+                "serving": failure.serving,
+            }
+        return {"restore_verified": True} if injection and injection["injected"] else {}
 
     # --- clearing and recovery --------------------------------------------------------------------------------
 
@@ -423,34 +748,101 @@ class FaultInjector:
         """Bring the target back and verify its identity changed; record the outcome and never raise for it.
 
         Returns True when this injector leaves nothing down. Until a restore is verified the injection stays pending,
-        with the target's lock held, so a later `clear`, `finish` or `start` tries again; a verified one makes calling
-        it again harmless. A target the injection never took down is found running with its old identity, unless the
-        stop's outcome is unknown: then the clear first waits for the target to show not running. An injector discarded
-        with its restore still unverified lets the lock go when it is collected, so recovery can settle it.
+        with the target's lock held, so a later `clear`, `finish` or `start` tries again, but only while no step of the
+        run that uses its tokens runs: with one running, the injection is handed to recovery open, its lock kept until
+        the run's admission ends, and this returns False, now and later (`_retry_now`); a verified one makes calling it
+        again harmless. A target the injection never
+        took down is found running with its old identity, unless the stop's outcome is unknown: then the clear first
+        waits for the target to show not running. An injector discarded with its restore still unverified lets the lock
+        go when it is collected, so recovery can settle it.
         """
         with self._mutex:
-            return self._clear()
+            # a share of the run's admission for the whole clear: a cancelled run whose context lets its admission go
+            # while this worker still restores or heals keeps the federation held until the clear has ended (O35)
+            give_up = retain_admission()
+            try:
+                return self._clear()
+            finally:
+                give_up()
 
     def _clear(self) -> bool:
         if self._pending is None:
+            return not self._left_open  # one handed to recovery is still open, whoever restores it later
+        if self._tried and not self._retry_now():  # a retry inside the token's window: handed to recovery instead
+            return False
+        self._tried += 1
+        with self._restoring() as (admission, own, refused):
+            if refused is not None:
+                # the federation could not be taken for the restore, so nothing was restored and nothing is journalled
+                # (settle never ran): the injection stays open and pending, which fails closed
+                self._step("cleared", False, how="federation_unavailable")
+                return False
+            return self._settle_pending(admission, own)
+
+    def _retry_now(self) -> bool:
+        """Before the pending injection's restore is tried again: whether it may be now, decided at once, never waited
+        for (O35, O11). It may when no step of the run that uses its tokens still runs (the run's admission counts
+        them, `admission.token_step`): the token's window has then closed, as in an executor that stops its sandbox and
+        tool server before `running`'s exit. While one runs, a second restore inside the window would outlast the
+        least margin, which counts one: the injection is handed to recovery instead (`_hand_over`). Either way a
+        `restore_retry` step records the path taken, why, and the steps that ran."""
+        held = current_admission()
+        running = list(held.open_steps()) if held is not None else []
+        if held is None or not running:  # a step that uses a token runs only under the run's admission
+            why = "no step of the run that uses its tokens still runs, so the restore is tried again outside its window"
+            self._step("restore_retry", True, path="after_steps", why=why, steps=running)
             return True
+        why = (
+            "a step of the run that uses its tokens still runs, so a second restore would fall inside the token's "
+            "window: the injection is left open, the run set aside, and the next start's recovery restores it"
+        )
+        self._step("restore_retry", False, path="left_open", why=why, steps=running)
+        self._hand_over(held)
+        return False
+
+    def _hand_over(self, admission: Admission) -> None:
+        """Leave the pending injection open in the journal (`clear_failed` already says how), for the recovery of the
+        next start or of the health gate, and touch the target no more. Its lock goes with the run's admission, one of
+        the admission's `endings`, so nothing restores it inside the run's token window: until then a recovery, this
+        injector's own included, finds it held by a live injector and leaves it (a start fails closed), and once the
+        admission's last share is let go, after the run's post-run check, recovery may take it. The closure holds the
+        lock alone, never the injector. The snapshot keeps the restore unverified and the injection open
+        (`_unrestored`), so the record is never scored (#245), and a later `clear` reports it still down."""
+        lock, self._lock = self._lock, None
+        self._pending, self._stop_unknown, self._left_open = None, False, True
+        if lock is not None:
+            admission.endings.append(lock.close)
+
+    def _settle_pending(self, admission: Admission | None, own: bool) -> bool:
+        """Settle the pending injection under `admission`, which the restore keeps held: the drain is armed before the
+        provider is brought back, and an injector that holds the federation by an admission of its own waits it out
+        before it lets go (`_drain`)."""
+        assert self._pending is not None
         entry, digest = self._pending
         injection = self._injection if self._injection is not None else {"target": self.target, "injected": False}
+        began = self._clock()  # the restore's start, from which an unknown end of the run's sessions is drained in full
+        drain, fresh = self._arm(admission, began)  # before the provider is brought back
         try:
             done, how, after, ready_after_s = self._recovery.settle(
                 {
                     "id": entry,
+                    "target": self.target,
                     "service": self._service,
                     "identity_sha256": digest,
                     "injected": self._went_down,
                     "stop_unknown": self._stop_unknown,
-                }
+                    "gate_probe": self._gate_probe,
+                },
+                heal=self._holds_exclusive(),  # a heal only under an exclusive admission held now, between runs
             )
         except Exception as error:  # never lose the reading: a clear that failed stays pending and open
             done, how, after, ready_after_s = False, type(error).__name__, None, None
+        if drain is not None and fresh and done and how == "never_down":
+            drain.disarm()  # the provider never went down: nothing was left to drain
         verified = done and how in ("restored", "found_restored")
         timed = {} if ready_after_s is None else {"ready_after_s": ready_after_s}
         self._injection = {**injection, "cleared": done, "verified": verified, **timed}
+        self._record_links(self._recovery.restore_record)
         self._step("cleared", done, how=how)
         self._step(
             "verified",
@@ -460,6 +852,7 @@ class FaultInjector:
             ready_after_s=ready_after_s,
         )
         if done:
+            self._drain(admission, own, how, began)  # before the federation goes back to the other runs
             self._pending, self._stop_unknown = None, False
             self._unlock()
             self._release_admission()
@@ -472,9 +865,113 @@ class FaultInjector:
         with self._mutex:
             return self._recover()
 
-    def _recover(self) -> list[str]:
+    def _recover(self, *, heal: bool = False) -> list[str]:
+        """Recovery, healing a stuck link only when `heal`: the caller holds the federation exclusively (`_start`). A
+        provider it restored went down in a run this injector knows nothing of, so its sessions are unknown whatever the
+        current run's sandbox says: the exclusive admission it restores under owes the full drain from the start of the
+        recovery (`SessionDrain.owe`), decided against the injections the recovery has just read and before it settles
+        one (`fault_drain`), including one a live injector holds, which makes the drain longer than needed and no worse."""
         self._require_sanction()
-        return self._recovery.recover(self._step)
+        with self._restoring() as (admission, _, refused):
+            if refused is not None:
+                raise refused
+            drain = None if admission is None else admission.drain
+            owe = (lambda entries: drain.owe(self._clock(), clock=self._clock, sleep=self._sleep)) if drain else None
+            return self._recovery.recover(self._step, heal=heal, before=owe)
+
+    @contextlib.contextmanager
+    def _restoring(self) -> Iterator[tuple[Admission | None, bool, InfraError | None]]:
+        """The exclusive admission a restore runs under, for the restore's whole duration, so that nothing is admitted
+        while it restores and the drain it arms is published when it ends (`fault_drain`). Yield `(admission, own,
+        refused)`:
+
+        - the exclusive admission already held, a share of it kept for the restore (`Admission.try_retain`: a cancelled
+          owner cannot let the lock go under it; one whose last share is already given up is not held for this purpose);
+        - else an exclusive admission this injector takes for the restore and gives up when it ends (`own` true: no
+          sandbox of the run is under it), which waits for the federation inside `[faults] admission_timeout_s`; one it
+          cannot get is `refused`, and nothing is restored: the hold `federation_busy` (`FederationBusy`) when the wait
+          ran out, else an InfraError of kind `injector_failure`;
+        - with `session_drain_s` 0, nothing: there is no drain to keep.
+
+        Declared limits. A restore that holds no admission waits for the federation (and for a drain still standing)
+        inside `admission_timeout_s`, which `cancel_wait_s` does not count: inside `running` the run's or the injector's
+        own admission is always held, so only a later retry of `clear` or `finish` takes that branch. The least token
+        margin counts the drain record that branch waits out before it restores, and the drain `_drain` waits after it
+        (`fault_settings.restore_drain_s`); the wait for the lock itself it does not, since no exclusive admission is
+        then held for this context and no step that uses a token runs without the run's (`admission.begin_token_step`;
+        a retry while one runs is handed to recovery first, `_retry_now`). The holder record of an admission
+        taken for a restore names this injector's own target, not the one recovered.
+        """
+        if self._settings.session_drain_s <= 0:
+            yield None, False, None
+            return
+        held = self._exclusive_admission()
+        give_up = held.try_retain() if held is not None else None
+        if held is not None and give_up is not None:
+            try:
+                yield held, held is self._admission, None
+            finally:
+                give_up()
+            return
+        try:
+            taken = self._federation.acquire(
+                exclusive=True,
+                timeout_s=self._settings.admission_timeout_s,
+                cancel=self._cancel,
+                purpose=INJECTOR,
+                target=self.target,
+            )
+        except FederationBusy as busy:  # another run holds the federation, or it drains: a hold, never a failure (O11)
+            yield None, False, busy
+            return
+        except InfraError as error:
+            yield None, False, self._fail(error.detail)
+            return
+        try:
+            yield taken, True, None
+        finally:
+            taken.close()
+
+    def _arm(self, admission: Admission | None, began: float) -> tuple[SessionDrain | None, bool]:
+        """Before a restore of a provider that may have gone down: arm the drain of the admission it runs under. Return
+        the drain, and whether this call armed it (for a restore that finds nothing to restore, `SessionDrain.disarm`)."""
+        if admission is None or admission.drain is None:
+            return None, False
+        drain = admission.drain
+        fresh = not drain.armed
+        drain.arm(began, clock=self._clock, sleep=self._sleep)
+        return drain, fresh
+
+    def _drain(self, admission: Admission | None, own: bool, how: str, began: float) -> None:
+        """After a verified restore of a provider that went down, record a `drain` step. An injector that holds the
+        federation by an admission of its own (`own`) waits the drain out here, before it lets go: it has no sandbox of
+        its own run. A run's admission is waited out when the run ends, with the sandbox's mount and gate ends known; the
+        restore comes before them, so the step records the plan as it stands (`deferred`), with the mount unknown if it
+        is still up."""
+        if how not in RESTORED or self._settings.session_drain_s <= 0:
+            return
+        if admission is None or admission.drain is None:
+            self._step("drain", False, why="no exclusive admission holds the federation: nothing keeps it closed")
+            return
+        admission.drain.arm(began, clock=self._clock, sleep=self._sleep)
+        record = admission.drain.wait() if own else {**admission.drain.plan().record(), "waited_s": 0.0}
+
+        def since_start(moment: float | None) -> float | None:
+            return None if moment is None else round(moment - self._origin, 3)
+
+        self._step(
+            "drain",
+            True,
+            deferred=not own,
+            drain_s=record["drain_s"],
+            basis=record["basis"],
+            why=record["why"],
+            mount_end_s=since_start(record["mount_end"]),
+            gate_stop_s=since_start(record["gate_stop"]),
+            restore_start_s=since_start(record["restore_started"]),
+            until_s=since_start(record["until"]),
+            waited_s=round(record["waited_s"], 3),
+        )
 
     def _unlock(self) -> None:
         if self._lock is not None:

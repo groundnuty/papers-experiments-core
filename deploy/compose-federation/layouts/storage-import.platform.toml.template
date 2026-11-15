@@ -1,0 +1,38 @@
+# platform.toml of the storage-import layout, rendered by federation.py into the federation's root at every up. Each
+# @...@ is filled from facts.json, since the ids are new at every up; every path is relative to the root.
+#
+# Two spaces in the `[[spaces]]` form: `imported` (alpha-import, held on an imported storage, read-only) and `uploaded`
+# (alpha-upload). Both are owned and held by pine, which is also the agent's local provider, and mirrored by birch and
+# cedar. The imported entry's `import = { readonly = true }` is read by the core's platform layer; a core that does not
+# know the key refuses this file. The tables sit after every top-level key, since a key written after `[[spaces]]`
+# belongs to the last entry.
+zone = { name = "zone", url = "@zone_url@" }
+providers.pine = { url = "@provider_url.pine@", id = "@provider_id.pine@" }
+providers.birch = { url = "@provider_url.birch@", id = "@provider_id.birch@" }
+providers.cedar = { url = "@provider_url.cedar@", id = "@provider_id.cedar@" }
+credentials.admin = { file = "secrets/admin.token" }
+credentials.users = { directory = "secrets/users", pattern = "{user}.pass" }
+principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
+principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-tools@" }
+principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
+tls = { ca_file = "ca/federation-ca.pem" }
+placement = { holder = "pine" }  # each entry's holder is its data provider; a provisioner also needs the table
+
+[[spaces]]
+label = "imported"
+name = "alpha-import"
+id = "@space_id.alpha-import@"
+prefixes = ["alpha-"]
+providers = ["pine", "birch", "cedar"]
+local = "pine"
+holder = "pine"
+import = { readonly = true }
+
+[[spaces]]
+label = "uploaded"
+name = "alpha-upload"
+id = "@space_id.alpha-upload@"
+prefixes = ["alpha-"]
+providers = ["pine", "birch", "cedar"]
+local = "pine"
+holder = "pine"

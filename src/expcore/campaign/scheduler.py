@@ -37,14 +37,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign import reply_cap
+from expcore.campaign import liveness, reply_cap
 from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
-from expcore.campaign.healthgate import HealthCheck, HealthGate
+from expcore.campaign.health_required import refuse_without_health_check
+from expcore.campaign.healthgate import (
+    ADMISSION_OWNER,
+    DECLARED_HOOK,
+    HealthCheck,
+    HealthGate,
+    deferral_bound,
+    exposes_deferral,
+)
 from expcore.campaign.holds import ALL, Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import LeasePool
@@ -77,6 +85,12 @@ def utc_now() -> dt.datetime:
 def iso(moment: dt.datetime) -> str:
     """Return a time the way the store writes timestamps: ISO 8601 UTC, whole seconds, Z suffix."""
     return moment.astimezone(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _attempt_state(store: Store, attempt_id: int) -> str | None:
+    """The state of an attempt's row in the store, or None when there is none (`liveness.register`)."""
+    rows = store.q("SELECT state FROM attempts WHERE id=?", (attempt_id,))
+    return rows[0]["state"] if rows else None
 
 
 @dataclass(frozen=True)
@@ -119,9 +133,11 @@ class Scheduler:
         crash_hook: Callable[[str, str], None] = lambda point, run_key: None,
         on_hold: Callable[[str], None] | None = None,
         shard: ShardStart | None = None,
+        reset_settings: Mapping[str, Any] | None = None,
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
         self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
+        self.reset_settings = reset_settings  # the platform's settings in no fingerprint, recorded and compared (C35)
         self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
@@ -141,13 +157,17 @@ class Scheduler:
             else ()
         )
         self.settings.check_kinds(schema)
+        if health is not None:  # before the lock or the store: the platform's own wait must fit under max_defer_s
+            self._check_deferral(health, admission)
         exclusive = [name for name, value in schema.exclusive.items() if value]
         if exclusive and admission is None:  # nothing would hold the platform exclusively: refuse, never pretend
             raise Section({}, schema.file, f"[conditions.{exclusive[0]}]").fail(
                 EXCLUSIVE_KEY,
                 "declares an exclusive run, but the platform gives the campaign no run admission to hold exclusively",
             )
+        refuse_without_health_check(admission, health)  # an admission that reads the pre-run check's note: never blind
         self.store: Store | None = None
+        self._campaign: str | None = None  # the store's key for the attempts' liveness (`liveness.register`)
         self.recovery: Recovery | None = None
         self.not_admitted: dict[str, str] = {}
         self.stop = threading.Event()
@@ -163,6 +183,15 @@ class Scheduler:
         self._workers: list[threading.Thread] = []
         self._run_thread: threading.Thread | None = None  # the thread inside `run`, while there is one
         self._fatal: BaseException | None = None
+
+    def _check_deferral(self, health: HealthCheck, admission: RunAdmission | None) -> None:
+        """Refuse a campaign the platform's own deferral outlasts: first one whose health check does not carry what the
+        platform declares through its admission (a wrapper that hid `max_deferral_s`), then a `max_defer_s` shorter than
+        what the check declares (`SchedulerConfig.check_declared_deferral`, `check_deferral_bound`)."""
+        declared = deferral_bound(admission, DECLARED_HOOK, ADMISSION_OWNER)
+        reported = deferral_bound(health)
+        self.settings.check_declared_deferral(declared, reported, exposed=exposes_deferral(health))
+        self.settings.check_deferral_bound(reported)
 
     # --- lifecycle ------------------------------------------------------------------------------------------------
 
@@ -200,6 +229,7 @@ class Scheduler:
             max_attempts=cfg.max_attempts,
             allow_growth=cfg.allow_growth,
             shard=self.shard,
+            reset_settings=self.reset_settings,
         )
         store = self.store
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)
@@ -240,6 +270,7 @@ class Scheduler:
             )
             self.gate.load()
         self._sweep_leases()
+        self._campaign = liveness.register(lambda attempt_id: _attempt_state(store, attempt_id))
         self.runner = AttemptRunner(
             Parts(
                 store=store,
@@ -268,6 +299,7 @@ class Scheduler:
                 ledger=self.ledger,
                 reserved_capped=self._admitted_capped,
                 reply_cap_unheld=self._reply_cap_unheld,
+                campaign=self._campaign,
             )
         )
 
@@ -384,6 +416,9 @@ class Scheduler:
         gate = getattr(self, "gate", None)
         if gate is not None:
             gate.join()
+        if self._campaign is not None:  # before the store closes: its attempts read as ended from here
+            liveness.unregister(self._campaign)
+            self._campaign = None
         if self.store is not None:
             self.store.close()
             self.store = None
@@ -476,11 +511,14 @@ class Scheduler:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
             return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+        reason = None if self.gate is None else self.gate.operator_reason  # what only an operator can end, said first
+        said = "" if reason is None else f": {reason}"
         if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
-            why = "the health gate is closed: the platform's check stayed deferred past max_defer_s"
+            why = f"the health gate is closed: the platform's check stayed deferred past max_defer_s{said}"
             return Hold("health_gate", why, temporary=False)
         if self.gate is not None and self.gate.closed:
-            return Hold("health_gate", "the health gate is closed: no run starts until a check passes", temporary=True)
+            why = f"the health gate is closed: no run starts until a check passes{said}"
+            return Hold("health_gate", why, temporary=True)
         return None
 
     def _model_hold(self, model: str, stopped: frozenset[str], budget: Any) -> Hold | None:

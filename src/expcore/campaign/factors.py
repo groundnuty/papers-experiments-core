@@ -46,7 +46,10 @@ The target is a position label from the platform's configuration, never a config
 kind that names that target, while the run's fault injector held the target down in the attempt, is the condition's
 treatment; another target's failure, a failure that names none and an injection that did not happen are set aside
 (`Outcome.is_treatment`, record version 3). A plain name declares the kind with no target: any failure of the kind is
-the treatment, whatever it names. The targets are part of the schema too (`treatment_targets`).
+the treatment, whatever it names, except for a kind that is a fault on one target (`expcore.errors.targeted_kinds`,
+registered with `requires_target=True`, such as `provider_outage`). That kind is refused by its plain name, naming the
+file, the condition and the kind, so a schema cut to the kind names alone cannot be built for it and no other target's
+failure is ever scored as the manipulation (C34). The targets are part of the schema too (`treatment_targets`).
 
 A condition may run exclusive, with no fault of its own:
 
@@ -85,7 +88,7 @@ from typing import Any
 from urllib.parse import quote
 
 from expcore.config.loading import Section, load_toml
-from expcore.errors import TARGET_LABEL, vocabulary
+from expcore.errors import TARGET_LABEL, treatment_vocabulary
 
 BUILTIN_FACTORS = ("task", "model", "seed")
 TREATMENT_KEY = "infrastructure_is_treatment"
@@ -94,6 +97,18 @@ EXCLUSIVE_KEY = "exclusive"
 # A factor name becomes part of a SQL column name in the store, so it is held to a plain identifier.
 _NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _SEPARATOR = "|"
+# What a schema holds, and how each is told in a refusal; `rebuilt` compares every one with what the constructor makes.
+_STATE = (
+    ("file", "its file"),
+    ("declared", "its factors"),
+    ("order", "its identity order"),
+    ("conditions", "its conditions"),
+    ("treatment_targets", "its treatment targets"),
+    ("treatment_kinds", "its treatment kinds"),
+    ("condition_tasks", "its condition tasks"),
+    ("exclusive", "its exclusive conditions"),
+    ("_by_levels", "its lookup of a condition by its levels"),
+)
 
 
 class PlanError(ValueError):
@@ -174,6 +189,41 @@ class FactorSchema:
         self.exclusive: dict[str, bool] = self._check_exclusive(exclusive or {})
         self._by_levels = {tuple(c[f] for f in self.declared): name for name, c in self.conditions.items()}
 
+    def rebuilt(self) -> "FactorSchema":
+        """Return a schema built again from this one's own parts, so every rule of the constructor holds once more.
+
+        A schema checks itself once, when it is built, against the kinds known at that moment, and its attributes are
+        plain dicts. A study that builds its configuration in code (a smoke cut, a selection) hands over a schema
+        built earlier, perhaps outside the scope of its own kinds, perhaps edited since; this is the check that the
+        schema it hands over holds against the vocabulary in scope now, including that a kind that is a fault on one
+        target still names it (C34). A failure of a rule is the constructor's own, naming the file and the key.
+
+        Every attribute is then compared with the one the constructor made, and so is the digest: a schema whose
+        conditions were swapped, or a part of it deleted, after it was built would otherwise resolve a run key to
+        another condition's treatment, lack a part its accessors read, or fingerprint as what it no longer is. Such
+        a schema is refused, naming the first attribute that differs, so the schema returned equals this one.
+        """
+        treatment: dict[str, list[Any]] = {}
+        for name, kinds in self.treatment_kinds.items():
+            targets = self.treatment_targets.get(name, {})  # a part deleted since is found by the comparison below
+            treatment[name] = [{"kind": kind, "target": targets[kind]} if kind in targets else kind for kind in kinds]
+        again = FactorSchema(
+            self.declared,
+            self.order,
+            self.conditions,
+            treatment=treatment,
+            tasks={name: listed for name, listed in self.condition_tasks.items() if listed is not None},
+            exclusive=self.exclusive,
+            file=self.file,
+        )
+        where = Section({}, self.file, "the schema")
+        for attribute, label in _STATE:
+            if getattr(again, attribute) != getattr(self, attribute):
+                raise where.fail(None, f"no longer matches what its constructor makes of its parts ({label} differs)")
+        if again.digest != self.digest:
+            raise where.fail(None, "no longer matches its digest: it was edited after the digest was taken")
+        return again
+
     # --- validation ---------------------------------------------------------------------------------------------
 
     def _check_factors(self) -> None:
@@ -239,7 +289,8 @@ class FactorSchema:
         A table entry's target goes into `treatment_targets`, by condition and kind.
         """
         out: dict[str, tuple[str, ...]] = dict.fromkeys(self.conditions, ())
-        known, untreatable = vocabulary()  # one view for the whole schema: a scope leaving cannot split two reads
+        # one view for the whole schema: a scope leaving cannot split two reads
+        known, untreatable, targeted = treatment_vocabulary()
         for name, entries in declared.items():
             if name not in self.conditions:
                 raise Section({}, self.file, "[conditions]").fail(name, f"declares {TREATMENT_KEY} but is no condition")
@@ -262,6 +313,15 @@ class FactorSchema:
             repeated = sorted({k for k in kinds if kinds.count(k) > 1})
             if repeated:
                 raise where.fail(TREATMENT_KEY, f"repeats {', '.join(map(repr, repeated))}")
+            for kind in kinds:
+                if kind in targeted and kind not in targets:
+                    raise where.fail(
+                        TREATMENT_KEY,
+                        f"declares infrastructure kind {kind!r} with no target; a condition whose treatment is "
+                        f"{kind!r} must say which target it manipulates, or any target's failure would be scored as "
+                        f'its treatment: write {{ kind = "{kind}", target = "providers[1]" }}, the position label of '
+                        "that target in the platform's configuration",
+                    )
             out[name] = tuple(sorted(kinds))
             self.treatment_targets[name] = dict(sorted(targets.items()))
         return out

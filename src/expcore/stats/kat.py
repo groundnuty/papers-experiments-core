@@ -175,7 +175,72 @@ WILCOXON_CASES = (
         why="cluster differences 0.2, 0.2, 0.4 (equal weight over the models with a cell); models 0.2 and 0.4",
     ),
 )
-CASES: Mapping[str, tuple[EstimatorCase, ...]] = {estimators.WILCOXON: WILCOXON_CASES}
+LN2 = math.log(2)
+
+# The ratio estimator reads log ratios of cells' sums and tests and resamples them as the Wilcoxon one does (S13), so
+# its known answers are the same arithmetic on log values: what a ratio of 2, 4 or 8 means is the cell's own business
+# (`expcore.stats.ratio`), and these inputs begin where it ends.
+RATIO_CASES = (
+    EstimatorCase(
+        "log ratios of 2, 4 and 8",
+        ((LN2,), (2 * LN2,), (3 * LN2,)),
+        {"method": "exact"},
+        estimate=2 * LN2,
+        p_value=0.25,
+        n_clusters=3,
+        counts={"zero_dropped": 0},
+        model_estimates=(2 * LN2,),
+        why=(
+            "mean (ln 2 + ln 4 + ln 8) / 3 = 2 ln 2, the log of a geometric mean of 4; "
+            "ranks 1, 2, 3 all positive, p = 2 * (1 / 2**3)"
+        ),
+    ),
+    EstimatorCase(
+        "equal log ratios, exact",
+        ((LN2,),) * 4,
+        {"method": "exact"},
+        estimate=LN2,
+        p_value=0.125,
+        n_clusters=4,
+        counts={"zero_dropped": 0},
+        model_estimates=(LN2,),
+        interval=(LN2, LN2),
+        why=(
+            "every cluster's ratio is 2, so every resample mean is ln 2; "
+            "all sign patterns give W = 0 or 10, p = 2 / 2**4"
+        ),
+    ),
+    EstimatorCase(
+        "ratios of one",
+        ((0.0,), (0.0,), (0.0,)),
+        {},
+        estimate=0.0,
+        p_value=1.0,
+        n_clusters=3,
+        counts={"zero_dropped": 3},
+        model_estimates=(0.0,),
+        interval=(0.0, 0.0),
+        why=(
+            "A's ratio is B's in every cluster, ln 1 = 0: no evidence of a difference, "
+            "p = 1 by definition, every zero counted"
+        ),
+    ),
+    EstimatorCase(
+        "two models' cells, one cell lost",
+        ((0.1, 0.3), (0.2, NAN), (0.3, 0.5)),
+        {"method": "exact"},
+        estimate=0.8 / 3,
+        p_value=0.25,
+        n_clusters=3,
+        counts={"zero_dropped": 0},
+        model_estimates=(0.2, 0.4),
+        why=(
+            "a cluster's value is the equal-weight mean of its cells: 0.2, 0.2, 0.4; "
+            "each model's estimate is its own cells' mean"
+        ),
+    ),
+)
+CASES: Mapping[str, tuple[EstimatorCase, ...]] = {estimators.WILCOXON: WILCOXON_CASES, estimators.RATIO: RATIO_CASES}
 
 # Frozen from the reviewed implementation, not derived by hand. Produced once by calling the registered estimator on
 # each input below with the replicates, level and seed listed, on this repository at 93395ed with numpy 2.5.4 and

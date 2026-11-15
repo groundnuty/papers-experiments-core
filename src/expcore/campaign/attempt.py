@@ -15,12 +15,16 @@ The order is fixed, and each step is decided by what a kill at that point must l
    wait for it before anything starts (outside the agent's clock), and is left only after the post-run check and the
    store's record, so what the post-run check sees is what the run left; refused (`InfraError`), the run is left
    unstarted and uses no attempt. Its wait can be long too, so once admitted the run **looks at the gates again**, as
-   after its lease: if one is closed now the admission is let go and the run stays pending, uncharged;
+   after its lease: if one is closed now the admission is let go and the run stays pending, uncharged. What the run's
+   pre-run check noted for its admission is in the try's note (`expcore.campaign.prerun`), open from step 1 to the end
+   of every try: with no health check the note holds only `prerun.UNCHECKED`;
 4. the backend, from the endpoint the campaign admitted (C14), and the attempt's timer;
 5. the **'running' row** in the store, then the study's `RunExecutor`, which calls `record_attempt`; with a budget,
-   under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26);
-6. the post-run health check, an instrument's refusal and the served-identity check, which can turn the result into
-   infrastructure (C11, C31, C16);
+   under the attempt's spend guard, which tops up each send its token cap cannot account for (`topup`, C26). From the
+   row to the store's record of the result the attempt is **live** (`liveness.running`): a hold a platform takes in it
+   names the attempt, and reads as ended the moment the store has the result;
+6. the post-run health check, an instrument's refusal (or a fault injector's reading in the record that its restore was
+   not verified, O11) and the served-identity check, which can turn the result into infrastructure (C11, C31, C16);
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
    harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
    lose the stop or the failure it caused; the lease ends after it. A result committed from its marker at the next
@@ -45,7 +49,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.attempts import classify, unverified
+from expcore.campaign import liveness, prerun
+from expcore.campaign.attempts import classify, is_charged, unverified
 from expcore.campaign.defect_log import DefectLog
 from expcore.campaign.executor import (
     BackendFactory,
@@ -73,6 +78,7 @@ from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import Outcome
 from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
+from expcore.records.injections import restore_refusal
 
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
 # A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
@@ -114,6 +120,8 @@ class Parts:
     reserved_capped: Callable[[str], bool | None] = lambda run_key: None
     # with a budget: whether the store has taken the model off the reply maximum now (C27); None: no budget, no maximum
     reply_cap_unheld: Callable[[str], bool | None] = lambda model: None
+    # the key the store is registered under for the attempts' liveness (`liveness.register`); None: not registered
+    campaign: str | None = None
 
 
 class AttemptRunner:
@@ -131,7 +139,14 @@ class AttemptRunner:
         return self.p.schema.treatment_targets[self.p.schema.condition_named(factors, run_key)]
 
     def work(self, row: Any) -> float:
-        """Run one attempt of the row's run, end to end. Return the seconds before the run may start again."""
+        """Run one attempt of the row's run, end to end. Return the seconds before the run may start again. Every try
+        has a note of its own (`prerun`), which its pre-run check writes and its admission reads; with no health check
+        the note says so (`prerun.UNCHECKED`)."""
+        with prerun.opened(checked=self.p.health is not None):
+            return self._tried(row)
+
+    def _tried(self, row: Any) -> float:
+        """One try of the row's run, from the gates to the store (see the module docstring)."""
         p = self.p
         key, factors = row["run_key"], json.loads(row["factors"])
         if p.health is not None:
@@ -301,60 +316,63 @@ class AttemptRunner:
         # checks more, never less.
         decided = p.reserved_capped(key)
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
-        guard = None
-        if p.ledger is not None:
-            guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=True if decided is None else decided)
-        defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
-        request = RunRequest(
-            RunIdentity(key, factors, begun.number),
-            run_dir,
-            endpoint,
-            backend,
-            timer,
-            p.monotonic,
-            kinds,
-            lease,
-            treatment_targets=targets,
-            models=p.models,
-            defect_log=defects,
-            reserved_capped=decided,  # the row's value, so the record and the store say one thing (C27)
-            reply_cap_unheld=lambda: p.reply_cap_unheld(model),
-        )
-
-        async def go() -> Any:
-            try:  # every request of the attempt, in any task or thread it starts, goes through its guard
-                with contextlib.nullcontext() if guard is None else spend.watching(guard):
-                    return await p.executor(request)
-            finally:
-                await backend.aclose()
-
-        started = p.monotonic()
-        record = None
-        try:
-            record = asyncio.run(go())
-            result = result_from_record(record, ended_utc=p.stamp())
-        except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
-            result = failure_result(
-                error,
-                ended_utc=p.stamp(),
-                wall_s=p.monotonic() - started,
-                treatment_kinds=kinds,
+        live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
+        with live:  # the attempt is live from its row to its result: the executor and the post-run check inside it
+            guard = None
+            if p.ledger is not None:
+                capped = True if decided is None else decided
+                guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=capped)
+            defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
+            request = RunRequest(
+                RunIdentity(key, factors, begun.number),
+                run_dir,
+                endpoint,
+                backend,
+                timer,
+                p.monotonic,
+                kinds,
+                lease,
                 treatment_targets=targets,
-                sent_nothing=sent_no_request(error, backend),
+                models=p.models,
+                defect_log=defects,
+                reserved_capped=decided,  # the row's value, so the record and the store say one thing (C27)
+                reply_cap_unheld=lambda: p.reply_cap_unheld(model),
             )
-            if result.outcome.defect is not None:  # the attempt keeps the class and the stack hash; the log the rest
-                defects(error, result.outcome.defect)
-        result, moved = self._judge(result, record, model, key)
-        mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
 
-        def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
-            self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
-            if mix is not None:
-                p.store.record_deployments(begun.id, mix)
+            async def go() -> Any:
+                try:  # every request of the attempt, in any task or thread it starts, goes through its guard
+                    with contextlib.nullcontext() if guard is None else spend.watching(guard):
+                        return await p.executor(request)
+                finally:
+                    await backend.aclose()
 
-        status = self._finish(begun, run_dir, key, result, bookkeeping)
-        defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
-        return p.settings.retry_delay_s if status == "pending" else 0.0
+            started = p.monotonic()
+            record = None
+            try:
+                record = asyncio.run(go())
+                result = result_from_record(record, ended_utc=p.stamp())
+            except Exception as error:  # the executor's: infrastructure or a defect of ours, classified by what it is
+                result = failure_result(
+                    error,
+                    ended_utc=p.stamp(),
+                    wall_s=p.monotonic() - started,
+                    treatment_kinds=kinds,
+                    treatment_targets=targets,
+                    sent_nothing=sent_no_request(error, backend),
+                )
+                if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
+                    defects(error, result.outcome.defect)
+            result, moved = self._judge(result, record, model, key)
+            mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
+
+            def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
+                self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
+                if mix is not None:
+                    p.store.record_deployments(begun.id, mix)
+
+            status = self._finish(begun, run_dir, key, result, bookkeeping)
+            defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
+            return p.settings.retry_delay_s if status == "pending" else 0.0
 
     def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:
         """Apply the post-run health check (C11) and the served-identity check (C16) to a result."""
@@ -368,6 +386,10 @@ class AttemptRunner:
             elif not health.ok and outage is not None:
                 result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
                 p.health.note_discard(outage, result.input_tokens, result.output_tokens)
+            elif not health.ok and not health.charge:  # a failure another attempt left: overlapped, never charged
+                result = dataclasses.replace(result, outage_kind=p.settings.health_kind)
+                text = f"{key}: {health.detail}; set aside as overlapped by a failure another attempt left, uncharged"
+                p.store.event(p.stamp(), "post_run_check_failed", model, text)
             elif not health.ok and not result.outcome.set_aside:
                 text = f"post-run health check failed: {health.detail}"
                 result = dataclasses.replace(
@@ -403,14 +425,27 @@ class AttemptRunner:
 
         An attempt the store would not score, one set aside by the health check, an outage, or its own infrastructure
         failure or defect, keeps its outcome and the refusal is noted.
+
+        A record whose fault injector's reading says the restore was not verified (`restore_verified` not true) is
+        refused the same way, as `injector_failure` (`post_check_unverified` in a process that has not registered it),
+        whether or not an instrument's own check refused it: the record carries the failure itself (O11), because the
+        executor that holds it inside `FaultInjector.running` keeps its record when the restore fails. It takes
+        precedence over a refusal of the record's own, so the kind is the injector's. The health check decides before,
+        and nothing after this step can score what it set aside.
+
+        A refusal that is a platform's hold (C33: an instrument that held its start back, so nothing the run did
+        counts) takes precedence over both, and always decides, so the attempt costs no attempt whatever set it aside
+        first, a charged post-run failure or an unverified restore included; it is still never scored.
         """
-        p, refusal = self.p, record.instrument_refusal
+        p, own = self.p, record.instrument_refusal
+        held = own if own is not None and not is_charged(own["infra_kind"]) else None
+        refusal = held or restore_refusal(record.instruments) or own
         if refusal is None:
             return result
         who = f"instrument {refusal['namespace']!r} refused the attempt"
         text = f"{key}: {who}: {refusal['infra_kind']}: {refusal['detail']}"
         scored = classify(result, result.treatment_kinds, result.treatment_targets).state == "done"
-        if not scored and (result.outage_kind is not None or result.outcome.set_aside):
+        if held is None and not scored and (result.outage_kind is not None or result.outcome.set_aside):
             p.store.event(p.stamp(), "instrument_refused", model, f"{text}; the outcome stands")
             return result
         p.store.event(p.stamp(), "instrument_refused", model, text)

@@ -33,22 +33,29 @@ def test_the_live_tests_are_skipped_when_no_platform_is_named():
         assert outcome not in done.stdout, done.stdout[-800:]
 
 
-def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_reads_and_the_clock_are_unconfirmed():
+def test_o09_only_the_resets_calls_the_tool_server_user_reads_and_the_clock_are_unconfirmed():
     """O09, O11: the live contract tests against Onedata 25.0 confirmed every call the layer makes that no source did,
     the gate's walk by `parent_id` among them, the reset's eviction of a directory and a transfer record's `spaceId`,
     and refuted the file's `path` attribute the gate read before, which no release at hand answers. The gate no longer
     asks for it; the client's docstring records what refuted it. What is left unconfirmed are the reset's calls no live
-    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal), the write of content
-    without an offset, which truncates the file and which a restarted upload relies on (O25), and the two reads that
+    run has made (a transfer's cancel, a QoS summary, a requirement's record and its removal) and the two reads that
     bound a writing tool-server user (#177): its Onezone admin privileges, named by Onezone's REST description alone,
     and the clusters its token acts in, the current user's read sent as the token, named by that description and the
     route of oz-worker. And, since a job's times are stamped on the platform's global clock, Onezone's reading of it
     that the transfer log and the reset's history place their window by (#207), a public call named by oz-worker's
-    source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it."""
+    source alone (14b5bda, `provider_routes.erl:192-198`): the next live slot confirms it. And the three calls of a
+    run's revocation at its end (C19): a user's read of its generation of temporary tokens, its own revocation of them,
+    and the verification that answers a revoked token `tokenRevoked`, all named by oz-worker's source alone. The write
+    of content without an offset, which truncates the file, left the list when the client began to refuse it (O44):
+    nothing sends it, so nothing relies on it. And the four Onepanel calls that check a space held on an imported
+    storage (O41), named by onepanel's source alone."""
     from expcore_onedata import client
 
     assert {(m, p) for m, p, _ in client.UNVERIFIED_ENDPOINTS} == {
-        ("PUT", "/data/{id}/content"),
+        ("GET", "/provider/spaces/{space}"),  # an imported space's support and its storage, and its scan (O41)
+        ("GET", "/provider/storages/{id}"),
+        ("GET", "/provider/spaces/{space}/storage-import/auto/info"),
+        ("POST", "/provider/spaces/{space}/storage-import/auto/force-start"),
         ("DELETE", "/transfers/{id}"),
         ("GET", "/data/{id}/qos/summary"),
         ("GET", "/qos_requirements/{qid}"),
@@ -57,11 +64,23 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
         ("GET", "/users/{id}/effective_privileges"),
         ("GET", "/user/effective_clusters"),
         ("GET", "/provider/public/get_current_time"),
+        ("GET", "/user/tokens/temporary"),  # a run's revocation at its end (C19), from the source only
+        ("DELETE", "/user/tokens/temporary"),
+        ("POST", "/tokens/verify_access_token"),
     }
     what = " ".join(w for _, _, w in client.UNVERIFIED_ENDPOINTS)
     assert all(
         field in what
-        for field in ("fileId", "requirements", "400", "truncates", "oz_view_privileges", "clusters", "timeMillis")
+        for field in (
+            "fileId",
+            "requirements",
+            "400",
+            "oz_view_privileges",
+            "clusters",
+            "timeMillis",
+            "generation",
+            "tokenRevoked",
+        )
     )
     assert "14b5bda7d84bbfe2f25bc9bedb9033af6d1a8b55" in client.__doc__  # the source that names the clock's endpoint
     assert "provider_routes.erl:192-198" in client.__doc__
@@ -74,10 +93,10 @@ def test_o09_only_the_resets_calls_the_truncating_write_the_tool_server_user_rea
 
 def test_every_unverified_endpoint_has_a_live_contract_test():
     """Each (method, path) neither a source nor a live run confirms is named by a `covers:` line of a live test, so
-    none goes unchecked."""
+    none goes unchecked: the contract tests', or, for the panel calls of an imported space, the import's (O41)."""
     from expcore_onedata.client import UNVERIFIED_ENDPOINTS
 
-    live = (ROOT / "tests" / "live" / "test_contract.py").read_text(encoding="utf-8")
+    live = "".join(path.read_text(encoding="utf-8") for path in sorted((ROOT / "tests" / "live").glob("test_*.py")))
     missing = [f"{m} {p}" for m, p, _ in UNVERIFIED_ENDPOINTS if f"# covers: {m} {p}\n" not in live]
     assert not missing, f"no live test covers: {missing}"
 

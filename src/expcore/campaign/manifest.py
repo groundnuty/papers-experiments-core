@@ -30,6 +30,7 @@ from functools import cached_property
 from typing import Any
 
 from expcore.campaign.factors import FactorSchema, PlanError, RunKey
+from expcore.campaign.selection import Selection, SelectionSpec, Spec
 from expcore.campaign.shard import ModelShards, ShardError, ShardSpec, in_shard, layout_of, pair_of, partition
 
 ORDER_RULE = "sha256(order_seed|run_key)"
@@ -87,6 +88,11 @@ def shard_manifest(manifest: Manifest, spec: ShardSpec, layout: ModelShards | No
     return Manifest(
         manifest.order_seed, tuple(row for row in manifest.rows if in_shard(row.key.factors, spec, assignment))
     )
+
+
+def selection_manifest(manifest: Manifest, selection: Selection) -> Manifest:
+    """Return the runs a selection keeps (C38), each keeping its place in the whole plan and the plan's order (C08)."""
+    return Manifest(manifest.order_seed, tuple(row for row in manifest.rows if selection.selects(row.key.factors)))
 
 
 def build_manifest(keys: Iterable[RunKey], order_seed: int) -> Manifest:
@@ -211,17 +217,20 @@ def build_fingerprint(
 
 
 def plan_problem(
-    schema: FactorSchema, manifest: Manifest, fingerprint: Mapping[str, Any], shard: ShardSpec | None = None
+    schema: FactorSchema, manifest: Manifest, fingerprint: Mapping[str, Any], shard: Spec | None = None
 ) -> str | None:
     """Describe how a manifest is not the plan its fingerprint declares; None when it is exactly that plan.
 
     The plan is every condition x task x model x seed of the fingerprint. A manifest that lists other runs would be a
     different experiment whatever the fingerprint says, so a start whose two disagree is refused. A shard's plan is the
     part of that one its pairs are assigned to, with the assignment made from the whole declared plan (C28) under the
-    shard's rule, by model with the `[shards]` layout the fingerprint declares (C32).
+    shard's rule, by model with the `[shards]` layout the fingerprint declares (C32); a selection's is the runs of that
+    plan its levels select (C38).
     """
     keys = schema.expand(fingerprint["tasks"], fingerprint["models"], [int(seed) for seed in fingerprint["seeds"]])
-    if shard is not None:
+    if isinstance(shard, SelectionSpec):  # a selection's part is the runs its levels select (C38)
+        keys = [key for key in keys if shard.selection.selects(key.factors)]
+    elif shard is not None:
         try:
             assignment = partition({pair_of(key.factors) for key in keys}, shard, layout_of(fingerprint))
         except ShardError as error:

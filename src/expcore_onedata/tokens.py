@@ -22,8 +22,12 @@ What `TokenIssuer.mint` does, in this order, and refuses at the first failure:
    data-access caveat, requires Onezone's scope of it to be exactly the plane's spaces and the clusters it acts in to
    be none (`tokenscope`). A token that fails is dropped.
 
-A principal mints its own token with its own credential (`OnezoneClient.mint_own_token`). Tokens are never revoked: no
-source revokes one, so each ends with its lifetime, which derives from the whole-time ceiling (O06).
+A principal mints its own token with its own credential (`OnezoneClient.mint_own_token`). A token ends with its
+lifetime, which derives from the whole-time ceiling (O06), unless its user revokes it: a leased slot's users revoke all
+their temporary tokens, each with its own credential, when the run that held the slot ends (`users.SlotTokens.revoke`,
+C19). `revoke_own` sends that revocation and requires the user's generation to have risen, and `require_revoked`
+requires a token to verify as 400 `tokenRevoked` and nothing else: an examination only decodes a token, and a
+verification refuses a token with a data-access caveat for that caveat whether or not it is revoked.
 
 The minted value is registered with `expcore.records.redact.register_secret` inside the client, before it comes back
 here (R12), and it is wrapped in a `Secret` whose repr and str never show it. A caller reads it with `.reveal()` at the
@@ -42,7 +46,7 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import quote
 
-from expcore_onedata.client import MintNotSent, OnezoneClient, PlatformError
+from expcore_onedata.client import VERIFY_TOKEN_PATH, MintNotSent, OnezoneClient, PlatformError
 from expcore_onedata.config import Condition, PlatformConfig, TokenSettings
 from expcore_onedata.credentials import Principal
 from expcore_onedata.readretry import ONE_ATTEMPT
@@ -64,6 +68,8 @@ from expcore_onedata.tokenscope import (
     require_scope,
     scope_spaces,
 )
+
+TOKEN_REVOKED = "tokenRevoked"  # Onezone's error id for a token older than its user's generation (ctool, HTTP 400)
 
 
 class Plane(StrEnum):
@@ -92,12 +98,18 @@ class Secret:
 
 
 class DroppedToken(TokenRefused):
-    """A token was minted and then refused; it is dropped, never revoked. `expires_at` is when it stops working,
-    or None when its examination could not read that, in which case nothing may assume it has ended."""
+    """A token was minted and then refused; it is dropped, and revoked only with all its user's temporary tokens when
+    the run that leased the slot ends. `expires_at` is when it stops working unless revoked, or None when its
+    examination could not read that, in which case nothing may assume it has ended."""
 
     def __init__(self, message: str, expires_at: float | None) -> None:
         super().__init__(message)
         self.expires_at = expires_at
+
+
+class RevocationUnconfirmed(RuntimeError):
+    """A revocation that could not be shown to have taken effect: the user's generation did not rise, or a token did
+    not verify as revoked. The message names what failed, never a token, a user or a value of the configuration."""
 
 
 class ExpiryMismatch(DroppedToken):
@@ -318,8 +330,8 @@ class TokenIssuer:
         before minting (a journal line that outlasts every token) passes `valid_until`: the token is minted with
         exactly that, and refused with `ExpiryMismatch` if its examination shows another expiry.
 
-        A token that fails examination is dropped and never returned. Nothing revokes it: no source revokes a token,
-        and it ends with its lifetime, which derives from `ceiling_s` (O06).
+        A token that fails examination is dropped and never returned. It ends with its lifetime, which derives from
+        `ceiling_s` (O06), or when its user's temporary tokens are revoked (`revoke_own`).
         """
         window = token_window(ceiling_s, self._config.tokens)
         self.check_principal(spec, principal)
@@ -344,6 +356,36 @@ class TokenIssuer:
         except TokenRefused as refused:
             raise DroppedToken(str(refused), examined.valid_until) from refused
         return MintedToken(spec.plane, principal.user_id, examined.token_id, examined.valid_until, Secret(value))
+
+    def revoke_own(self, principal: Principal) -> tuple[int, int]:
+        """Revoke every temporary token of the principal, as the principal, and return its generation before and after.
+
+        The generation is read, the principal's own revocation sent, and the generation read again; one that did not
+        rise raises `RevocationUnconfirmed`, and a failed request raises `PlatformError`. Every token of the principal
+        then has a generation at or below the one read first, so every one of them is revoked (C19).
+        """
+        before = self._client.own_temporary_generation(principal)
+        self._client.revoke_own_temporary_tokens(principal)
+        after = self._client.own_temporary_generation(principal)
+        if after <= before:
+            raise RevocationUnconfirmed(
+                f"the generation of a user's temporary tokens did not rise when they were revoked ({before}, {after})"
+            )
+        return before, after
+
+    def require_revoked(self, value: str) -> None:
+        """Require a token to verify as revoked: Onezone's verification must answer 400 `tokenRevoked`.
+
+        Any other answer raises `RevocationUnconfirmed`: a token that verifies, and every other error, since the
+        verification refuses a token with a data-access caveat for that caveat whatever its generation.
+        """
+        try:
+            self._client.query(VERIFY_TOKEN_PATH, {"token": value})
+        except PlatformError as error:
+            if (error.status, error.code) == (400, TOKEN_REVOKED):
+                return
+            raise RevocationUnconfirmed(f"a token did not verify as revoked: {error}") from None
+        raise RevocationUnconfirmed("a token still verifies after its user's revocation")
 
     def mint_run_tokens(
         self,

@@ -8,6 +8,7 @@ from campaign_support import STUDY_TOML, chain_schema, make_schema, treatment_sc
 from expcore import errors
 from expcore.campaign.factors import FactorSchema, PlanError, RunKey, load_factor_schema
 from expcore.config.loading import ConfigError
+from expcore.loop.outcomes import Outcome
 
 
 def test_the_study_file_loads_into_a_schema(tmp_path):
@@ -252,6 +253,7 @@ def registry(monkeypatch):
     """Start with only the core's infrastructure kinds and leave no platform kind behind."""
     monkeypatch.setattr(errors, "_platform_kinds", {})
     monkeypatch.setattr(errors, "_platform_untreatable", {})
+    monkeypatch.setattr(errors, "_platform_targeted", {})
 
 
 def test_c02_a_condition_may_declare_infrastructure_kinds_as_its_treatment(tmp_path, registry):
@@ -471,6 +473,139 @@ def test_o05_a_kind_a_platform_registered_as_not_treatable_is_refused_and_a_trea
         ConfigError, match=r"key 'infrastructure_is_treatment' names infrastructure kind 'provider_tamp"
     ):
         load_factor_schema(write_study(tmp_path, declared.replace('"provider_down"', '"provider_tampered"')))
+
+
+def test_c34_a_kind_that_requires_a_target_is_refused_without_one_naming_file_condition_and_kind(tmp_path, registry):
+    """C34: a condition whose treatment is a fault on one target must name it: the plain name `provider_down` would
+    score any provider's outage as the manipulation, so it is refused at load, naming the file, the condition, the key
+    and the kind, and the message shows the declaration that is accepted."""
+    errors.register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    plain = TREATMENT_TOML.replace('"sandbox", "endpoint"', '"endpoint", "provider_down"')
+    path = write_study(tmp_path, plain)
+    with pytest.raises(ConfigError) as caught:
+        load_factor_schema(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: [conditions.api-none]: key 'infrastructure_is_treatment'")
+    assert "'provider_down'" in message
+    assert "no target" in message
+    assert 'kind = "provider_down", target = ' in message
+
+
+def test_c34_a_kind_that_requires_a_target_loads_with_one_and_keeps_it(tmp_path, registry):
+    """C34: the same condition with the target named loads, the target is the schema's and in its digest, and a kind
+    that does not require one is still declared by its plain name."""
+    errors.register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    table = '["endpoint", { kind = "provider_down", target = "providers[1]" }]'
+    schema = load_factor_schema(write_study(tmp_path, TREATMENT_TOML.replace('["sandbox", "endpoint"]', table)))
+    assert schema.treatment_kinds["api-none"] == ("endpoint", "provider_down")
+    assert schema.treatment_targets["api-none"] == {"provider_down": "providers[1]"}
+    other = TREATMENT_TOML.replace('["sandbox", "endpoint"]', table.replace("providers[1]", "providers[0]"))
+    assert load_factor_schema(write_study(tmp_path, other)).digest != schema.digest
+
+
+def test_c34_a_schema_cut_to_the_kind_names_alone_loses_the_target_and_is_refused(registry):
+    """C34: a study that cut its schema to one condition by rebuilding it with the kind names alone dropped the
+    outage's target, and `Outcome.is_treatment` then counted any provider's outage as the treatment while the store
+    compared the record to the cut schema and saw nothing. The cut is refused when it is built, naming the condition,
+    and a cut that keeps each target is the schema it was cut from."""
+    errors.register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    base = make_schema()
+    declared = {"api-none": [{"kind": "provider_down", "target": "providers[1]"}]}
+    schema = FactorSchema(base.declared, base.order, base.conditions, treatment=declared)
+    names_only = {name: schema.treatment_kinds[name] for name in schema.conditions}
+    with pytest.raises(
+        ConfigError, match=r"\[conditions\.api-none\]: key 'infrastructure_is_treatment'.*'provider_down'"
+    ):
+        FactorSchema(base.declared, base.order, base.conditions, treatment=names_only)
+    kept = {"api-none": [{"kind": k, "target": t} for k, t in schema.treatment_targets["api-none"].items()]}
+    assert FactorSchema(base.declared, base.order, base.conditions, treatment=kept).digest == schema.digest
+
+
+def test_c37_a_schema_rebuilt_from_its_parts_is_the_schema_and_holds_every_rule_again(registry):
+    """C37: `rebuilt` runs the constructor over the schema's own parts, so a schema is checked again against the
+    vocabulary in scope now and against the rules of the constructor, and a valid one is the schema it was: the same
+    digest, the same targets, the same tasks and exclusive conditions. One whose parts were edited after it was built
+    is refused as a schema built that way would be."""
+    errors.register_infra_kind("provider_down", "a provider that is down", requires_target=True)
+    base = chain_schema()
+    declared = {"api-none": ["endpoint", {"kind": "provider_down", "target": "providers[1]"}]}
+    schema = FactorSchema(
+        base.declared,
+        base.order,
+        base.conditions,
+        treatment=declared,
+        tasks={name: tasks for name, tasks in base.condition_tasks.items() if tasks is not None},
+        exclusive={"api-none": True},
+    )
+    again = schema.rebuilt()
+    assert again is not schema
+    assert again.digest == schema.digest
+    assert again.treatment_targets == schema.treatment_targets
+    assert again.condition_tasks == schema.condition_tasks
+    assert again.exclusive == schema.exclusive
+    schema.treatment_targets["api-none"] = {}  # edited after it was built: the targeted kind is now a plain name
+    with pytest.raises(ConfigError, match=r"\[conditions\.api-none\]: key 'infrastructure_is_treatment'.*no target"):
+        schema.rebuilt()
+
+
+def test_c37_a_schema_whose_conditions_were_swapped_after_it_was_built_is_refused_not_rebuilt_around():
+    """C37: a run key resolves to its condition by a lookup built with the schema. Swapping the levels of two conditions
+    afterwards leaves a lookup that gives each key the other's treatment kinds, which a rebuild that only checked the
+    parts would accept; the schema is refused, naming the file and the schema."""
+    schema = make_schema()
+    key = schema.expand(["task-a"], ["m1"], [1])[0]
+    before = schema.condition_of(key)
+    schema.conditions["mount-read"], schema.conditions["api-none"] = (
+        schema.conditions["api-none"],
+        schema.conditions["mount-read"],
+    )
+    assert schema.condition_of(key) == before  # the stale lookup still answers, which is the hazard
+    with pytest.raises(ConfigError, match=r"the schema: no longer matches .*\(its lookup of a condition by its levels"):
+        schema.rebuilt()
+
+
+@pytest.mark.parametrize(
+    ("deleted", "label"),
+    [
+        ("treatment_kinds", "its treatment kinds"),
+        ("treatment_targets", "its treatment targets"),
+        ("condition_tasks", "its condition tasks"),
+        ("exclusive", "its exclusive conditions"),
+    ],
+)
+def test_c37_a_schema_with_a_condition_deleted_from_one_of_its_parts_is_refused_not_given_the_default(deleted, label):
+    """C37: a rebuild gives a condition missing from a part the default the constructor gives, which would equal the
+    digest, while the schema's own accessors would raise KeyError for that condition's run keys at run time; the
+    schema is refused naming the part that differs."""
+    schema = chain_schema()
+    assert schema.digest  # taken before the edit
+    del getattr(schema, deleted)["download-write"]
+    with pytest.raises(ConfigError, match=rf"the schema: no longer matches .*\({label} differs\)"):
+        schema.rebuilt()
+
+
+def test_c37_a_schema_edited_after_its_digest_was_taken_is_refused():
+    """C37: the digest is taken once and is what the campaign fingerprint holds, so a schema edited after it was taken
+    no longer is what its digest says, and is refused."""
+    schema = make_schema()
+    assert schema.digest == schema.rebuilt().digest  # taken, and unchanged by a rebuild
+    schema.exclusive["api-none"] = True  # a valid edit, which the cached digest does not show
+    with pytest.raises(ConfigError, match=r"the schema: no longer matches its digest"):
+        schema.rebuilt()
+
+
+def test_c34_a_study_s_own_kind_named_provider_outage_is_held_to_a_target_too(tmp_path, registry):
+    """C34: in a process that never imported the platform, a study that declares a kind named `provider_outage` of its
+    own in `[study.kinds]` is held to the same rule: its plain name is refused, and no outage is scored as its
+    treatment without a declared target, whichever provider failed and whatever the injector held."""
+    plain = TREATMENT_TOML.replace('"sandbox", "endpoint"', '"provider_outage"')
+    with errors.study_kinds({"provider_outage": errors.StudyKind("a study's own outage")}):
+        with pytest.raises(ConfigError, match=r"\[conditions\.api-none\].*'provider_outage'.*no target"):
+            load_factor_schema(write_study(tmp_path, plain))
+        outage = Outcome("infrastructure", "down", infra_kind="provider_outage", infra_target="providers[0]")
+        assert outage.is_treatment(("provider_outage",), 1, injected={"providers[0]"}) is False
+        declared = {"provider_outage": "providers[0]"}
+        assert outage.is_treatment(("provider_outage",), 1, treatment_targets=declared, injected={"providers[0]"})
 
 
 def test_o05_a_schema_built_in_code_refuses_an_untreatable_kind_too(registry):

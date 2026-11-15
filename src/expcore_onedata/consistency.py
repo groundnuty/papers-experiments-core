@@ -28,9 +28,11 @@ of its reads.
 """
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -136,6 +138,35 @@ def bounded_map[K, V](call: Callable[[K], V], keys: Sequence[K], workers: int) -
         futures = [pool.submit(call, key) for key in keys]
         wait(futures)
     return [future.result() for future in futures]
+
+
+class WaitLog:
+    """The waits an operation took, by why each was taken: how many, and their seconds, for its record. `sleeper`
+    wraps a sleep so that each wait through it is logged under its reason; several threads may log at once."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._waits: dict[str, list[float]] = {}  # reason -> [count, seconds]
+
+    def add(self, why: str, seconds: float) -> None:
+        with self._lock:
+            entry = self._waits.setdefault(why, [0, 0.0])
+            entry[0] += 1
+            entry[1] += seconds
+
+    def sleeper(self, why: str, sleep: Callable[[float], None]) -> Callable[[float], None]:
+        """`sleep`, logging each wait under `why` before it is taken."""
+
+        def logged(seconds: float) -> None:
+            self.add(why, seconds)
+            sleep(seconds)
+
+        return logged
+
+    def facts(self) -> dict[str, dict[str, float | int]]:
+        """Each reason's `count` and `seconds`, in the order the reasons were first logged."""
+        with self._lock:
+            return {why: {"count": int(n), "seconds": round(s, 3)} for why, (n, s) in self._waits.items()}
 
 
 @dataclass(frozen=True)
@@ -325,6 +356,7 @@ def wait_visible(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     retry: ReadRetry = ONE_ATTEMPT,
+    slot: Callable[[], AbstractContextManager[Any]] = nullcontext,
 ) -> float:
     """Wait until a provider sees a file written through another, at its size; return the seconds it took.
 
@@ -335,19 +367,22 @@ def wait_visible(
     (`VISIBLE_ATTRIBUTES`). "Not visible yet" is `answered_absent` (a 404, or 25.0's 400 posix enoent), and a size other
     than `size` is a file the provider has not caught up with; both are asked again every `poll_s`. Any other failure,
     another 400 included, propagates at once (fail closed). Past `timeout_s` it raises `NotVisible`, naming the provider
-    by its position in platform.toml. A consistency wait (O07), never a probe's read (O08).
+    by its position in platform.toml. A consistency wait (O07), never a probe's read (O08). Each read is made inside
+    `slot()` (a reset's per-provider bound, `Provisioner.reading_slot`; none by default), its retries included and the
+    wait's pauses outside it.
     """
     guard()
     began = clock()
     while True:
         try:
-            answer = client.get(
-                f"/data/{file_id}",
-                provider=provider,
-                params={"attribute": list(VISIBLE_ATTRIBUTES)},
-                retry=retry,
-                deadline_s=timeout_s - (clock() - began),
-            )
+            with slot():
+                answer = client.get(
+                    f"/data/{file_id}",
+                    provider=provider,
+                    params={"attribute": list(VISIBLE_ATTRIBUTES)},
+                    retry=retry,
+                    deadline_s=timeout_s - (clock() - began),
+                )
             if isinstance(answer, dict) and answer.get("size") == size:
                 return round(clock() - began, 3)
         except PlatformError as error:

@@ -30,7 +30,15 @@ from expcore_onedata.testing import (
     with_placement,
     write_platform,
 )
-from expcore_onedata.testing.world import SPACE_IDS, SPACE_LABELS, SPACE_NAMES, with_spaces
+from expcore_onedata.testing.world import (
+    PROBE_SPACE_ID,
+    PROBE_SPACE_NAME,
+    SPACE_IDS,
+    SPACE_LABELS,
+    SPACE_NAMES,
+    with_link_check,
+    with_spaces,
+)
 from expcore_onedata.tokens import TokenIssuer
 
 
@@ -155,18 +163,22 @@ def test_o09_a_reset_plan_naming_a_provider_that_does_not_support_its_space_is_r
 
 def test_o04_the_health_token_reaches_only_the_spaces_the_data_path_reaches(tmp_path, fake, ticker):
     """O04: the second space is the tool server's alone, and the service user has no rights in it; the health check's
-    token is scoped to the data path's space, so it is minted and the check passes on that space."""
+    token is scoped to the data path's space, so it is minted and the check passes on that space. The second space is
+    beta's too, so the link check (O35) probes alpha <- beta in a probe space of its own."""
 
     def edit(data):
         two_spaces(data)
         data["spaces"][0]["providers"] = ["alpha"]
         data["spaces"][1]["tokens"] = ["tool_server"]
+        with_link_check(data)
 
     fake.supports.pop(BETA_ID)
     del fake.privileges[(SPACE_IDS[1], SERVICE_USER.user_id)]
+    fake.add_data_space(PROBE_SPACE_ID, PROBE_SPACE_NAME, [ALPHA_ID, BETA_ID])
     config = load_platform(written(tmp_path, edit))
     client = OnezoneClient(config, http=fake.client_http())
-    health = PlatformHealth(config, client, TokenIssuer(client, config, clock=ticker.clock), clock=ticker.clock)
+    issuer = TokenIssuer(client, config, clock=ticker.clock)
+    health = PlatformHealth(config, client, issuer, clock=ticker.clock, monotonic=ticker.clock, sleep=ticker.sleep)
     verdict = health()
     assert verdict.ok, verdict.detail
     caveats = next(iter(fake.issued.values()))["caveats"]

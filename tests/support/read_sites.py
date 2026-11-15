@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 CLIENT_NAMES = {"client", "zone", "http"}  # receivers (leading underscores dropped) that are a client or its transport
 POLICY_KEYWORDS = {"retry", "provider", "token", "timeout_s", "deadline_s", "params"}  # a mapping's `get` has none
 WAITS = {"space_root", "wait_visible", "wait_transfers"}  # the consistency module's reads, named `consistency.<name>`
-OCCUPANCY = {"physical_sizes"}  # `occupancy.physical_sizes`, which reads a distribution
+OCCUPANCY = {"physical_sizes", "holdings"}  # `occupancy.physical_sizes` and `.holdings`, which read distributions
 GATED = {"mutate", "read_range", "read_content"}  # client calls whose gate reads under `gate_retry=`
 SPACE_READS = {"space_name", "file_space_id", "file_space_name"}  # client reads that find a space, under `retry=`
 NO_POLICY = {"content_answer"}  # client calls with no policy at all: one attempt by construction
@@ -82,6 +82,7 @@ PROVISIONER_HELPERS: dict[str, str | None] = {
     "read_through": None,
     "schedule_transfer": None,
     "replicate": None,
+    "replicate_file": None,
     "evict": None,
     "teardown": None,
     "verify_space": None,
@@ -274,7 +275,7 @@ class _Scanner:
             self._read(where, attr, _keyword(call, "retry") or MISSING)
         elif attr in ("_send", "_request") and receiver == "self":
             self._internal_request(call, where, attr)
-        elif attr in ("stream", "request") and _segment(func.value) in CLIENT_NAMES | {"one_shot"}:
+        elif attr in ("stream", "request", "send") and _segment(func.value) in CLIENT_NAMES | {"one_shot"}:
             self._read(where, f"http.{attr}", "<streamed>" if attr == "stream" else "<transport>")
         elif attr in GATE_INTERNALS and receiver == "self":
             self._read(where, f"self.{attr}", _reads_of(call))

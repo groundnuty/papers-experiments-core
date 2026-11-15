@@ -237,12 +237,19 @@ def _no_deadline() -> None:
     return None
 
 
+def _nothing_known() -> dict[str, Any]:
+    """The default `in_flight`: the caller says nothing of the request in flight."""
+    return {}
+
+
 @dataclass
 class Retrier:
     """Sends requests one at a time and retries transient errors; one per backend, so its counters are the run's.
 
     `sleep`, `rng` and `time_left` are injected, so a test never waits and a run's deadline is the loop's.
-    `time_left` returns the seconds the run has left, or None when it has no deadline.
+    `time_left` returns the seconds the run has left, or None when it has no deadline. `in_flight` returns what the
+    caller knows of the request in flight, read when the request is given up and kept in the abandoned entry beside
+    the reason (the adapters' bound on its prompt, B19); it cannot replace the reason or the unknown usage.
     """
 
     policy: RetryPolicy
@@ -251,11 +258,14 @@ class Retrier:
     time_left: Callable[[], float | None] = _no_deadline
     stats: RetryStats = field(default_factory=RetryStats)
     events: list[dict[str, Any]] = field(default_factory=list)
-    abandoned: dict[str, str] | None = None
+    abandoned: dict[str, Any] | None = None
+    in_flight: Callable[[], Mapping[str, Any]] = _nothing_known
 
     def abandon(self, reason: str) -> None:
-        """Record that a request in flight was given up; its usage is unknown."""
-        self.abandoned = {"reason": reason, "usage": "unknown"}
+        """Record that a request in flight was given up; its usage is unknown. What the caller knows of that request
+        is read now, so a request built later cannot change the entry."""
+        account = {k: v for k, v in self.in_flight().items() if k not in ("reason", "usage")}
+        self.abandoned = {"reason": reason, "usage": "unknown", **account}
 
     async def call[T](self, send: Callable[[], Awaitable[T]]) -> tuple[T, tuple[dict[str, Any], ...]]:
         """Send until it answers; return the reply and the retries this call made, each with its error.
@@ -294,7 +304,7 @@ class Retrier:
             raise InfraError("key_rejected", f"HTTP {info.status} {info.error_class}") from None
         if info.kind == "read_timeout":
             self.stats.read_timeouts += 1
-            self.abandoned = {"reason": "read_timeout", "usage": "unknown"}
+            self.abandon("read_timeout")
             raise RequestAbandoned("read timeout") from exc
         if info.kind == "context_overflow":
             raise ContextOverflow(info.status, info.overflow or "context") from None

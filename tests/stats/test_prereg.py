@@ -7,10 +7,13 @@ import pytest
 
 from expcore.campaign.factors import FactorSchema
 from expcore.config.loading import ConfigError
+from expcore.stats import estimators
+from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import ContrastSpec
 from expcore.stats.power import PowerSettings
-from expcore.stats.prereg import BootstrapSettings, Preregistration, parse
+from expcore.stats.prereg import BootstrapSettings, Preregistration, name_digest, parse
 from expcore.stats.prereg import load as load_checked
+from expcore.stats.ratio import RatioForm
 
 SCHEMA = FactorSchema(
     {"gate": ["open", "shut"]},
@@ -478,3 +481,396 @@ def test_the_target_power_is_a_setting_with_a_default(tmp_path):
     assert prereg.power.target_power == 0.9
     with pytest.raises(ConfigError, match="key 'target_power' must be strictly between 0 and 1"):
         load(write(tmp_path, edited("sd_grid = [0.1, 0.2]", "sd_grid = [0.1, 0.2]\ntarget_power = 1.0")))
+
+
+# --- a ratio contrast: a numerator and a denominator in place of an outcome, and a declared zero rule -----------------
+
+RATIO = """
+[contrasts.spend-per-win]
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator = "spend"
+denominator = "wins"
+zero_denominator = "exclude"
+cluster = "group"
+"""
+
+
+def with_ratio(old="", new=""):
+    """The base text with the ratio contrast above appended, one exact piece of it replaced."""
+    contrast = RATIO if not old else edited(old, new, RATIO)
+    return BASE + contrast
+
+
+def test_s13_a_ratio_contrast_loads_with_its_two_outcomes_and_its_declared_zero_rule(tmp_path):
+    """S13: its outcome is the label numerator/denominator, and its form holds the rule as written."""
+    spec = load(write(tmp_path, with_ratio())).contrasts["spend-per-win"]
+    assert spec.ratio == RatioForm("spend", "wins", "exclude", None)
+    assert (spec.outcome, spec.estimator) == ("spend/wins", "ratio")
+
+
+def test_s13_a_ratio_contrast_may_declare_a_continuity_correction_in_place_of_exclusion(tmp_path):
+    """S13: the other rule, with the constant added to every cell's totals."""
+    text = with_ratio('zero_denominator = "exclude"', 'zero_denominator = "continuity"\ncontinuity_correction = 0.5')
+    assert load(write(tmp_path, text)).contrasts["spend-per-win"].ratio == RatioForm("spend", "wins", "continuity", 0.5)
+
+
+def test_s13_a_ratio_contrast_without_a_zero_rule_is_refused_naming_the_two_rules(tmp_path):
+    """S13: an undefined ratio is never handled by a default; the preregistration chooses."""
+    with pytest.raises(
+        ConfigError, match=r"\[contrasts.spend-per-win\]: key 'zero_denominator' is required.*'exclude'"
+    ):
+        load(write(tmp_path, with_ratio('zero_denominator = "exclude"\n', "")))
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "message"),
+    [
+        ('zero_denominator = "exclude"', 'zero_denominator = "drop"', "zero_denominator", "one of 'exclude'"),
+        ('zero_denominator = "exclude"', 'zero_denominator = "continuity"', "continuity_correction", "required"),
+        ('"exclude"', '"exclude"\ncontinuity_correction = 0.5', "continuity_correction", '"continuity"'),
+        ('"exclude"', '"continuity"\ncontinuity_correction = 0', "continuity_correction", "positive"),
+        ('"exclude"', '"continuity"\ncontinuity_correction = true', "continuity_correction", "number"),
+        ('denominator = "wins"', 'denominator = "spend"', "denominator", "two different outcomes"),
+        ('denominator = "wins"\n', "", "denominator", "is required"),
+        ('numerator = "spend"\n', 'outcome = "spend"\n', "outcome", "numerator and denominator"),
+    ],
+)
+def test_s13_a_ratio_contrast_that_is_not_fully_declared_is_refused_naming_the_key(tmp_path, old, new, key, message):
+    """S13: every key of the ratio form is checked where it is written."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_ratio(old, new)))
+
+
+@pytest.mark.parametrize(
+    "key", ["numerator", "denominator", "zero_denominator", "continuity_correction", "estimation_unit"]
+)
+def test_s13_a_ratio_key_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
+    """S13: a difference estimator reads one outcome, so a numerator beside it would be silently ignored."""
+    text = edited('outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n',
+                  f'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n{key} = "spend"\n')  # fmt: skip
+    with pytest.raises(ConfigError, match=rf"\[contrasts.a-vs-b\]: key '{key}' belongs to a ratio contrast"):
+        load(write(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "spend_high"'),
+        ('numerator = "spend"', 'numerator_a = "spend_high"\nnumerator_b = "spend"'),
+        ('numerator = "spend"', 'numerator = "spend_high"\nnumerator_b = "spend"'),
+    ],
+)
+def test_s13_a_ratio_contrast_may_declare_a_numerator_column_per_arm(tmp_path, old, new):
+    """S13: `numerator_a` and `numerator_b` each default to `numerator`; however the arms' columns are written, the
+    contrast holds them as arm A's and arm B's, and its outcome names both."""
+    spec = load(write(tmp_path, with_ratio(old, new))).contrasts["spend-per-win"]
+    assert spec.ratio == RatioForm(None, "wins", "exclude", numerator_a="spend_high", numerator_b="spend")
+    assert (spec.ratio.columns(0), spec.ratio.columns(1)) == (("spend_high", "wins"), ("spend", "wins"))
+    assert spec.outcome == "spend_high/wins vs spend/wins"
+
+
+def test_s13_a_ratio_contrast_may_declare_a_denominator_column_per_arm(tmp_path):
+    """S13: the denominator takes per-arm columns by the same rule."""
+    text = with_ratio('denominator = "wins"', 'denominator = "wins"\ndenominator_b = "wins_strict"')
+    spec = load(write(tmp_path, text)).contrasts["spend-per-win"]
+    assert (spec.ratio.columns(0), spec.ratio.columns(1)) == (("spend", "wins"), ("spend", "wins_strict"))
+
+
+def test_s13_per_arm_columns_that_restate_the_shared_one_load_as_the_one_column_contrast_exactly(tmp_path):
+    """S13: a per-arm key naming the shared column declares nothing new, so the contrast is the one without it."""
+    plain = load(write(tmp_path, with_ratio())).contrasts["spend-per-win"]
+    text = with_ratio('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "spend"\ndenominator_b = "wins"')
+    assert load(write(tmp_path, text)).contrasts["spend-per-win"] == plain
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "message"),
+    [
+        (
+            'numerator = "spend"',
+            'numerator = "spend"\nnumerator_a = "hi"\nnumerator_b = "lo"',
+            "numerator",
+            "is read by neither arm: numerator_a and numerator_b name both arms' columns",
+        ),
+        ('numerator = "spend"', 'numerator_a = "hi"', "numerator", "is required: arm B has no column"),
+        ('numerator = "spend"', 'numerator_b = "lo"', "numerator", "is required: arm A has no column"),
+        ('denominator = "wins"', 'denominator_a = "wins"', "denominator", "is required: arm B has no column"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = ""', "numerator_a", "non-empty string"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_b = 3', "numerator_b", "non-empty string"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_a = "wins"', "numerator_a", "make arm A read 'wins'"),
+        ('denominator = "wins"', 'denominator = "wins"\ndenominator_b = "spend"', "denominator_b", "make arm B read"),
+        ('numerator = "spend"', 'numerator = "spend"\nnumerator_c = "hi"', "numerator_c", "is not a known key"),
+    ],
+)
+def test_s13_per_arm_columns_that_leave_an_arm_or_a_column_unread_are_refused_naming_the_key(
+    tmp_path, old, new, key, message
+):
+    """S13: the shared column beside both arms' own is read by no arm; an arm with no column of a role has no ratio;
+    an arm's numerator and denominator are two outcomes; and no third arm has a key."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_ratio(old, new)))
+
+
+@pytest.mark.parametrize("key", ["numerator_a", "numerator_b", "denominator_a", "denominator_b"])
+def test_s13_a_per_arm_column_on_a_contrast_of_one_outcome_is_refused(tmp_path, key):
+    """S13: a difference estimator reads one outcome, so an arm's column beside it would be silently ignored."""
+    text = edited('outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n',
+                  f'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\n{key} = "spend"\n')  # fmt: skip
+    with pytest.raises(ConfigError, match=rf"\[contrasts.a-vs-b\]: key '{key}' belongs to a ratio contrast"):
+        load(write(tmp_path, text))
+
+
+def test_s13_a_ratio_contrast_may_declare_an_equivalence_margin_on_the_log_scale(tmp_path):
+    """S13: its margin, like its estimate, is a natural-log ratio (ln 1.25: within a factor of 1.25 either way)."""
+    text = with_ratio('cluster = "group"', 'cluster = "group"\nequivalence_margin = 0.2231')
+    assert load(write(tmp_path, text)).contrasts["spend-per-win"].equivalence_margin == 0.2231
+
+
+# --- a ratio contrast's estimation unit, and the cluster as the independent unit of every contrast -----------------
+
+
+@pytest.mark.parametrize("written", ['["model", "group"]', '["group", "model"]'])
+def test_s13_a_ratio_contrast_may_estimate_per_models_cell_of_its_cluster(tmp_path, written):
+    """S13: the sums run per model's cell of a group, the unit held in one order whichever way it is written; the
+    group stays the contrast's `cluster`, the independent unit its test and bootstrap count."""
+    text = with_ratio('cluster = "group"', f'cluster = "group"\nestimation_unit = {written}')
+    spec = load(write(tmp_path, text)).contrasts["spend-per-win"]
+    assert (spec.cluster, spec.estimation_unit) == ("group", ("model", "group"))
+
+
+@pytest.mark.parametrize("written", [None, '"group"', '["group"]'])
+def test_s13_the_cluster_alone_is_the_default_estimation_unit_of_a_ratio_contrast(tmp_path, written):
+    """S13: the default, the models of a group pooled in its sums, is the unit of the attribute alone; a contrast of
+    one outcome estimates per model's cell of its cluster, as it always has."""
+    text = (
+        with_ratio()
+        if written is None
+        else with_ratio('cluster = "group"', f'cluster = "group"\nestimation_unit = {written}')
+    )
+    spec = load(write(tmp_path, text)).contrasts["spend-per-win"]
+    assert (spec.cluster, spec.estimation_unit) == ("group", ("group",))
+    assert load(write(tmp_path)).contrasts["a-vs-b"].estimation_unit == ("model", "group")
+
+
+@pytest.mark.parametrize(
+    ("written", "message"),
+    [
+        ('["model"]', "the contrast's cluster 'group'"),
+        ("[]", "the contrast's cluster 'group'"),
+        ('["region"]', "the contrast's cluster 'group'"),
+        ('["model", "region"]', "the contrast's cluster 'group'"),
+        ('["model", "group", "region"]', "the contrast's cluster 'group'"),
+        ('["model", "model"]', "twice"),
+        ('["task", "group"]', "the contrast's cluster 'group'"),
+        ('["seed", "group"]', "the contrast's cluster 'group'"),
+        ('["model", ""]', "array of non-empty strings"),
+        ("3", "an array"),
+    ],
+)
+def test_s13_an_estimation_unit_that_is_not_the_cluster_or_the_model_and_the_cluster_is_refused(
+    tmp_path, written, message
+):
+    """S13: a cell nests in the contrast's independent unit, so it is the cluster alone or the model's cell of it."""
+    text = with_ratio('cluster = "group"', f'cluster = "group"\nestimation_unit = {written}')
+    with pytest.raises(ConfigError, match=rf"\[contrasts.spend-per-win\]: key 'estimation_unit' .*{message}"):
+        load(write(tmp_path, text))
+
+
+@pytest.mark.parametrize("confirmatory", [True, False])
+def test_s13_cells_declared_as_the_cluster_are_refused_naming_why_they_are_not_independent(tmp_path, confirmatory):
+    """S13: (model, group) cells of one group share its response to the treatment, so a test over them as
+    independent units claims an n it does not have. The cluster names one attribute, on any contrast, and the
+    refusal names the declaration that estimates per cell and tests over groups."""
+    text = with_ratio('cluster = "group"', 'cluster = ["model", "group"]')
+    if confirmatory:
+        text = text.replace('"gate-effect"]', '"gate-effect", "spend-per-win"]', 1)
+    with pytest.raises(ConfigError, match=r"\[contrasts.spend-per-win\]: key 'cluster' .*not independent") as caught:
+        load(write(tmp_path, text))
+    assert 'estimation_unit = ["model", "group"]' in str(caught.value)
+
+
+@pytest.mark.parametrize("written", ['["group"]', '["model", "group"]'])
+def test_a_cluster_written_as_an_array_is_refused_on_a_contrast_of_one_outcome(tmp_path, written):
+    """The cluster of every contrast is one task attribute, a string."""
+    text = edited('estimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"',
+                  f'estimator = "wilcoxon_cluster_bootstrap"\ncluster = {written}')  # fmt: skip
+    with pytest.raises(ConfigError, match=r"\[contrasts.a-vs-b\]: key 'cluster' .*one task attribute"):
+        load(write(tmp_path, text))
+
+
+# --- an equivalence family: Holm over the two one-sided tests of its members (S15) -----------------------------------
+
+
+def with_margins(text=BASE):
+    """The base text with a margin on both contrasts."""
+    text = edited('cluster = "group"\n\n[contrasts.gate-effect]', 'cluster = "group"\nequivalence_margin = 0.1\n\n'
+                  "[contrasts.gate-effect]", text)  # fmt: skip
+    return text + "equivalence_margin = 0.2\n"
+
+
+def family_of(*names, text=None):
+    """A preregistration declaring an equivalence family of the given contrasts."""
+    text = with_margins() if text is None else text
+    listed = ", ".join(f'"{name}"' for name in names)
+    return edited('holm_family = ["a-vs-b", "gate-effect"]', f'holm_family = ["a-vs-b", "gate-effect"]\n'
+                  f"equivalence_family = [{listed}]", text)  # fmt: skip
+
+
+def test_s15_an_equivalence_family_loads_in_its_declared_order(tmp_path):
+    """S15: its members, as written; a preregistration without one has none."""
+    assert load(write(tmp_path, family_of("gate-effect", "a-vs-b"))).equivalence_family == ("gate-effect", "a-vs-b")
+    assert load(write(tmp_path)).equivalence_family == ()
+
+
+@pytest.mark.parametrize(
+    ("names", "message"),
+    [
+        (("nope",), "names 'nope', which is not a declared contrast"),
+        (("a-vs-b", "a-vs-b"), "names a contrast twice"),
+        ((), "is empty"),
+    ],
+)
+def test_s15_an_equivalence_family_that_names_no_declared_contrast_once_is_refused(tmp_path, names, message):
+    """S15: each member a declared contrast, once."""
+    with pytest.raises(ConfigError, match=f"key 'equivalence_family' {message}"):
+        load(write(tmp_path, family_of(*names)))
+
+
+def test_s15_a_member_without_a_margin_is_refused(tmp_path):
+    """S15: equivalence is within a margin, so a member must declare one."""
+    with pytest.raises(ConfigError, match="names 'a-vs-b', which declares no equivalence_margin"):
+        load(write(tmp_path, family_of("a-vs-b", text=BASE + "equivalence_margin = 0.2\n")))
+
+
+def test_s15_a_member_outside_the_holm_family_is_refused(tmp_path):
+    """S15: an equivalence claim the family controls is confirmatory, so its contrast is not shown as exploratory."""
+    text = edited('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["a-vs-b"]', family_of("gate-effect"))
+    with pytest.raises(ConfigError, match="names 'gate-effect', which is not in holm_family"):
+        load(write(tmp_path, text))
+
+
+def test_s15_an_equivalence_family_beside_exploratory_only_is_refused(tmp_path):
+    """S15, S12: a preregistration that makes no confirmatory claim makes no confirmatory equivalence claim either."""
+    flag = 'exploratory_only = true\nequivalence_family = ["a-vs-b"]'
+    text = edited('holm_family = ["a-vs-b", "gate-effect"]', flag, with_margins())
+    with pytest.raises(ConfigError, match="key 'equivalence_family' is given with exploratory_only = true"):
+        load(write(tmp_path, text))
+
+
+def test_s15_a_member_whose_estimator_has_no_tost_p_is_refused(tmp_path, monkeypatch):
+    """S15: the family's decision is Holm over TOST p-values, which such an estimator cannot give."""
+    monkeypatch.setattr(estimators, "_REGISTRY", dict(estimators._REGISTRY))
+    estimators.register("no_tost")(lambda paired, settings: None)
+    text = edited('estimator = "wilcoxon_cluster_bootstrap"', 'estimator = "no_tost"', family_of("a-vs-b"))
+    with pytest.raises(ConfigError, match="names 'a-vs-b', whose estimator 'no_tost' registers no TOST p-value"):
+        load(write(tmp_path, text))
+
+
+# --- one-arm estimates: [descriptives.<name>] ------------------------------------------------------------------------
+
+DESCRIPTIVES = """
+[descriptives.waited-in-a]
+conditions = ["cond-a"]
+outcome = "waited"
+cluster = "group"
+
+[descriptives.queries-per-placement]
+conditions = ["cond-a", "cond-b"]
+numerator = "queries"
+denominator = "placements"
+cluster = "group"
+"""
+
+
+def test_s14_one_arm_estimates_load_in_their_order_with_their_settings(tmp_path):
+    """S14: a rate and a ratio of totals, each over its conditions, seeded by its own name."""
+    prereg = load(write(tmp_path, BASE + DESCRIPTIVES))
+    assert list(prereg.descriptives) == ["waited-in-a", "queries-per-placement"]
+    assert prereg.descriptives["waited-in-a"] == DescriptiveSpec("waited-in-a", ("cond-a",), "group", outcome="waited")
+    ratio = prereg.descriptives["queries-per-placement"]
+    assert (ratio.conditions, ratio.numerator, ratio.denominator) == (("cond-a", "cond-b"), "queries", "placements")
+    settings = prereg.descriptive_settings(ratio)
+    assert (settings.replicates, settings.level) == (500, 0.9)
+    assert settings.seed == (20260101, name_digest("queries-per-placement"))
+    assert load(write(tmp_path)).descriptives == {}
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "key", "message"),
+    [
+        ('conditions = ["cond-a"]', 'conditions = ["cond-z"]', "conditions", "unknown condition 'cond-z'"),
+        ('conditions = ["cond-a"]', "conditions = []", "conditions", "one condition or more"),
+        ('conditions = ["cond-a"]', 'conditions = ["cond-a", "cond-a"]', "conditions", "each condition once"),
+        ('outcome = "waited"', 'outcome = "waited"\nnumerator = "q"', "numerator", "not both"),
+        ('outcome = "waited"\n', "", "outcome", "an outcome, or a numerator and a denominator"),
+        ('denominator = "placements"', 'denominator = "queries"', "denominator", "two different outcomes"),
+        ('cluster = "group"\n\n[descriptives.q', 'groups = "group"\n\n[descriptives.q', "groups", "is not a known key"),
+    ],
+)
+def test_s14_a_one_arm_estimate_that_is_not_fully_declared_is_refused_naming_the_key(tmp_path, old, new, key, message):
+    """S14: every key is checked where it is written."""
+    with pytest.raises(ConfigError, match=rf"\[descriptives\.[a-z-]+\]: key '{key}' .*{message}|{message}"):
+        load(write(tmp_path, BASE + edited(old, new, DESCRIPTIVES)))
+
+
+def test_s14_a_one_arm_estimate_may_not_share_a_contrasts_name_or_join_the_holm_family(tmp_path):
+    """S14: it is descriptive, never a test, and its name seeds its draws apart from every contrast's."""
+    same = DESCRIPTIVES.replace("[descriptives.waited-in-a]", "[descriptives.a-vs-b]")
+    with pytest.raises(ConfigError, match=r"\[descriptives.a-vs-b\]: .*is also a contrast's name"):
+        load(write(tmp_path, BASE + same))
+    family = edited('holm_family = ["a-vs-b", "gate-effect"]', 'holm_family = ["a-vs-b", "waited-in-a"]')
+    with pytest.raises(ConfigError, match="names 'waited-in-a', which is not a declared contrast"):
+        load(write(tmp_path, family + DESCRIPTIVES))
+
+
+# --- a smallest effect of interest (S16) -----------------------------------------------------------------------------
+
+
+def with_smallest(difference="", ratio=""):
+    """The base text with the ratio contrast appended, `difference` declared on a-vs-b and `ratio` on the ratio."""
+    head = 'outcome = "score"\nestimator = "wilcoxon_cluster_bootstrap"\ncluster = "group"\n'
+    return edited(head, f"{head}{difference}\n") + RATIO + ratio + "\n"
+
+
+def test_s16_a_smallest_effect_and_a_smallest_ratio_load_with_their_direction(tmp_path):
+    """S16: a difference on the outcome's scale, a ratio as written, compared as its natural log."""
+    text = with_smallest('smallest_effect = 0.1\ndirection = "higher"', "smallest_ratio = 2")
+    contrasts = load(write(tmp_path, text)).contrasts
+    assert (contrasts["a-vs-b"].smallest_effect, contrasts["a-vs-b"].direction) == (0.1, "higher")
+    assert (contrasts["spend-per-win"].smallest_ratio, contrasts["spend-per-win"].direction) == (2, None)
+    assert contrasts["spend-per-win"].smallest_rule.threshold == pytest.approx(0.693147, abs=1e-6)
+    assert contrasts["gate-effect"].smallest_rule is None
+
+
+@pytest.mark.parametrize(
+    ("difference", "ratio", "contrast", "key", "message"),
+    [
+        ("smallest_ratio = 2", "", "a-vs-b", "smallest_ratio", "belongs to a ratio contrast"),
+        ("", "smallest_effect = 0.5", "spend-per-win", "smallest_effect", "belongs to a contrast of one outcome"),
+        ("", "smallest_ratio = 1.0", "spend-per-win", "smallest_ratio", "a factor of one"),
+        ("", "smallest_ratio = 0", "spend-per-win", "smallest_ratio", "positive ratio"),
+        ("", "smallest_ratio = -2", "spend-per-win", "smallest_ratio", "positive ratio"),
+        ("smallest_effect = 0", "", "a-vs-b", "smallest_effect", "must be positive"),
+        ("smallest_effect = -0.1", "", "a-vs-b", "smallest_effect", "must be positive"),
+        ('smallest_effect = "0.1"', "", "a-vs-b", "smallest_effect", "finite number"),
+        ('direction = "higher"', "", "a-vs-b", "direction", "without smallest_effect or smallest_ratio"),
+        ('smallest_effect = 0.1\ndirection = "up"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
+        ('smallest_effect = 0.1\ndirection = "either"', "", "a-vs-b", "direction", "'higher' or 'lower'"),
+        ("", 'smallest_ratio = 0.5\ndirection = "higher"', "spend-per-win", "smallest_ratio", "below 1"),
+    ],
+)
+def test_s16_a_smallest_effect_of_the_wrong_form_or_value_is_refused_naming_the_contrast_and_the_key(
+    tmp_path, difference, ratio, contrast, key, message
+):
+    """S16: the loader refuses what the rule refuses, naming the file, the table and the key."""
+    with pytest.raises(ConfigError, match=rf"\[contrasts.{contrast}\]: key '{key}' .*{message}"):
+        load(write(tmp_path, with_smallest(difference, ratio)))
+
+
+def test_s16_the_preregistration_hash_covers_a_smallest_effect(tmp_path):
+    """S16, P04: the declaration is in the file, so in the hash every output carries; changing it is another file."""
+    first = load(write(tmp_path, with_smallest("smallest_effect = 0.1")))
+    second = load(write(tmp_path, with_smallest("smallest_effect = 0.2")))
+    third = load(write(tmp_path, with_smallest('smallest_effect = 0.1\ndirection = "lower"')))
+    assert len({first.sha256, second.sha256, third.sha256}) == 3

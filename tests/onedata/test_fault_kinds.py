@@ -52,6 +52,33 @@ def test_c02_a_study_that_lists_the_kinds_module_declares_a_provider_outage_with
     assert study.schema.treatment_targets["relay-down"] == {"provider_outage": "providers[1]"}
 
 
+def test_c34_a_study_that_declares_a_provider_outage_without_its_target_is_refused_naming_the_condition(tmp_path):
+    """C34: the plain name `provider_outage` would score any provider's outage as the manipulation, so `load_study`
+    refuses it, naming study.toml, the condition, the key and the kind, and says what to write instead."""
+    with pytest.raises(ConfigError) as caught:
+        load_study(study_declaring(tmp_path, '["provider_outage"]'))
+    message = str(caught.value)
+    assert "study.toml: [conditions.relay-down]: key 'infrastructure_is_treatment'" in message
+    assert "'provider_outage'" in message
+    assert "no target" in message
+    assert 'kind = "provider_outage", target = ' in message
+    with pytest.raises(ConfigError, match=r"'provider_outage'.*no target"):
+        load_study(study_declaring(tmp_path / "again", '["provider_outage", "knowledge"]'))
+
+
+def test_c34_the_outage_is_the_one_kind_of_the_layer_that_requires_its_target():
+    """C34: in a fresh process the one kinds module registers `provider_outage` as a kind that requires its target,
+    and no other kind of the layer requires one."""
+    code = (
+        "import expcore_onedata.sandbox.kinds\n"
+        "from expcore.errors import targeted_kinds\n"
+        "print(sorted(targeted_kinds()))\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "['provider_outage']"
+
+
 def test_c02_the_injectors_own_failure_is_refused_as_a_treatment_as_one_that_never_can_be_not_as_unknown(tmp_path):
     """C02: `injector_failure` is known once the module is listed, and refused because a run whose fault was never
     verified says nothing about the outage, with the reason its registration gives."""

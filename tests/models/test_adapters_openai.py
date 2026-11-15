@@ -403,7 +403,9 @@ def test_b03_a_read_timeout_is_abandoned_after_one_request_with_usage_unknown(
         step(backend)
     assert len(client.requests) == 1
     info = backend.info()
-    assert info["abandoned_request"] == {"reason": "read_timeout", "usage": "unknown"}
+    entry = info["abandoned_request"]
+    assert (entry["reason"], entry["usage"]) == ("read_timeout", "unknown")
+    assert entry["prompt_bound_by"] == "none"  # the first request, and the entry names no window (B19)
     assert info["read_timeouts"] == 1
 
 
@@ -423,7 +425,9 @@ def test_b03_the_run_deadline_cancelling_a_request_is_recorded_as_abandoned(make
 
     with pytest.raises(TimeoutError):
         asyncio.run(run())
-    assert backend.info()["abandoned_request"] == {"reason": "deadline", "usage": "unknown"}
+    entry = backend.info()["abandoned_request"]
+    assert (entry["reason"], entry["usage"]) == ("deadline", "unknown")
+    assert entry["prompt_bound_by"] == "none"  # the first request, and the entry names no window (B19)
 
 
 @pytest.mark.parametrize("status", [401, 403])
