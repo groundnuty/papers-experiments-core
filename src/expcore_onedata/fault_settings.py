@@ -112,12 +112,13 @@ four providers, and 4,790 s and 182 s, 4,972 s, for five at the 4,290 s they nee
 deferral is the check that starts the heal, and only the waits after the heal are added (the 4,470 s of five providers
 and 91 s, 4,561 s). A `health_timeout_s` of 150 s, as the link check needs, makes them 5,062 s, 5,152 s and 4,651 s.
 
-The figure assumes every check ends within `health_timeout_s`, as a check must (the link check too: keep it above
-`visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but its thread runs on
-and can still start the heal later than the figure counts. A deferral that began before the drain (an outage run still
-running, and another worker's check deferred on it) or for another reason (a run on an ingest baseline), and a heal
-that waits for another holder of the federation (the hold `federation_busy`), count from the deferral's first answer, so
-its age holds that wait too, which no setting here bounds.
+The figure assumes the heal ends within its own bound (a heal that overruns it closes the gate, and the settle's hold it
+leaves can defer a check later still), and every check ends within `health_timeout_s`, as a check must (the link check
+too: keep it above `visible_timeout_s + timeout_s + evict_timeout_s`): the core gives up on one that outlives it, but
+its thread runs on and can still start the heal later than the figure counts. A deferral that began before the drain
+(an outage run still running, and another worker's check deferred on it) or for another reason (a run on an ingest
+baseline), and a heal that waits for another holder of the federation (the hold `federation_busy`), count from the
+deferral's first answer, so its age holds that wait too, which no setting here bounds.
 """
 
 import hashlib
