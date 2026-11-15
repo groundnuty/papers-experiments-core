@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
+from tree_support import tree_of
 
 from expcore.campaign.export import read_export
 from expcore.campaign.snapshot import SNAPSHOT_FILE
@@ -172,6 +173,23 @@ def test_r04_the_analysis_reads_the_snapshot_and_never_the_live_store(copy, clea
         leftover.unlink()
     assert cli(clean_environment, "report", str(copy.root))[0] == 0
     assert (copy.root / "out" / "report.md").read_text(encoding="utf-8") == finished.report
+
+
+def test_r16_analyze_report_and_regenerate_leave_the_sealed_batch_and_out_byte_for_byte_as_they_were(
+    copy, clean_environment
+):
+    """R16: the readers of a checked batch read the sealed snapshot's bytes, never the file in place, and never open
+    the live store: every file of out/, the hashed batch with its snapshot among them, keeps its bytes (the outputs
+    are written again with the same ones), and no file is added, no side file of the snapshot or of the store."""
+    out = copy.root / "out"
+    for leftover in out.glob("state.sqlite-*"):  # what the check's read-only opens of the store left
+        leftover.unlink()
+    sealed = tree_of(out)
+    assert f"runs/{SNAPSHOT_FILE}" in sealed
+    assert cli(clean_environment, "analyze", str(copy.root))[0] == 0
+    assert cli(clean_environment, "report", str(copy.root))[0] == 0
+    assert pipeline.regenerate(copy.root) == []
+    assert tree_of(out) == sealed
 
 
 @pytest.mark.parametrize(

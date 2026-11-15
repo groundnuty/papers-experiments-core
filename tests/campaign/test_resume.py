@@ -1,6 +1,7 @@
 """Resume: a campaign never continues into another experiment (C06) and keeps its order (C08)."""
 
 import json
+import os
 import sqlite3
 from dataclasses import replace
 
@@ -15,12 +16,21 @@ from campaign_support import (
     sha,
     treatment_schema,
 )
+from tree_support import added, tree_of
 
 from expcore.campaign.attempts import PinMismatch, ResumeRefused, SchemaMismatch
 from expcore.campaign.factors import FactorSchema, PlanError
 from expcore.campaign.recovery import Recovery
-from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, RunSetMismatch, open_campaign
+from expcore.campaign.resume import (
+    FINGERPRINT_KEY,
+    FingerprintMismatch,
+    RunSetMismatch,
+    open_campaign,
+    read_fingerprint,
+)
+from expcore.campaign.scheduler import STATE_FILE
 from expcore.campaign.store import Store
+from expcore.package.spec import never_selected
 
 LIMIT = 3
 
@@ -409,3 +419,27 @@ def test_c06_a_manifest_that_runs_the_subset_condition_on_every_task_is_refused_
             max_attempts=LIMIT,
         )
     assert not (tmp_path / "campaign.db").exists()
+
+
+# --- reading the fingerprint of a finished store (R16) ---------------------------------------------------------------
+
+
+def test_r16_reading_a_finished_stores_fingerprint_leaves_the_batch_and_the_store_and_adds_only_unpackaged_side_files(
+    tmp_path,
+):
+    """R16: the check reads the fingerprint over a read-only connection to the store in place, which in WAL mode makes
+    its -shm and -wal and cannot remove them. They lie beside the store in out/, outside the hashed batch out/runs/,
+    and the package drops every `out/state.sqlite-*`; the batch and the store keep every byte."""
+    store, _ = start(tmp_path)
+    store.close()
+    out = tmp_path / "out"
+    (out / "runs").mkdir(parents=True)
+    (out / "runs" / "record.json").write_text("{}", encoding="utf-8")
+    os.replace(tmp_path / "campaign.db", out / STATE_FILE)
+    before = tree_of(out)
+    assert read_fingerprint(out / STATE_FILE) == make_fingerprint(make_schema())
+    after = tree_of(out)
+    new = added(before, after)
+    assert set(new) <= {f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"}, new
+    assert all(never_selected(f"out/{name}") for name in new)
+    assert {name: after[name] for name in before} == before

@@ -31,9 +31,11 @@ from shard_support import (
     write_meta,
 )
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, table
+from tree_support import added, tree_of
 
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.merge import SHARDS_DIR
+from expcore.campaign.scheduler import STATE_FILE
 from expcore.campaign.shard import (
     MERGE_FILE,
     MERGE_SCHEMA,
@@ -43,6 +45,7 @@ from expcore.campaign.shard import (
     RULE,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, StoreSnapshot, take_snapshot
+from expcore.package.spec import never_selected
 from expcore.records.record import record_filename
 from expcore.study.config import load_study
 from expcore.study.pipeline import Refused, regenerate
@@ -314,6 +317,50 @@ def _report_differs_only_in_positions(merged: str, whole: str) -> bool:
         if a != b and not (a.startswith("| ") and a.rsplit(" | ", 1)[0] == b.rsplit(" | ", 1)[0]):
             return False
     return True
+
+
+def test_r16_a_merge_leaves_each_shards_batch_and_store_and_adds_only_the_stores_unpackaged_side_files(
+    base, clean_environment, shard1, shard2
+):
+    """R16: the merge copies a finished shard's store over a read-only connection in place, which in WAL mode makes
+    its -shm and -wal and cannot remove them. They lie beside the store in the shard's out/, outside its hashed
+    batch, and a package drops every `out/state.sqlite-*`; every other file of the shard's out/ keeps its bytes."""
+    shards = [copy_campaign(shard, base, f"r16-{shard.root.name}") for shard in (shard1, shard2)]
+    for shard in shards:
+        for leftover in (shard.root / "out").glob(f"{STATE_FILE}-*"):  # what the shard's own check left
+            leftover.unlink()
+    before = [tree_of(shard.root / "out") for shard in shards]
+    code, errors = merge_into(clean_environment, Campaign(make_study(base, "r16-merge")), *shards)
+    assert code == 0, errors
+    for shard, was in zip(shards, before, strict=True):
+        now = tree_of(shard.root / "out")
+        new = added(was, now)
+        assert set(new) <= {f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"}, new
+        assert all(never_selected(f"out/{name}") for name in new)
+        assert {name: now[name] for name in was} == was
+
+
+def test_r16_check_analyze_and_regenerate_read_a_merged_batchs_sealed_snapshots_and_leave_it_as_it_was(
+    base, clean_environment, merged
+):
+    """R16: each shard's snapshot under OUT/shards/ is read as the bytes merge.json names, never opened in place:
+    analyze, report and regenerate leave every file of OUT byte for byte, and check rewrites its own check file and
+    nothing else."""
+    copy = copy_campaign(merged, base, "r16-merged")
+    out = copy.root / "out"
+    sealed = tree_of(out)
+    assert [name for name in sealed if name.startswith(f"{SHARDS_DIR}/")] == [
+        f"{SHARDS_DIR}/1/{SNAPSHOT}",
+        f"{SHARDS_DIR}/2/{SNAPSHOT}",
+    ]
+    assert cli(clean_environment, "analyze", str(copy.root))[0] == 0
+    assert cli(clean_environment, "report", str(copy.root))[0] == 0
+    assert regenerate(copy.root) == []
+    assert tree_of(out) == sealed
+    assert cli(clean_environment, "check", str(copy.runs))[0] == 0
+    checked = tree_of(out)
+    assert set(checked) == set(sealed)
+    assert [name for name in sealed if checked[name] != sealed[name]] in ([], ["runs/replay-check.json"])
 
 
 def test_c29_regenerate_derives_the_outputs_of_a_merged_batch_anew(merged):

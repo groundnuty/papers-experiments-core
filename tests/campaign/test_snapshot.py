@@ -1,14 +1,20 @@
 """The snapshot of the campaign store: a consistent read-only copy the replay check hashes, and a view of its bytes."""
 
+import os
 import sqlite3
 
 import pytest
 from campaign_support import NOW, make_schema, planned_store, run_one
+from tree_support import added, tree_of
 
 from expcore.campaign.export import export_run_state
 from expcore.campaign.markers import AttemptResult
+from expcore.campaign.scheduler import STATE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE, AttemptsRunning, SnapshotError, StoreSnapshot, take_snapshot
 from expcore.loop.outcomes import Outcome
+from expcore.package.spec import never_selected
+
+WAL_HEADER, ROLLBACK_HEADER = b"\x02\x02", b"\x01\x01"  # a database file's bytes 18 and 19: its write and read versions
 
 
 def finished() -> AttemptResult:
@@ -23,6 +29,18 @@ def settled(tmp_path):
     run_one(store, keys[0], finished())
     run_one(store, keys[1], finished())
     return store, keys
+
+
+@pytest.fixture
+def finished_out(settled, tmp_path):
+    """A study's out/ as a finished campaign leaves it: the store closed under its own name, and an empty batch."""
+    store, _ = settled
+    store.close()
+    out = tmp_path / "out"
+    (out / "runs").mkdir(parents=True)
+    os.replace(store.path, out / STATE_FILE)
+    assert sorted(p.name for p in tmp_path.glob(f"{store.path.name}*")) == []  # the close left no side file
+    return out
 
 
 def test_a_snapshot_is_a_copy_whose_export_equals_the_stores(settled, tmp_path):
@@ -136,3 +154,53 @@ def test_r04_a_snapshot_from_before_the_admission_column_exports_it_as_unknown(s
     data = export_run_state(StoreSnapshot(destination.read_bytes(), make_schema()))
     assert data["analysed_attempts"]
     assert all(entry["admission"] is None for entry in data["analysed_attempts"])
+
+
+# --- R16: a read of a finished or sealed store writes nothing into a hashed or packaged directory --------------------
+
+
+def test_r16_a_finished_store_stays_in_wal_mode_and_its_snapshot_is_one_rollback_journal_file(finished_out):
+    """R16: the campaign keeps its store in WAL mode, closed too (bytes 18 and 19 at 2), so any later open of it makes
+    a -shm and a -wal. What is sealed is the snapshot, which says rollback journal (both at 1): read in place or as
+    bytes, it never needs a side file."""
+    store = finished_out / STATE_FILE
+    assert store.read_bytes()[18:20] == WAL_HEADER
+    take_snapshot(store, finished_out / "runs" / SNAPSHOT_FILE)
+    assert (finished_out / "runs" / SNAPSHOT_FILE).read_bytes()[18:20] == ROLLBACK_HEADER
+
+
+def test_r16_snapshotting_a_finished_store_writes_only_the_snapshot_into_the_batch(finished_out):
+    """R16: the check copies the store into the batch it then hashes; the batch gains the snapshot and nothing else,
+    no scratch copy and no side file of either database."""
+    batch = finished_out / "runs"
+    take_snapshot(finished_out / STATE_FILE, batch / SNAPSHOT_FILE)
+    assert list(tree_of(batch)) == [SNAPSHOT_FILE]
+
+
+def test_r16_reading_the_sealed_snapshot_leaves_the_batch_byte_for_byte_as_it_was(finished_out):
+    """R16: the analysis reads the snapshot's bytes once and opens them in memory; the batch, the snapshot with it,
+    keeps every byte and gains no file."""
+    batch = finished_out / "runs"
+    take_snapshot(finished_out / STATE_FILE, batch / SNAPSHOT_FILE)
+    sealed = tree_of(batch)
+    snapshot = StoreSnapshot((batch / SNAPSHOT_FILE).read_bytes(), make_schema())
+    try:
+        assert export_run_state(snapshot)["analysed_attempts"]
+    finally:
+        snapshot.close()
+    assert tree_of(batch) == sealed
+
+
+def test_r16_the_read_only_open_of_a_finished_store_adds_only_its_side_files_beside_it_and_no_package_takes_them(
+    finished_out,
+):
+    """R16: the store is copied over a read-only connection in place, and a read-only open of a database in WAL mode
+    makes its -shm and -wal, which it cannot remove. They lie beside the store in out/, outside the hashed batch, and
+    the package drops every `out/state.sqlite-*`; the store's own bytes do not change."""
+    store = finished_out / STATE_FILE
+    before, stored = tree_of(finished_out), store.read_bytes()
+    take_snapshot(store, finished_out / "runs" / SNAPSHOT_FILE)
+    new = [name for name in added(before, tree_of(finished_out)) if name != f"runs/{SNAPSHOT_FILE}"]
+    assert set(new) <= {f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"}, new
+    assert all(never_selected(f"out/{name}") for name in new)
+    assert store.read_bytes() == stored
