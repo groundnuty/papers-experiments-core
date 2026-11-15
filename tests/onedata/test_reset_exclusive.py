@@ -26,6 +26,7 @@ from fault_support import OUTAGE_TARGET, FakeServices, write_faults
 from reset_lock_support import hold_and_fork, run_and_hang
 from shared_support import hold_and_die
 
+import expcore_onedata.admission as admission_module
 from expcore.errors import InfraError
 from expcore_onedata import resetgrant, resetshortcut
 from expcore_onedata.admission import (
@@ -342,6 +343,26 @@ def test_o11_a_worker_that_holds_a_share_keeps_the_shortcut_off_and_nothing_is_g
             assert admission.reset.shared
             assert not free(settings, FEDERATION_RESET)
         give_up()
+
+
+def test_o11_a_section_entered_after_the_owner_left_a_worker_holding_the_last_share_gives_no_shortcut(tmp_path):
+    """O11: the owner has left and a worker it handed a share still holds the admission, and may be reading: a section
+    entered from a context that inherited the admission is not sealed, gives no shortcut and gives nothing up."""
+    config, settings, lock = federation(tmp_path)
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        give_up = admission.retain()
+    assert admission.held  # the worker's share keeps it
+    assert admission.seal() is False
+    token = admission_module._ADMISSION.set(admission)  # a context that inherited it, as a task inherits its parent's
+    try:
+        with exclusive(config, shortcut()) as grant:
+            assert (grant.why, grant.shortcut) == (SHARES_RETAINED, False)
+            assert admission.reset.shared
+            assert not free(settings, FEDERATION_RESET)
+    finally:
+        admission_module._ADMISSION.reset(token)
+        give_up()
+    assert free(settings, FEDERATION_RESET)
 
 
 def test_o11_no_worker_takes_a_share_while_a_section_is_held(tmp_path):

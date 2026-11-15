@@ -201,10 +201,11 @@ class Admission:
 
     def seal(self) -> bool:
         """For a shortcut reset's section (`resetgrant.py`): refuse every worker a share from now on, and return True,
-        when the admission is held and no worker holds a share (its owner's alone); else False, sealing nothing. A
-        worker that already holds a share may be reading, which the section must rule out."""
+        when the admission is held and its one share is its owner's (the owner has not left, and no worker holds a
+        share); else False, sealing nothing. A worker that holds a share, the last one after the owner left included,
+        may be reading, which the section must rule out."""
         with self.shares.lock:
-            if not self.held or self.shares.count != 1 or self.shares.sealed:
+            if not self.held or self.shares.owner_left or self.shares.count != 1 or self.shares.sealed:
                 return False
             self.shares.sealed = True
             return True
