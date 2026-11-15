@@ -87,16 +87,20 @@ is refused. **Both durations are provisional,** to be tuned as live heals are me
 restore come the collection, `finish_instruments` and the tool server's stop, whose re-verification of the tool plane
 examines the run's token and fails the run as `tool_plane_integrity` once it has expired (`toolserver._recheck`). A
 run's token outlives its whole-time ceiling by `[tokens] margin_s` only, counted from its mint. The restore always runs
-(its container start and its session gate use no run token), so a platform.toml with `[faults]` is refused at load,
-heal declared or not, unless `margin_s` is at least `restore_token_margin_s`, naming every number: the restore's bound
-(`restore_bound_s`: a stop of unknown outcome waited out, `settle_timeout_s`; `clear_attempts` starts, each with its
-command and its wait for the new identity, `command_timeout_s` and `settle_timeout_s`, and a pause between two; the
-wait to serve, `ready_timeout_s`; each of those waits one pause, `poll_s`, past its bound, which it checks only after a
-reading; and the session gate, `gate_timeout_s`), 1,514 s with the defaults, plus `TOKEN_SLACK_S`, 300 s, for what
-that bound does not hold (the readings' own time, the injector's start after the mint, the link check after the gate,
-the steps before the tool server's check): 1,814 s with the defaults, so the default 900 s must be raised. Not
-counted: a start's recovery of an injection an earlier run left, which the health gate settles before a run is
-dispatched, and the session drain, which the run's admission publishes after the post-run check.
+(its container start and its session gate use no run token), and a token's lifetime is the study's choice, declared
+and never implied, so a platform.toml with `[faults]` is refused at load, heal declared or not, unless it declares
+`[tokens] margin_s` and that is at least `restore_token_margin_s`: a missing margin and a short one are refused alike,
+naming the least, its derivation term by term (`restore_margin_derivation`) and the line to write, and no default is
+derived. The least is the restore's bound (`restore_bound_s`: a stop of unknown outcome waited out,
+`settle_timeout_s`; `clear_attempts` starts, each with its command and its wait for the new identity,
+`command_timeout_s` and `settle_timeout_s`, and a pause between two; the wait to serve, `ready_timeout_s`; each of
+those waits one pause, `poll_s`, past its bound, which it checks only after a reading; and the session gate,
+`gate_timeout_s`), 1,514 s with the defaults, plus `TOKEN_SLACK_S`, 300 s, for what that bound does not hold (the
+readings' own time, the injector's start after the mint, the link check after the gate, the steps before the tool
+server's check), rounded up to a whole second: 1,814 s with the defaults, above the 900 s a platform without
+`[faults]` still gets when it declares nothing. Not counted: a start's recovery of an injection an earlier run left,
+which the health gate settles before a run is dispatched, and the session drain, which the run's admission publishes
+after the post-run check.
 
 **A heal is skipped while a step of the run that uses its tokens runs.** A heal may take `heal_timeout_s` more, so at
 its start the injector reads the steps of the run that use its tokens (the tool server's launch and the sandbox's,
@@ -266,22 +270,56 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             "heal_timeout_s",
             f'must be at least {least:g} for heal = "{heal}": one round of its actions at their declared bounds',
         )
-    margin, needed = config.tokens.margin_s, restore_token_margin_s(settings)
-    if margin < needed:
-        s = settings
+    _require_token_margin(table, load_toml(file), settings)
+    return settings
+
+
+def _require_token_margin(table: Section, document: Mapping[str, Any], settings: FaultSettings) -> None:
+    """Refuse a platform with `[faults]` whose `[tokens] margin_s` is not declared, or is below the least the restore
+    and its gate need (`restore_token_margin_s`); the refusal names the least, its derivation and the line to write. A
+    token's lifetime is the study's choice: none is derived for it (see the module docstring)."""
+    tokens = document.get("tokens")
+    declared = tokens.get("margin_s") if isinstance(tokens, Mapping) else None
+    needed = restore_token_margin_s(settings)
+    least = math.ceil(needed)  # margin_s is a whole number of seconds
+    why = f"the least is {least:g} s, the restore and its gate before the tool server's stop examines the run's token: "
+    how = f"{restore_margin_derivation(settings)}, so"
+    if declared is None:
         raise table.fail(
             None,
-            f"its restore could outlast the run's token: [tokens] margin_s must be at least {needed:g} s, not "
-            f"{margin:g} s: a stop of unknown outcome waited out (settle_timeout_s {s.settle_timeout_s:g} s), "
-            f"{s.clear_attempts} starts each with its wait for the new identity ({s.clear_attempts} x "
-            f"(command_timeout_s {s.command_timeout_s:g} s + settle_timeout_s {s.settle_timeout_s:g} s)) and "
-            f"{s.clear_attempts - 1} pause(s) between them, the wait to serve (ready_timeout_s "
-            f"{s.ready_timeout_s:g} s), each wait one pause (poll_s {s.poll_s:g} s) past its bound, the session gate "
-            "(gate_timeout_s "
-            f"{s.gate_timeout_s:g} s) and {TOKEN_SLACK_S:g} s of slack, since the tool server's stop after the restore "
-            "examines the run's token",
+            f"[tokens] margin_s is not declared, and a platform with [faults] must declare it: {why}{how} add: "
+            f"[tokens] margin_s = {least:g}",
         )
-    return settings
+    if declared < needed:
+        raise table.fail(
+            None, f"[tokens] margin_s = {declared:g} is too small: {why}{how} set: [tokens] margin_s = {least:g}"
+        )
+
+
+def _restore_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
+    """The terms of `restore_token_margin_s`, each with its declared values in words (see `restore_bound_s`)."""
+    s, attempts = settings, settings.clear_attempts
+    identity_wait = s.settle_timeout_s + s.poll_s
+    return (
+        (f"a stop of unknown outcome waited out (settle_timeout_s {s.settle_timeout_s:g} s + poll_s {s.poll_s:g} s)",
+         identity_wait),
+        (f"{attempts} starts each with its wait ({attempts} x (command_timeout_s {s.command_timeout_s:g} s + "
+         f"settle_timeout_s {s.settle_timeout_s:g} s + poll_s {s.poll_s:g} s))",
+         attempts * (s.command_timeout_s + identity_wait)),
+        (f"{attempts - 1} pause(s) between them ({attempts - 1} x poll_s {s.poll_s:g} s)", (attempts - 1) * s.poll_s),
+        (f"the wait to serve (ready_timeout_s {s.ready_timeout_s:g} s + poll_s {s.poll_s:g} s)",
+         s.ready_timeout_s + s.poll_s),
+        (f"the session gate (gate_timeout_s {s.gate_timeout_s:g} s)", s.gate_timeout_s),
+        (f"slack {TOKEN_SLACK_S:g} s", TOKEN_SLACK_S),
+    )  # fmt: skip
+
+
+def restore_margin_derivation(settings: FaultSettings) -> str:
+    """`restore_token_margin_s` term by term, in words and then as a sum: what a refusal at load spells out."""
+    terms = _restore_terms(settings)
+    words = " + ".join(word for word, _ in terms)
+    total = sum(value for _, value in terms)
+    return f"{words}: {' + '.join(f'{value:g}' for _, value in terms)} = {total:g}"
 
 
 def restore_bound_s(settings: FaultSettings) -> float:
@@ -291,21 +329,12 @@ def restore_bound_s(settings: FaultSettings) -> float:
     serve (`ready_timeout_s`), each of those waits one pause (`poll_s`) past its bound, since it checks the bound only
     after a reading, and the session gate (`gate_timeout_s`, whose pauses end at its bound). 1,514 s with the
     defaults. A reading's own time and the link check after the gate are the slack's (`TOKEN_SLACK_S`)."""
-    poll, attempts = settings.poll_s, settings.clear_attempts
-    identity_wait = settings.settle_timeout_s + poll
-    return (
-        identity_wait
-        + attempts * (settings.command_timeout_s + identity_wait)
-        + (attempts - 1) * poll
-        + settings.ready_timeout_s
-        + poll
-        + settings.gate_timeout_s
-    )
+    return sum(value for _, value in _restore_terms(settings)) - TOKEN_SLACK_S
 
 
 def restore_token_margin_s(settings: FaultSettings) -> float:
-    """The least `[tokens] margin_s` of a platform with `[faults]`, refused at load below it: the restore's bound and
-    `TOKEN_SLACK_S` (see the module docstring). 1,814 s with the defaults."""
+    """The least `[tokens] margin_s` of a platform with `[faults]`, which must declare it and is refused at load below
+    it: the restore's bound and `TOKEN_SLACK_S` (see the module docstring). 1,814 s with the defaults."""
     return restore_bound_s(settings) + TOKEN_SLACK_S
 
 

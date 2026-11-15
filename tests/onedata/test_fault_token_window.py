@@ -35,7 +35,7 @@ from expcore.records.injections import restore_refusal
 from expcore.records.instruments import finish_instruments
 from expcore.tools.manifest import FrozenManifest, live_manifest
 from expcore_onedata import toolserver
-from expcore_onedata.admission import SANDBOX_STEP, TOOL_SERVER_STEP, FederationLock, token_step
+from expcore_onedata.admission import SANDBOX_STEP, TOOL_SERVER_STEP, FederationLock, fault_settings_of, token_step
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import (
@@ -81,31 +81,78 @@ def at_default_bounds(data, heal, margin_s, **faults):
     data["tokens"] = {"margin_s": margin_s}
 
 
+# the derivation at the default bounds, as the refusal spells it: the stop's wait and its pause (180 + 2), three
+# starts with their waits and pauses (3 x (120 + 180 + 2)), two pauses between them (2 x 2), the wait to serve and its
+# pause (180 + 2), the session gate (240) and the slack (300)
+DEFAULT_DERIVATION = r"182 \+ 906 \+ 4 \+ 182 \+ 240 \+ 300 = 1814"
+
+
+@pytest.mark.parametrize("tokens", [None, {}, {"max_excess_s": 600}], ids=["no table", "empty table", "no key"])
+def test_o35_a_platform_with_faults_that_declares_no_token_margin_is_refused_naming_the_line_to_add(tmp_path, tokens):
+    """O35, O06: a token's lifetime is the study's choice, declared and never implied: with `[faults]`, a platform
+    that declares no `[tokens] margin_s` (no table, an empty one, or one without the key) is refused at load, naming
+    the least figure, its derivation term by term, and the line to add; no default is derived."""
+
+    def edit(data):
+        at_default_bounds(data, "off", DEFAULT_MARGIN_S)
+        if tokens is None:
+            data.pop("tokens")
+        else:
+            data["tokens"] = dict(tokens)
+
+    expected = (
+        r"\[tokens\] margin_s is not declared.*the least is 1814 s.*settle_timeout_s 180 s.*command_timeout_s 120 s.*"
+        r"ready_timeout_s 180 s.*poll_s 2 s.*gate_timeout_s 240 s.*slack 300 s.*" + DEFAULT_DERIVATION + r".*"
+        r"add: \[tokens\] margin_s = 1814"
+    )
+    with pytest.raises(ConfigError, match=expected):
+        settings_of(write_platform(tmp_path, edit))
+
+
 @pytest.mark.parametrize("heal", ["off", "all_links"])
-def test_o35_a_restore_and_gate_that_could_outlast_the_token_margin_are_refused_at_load_naming_the_numbers(
-    tmp_path, heal
-):
+def test_o35_a_token_margin_the_restore_and_gate_could_outlast_is_refused_with_its_derivation(tmp_path, heal):
     """O35, O06: the restore always runs, inside the run's token window in the documented order, so `[tokens]
     margin_s` must outlive it: a stop of unknown outcome waited out (settle_timeout_s 180 s), three starts each with its
     wait for the new identity (3 x (command_timeout_s 120 s + settle_timeout_s 180 s)) and two pauses between them, the
     wait to serve (ready_timeout_s 180 s), each wait one pause (poll_s 2 s) past its bound, and the session gate
-    (gate_timeout_s 240 s), 1,514 s at the defaults, and 300 s of slack: 1,814 s. The default margin (900 s) is refused,
-    naming every number, heal declared or not; 1,814 s loads."""
+    (gate_timeout_s 240 s), 1,514 s at the defaults, and 300 s of slack: 1,814 s. A margin of 900 s is refused with
+    that derivation and the line to change, heal declared or not; the least, 1,814 s, loads."""
     expected = (
-        r"\[tokens\] margin_s must be at least 1814 s, not 900 s.*settle_timeout_s 180 s.*3 starts.*"
-        r"command_timeout_s 120 s.*2 pause.*ready_timeout_s 180 s.*poll_s 2 s.*gate_timeout_s 240 s.*300 s of slack"
+        r"\[tokens\] margin_s = 900 is too small: the least is 1814 s.*settle_timeout_s 180 s.*3 starts.*"
+        r"command_timeout_s 120 s.*ready_timeout_s 180 s.*poll_s 2 s.*gate_timeout_s 240 s.*slack 300 s.*"
+        + DEFAULT_DERIVATION
+        + r".*set: \[tokens\] margin_s = 1814"
     )
     with pytest.raises(ConfigError, match=expected):
         settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, DEFAULT_MARGIN_S)))
+    with pytest.raises(ConfigError, match=r"margin_s = 1813 is too small: the least is 1814 s"):
+        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 1813)))
     settings = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, heal, 1814)))
     assert (restore_token_margin_s(settings), TOKEN_SLACK_S) == (1814, 300)
+
+
+def test_o35_a_least_margin_with_a_fraction_of_a_second_rounds_up_to_the_whole_second_the_line_names(tmp_path):
+    """O35: `margin_s` is a whole number of seconds, so a least figure with a fraction (poll_s 0.5 s) names the next
+    whole second as the least and in the line to add, and that margin loads."""
+    with pytest.raises(ConfigError, match=r"the least is 1804 s.*= 1803\.5.*\[tokens\] margin_s = 1804"):
+        settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 900, poll_s=0.5)))
+    assert settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 1804, poll_s=0.5)))
+
+
+def test_o35_a_platform_without_faults_needs_no_token_margin_declared(tmp_path):
+    """O35, O06: without `[faults]` nothing changes: a platform that declares no `[tokens]` loads with the default
+    margin, and no fault settings are read."""
+    platform = write_platform(tmp_path, lambda data: data.pop("tokens", None))
+    config = load_platform(platform, require_secrets=False)
+    assert config.tokens.margin_s == 900
+    assert fault_settings_of(config) is None
 
 
 def test_o35_a_long_pause_counts_against_the_token_margin_since_each_wait_ends_one_pause_past_its_bound(tmp_path):
     """O35, O06: each wait checks its bound only after a reading, so a restore can end one pause past each bound: with
     `poll_s` of 2,000 s, a margin of 1,814 s, enough for the default pause, is refused, and the figure counts the pause
     after the stop's wait, after each start's wait and between them, and after the wait to serve."""
-    with pytest.raises(ConfigError, match=r"margin_s must be at least .* s, not 1814 s.*poll_s 2000 s"):
+    with pytest.raises(ConfigError, match=r"margin_s = 1814 is too small: the least is .* s.*poll_s 2000 s"):
         settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 1814, poll_s=2000)))
     slow = settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 20000, poll_s=2000)))
     assert restore_token_margin_s(slow) == 1814 - 7 * 2 + 7 * 2000  # seven pauses with three starts
