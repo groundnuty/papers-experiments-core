@@ -282,6 +282,11 @@ class Provisioner:
         return self._settings
 
     @property
+    def config(self) -> PlatformConfig:
+        """The platform's loaded configuration, whose `[faults]` names the federation's locks (`resetgrant.py`)."""
+        return self._config
+
+    @property
     def space(self) -> StudySpace:
         """The declared space this provisioner acts in."""
         return self._entry

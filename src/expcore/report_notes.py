@@ -56,10 +56,29 @@ def contrast_notes(alpha: float, family: bool = True) -> list[str]:
     ]
 
 
-def equivalence_family_notes(alpha: float) -> list[str]:
-    """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces."""
+FAMILY_NOTES = [  # beside the named Holm families' tables (S17)
+    "Each Holm family is adjusted on its own, at alpha. Its members' p-values are taken from the smallest up, and the",
+    "k-th of a family of m is compared with alpha / (m - k + 1), its step's Level; the first that misses its level",
+    "stops the family, so it and every later member are not rejected, whatever their raw p-values. Holm p is the",
+    "member's adjusted p-value within its own family, for reading; the decision compares each raw p with its step's",
+    "level. An untestable member counts as p = 1 and keeps its family's size. A contrast is in one family at most, and",
+    "no family's size or p-values move another's decisions.",
+]
+
+
+def equivalence_family_notes(alpha: float, by_family: bool = False) -> list[str]:
+    """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces.
+    `by_family` adds what several named Holm families change (S17): each claim is adjusted within its own."""
+    one = [
+        "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two"
+    ]
+    within = [
+        "The preregistration declares these contrasts' equivalence claims, and each is adjusted together with the",
+        "other claims of its own Holm family only (the Holm family column): that group is the family Holm TOST p,",
+        "Interval level and Equivalent are computed over. TOST p: the larger of the two",
+    ]
     return [
-        "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two",
+        *(within if by_family else one),
         "one-sided tests' p-values, for an effect above minus the margin and for one below the margin (for the",
         "Wilcoxon cluster bootstrap, t-tests of the mean cluster difference on clusters - 1 degrees of freedom; n/a",
         "with fewer than two clusters or no spread between them). Holm TOST p: Holm-adjusted over the family, for",
@@ -82,6 +101,28 @@ MDE_NOTES = [
     "Min. detectable effect: the smallest effect this contrast's number of clusters could detect with the",
     "preregistered power; n/a when it cannot be found (no spread between clusters, or too few clusters);",
     "`-` for an untestable contrast, which has none.",
+]
+
+SMALLEST_NOTES = [  # after the smallest effects' table, only in a report with one (S16)
+    "Smallest effect: as preregistered, on the scale of the contrast's estimate; a ratio contrast's is a ratio,",
+    "compared as its natural log (in brackets), the scale of its estimate, interval and minimum detectable effect.",
+    "Direction: the sign the preregistration claims for A - B (`higher`, `lower`), or `either` when it declares",
+    "none. Decision: `meets` (significant, and the estimate at or beyond the smallest effect on the claimed side),",
+    "`meets (either direction)` (the same with no direction declared: the estimate's sign says which way),",
+    "`opposite_direction` (significant, with the estimate on the other side of zero from the claim, whatever its",
+    "size), `falls_short` (significant, and the estimate short of it), `not_significant`, `untestable` (no pair).",
+    "Significant is Holm's decision for a member of the family and the raw p-value at alpha for an exploratory",
+    "contrast, as for its conclusion.",
+    "Interval against it: where the interval lies against the smallest effect on the claimed side (either side",
+    "without a direction): it includes it, or excludes it, every value beyond it or every value short of it.",
+    "Detects it: `yes` when the minimum detectable effect is at most the smallest effect, so the test reaches the",
+    "preregistered power at a true effect of that size; `no` when it is larger; n/a when it cannot be found, `-`",
+    "without power settings. A member's minimum detectable effect is at alpha over the family size, so a `yes` is",
+    "conservative. At a true effect of exactly the smallest effect, the estimate reaches it only about half the",
+    "time, so `meets` is not reached at the preregistered power even when the design detects it.",
+    "An equivalence margin is another declaration: it bounds the differences the study calls negligible and",
+    "decides `equivalent` and `trivial_difference`, while the smallest effect is what a difference must reach to",
+    "count. A contrast that declares both holds two declarations, and neither is derived from the other.",
 ]
 
 MISSING_PAIRS = [
@@ -126,6 +167,13 @@ RATIO_NOTES = [
     "`exclude` (the cell is excluded from the contrast, and its pairs are counted by cause in the pairs tables)",
     "or `continuity correction c` (c is added to both sums of both arms in every cell, which keeps every cell",
     "and moves each log ratio most where its sums are small).",
+]
+
+RATIO_ARM_COLUMNS_NOTES = [  # after the ratio notes, only for a contrast whose arms read different columns
+    "A contrast whose Numerator or Denominator names two columns, each with its arm, reads its own columns in each",
+    "arm: in each cell N_A and D_A are summed from arm A's columns and N_B and D_B from arm B's, such as a",
+    "sensitivity estimate that puts arm A at its upper-bound cost and arm B at its lower-bound one. Its outcome",
+    "names arm A's ratio, then arm B's.",
 ]
 
 RATIO_BY_MODEL_NOTES = [  # after the ratio contrasts' table, only for a contrast estimated per model's cell
@@ -203,6 +251,20 @@ SHARD_NOTES = [
     "score is shown by shard. A pair never crosses shards, so a host effect meets both arms alike, and a score by",
     "shard would mostly show which instances landed on which host. A difference between shards is for the reader to",
     "weigh: a condition whose figures differ by shard is worth a look at the shards before it is read as an effect.",
+]
+
+SELECTION_NOTES = [
+    "This batch was merged from selections: one campaign run in batches, each the runs whose factors have the levels",
+    "it names, by one driver. Each run belongs to one selection, and a pair of runs may cross two: a contrast between",
+    "conditions of different selections pairs a run of each by task, model and seed, as one driver's runs are paired.",
+    "Planned counts the condition's runs in that selection; the three rates are the shares of those planned runs that",
+    "were analysed, exhausted or unfinished (a run a partial analysis leaves out is in none of the three), and `n/a`",
+    "where the selection ran none of the condition's runs.",
+    "",
+    "The selections are batches of one design, not a factor of it: the contrasts above pool the runs of every",
+    "selection, and every figure in this section is descriptive. A contrast across selections compares runs made at",
+    "different times, and possibly on a platform that changed in between; the environment identity every selection",
+    "recorded is the same, which the merge checked, and anything it does not cover is for the reader to weigh.",
 ]
 
 SHARD_KIND_NOTES = [
