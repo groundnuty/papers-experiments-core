@@ -16,6 +16,14 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     equivalence_family = ["a-vs-b"]  # optional (S15): members of holm_family with a margin, whose equivalence
                                # claims are decided by Holm over their two one-sided tests' p-values
 
+    [holm_families]            # in place of holm_family (S17): several named families, each adjusted on its own
+    phase1 = ["a-vs-b"]        # at alpha; a contrast is in one family at most, and a family may hold one
+    phase2 = ["gate-effect"]
+
+    [equivalence_families]     # in place of equivalence_family (S18): named families of equivalence claims, each
+    h1 = ["a-vs-b"]            # Holm-adjusted over its own members, apart from the Holm families; each member in a
+                               # Holm family with a margin, and in one equivalence family at most
+
     [bootstrap]
     replicates = 2000
     seed = 20260101
@@ -43,6 +51,8 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
                                    # treatment attempt scored None is refused without it, and with "scored" too
     max_unscored_treatment = 1 # optional, with "scored" in the Holm family only: the pairs it may still lose to a
                                # treatment attempt that genuinely could not be measured (default 0)
+    smallest_effect = 0.1      # optional (S16): the smallest difference of interest, on the outcome's scale
+    direction = "higher"       # optional, beside it: the claimed sign of A - B ("higher" or "lower"); none is either
 
     [contrasts.gate-effect]    # factor form: a declared factor of the schema and two of its levels
     factor = "gate"
@@ -59,6 +69,16 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     zero_denominator = "exclude"   # or "continuity", with `continuity_correction = 0.5` (required with it, only with it)
     cluster = "group"              # the independent unit, as for every contrast
     estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group, the group their mean (S13)
+    smallest_ratio = 2             # optional (S16): a ratio of interest, a factor of two, compared as ln 2 = 0.6931
+
+    [contrasts.cost-per-success-adverse]  # each arm may read its own column (S13): numerator_a, numerator_b,
+    conditions = ["cond-a", "cond-b"]     # denominator_a, denominator_b, each defaulting to the shared key; the
+    estimator = "ratio"                   # shared key beside both arms' own is refused, as no arm reads it
+    numerator_a = "tokens_high"
+    numerator_b = "tokens_low"
+    denominator = "success"
+    zero_denominator = "exclude"
+    cluster = "group"
 
     [descriptives.waited-in-a] # optional, S14: a one-arm estimate, descriptive, never in the Holm family
     conditions = ["cond-a"]    # one condition or a set of them, pooled
@@ -79,12 +99,12 @@ from typing import Any
 
 from expcore.campaign.factors import BUILTIN_FACTORS, FactorSchema
 from expcore.config.loading import ConfigError, Section
-from expcore.stats import estimators
+from expcore.stats import estimators, smallest
 from expcore.stats.estimators import EstimatorSettings, ParamError, UnknownEstimator
 from expcore.stats.onearm import DescriptiveSpec
 from expcore.stats.pairing import MODEL_KEY, TREATMENT_OUTCOMES, ContrastSpec
 from expcore.stats.power import PowerSettings
-from expcore.stats.ratio import ZERO_RULES, RatioForm
+from expcore.stats.ratio import ARM_SUFFIXES, ROLES, ZERO_RULES, RatioForm
 
 OVERRIDE_MARK = "+override"
 DEFAULT_CI_LEVEL = 0.95
@@ -92,8 +112,10 @@ DEFAULT_TARGET_POWER = 0.8
 _TOP_KEYS = (
     "alpha",
     "holm_family",
+    "holm_families",
     "exploratory_only",
     "equivalence_family",
+    "equivalence_families",
     "bootstrap",
     "power",
     "estimators",
@@ -101,8 +123,14 @@ _TOP_KEYS = (
     "descriptives",
 )
 _DESCRIPTIVE_KEYS = ("conditions", "cluster", "outcome", "numerator", "denominator")
-# a ratio contrast's keys (S13)
-_RATIO_KEYS = ("numerator", "denominator", "zero_denominator", "continuity_correction", "estimation_unit")
+# a ratio contrast's keys (S13): its two outcomes, each also per arm, its zero rule and its estimation unit
+_RATIO_KEYS = (
+    *ROLES,
+    *(f"{role}_{suffix}" for role in ROLES for suffix in ARM_SUFFIXES),
+    "zero_denominator",
+    "continuity_correction",
+    "estimation_unit",
+)
 _CONTRAST_KEYS = (
     "conditions",
     "factor",
@@ -114,6 +142,7 @@ _CONTRAST_KEYS = (
     "treatment_outcomes",
     "max_unscored_treatment",
     *_RATIO_KEYS,
+    *smallest.KEYS,
 )
 
 
@@ -145,6 +174,14 @@ class Preregistration:
     `exploratory_only` is the preregistration's statement that it makes no confirmatory claim: it has no Holm family,
     and every contrast is exploratory (S12). Exactly one of the two holds: a family, or that statement.
 
+    `holm_families` holds several named families (S17), each adjusted on its own; `holm_family` is then every
+    family's members, the families in declared order, so it is always the set of confirmatory contrasts. Built with
+    `holm_family` empty, it is filled in from the families; given, it must be exactly that.
+
+    `equivalence_families` holds named families of equivalence claims (S18), each Holm-adjusted over its own members
+    whatever their Holm families; `equivalence_family` is then every family's members, the families in declared
+    order, so it is always the set of claims decided by TOST, and is filled in or checked the same way.
+
     The mappings and sequences it holds are frozen when it is built, whichever way it is built: assigning into one
     raises TypeError, and a mapping or list handed in is copied, so the caller's own object stays the caller's (P04).
     """
@@ -161,13 +198,35 @@ class Preregistration:
     exploratory_only: bool = False  # no confirmatory claim: no Holm family, every contrast exploratory (S12)
     equivalence_family: tuple[str, ...] = ()  # contrasts whose equivalence claims Holm adjusts together (S15)
     descriptives: Mapping[str, DescriptiveSpec] = dataclasses.field(default_factory=dict)  # one-arm estimates (S14)
+    holm_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)  # named families (S17)
+    # named equivalence families (S18), each Holm-adjusted over its own members
+    equivalence_families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Deep-freeze the contrasts, the families, the estimator parameters and the one-arm estimates into fresh
-        read-only containers; refuse a family beside `exploratory_only`, and neither of them (S12); and an
-        equivalence family that is not of members of the Holm family with a margin (S15)."""
-        for name in ("contrasts", "holm_family", "estimator_params", "equivalence_family", "descriptives"):
+        read-only containers; refuse a family beside `exploratory_only`, and neither of them (S12); named families
+        that are not each a non-empty list of declared contrasts, each contrast in one family at most, whose union
+        is `holm_family` (S17), and named equivalence families held to the same, whose union is `equivalence_family`
+        (S18); and an equivalence family that is not of members of the Holm family with a margin (S15)."""
+        # before freezing, which leaves a set or a string as it is
+        _check_family_shapes(self.holm_families)
+        _check_family_shapes(self.equivalence_families, "equivalence")
+        names = (
+            "contrasts",
+            "holm_family",
+            "estimator_params",
+            "equivalence_family",
+            "descriptives",
+            "holm_families",
+            "equivalence_families",
+        )
+        for name in names:
             object.__setattr__(self, name, freeze(getattr(self, name)))
+        if self.holm_families:
+            object.__setattr__(self, "holm_family", self._union_of_families())
+        if self.equivalence_families:
+            union = _union(self.equivalence_families, self.contrasts, "equivalence", self.equivalence_family)
+            object.__setattr__(self, "equivalence_family", union)
         if self.exploratory_only and self.holm_family:
             raise ValueError("a preregistration with exploratory_only has no Holm family, and this one names one")
         for name in self.equivalence_family:
@@ -175,6 +234,27 @@ class Preregistration:
                 raise ValueError(f"equivalence family member {name!r} must be in the Holm family and have a margin")
         if not self.exploratory_only and not self.holm_family:
             raise ValueError("a preregistration needs a Holm family, or exploratory_only to make no confirmatory claim")
+
+    def _union_of_families(self) -> tuple[str, ...]:
+        """Every named family's members, the families in declared order; refuse a blank name, an empty family, an
+        undeclared contrast, a contrast in two families, and a `holm_family` given as anything else (S17)."""
+        return _union(self.holm_families, self.contrasts, "Holm", self.holm_family)
+
+    def families(self) -> tuple[tuple[str | None, tuple[str, ...]], ...]:
+        """Each Holm family with its members, in declared order: the named families (S17), or the one family of
+        `holm_family`, whose name is None; none under `exploratory_only`."""
+        if self.holm_families:
+            return tuple(self.holm_families.items())
+        return ((None, self.holm_family),) if self.holm_family else ()
+
+    def family_of(self, name: str) -> tuple[str | None, tuple[str, ...]] | None:
+        """The family a contrast is a member of, with its members; None for a contrast in no family."""
+        return next((family for family in self.families() if name in family[1]), None)
+
+    @property
+    def family_key(self) -> str:
+        """The key that declares the families, for messages: `holm_families` when they are named, else `holm_family`."""
+        return "holm_families" if self.holm_families else "holm_family"
 
     def with_override(self, **changes: Any) -> Preregistration:
         """Return a copy with fields replaced, for tests and never for production; its hash ends in `+override` (P04).
@@ -220,6 +300,47 @@ class Preregistration:
         )
 
 
+def _check_family_shapes(families: object, kind: str = "Holm") -> None:
+    """Refuse named families (Holm's, S17, or equivalence, S18) that are not a mapping of names to lists or tuples of
+    contrast names. A set would stay the caller's to change after freezing, and a string would be read as its
+    letters."""
+    if not isinstance(families, Mapping):
+        raise ValueError(f"{kind} families must be a mapping of family names to contrast names, got {type(families)}")
+    for family, members in families.items():
+        if not isinstance(members, list | tuple) or not all(isinstance(name, str) for name in members):
+            raise ValueError(
+                f"{kind} family {family!r} must be a list or tuple of contrast names, got {type(members).__name__}"
+            )
+
+
+def _union(
+    families: Mapping[str, tuple[str, ...]], contrasts: Mapping[str, ContrastSpec], kind: str, given: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Every named family's members, the families in declared order (`kind` "Holm", S17, or "equivalence", S18);
+    refuse a blank name, an empty family, an undeclared contrast, a contrast in two families, and the flat list
+    (`holm_family` or `equivalence_family`) given as anything but this union."""
+    owner: dict[str, str] = {}
+    qualifier = "" if kind == "Holm" else f"{kind} "  # keeps the Holm messages as S17 wrote them
+    for family, members in families.items():
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError(f"{kind} family name {family!r} is blank")
+        if not members:
+            raise ValueError(f"{kind} family {family!r} is empty")
+        for name in members:
+            if name not in contrasts:
+                raise ValueError(f"{kind} family {family!r} names {name!r}, which is not a declared contrast")
+            if name in owner:
+                raise ValueError(f"contrast {name!r} is in two {qualifier}families, {owner[name]!r} and {family!r}")
+            owner[name] = family
+    union = tuple(owner)
+    if given and given != union:
+        key = "holm_family" if kind == "Holm" else f"{kind}_family"
+        raise ValueError(
+            f"{key} must be the {qualifier}families' members in order, {list(union)}, or left empty; got {list(given)}"
+        )
+    return union
+
+
 def name_digest(name: str) -> int:
     """A number derived from a contrast's name, to seed its draws apart from every other contrast's."""
     return int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big")
@@ -255,9 +376,14 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
     if not contrasts:
         raise root.fail("contrasts", "must declare at least one contrast")
     exploratory_only = _flag(root, "exploratory_only")
-    family = () if exploratory_only else _family(root, contrasts)
-    _check_family_claims(root, contrasts, family, exploratory_only)
-    equivalence = _equivalence_family(root, contrasts, family, exploratory_only)
+    families = _named_families(root, contrasts, exploratory_only)
+    if families:
+        family = tuple(name for members in families.values() for name in members)
+    else:
+        family = () if exploratory_only else _family(root, contrasts)
+    _check_family_claims(root, contrasts, family, exploratory_only, bool(families))
+    equivalence_families = _equivalence_families(root, contrasts, family, exploratory_only, bool(families))
+    equivalence = _equivalence_family(root, contrasts, family, exploratory_only, bool(families))
     power = _power(_table_section(root, "power")) if "power" in raw else None
     params = {name: _estimator_params(source, name, table) for name, table in _tables(root, "estimators").items()}
     descriptives = {
@@ -277,14 +403,71 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
         exploratory_only,
         equivalence,
         descriptives,
+        holm_families=families,
+        equivalence_families=equivalence_families,  # its union fills in `equivalence`, empty beside it (S18)
     )
 
 
+def _named_families(
+    root: Section, contrasts: Mapping[str, ContrastSpec], exploratory_only: bool
+) -> dict[str, tuple[str, ...]]:
+    """Read the optional [holm_families] table (S17): each key a family's name, each value a non-empty list of
+    declared contrasts, each named once in all the families. It is refused beside holm_family and beside
+    exploratory_only; absent, the result is empty and holm_family declares the one family."""
+    key = "holm_families"
+    if key not in root.data:
+        return {}
+    if "holm_family" in root.data:
+        raise root.fail(
+            key, "is given with holm_family: declare one flat family there or several named families here, not both"
+        )
+    if exploratory_only:
+        raise root.fail(
+            key,
+            "is given with exploratory_only = true, which says no contrast is confirmatory: leave [holm_families] "
+            "out, or set exploratory_only = false",
+        )
+    table = Section(root.table(key), root.file, f"[{key}]")
+    if not table.data:
+        raise root.fail(key, "is empty: name at least one family, or leave the table out")
+    families: dict[str, tuple[str, ...]] = {}
+    owner: dict[str, str] = {}
+    for name in table.data:
+        if not name.strip():
+            raise table.fail(name, "is a blank family name")
+        members = table.strings(name)
+        if not members:
+            raise table.fail(
+                name,
+                "is empty: a family names at least one contrast (a stand-alone confirmatory test is a family of one)",
+            )
+        if len(set(members)) != len(members):
+            raise table.fail(name, "names a contrast twice")
+        for member in members:
+            if member not in contrasts:
+                raise table.fail(
+                    name, f"names {member!r}, which is not a declared contrast; declared: {', '.join(contrasts)}"
+                )
+            if member in owner:
+                raise table.fail(
+                    name,
+                    f"names {member!r}, which family {owner[member]!r} names too: a contrast is in one family at most",
+                )
+            owner[member] = name
+        families[name] = members
+    return families
+
+
 def _equivalence_family(
-    root: Section, contrasts: Mapping[str, ContrastSpec], family: tuple[str, ...], exploratory_only: bool
+    root: Section,
+    contrasts: Mapping[str, ContrastSpec],
+    family: tuple[str, ...],
+    exploratory_only: bool,
+    named: bool = False,
 ) -> tuple[str, ...]:
-    """Read the optional equivalence_family (S15): declared contrasts, each once, each in the Holm family, with an
-    equivalence margin and an estimator that registers a TOST p-value; none beside exploratory_only."""
+    """Read the optional equivalence_family (S15): declared contrasts, each once, each in a Holm family, with an
+    equivalence margin and an estimator that registers a TOST p-value; none beside exploratory_only. `named` says
+    the families are the named ones of [holm_families] (S17), which the message then names."""
     key = "equivalence_family"
     if key not in root.data:
         return ()
@@ -300,22 +483,88 @@ def _equivalence_family(
     if len(set(names)) != len(names):
         raise root.fail(key, "names a contrast twice")
     for name in names:
-        if name not in contrasts:
-            raise root.fail(key, f"names {name!r}, which is not a declared contrast; declared: {', '.join(contrasts)}")
-        spec = contrasts[name]
-        if spec.equivalence_margin is None:
-            raise root.fail(key, f"names {name!r}, which declares no equivalence_margin to be equivalent within")
-        if name not in family:
-            raise root.fail(
-                key,
-                f"names {name!r}, which is not in holm_family: an equivalence claim the family controls is "
-                "confirmatory, so its contrast must be too",
-            )
-        if estimators.tost_function(spec.estimator) is None:
-            raise root.fail(
-                key, f"names {name!r}, whose estimator {spec.estimator!r} registers no TOST p-value (`tost`)"
-            )
+        _check_equivalence_claim(root, key, name, contrasts, family, named)
     return names
+
+
+def _check_equivalence_claim(
+    section: Section,
+    key: str,
+    name: str,
+    contrasts: Mapping[str, ContrastSpec],
+    family: tuple[str, ...],
+    named: bool,
+) -> None:
+    """Refuse an equivalence claim (S15, S18) on an undeclared contrast, on one with no equivalence_margin, on one in
+    no Holm family (its significance test must be confirmatory too), or on one whose estimator registers no TOST
+    p-value, naming `key` of `section` and the contrast."""
+    if name not in contrasts:
+        raise section.fail(key, f"names {name!r}, which is not a declared contrast; declared: {', '.join(contrasts)}")
+    spec = contrasts[name]
+    if spec.equivalence_margin is None:
+        raise section.fail(key, f"names {name!r}, which declares no equivalence_margin to be equivalent within")
+    if name not in family:
+        where = "is in no family of [holm_families]" if named else "is not in holm_family"
+        raise section.fail(
+            key,
+            f"names {name!r}, which {where}: an equivalence claim the family controls is confirmatory, so its "
+            "contrast must be too",
+        )
+    if estimators.tost_function(spec.estimator) is None:
+        raise section.fail(
+            key, f"names {name!r}, whose estimator {spec.estimator!r} registers no TOST p-value (`tost`)"
+        )
+
+
+def _equivalence_families(
+    root: Section,
+    contrasts: Mapping[str, ContrastSpec],
+    family: tuple[str, ...],
+    exploratory_only: bool,
+    named: bool,
+) -> dict[str, tuple[str, ...]]:
+    """Read the optional [equivalence_families] table (S18): each key a family's name, each value a non-empty list of
+    equivalence claims, each a declared contrast in a Holm family with a margin and a TOST p-value, each in one
+    equivalence family at most. Each family is Holm-adjusted over its own members, whatever their Holm families. It
+    is refused beside equivalence_family, whose claims are adjusted within each Holm family, and beside
+    exploratory_only; absent, the result is empty."""
+    key = "equivalence_families"
+    if key not in root.data:
+        return {}
+    if "equivalence_family" in root.data:
+        raise root.fail(
+            key,
+            "is given with equivalence_family: declare one flat list there, whose claims are adjusted within each "
+            "Holm family, or named equivalence families here, each adjusted over its own members, not both",
+        )
+    if exploratory_only:
+        raise root.fail(
+            key, "is given with exploratory_only = true, which makes no confirmatory claim, of equivalence or other"
+        )
+    table = Section(root.table(key), root.file, f"[{key}]")
+    if not table.data:
+        raise root.fail(key, "is empty: name at least one equivalence family, or leave the table out")
+    families: dict[str, tuple[str, ...]] = {}
+    owner: dict[str, str] = {}
+    for name in table.data:
+        if not name.strip():
+            raise table.fail(name, "is a blank family name")
+        members = table.strings(name)
+        if not members:
+            raise table.fail(name, "is empty: an equivalence family names at least one claim, or is left out")
+        if len(set(members)) != len(members):
+            raise table.fail(name, "names a contrast twice")
+        for member in members:
+            _check_equivalence_claim(table, name, member, contrasts, family, named)
+            if member in owner:
+                raise table.fail(
+                    name,
+                    f"names {member!r}, which equivalence family {owner[member]!r} names too: a claim is in one "
+                    "equivalence family at most",
+                )
+            owner[member] = name
+        families[name] = members
+    return families
 
 
 def _descriptive(
@@ -502,8 +751,8 @@ def _max_unscored(section: Section, treatment: str | None) -> int:
 
 
 def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
-    """Read a ratio contrast's numerator, denominator and zero rule (S13); refuse them beside an estimator of one
-    outcome, and an outcome beside an estimator of the ratio form."""
+    """Read a ratio contrast's numerator, denominator (each shared or per arm) and zero rule (S13); refuse them beside
+    an estimator of one outcome, and an outcome beside an estimator of the ratio form."""
     if estimators.form(estimator) != "ratio":
         for key in _RATIO_KEYS:
             if key in section.data:
@@ -515,9 +764,8 @@ def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
         raise section.fail(
             "outcome", f"is not read by estimator {estimator!r}, a ratio: name its numerator and denominator instead"
         )
-    numerator, denominator = section.string("numerator"), section.string("denominator")
-    if numerator == denominator:
-        raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+    numerator, denominator = (_ratio_columns(section, role) for role in ROLES)
+    _check_two_outcomes(section, numerator, denominator)
     rule = section.data.get("zero_denominator")
     if rule is None:
         raise section.fail(
@@ -534,7 +782,63 @@ def _ratio_form(section: Section, estimator: str) -> RatioForm | None:
             raise section.fail("continuity_correction", f"must be a positive number, got {correction}")
     elif "continuity_correction" in section.data:
         raise section.fail("continuity_correction", 'is only for zero_denominator = "continuity"')
-    return RatioForm(numerator, denominator, rule, correction)
+    return RatioForm(  # held canonically: a role whose arms read one column keeps it as the shared one
+        numerator[0],
+        denominator[0],
+        rule,
+        correction,
+        numerator_a=numerator[1],
+        numerator_b=numerator[2],
+        denominator_a=denominator[1],
+        denominator_b=denominator[2],
+    )
+
+
+Columns = tuple[str | None, str | None, str | None]  # one role's shared column, then arm A's and arm B's own
+
+
+def _ratio_columns(section: Section, role: str) -> Columns:
+    """Read one role's columns (S13): `role`, the column both arms read, and `role_a` and `role_b`, arm A's and arm
+    B's own, each defaulting to it. The shared column beside both arms' own is read by neither arm and refused, and so
+    is an arm left without a column."""
+    keys = (role, *(f"{role}_{suffix}" for suffix in ARM_SUFFIXES))
+    shared, own_a, own_b = (section.optional_string(key) for key in keys)
+    if shared is None:
+        if own_a is None and own_b is None:
+            raise section.fail(role, "is required")
+        if own_a is None or own_b is None:
+            bare, given = ("A", keys[2]) if own_a is None else ("B", keys[1])
+            raise section.fail(
+                role,
+                f"is required: arm {bare} has no column, since only {given} is given. Name the {role} an arm "
+                f"without its own reads, or each arm's ({keys[1]} and {keys[2]})",
+            )
+    elif own_a is not None and own_b is not None and shared not in (own_a, own_b):
+        raise section.fail(
+            role,
+            f"is read by neither arm: {keys[1]} and {keys[2]} name both arms' columns ({own_a!r} and {own_b!r}). "
+            f"Leave {role} out, or leave out the per-arm key of the arm that reads it",
+        )
+    return shared, own_a, own_b
+
+
+def _check_two_outcomes(section: Section, numerator: Columns, denominator: Columns) -> None:
+    """Require each arm to read two different outcomes as its numerator and its denominator, naming the key that
+    gave the arm the column it reads twice."""
+    for side, arm in enumerate("AB"):
+        own_numerator, own_denominator = numerator[1 + side], denominator[1 + side]
+        read = own_numerator or numerator[0]
+        if read != (own_denominator or denominator[0]):
+            continue
+        suffix = ARM_SUFFIXES[side]
+        if own_denominator is None and own_numerator is None:
+            raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
+        key = f"denominator_{suffix}" if own_denominator is not None else f"numerator_{suffix}"
+        raise section.fail(
+            key,
+            f"would make arm {arm} read {read!r} as both its numerator and its denominator: a ratio needs two "
+            "different outcomes",
+        )
 
 
 def _cluster(section: Section) -> str:
@@ -590,6 +894,20 @@ def _estimation_unit(section: Section, cluster: str, ratio: bool) -> tuple[str, 
     )
 
 
+def _smallest(section: Section, *, ratio: bool) -> dict[str, Any]:
+    """Read a contrast's smallest effect of interest (S16): `smallest_effect` beside an estimator of one outcome,
+    `smallest_ratio` beside one of the ratio form, and the optional `direction`; refused naming the key as the rule
+    refuses it. A declared number is held as a float; the keys left out stay None."""
+    declared = {key: section.data.get(key) for key in smallest.KEYS}
+    try:
+        rule = smallest.rule(**declared, ratio=ratio)
+    except smallest.RuleError as error:
+        raise section.fail(error.key, error.message) from None
+    if rule is not None:
+        declared["smallest_ratio" if ratio else "smallest_effect"] = rule.declared
+    return declared
+
+
 def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSchema, alpha: float) -> ContrastSpec:
     """Read one [contrasts.<name>] table in either form and check its arms against the factor schema."""
     section = Section(table, source, f"[contrasts.{name}]")
@@ -610,6 +928,7 @@ def _contrast(source: str, name: str, table: Mapping[str, Any], schema: FactorSc
         "max_unscored_treatment": _max_unscored(section, treatment),
         "ratio": form,
         "estimation_unit": unit,
+        **_smallest(section, ratio=form is not None),
     }
     if "conditions" in table:
         for extra in ("factor", "levels"):
@@ -666,8 +985,8 @@ def _family(root: Section, contrasts: Mapping[str, ContrastSpec]) -> tuple[str, 
     if "holm_family" not in root.data:
         raise root.fail(
             "holm_family",
-            "is required: name the confirmatory contrasts or, if the preregistration makes no confirmatory claim "
-            "(a pilot), say so with exploratory_only = true",
+            "is required: name the confirmatory contrasts (or declare several named families in [holm_families]) "
+            "or, if the preregistration makes no confirmatory claim (a pilot), say so with exploratory_only = true",
         )
     family = root.strings("holm_family")
     if not family:
@@ -688,10 +1007,14 @@ def _family(root: Section, contrasts: Mapping[str, ContrastSpec]) -> tuple[str, 
 
 
 def _check_family_claims(
-    root: Section, contrasts: Mapping[str, ContrastSpec], family: tuple[str, ...], exploratory_only: bool
+    root: Section,
+    contrasts: Mapping[str, ContrastSpec],
+    family: tuple[str, ...],
+    exploratory_only: bool,
+    named: bool = False,
 ) -> None:
     """Refuse a family beside `exploratory_only`, and a setting only a member of the family uses on a contrast that is
-    not one (S10, S12)."""
+    not one (S10, S12), naming [holm_families] when the families are named (S17)."""
     if exploratory_only and "holm_family" in root.data:
         raise root.fail(
             "holm_family",
@@ -706,7 +1029,8 @@ def _check_family_claims(
                     f"is true, so there is no family and the max_unscored_treatment of {name!r}",
                 )
             else:
-                key, why = "holm_family", f"does not name {name!r}, whose max_unscored_treatment"
+                key = "holm_families" if named else "holm_family"
+                why = f"does not name {name!r}, whose max_unscored_treatment"
             raise root.fail(
                 key, f"{why} would do nothing: only a member of the family is refused for a treatment attempt left None"
             )

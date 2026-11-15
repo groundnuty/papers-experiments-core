@@ -30,6 +30,12 @@ the scheduler sets the attempt aside next to its other post-run checks, so the a
 Anything else an instrument raises there, an `InfraError` of a kind a condition may declare included, is a defect of
 the instrument and reaches the executor's caller as it is. A run whose instruments have neither method takes no
 reading and writes nothing new.
+
+**A wrapper passes the optional methods on.** The core finds them by name, on the object it is given, so a study's
+class that wraps an instrument (to add a label, a retry, a log) and does not pass `at_first_turn` or `check` on drops
+them without a word: the wrapped instrument's refusal is never asked for and the attempt is scored. `OPTIONAL_HOOKS`
+is the list of names the core looks for, and `missing_hooks(wrapper, wrapped)` names the ones a wrapper lacks, for a
+study's own test.
 """
 
 import json
@@ -45,6 +51,19 @@ from expcore.records.digest import canonical
 from expcore.records.record import RunRecord
 
 NAMESPACE = re.compile(r"[a-z][a-z0-9_]*")
+
+OPTIONAL_HOOKS: tuple[str, ...] = ("at_first_turn", "check")
+"""The optional methods of an instrument that the core looks for by name, in the order a run reaches them.
+
+The core finds each with `getattr` on the instrument it is given and calls it when it is callable, so a class that
+wraps an instrument and does not have one of these names drops it silently: the wrapped instrument's refusal is then
+never asked for. A wrapper passes each name on (a method that calls the wrapped one, or `__getattr__`), or leaves it
+out deliberately and says so in its own test. `missing_hooks` names the ones it dropped.
+
+The core's discovery uses exactly this list: it refuses to look any other name up (`_method`), and a test compares the
+list with every name the module looks an instrument up by, so a hook added to the core without being added here fails
+it. `namespace`, `start` and `finish` are not optional, are not in the list, and a wrapper must have them.
+"""
 
 
 class InstrumentRefusalError(ValueError):
@@ -77,9 +96,28 @@ def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, 
 
 
 def _method(instrument: Instrument, name: str) -> Any:
-    """The optional method of an instrument, or None when it has none."""
+    """The optional method of an instrument, or None when it has none. A name that is not in `OPTIONAL_HOOKS` is a
+    defect of the core, refused here rather than looked up: the list is what a wrapper is told to pass on."""
+    if name not in OPTIONAL_HOOKS:
+        raise ValueError(
+            f"{name!r} is not an optional instrument hook: add it to OPTIONAL_HOOKS, which a wrapper passes on"
+        )
     method = getattr(instrument, name, None)
     return method if callable(method) else None
+
+
+def missing_hooks(wrapper: Instrument, wrapped: Instrument) -> tuple[str, ...]:
+    """The optional hooks the wrapped instrument has and the wrapper does not, in the order of `OPTIONAL_HOOKS`.
+
+    For a study's own test of a class that wraps an instrument: an empty answer says the wrapper passes on every hook
+    the wrapped instrument has, so the core calls them as it would on the wrapped one. A hook counts the way the core
+    counts it, when it is looked up: an attribute that is callable. A property that answers None (the progressive
+    ingest's first-turn hook outside its preallocated mode) is no hook, and a hook only the wrapper has is not missing.
+    A wrapper that leaves a hook out on purpose asserts the names it expects here.
+    """
+    return tuple(
+        name for name in OPTIONAL_HOOKS if _method(wrapped, name) is not None and _method(wrapper, name) is None
+    )
 
 
 def _require_untreatable(instrument: Instrument, error: InfraError, when: str) -> None:

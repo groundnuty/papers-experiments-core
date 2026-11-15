@@ -56,7 +56,7 @@ another (below).
    and a new file id, and the failed file and the source's other probe files are deleted (a file with a stuck job may be
    deleted). The next check reads the new file, so a recovered link passes at once. When no probe file is left that a
    marker does not retire and a fresh one cannot be written, the pair fails closed, "no fresh probe for <source> to
-   <local>: creation failed", and no retired file is read in its place. The deletions are best-effort: a retired file
+   <reader>: creation failed", and no retired file is read in its place. The deletions are best-effort: a retired file
    that stays is deleted by a later check of the pair that passes, and stays excluded until then; a marker is deleted
    once the source no longer lists its file, so the record is bounded by the retired files that remain. Only when the
    marker cannot be written and the failed file is not deleted is it not excluded for good: the failure says so, with a
@@ -66,8 +66,8 @@ another (below).
    waited for and that provider's block map read. On Onedata 25.0 an eviction scheduled right after a fetch completes
    having evicted nothing (the same eviction about 30 s later works), so one that did not take is recorded, never
    retried and never a failure: the link was shown to work, and the next check's step 1 evicts the probe and confirms
-   the local block map empty before it reads. When a pair fails the check answers at once, retiring its probe and
-   evicting nothing.
+   the reading provider's block map empty before it reads. When a pair fails the check answers at once, retiring its
+   probe and evicting nothing.
 
 **The remedy** of a stuck link is named with its failure: restart the reading provider's rtransfer link
 (`rtransfer_config:restart_link()` in its op-worker), or restart that provider's container alone (`docker restart`,
@@ -78,8 +78,10 @@ pair and why; so does every pair when platform.toml declares none of `[link_chec
 provider outside `[link_check].providers` holds, or whose holding by any provider cannot be read, and a pair whose probe
 files are all retired when a fresh one cannot be written. Unknown is never a pass.
 
-**The record** (`LinkReport.to_json()`): each pair by position (`providers[i]`, never a name, O12; `local` is the
-provider that reads, the agent's local provider or another), whether it passed,
+**The record** (`LinkReport.to_json()`): each pair by position (`providers[i]`, never a name, O12; `reader` is the
+provider that reads the pair, the platform's local provider or another; `local` holds the same value and is its
+deprecated alias, the key's name before every ordered pair was checked, kept for records written before: it never
+means the platform's local provider), whether it passed,
 the seconds and bytes of its fetch, whether its probe was written now, the evictions that made it cold and those that
 evicted it afterwards, by transfer id, and whether that took; whether a failed probe was retired, and how many retired
 files a passing check deleted and could not delete; the check's window on the host's epoch clock and every
@@ -135,18 +137,24 @@ VERSION = 1  # of the record
 WORKERS = 8  # pairs prepared, fetched and evicted at once (a test sets it to 1: its fake clock is every thread's)
 POLL_S = 2.0  # between reads of a block map or a transfer's record
 EVICTION_PAUSE_S = 10.0  # before an eviction that took nothing is scheduled again
-REMEDY = (
-    "remedy: restart the rtransfer link on {local} (rtransfer_config:restart_link() in its op-worker) or restart "
-    "{local}'s container alone (docker restart, never a compose down); it clears by itself only after about 1800 s"
+REMEDY = (  # `{reader}`: the label of the pair's reading provider, which is the platform's local provider or another
+    "remedy: restart the rtransfer link on {reader} (rtransfer_config:restart_link() in its op-worker) or restart "
+    "{reader}'s container alone (docker restart, never a compose down); it clears by itself only after about 1800 s"
 )
 Pair = tuple[str, str]  # (reading provider, source provider), by their names in platform.toml
 
 
 @dataclass(frozen=True)
 class PairResult:
-    """What the check found for one pair; providers are named by their positions in platform.toml."""
+    """What the check found for one pair; providers are named by their positions in platform.toml.
 
-    local: str
+    `reader` is the pair's reading provider, the one the probe is fetched through: the platform's local provider for
+    some pairs and another provider for the rest (every ordered pair is checked, #254). `local` is its deprecated
+    alias, the field's name before #254, when the reader of a pair was always the local provider; it is kept, in the
+    object and in the record, for code and records that still read it, and means the pair's reader, not the platform's
+    local provider."""
+
+    reader: str
     source: str
     ok: bool
     seconds: float | None = None
@@ -163,9 +171,15 @@ class PairResult:
     purged: int = 0  # the retired probes of the source that a passing check deleted
     unpurged: int = 0  # those it could not delete, which the next passing check deletes
 
+    @property
+    def local(self) -> str:
+        """Deprecated alias of `reader`: the pair's reading provider, whichever provider it is."""
+        return self.reader
+
     def to_json(self) -> dict[str, Any]:
         return {
-            "local": self.local,
+            "reader": self.reader,
+            "local": self.reader,  # deprecated alias of "reader", for records read before #254 named it
             "source": self.source,
             "ok": self.ok,
             "seconds": None if self.seconds is None else round(self.seconds, 3),
@@ -272,21 +286,21 @@ class _Check:
         digest = hashlib.sha256(provider_id.encode()).hexdigest()[:8]
         return f"a provider platform.toml does not declare (id digest {digest})"
 
-    def _make_cold(self, local: str, source: str, file_id: str) -> tuple[str, ...]:
-        """Wait until the local block map shows the source holding the probe whole and every other provider of the probe
-        space holding none of it, evicting any part another provider holds; return the evictions made, by transfer id.
-        A holder that cannot be evicted, or whose holding cannot be read, never passes."""
+    def _make_cold(self, reader: str, source: str, file_id: str) -> tuple[str, ...]:
+        """Wait until the reading provider's block map shows the source holding the probe whole and every other provider
+        of the probe space holding none of it, evicting any part another provider holds; return the evictions made, by
+        transfer id. A holder that cannot be evicted, or whose holding cannot be read, never passes."""
         settings, began = self._settings, self._clock()
         made: list[str] = []
         evicted: set[str] = set()  # each provider is evicted from once, its retries inside `_evict`
         while True:
             try:
-                held, unreadable = self._holdings(local, file_id)
+                held, unreadable = self._holdings(reader, file_id)
             except PlatformError:
                 held, unreadable = {}, []
             warm = [name for name, blocks in held.items() if name != source and held_bytes(blocks)]
             if (
-                local in held
+                reader in held
                 and file_fully_placed(held.get(source, []), settings.probe_bytes)
                 and not (warm or unreadable)
             ):
@@ -298,7 +312,7 @@ class _Check:
                 if not done[file_id]:
                     raise ProbeNotReady(
                         f"the probe could not be evicted from {self._label(name)} within "
-                        f"{settings.evict_timeout_s:g} s, so the local provider could fetch it from there"
+                        f"{settings.evict_timeout_s:g} s, so the reading provider could fetch it from there"
                     )
             if self._clock() - began >= settings.visible_timeout_s + (settings.evict_timeout_s if evicted else 0.0):
                 if warm:
@@ -307,16 +321,16 @@ class _Check:
                     shown = f"what {unreadable[0]} holds of it, readable"
                 else:
                     shown = "the source holding it whole"
-                raise ProbeNotReady(f"the block map of {self._label(local)} did not show {shown} in time")
+                raise ProbeNotReady(f"the block map of {self._label(reader)} did not show {shown} in time")
             self._sleep(POLL_S)
 
     def prepare(self, pair: Pair) -> _Ready:
-        """Make the pair's probe ready: written, seen by the local provider, held by the source alone."""
-        local, source = pair
-        probe = self._files.provision(source, local)
+        """Make the pair's probe ready: written, seen by the reading provider, held by the source alone."""
+        reader, source = pair
+        probe = self._files.provision(source, reader)
         consistency.wait_visible(
             self._client,
-            local,
+            reader,
             probe.file_id,
             size=self._settings.probe_bytes,
             timeout_s=self._settings.visible_timeout_s,
@@ -324,7 +338,7 @@ class _Check:
             sleep=self._sleep,
             retry=ONE_ATTEMPT,
         )
-        return _Ready(probe, self._make_cold(local, source, probe.file_id))
+        return _Ready(probe, self._make_cold(reader, source, probe.file_id))
 
     # -- evictions -------------------------------------------------------------------------------------------------
     def _empty_on(self, provider: str, file_id: str) -> bool:
@@ -381,15 +395,15 @@ class _Check:
     # -- the fetch -------------------------------------------------------------------------------------------------
     def fetch_probe(self, pair: Pair, file_id: str) -> PairResult:
         """Read the whole probe through the reading provider, once, within `timeout_s`, and check its bytes."""
-        local, source = pair
-        names = self._label(local), self._label(source)
+        reader, source = pair
+        names = self._label(reader), self._label(source)  # (the reader's, the source's)
         bound, size = self._settings.timeout_s, self._settings.probe_bytes
-        expected = hashlib.sha256(self._files.content(source, local)).hexdigest()
+        expected = hashlib.sha256(self._files.content(source, reader)).hexdigest()
         began = self._clock()
         try:
-            digest = self._files.digest(local, file_id, size)
+            digest = self._files.digest(reader, file_id, size)
         except PlatformError as error:
-            remedy = REMEDY.format(local=names[0])
+            remedy = REMEDY.format(reader=names[0])  # the reading provider's link is the one that is stuck
             reason = f"no transfer from {names[1]} to {names[0]} within {bound:g} s ({error}); {remedy}"
             return PairResult(*names, False, self._clock() - began, reason=reason, remedy=remedy)
         seconds = self._clock() - began
@@ -402,11 +416,11 @@ class _Check:
         """What follows a pair's fetch. A probe that passed is kept, and the retired probes of its source are deleted. A
         probe whose fetch failed is retired, recorded in the probe space, so no later check reads the file a stuck
         fetch may still be waiting on (`linkprobe.py`)."""
-        local, source = pair
+        reader, source = pair
         if result.ok:
             deleted, undeleted = self._files.purge(source, ready.probe)
             return _with(result, purged=deleted, unpurged=undeleted)
-        retired = self._files.retire(source, local, ready.probe)
+        retired = self._files.retire(source, reader, ready.probe)
         note = ""
         if not retired.ok:
             cause = retired.why or "not deleted"
@@ -415,14 +429,14 @@ class _Check:
 
     def _prepared(self, pair: Pair) -> _Ready | PairResult:
         """The pair's probe made ready, or the failed result of a pair that could not be tested."""
-        local, source = (self._label(name) for name in pair)
+        reader, source = (self._label(name) for name in pair)
         try:
             return self.prepare(pair)
         except NoFreshProbe as error:
-            return PairResult(local, source, False, reason=str(error))
+            return PairResult(reader, source, False, reason=str(error))
         except (PlatformError, consistency.WaitTimeout, ProbeNotReady) as error:
-            why = f"{source} -> {local} was not tested: its probe could not be made ready ({error})"
-            return PairResult(local, source, False, reason=why)
+            why = f"{source} -> {reader} was not tested: its probe could not be made ready ({error})"
+            return PairResult(reader, source, False, reason=why)
 
     def run(self, pairs: Sequence[Pair], workers: int) -> tuple[PairResult, ...]:
         """Prepare every pair and fetch the ready ones, at most `workers` at once, settle each probe, and evict the
@@ -515,7 +529,7 @@ def check_links(
     if failed:
         detail = "a provider link is stuck or untested: " + "; ".join(str(result.reason) for result in failed)
     else:
-        timed = ", ".join(f"{r.source}->{r.local} {r.seconds:.2f} s" for r in results)  # the gate keeps the detail
+        timed = ", ".join(f"{r.source}->{r.reader} {r.seconds:.2f} s" for r in results)  # the gate keeps the detail
         detail = (
             f"each of the {len(results)} provider pair(s) fetched its probe within {settings.timeout_s:g} s ({timed})"
         )

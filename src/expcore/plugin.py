@@ -192,6 +192,9 @@ class Instrument(Protocol):
 
     Neither method is part of the nest: the hook is one moment and the checks are a verdict taken once every snapshot
     is in, so both run in list order, and the first listed instrument that refuses is the refusal the record keeps.
+
+    The core finds the two by name (`expcore.records.instruments.OPTIONAL_HOOKS`), so a class that wraps an instrument
+    must pass each on, or it drops it silently; `missing_hooks(wrapper, wrapped)` names what a wrapper lacks.
     """
 
     namespace: str
