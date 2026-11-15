@@ -68,16 +68,18 @@ def _is_hold(line: Mapping[str, Any]) -> bool:
 
 
 class SharedHolds:
-    """The record of the tools' shared holds in one fault journal's directory (see the module docstring)."""
+    """The record of the tools' shared holds in one fault journal's directory (see the module docstring). `name` is the
+    record's file: `shared-holds.jsonl` for the tools' holds of `federation.lock`, or `reset-holds.jsonl`, in the same
+    format, for every shared admission's hold of `federation.reset` (`expcore_onedata.resetlock`)."""
 
-    def __init__(self, directory: Path) -> None:
-        self._journal = InjectionJournal(Path(directory))
+    def __init__(self, directory: Path, *, name: str = HOLDS) -> None:
+        self._journal, self._name = InjectionJournal(Path(directory)), name
 
     def begin(self, reason: str) -> str:
         """Record that this context's tool holds the federation shared, durably; return the hold's id."""
         token = uuid.uuid4().hex
         self._journal.append_to(
-            HOLDS,
+            self._name,
             {
                 "event": HELD,
                 "id": token,
@@ -91,14 +93,14 @@ class SharedHolds:
 
     def end(self, token: str, how: str = RELEASED_BY_ITS_TOOL) -> None:
         """Record that the hold `token` named is over, durably."""
-        self._journal.append_to(HOLDS, {"event": RELEASED, "id": token, "until_utc": _now(), "how": how})
+        self._journal.append_to(self._name, {"event": RELEASED, "id": token, "until_utc": _now(), "how": how})
 
     def holds(self) -> list[dict[str, Any]]:
         """Every hold in the order it began: `id`, `reason`, `holder`, `owner`, `since_utc`, and `until_utc` and `how`
         (None while it is open). `ValueError` for a complete line that is not a hold event; `OSError` for a record
         that cannot be read."""
         records: dict[str, dict[str, Any]] = {}
-        for number, text in enumerate(self._journal.complete_text(HOLDS).splitlines(), 1):
+        for number, text in enumerate(self._journal.complete_text(self._name).splitlines(), 1):
             where = f"line {number} of the record of the tools' holds"
             try:
                 line = json.loads(text)
