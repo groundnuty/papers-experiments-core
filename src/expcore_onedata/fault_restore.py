@@ -21,15 +21,15 @@ The gate's and the heal's readings go into `restore_record`, for the injector's 
 **The settle of a recovered container restart.** A recovery that finds a heal's container restart open (its heal was cut
 short, or ended with a pair failing) first waits out every hold its heal left (one reading then decides: a reader the
 heal never stopped is `never_down` and cleared), brings the reader back, verified (a new identity, serving), and reads
-its session gate only once a settle after the container's start has passed: when it started the container itself, it
-holds one of `heal_settle_s` from the moment the reader serves, in the federation's drain record first when it has one
-(`hold_for`), then on the entry (`settle_until`), a `clear_failed` line `settling` marked `healing`, which no reader
-takes for a failed restore; a container found back was started by its heal, whose holds covered that settle. A recovery
-that may not wait (the fault gate's, whose check the core bounds by `health_timeout_s`: `recover(defer=True)`) never
-sleeps out a held settle: it raises `RestoreSettling`, which the gate answers as a wait that charges no run; a later
-check, once the settle has passed, reads the gate and clears the entry when it passes, and the gate's own link check,
-next in that check, judges every pair (an entry left open would keep every later heal out). Any other recovery (the
-injector's start) waits the settle out and clears the entry only when the gate and every pair pass.
+its session gate only once a settle journalled on that entry has passed: when it started the container itself, or when
+none is journalled (who started it, and when, is not known), it holds one of `heal_settle_s` from the moment the reader
+serves, in the federation's drain record first when it has one (`hold_for`), then on the entry (`settle_until`), a
+`clear_failed` line `settling` marked `healing`, which no reader takes for a failed restore. A recovery that may not
+wait (the fault gate's, whose check the core bounds by `health_timeout_s`: `recover(defer=True)`) never sleeps out a
+held settle: it raises `RestoreSettling`, which the gate answers as a wait that charges no run; a later check, once the
+settle has passed, reads the gate and clears the entry when it passes, and the gate's own link check, next in that
+check, judges every pair (an entry left open would keep every later heal out). Any other recovery (the injector's start)
+waits the settle out and clears the entry only when the gate and every pair pass.
 
 **The fault gate's heal** (`heal_stuck`, `fault_gate_heal`) runs the same heal on stuck pairs the gate's own check
 found, with no injection to journal it on: its holds are the caller's, and its container restarts are cleared or left
@@ -149,13 +149,14 @@ class LinkSettling:
 
     def _settle_child(self, entry: Mapping[str, Any], how: str) -> None:
         """A heal's container restart this recovery has just verified serving: when this recovery started the container
-        (`restored`), hold a settle of `heal_settle_s` from now, in the federation's drain record first (`hold_for`,
-        when this recovery has one), then on the entry, so that its gate and pairs are read, in any process, only once
-        it has passed (`_await_quiet`). A container found back was started by its heal, whose holds (the drain record
-        every admission waits for, or the journalled ones `_settle` waited out first) covered the settle after that
-        start. A record that cannot be written raises, and nothing is read."""
-        if how != "restored":
-            return
+        (`restored`), or no settle is journalled on its entry (who started it, and when, is not known: a recovery killed
+        after its start and before its hold leaves exactly that), hold a settle of `heal_settle_s` from now, in the
+        federation's drain record first (`hold_for`, when this recovery has one), then on the entry, so that its gate
+        and pairs are read, in any process, only once it has passed (`_await_quiet`). A record that cannot be written
+        raises, and nothing is read."""
+        until = entry.get("settle_until")
+        if how != "restored" and isinstance(until, int | float) and not isinstance(until, bool):
+            return  # held already, by the recovery that started it: `_await_quiet` waits for it, or defers
         seconds = self._settings.heal_settle_s
         until = self._wall() + seconds  # read before the drain record's own: the record never ends before the line
         if self._hold_for is not None:
