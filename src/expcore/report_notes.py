@@ -66,9 +66,10 @@ FAMILY_NOTES = [  # beside the named Holm families' tables (S17)
 ]
 
 
-def equivalence_family_notes(alpha: float, by_family: bool = False) -> list[str]:
+def equivalence_family_notes(alpha: float, by_family: bool = False, declared: bool = False) -> list[str]:
     """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces.
-    `by_family` adds what several named Holm families change (S17): each claim is adjusted within its own."""
+    `by_family` adds what several named Holm families change (S17): each claim is adjusted within its own.
+    `declared` says the claims are in declared equivalence families (S18), each adjusted over its own claims."""
     one = [
         "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two"
     ]
@@ -77,8 +78,14 @@ def equivalence_family_notes(alpha: float, by_family: bool = False) -> list[str]
         "other claims of its own Holm family only (the Holm family column): that group is the family Holm TOST p,",
         "Interval level and Equivalent are computed over. TOST p: the larger of the two",
     ]
+    named = [
+        "The preregistration declares these contrasts' equivalence claims in named equivalence families (the",
+        "Equivalence family column), each Holm-adjusted over its own claims alone, whatever the Holm families of the",
+        "contrasts' significance tests: that family is the one Holm TOST p, Interval level and Equivalent are computed",
+        "over, and its TOST steps follow the table. TOST p: the larger of the two",
+    ]
     return [
-        *(within if by_family else one),
+        *(named if declared else within if by_family else one),
         "one-sided tests' p-values, for an effect above minus the margin and for one below the margin (for the",
         "Wilcoxon cluster bootstrap, t-tests of the mean cluster difference on clusters - 1 degrees of freedom; n/a",
         "with fewer than two clusters or no spread between them). Holm TOST p: Holm-adjusted over the family, for",

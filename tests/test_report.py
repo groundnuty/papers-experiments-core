@@ -6,7 +6,15 @@ import math
 import pytest
 
 from expcore.report import render_report, summary_lines
-from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision, HolmFamily, HolmStep
+from expcore.stats.analysis import (
+    CONCLUSIONS,
+    AnalysisResult,
+    ContrastResult,
+    EquivalenceFamily,
+    HolmDecision,
+    HolmFamily,
+    HolmStep,
+)
 from expcore.stats.armruns import LOST_CAUSES, ArmRuns
 from expcore.stats.estimators import ModelEstimate
 from expcore.stats.onearm import DescriptiveResult
@@ -1292,3 +1300,160 @@ def test_s17_a_single_family_report_has_no_family_steps_or_family_column():
     assert "Holm steps of" not in report
     assert "Holm family |" not in report
     assert "### Equivalence family (Holm over two one-sided tests)\n" in report
+
+
+# --- declared equivalence families (S18) ------------------------------------------------------------------------------
+
+# One declared equivalence family of three claims across both Holm families above, worked by hand at alpha = 0.05:
+# TOST p 0.004 (h1a) <= 0.05/3 = 0.01667, adjusted 3 x 0.004 = 0.012; 0.020 (h2a) <= 0.05/2, adjusted max(0.012,
+# 2 x 0.020) = 0.040; 0.30 (h1b) > 0.05, adjusted max(0.040, 0.30) = 0.30.
+DECLARED_STEPS = (
+    HolmStep(1, "h1a", 0.004, 0.012, 0.05 / 3, True),
+    HolmStep(2, "h2a", 0.020, 0.040, 0.05 / 2, True),
+    HolmStep(3, "h1b", 0.30, 0.30, 0.05 / 1, False),
+)
+
+
+def declared(result, steps=DECLARED_STEPS, name="h1"):
+    """`result` with h1a, h2a and h1b as the claims of one declared equivalence family of these steps, each claim's
+    numbers its step's, and no Holm family holding an equivalence decision."""
+    by_step = {s.name: s for s in steps}
+    claims = tuple(
+        dataclasses.replace(r, **claim_fields(by_step[r.name])) if r.name in by_step else r for r in result.contrasts
+    )
+    decisions = tuple(HolmDecision(s.name, s.p_value, s.p_holm, s.level, s.reject) for s in steps)
+    family = EquivalenceFamily(name, tuple(s.name for s in steps), steps)
+    return dataclasses.replace(result, contrasts=claims, equivalence_holm=decisions, equivalence_families=(family,))
+
+
+def claim_fields(step):
+    """What the analysis gives a claim of an equivalence family from its step."""
+    return {
+        "p_value": 0.4,
+        "significant": False,
+        "conclusion": "equivalent" if step.reject else "not_detected",
+        "equivalence_margin": 0.2,
+        "equivalence_interval": (-0.05, 0.06),
+        "equivalent": step.reject,
+        "in_equivalence_family": True,
+        "tost_p": step.p_value,
+        "tost_p_holm": step.p_holm,
+        "equivalence_level": 1 - 2 * step.level,
+        "equivalence_interval_adjusted": (-0.08, 0.09),
+    }
+
+
+DECLARED_HEADING = "### Equivalence families (Holm over two one-sided tests, within each declared equivalence family)"
+
+
+def test_s18_the_report_gives_each_declared_equivalence_family_its_claims_and_its_tost_steps():
+    """S18: each claim's equivalence family beside the Holm family of its significance test, its raw and adjusted
+    TOST p and its verdict, then the family's steps at alpha/3, alpha/2, alpha/1 over its own three claims."""
+    report = render(declared(families_analysis()))
+    table = table_of(report, DECLARED_HEADING)
+    assert table["Contrast"] == [
+        "Contrast",
+        "Equivalence family",
+        "Holm family",
+        "Margin",
+        "TOST p",
+        "Holm TOST p",
+        "Interval level",
+        "Adjusted interval",
+        "Equivalent",
+    ]
+    assert table["h1a"][1:] == ["h1", "phase1", "0.2", "0.0040", "0.0120", "96.66666667%", "[-0.08, 0.09]", "yes"]
+    assert table["h2a"][1:3] == ["h1", "phase2"]
+    assert table["h1b"][1:] == ["h1", "phase1", "0.2", "0.3000", "0.3000", "90%", "[-0.08, 0.09]", "no"]
+    steps = table_of(report, "TOST steps of equivalence family h1")
+    assert steps["Step"] == ["Step", "Contrast", "TOST p", "Level", "Holm TOST p", "Equivalent"]
+    assert steps["1"][1:] == ["h1a", "0.0040", "0.01667 (alpha/3)", "0.0120", "yes"]
+    assert steps["2"][1:] == ["h2a", "0.0200", "0.025 (alpha/2)", "0.0400", "yes"]
+    assert steps["3"][1:] == ["h1b", "0.3000", "0.05 (alpha/1)", "0.3000", "no"]
+    assert "each Holm-adjusted over its own claims alone" in report
+    assert "within each Holm family" not in report
+
+
+def test_s18_under_one_flat_holm_family_the_equivalence_table_has_no_holm_family_column():
+    """S18: declared equivalence families need no named Holm family; the table then names the equivalence family
+    only."""
+    flat = analysis(contrast("h1a", "difference"), contrast("h2a", "difference"), contrast("h1b", "difference"))
+    table = table_of(render(declared(flat)), DECLARED_HEADING)
+    assert table["Contrast"][:3] == ["Contrast", "Equivalence family", "Margin"]
+    assert table["h2a"][1:3] == ["h1", "0.2"]
+
+
+def test_s18_the_terminal_summary_names_each_claims_equivalence_family():
+    """S18: a claim's Holm TOST p is its own equivalence family's, and the line says which family that is."""
+    lines = {line.split(":")[0]: line for line in summary_lines(declared(families_analysis()))}
+    assert lines["h1a"] == (
+        "h1a: estimate 0.25, p 0.4000, Holm p 0.0240 (family phase1), equivalent, Holm TOST p 0.0120 "
+        "(equivalence family h1)"
+    )
+    assert lines["h1c"].endswith(", not_detected")
+
+
+NOT_ITS_DECISION = "'h1b': its step in equivalence family 'h1' is not its decision in equivalence_holm"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: dataclasses.replace(r, equivalence_holm=r.equivalence_holm[:2]), NOT_ITS_DECISION),
+        (
+            lambda r: dataclasses.replace(
+                r, equivalence_families=(*r.equivalence_families, EquivalenceFamily("h2", ("h1b",), DECLARED_STEPS[2:]))
+            ),
+            "'h1b' is in two equivalence families, 'h1' and 'h2'",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                equivalence_families=(
+                    EquivalenceFamily(
+                        "h1",
+                        ("h1a", "h2a", "h1b"),
+                        (*DECLARED_STEPS[:2], dataclasses.replace(DECLARED_STEPS[2], level=0.05 / 11)),
+                    ),
+                ),
+            ),
+            NOT_ITS_DECISION,
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                holm_families=(
+                    dataclasses.replace(r.holm_families[0], equivalence=r.equivalence_holm[:1]),
+                    *r.holm_families[1:],
+                ),
+            ),
+            "Holm family 'phase1' holds equivalence decisions",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, in_equivalence_family=False) if c.name == "h1b" else c for c in r.contrasts
+                ),
+            ),
+            "'h1b' is in equivalence family 'h1' but is not an equivalence claim",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r, equivalence_families=(EquivalenceFamily("h1", ("h1a", "h2a"), DECLARED_STEPS[:2]),)
+            ),
+            "'h1b' is an equivalence claim that no equivalence family holds",
+        ),
+    ],
+    ids=["no-decision", "claim-in-two", "another-level", "holm-family-holds-one", "unflagged", "claim-in-none"],
+)
+def test_s18_a_result_whose_equivalence_families_disagree_with_its_decisions_is_refused(change, message):
+    """S18: each claim is in exactly one declared equivalence family, with that family's step as its decision (at
+    its own family's level, never another's), no Holm family holds one, and every family member is a claim; anything
+    else would show a claim adjusted in another family than its own, so the report refuses it, and so does the
+    summary."""
+    bad = change(declared(families_analysis()))
+    with pytest.raises(ValueError, match=message):
+        render(bad)
+    with pytest.raises(ValueError, match=message):
+        summary_lines(bad)

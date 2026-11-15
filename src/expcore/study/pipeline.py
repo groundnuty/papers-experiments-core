@@ -732,18 +732,23 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
 def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
     """The Holm decisions `analysis.json` holds: `holm`, every member's decision as its own family made it, and,
     only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
-    decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named."""
+    decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named.
+    Only for declared equivalence families (S18), `equivalence_families`: each one's name, members and steps over
+    their TOST p-values; a study that declares none keeps its analysis.json byte for byte."""
     entries: dict[str, Any] = {"holm": result.holm}
     if result.holm_families:
         entries["holm_families"] = result.holm_families
+    if result.equivalence_families:
+        entries["equivalence_families"] = result.equivalence_families
     return entries
 
 
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
-    Holm decision, with each named family's steps (S17). `exploratory_only` is true when the preregistration makes no
-    confirmatory claim (S12): there is then no Holm decision, and every contrast is exploratory."""
+    Holm decision, with each named family's steps (S17) and each declared equivalence family's (S18). `exploratory_only`
+    is true when the preregistration makes no confirmatory claim (S12): there is then no Holm decision, and every
+    contrast is exploratory."""
     return {
         "preregistration": dict(analysis.result.manifest),
         "exploratory_only": analysis.result.exploratory_only,
