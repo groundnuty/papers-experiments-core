@@ -1,5 +1,6 @@
-"""The replication package of a merged batch (#154, C29): merge.json and each shard's snapshot go in with the records,
-the package's own check passes, and an anonymised build leaves no source in any snapshot and keeps the hashes true.
+"""The replication package of a merged batch (#154, C29, C38): merge.json and each shard's (or selection's) snapshot go
+in with the records, the package's own check passes, and an anonymised build leaves no source in any snapshot and keeps
+the hashes true.
 
 The shards run under a directory with an invented private name, so every package built here also shows that no path of
 the machine the shards ran on reaches it. Every build vendors stand-in wheels (`package_support`).
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from package_support import stand_in_vendor
+from selection_support import DIRECT, RELAY, make_selection_study, run_selection
 from shard_support import make_study, run_shard
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
@@ -138,6 +140,46 @@ def test_c29_an_anonymised_package_of_a_merged_batch_has_no_source_and_hashes_th
         assert shard["snapshot_sha256"] == hashlib.sha256(files[f"out/shards/{shard['index']}/{SNAPSHOT}"]).hexdigest()
     check = json.loads(files["out/runs/replay-check.json"])
     assert check["merge"]["sha256"] == hashlib.sha256(files["out/merge.json"]).hexdigest()
+    assert verify_package(root) == []
+
+
+@pytest.fixture(scope="module")
+def selections(tmp_path_factory, clean_environment, core_from_a_repository) -> Campaign:
+    """The example study run as two sequential selections (C38), merged into a copy that lists the merged files."""
+    home = tmp_path_factory.mktemp("selections") / f"{PRIVATE}-home"
+    home.mkdir()
+    now = run_selection(home, "now", clean_environment, [DIRECT], "now", sequential=True)
+    later = run_selection(home, "later", clean_environment, [RELAY], "later", sequential=True, after=[now])
+    merged = Campaign(make_selection_study(home, "study"))
+    spec = merged.root / "package.toml"
+    listed = '    "out/runs",\n    "out/merge.json",\n    "out/shards",\n'
+    spec.write_text(spec.read_text(encoding="utf-8").replace('    "out/runs",\n', listed), encoding="utf-8")
+    outs = [str(now.root / "out"), str(later.root / "out")]
+    merged.codes["merge"], errors = cli(clean_environment, "merge", str(merged.root / "out"), *outs)
+    assert merged.codes["merge"] == 0, errors
+    finish(clean_environment, merged)
+    assert merged.codes == {"merge": 0, "check": 0, "analyze": 0, "report": 0}
+    return merged
+
+
+@pytest.mark.parametrize("anonymised", [False, True], ids=["plain", "anonymised"])
+def test_c38_the_package_of_merged_selections_passes_its_own_check(
+    selections, hashes, anonymisation, tmp_path, anonymised
+):
+    """C38: merged selections package as merged shards do, plain and anonymised: merge.json with each selection's
+    levels, mode and window, a snapshot per selection, and a check that regenerates every output byte for byte."""
+    archive = build_package(
+        selections.root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation if anonymised else None
+    )
+    root = unpack(archive, tmp_path)
+    files = every_byte(root)
+    document = json.loads(files["out/merge.json"])
+    assert [(s["label"], s["selection"], s["sequential"]) for s in document["shards"]] == [
+        ("now", {"access": ["direct"]}, True),
+        ("later", {"access": ["relay"]}, True),
+    ]
+    for shard in document["shards"]:
+        assert shard["snapshot_sha256"] == hashlib.sha256(files[f"out/shards/{shard['index']}/{SNAPSHOT}"]).hexdigest()
     assert verify_package(root) == []
 
 

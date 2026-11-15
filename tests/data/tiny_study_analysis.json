@@ -1,0 +1,374 @@
+{
+ "alpha": 0.05,
+ "code": {
+  "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "dirty": false,
+  "tree_sha256": "(not pinned)"
+ },
+ "conditions": [
+  {
+   "analysed": 8,
+   "condition": "baseline",
+   "exhausted": 0,
+   "left_out": 0,
+   "planned": 8,
+   "set_aside": 0,
+   "unfinished": 0
+  },
+  {
+   "analysed": 6,
+   "condition": "extended",
+   "exhausted": 0,
+   "left_out": 0,
+   "planned": 6,
+   "set_aside": 0,
+   "unfinished": 0
+  },
+  {
+   "analysed": 8,
+   "condition": "relay-down",
+   "exhausted": 0,
+   "left_out": 0,
+   "planned": 8,
+   "set_aside": 0,
+   "unfinished": 0
+  }
+ ],
+ "contrasts": [
+  {
+   "arm_runs": [
+    {
+     "arm": "extended",
+     "finished": 6,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 6,
+     "planned": 6
+    },
+    {
+     "arm": "baseline",
+     "finished": 6,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 6,
+     "planned": 6
+    }
+   ],
+   "arms": [
+    "extended",
+    "baseline"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": 0.5,
+   "ci_low": 0.25,
+   "cluster": "region",
+   "conclusion": "not_detected",
+   "counts": {
+    "zero_dropped": 0
+   },
+   "equivalence_interval": [
+    0.25,
+    0.5
+   ],
+   "equivalence_interval_adjusted": null,
+   "equivalence_level": null,
+   "equivalence_margin": 0.2,
+   "equivalent": false,
+   "estimate": 0.375,
+   "estimation_unit": [
+    "model",
+    "region"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": false,
+   "factor": null,
+   "in_equivalence_family": false,
+   "in_family": true,
+   "independent_unit": "region",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": null,
+   "n_cells": 4,
+   "n_clusters": 2,
+   "n_clusters_dropped": 0,
+   "n_pairs": 6,
+   "n_pairs_missing": 0,
+   "n_unpaired": 2,
+   "name": "extended-vs-baseline",
+   "outcome": "accuracy",
+   "p_value": 0.5,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 2
+   },
+   "per_model": [
+    {
+     "ci_high": 1.0,
+     "ci_low": 0.0,
+     "estimate": 0.5,
+     "model": "alpha-stub",
+     "n_undefined_replicates": 0
+    },
+    {
+     "ci_high": 0.5,
+     "ci_low": 0.0,
+     "estimate": 0.25,
+     "model": "beta-stub",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": false,
+   "tasks_dropped": [
+    "dune"
+   ],
+   "tost_p": null,
+   "tost_p_holm": null,
+   "treatment_outcomes": null
+  },
+  {
+   "arm_runs": [
+    {
+     "arm": "relay-down",
+     "finished": 8,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 8,
+     "planned": 8
+    },
+    {
+     "arm": "baseline",
+     "finished": 8,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 8,
+     "planned": 8
+    }
+   ],
+   "arms": [
+    "relay-down",
+    "baseline"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": 0.5,
+   "ci_low": -0.25,
+   "cluster": "region",
+   "conclusion": "not_detected",
+   "counts": {
+    "zero_dropped": 0
+   },
+   "equivalence_interval": null,
+   "equivalence_interval_adjusted": null,
+   "equivalence_level": null,
+   "equivalence_margin": null,
+   "equivalent": false,
+   "estimate": 0.125,
+   "estimation_unit": [
+    "model",
+    "region"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": false,
+   "factor": null,
+   "in_equivalence_family": false,
+   "in_family": true,
+   "independent_unit": "region",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": null,
+   "n_cells": 4,
+   "n_clusters": 2,
+   "n_clusters_dropped": 0,
+   "n_pairs": 8,
+   "n_pairs_missing": 0,
+   "n_unpaired": 0,
+   "name": "relay-vs-baseline",
+   "outcome": "accuracy",
+   "p_value": 1.0,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 0
+   },
+   "per_model": [
+    {
+     "ci_high": 0.5,
+     "ci_low": -0.5,
+     "estimate": 0.0,
+     "model": "alpha-stub",
+     "n_undefined_replicates": 0
+    },
+    {
+     "ci_high": 0.5,
+     "ci_low": 0.0,
+     "estimate": 0.25,
+     "model": "beta-stub",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": false,
+   "tasks_dropped": [],
+   "tost_p": null,
+   "tost_p_holm": null,
+   "treatment_outcomes": "scored"
+  },
+  {
+   "arm_runs": [
+    {
+     "arm": "extended",
+     "finished": 6,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 6,
+     "planned": 6
+    },
+    {
+     "arm": "basic",
+     "finished": 6,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 6,
+     "planned": 6
+    }
+   ],
+   "arms": [
+    "extended",
+    "basic"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": -1.0,
+   "ci_low": -2.0,
+   "cluster": "region",
+   "conclusion": "not_detected",
+   "counts": {
+    "zero_dropped": 0
+   },
+   "equivalence_interval": null,
+   "equivalence_interval_adjusted": null,
+   "equivalence_level": null,
+   "equivalence_margin": null,
+   "equivalent": false,
+   "estimate": -1.5,
+   "estimation_unit": [
+    "model",
+    "region"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": true,
+   "factor": "tools",
+   "in_equivalence_family": false,
+   "in_family": false,
+   "independent_unit": "region",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": null,
+   "n_cells": 4,
+   "n_clusters": 2,
+   "n_clusters_dropped": 0,
+   "n_pairs": 6,
+   "n_pairs_missing": 0,
+   "n_unpaired": 10,
+   "name": "tools-effect-on-rounds",
+   "outcome": "rounds",
+   "p_value": 0.5,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 10
+   },
+   "per_model": [
+    {
+     "ci_high": -1.0,
+     "ci_low": -2.0,
+     "estimate": -1.5,
+     "model": "alpha-stub",
+     "n_undefined_replicates": 0
+    },
+    {
+     "ci_high": -1.0,
+     "ci_low": -2.0,
+     "estimate": -1.5,
+     "model": "beta-stub",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": false,
+   "tasks_dropped": [
+    "dune"
+   ],
+   "tost_p": null,
+   "tost_p_holm": null,
+   "treatment_outcomes": null
+  }
+ ],
+ "core_version": "(not pinned)",
+ "excluded_attempts": [],
+ "exploratory_only": false,
+ "holm": [
+  {
+   "level": 0.025,
+   "name": "extended-vs-baseline",
+   "p_holm": 1.0,
+   "p_value": 0.5,
+   "reject": false
+  },
+  {
+   "level": 0.05,
+   "name": "relay-vs-baseline",
+   "p_holm": 1.0,
+   "p_value": 1.0,
+   "reject": false
+  }
+ ],
+ "partial": false,
+ "preregistration": {
+  "factor_schema_sha256": "dccda65c82f6030717ea12ca7a0c9654bda6e9073e04e93a0663bf6d313796e5",
+  "preregistration_sha256": "365aa74b9a821b15e50307253dd69d5f9c424622ed9b42d7de443b79d9d182f9"
+ },
+ "running_attempts": 0,
+ "scorers": {
+  "tiny": "1"
+ }
+}
