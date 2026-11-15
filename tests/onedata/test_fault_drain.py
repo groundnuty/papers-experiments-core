@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from fault_support import (
@@ -31,6 +32,7 @@ from fault_support import (
 
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
+from expcore_onedata import admission as admission_module
 from expcore_onedata.admission import (
     _STRANDED,
     EXCLUSIVE_RUN,
@@ -45,11 +47,16 @@ from expcore_onedata.fault_drain import GATE, MOUNT, SessionDrain
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import DRAIN, HOLDER, JOURNAL, InjectionJournal, boot_id
 from expcore_onedata.fault_recovery import Recovery
+from expcore_onedata.fault_settings import restore_bound_s, restore_drain_s
 from expcore_onedata.faults import FaultInjector, load_faults
 from expcore_onedata.testing import write_platform
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
 DRAIN_S = 320.0
+# the fixture's restore and gate (505 s), the slack (300 s) and the drain a clear may wait (320 s): a platform that
+# declares the drain needs `[tokens] margin_s` of 1,125 s (`fault_settings.restore_token_margin_s`), past the default
+DRAIN_MARGIN_S = 1125
+SLOW_READY_MARGIN_S = 1320  # a 200 s wait to serve takes the fixture's restore and drain to 1,320 s
 
 
 def settings_of(platform):
@@ -88,7 +95,8 @@ def test_o11_session_drain_s_is_a_number_of_at_least_zero_and_zero_declares_no_d
     non-numeric value is refused naming the key."""
     for name, value in (("b", 320), ("c", 0), ("d", 12.5)):
         (tmp_path / name).mkdir()
-        assert settings_of(write_faults(tmp_path / name, session_drain_s=value)).session_drain_s == value
+        platform = write_faults(tmp_path / name, session_drain_s=value, margin_s=DRAIN_MARGIN_S)
+        assert settings_of(platform).session_drain_s == value
     for name, value in (("e", -1), ("f", "320"), ("g", True), ("h", float("inf"))):
         (tmp_path / name).mkdir()
         with pytest.raises(ConfigError, match="session_drain_s"):
@@ -103,6 +111,7 @@ def test_o11_a_platform_that_declares_no_session_drain_waits_the_full_default(tm
         table = faults_table()
         del table["session_drain_s"]
         data["faults"] = table
+        data["tokens"] = {"margin_s": DRAIN_MARGIN_S}  # the default drain counts in the least token margin
 
     assert settings_of(write_platform(tmp_path, edit)).session_drain_s == 320.0
 
@@ -288,10 +297,10 @@ def forbidden(seconds):
     raise AssertionError("an admission slept where it must let go at once")
 
 
-def fake_federation(tmp_path, **changes):
+def fake_federation(tmp_path, margin_s=DRAIN_MARGIN_S, **changes):
     """A platform declaring the drain, its settings, a fake clock, and a lock whose drains run on that clock (and whose
     wall clock is that clock), whose releases must never sleep."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, **changes), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=margin_s, **changes), FakeClock()
     settings = settings_of(platform)
     return platform, settings, clock, FederationLock(settings, clock=clock, sleep=forbidden, wall=clock)
 
@@ -368,7 +377,7 @@ def test_o11_an_admission_nothing_armed_writes_no_record_and_opens_the_federatio
 def test_o11_a_run_that_is_not_an_outage_run_is_not_delayed_by_the_run_admission(tmp_path):
     """O11: the platform's run admission lets a baseline run and an exclusive control go the moment their attempt ends,
     with the default drain of 320 s declared, and the next is admitted at once."""
-    platform = write_faults(tmp_path, session_drain_s=DRAIN_S)
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S)
     admit = run_admission(load_platform(platform, require_secrets=False))
     started = time.monotonic()
     for kinds, exclusive in (((), False), ((), True), ((), False)):
@@ -410,7 +419,7 @@ def test_o11_a_drain_record_that_cannot_be_read_refuses_every_admission_and_hold
 def test_o11_a_drain_that_cannot_be_recorded_is_waited_out_before_the_lock_is_let_go(tmp_path, monkeypatch):
     """O11: a record that cannot be written is no reason to let the federation go inside the drain: the release waits
     in process, the lock held, for the whole of it."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     slept: list[float] = []
 
     def sleep(seconds):
@@ -452,7 +461,8 @@ def test_o11_the_injectors_own_admission_is_kept_until_the_drain_is_over_and_the
     """O11: the sandbox's sessions ended just before the restore; the restore took 180 s serving (what a heal's settle
     takes); the injector holds its own admission and waits the 140 s that are left, so the clear takes 320 s from the
     end of the sessions and not 500, and the snapshot records the times, the wait and why."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, ready_timeout_s=200), FakeClock()
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, ready_timeout_s=200, margin_s=SLOW_READY_MARGIN_S)
+    clock = FakeClock()
     injector = injector_for(platform, FakeServices(serves_after=180), clock=clock)
     injector.start(RUN)
     ended = clock.now
@@ -478,7 +488,7 @@ def test_o11_the_injectors_own_admission_is_kept_until_the_drain_is_over_and_the
 
 def test_o11_the_injectors_own_admission_stays_closed_while_it_drains(tmp_path):
     """O11: while the injector waits out the drain, the federation is still held against every other run."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     injector = injector_for(platform, FakeServices(), clock=clock)
     lock = FederationLock(settings_of(platform))
     seen: list[bool] = []
@@ -503,7 +513,8 @@ def test_o11_the_injectors_own_admission_stays_closed_while_it_drains(tmp_path):
 def test_o11_an_injector_with_no_report_of_the_sessions_waits_the_full_drain_from_its_restores_start(tmp_path):
     """O11: no sandbox reported its mount or gate to the injector's admission: the end is unknown, so the injector
     waits the whole 320 s from the start of its restore, the restore's own 100 s included."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, ready_timeout_s=200), FakeClock()
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, ready_timeout_s=200, margin_s=SLOW_READY_MARGIN_S)
+    clock = FakeClock()
     injector = injector_for(platform, FakeServices(serves_after=100), clock=clock)
     injector.start(RUN)
     began = clock.now
@@ -519,7 +530,7 @@ def test_o11_an_injector_with_no_report_of_the_sessions_waits_the_full_drain_fro
 
 def test_o11_an_injector_whose_provider_never_went_down_drains_nothing(tmp_path):
     """O11: a stop that took no effect injected nothing, so no read hung: no wait and no drain step."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     injector = injector_for(platform, FakeServices(stop_noop=True), clock=clock)
     with pytest.raises(Exception, match="could not be taken down"):
         injector.start(RUN)
@@ -572,7 +583,7 @@ def test_o11_a_runs_admission_is_let_go_into_the_drain_when_it_ends_not_when_the
 def test_o11_a_runs_admission_whose_sandbox_ended_before_the_restore_overlaps_the_heals_settle(tmp_path):
     """O11: the sandbox ended, then a restore of 180 s ran (a heal's settle): the federation is closed only for what is
     left of the drain after it, not for 320 s more."""
-    platform, _, clock, lock = fake_federation(tmp_path, ready_timeout_s=200)
+    platform, _, clock, lock = fake_federation(tmp_path, ready_timeout_s=200, margin_s=SLOW_READY_MARGIN_S)
     injector = injector_for(platform, FakeServices(serves_after=180), clock=clock)
     with lock.held(exclusive=True, target=OUTAGE_TARGET, purpose=OUTAGE_RUN) as admission:
         injector.start(RUN)
@@ -592,7 +603,7 @@ def test_o11_a_runs_admission_whose_sandbox_ended_before_the_restore_overlaps_th
 def test_o11_an_unverified_restore_keeps_its_admission_and_drains_when_a_later_clear_verifies(tmp_path):
     """O11: a restore that is not verified is not drained and arms nothing: the injection stays open with the
     admission held; the clear that verifies it arms the drain."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     services = FakeServices(never_serves=True)
     injector = injector_for(platform, services, clock=clock)
     injector.start(RUN)
@@ -612,7 +623,7 @@ def test_o11_the_clears_cancel_bound_counts_the_drain_it_may_wait(tmp_path):
     for name in ("a", "b"):
         (tmp_path / name).mkdir()
     short = injector_for(write_faults(tmp_path / "a", session_drain_s=0), FakeServices())
-    long = injector_for(write_faults(tmp_path / "b", session_drain_s=500), FakeServices())
+    long = injector_for(write_faults(tmp_path / "b", session_drain_s=500, margin_s=1305), FakeServices())  # 805 + 500
     assert long.cancel_wait_s - short.cancel_wait_s == pytest.approx(500)
 
 
@@ -636,7 +647,9 @@ def crashed(tmp_path, **options):
 def test_o11_the_health_gates_recovery_of_a_crashed_runs_injection_closes_the_federation_for_the_drain(tmp_path):
     """O11: a restore the gate makes after a crashed outage run has no sandbox to take times from, so the federation is
     closed for the full drain from the start of its recovery, and its own check waits for it, charging no run."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.3)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.3
+    )
     clock = FakeClock()
     began = clock.now
     gate = FaultGate(settings_of(platform), FakeServices(path=state), clock=clock, sleep=clock.sleep, wall=clock)
@@ -656,7 +669,7 @@ def test_o11_the_health_gates_recovery_of_a_crashed_runs_injection_closes_the_fe
 
 def test_o11_a_gate_with_nothing_to_recover_drains_nothing(tmp_path):
     """O11: no open injection, no restore, no record."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     health = FaultGate(settings_of(platform), FakeServices(), clock=clock, sleep=clock.sleep, wall=clock)()
     assert health.ok is True, health.detail
     assert not (settings_of(platform).journal / DRAIN).exists()
@@ -666,7 +679,9 @@ def test_o11_a_start_that_recovers_a_crashed_runs_injection_owes_its_drain_whate
     """O11: the start restores what a crashed run left, under the exclusive admission it holds: that run's sessions are
     unknown, so the admission owes the full drain from the start of the recovery, even when the current run's own
     sandbox, begun before, has no sessions."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5
+    )
     clock = FakeClock()
     injector = injector_for(platform, FakeServices(path=state), clock=clock)
     lock = FederationLock(settings_of(platform), clock=clock, sleep=clock.sleep, wall=clock)
@@ -690,7 +705,9 @@ def test_o11_a_recovery_that_holds_no_admission_still_closes_the_federation_for_
     """O11: `FaultInjector.recover()` called with no admission held restores a crashed run's provider and clears its
     journal entry; with no admission to keep closed it writes the drain record itself, so the next run is not admitted
     inside the drain."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5
+    )
     clock = FakeClock()
     injector = injector_for(platform, FakeServices(path=state), clock=clock, wall=clock)
     assert injector.recover() == []
@@ -702,7 +719,7 @@ def test_o11_a_recovery_that_holds_no_admission_still_closes_the_federation_for_
 
 def test_o11_a_recovery_that_restored_nothing_closes_nothing(tmp_path):
     """O11: no open injection, nothing restored, no record."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     injector = injector_for(platform, FakeServices(), clock=clock, wall=clock)
     assert injector.recover() == []
     assert not (settings_of(platform).journal / DRAIN).exists()
@@ -712,7 +729,9 @@ def test_o11_a_recovery_with_no_admission_takes_the_federation_for_the_restore_a
     """O11: with no admission held, `FaultInjector.recover()` takes the federation exclusively for the restore, so no
     process is admitted in any gap around it (the lock, not a record written beside it, is what keeps it closed), and
     lets it go into the drain."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5
+    )
     clock = FakeClock()
     settings = settings_of(platform)
     lock = FederationLock(settings, wall=clock)
@@ -733,7 +752,12 @@ def test_o11_a_recovery_with_no_admission_that_cannot_get_the_federation_restore
     injector's own failure, and restarts nothing, since a restore that nothing keeps the federation closed behind is
     not made."""
     platform, state = crashed(
-        tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5, admission_timeout_s=0.2
+        tmp_path,
+        session_drain_s=DRAIN_S,
+        margin_s=DRAIN_MARGIN_S,
+        poll_s=0.01,
+        ready_timeout_s=5,
+        admission_timeout_s=0.2,
     )
     clock = FakeClock()
     services = FakeServices(path=state)
@@ -770,7 +794,9 @@ def stuck_federation(settings):
 def test_o11_the_gates_recovery_of_a_stuck_holders_injection_closes_the_federation_before_it_restores(tmp_path):
     """O11: a holder that is gone while the lock stays held left an injection open: the health gate recovers it with no
     admission, so it writes the drain record first, then restores."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.2)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.2
+    )
     settings = settings_of(platform)
     clock = FakeClock()
     lock = FederationLock(settings, wall=clock)
@@ -824,7 +850,7 @@ def test_o11_a_pause_between_the_two_clocks_never_publishes_an_earlier_deadline(
 def test_o11_an_admission_whose_drain_can_be_neither_recorded_nor_waited_out_is_never_let_go(tmp_path, monkeypatch):
     """O11: the record cannot be written, and the wait in its place is interrupted: the lock is kept, with its holder
     record, for as long as the process lives, instead of opening the federation inside the drain."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     settings = settings_of(platform)
 
     def interrupted(seconds):
@@ -859,7 +885,9 @@ def test_o11_an_interrupt_during_the_gates_recovery_still_closes_the_federation(
     """O11: the gate's recovery arms its drain before it restores anything, so an interrupt after the provider is back
     and the journal cleared, before the recovery could report it, cannot leave the federation open: the admission's
     release publishes the drain whatever ended the recovery."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5
+    )
     clock = FakeClock()
     services = FakeServices(path=state)
 
@@ -877,7 +905,9 @@ def test_o11_a_recovery_under_an_admission_owes_its_drain_before_it_restores_and
     """O11: `FaultInjector.recover()` under an exclusive admission owes the drain on it before the provider is
     restarted, and keeps a share of the admission until it has ended, so a cancelled owner cannot let the lock go
     under it."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5
+    )
     clock = FakeClock()
     settings = settings_of(platform)
     lock = FederationLock(settings, clock=clock, sleep=clock.sleep, wall=clock)
@@ -896,7 +926,7 @@ def test_o11_a_recovery_under_an_admission_owes_its_drain_before_it_restores_and
 def test_o11_a_later_clear_without_the_original_admission_takes_the_federation_for_its_restore(tmp_path):
     """O11: the first clear fails readiness and the run's admission is let go; the retry, which holds none, takes the
     federation exclusively for its restore, so nothing is admitted while it restores, and lets it go into the drain."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S), FakeClock()
+    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S), FakeClock()
     settings = settings_of(platform)
     lock = FederationLock(settings, clock=clock, sleep=clock.sleep, wall=clock)
     services = FakeServices(never_serves=True)
@@ -915,6 +945,38 @@ def test_o11_a_later_clear_without_the_original_admission_takes_the_federation_f
     assert all(seen)  # held against every other admission until the journal's clear and after it
     assert open_injections(tmp_path) == []
     assert clock.now - began >= DRAIN_S - 5  # it holds no sandbox of its own: it waits the drain out before it lets go
+    assert step(injector, "drain")["deferred"] is False
+
+
+def test_o35_a_clear_that_takes_the_federation_itself_waits_out_a_standing_drain_before_it_restores(
+    tmp_path, monkeypatch
+):
+    """O35, O11: why the least token margin counts the drain. The first clear fails readiness under the run's
+    admission, whose release closes the federation for the drain; the retry holds no admission, so it takes the
+    federation itself, waits out that drain record before it restores anything, and then holds its own admission until
+    its own drain, counted from its restore's start, is over. The two waits follow each other: the retry takes longer
+    than the restore's bound alone, and stays inside that bound and the drain the margin counts (`restore_drain_s`)."""
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, admission_timeout_s=60)
+    clock, settings = FakeClock(), settings_of(platform)
+    lock = FederationLock(settings, clock=clock, sleep=clock.sleep, wall=clock)
+    services = FakeServices(never_serves=True)
+    injector = injector_for(platform, services, clock=clock, wall=clock)
+    with lock.held(exclusive=True, target=OUTAGE_TARGET, purpose=OUTAGE_RUN):
+        injector.start(RUN)
+        assert injector.clear() is False  # not serving: the injection stays open and the run's admission armed
+    standing = lock.drain_left()
+    assert standing > DRAIN_S - 20  # the first clear's drain, published as the run's admission went
+    # the lock's wait for the record pauses on the real clock: here each pause moves the fake one, its deadline real
+    monkeypatch.setattr(admission_module, "time", SimpleNamespace(monotonic=time.monotonic, sleep=clock.sleep))
+    services.knobs["never_serves"] = False
+    read_back: list[float] = []
+    services.on_serves = lambda service: read_back.append(clock.now)
+    began = clock.now
+    assert injector.clear() is True
+    assert read_back[0] - began >= standing  # nothing was read back before the standing drain had passed
+    took = clock.now - began
+    assert took > restore_bound_s(settings)  # more than the restore alone may take
+    assert took <= restore_bound_s(settings) + restore_drain_s(settings)
     assert step(injector, "drain")["deferred"] is False
 
 
@@ -951,7 +1013,9 @@ def test_o11_a_drain_that_cannot_be_recorded_after_a_recovery_is_waited_out_hold
 ):
     """O11: the recovery's own admission cannot write the drain record when it lets go: it waits the drain out in
     process, the lock held, before the federation goes."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5
+    )
     clock = FakeClock()
     injector = injector_for(platform, FakeServices(path=state), clock=clock, wall=clock)
 
@@ -1012,7 +1076,7 @@ def test_o11_an_admission_that_read_the_record_before_a_lockless_restore_wrote_i
     """O11: a restore that holds no lock (the health gate's, of a stuck holder's injection) writes the drain record
     before it clears the journal. An admission that read the record before that and the journal after it must read the
     record again, or it would pass `_require_settled` and start inside the drain."""
-    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, admission_timeout_s=0.3)
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, admission_timeout_s=0.3)
     settings = settings_of(platform)
     lock = FederationLock(settings)
     original = FederationLock._require_settled
@@ -1034,7 +1098,10 @@ def test_o11_an_admission_that_read_the_record_before_a_lockless_restore_wrote_i
 def test_o11_a_start_that_finds_the_journal_settled_waits_for_a_record_written_before_that(tmp_path, monkeypatch):
     """O11: the injector's start reads the journal (`_recover`), then the record: one written by a restore that cleared
     the journal in between holds the start back, and it takes nothing down when it cannot wait it out."""
-    platform, clock = write_faults(tmp_path, session_drain_s=DRAIN_S, admission_timeout_s=5), FakeClock()
+    platform, clock = (
+        write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, admission_timeout_s=5),
+        FakeClock(),
+    )
     services = FakeServices()
     injector = injector_for(platform, services, clock=clock, wall=clock)
     original = FaultInjector._recover
@@ -1055,7 +1122,9 @@ def test_o11_the_gates_recovery_after_the_holder_went_runs_under_the_lock_it_tak
     """O11: the gate's wait ran out against a lock a holder that is gone left held, and by the time it reads the
     holder the lock is free: the recovery then runs under an exclusive admission of its own, and the federation is
     closed for the drain by that admission's release."""
-    platform, state = crashed(tmp_path, session_drain_s=DRAIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.2)
+    platform, state = crashed(
+        tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, poll_s=0.01, ready_timeout_s=5, health_wait_s=0.2
+    )
     settings = settings_of(platform)
     clock = FakeClock()
     lock = FederationLock(settings, wall=clock)
@@ -1083,7 +1152,7 @@ def test_o11_an_exclusive_control_settles_the_journal_before_it_reads_the_record
     """O11: a control with no fault holds the federation exclusively and has no injector to settle the journal for it:
     like a shared run it refuses an unsettled one, and reads the record again after it, so a restore that cleared the
     journal without the lock (the health gate's, of a stuck holder's) and wrote its record first cannot be raced."""
-    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, admission_timeout_s=0.3)
+    platform = write_faults(tmp_path, session_drain_s=DRAIN_S, margin_s=DRAIN_MARGIN_S, admission_timeout_s=0.3)
     lock = FederationLock(settings_of(platform))
     original = FederationLock._require_settled
 

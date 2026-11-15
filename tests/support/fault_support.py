@@ -128,11 +128,14 @@ def faults_table(**changes: Any) -> dict[str, Any]:
     return table
 
 
-def write_faults(tmp_path: Path, **changes: Any) -> Path:
-    """Write platform.toml with a `[faults]` table; return its path."""
+def write_faults(tmp_path: Path, *, margin_s: int | None = None, **changes: Any) -> Path:
+    """Write platform.toml with a `[faults]` table; return its path. `margin_s` sets `[tokens] margin_s`, which a table
+    whose restore bounds outgrow the default 900 s needs at load (`fault_settings.restore_token_margin_s`)."""
 
     def edit(data: dict[str, Any]) -> None:
         data["faults"] = faults_table(**changes)
+        if margin_s is not None:
+            data["tokens"] = {**data.get("tokens", {}), "margin_s": margin_s}
 
     return write_platform(tmp_path, edit)
 

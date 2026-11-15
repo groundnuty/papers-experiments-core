@@ -378,7 +378,9 @@ def test_c06_a_campaign_does_not_resume_under_another_target_service_or_sanction
     schema, manifest = make_schema(), make_manifest(make_schema())
     configs = {
         "started": write_faults(folder(tmp_path, "a")),
-        "other waits": write_faults(folder(tmp_path, "b"), settle_timeout_s=60, admission_timeout_s=10, poll_s=3),
+        "other waits": write_faults(
+            folder(tmp_path, "b"), settle_timeout_s=60, admission_timeout_s=10, poll_s=3, margin_s=1800
+        ),
         "other service": write_faults(folder(tmp_path, "c"), services={**SERVICES, "beta": "store-three"}),
         "other project": write_faults(folder(tmp_path, "f"), project="stack-b"),
         "unsanctioned": write_faults(folder(tmp_path, "d"), sanctioned=False),

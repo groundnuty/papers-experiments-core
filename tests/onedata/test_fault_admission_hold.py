@@ -14,6 +14,7 @@ import time
 import pytest
 from campaign_support import keys_under, make_schema, planned_store
 from fault_support import LOCAL_TARGET, SERVICES, FakeServices, injector_for, write_faults
+from gate_support import noting_check
 from heal_support import READER, TARGET, HealServices, heal_injector, stale
 from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings_for
 
@@ -298,8 +299,15 @@ def test_o11_a_run_waiting_behind_an_outage_runs_heal_holds_uncharged_and_starts
 
     executor = FakeExecutor({ONE_KEY: [baseline]})
     settings = settings_for(max_attempts=1)
+    journal = load_faults(federation / "platform.toml", config).journal
     with build(
-        tmp_path / "campaign", schema=ONE, executor=executor, plan=SMALL, settings=settings, admission=counted
+        tmp_path / "campaign",
+        schema=ONE,
+        executor=executor,
+        plan=SMALL,
+        settings=settings,
+        health=noting_check(journal),  # the platform's admission needs a check: it notes the epoch, as the gate does
+        admission=counted,
     ) as scheduler:
         summary = scheduler.run()
         assert attempts_of(scheduler.store, ONE_KEY) == [("done", 0, 1)]
