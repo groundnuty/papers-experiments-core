@@ -28,6 +28,9 @@ outage run out for ever. What it does around that:
   holder (boot id, pid and start time), the start and the end, in `shared-holds.jsonl` beside the fault journal that
   the exclusive admission reads. An exclusive wait that runs out says that tools hold the federation and since when,
   never their reasons.
+- **It holds the reset lock shared too** (`expcore_onedata.resetlock`, as every shared admission does), so a shortcut
+  reset, which needs no reader to place bytes while it runs, waits for the tool, and the tool waits for it; inside a
+  run whose own shortcut reset holds that lock, a tool that would reuse the run's admission is refused.
 - **It releases on exit and on an exception.** The lock goes with the process however it dies, and the record of a
   dead tool is ended by the next hold or the next exclusive admission as `holder_gone`.
 
@@ -62,6 +65,7 @@ from expcore_onedata.admission import (
     FederationLock,
     current_admission,
     fault_settings_of,
+    require_reset_share,
 )
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_recovery import failure
@@ -113,6 +117,7 @@ def _reusable(plan: _Plan, lock: FederationLock) -> tuple[Admission, Callable[[]
     held = current_admission()
     if held is None or held.exclusive or held.federation != lock.federation:
         return None
+    require_reset_share(held)  # its own shortcut reset holds the reset lock: no tool may act until it ends
     _require_baselines(plan)
     share = held.try_retain()
     if share is None:

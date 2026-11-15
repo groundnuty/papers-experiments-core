@@ -29,10 +29,11 @@ runs, so the window is the planner's own reading.
 """
 
 from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from expcore_onedata import occupancy, resetqos
+from expcore_onedata.resetgrant import current_grant
 
 if TYPE_CHECKING:  # the reset imports this module's type; only its interface is used here
     from expcore_onedata.reset import SpaceReset
@@ -41,12 +42,16 @@ if TYPE_CHECKING:  # the reset imports this module's type; only its interface is
 @dataclass(frozen=True)
 class Holdings:
     """What a planner read: the QoS scan (with each regular file's path), each file's bytes at each provider read
-    (provider to file id to bytes), the provisioner's clock when the listing began, and the seconds it all took."""
+    (provider to file id to bytes), the provisioner's clock when the listing began, and the seconds it all took; and,
+    for the shortcut (`resetshortcut.py`), this host's epoch clock when the listing began (`read_epoch`) and the grant
+    of the exclusive section the reading was made in (`grant`, `resetgrant.current_grant`; None outside one)."""
 
     scan: resetqos.Found
     held: dict[str, dict[str, int]]
     read_at: float
     seconds: float
+    read_epoch: float | None = None
+    grant: Any = field(default=None, compare=False, repr=False)
 
     def held_paths(self, provider: str) -> list[str]:
         """The paths of the files a provider holds any bytes of, sorted; none for a provider not read."""
@@ -86,12 +91,13 @@ def plan_scan(reset: "SpaceReset", *, never_holds: Collection[str] = ()) -> Hold
     for provider in never_holds:
         p.check_eviction(provider)
     p.verify_space()
-    began = p.clock()
+    grant = current_grant()  # the section the reading is made in, held from before its listing begins
+    epoch, began = reset.now(), p.clock()
     found = resetqos.by_listing(p, providers)
     files = sorted(found.listing.regular)  # every provider's listing's, read at each: one listing may miss a file
     can_hold = [q for q in p.space.support.providers if q != p.settings.holder and q not in never_holds]
     held = occupancy.read_files(p, dict.fromkeys(can_hold, files), p.client.provider_label, occupancy.Budget(p.clock()))
-    return Holdings(found, held, began, round(p.clock() - began, 3))
+    return Holdings(found, held, began, round(p.clock() - began, 3), read_epoch=epoch, grant=grant)
 
 
 def given_scan(reset: "SpaceReset", holdings: Holdings) -> resetqos.Found:

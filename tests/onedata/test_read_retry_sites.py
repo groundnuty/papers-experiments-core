@@ -49,6 +49,7 @@ PLUMBING = {
         "self._p.retry"
     ],  # the global clock, Onezone's reading
     ("reset.py", "SpaceReset._finish", "client.get"): ["self._p.retry"],
+    ("reset.py", "SpaceReset._job", "client.get"): ["self._p.retry"],
     ("reset.py", "SpaceReset._wait_ended", "consistency.wait_transfers"): ["self._p.retry"],
     # the occupancy's reading, the occupancy stage's and the quiet stage's (O46): the counter, and every file's block
     # map at each provider that can hold the space's bytes
@@ -283,6 +284,7 @@ NOT_THE_PROVISIONERS = {
     ("day0/outage_run.py", "Run.agent_baseline", "self.tools"),
     ("day0/outage_run.py", "Run.during", "tools"),
     ("shared_holds.py", "SharedHolds.open_holds", "self"),  # the record of the tools' shared holds (O48)
+    ("resetgrant.py", "_settled", "holds"),  # the record of the reset lock's holds (O11), not a block map
 }
 
 # Modules whose every read measures: no site in them may ever name another policy, or call a helper that retries.

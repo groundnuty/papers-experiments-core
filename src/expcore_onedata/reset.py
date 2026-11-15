@@ -150,13 +150,15 @@ at once; `run` is that driver with this space alone.
 
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
 
-from expcore_onedata import consistency, occupancy, resetheld, resetqos, resetremove
+from expcore_onedata import consistency, occupancy, resetgrant, resetheld, resetqos, resetremove, resetshortcut
 from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError
 from expcore_onedata.eviction import evict_ids, evict_tree, sum_counts
 from expcore_onedata.provision import Provisioner, ProvisionError
+from expcore_onedata.resetgrant import ResetGrant
 from expcore_onedata.resetplan import Holdings, plan_scan
 from expcore_onedata.transferlog import PAGE_LIMIT
 from expcore_onedata.transferorder import (
@@ -268,7 +270,10 @@ class SpaceReset:
         never hold the space's bytes: the occupancy reads every regular file's block map at every other provider but
         the data provider, whatever the space root's counter says, and skips one of these only while its counter reads
         0 (`occupancy.py`, O46); none by default. `planned`, a planner's reading of this space (`plan_scan`), makes
-        its scan the qos stage's first, so the space is listed once (`resetplan.py`); by default the stage scans."""
+        its scan the qos stage's first, so the space is listed once (`resetplan.py`); by default the stage scans. With
+        `[placement] reset_shortcut` on and the reading made inside a live exclusive section (`exclusive`), the
+        occupancy and quiet stages re-read only what may have changed since it (`resetshortcut.py`); the record's
+        `occupancy_reads` says which reads were made, and why."""
         from expcore_onedata.resetspaces import ResetPlan, SpacesReset  # the driver builds on this module
 
         plan = ResetPlan(
@@ -284,8 +289,15 @@ class SpaceReset:
 
     def plan_scan(self, *, never_holds: Collection[str] = ()) -> Holdings:
         """A planner's reading of the space: one recursive listing, the QoS scan the reset makes, and each regular
-        file's block map at every provider that can hold the space's bytes (`resetplan.plan_scan`, `Holdings`)."""
+        file's block map at every provider that can hold the space's bytes (`resetplan.plan_scan`, `Holdings`). Made
+        inside `exclusive`, the reading carries the section's grant, which the shortcut needs."""
         return plan_scan(self, never_holds=never_holds)
+
+    def exclusive(self) -> AbstractContextManager[ResetGrant]:
+        """The exclusive section of a shortcut reset (`resetgrant.exclusive`): the planner's reading and the reset that
+        uses it go inside, under the run's shared admission, which keeps its share of `federation.lock` throughout.
+        With `[placement] reset_shortcut` off it takes nothing."""
+        return resetgrant.exclusive(self._p.config, self._p.settings)
 
     # -- 1. QoS requirements, and 1a. their files settled (`resetqos.py`) -------------------
     def qos_requirements(self) -> frozenset[str]:
@@ -343,6 +355,7 @@ class SpaceReset:
                 f"a transfer ran or ended on {', '.join(moved)} after the occupancy stage's wait began: an eviction "
                 "then can hide a growth in the quiet stage's reading, so it certifies nothing"
             )
+        resetshortcut.require_held(run)
         return {
             "ran": True,
             "why": run["why"],
@@ -522,9 +535,16 @@ class SpaceReset:
     # -- 4. occupancy -----------------------------------------------------------------
     def _holdings(self, run: dict[str, Any]) -> occupancy.Reading:
         """One reading of the occupancy: every regular file's block map at each provider that can hold the space's
-        bytes, and the counter beside them (`occupancy.holdings`)."""
+        bytes, and the counter beside them (`occupancy.holdings`); under the shortcut, only the files that may have
+        changed since the planner's reading (`run["only"]`, `resetshortcut.py`), the rest carried as empty."""
         return occupancy.holdings(
-            self._p, run["files"], run["never_holds"], providers=self._providers, label=self._label, retry=self._p.retry
+            self._p,
+            run["files"],
+            run["never_holds"],
+            providers=self._providers,
+            label=self._label,
+            retry=self._p.retry,
+            only=run["only"],
         )
 
     # The occupancy stage, in the steps `resetspaces` takes for every space, with one wait between each
@@ -534,12 +554,17 @@ class SpaceReset:
         """Begin a round and return the instant the occupancy may be read at: `resetqos.occupancy_wait_s` for the
         deepest regular file of the space from the instant the wait counts from, the eviction stage's end in the
         first round, by when every eviction's and every ended transfer's change can show in the space root's physical
-        size (O46)."""
+        size (O46). Under the shortcut, no earlier than `transfer_settle_s` after the transfers stage's last observation
+        either, by when every job it did not see waiting or ongoing is on the ended listing the shortcut walks
+        (`resetshortcut.py`): a later bound, which never weakens a check."""
         state = run.setdefault(
             "occupancy_wait", {"anchor": run["evicted_at"], "before": run["ended_head"], "waited": 0.0, "rounds": 0}
         )
         state["rounds"] += 1
-        return state["anchor"] + resetqos.occupancy_wait_s(max(run["deepest"], 1))
+        due = state["anchor"] + resetqos.occupancy_wait_s(max(run["deepest"], 1))
+        if run["reads"]["mode"] == resetshortcut.SHORTCUT and run["transfers_at"] is not None:
+            due = max(due, run["transfers_at"] + self._p.settings.transfer_settle_s)
+        return due
 
     def _occupancy_read(self, run: dict[str, Any], waited: float) -> float:
         """After a wait of `waited` seconds, with no transfer running, read the occupancy (`_holdings`: each file's
@@ -551,6 +576,7 @@ class SpaceReset:
         state = run["occupancy_wait"]
         state["waited"] += waited
         self._require_quiet(run)
+        run["only"] = resetshortcut.narrowed(self, run)  # every round: a job that ran in the last is walked too
         state["reading"] = self._holdings(run)
         return self._p.settings.transfer_settle_s if run["why"] is None else 0.0
 
@@ -579,6 +605,7 @@ class SpaceReset:
         state = run["occupancy_wait"]
         reading = state["reading"]
         run["occupancy"], run["ended_head"] = reading, state["before"]  # the quiet stage looks for jobs since this wait
+        resetshortcut.require_held(run)
         occupancy.judge(reading, allowed, self._label)
         return {
             **reading.facts(self._label),
@@ -587,6 +614,53 @@ class SpaceReset:
             "rounds": state["rounds"],
             "listings_after_s": after_s,
         }
+
+    def _ended_since(self, epoch: float, cancelled: Collection[tuple[str, str]]) -> dict[str, str]:
+        """The jobs that may have run since `epoch` (this host's clock), with the file id each record names: every job
+        each provider's ended listing shows finished since `epoch` less the clock-skew allowance and the margin, walked
+        newest first as the history walks it (`transferorder.newest_first`), and every job the transfers stage
+        cancelled (`cancelled`, (provider, id) pairs), whose record is read on its provider whatever the listing shows.
+        Onezone's readings of the global clock, before and after the walk, place that cutoff on the clock finish times
+        are stamped on (`transferorder.start_band`); raise Unreadable when they cannot, or for a record without a
+        readable `finishTime` and `fileId`, and PlatformError for a read that fails (`resetshortcut.py`)."""
+        settings = self._p.settings
+        allowance = settings.clock_skew_allowance_s
+        zone = [self._zone_clock()]
+        jobs: dict[str, str] = {}
+        for provider in self._providers:
+            walk = newest_first(
+                lambda token, q=provider: self._page(q, "ended", token),
+                partial(self._jobs, provider),
+                lambda job: job[0],
+                cutoff=epoch - allowance - STOP_MARGIN_S,
+                bound=self._listed_max,
+                max_pages=self._listed_max // PAGE_LIMIT + 1,
+                where=f"{self._label(provider)}: ",
+                chunk=settings.concurrency,
+            )
+            jobs.update((tid, job[1]) for tid, job in walk.kept.items())
+        for provider, tid in cancelled:
+            jobs[tid] = self._job(provider, tid)[1]
+        zone.append(self._zone_clock())
+        start_band(epoch, zone, allowance)  # raises when the global clock cannot place the cutoff
+        return jobs
+
+    def _jobs(self, provider: str, ids: Sequence[str]) -> list[tuple[float, str]]:
+        """The records of a few ended jobs on one provider (`_job`), `[placement] concurrency` at a time."""
+        return consistency.bounded_map(
+            lambda job_id: self._job(provider, job_id), list(ids), self._p.settings.concurrency
+        )
+
+    def _job(self, provider: str, tid: str) -> tuple[float, str]:
+        """An ended job's finish time (`_finish`) and the file id its record names; Unreadable without either."""
+        record = self._p.client.get(f"/transfers/{tid}", provider=provider, retry=self._p.retry)
+        value = record.get("finishTime") if isinstance(record, dict) else None
+        file_id = record.get("fileId") if isinstance(record, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
+            raise Unreadable("an ended transfer's record has no finishTime that is a number")
+        if not isinstance(file_id, str) or not file_id:
+            raise Unreadable("an ended transfer's record names no fileId")
+        return float(value), file_id
 
     # -- 5. ended-transfer history ------------------------------------------------------
     def _finish(self, provider: str, tid: str) -> float:
