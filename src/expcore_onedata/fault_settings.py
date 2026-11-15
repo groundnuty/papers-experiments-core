@@ -66,17 +66,18 @@ federation whose agents never read a file a stopped provider alone holds may cho
 of every provider in quick succession, settles with no fetch, checks every pair, and falls back to restarting a stuck
 pair's reader's container. `"link_then_container"` and `"link"` are the per-reader design, kept: each stuck pair's
 reader's link restarted in turn, then (in the first) its container. A container restart is itself an outage of that
-provider, so declare a mode that can make one knowingly. `heal_settle_s` is the enforced settle after every link or
-container restart: no probe, no gate read, no check and no run until it has passed, since a fetch through a provider
-soon after its link restarts can leave the pair stale (seen live 23 s after a restart; a clean 3-minute settle left
-every pair healthy). `heal_timeout_s` bounds the heal: no step starts whose declared bounds would carry the heal
-past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming the key and
-the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a ping and a
-link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one container
-restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice, `ready_timeout_s`
-and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link restart, and one
-settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four providers in
-`"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it.
+provider, so declare a mode that can make one knowingly. The fault gate's health check heals the stuck pairs its own
+link check finds with the same mode and bounds, between runs (`fault_gate_heal`). `heal_settle_s` is the enforced settle
+after every link or container restart: no probe, no gate read, no check and no run until it has passed, since a fetch
+through a provider soon after its link restarts can leave the pair stale (seen live 23 s after a restart; a clean
+3-minute settle left every pair healthy). `heal_timeout_s` bounds the heal: no step starts whose declared bounds would
+carry the heal past it, so a declared heal must leave room for one round of its steps, or it is refused at load, naming
+the key and the least it may be: for `"all_links"`, `heal_all_links_reserve` (per provider of `[faults.services]`, a
+ping and a link restart: three commands at `command_timeout_s`, the RPC's bound and its margin; and one settle) and one
+container restart (`heal_container_reserve`: four commands and a margin of three, `settle_timeout_s` twice,
+`ready_timeout_s` and one settle); for `"link_then_container"`, `heal_link_reserve` (one provider's ping and link
+restart, and one settle) and one container restart; for `"link"`, `heal_link_reserve`. With the other defaults, four
+providers in `"all_links"` need 3,780 s, which the default 4,200 s covers; five need 4,290 s, which must raise it.
 `heal_container_fallback = false` keeps `"all_links"` to link restarts: a pair they do not mend fails the restore
 closed, for an operator to decide, and no container is restarted; its least `heal_timeout_s` then holds no container
 restart (2,220 s for four providers, 2,730 s for five, with the other defaults). `"link_then_container"` with it false

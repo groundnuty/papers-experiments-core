@@ -17,6 +17,10 @@ gate probe of the injection it heals, under the reader's lock, restored and wait
 **cleared only when the heal ends with every pair passing**; otherwise it is journalled `clear_failed` with the heal's
 word and stays open, and recovery (which settles such entries first, `Recovery.recover`) brings it back and checks it.
 The gate's and the heal's readings go into `restore_record`, for the injector's snapshot.
+
+**The fault gate's heal** (`heal_stuck`, `fault_gate_heal`) runs the same heal on stuck pairs the gate's own check
+found, with no injection to journal it on: its holds are the caller's, and its container restarts are cleared or left
+open as a restore's are.
 """
 
 import contextlib

@@ -12,6 +12,11 @@ code.) So every restart here is followed by an **enforced settle**: no probe, no
 injector holds the federation exclusively) until `heal_settle_s` has passed, with no active transfer before the restart
 or at the settle's end.
 
+**The fault gate heals with it too** (`fault_gate_heal`): stuck pairs its own link check found, under its exclusive
+admission, with no provider restored (`restored` None: no restored provider's gate after the all-links sequence and no
+container to spare for it) and with `sources_seen`, so a provider that was ever the source of a failing pair keeps its
+container.
+
 **`"all_links"`, the one-round mode.** Between runs, under the injector's exclusive admission:
 
 1. a fresh matrix of every pair (`LinkMatrix`); nothing more is done when it passes;
