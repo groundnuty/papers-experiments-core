@@ -11,8 +11,8 @@ line, and its log reads as unknown (`not_closed`).
 The snapshot, under `record.instruments["egress"]`:
 
     {"version": 1, "log": "intact" | "unknown", "unknown": [<reasons>], "declared": {...}, "canary": true,
-     "counts": {"gate": 3, "loopback": 1, "outside": 0} | None, "records": 12,
-     "outside": [{"address": "192.0.2.1", "port": 443, "family": "inet", "type": "tcp", "attempts": 1,
+     "counts": {"gate": 3, "loopback": 1, "outside": 1} | None, "records": 12,
+     "outside": [{"address": "<an address>", "port": 443, "family": "inet", "type": "tcp", "attempts": 1,
                   "results": {"115": 1}}],
      "outside_cut": false, "outside_complete": true}
 
