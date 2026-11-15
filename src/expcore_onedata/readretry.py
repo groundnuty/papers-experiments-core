@@ -36,8 +36,9 @@ two, and the client (`OnezoneClient.get`) applies it:
 - **The gate:** every mutation and range read first reads the space of its target (`OnezoneClient.mutate`), and a stall
   there would end an upload or a reset as surely as one in the read the caller asked for. The plumbing's `gate_retry`
   tries those reads again, and fails closed all the same: each attempt that is answered decides from its own answer,
-  nothing an earlier attempt or call saw is reused (O09), and after the last timeout the target is unread
-  (`ScopeUnread`) and nothing was sent.
+  nothing an earlier attempt or call saw is reused (O09), and after the last failed attempt the target is
+  unread (`ScopeUnread`) and nothing was sent. A reset hands the gate its stage's policy, which tries a connection
+  failure again too (O46); the mutation itself is sent once whatever the policy.
 - **Bounded:** with a `deadline_s` the whole call, its pauses included, stays within it: no retry starts unless its
   pause and `MIN_RETRY_S` more fit in what remains, and a retry's timeout is cut to what remains. The first attempt is
   the caller's own and is made as it always was.

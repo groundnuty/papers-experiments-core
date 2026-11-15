@@ -94,10 +94,11 @@ def plan_scan(reset: "SpaceReset", *, never_holds: Collection[str] = ()) -> Hold
         raise ValueError("never_holds is a collection of provider names")
     for provider in never_holds:
         p.check_eviction(provider)
-    p.verify_space()
+    reads = p.reading_retry()  # every read of the reading, the space's name, its listing's and block maps', tallied
+    with recorded(reads):
+        p.verify_space(retry=reads)
     grant = current_grant()  # the section the reading is made in, held from before its listing begins
     epoch, began = reset.now(), p.clock()
-    reads = p.reading_retry()  # every read of the reading, its listing's and its block maps', and their tally
     with recorded(reads):
         found = resetqos.by_listing(p, providers, reads)
         files = sorted(found.listing.regular)  # every provider's listing's, read at each: one listing may miss a file

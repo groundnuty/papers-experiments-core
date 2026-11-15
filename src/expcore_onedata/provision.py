@@ -43,7 +43,10 @@ configured name or lies outside the prefixes. On top of that gate:
   caller names a policy), and what is read inside a poll that already counts a failed read as a poll that did not match.
   An instrument's own read (`resolve(wait=False)`) is one attempt. A reset's per-file reads go under a policy made for
   each reading (`reading_retry`), which also retries a connection failure, never an answer, and under a per-provider
-  bound on the reads in flight (`reading_slot`, `[placement] provider_concurrency`, `readslots.py`).
+  bound on the reads in flight (`reading_slot`, `[placement] provider_concurrency`, `readslots.py`); so do, when the
+  reset names its policy, the gate's reads (`mutate(gate_retry=)`, `schedule_transfer(gate_retry=)`), the space's name
+  (`verify_space(retry=)`), the root's first read, the listings of `resolve`, `resolve_many` and `walk` and the
+  visibility wait (`retry=`), the last three each under a slot. The mutation is sent once whatever the policy.
 
 The change log is a JSON-lines file: one line per creation and per deletion with the path, the id and the time. It holds
 no token and no credential. A last line a crash cut short (no newline after it, and not a whole line) is no line, and
@@ -59,7 +62,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -317,11 +320,12 @@ class Provisioner:
                 f"{self._where}the space is held on a read-only imported storage, so {what} is refused; nothing was sent"
             )
 
-    def mutate(self, method: str, path: str, **options: Any) -> Any:
+    def mutate(self, method: str, path: str, *, gate_retry: ReadRetry | None = None, **options: Any) -> Any:
         """Send a mutation through the client's gate, bound to this provisioner's space: one whose target lies in any
         other declared space is refused before it is sent, even under a shared prefix (O09). The gate's own reads, which
-        find the target's space, are tried again when they time out, under this provisioner's policy (O29); the mutation
-        is sent once.
+        find the target's space, are tried again when they time out, under this provisioner's policy (O29), or under
+        `gate_retry`, a reset's (`reading_retry`, which tries a connection failure again too, O46); the mutation is sent
+        once, whatever the policy.
 
         In a space held on a read-only imported storage every change of a file's content or of the tree
         (`/data/...`), through any provider, is refused unsent (O41): op-worker answers a creation or a write there
@@ -330,7 +334,13 @@ class Provisioner:
         read-only storage (op-worker f118ed9, `test_distributed/readonly_storage_test_SUITE.erl`)."""
         if path.startswith("/data/"):
             self._refuse_read_only(f"a {method} of a file or directory")
-        return self._client.mutate(method, path, space=self._entry.space, gate_retry=self._retry, **options)
+        return self._client.mutate(
+            method,
+            path,
+            space=self._entry.space,
+            gate_retry=self._retry if gate_retry is None else gate_retry,
+            **options,
+        )
 
     @property
     def retry(self) -> ReadRetry:
@@ -384,16 +394,17 @@ class Provisioner:
         self._sleep(seconds)
 
     # -- scope -----------------------------------------------------------------
-    def verify_space(self) -> str:
+    def verify_space(self, *, retry: ReadRetry | None = None) -> str:
         """Read the space's live name and refuse one that differs from the configuration or lies outside the prefixes.
 
         The name is Onezone's, read by the client (`space_name`, read again on every call, and again when it timed out,
-        under this provisioner's policy: O29). The client's own gate refuses every mutation whose target space lies
-        outside the prefixes; this adds that the space is the configured one.
+        under this provisioner's policy: O29, or under `retry`, a reset's, which tries a connection failure again too:
+        O46). The client's own gate refuses every mutation whose target space lies outside the prefixes; this adds that
+        the space is the configured one.
         """
         space = self._entry.space
         try:
-            name = self._client.space_name(space.id, retry=self._retry)
+            name = self._client.space_name(space.id, retry=self._retry if retry is None else retry)
         except OutOfScope:
             raise Refused(f"{self._where}the configured space is unknown to Onezone; nothing was changed") from None
         if not name.startswith(space.prefixes):
@@ -403,10 +414,10 @@ class Provisioner:
         self._verified_name = name
         return name
 
-    def _verified(self) -> None:
-        """Verify the space once, before this provisioner first changes anything."""
+    def _verified(self, retry: ReadRetry | None = None) -> None:
+        """Verify the space once, before this provisioner first changes anything (under `retry`, as `verify_space`)."""
         if self._verified_name is None:
-            self.verify_space()
+            self.verify_space(retry=retry)
 
     def provider_id(self, name: str) -> str:
         """Return a declared provider's Onezone id, or refuse when it is unknown."""
@@ -427,12 +438,17 @@ class Provisioner:
         """The id of the space this provisioner acts in."""
         return self._entry.space.id
 
-    def root(self, *, wait: bool = True) -> str:
-        """Return the space's root directory id on the data provider.
+    def root(self, *, wait: bool = True, retry: ReadRetry | None = None) -> str:
+        """Return the space's root directory id on the data provider, read once and kept.
 
-        With `wait` (provisioning) a root that answers "no such file" is waited out, within bounds (O07). Without it (an
-        instrument's read, O08) there is one request and no wait: a real answer, a 404 included, is raised as it came.
+        With `wait` (provisioning) a root that answers "no such file" is waited out, within bounds (O07), and a read
+        that timed out is tried again under this provisioner's policy, or under `retry`, a reset's, which tries a
+        connection failure again too (O46; the caller holds the read's slot, `reading_slot`). Without it (an
+        instrument's read, O08) there is one request and no wait: a real answer, a 404 included, is raised as it came,
+        and no policy may be named.
         """
+        if retry is not None and not wait:
+            raise ValueError("an instrument's read of the space root is one attempt: it takes no policy")
         if self._root is None:
             self._root = consistency.space_root(
                 self._client,
@@ -440,9 +456,16 @@ class Provisioner:
                 self._entry.space.id,
                 **({} if wait else {"tries": 1}),
                 sleep=self._sleep,
-                retry=self._retry if wait else ONE_ATTEMPT,
+                retry=(self._retry if retry is None else retry) if wait else ONE_ATTEMPT,
             )
         return self._root
+
+    def _reading_root(self, retry: ReadRetry) -> str:
+        """`root` as a reset reading reads it: under `retry` and one of the data provider's slots (`reading_slot`)."""
+        if self._root is not None:
+            return self._root
+        with self.reading_slot(self._settings.holder, retry):
+            return self.root(retry=retry)
 
     # -- the change log --------------------------------------------------------
     def _write(self, action: str, **fields: Any) -> None:
@@ -567,38 +590,66 @@ class Provisioner:
                 return entries
             params = {**params, "token": token}
 
+    def _read_children(
+        self, directory_id: str, provider: str | None, listings: Listings | None, retry: bool | ReadRetry
+    ) -> dict[str, Entry]:
+        """`children` with `retry` as it takes it; a reset reading's policy (a `ReadRetry`) also holds one of the
+        provider's slots for the listing (`reading_slot`), as the reset's QoS scan does."""
+        if not isinstance(retry, ReadRetry):
+            return self.children(directory_id, provider, listings=listings, retry=retry)
+        with self.reading_slot(provider or self._settings.holder, retry):
+            return self.children(directory_id, provider, listings=listings, retry=retry)
+
     def resolve(
-        self, path: str, provider: str | None = None, *, wait: bool = True, listings: Listings | None = None
+        self,
+        path: str,
+        provider: str | None = None,
+        *,
+        wait: bool = True,
+        listings: Listings | None = None,
+        retry: ReadRetry | None = None,
     ) -> Entry:
         """Walk a space-relative path down from the root and return its entry; raise KeyError naming the part missing.
 
         `wait` is as for `root`: an instrument passes False so that no real answer is retried inside its read, and no
         read that timed out either (O29): its listings are one attempt each.
         `listings` is the operation's cache of directory listings (`children`), shared by every path it resolves.
+        `retry`, a reset reading's policy, reads the root and every listing under it, each under one of its provider's
+        slots (O46); an instrument's read takes none.
         """
-        node = Entry(self.root(wait=wait), "", 0, "DIR")
+        if retry is not None and not wait:
+            raise ValueError("an instrument's resolve is one attempt per read: it takes no policy")
+        node = Entry(self.root(wait=wait) if retry is None else self._reading_root(retry), "", 0, "DIR")
         for part in safe_path(path):
-            found = self.children(node.file_id, provider, listings=listings, retry=wait).get(part)
+            found = self._read_children(node.file_id, provider, listings, wait if retry is None else retry).get(part)
             if found is None:
                 raise KeyError(f"no entry {part!r} on the way down the path")
             node = found
         return node
 
-    def resolve_many(self, paths: Iterable[str], provider: str | None = None) -> dict[str, Entry]:
-        """Resolve many space-relative paths with one listing of each directory on their way, never one per path."""
+    def resolve_many(
+        self, paths: Iterable[str], provider: str | None = None, *, retry: ReadRetry | None = None
+    ) -> dict[str, Entry]:
+        """Resolve many space-relative paths with one listing of each directory on their way, never one per path;
+        under `retry`, a reset reading's policy, as `resolve` takes it."""
         listings: Listings = {}
-        return {path: self.resolve(path, provider, listings=listings) for path in dict.fromkeys(paths)}
+        return {path: self.resolve(path, provider, listings=listings, retry=retry) for path in dict.fromkeys(paths)}
 
-    def walk(self, directory_id: str | None = None, provider: str | None = None) -> Iterator[tuple[Entry, bool]]:
+    def walk(
+        self, directory_id: str | None = None, provider: str | None = None, *, retry: ReadRetry | None = None
+    ) -> Iterator[tuple[Entry, bool]]:
         """Yield every entry under a directory (the space's root by default), each directory listed once, with
-        whether it is a leaf: a file, or a directory with nothing in it. Directories are entered breadth first."""
+        whether it is a leaf: a file, or a directory with nothing in it. Directories are entered breadth first. Under
+        `retry`, a reset reading's policy, the root and every listing are read under it, each under one of its
+        provider's slots (O46)."""
         listings: Listings = {}
-        pending = [directory_id or self.root()]
+        reads: bool | ReadRetry = True if retry is None else retry
+        pending = [directory_id or (self.root() if retry is None else self._reading_root(retry))]
         while pending:
             current = pending.pop(0)
-            for entry in self.children(current, provider, listings=listings).values():
+            for entry in self._read_children(current, provider, listings, reads).values():
                 if entry.kind == "DIR":
-                    inside = self.children(entry.file_id, provider, listings=listings)
+                    inside = self._read_children(entry.file_id, provider, listings, reads)
                     yield entry, not inside
                     pending.append(entry.file_id)
                 else:
@@ -900,26 +951,32 @@ class Provisioner:
         return found
 
     # -- visibility ------------------------------------------------------------
-    def await_visible(self, provider: str, file_ids: Iterable[str]) -> float:
+    def await_visible(self, provider: str, file_ids: Iterable[str], *, retry: ReadRetry | None = None) -> float:
         """Wait, bounded, until a provider sees each file at its size on the data provider; return the seconds waited.
 
         A file written through the data provider is not visible through another at once (Onedata 25.0 answers it with
         a 404 or 400 posix enoent for some seconds), so a read or a transfer through that provider waits here first
         (`consistency.wait_visible`, bounded by `VISIBLE_TIMEOUT_S`; past it, `NotVisible` names the provider by its
         label, and any other error fails closed). The data provider, the writer, needs no wait, and a provider and file
-        seen once are not asked again. Instruments never call this: a probe records what it reads (O08)."""
+        seen once are not asked again. Instruments never call this: a probe records what it reads (O08). Its reads, the
+        size on the data provider and each of the wait's, go under this provisioner's policy, or under `retry`, a
+        reset's (`reading_retry`, which tries a connection failure again too, never an answer, O46), each then holding
+        one of its provider's slots (`reading_slot`) through its retries and none through the wait's pauses."""
         if provider == self._settings.holder:
             return 0.0
         waited = 0.0
         for file_id in file_ids:
             if (provider, file_id) in self._visible:
                 continue
-            size = self._client.get(  # with `name`, which a deleted entry refuses: `size` alone may read a tombstone
-                f"/data/{_segment(file_id)}",
-                provider=self._settings.holder,
-                params={"attribute": list(consistency.VISIBLE_ATTRIBUTES)},
-                retry=self._retry,
-            ).get("size")
+            with self._slot(self._settings.holder, retry):
+                size = (
+                    self._client.get(  # with `name`, which a deleted entry refuses: `size` alone may read a tombstone
+                        f"/data/{_segment(file_id)}",
+                        provider=self._settings.holder,
+                        params={"attribute": list(consistency.VISIBLE_ATTRIBUTES)},
+                        retry=self._retry if retry is None else retry,
+                    ).get("size")
+                )
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise PlatformError("the data provider's answer for a file's size holds no size")
             waited += consistency.wait_visible(
@@ -929,10 +986,16 @@ class Provisioner:
                 size=size,
                 clock=self._clock,
                 sleep=self._sleep,
-                retry=self._retry,
+                retry=self._retry if retry is None else retry,
+                slot=lambda: self._slot(provider, retry),
             )
             self._visible.add((provider, file_id))
         return round(waited, 3)
+
+    def _slot(self, provider: str, retry: ReadRetry | None) -> AbstractContextManager[None]:
+        """One of `provider`'s slots for a read under a reset's policy (`reading_slot`); no slot for this provisioner's
+        own reads, which were never bounded so."""
+        return nullcontext() if retry is None else self.reading_slot(provider, retry)
 
     # -- block maps ------------------------------------------------------------
     def blocks(
@@ -1051,21 +1114,23 @@ class Provisioner:
         return Confirmation(True, report, len(result.checks), 0.0)
 
     # -- transfers -------------------------------------------------------------
-    def schedule_transfer(self, kind: str, file_id: str, provider: str) -> str:
+    def schedule_transfer(self, kind: str, file_id: str, provider: str, *, gate_retry: ReadRetry | None = None) -> str:
         """Schedule a replication to, or an eviction from, a provider of a file (or of a directory, which covers every
         file under it), through that provider once it sees the entry (`await_visible`), through the mutation gate; log
         it and return the transfer's id. Its end is a report, never placement (O01): a caller confirms by the block
-        map."""
+        map. `gate_retry` is the gate's policy (and a first `verify_space`'s and the visibility wait's), as `mutate`
+        takes it; the request is sent once."""
         field_name = "replicatingProviderId" if kind == "replication" else "evictingProviderId"
         if kind == "replication" and provider == self._settings.holder:
             self._refuse_read_only("a replication onto the data provider")  # op-worker answers it EROFS
-        self._verified()
-        self.await_visible(provider, [file_id])
+        self._verified(gate_retry)
+        self.await_visible(provider, [file_id], retry=gate_retry)
         answer = self.mutate(
             "POST",
             "/transfers",
             provider=provider,
             json={"type": kind, field_name: self.provider_id(provider), "dataSourceType": "file", "fileId": file_id},
+            gate_retry=gate_retry,
         )
         tid = answer.get("transferId") if isinstance(answer, dict) else None
         if not isinstance(tid, str) or not tid:

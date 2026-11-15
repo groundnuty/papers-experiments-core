@@ -196,7 +196,8 @@ def test_o46_a_connection_failure_on_one_block_map_read_is_tried_again_and_the_r
     tally = record["stages"]["occupancy"]["read_retry"]
     assert record["ok"] is True
     assert (tally["retries"], tally["errors"], tally["failed"]) == (1, {"ConnectError": 1}, 0)
-    assert tally["reads"] == len(FILES) + 1  # every file's map at beta, and the counter at the data provider
+    # every file's map at beta, the counter at the data provider, and the space root's first read there (O46)
+    assert tally["reads"] == len(FILES) + 2
     assert {k: v for k, v in beta(tally).items() if k != "slot_wait_s"} == {
         "reads": len(FILES),
         "retries": 1,
