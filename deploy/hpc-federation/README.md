@@ -87,7 +87,7 @@ random administrator, then `bucket-create`.
   the password is rotated.
 
 `tests/deploy/test_hpc_couchbase_guard.py` and `test_hpc_credentials.py` run the guard and the password rules
-against `tests/fake_couchbase.py`, a loopback stand-in with Couchbase 4.5's access rules (O48).
+against `tests/fake_couchbase.py`, a loopback stand-in with Couchbase 4.5's access rules (O53).
 
 ## Site configuration
 

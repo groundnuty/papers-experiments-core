@@ -23,8 +23,8 @@ def lib(command: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["bash", "-c", script, "lib", *args], capture_output=True, text=True, timeout=30, check=False)
 
 
-def test_o48_a_generated_password_is_24_random_alphanumerics():
-    """O48: the most couchbase-cli accepts, and nothing that needs quoting on onepanel's command line."""
+def test_o53_a_generated_password_is_24_random_alphanumerics():
+    """O53: the most couchbase-cli accepts, and nothing that needs quoting on onepanel's command line."""
     passwords = set()
     for _ in range(3):
         result = lib("gen_alnum", str(COUCHBASE_CLI_MAX_PASSWORD))
@@ -34,15 +34,15 @@ def test_o48_a_generated_password_is_24_random_alphanumerics():
     assert len(passwords) == 3
 
 
-def test_o48_the_bundle_password_length_is_couchbase_clis_limit():
-    """O48: CB_PASSWORD_LEN is 24, couchbase-cli's MAX_LEN_PASSWORD; the third live run's 48 hex characters were not."""
+def test_o53_the_bundle_password_length_is_couchbase_clis_limit():
+    """O53: CB_PASSWORD_LEN is 24, couchbase-cli's MAX_LEN_PASSWORD; the third live run's 48 hex characters were not."""
     result = lib("printf '%s' \"$CB_PASSWORD_LEN\"")
     assert result.returncode == 0, result.stderr
     assert result.stdout == str(COUCHBASE_CLI_MAX_PASSWORD)
 
 
-def test_o48_node_init_generates_the_administrator_within_the_limit_and_checks_it():
-    """O48: node-init.sh draws the password with gen_alnum at CB_PASSWORD_LEN and refuses the launch unless
+def test_o53_node_init_generates_the_administrator_within_the_limit_and_checks_it():
+    """O53: node-init.sh draws the password with gen_alnum at CB_PASSWORD_LEN and refuses the launch unless
     cb_cred_ok accepts the pair, before any secret is written."""
     text = (BUNDLE / "node-init.sh").read_text(encoding="utf-8")
     assert 'cb_pass=$(gen_alnum "$CB_PASSWORD_LEN")' in text
@@ -61,8 +61,8 @@ def test_o48_node_init_generates_the_administrator_within_the_limit_and_checks_i
         ("A" * 23 + "-", False),  # outside [A-Za-z0-9]
     ],
 )
-def test_o48_cb_cred_ok_takes_only_a_password_couchbase_cli_accepts(password, accepted):
-    """O48: cb_cred_ok, which node-init.sh, the rotation and the overlay all apply, accepts exactly 24
+def test_o53_cb_cred_ok_takes_only_a_password_couchbase_cli_accepts(password, accepted):
+    """O53: cb_cred_ok, which node-init.sh, the rotation and the overlay all apply, accepts exactly 24
     alphanumerics."""
     result = lib("cb_cred_ok", USER, password)
     assert (result.returncode == 0) is accepted, result.stderr
@@ -72,8 +72,8 @@ def test_o48_cb_cred_ok_takes_only_a_password_couchbase_cli_accepts(password, ac
     ("user", "accepted"),
     [(USER, True), ("a" * 32, True), ("a" * 33, False), ("", False), ("cb user", False), ("cb:user", False)],
 )
-def test_o48_cb_cred_ok_takes_only_a_user_couchbase_accepts(user, accepted):
-    """O48: a user of 1 to 32 characters of [A-Za-z0-9._-], so user:password fits one line of couchbase-cli's
+def test_o53_cb_cred_ok_takes_only_a_user_couchbase_accepts(user, accepted):
+    """O53: a user of 1 to 32 characters of [A-Za-z0-9._-], so user:password fits one line of couchbase-cli's
     base64 Basic header (57 bytes)."""
     result = lib("cb_cred_ok", user, "A" * 24)
     assert (result.returncode == 0) is accepted, result.stderr

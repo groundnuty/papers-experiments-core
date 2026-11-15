@@ -29,6 +29,7 @@ from expcore.campaign.defect_log import write_failure
 from expcore.campaign.executor import BackendFactory, RunExecutor
 from expcore.campaign.healthgate import HealthCheck
 from expcore.campaign.lease import ResourceProbe
+from expcore.campaign.reset_settings import checked as checked_settings
 from expcore.config.loading import ConfigError, Section
 from expcore.config.models import ModelTable, not_built_by_core
 from expcore.plugin import ToolSpec
@@ -72,16 +73,27 @@ class StudyPlugin:
       differ.
     - `prompts`, `tools`: for each condition, the SHA-256 of its prompt template and of its tool manifest
       (`tools_sha256`); they go into the campaign fingerprint, so a resume cannot change either unnoticed.
-    - `health`: the platform's quick look at whether runs can start; None when it has no such check.
+    - `health`: the platform's quick look at whether runs can start; None when it has no such check. A platform whose
+      `admission` declares that it needs one (`campaign.health_required`; the Onedata layer's does with `[faults]`)
+      refuses a campaign without it, when the scheduler is built.
     - `probe`, `lease_group`, `lease_keys`: the platform's resources. `lease_group` maps a run's factor values to the
       group of leases it needs (None: no lease) and `lease_keys` the keys of a group; `probe` answers for holders and
       resources. Leave them out for a study that shares nothing.
     - `admission`: the platform's hold on a resource every run shares (`campaign.attempt.RunAdmission`): entered before
       an attempt starts and left after its post-run check, so the check sees what the run left; None when it has none.
+      It may also have a method `declared_deferral_s()` answering the longest the platform's health check may stay
+      deferred (a `DeferralBound` or None, read from the platform's settings), which the core holds `health` to: a
+      health check that exposes no `max_deferral_s`, or a smaller bound, is refused when the campaign starts.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
       listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
       fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+    - `reset_settings`: the platform's settings that change how it does its work and not what an agent sees, and so are
+      in no fingerprint, after its defaults (the Onedata layer's `Placement.reset_settings()`): a flat mapping
+      of names to text, numbers, booleans or None, without a secret or a name that identifies a machine, since it
+      travels with the export. The core records it at the first start and compares it at every resume; a resume
+      under other values is never refused, and says which keys changed, with their old and new values, in the log,
+      in an event of the store and in the report (`campaign.reset_settings`, C35). Empty: nothing is recorded.
     - `backend_factory`: builds the backend of every model, for admission and for each run, in place of the core's
       `default_backend_factory`; None keeps the core's. A model whose backend the core does not build
       (`config.models.BACKENDS`) needs one, and the factory decides which models it serves: it hands the others to
@@ -109,6 +121,7 @@ class StudyPlugin:
     platform: Mapping[str, Any] = field(default_factory=dict)
     backend_factory: BackendFactory | None = None
     environment_identity: Callable[[], Mapping[str, str]] | None = None
+    reset_settings: Mapping[str, Any] = field(default_factory=dict)  # last, so positional callers keep their order
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
@@ -319,6 +332,13 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    if not isinstance(plugin.reset_settings, Mapping):
+        kind = type(plugin.reset_settings).__name__
+        raise ConfigError(f"{file}: the plugin's reset_settings must be a mapping of plain data, not a {kind}")
+    try:
+        checked_settings(plugin.reset_settings)
+    except ValueError as error:
+        raise ConfigError(f"{file}: the plugin's reset_settings: {error}") from None
     if plugin.environment_identity is not None and not callable(plugin.environment_identity):
         kind = type(plugin.environment_identity).__name__
         raise ConfigError(
