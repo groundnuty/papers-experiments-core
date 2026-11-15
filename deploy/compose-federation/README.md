@@ -32,7 +32,7 @@ Compose (`up`, `reset --replicas` and `down`; see "An imported space").
   but those declared `baseline = false`), and writes `facts.json` and, from the layout's platform template,
   `platform.toml`. Last, it runs the platform layer's link check through that `platform.toml` (`fedlinks.py`, #221):
   each ordered (reading provider, source) pair of providers sharing a space must fetch a probe, a file of its own, from
-  the layout's `probe_space` within the bound, or up fails naming the pair and the remedy; the report is written as `link-check.json` beside `facts.json`, atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`): a fault injector's restore and a heal write the same file after each of their all-pairs checks, so it is always the latest check's whole report. Run on a federation that is up,
+  the layout's `probe_space` within the bound, or up fails naming the pair and the remedy; the report is written as `link-check.json` beside `facts.json`, atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`): a fault injector's restore and a heal write the same file after each of their all-pairs checks, so it is always the latest check's whole report (one check at a time makes it, under a lock file `link-check.lock` beside it). Run on a federation that is up,
   it starts what is stopped and checks every step again, the links included, and writes no baseline file (see "The
   baseline" for changing a space's `baseline` key).
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
@@ -160,6 +160,7 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   | `<provider>/storage` | each provider's POSIX storage |
   | `<owner>/import/<space>` | a writable import's copy of its dataset, made by up once (see "An imported space") |
   | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are; no secret |
+  | `link-check.json`, `link-check.lock` | the latest all-pairs link check's report (up's, and a restore's and a heal's, which write it too), and the lock that orders the checks that write it; no secret |
   | `platform.toml` (0600) | rendered from the layout's template, next to the CA and the secrets it names by relative path |
   | `fault-journal/` | the fault injector's journal, when the fault test runs |
 

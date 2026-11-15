@@ -25,9 +25,11 @@ and `sessions` are the session gate that comes before it (`expcore_onedata.fault
 the pairs a heal makes, its re-check after the settle among them, write `link-check.json` beside platform.toml (the
 federation's root, beside `facts.json`, under `deploy/compose-federation`), atomically and in the format `up` writes, so
 the record on disk is the latest check's verdict and time: a passing re-check after a heal leaves a pass, a check that
-finds a pair stuck leaves its failing verdict over an older pass, and a check that raises removes the older record, as
-does one whose record cannot be written (logged, never failing the restore or the heal). The gate's own routine link
-check (`PlatformHealth`) writes none, and the record is read by no admission: it takes no lock and touches no epoch.
+finds a pair stuck leaves its failing verdict over an older pass, and a check that raises removes the older record (or
+empties it in place), as does one whose record cannot be written (logged, never failing the restore or the heal). One
+check at a time makes the record (`linkrecord.recording`: a leaf lock around the check and its write), so a late
+finisher never replaces a later check's record. The gate's own routine link check (`PlatformHealth`) writes none, and
+the record is read by no admission: it touches no federation lock and no epoch.
 """
 
 import logging
@@ -41,7 +43,7 @@ from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import SessionGate
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.linkcheck import LinkReport, check_links
-from expcore_onedata.linkrecord import RECORD, discard_record, write_record
+from expcore_onedata.linkrecord import RECORD, discard_record, recording, write_record
 from expcore_onedata.readretry import ONE_ATTEMPT
 
 PROBE_TIMEOUT_S = 10.0
@@ -106,31 +108,37 @@ class ServingProbe:
 
     def _checked(self) -> LinkReport:
         """The platform layer's all-pairs check, and its record (`expcore_onedata.linkrecord`), pass or fail: the record
-        on disk is always the latest check's verdict, never an older one. A check that raises answers nothing, so the
-        older record is removed before the error goes on to the caller; a record that cannot be written is removed
-        too, and logged (its error's type only), and the check's answer is returned as made: the record is advisory,
-        and neither the restore's verdict nor the heal's depends on it. It touches no lock and no epoch
+        on disk is always the latest check's verdict, never an older one. The check and the writing of its record are
+        one step under the record's lock, so a check that starts while another is under way waits for it and writes
+        after it. A check that raises answers nothing, so the older record is removed (or, when the directory refuses
+        that, emptied in place) before the error goes on to the caller; a record that cannot be written is treated the
+        same, and logged (its error's type only), and the check's answer is returned as made: the record is advisory,
+        and neither the restore's verdict nor the heal's depends on it. It touches no federation lock and no epoch
         (`fault_epoch`)."""
         path = self._config.file.parent / RECORD
-        try:
-            report = check_links(self._config, self._client)
-        except Exception:
-            self._discarded(path)
-            raise
-        try:
-            write_record(report, path)
-        except OSError as error:
-            log.warning("the link check's record could not be written (%s)", type(error).__name__)
-            self._discarded(path)
-        return report
+        with recording(path) as serialized:
+            if not serialized:
+                log.warning("the link check's record lock could not be taken, so another check may overlap this one")
+            try:
+                report = check_links(self._config, self._client)
+            except Exception:
+                self._discarded(path)
+                raise
+            try:
+                write_record(report, path)
+            except OSError as error:
+                log.warning("the link check's record could not be written (%s)", type(error).__name__)
+                self._discarded(path)
+            return report
 
     @staticmethod
     def _discarded(path: Path) -> None:
-        """Remove the record so that no older verdict stands; a removal that fails is logged, its type only."""
+        """Make sure no older verdict stands: the record removed, or emptied in place; a record that can be neither is
+        logged, its error's type only."""
         try:
             discard_record(path)
         except OSError as error:
-            log.warning("the older link check record could not be removed (%s)", type(error).__name__)
+            log.warning("the older link check record could be neither removed nor emptied (%s)", type(error).__name__)
 
     def arm(self, service: str) -> str | None:
         """Before an injection: the session gate's probe file, found or written and seen by every provider of the probe

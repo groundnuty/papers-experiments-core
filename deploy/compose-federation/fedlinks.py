@@ -6,7 +6,8 @@ rendered, so the pairs, the probe space and the bounds are the ones a campaign's
 naming the pair and the remedy, unless every pair passes. The report is written beside facts.json as
 `link-check.json`: each pair by position, its seconds and bytes, and the transfers the check made. It is written
 atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`), which a fault injector's restore and a
-heal write through too, so the file is always the latest check's whole report.
+heal write through too, under the record's lock (one check at a time makes it), so the file is always the latest
+check's whole report.
 
 A layout with no platform template renders no platform.toml, so no local provider is declared and nothing is checked;
 up says so. One whose platform.toml declares provider pairs and no `[link_check]` is refused: up does not report a
@@ -19,7 +20,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.linkcheck import check_links
-from expcore_onedata.linkrecord import RECORD, write_record
+from expcore_onedata.linkrecord import RECORD, recording, write_record
 from expcore_onedata.linksettings import link_pairs
 
 REPORT = RECORD  # the one name and the one writer of the record: a restore's and a heal's checks write it too
@@ -46,11 +47,13 @@ def check_after_up(layout: Layout, space_ids: dict[str, str]) -> str:
     if spec.probe_space is None or config.link_check.space.id != space_ids.get(spec.probe_space):
         raise RuntimeError("the [link_check] of platform.toml does not name the layout's probe_space")
     client = OnezoneClient(config)
+    record = layout.root / REPORT
     try:
-        report = check_links(config, client)
+        with recording(record):  # one check at a time makes the record: a restore's or a heal's, if one is under way
+            report = check_links(config, client)
+            write_record(report, record)
     finally:
         client.close()
-    write_record(report, layout.root / REPORT)
     if not report.ok:
         raise RuntimeError(f"the link check failed, so the federation is not ready: {report.detail}")
     rows = (f"{p.source} -> {p.reader} {p.seconds:.2f} s {p.bytes} B" for p in report.pairs)

@@ -10,6 +10,7 @@ in `tests/onedata/test_fault_link_record.py`.
 import json
 import logging
 from functools import partial
+from pathlib import Path
 
 import pytest
 from fault_support import SERVICES, faults_table
@@ -150,6 +151,28 @@ def test_o35_a_record_that_cannot_be_written_removes_the_older_one_and_leaves_th
     (warning,) = [r for r in caplog.records if r.name == fault_serves.__name__ and r.levelno == logging.WARNING]
     assert "PermissionError" in warning.getMessage()
     assert str(tmp_path) not in warning.getMessage()
+
+
+def test_o35_a_record_in_a_directory_that_refuses_both_is_emptied_in_place_so_no_old_pass_stays(
+    tmp_path, serves, monkeypatch
+):
+    """O35: a read-only directory takes neither a new record nor the removal of the old one, but the old file is still
+    writable: the old pass is emptied in place and dated to the epoch, so it is no record, and the check answers as
+    made."""
+    serves.matrix(SERVICE)
+    assert record(tmp_path)["ok"] is True
+
+    def refused(*args, **kwargs):
+        raise PermissionError(13, "read-only directory")
+
+    monkeypatch.setattr(fault_serves, "write_record", refused)
+    monkeypatch.setattr(Path, "unlink", refused)
+    matrix = serves.matrix(SERVICE)
+    monkeypatch.undo()
+    assert matrix is not None
+    assert matrix.ok
+    assert (tmp_path / RECORD).read_bytes() == b""
+    assert (tmp_path / RECORD).stat().st_mtime == 0
 
 
 def test_o35_a_record_that_can_be_neither_written_nor_removed_is_said_twice_and_changes_nothing_else(

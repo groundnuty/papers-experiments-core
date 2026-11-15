@@ -15,7 +15,7 @@ import pytest
 
 from expcore_onedata import linkrecord
 from expcore_onedata.linkcheck import REMEDY, LinkReport, PairResult
-from expcore_onedata.linkrecord import RECORD, discard_record, record_text, write_record
+from expcore_onedata.linkrecord import LOCK, RECORD, discard_record, record_text, recording, write_record
 
 
 def passing(pairs: int = 2, *, started: float = 10.0, ended: float = 12.5) -> LinkReport:
@@ -201,6 +201,85 @@ def test_o35_a_record_is_discarded_so_that_no_older_verdict_stands(tmp_path):
     assert directory_names(tmp_path) == []
 
 
-def test_o35_the_module_names_its_three_functions_and_the_record():
-    """O35: the writer's whole interface: what `fedlinks` and the platform's probe import."""
-    assert set(linkrecord.__all__) == {"RECORD", "discard_record", "record_text", "write_record"}
+def test_o35_a_record_the_directory_will_not_let_go_is_emptied_in_place_and_dated_to_the_epoch(tmp_path, monkeypatch):
+    """O35: when the directory refuses the removal (a read-only directory, with the record's own file still writable),
+    the old pass must not stay readable: it is emptied in place, which is no record (it is not JSON), and dated to the
+    epoch, so that a reader that goes by the file's time finds it old too."""
+    path = tmp_path / RECORD
+    write_record(passing(), path)
+
+    def refuse(self, missing_ok=False):
+        raise PermissionError(errno.EACCES, "read-only directory")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    discard_record(path)
+    monkeypatch.undo()
+    assert path.exists()
+    assert path.read_bytes() == b""
+    assert path.stat().st_mtime == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_o35_a_record_that_can_be_neither_removed_nor_emptied_raises_for_the_caller_to_say(tmp_path, monkeypatch):
+    """O35: the one case in which an old record this process cannot change stays: discarding it raises `OSError`, which
+    the probe logs."""
+    path = tmp_path / RECORD
+    write_record(passing(), path)
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "read-only")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    monkeypatch.setattr(linkrecord, "open", refuse, raising=False)
+    with pytest.raises(PermissionError):
+        discard_record(path)
+    monkeypatch.undo()
+    assert json.loads(path.read_text(encoding="utf-8")) == passing().to_json()
+
+
+def test_o35_a_check_that_starts_while_another_is_under_way_waits_for_it(tmp_path):
+    """O35: `recording` holds the record's lock exclusively, so one check at a time makes the record: the second waits
+    until the first has let go, and holds it itself then."""
+    path = tmp_path / RECORD
+    inside, release, second_in = threading.Event(), threading.Event(), threading.Event()
+    order: list[str] = []
+
+    def first() -> None:
+        with recording(path) as held:
+            assert held
+            order.append("first in")
+            inside.set()
+            release.wait(30)
+            order.append("first out")
+
+    def second() -> None:
+        with recording(path) as held:
+            assert held
+            order.append("second in")
+            second_in.set()
+
+    holder = threading.Thread(target=first)
+    holder.start()
+    assert inside.wait(30)
+    waiter = threading.Thread(target=second)
+    waiter.start()
+    assert not second_in.wait(0.3)  # it waits while the first is inside
+    release.set()
+    assert second_in.wait(30)
+    holder.join(30)
+    waiter.join(30)
+    assert order == ["first in", "first out", "second in"]
+    assert LOCK in directory_names(tmp_path)
+
+
+def test_o35_a_lock_that_cannot_be_taken_is_said_by_a_false_and_never_raises(tmp_path):
+    """O35: a directory that cannot hold the lock file is no reason to skip a check: the caller is told it runs
+    unserialized."""
+    with recording(tmp_path / "missing" / RECORD) as held:
+        assert held is False
+
+
+def test_o35_the_module_names_what_up_and_the_platforms_probe_import():
+    """O35: the writer's whole interface."""
+    assert set(linkrecord.__all__) == {"LOCK", "RECORD", "discard_record", "record_text", "recording", "write_record"}

@@ -11,27 +11,44 @@ and a final newline, the bytes `up` always wrote.
 **Atomic.** The text goes to a draft of the writer's own in the record's directory (its name holds the process and a
 random part, so two writers never share one), which is flushed and fsynced and then renamed over the record, and the
 directory is fsynced so that the rename survives a crash (best effort: the rename is done by then). A reader sees the
-old record or the new one, whole. A write that fails leaves the old record as it was and no draft behind, and raises
-`OSError`. The record keeps the mode a plain
-write gives it (the process's umask), as `up`'s always had: it holds labels, seconds, bytes and transfer ids, no secret.
+old record or the new one, whole. A write that fails leaves the old record as it was and raises `OSError`; the draft
+is removed unless that removal fails too. The record keeps the mode a plain write gives it (the process's umask), as
+`up`'s always had: it holds labels, seconds, bytes and transfer ids, no secret.
+
+**In the order of the checks.** One check at a time makes the record: `recording` holds `link-check.lock`, beside the
+record, exclusively around a check and the writing of its record, so a check that starts while another is under way
+waits for it to end and writes after it, and the record is the latest-started check's, never an older one's that
+finished late. Under a restore's and a heal's exclusive admission the lock is never contended; it orders what the
+admission does not (`up` run on a federation another process is checking, say). No clock is read for the order. The
+lock is a leaf of the federation's lock order (`admission`). A lock that cannot be taken is no reason to skip the
+check: `recording` yields False and the caller goes on unserialized, saying so.
+
+**An older verdict never stands.** `discard_record` removes the record, or, when the directory refuses that, empties it
+in place (which needs only the file's own write permission) and dates it to the epoch, so that no reader takes it, by
+its contents or by its time, for a recent check. It raises `OSError` only when neither is possible, the one case in
+which a record this process cannot change stays as it was (the same permissions would stop `up` and the injector's
+journal too).
 
 **The record is advisory.** The federation's link epoch (`fault_epoch`) and the gate's heal journal are what a run's
-admission compares (`admission_recheck`); the record is read by no admission, takes no lock, and lives beside
-`platform.toml`, not in the fault journal's directory. Writing it never raises or lowers the epoch.
+admission compares (`admission_recheck`); the record is read by no admission and lives beside `platform.toml`, not in
+the fault journal's directory. Writing it never raises or lowers the epoch.
 """
 
 import contextlib
+import fcntl
 import json
 import os
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from expcore_onedata.fault_journal import _fsync_directory
 
-__all__ = ["RECORD", "discard_record", "record_text", "write_record"]
+__all__ = ["LOCK", "RECORD", "discard_record", "record_text", "recording", "write_record"]
 
 RECORD = "link-check.json"  # beside facts.json (under `up`) and platform.toml, wherever that file lies
+LOCK = "link-check.lock"  # beside the record: held exclusively around a check and the writing of its record
 
 
 def record_text(report: Any) -> str:
@@ -42,7 +59,7 @@ def record_text(report: Any) -> str:
 def write_record(report: Any, path: Path) -> None:
     """Write `report`'s record at `path`, atomically: a draft in the same directory, fsynced, renamed over `path`, the
     directory fsynced (best effort: the rename is done by then). Raises OSError when the record cannot be written; the
-    old one is then as it was, with no draft."""
+    old one is then as it was."""
     path = Path(path)
     draft = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
@@ -61,8 +78,49 @@ def write_record(report: Any, path: Path) -> None:
 
 
 def discard_record(path: Path) -> None:
-    """Remove the record, so that no older verdict stands as the latest one; a record that is not there is no error.
-    Raises OSError when the removal is refused."""
-    Path(path).unlink(missing_ok=True)
+    """Make sure no older verdict stands as the latest one: remove the record, or, when the directory refuses that,
+    empty it in place and date it to the epoch. A record that is not there is no error. Raises OSError when the record
+    can be neither removed nor emptied."""
+    path = Path(path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        _empty(path)
+        return
     with contextlib.suppress(OSError):  # the removal is done; its durability is the directory's
-        _fsync_directory(Path(path).parent)
+        _fsync_directory(path.parent)
+
+
+def _empty(path: Path) -> None:
+    """Empty the record in place (an empty record is no record: it is not JSON), and date it to the epoch so that a
+    reader that goes by its time finds it old; the dating is best effort, the emptying is not."""
+    try:
+        with open(path, "r+b") as handle:
+            handle.truncate(0)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileNotFoundError:
+        return  # there is nothing left to stand
+    with contextlib.suppress(OSError):
+        os.utime(path, (0, 0))
+
+
+@contextlib.contextmanager
+def recording(path: Path) -> Iterator[bool]:
+    """Hold the record's lock (`LOCK`, beside `path`) exclusively, waiting for any other check under way to end, for a
+    check and the writing of its record; yield whether it is held. False means the lock file could not be opened or
+    locked, and the caller goes on unserialized. The lock is let go when the block ends, and by the kernel with a
+    process that dies."""
+    descriptor = None
+    held = False
+    try:
+        descriptor = os.open(Path(path).parent / LOCK, os.O_RDWR | os.O_CREAT, 0o666)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        held = True
+    except OSError:
+        pass
+    try:
+        yield held
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)

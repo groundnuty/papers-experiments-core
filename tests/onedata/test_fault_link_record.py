@@ -9,6 +9,7 @@ is in `tests/onedata/placement/test_link_record.py`.
 """
 
 import json
+import threading
 
 from fault_support import FakeClock, injector_for
 from gate_heal_support import healed
@@ -235,3 +236,49 @@ def test_o35_a_restores_heal_ends_with_the_passing_rechecks_record(tmp_path, mon
     assert wired.on_disk[-1] is False
     assert wired.text() == record_text(wired.reports[-1])
     assert json.loads(wired.text())["window"]["end_epoch_s"] == services.checked_at[-1]
+
+
+# --- checks that overlap ---------------------------------------------------------------------------------------------
+
+
+def test_o35_a_check_that_finishes_late_never_replaces_the_record_of_a_check_that_started_after_it(
+    tmp_path, monkeypatch
+):
+    """O35: one check passes but is slow, and another starts meanwhile and finds a pair stuck (a check that overlaps
+    because something other than the federation's exclusive admission, `up` say, ran beside it). The second waits for
+    the first's check and record, runs after it, and its failing verdict is the one left: the record is the
+    latest-started check's, never an older pass that finished late."""
+    platform = write_platform(tmp_path, lambda data: (four_providers(data, None), with_link_check(data)))
+    config = load_platform(platform, require_secrets=False)
+    probe = ServingProbe(config, load_faults(platform, config), None)
+    fetched = PairResult("providers[1]", "providers[0]", True, 0.1, 1)
+    slow_passing = LinkReport(True, "every pair passed", (fetched,), 1, 2)
+    remedy = REMEDY.format(reader="providers[1]")
+    stuck = PairResult("providers[1]", "providers[0]", False, 30.0, reason="no transfer", remedy=remedy)
+    failing_report = LinkReport(False, "a provider link is stuck", (stuck,), 3, 4)
+    first_in, release, second_in = threading.Event(), threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def check(config, client):
+        if not calls:
+            calls.append("first starts")
+            first_in.set()
+            release.wait(30)
+            calls.append("first ends")
+            return slow_passing
+        calls.append("second starts")
+        second_in.set()
+        return failing_report
+
+    monkeypatch.setattr(fault_serves, "check_links", check)
+    first = threading.Thread(target=probe.matrix, args=(SERVICE,))
+    first.start()
+    assert first_in.wait(30)
+    second = threading.Thread(target=probe.matrix, args=(SERVICE,))
+    second.start()
+    assert not second_in.wait(0.3)  # its check does not begin while the first is under way
+    release.set()
+    first.join(30)
+    second.join(30)
+    assert calls == ["first starts", "first ends", "second starts"]
+    assert (tmp_path / RECORD).read_text(encoding="utf-8") == record_text(failing_report)
