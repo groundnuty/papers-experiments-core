@@ -220,3 +220,11 @@ def test_o55_the_code_tool_raises_the_incomplete_exec_as_sandbox_infrastructure(
     with pytest.raises(InfraError, match=NOT_RECORDED) as raised:
         asyncio.run(tool.execute("python", {"code": "print(1)"}, timeout_s=30, ctx=NO_WAITS))
     assert raised.value.kind == "sandbox"
+
+
+def test_o55_the_code_tool_hands_on_the_check_of_a_verified_cell(world, sbx):
+    world.host.exec_handler = answers(CmdResult(0, "", ""))
+    tool = CodeExecutionProvider(sbx)
+    out = asyncio.run(tool.execute("python", {"code": "x = 1"}, timeout_s=30, ctx=NO_WAITS))
+    assert (out.text, out.is_error) == ("", False)
+    assert out.exec_check == VERIFIED

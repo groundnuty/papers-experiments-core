@@ -87,13 +87,13 @@ class CodeExecutionProvider:
     @classmethod
     def _output(cls, result: ExecResult) -> ToolOutput:
         """The text the model sees for a finished cell, or for one too little time was left to start; a notice ends it
-        when the sandbox cut the cell's output (O43)."""
+        when the sandbox cut the cell's output (O43). What the cell's completion record showed goes with it, for the
+        call's record (`exec_check`, O55); the model never sees it."""
         shown = cls._shown(result)
-        if not result.output_cut:
-            return shown
-        return ToolOutput(
-            f"{shown.text}\n{_cut_notice(result.output_cut)}", shown.is_error, shown.error_class, source_truncated=True
-        )
+        text, cut = shown.text, None
+        if result.output_cut:
+            text, cut = f"{shown.text}\n{_cut_notice(result.output_cut)}", True
+        return ToolOutput(text, shown.is_error, shown.error_class, source_truncated=cut, exec_check=result.exec_check)
 
     @staticmethod
     def _shown(result: ExecResult) -> ToolOutput:
