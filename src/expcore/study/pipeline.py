@@ -46,6 +46,7 @@ Everything a study produces goes under `<study>/out/`: the campaign store (`stat
 """
 
 import collections
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -60,10 +61,18 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.campaign.executor import default_backend_factory
-from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.export import (
+    EXPORT_FINGERPRINT,
+    NOT_RECORDED,
+    ExportError,
+    export_run_state,
+    export_text,
+    stored_fingerprint_sha256,
+    verify_export_fingerprint,
+)
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
-from expcore.campaign.lock import CampaignLocked, LockMissing, LockUnavailable, ReaderLock
+from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
@@ -101,6 +110,7 @@ from expcore.replay.check import (
     write_check,
 )
 from expcore.replay.native import has_native_parser
+from expcore.replay.side_file_placement import settle_side_files
 from expcore.report import render_report
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.ratio import OMIT_NONE
@@ -329,6 +339,7 @@ def _run_campaign(
             backend_factory=default_backend_factory if plugin.backend_factory is None else plugin.backend_factory,
             on_hold=_say_hold,
             shard=started,
+            reset_settings=plugin.reset_settings,
             **options,
         ) as scheduler:
             return scheduler.run()
@@ -495,6 +506,7 @@ def _check_batch_of(
             raise Refused(str(error)) from None
     finally:
         lock.release()
+    _settle_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
     )
@@ -528,6 +540,29 @@ def _hold_for_check(store: Path, partial: bool) -> tuple[ReaderLock, bool]:
         ) from None
     except LockUnavailable as error:
         raise Refused(f"{store}: {error}; the store cannot be shown to have no dispatcher") from None
+
+
+def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
+    """Finish or remove what a kill left of the placement of a declared side file in the batch (R15), and say so.
+
+    A temporary file no record names is removed only while this process holds the lock of the campaign the batch
+    belongs to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with
+    no dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released.
+    A lock that cannot be taken (a campaign runs, or the file system refuses `flock`), or a batch that is not the
+    study's own, leaves such a file where it is; a rename that a record names is finished either way. A study that
+    declares no side file is not touched at all.
+    """
+    if not study.side_files:
+        return
+    lock = DispatchLock(out_dir(study))
+    if Path(batch).resolve().is_relative_to(out_dir(study).resolve()):
+        with contextlib.suppress(CampaignLocked):  # a dispatcher is alive: only what the records name is finished
+            lock.acquire()
+    try:
+        for settled in settle_side_files(batch, study.side_files, remove_unnamed=lock.held):
+            print(f"check: {settled}", file=sys.stderr)
+    finally:
+        lock.release()
 
 
 def _check_merged(
@@ -733,6 +768,7 @@ def _analyse_loaded(
     plugin = load_plugin(StudyContext(study, code))
     try:
         export = _export_of(verified, study.manifest)
+        _require_campaign(export, verified)
     finally:
         verified.close()
     rows, scores = [], {}
@@ -767,21 +803,41 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
     return join_exports(parts, {row.key.text: row.seq for row in plan.rows}, verified.shards)
 
 
+def _require_campaign(export: Mapping[str, Any], verified: VerifiedBatch) -> None:
+    """Refuse an export that is not of the campaign the analysis read: its campaign fingerprint's hash must be that of
+    every snapshot, and, for a merged batch, the `fingerprint` merge.json names (C36). A snapshot that records no
+    fingerprint has nothing to compare with."""
+    held = [stored_fingerprint_sha256(snapshot) for snapshot in verified.snapshots.values()]
+    if verified.merge is not None:
+        held.append(verified.merge["fingerprint"])
+    try:
+        for expected in held:
+            if expected is not None:
+                verify_export_fingerprint(export, expected)
+    except ExportError as error:
+        raise Refused(str(error)) from None
+
+
 def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
     """The Holm decisions `analysis.json` holds: `holm`, every member's decision as its own family made it, and,
     only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
-    decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named."""
+    decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named.
+    Only for declared equivalence families (S18), `equivalence_families`: each one's name, members and steps over
+    their TOST p-values; a study that declares none keeps its analysis.json byte for byte."""
     entries: dict[str, Any] = {"holm": result.holm}
     if result.holm_families:
         entries["holm_families"] = result.holm_families
+    if result.equivalence_families:
+        entries["equivalence_families"] = result.equivalence_families
     return entries
 
 
 def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds: the preregistration, the code, the core, each condition's planned runs and how they
     ended (C23), and each contrast with its pairs used and missing by cause, its treatment declaration (S10) and its
-    Holm decision, with each named family's steps (S17). `exploratory_only` is true when the preregistration makes no
-    confirmatory claim (S12): there is then no Holm decision, and every contrast is exploratory."""
+    Holm decision, with each named family's steps (S17) and each declared equivalence family's (S18). `exploratory_only`
+    is true when the preregistration makes no confirmatory claim (S12): there is then no Holm decision, and every
+    contrast is exploratory."""
     return {
         "preregistration": dict(analysis.result.manifest),
         "exploratory_only": analysis.result.exploratory_only,
@@ -853,5 +909,24 @@ def regenerate(
         if not target.is_file():
             problems.append(f"{name}: missing")
         elif target.read_bytes() != made:
-            problems.append(f"{name}: differs from what the records give")
+            why = _export_difference(analysis.export, target.read_bytes()) if name == EXPORT_FILE else None
+            problems.append(f"{name}: {why or 'differs from what the records give'}")
     return problems
+
+
+def _export_difference(derived: Mapping[str, Any], held: bytes) -> str | None:
+    """Say how a saved export that differs from the derived one differs in the campaign fingerprint, if it does: it is
+    of another campaign (or its entry is not the hash of its fingerprint), or it records none (an export from before the
+    key, which is read as it was and only said so, C36). None when the fingerprint is not what differs."""
+    try:
+        saved = json.loads(held)
+    except ValueError:
+        return None
+    if not isinstance(saved, dict):
+        return None
+    expected = derived.get(EXPORT_FINGERPRINT)
+    try:
+        said = verify_export_fingerprint(saved, None if expected is None else expected["sha256"])
+    except ExportError as error:
+        return str(error)
+    return f"differs from what the records give ({NOT_RECORDED})" if said == NOT_RECORDED and expected else None

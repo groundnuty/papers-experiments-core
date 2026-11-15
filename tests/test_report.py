@@ -6,7 +6,15 @@ import math
 import pytest
 
 from expcore.report import render_report, summary_lines
-from expcore.stats.analysis import CONCLUSIONS, AnalysisResult, ContrastResult, HolmDecision, HolmFamily, HolmStep
+from expcore.stats.analysis import (
+    CONCLUSIONS,
+    AnalysisResult,
+    ContrastResult,
+    EquivalenceFamily,
+    HolmDecision,
+    HolmFamily,
+    HolmStep,
+)
 from expcore.stats.armruns import LOST_CAUSES, ArmRuns
 from expcore.stats.estimators import ModelEstimate
 from expcore.stats.onearm import DescriptiveResult
@@ -301,6 +309,75 @@ def test_set_aside_and_treatment_counts_are_listed_per_condition_and_kind():
     assert "| cond-a | endpoint | no | 3 | 0 | 0 |" in report
     assert "| cond-b | knowledge | yes | 1 | 2 | 0 |" in report
     assert "| cond-a | none |" not in report  # a condition with a row of its own needs no row of zeros
+
+
+SETTINGS_HEADING = "### Platform settings outside the fingerprint"
+SCAN = {"at": "2026-03-01T11:00:00Z", "key": "placement.qos_scan", "old": "listing", "new": "summaries"}
+
+
+def settings_export(changes=(), unknown=()):
+    return export(reset_settings={"changes": list(changes), "unknown_before": list(unknown)})
+
+
+def settings_section(report: str) -> str:
+    """The text of the settings section: from its heading to the next one."""
+    return report.split(SETTINGS_HEADING, 1)[1].split("\n### ", 1)[0]
+
+
+def test_c35_a_changed_platform_setting_is_in_the_infrastructure_notes_with_both_values_and_when():
+    """C35: each start that found a setting changed is a row with the key, the value before and the value after, as the
+    store holds them; a setting that was not reported on one side reads `absent`, never None or empty; the section is
+    among the infrastructure notes, before the budget holds."""
+    changes = [SCAN, {"at": "2026-03-02T09:00:00Z", "key": "placement.concurrency", "old": 16}]
+    report = render(analysis(contrast("primary", "difference")), settings_export(changes))
+    assert (
+        report.index("### Infrastructure failures") < report.index(SETTINGS_HEADING) < report.index("### Budget holds")
+    )
+    rows = table_of(report, SETTINGS_HEADING)
+    assert rows["Recorded"] == ["Recorded", "Key", "Before", "After"]
+    assert rows["2026-03-01T11:00:00Z"] == ["2026-03-01T11:00:00Z", "placement.qos_scan", '"listing"', '"summaries"']
+    assert rows["2026-03-02T09:00:00Z"] == ["2026-03-02T09:00:00Z", "placement.concurrency", "16", "absent"]
+    assert "No change" not in settings_section(report)
+
+
+def test_c35_a_store_whose_earlier_settings_are_unknown_says_so_and_names_the_start_that_recorded_them():
+    """C35: the start of a store made before the settings were recorded says that the runs before it ran under
+    settings that are unknown, and never that nothing changed."""
+    report = render(
+        analysis(contrast("primary", "difference")), settings_export(unknown=[{"at": "2026-03-05T08:00:00Z"}])
+    )
+    section = settings_section(report)
+    assert "2026-03-05T08:00:00Z" in section
+    assert "unknown" in section
+    assert "No change" not in section
+
+
+def test_c35_settings_that_never_changed_are_reported_as_such_in_one_line_and_never_as_a_table():
+    """C35: the key is present when the store recorded settings, and says that no start found them changed."""
+    section = settings_section(render(analysis(contrast("primary", "difference")), settings_export()))
+    assert "No change in them was recorded at any start." in section
+    assert "|" not in section
+
+
+def test_c35_the_changes_of_a_merged_batch_name_their_shard():
+    """C35: the joined export's changes and unknown starts carry the shard that saw them, and the table has a shard
+    column only then."""
+    data = settings_export([{**SCAN, "shard": 2}], [{"at": "2026-03-05T08:00:00Z", "shard": 1}])
+    report = render(analysis(contrast("primary", "difference")), data)
+    rows = table_of(report, SETTINGS_HEADING)
+    assert rows["Shard"] == ["Shard", "Recorded", "Key", "Before", "After"]
+    assert rows["2"] == ["2", "2026-03-01T11:00:00Z", "placement.qos_scan", '"listing"', '"summaries"']
+    assert "shard 1" in settings_section(report)
+
+
+def test_c35_an_export_without_the_key_gives_the_report_it_always_gave():
+    """C35: a campaign whose platform supplies no settings has no section, and nothing else in its report moves."""
+    result = analysis(contrast("primary", "difference"))
+    plain = render(result)
+    assert SETTINGS_HEADING not in plain
+    with_section = render(result, settings_export([SCAN]))
+    before, rest = with_section.split(SETTINGS_HEADING)
+    assert before + "### Budget holds" + rest.split("### Budget holds", 1)[1] == plain
 
 
 def test_c23_each_condition_shows_its_planned_runs_how_each_ended_and_its_attempts_set_aside():
@@ -1292,3 +1369,207 @@ def test_s17_a_single_family_report_has_no_family_steps_or_family_column():
     assert "Holm steps of" not in report
     assert "Holm family |" not in report
     assert "### Equivalence family (Holm over two one-sided tests)\n" in report
+
+
+# --- declared equivalence families (S18) ------------------------------------------------------------------------------
+
+# One declared equivalence family of three claims across both Holm families above, worked by hand at alpha = 0.05:
+# TOST p 0.004 (h1a) <= 0.05/3 = 0.01667, adjusted 3 x 0.004 = 0.012; 0.020 (h2a) <= 0.05/2, adjusted max(0.012,
+# 2 x 0.020) = 0.040; 0.30 (h1b) > 0.05, adjusted max(0.040, 0.30) = 0.30.
+DECLARED_STEPS = (
+    HolmStep(1, "h1a", 0.004, 0.012, 0.05 / 3, True),
+    HolmStep(2, "h2a", 0.020, 0.040, 0.05 / 2, True),
+    HolmStep(3, "h1b", 0.30, 0.30, 0.05 / 1, False),
+)
+
+
+def declared(result, steps=DECLARED_STEPS, name="h1"):
+    """`result` with h1a, h2a and h1b as the claims of one declared equivalence family of these steps, each claim's
+    numbers its step's, and no Holm family holding an equivalence decision."""
+    by_step = {s.name: s for s in steps}
+    claims = tuple(
+        dataclasses.replace(r, **claim_fields(by_step[r.name])) if r.name in by_step else r for r in result.contrasts
+    )
+    decisions = tuple(HolmDecision(s.name, s.p_value, s.p_holm, s.level, s.reject) for s in steps)
+    family = EquivalenceFamily(name, tuple(s.name for s in steps), steps)
+    return dataclasses.replace(result, contrasts=claims, equivalence_holm=decisions, equivalence_families=(family,))
+
+
+def claim_fields(step):
+    """What the analysis gives a claim of an equivalence family from its step."""
+    return {
+        "p_value": 0.4,
+        "significant": False,
+        "conclusion": "equivalent" if step.reject else "not_detected",
+        "equivalence_margin": 0.2,
+        "equivalence_interval": (-0.05, 0.06),
+        "equivalent": step.reject,
+        "in_equivalence_family": True,
+        "tost_p": step.p_value,
+        "tost_p_holm": step.p_holm,
+        "equivalence_level": 1 - 2 * step.level,
+        "equivalence_interval_adjusted": (-0.08, 0.09),
+    }
+
+
+DECLARED_HEADING = "### Equivalence families (Holm over two one-sided tests, within each declared equivalence family)"
+
+
+def test_s18_the_report_gives_each_declared_equivalence_family_its_claims_and_its_tost_steps():
+    """S18: each claim's equivalence family beside the Holm family of its significance test, its raw and adjusted
+    TOST p and its verdict, then the family's steps at alpha/3, alpha/2, alpha/1 over its own three claims."""
+    report = render(declared(families_analysis()))
+    table = table_of(report, DECLARED_HEADING)
+    assert table["Contrast"] == [
+        "Contrast",
+        "Equivalence family",
+        "Holm family",
+        "Margin",
+        "TOST p",
+        "Holm TOST p",
+        "Interval level",
+        "Adjusted interval",
+        "Equivalent",
+    ]
+    assert table["h1a"][1:] == ["h1", "phase1", "0.2", "0.0040", "0.0120", "96.66666667%", "[-0.08, 0.09]", "yes"]
+    assert table["h2a"][1:3] == ["h1", "phase2"]
+    assert table["h1b"][1:] == ["h1", "phase1", "0.2", "0.3000", "0.3000", "90%", "[-0.08, 0.09]", "no"]
+    steps = table_of(report, "TOST steps of equivalence family h1")
+    assert steps["Step"] == ["Step", "Contrast", "TOST p", "Level", "Holm TOST p", "Equivalent"]
+    assert steps["1"][1:] == ["h1a", "0.0040", "0.01667 (alpha/3)", "0.0120", "yes"]
+    assert steps["2"][1:] == ["h2a", "0.0200", "0.025 (alpha/2)", "0.0400", "yes"]
+    assert steps["3"][1:] == ["h1b", "0.3000", "0.05 (alpha/1)", "0.3000", "no"]
+    assert "each Holm-adjusted over its own claims alone" in report
+    assert "within each Holm family" not in report
+
+
+def test_s18_under_one_flat_holm_family_the_equivalence_table_has_no_holm_family_column():
+    """S18: declared equivalence families need no named Holm family; the table then names the equivalence family
+    only."""
+    flat = analysis(contrast("h1a", "difference"), contrast("h2a", "difference"), contrast("h1b", "difference"))
+    table = table_of(render(declared(flat)), DECLARED_HEADING)
+    assert table["Contrast"][:3] == ["Contrast", "Equivalence family", "Margin"]
+    assert table["h2a"][1:3] == ["h1", "0.2"]
+
+
+def test_s18_the_terminal_summary_names_each_claims_equivalence_family():
+    """S18: a claim's Holm TOST p is its own equivalence family's, and the line says which family that is."""
+    lines = {line.split(":")[0]: line for line in summary_lines(declared(families_analysis()))}
+    assert lines["h1a"] == (
+        "h1a: estimate 0.25, p 0.4000, Holm p 0.0240 (family phase1), equivalent, Holm TOST p 0.0120 "
+        "(equivalence family h1)"
+    )
+    assert lines["h1c"].endswith(", not_detected")
+
+
+NOT_ITS_DECISION = "'h1b': its step in equivalence family 'h1' is not its decision in equivalence_holm"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: dataclasses.replace(r, equivalence_holm=r.equivalence_holm[:2]), NOT_ITS_DECISION),
+        (
+            lambda r: dataclasses.replace(
+                r, equivalence_families=(*r.equivalence_families, EquivalenceFamily("h2", ("h1b",), DECLARED_STEPS[2:]))
+            ),
+            "'h1b' is in two equivalence families, 'h1' and 'h2'",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                equivalence_families=(
+                    EquivalenceFamily(
+                        "h1",
+                        ("h1a", "h2a", "h1b"),
+                        (*DECLARED_STEPS[:2], dataclasses.replace(DECLARED_STEPS[2], level=0.05 / 11)),
+                    ),
+                ),
+            ),
+            NOT_ITS_DECISION,
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                holm_families=(
+                    dataclasses.replace(r.holm_families[0], equivalence=r.equivalence_holm[:1]),
+                    *r.holm_families[1:],
+                ),
+            ),
+            "Holm family 'phase1' holds equivalence decisions",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, in_equivalence_family=False) if c.name == "h1b" else c for c in r.contrasts
+                ),
+            ),
+            "'h1b' is in equivalence family 'h1' but is not an equivalence claim",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r, equivalence_families=(EquivalenceFamily("h1", ("h1a", "h2a"), DECLARED_STEPS[:2]),)
+            ),
+            "'h1b' is an equivalence claim that no equivalence family holds",
+        ),
+    ],
+    ids=["no-decision", "claim-in-two", "another-level", "holm-family-holds-one", "unflagged", "claim-in-none"],
+)
+def test_s18_a_result_whose_equivalence_families_disagree_with_its_decisions_is_refused(change, message):
+    """S18: each claim is in exactly one declared equivalence family, with that family's step as its decision (at
+    its own family's level, never another's), no Holm family holds one, and every family member is a claim; anything
+    else would show a claim adjusted in another family than its own, so the report refuses it, and so does the
+    summary."""
+    bad = change(declared(families_analysis()))
+    with pytest.raises(ValueError, match=message):
+        render(bad)
+    with pytest.raises(ValueError, match=message):
+        summary_lines(bad)
+
+
+# Three claims each adjusted alone (at alpha / 1: adjusted p = raw p, 0.03 and 0.04 rejected), filed as one family of
+# three. Holm over the three gives levels 0.01667, 0.025, 0.05 and adjusted p 3 x 0.03 = 0.09, max(0.09, 2 x 0.04) =
+# 0.09, 0.30: none rejected, so a report showing these steps would show two claims equivalent that are not.
+ALONE_STEPS = (
+    HolmStep(1, "h1a", 0.03, 0.03, 0.05, True),
+    HolmStep(2, "h2a", 0.04, 0.04, 0.05, True),
+    HolmStep(3, "h1b", 0.30, 0.30, 0.05, False),
+)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: declared(families_analysis(), steps=ALONE_STEPS), "'h1a': its step in equivalence family 'h1' is"),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, equivalent=False, conclusion="not_detected") if c.name == "h2a" else c
+                    for c in r.contrasts
+                ),
+            ),
+            "'h2a': its TOST p, Holm TOST p, verdict or interval level is not its step's in equivalence family 'h1'",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, equivalence_level=0.9) if c.name == "h1a" else c for c in r.contrasts
+                ),
+            ),
+            "'h1a': its TOST p, Holm TOST p, verdict or interval level is not its step's",
+        ),
+    ],
+    ids=["adjusted-alone-shown-as-a-family-of-three", "claim-verdict", "claim-level"],
+)
+def test_s18_a_family_whose_steps_are_not_holm_over_its_own_claims_is_refused(change, message):
+    """S18: each family's steps are recomputed from its own claims' raw TOST p-values at alpha, and each claim's
+    numbers must be its step's; decisions made at another family size, or a claim showing another verdict or level,
+    are refused by the report and the summary."""
+    bad = change(declared(families_analysis()))
+    with pytest.raises(ValueError, match=message):
+        render(bad)
+    with pytest.raises(ValueError, match=message):
+        summary_lines(bad)

@@ -133,9 +133,11 @@ class Scheduler:
         crash_hook: Callable[[str, str], None] = lambda point, run_key: None,
         on_hold: Callable[[str], None] | None = None,
         shard: ShardStart | None = None,
+        reset_settings: Mapping[str, Any] | None = None,
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
         self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
+        self.reset_settings = reset_settings  # the platform's settings in no fingerprint, recorded and compared (C35)
         self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
         self.endpoints, self.settings = dict(endpoints), settings or SchedulerConfig()
@@ -227,6 +229,7 @@ class Scheduler:
             max_attempts=cfg.max_attempts,
             allow_growth=cfg.allow_growth,
             shard=self.shard,
+            reset_settings=self.reset_settings,
         )
         store = self.store
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)
@@ -508,11 +511,14 @@ class Scheduler:
         """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
         if stopped_all:
             return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+        reason = None if self.gate is None else self.gate.operator_reason  # what only an operator can end, said first
+        said = "" if reason is None else f": {reason}"
         if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
-            why = "the health gate is closed: the platform's check stayed deferred past max_defer_s"
+            why = f"the health gate is closed: the platform's check stayed deferred past max_defer_s{said}"
             return Hold("health_gate", why, temporary=False)
         if self.gate is not None and self.gate.closed:
-            return Hold("health_gate", "the health gate is closed: no run starts until a check passes", temporary=True)
+            why = f"the health gate is closed: no run starts until a check passes{said}"
+            return Hold("health_gate", why, temporary=True)
         return None
 
     def _model_hold(self, model: str, stopped: frozenset[str], budget: Any) -> Hold | None:

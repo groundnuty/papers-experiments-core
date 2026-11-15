@@ -123,6 +123,59 @@ def test_c32_a_models_ceiling_whose_part_cannot_pay_for_one_run_is_refused():
         shard_budgets(budget, LAYOUT, plan(), MODELS, LIMITS)
 
 
+# --- at a main study's scale: 4 priced models, 150 pairs each, 21 or 27 shards ---------------------------------------
+
+SCALE_MODELS = {
+    "model-falcon": model("model-falcon"),
+    "model-heron": model("model-heron", Price(0.5, 1.5)),
+    "model-kestrel": model("model-kestrel", Price(3.0, 6.0)),
+    "model-plover": model("model-plover", Price(0.25, 1.0)),
+}
+SCALE_LAYOUTS = {
+    21: ModelShards((("model-falcon", 6), ("model-heron", 5), ("model-kestrel", 5), ("model-plover", 5))),
+    27: ModelShards((("model-falcon", 7), ("model-heron", 7), ("model-kestrel", 7), ("model-plover", 6))),
+}
+
+
+def scale_plan():
+    tasks = tuple(f"task-{n:03d}" for n in range(75))
+    return make_manifest(make_schema(), 7, tasks=tasks, models=tuple(SCALE_MODELS), seeds=SEEDS)
+
+
+def reserved_bounds(layout: ModelShards) -> dict[int, Fraction]:
+    """Each shard's planned runs times one run's reservation of its model: what `max_usd` is split by."""
+    runs = planned_runs(scale_plan(), layout)
+    return {i: runs[i] * Fraction(reservation_usd(SCALE_MODELS[layout.at(i)[0]], LIMITS)) for i in runs}
+
+
+@pytest.mark.parametrize("count", sorted(SCALE_LAYOUTS))
+@pytest.mark.parametrize("fraction", [Fraction(1, 10), Fraction(1, 2), Fraction(1), Fraction(5, 2)])
+def test_c32_at_21_and_27_shards_the_parts_sum_within_max_usd_and_each_pays_at_least_one_run(count, fraction):
+    """C32: a main study's plan split by model into 21 or 27 shards: for a `max_usd` from a tenth of what the plan
+    reserves to more than all of it, the parts sum to at most it, in micro-dollars, and each pays a run of its model."""
+    layout = SCALE_LAYOUTS[count]
+    max_usd = float(sum(reserved_bounds(layout).values()) * fraction)
+    parts = shard_budgets(Budget(max_usd), layout, scale_plan(), SCALE_MODELS, LIMITS)
+    assert sorted(parts) == list(range(1, count + 1))
+    assert micro_usd(max_usd) - count <= total_micro(parts) <= micro_usd(max_usd)
+    for index, part in parts.items():
+        assert part["max_usd"] >= reservation_usd(SCALE_MODELS[layout.at(index)[0]], LIMITS), index
+
+
+@pytest.mark.parametrize("count", sorted(SCALE_LAYOUTS))
+def test_c32_a_max_usd_above_what_the_plan_reserves_pays_every_shards_reservation_of_every_one_of_its_runs(count):
+    """C32: shares are never pooled, and a study's hold is not released, so a shard whose share runs out keeps its
+    runs unfinished for good. With a `max_usd` of a little more than the plan's reserved total, every shard's part of
+    `max_usd` pays the reservation of every run it plans once, whatever those runs cost. Only that part: a
+    `per_model_usd` ceiling is held on its own, and probes, top-ups, retries and interrupted attempts take more."""
+    layout = SCALE_LAYOUTS[count]
+    bounds = reserved_bounds(layout)
+    parts = shard_budgets(
+        Budget(float(sum(bounds.values()) * Fraction(1001, 1000))), layout, scale_plan(), SCALE_MODELS, LIMITS
+    )
+    assert all(Fraction(parts[index]["max_usd"]) >= bound for index, bound in bounds.items())
+
+
 def test_c32_a_campaign_of_free_models_only_gives_every_shard_nothing_and_is_not_refused():
     """C32: no shard is priced, so none needs a reservation and none gets dollars."""
     models = {"model-osprey": MODELS["model-osprey"], "model-plover": model("model-plover", None, free=True)}

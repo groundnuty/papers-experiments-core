@@ -6,6 +6,7 @@ what they make of it.
 """
 
 import errno
+import hashlib
 import json
 import os
 import shutil
@@ -17,7 +18,14 @@ from study_support import Campaign, clean_environment, cli, copy_campaign, finis
 from tree_support import read_only, tree_of, without
 
 from expcore.campaign import lock as lock_module
-from expcore.campaign.export import read_export
+from expcore.campaign.export import (
+    EXPORT_FINGERPRINT,
+    NOT_RECORDED,
+    export_text,
+    fingerprint_entry,
+    read_export,
+    verify_export_fingerprint,
+)
 from expcore.campaign.lock import DispatchLock
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.replay.check import inputs_sha256
@@ -482,3 +490,63 @@ def test_r04_partial_check_records_that_attempts_were_running_and_analysis_then_
     for name in ("export.json", "analysis.json"):
         saved = running.read(name)
         assert (saved["partial"], saved["running_attempts"], saved["excluded_attempts"]) == (True, 1, [])
+
+
+# --- the campaign fingerprint in the export (#243, C36) --------------------------------------------------------------
+
+
+def snapshot_fingerprint(campaign: Campaign) -> str:
+    """The text of the fingerprint the check's snapshot of the store holds."""
+    snapshot = sqlite3.connect(campaign.runs / SNAPSHOT_FILE)
+    try:
+        return snapshot.execute("SELECT value FROM meta WHERE key = 'fingerprint'").fetchone()[0]
+    finally:
+        snapshot.close()
+
+
+def test_c36_the_saved_export_carries_the_fingerprint_the_live_store_and_the_snapshot_record(finished):
+    """C36: `export.json` holds the fingerprint as the store keeps it and its hash, so a report can read a setting that
+    holds for the whole campaign (the platform's data paths, the caps) without opening state.sqlite."""
+    text = snapshot_fingerprint(finished)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    assert finished.sql("SELECT value FROM meta WHERE key = 'fingerprint'")[0]["value"] == text
+    export = read_export(finished.root / "out" / "export.json")
+    assert export[EXPORT_FINGERPRINT] == {"sha256": digest, "fingerprint": json.loads(text)}
+    assert list(export)[-1] == EXPORT_FINGERPRINT
+    assert {"tasks", "caps", "environment"} <= set(export[EXPORT_FINGERPRINT]["fingerprint"])
+    assert digest in verify_export_fingerprint(export, digest)
+
+
+def test_c36_package_check_names_an_export_that_is_another_campaigns(copy):
+    """C36: an export whose fingerprint hash is not the snapshot's is named for what it is, not only as a difference."""
+    path = copy.root / "out" / "export.json"
+    export = json.loads(path.read_text(encoding="utf-8"))
+    export[EXPORT_FINGERPRINT] = fingerprint_entry({**export[EXPORT_FINGERPRINT]["fingerprint"], "seeds": [999]})
+    path.write_text(export_text(export), encoding="utf-8")
+    (problem,) = pipeline.regenerate(copy.root)
+    assert problem.startswith("export.json: the export is of another campaign")
+    assert export[EXPORT_FINGERPRINT]["sha256"] in problem
+
+
+def test_c36_an_export_from_before_the_key_reads_and_is_said_not_to_record_a_fingerprint(copy):
+    """C36: an old export without the key is still read; the check says 'fingerprint not recorded' and does not refuse
+    it for that, though the file is not what the records now give."""
+    path = copy.root / "out" / "export.json"
+    export = json.loads(path.read_text(encoding="utf-8"))
+    del export[EXPORT_FINGERPRINT]
+    path.write_text(export_text(export), encoding="utf-8")
+    digest = hashlib.sha256(snapshot_fingerprint(copy).encode("utf-8")).hexdigest()
+    assert verify_export_fingerprint(read_export(path), digest) == NOT_RECORDED
+    assert pipeline.regenerate(copy.root) == [f"export.json: differs from what the records give ({NOT_RECORDED})"]
+
+
+def test_c36_the_analysis_refuses_an_export_whose_fingerprint_is_not_that_of_the_snapshot_it_read(copy, monkeypatch):
+    """C36: the export the analysis builds is checked against the fingerprint of every snapshot it read."""
+    built = pipeline.export_run_state
+
+    def of_another_campaign(store, **kwargs):
+        return {**built(store, **kwargs), EXPORT_FINGERPRINT: fingerprint_entry({"seeds": [999]})}
+
+    monkeypatch.setattr(pipeline, "export_run_state", of_another_campaign)
+    with pytest.raises(pipeline.Refused, match="another campaign"):
+        pipeline.analyse_study(copy.root)

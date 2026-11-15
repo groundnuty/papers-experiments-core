@@ -57,8 +57,18 @@ class Timeline(FakeServices):
             self.timeline.append(("start", service, time.monotonic()))
 
 
+WAIT_S = 30.0  # the bound of every wait of a test that holds the lock between threads: only a failure ever waits it out
+GRACE_S = 0.3  # how long a party that must be held back is given to get in anyway (a secondary check)
+PROBE_S = 0.2  # how long the test thread's own try for the lock is given before it counts as refused
+# The bound of a run's wait for the federation (`[faults] admission_timeout_s`). The fixture's own is 1 s, which a held
+# lock can outlast when its release is slow (a journal record fsynced under it on a busy disk), and a wait that runs
+# out is `FederationBusy`, a refusal of the run: no test here depends on the bound expiring, so it is generous, and
+# what a test asserts is the exclusion, never how soon a holder lets go.
+ADMISSION_S = 3 * WAIT_S
+
+
 def federation(tmp_path):
-    platform = write_faults(tmp_path)
+    platform = write_faults(tmp_path, admission_timeout_s=ADMISSION_S)
     settings = load_faults(platform, load_platform(platform, require_secrets=False))
     return platform, FederationLock(settings)
 
@@ -98,11 +108,6 @@ class WatchedLock(FederationLock):
         return held
 
 
-WAIT_S = 10.0  # the bound of every wait of a test that holds the lock between threads
-GRACE_S = 0.3  # how long a party that must be held back is given to get in anyway (a secondary check)
-PROBE_S = 0.2  # how long the test thread's own try for the lock is given before it counts as refused
-
-
 def held_back(entered, names, grace_s=GRACE_S):
     """The names, after a grace, that are in despite the test not having let them: empty when each is held back. A
     thread that has not yet got as far as the lock is held back too, so this alone proves no exclusion."""
@@ -137,7 +142,7 @@ def test_o11_two_outage_runs_on_different_targets_never_overlap(tmp_path):
     time.sleep(0.3)
     assert services.running(LOCAL_SERVICE) is True  # still waiting for the federation
     assert first.finish()["ok"] is True
-    thread.join(10)
+    thread.join(WAIT_S)
     assert landed == [None]
     assert second.finish()["ok"] is True
     order = [(event, service) for event, service, _ in services.timeline]
@@ -160,7 +165,7 @@ def test_o11_an_outage_run_waits_for_a_baseline_run_that_holds_the_federation(tm
         time.sleep(0.3)
         assert services.running(OUTAGE_SERVICE) is True  # the baseline run is still on a whole federation
         released = time.monotonic()
-    thread.join(10)
+    thread.join(WAIT_S)
     assert landed == [None]
     assert services.timeline[0][:2] == ("stop", OUTAGE_SERVICE)
     assert services.timeline[0][2] >= released
@@ -183,7 +188,7 @@ def test_o11_a_baseline_run_waits_for_an_outage_run_and_starts_on_a_whole_federa
     time.sleep(0.3)
     assert landed == []  # still waiting
     assert injector.finish()["ok"] is True
-    thread.join(10)
+    thread.join(WAIT_S)
     admitted_at, provider_up = landed[0]
     assert provider_up is True
     assert admitted_at >= services.timeline[-1][2]
@@ -287,7 +292,7 @@ class SlowRead(FakeServices):
     def observe(self, service):
         if not self.reading.is_set():
             self.reading.set()
-            self.release.wait(10)
+            self.release.wait(WAIT_S)
         return super().observe(service)
 
 
@@ -306,15 +311,15 @@ def test_o11_a_baseline_health_check_waits_for_an_injection_in_progress_and_pass
     assert health().ok is True
     injector = injector_for(platform, services)
     thread, landed = in_thread(lambda: injector.start(RUN))
-    assert services.reading.wait(10)
+    assert services.reading.wait(WAIT_S)
     checking, verdicts = in_thread(health)
     time.sleep(0.3)
     assert verdicts == []  # waiting: an injection proceeds
     services.release.set()
-    thread.join(10)
+    thread.join(WAIT_S)
     assert landed == [None]
     assert injector.finish()["ok"] is True
-    checking.join(10)
+    checking.join(WAIT_S)
     assert verdicts[0].ok is True, verdicts[0].detail
 
 
@@ -446,48 +451,86 @@ def matched_design(tmp_path):
     return path, load_factor_schema(path)
 
 
+def contend(admit, lock, holder_file, *, control_first):
+    """Two runs through the platform's run admission, an exclusive control and a baseline run, the one on the
+    federation (`control_first`: the control) holding until the test lets it go, and the other asking for it while it
+    does. Return the holds, by run name (`control`, `baseline`), each with its `in` and `out` times (taken inside the
+    hold) and the mode and holder record purpose it saw (`seen`), and what each admission yielded.
+
+    Before the second run is started, the test thread makes its own tries for the lock with the first on it (`refused`):
+    they hold back nothing vacuously, so they prove the exclusion whatever the threads' speed. A failed check leaves no
+    thread parked on the lock or on an Event."""
+    names = {True: "control", False: "baseline"}
+    first, second = names[control_first], names[not control_first]
+    holds: dict[str, dict] = {}
+    entered = {name: threading.Event() for name in names.values()}
+    trying, release = threading.Event(), {name: threading.Event() for name in names.values()}
+
+    def run(name, exclusive):
+        if name == second:
+            trying.set()  # about to ask for the lock
+        with admit((), {}, threading.Event(), exclusive) as mode:
+            hold = holds[name] = {"in": time.monotonic(), "seen": mode}
+            if exclusive:
+                hold["seen"] += ":" + json.loads(holder_file.read_text(encoding="utf-8"))["purpose"]
+            entered[name].set()
+            assert release[name].wait(WAIT_S), f"{name} was never let go"
+            hold["out"] = time.monotonic()
+        return mode
+
+    threads = []
+    try:
+        threads.append(in_thread(lambda: run(first, control_first), name=first))
+        assert entered[first].wait(WAIT_S)
+        # a control refuses every other request; a baseline run only an exclusive one (its own kind may share)
+        for exclusive in (False, True) if control_first else (True,):
+            kind = "an exclusive" if exclusive else "a shared"
+            assert refused(lock, exclusive=exclusive), f"{kind} request was granted with the {first} run on it"
+        threads.append(in_thread(lambda: run(second, not control_first), name=second))
+        assert trying.wait(WAIT_S)
+        assert held_back(entered, [second]) == [], f"the {second} run got in with the {first} run on the federation"
+        release[first].set()
+        assert entered[second].wait(WAIT_S)  # the run it waited for is gone: it is in
+        release[second].set()
+        for thread, _ in threads:
+            thread.join(WAIT_S)
+            assert not thread.is_alive()
+    finally:
+        for event in release.values():
+            event.set()
+        for thread, _ in threads:
+            thread.join(WAIT_S)
+    return holds, [landed[0] for _, landed in threads]
+
+
 def test_o11_an_exclusive_control_holds_the_federation_exclusively_and_never_overlaps_another_run(tmp_path):
     """O11: a condition that declares `exclusive = true` runs alone on the federation, as an outage run does, with no
     fault: its admission is exclusive and named as an exclusive run in the holder record, a baseline run waits for it,
-    and it waits for a baseline run already on the federation."""
-    platform, _ = federation(tmp_path)
+    and it waits for a baseline run already on the federation.
+
+    Every run holds until the test lets it go, so the contention is the test's to keep: neither a sleep nor a bound
+    decides it. The run admission's wait is bounded by `[faults] admission_timeout_s`, which the fixture sets high
+    (`ADMISSION_S`), since a holder that lets go slowly (a record fsynced under the lock, on a busy disk) is not what
+    this asserts. What it asserts is the exclusion: the times each run recorded inside its hold overlap nowhere, and
+    the second run is in only after the first is out, in both orders."""
+    platform, lock = federation(tmp_path)
     config = load_platform(platform, require_secrets=False)
     _, schema = matched_design(tmp_path)
     admit = run_admission(config, schema)
-    settings = load_faults(platform, config)
-    timeline: list[tuple[str, str, float]] = []
+    holder_file = load_faults(platform, config).journal / "federation.holder"
 
-    def run(name, exclusive, hold_s, entered):
-        with admit((), {}, threading.Event(), exclusive) as mode:
-            timeline.append((name, "in", time.monotonic()))
-            entered.set()
-            if exclusive:
-                record = json.loads((settings.journal / "federation.holder").read_text(encoding="utf-8"))
-                timeline.append((name, f"{mode}:{record['purpose']}", time.monotonic()))
-            time.sleep(hold_s)
-            timeline.append((name, "out", time.monotonic()))
-        return mode
+    holds, modes = contend(admit, lock, holder_file, control_first=True)
+    assert modes == ["exclusive", "shared"]
+    assert holds["control"]["seen"] == "exclusive:exclusive_run"
+    assert holds["baseline"]["seen"] == "shared"
+    assert not overlapping(holds["control"], holds["baseline"]), holds
+    assert holds["baseline"]["in"] >= holds["control"]["out"], holds  # the baseline run waited for the control to leave
 
-    # the run that arrives second starts once the first is in, not after a sleep a slow thread start could outlast
-    control_in, baseline_in = threading.Event(), threading.Event()
-    control, landed = in_thread(lambda: run("control", True, 0.4, control_in))
-    assert control_in.wait(10)
-    baseline, after = in_thread(lambda: run("baseline", False, 0.1, threading.Event()))
-    control.join(10)
-    baseline.join(10)
-    assert landed == ["exclusive"]
-    assert after == ["shared"]
-    marks = {(name, what): at for name, what, at in timeline}
-    assert ("control", "exclusive:exclusive_run") in marks
-    assert marks["baseline", "in"] >= marks["control", "out"]  # it waited for the control to leave
-
-    first, _ = in_thread(lambda: run("baseline", False, 0.4, baseline_in))
-    assert baseline_in.wait(10)
-    second, _ = in_thread(lambda: run("control", True, 0.1, threading.Event()))
-    first.join(10)
-    second.join(10)
-    marks = {(name, what): at for name, what, at in timeline[-5:]}
-    assert marks["control", "in"] >= marks["baseline", "out"]  # the control waited for the run already on it
+    holds, modes = contend(admit, lock, holder_file, control_first=False)
+    assert modes == ["shared", "exclusive"]
+    assert holds["control"]["seen"] == "exclusive:exclusive_run"
+    assert not overlapping(holds["baseline"], holds["control"]), holds
+    assert holds["control"]["in"] >= holds["baseline"]["out"], holds  # the control waited for the run already on it
 
 
 def test_c34_an_outage_run_with_no_declared_target_is_refused_before_it_takes_the_federation(tmp_path):

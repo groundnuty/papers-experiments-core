@@ -21,6 +21,11 @@ it opens, so a restart in the outage restores it (`restarts` counts those) and t
      itself, the passing one included, "restarts": restarts survived while open, "last_check_utc", "first_detail",
      "last_detail"}
 
+and, when a failed answer of the outage led with a reason only an operator can end (`deferral.operator_reason`),
+`"operator_reason"`: the latest such reason, kept apart because the passing check that opens the gate overwrites
+`last_detail` and an ordinary failure can be followed by one (a heal the dispatcher's own check began failed). The
+export's `operator_holds` reads it; the status's alarms and the hold the run says read the open outage's latest detail.
+
 **A gate state that cannot be read at a restart opens closed**: whether the platform is up is then unknown, and the
 first passing check ends it. Nothing is charged for a restart. A restored outage that was blocking does not block
 until the restored gate's first check has answered (bounded by its timeout), so a platform that is healthy again
@@ -79,7 +84,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
-from expcore.campaign.deferral import Deferral, deferral_alarms, parse_deferral
+from expcore.campaign.deferral import Deferral, deferral_alarms, operator_reason, parse_deferral
 from expcore.campaign.store import Store
 from expcore.config.loading import ConfigError
 
@@ -249,6 +254,13 @@ def alarms(state: dict[str, Any], every_s: float) -> list[str]:
         if outage.get("charged") is False
         else "one attempt was charged, to the run that found it"
     )
+    reason = operator_reason(last)
+    if reason is not None:  # only an operator ends it: the dispatcher's checks pass once what it left is mended
+        return [
+            f"HEALTH GATE CLOSED since {outage['start_utc']}: {reason}; no run starts; the dispatcher re-checks every "
+            f"{every_s:g} s, but a check passes only once an operator has mended it ({outage.get('checks', 0)} "
+            f"check(s) so far, last {outage.get('last_check_utc') or 'not yet'}: {str(last)[:160]}); {charged}"
+        ]
     return [
         f"HEALTH GATE CLOSED since {outage['start_utc']}: no run starts; the dispatcher re-checks every {every_s:g} s "
         f"and resumes by itself on the first pass ({outage.get('checks', 0)} check(s) so far, last "
@@ -311,6 +323,13 @@ class HealthGate:
         outage = self._open
         return outage is not None and bool(outage.get("blocking")) and not self._restored.is_set()
 
+    @property
+    def operator_reason(self) -> str | None:
+        """The reason the open outage's latest answer leads with when only an operator can end it
+        (`deferral.operator_reason`); None when the gate is open or it says none."""
+        outage = self._open
+        return None if outage is None else operator_reason(outage.get("last_detail") or outage.get("first_detail"))
+
     def load(self) -> None:
         """Restore the outage list at a start. A gate closed when the last process ended is closed again and checked at
         once; a record that cannot be read reads as closed too, until a check passes. Nothing is charged for it."""
@@ -369,6 +388,9 @@ class HealthGate:
                 record["blocking"] = True
             if not charge:
                 record["charged"] = False
+            reason = operator_reason(detail)
+            if reason is not None:
+                record["operator_reason"] = reason
             self._open = record
             self._outages.append(record)
             self.store.put_meta(META, dump(self._outages), now)
@@ -492,6 +514,9 @@ class HealthGate:
             now = self.clock()
             record["checks"] = int(record.get("checks", 0)) + 1
             record["last_check_utc"], record["last_detail"] = now, health.detail[:200]
+            reason = None if health.ok else operator_reason(health.detail)
+            if reason is not None:  # kept apart: the pass that opens the gate overwrites `last_detail`
+                record["operator_reason"] = reason
             if health.ok:
                 record["end_utc"], record["how"] = now, HOW_PASSED
                 self._open = None

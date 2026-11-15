@@ -66,9 +66,10 @@ FAMILY_NOTES = [  # beside the named Holm families' tables (S17)
 ]
 
 
-def equivalence_family_notes(alpha: float, by_family: bool = False) -> list[str]:
+def equivalence_family_notes(alpha: float, by_family: bool = False, declared: bool = False) -> list[str]:
     """What the equivalence family's table means (S15); the text names the 1 - 2 alpha interval it replaces.
-    `by_family` adds what several named Holm families change (S17): each claim is adjusted within its own."""
+    `by_family` adds what several named Holm families change (S17): each claim is adjusted within its own.
+    `declared` says the claims are in declared equivalence families (S18), each adjusted over its own claims."""
     one = [
         "The preregistration declares these contrasts' equivalence claims as one family. TOST p: the larger of the two"
     ]
@@ -77,8 +78,14 @@ def equivalence_family_notes(alpha: float, by_family: bool = False) -> list[str]
         "other claims of its own Holm family only (the Holm family column): that group is the family Holm TOST p,",
         "Interval level and Equivalent are computed over. TOST p: the larger of the two",
     ]
+    named = [
+        "The preregistration declares these contrasts' equivalence claims in named equivalence families (the",
+        "Equivalence family column), each Holm-adjusted over its own claims alone, whatever the Holm families of the",
+        "contrasts' significance tests: that family is the one Holm TOST p, Interval level and Equivalent are computed",
+        "over, and its TOST steps follow the table. TOST p: the larger of the two",
+    ]
     return [
-        *(within if by_family else one),
+        *(named if declared else within if by_family else one),
         "one-sided tests' p-values, for an effect above minus the margin and for one below the margin (for the",
         "Wilcoxon cluster bootstrap, t-tests of the mean cluster difference on clusters - 1 degrees of freedom; n/a",
         "with fewer than two clusters or no spread between them). Holm TOST p: Holm-adjusted over the family, for",
@@ -285,6 +292,17 @@ SHARD_TIME_NOTES = [
     "with no analysed run.",
 ]
 
+RESET_SETTINGS_NOTES = [
+    "The platform reports settings that are in no fingerprint, because they change how it does its work (how a reset",
+    "finds what it removes, how long it waits) and not what an agent sees, so a campaign resumes under any of",
+    "them. The campaign's store records them at its first start, and every later start compares them with the record.",
+    "Each row below is a start at which a setting was not what the record held, with its value before and after",
+    "(`absent`: the platform did not report the key on that side); the runs that started after that start ran under",
+    "the value after. A start of a store that had no record, made before the settings were recorded, leaves the",
+    "settings of the runs before it unknown.",
+]
+RESET_SETTINGS_UNCHANGED = "No change in them was recorded at any start."
+
 BUDGET_HOLD_NOTES = [
     "Attempts set aside by a budget hold: attempts that ended because a request the token cap could not account for",
     "(a resend after a failure that may have been billed, or a request after a reply without usage) needed a top-up",
@@ -292,4 +310,13 @@ BUDGET_HOLD_NOTES = [
     "counted by the kind of their own outcome: one an outage overlapped, which the table above counts under the",
     "outage's kind, is counted here too. They are counted over every run of the campaign, a run a partial analysis",
     "leaves out included. A model with more of them had its runs stopped by the budget more often than the others.",
+]
+
+HOLD_NOTES = [
+    "Each row is a stretch in which the platform's health check said that only an operator could end what it found (a",
+    "repair that failed and left its fault in place), so no run started. A held run has no attempt; the hold itself is",
+    "in none of the counts above. Until: when a check passed again, or `open` when the campaign ended with the gate",
+    "closed. Blocking: the wait outlasted `max_defer_s`, and a campaign that exits when blocked stopped. Charged a",
+    "run: one run was charged an attempt for the hold, the run whose check found it, and that attempt is among the",
+    "infrastructure failures above. The reason is the platform's own words, naming what is stuck by label only.",
 ]
