@@ -129,6 +129,7 @@ def test_o35_a_concurrent_reader_never_reads_a_torn_record(tmp_path):
                 problems.append("a record whose verdict and pairs disagree")
                 return
             reads[0] += 1
+            stop.wait(0.001)  # a read at least every millisecond, never a busy loop
 
     reader = threading.Thread(target=read)
     reader.start()
