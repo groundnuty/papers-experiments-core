@@ -75,15 +75,17 @@ from typing import Any
 from expcore_onedata.compose import DriverError
 from expcore_onedata.fault_matrix import LinkMatrix, PairState, label_order, unreadable
 
-__all__ = ["ROUNDS", "HealResult", "LinkHeal", "LinkMatrix", "PairState", "unreadable"]
+__all__ = ["INTERRUPTED", "ROUNDS", "HealResult", "LinkHeal", "LinkMatrix", "PairState", "unreadable"]
 
 ROUNDS = 2
+INTERRUPTED = "heal_interrupted"  # how a heal ends that a clean exit stopped between two steps (`stopping`)
 
 
 @dataclass
 class HealResult:
     """How a heal ended: `how` is `healed`, `links_stuck`, `heal_broke_pair`, `sessions_not_ready`,
-    `transfers_active` or `heal_restart_failed`; `record` goes into the injector's snapshot."""
+    `transfers_active` or `heal_restart_failed`, or `heal_interrupted` for one a clean exit stopped between two steps
+    (`stopping`, the fault gate's heal only); `record` goes into the injector's snapshot."""
 
     how: str
     record: dict[str, Any] = field(default_factory=dict)
@@ -179,13 +181,17 @@ class LinkHeal:
     def _left(self) -> float:
         return self._bound_s - (self._clock() - self._started)
 
+    def _stop_asked(self) -> bool:
+        """Whether a clean exit has asked the heal to start no further step (`stopping`); once it has, the heal ends
+        `heal_interrupted` at its next step boundary (`_end`)."""
+        if self._stopping is not None and self._stopping():
+            self._stopped = True
+        return self._stopped
+
     def _fits(self, cost: float) -> bool:
         """Whether a step whose declared bounds are `cost` seconds ends within `heal_timeout_s`, and the process is not
         exiting (`stopping`): a step under way finishes, its settle included, and none starts after the exit asked."""
-        if self._stopping is not None and self._stopping():
-            self._stopped = True
-            return False
-        return cost <= self._left()
+        return not self._stop_asked() and cost <= self._left()
 
     def _gate_within(self, service: str) -> dict[str, Any]:
         """The gate after a step, waiting at most `gate_timeout_s` and never past `heal_timeout_s`."""
@@ -197,8 +203,8 @@ class LinkHeal:
         self._actions.append({**entry, **extra, **({} if after is None else {"matrix_after": after.to_json()})})
 
     def _end(self, how: str, current: LinkMatrix, before: LinkMatrix, why: str | None = None) -> HealResult:
-        if self._stopped and how != "healed":
-            why = "the process is exiting, so the heal stopped before its next step"
+        if self._stopped and how != "healed":  # stopped at a step boundary: no step's own failure, only the exit
+            how, why = INTERRUPTED, "the process is exiting, so the heal stopped before its next step"
         tried = ", ".join(f"{a['action']} on {a['provider']} ({a['result']})" for a in self._actions) or "nothing"
         record = {
             "ok": how == "healed",
@@ -293,6 +299,8 @@ class LinkHeal:
         """One reader's link or container restart, enforced as the all-links sequence's is: no active transfer before
         it, then the settle with no fetch at all, no active transfer at its end, then its gate and a fresh matrix.
         `cost` is the step's declared bounds, checked again once the transfers are quiet."""
+        if self._stop_asked():  # before the wait for quiet transfers: an exit waits for no step that has not begun
+            return "links_stuck", before, f"the process is exiting, before the {action} on {label}"
         if not self._no_transfers("before"):
             return "transfers_active", before, f"a transfer stayed active before the {action} on {label}"
         if not self._fits(cost):
