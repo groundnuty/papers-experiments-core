@@ -154,6 +154,28 @@ the tool server, builds the injector for the target its condition declares and r
         record = await record_run(request, ...)
     record = await asyncio.to_thread(finish_instruments, record, [injector])
 
+**The token's window (O35, O06).** In that order the restore runs at `running`'s exit, while the run's sandbox and tool
+server still run, and the tool server's stop after it re-verifies the tool plane and examines the run's token, failing
+the run as `tool_plane_integrity` once it has expired (`toolserver._recheck`). The token outlives the run's ceiling by
+`[tokens] margin_s` only. The restore always runs, the provider brought back and its session gate passed, since none
+of it uses a run token, and `load_faults` refuses a margin it could outlast, with the session drain a clear that takes
+the federation itself may wait (`fault_settings.restore_token_margin_s`, `restore_drain_s`). A
+heal may take `heal_timeout_s` more, so at a heal's start, the restore's and the start's recovery's alike, the
+injector reads the steps of the run that use its tokens: the tool server's launch (to the end of that
+re-verification) and the sandbox's (from its mint to the end of its stop), which each launch counts on the run's
+admission while it runs (`admission.token_step`), its worker threads included. With a heal declared, the federation
+held exclusively, a step still running and no long margin declared, the heal is skipped: the reading records it (the
+`heal_skipped` step, or `heal_skipped` in the start's `recovered` step: the steps that ran, `margin_s` and
+`long_margin_s`), and a pair that stays stuck leaves the restore unverified (`links_stuck`, the record kept and never
+scored) or fails the start closed, the provider up and its injection open. A later start with no step of its run
+running heals it, under its own exclusive admission. **In this order that is no outage run's start**, whose launches
+run before it too, and the health gate, whose recovery never heals, holds the campaign meanwhile: a stuck pair is healed
+only by a start with no step running (an executor that starts the injector before its launches, or a bare injector
+start), by the long margin, or by hand. The long margin, `[tokens] margin_s` of at least
+`fault_settings.heal_token_margin_s` (10,854 s with the defaults), heals as before whatever still runs. An executor
+that stops its sandbox and tool server before `running`'s exit heals with the default margin. A tool server or sandbox
+the study starts itself, which no launch counts, is not seen.
+
 `running` starts the injector in a worker thread and keeps that thread's future: a cancellation cannot stop the thread,
 so on cancellation it waits for it (shielded, bounded), clears however the block ends and raises the cancellation again.
 A restore that is not verified does not raise at the block's exit: the record, built inside the block, is kept, and
@@ -203,7 +225,7 @@ from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
 from expcore_onedata.fault_recovery import RESTORED, FaultDriver, Recovery, RestoreNotVerified, digest
 from expcore_onedata.fault_serves import provider_serves
-from expcore_onedata.fault_settings import FaultSettings, compose_driver, load_faults
+from expcore_onedata.fault_settings import FaultSettings, compose_driver, heal_token_margin_s, load_faults
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 __all__ = [
@@ -240,6 +262,24 @@ def provider_outage(config: PlatformConfig, name: str, detail: str) -> InfraErro
     return InfraError(PROVIDER_OUTAGE, detail, target=config.provider_label(name))
 
 
+def heal_skipped(margin_s: float, long_margin_s: float) -> Callable[[], dict[str, Any] | None]:
+    """The question a recovery asks at a heal's start, the restore's or the start's recovery's (`LinkSettling`): why
+    the heal is skipped, the steps of the run that use its tokens and still run, with `margin_s` and `long_margin_s`,
+    when the study has not declared the long margin; None when it may run (see "The token's window"). The run's
+    admission counts the steps; none is counted without one."""
+
+    def skipped() -> dict[str, Any] | None:
+        if margin_s >= long_margin_s:
+            return None
+        held = current_admission()
+        running = held.open_steps() if held is not None else ()
+        if not running:
+            return None
+        return {"steps": list(running), "margin_s": margin_s, "long_margin_s": long_margin_s}
+
+    return skipped
+
+
 class FaultInjector:
     """The instrument that takes one provider down for a run and brings it back (see the module docstring)."""
 
@@ -270,7 +310,9 @@ class FaultInjector:
         self.target, self._service, self._driver = target, service, driver
         self._clock, self._sleep = clock, sleep
         labels = {config.provider_label(name): service for name, service in settings.services.items()}
-        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep, labels=labels)
+        # holds no reference to the injector: a dropped injector's locks go when its last reference does (no cycle)
+        heal_skip = heal_skipped(config.tokens.margin_s, heal_token_margin_s(settings))
+        self._recovery = Recovery(settings, driver, clock=clock, sleep=sleep, labels=labels, heal_skip=heal_skip)
         self._journal = self._recovery.journal
         self._gate_probe: str | None = None  # the open injection's session gate probe file (`fault_sessions`)
         self._lock: HeldLock | None = None
@@ -508,6 +550,9 @@ class FaultInjector:
         gate = record.get("gate")
         if isinstance(gate, Mapping) and gate.get("how") != "none":
             self._step("gate", gate.get("ok") is True, **{k: v for k, v in gate.items() if k != "ok"})
+        skipped = record.get("heal_skipped")
+        if isinstance(skipped, Mapping):
+            self._step("heal_skipped", False, **skipped)
         heal = record.get("heal")
         if isinstance(heal, Mapping):
             self._step("heal", heal.get("ok") is True, **{k: v for k, v in heal.items() if k != "ok"})
@@ -784,8 +829,10 @@ class FaultInjector:
 
         Declared limits. A restore that holds no admission waits for the federation (and for a drain still standing)
         inside `admission_timeout_s`, which `cancel_wait_s` does not count: inside `running` the run's or the injector's
-        own admission is always held, so only a later retry of `clear` or `finish` takes that branch. The holder record
-        of an admission taken for a restore names this injector's own target, not the one recovered.
+        own admission is always held, so only a later retry of `clear` or `finish` takes that branch. The least token
+        margin counts the drain record that branch waits out before it restores, and the drain `_drain` waits after it
+        (`fault_settings.restore_drain_s`); the wait for the lock itself it does not. The holder record of an admission
+        taken for a restore names this injector's own target, not the one recovered.
         """
         if self._settings.session_drain_s <= 0:
             yield None, False, None

@@ -83,18 +83,45 @@ closed, for an operator to decide, and no container is restarted; its least `hea
 restart (2,220 s for four providers, 2,730 s for five, with the other defaults). `"link_then_container"` with it false
 is refused. **Both durations are provisional,** to be tuned as live heals are measured.
 
-**A declared heal needs a token margin that outlives it.** The heal runs inside the outage run's attempt, at the
-injector's restore, which the executor's pattern places inside the tool server's launch (`faults.py`, "Use"): after
-the restore come the collection, `finish_instruments` and the tool server's stop, whose re-verification of the tool
-plane examines the run's token and fails the run as `tool_plane_integrity` once it has expired
-(`toolserver._recheck`). A run's token outlives its whole-time ceiling by `[tokens] margin_s` at least, counted from
-its mint, before the agent's loop and the injector's start. So a declared heal is refused at load unless `margin_s` is
-at least `heal_token_margin_s`: the base margin a platform without a heal relies on (`TOKEN_MARGIN_BASE_S`, the
-default 900 s, a heuristic for the start and the teardown, never a worst case of the restore) plus two heals of
-`heal_timeout_s`, one in the run's own restore and one in its start, which recovers and may heal an injection an
-earlier run left (as the injector's `cancel_wait_s` counts), and one session drain of `session_drain_s`, which that
-start waits out after it restored a provider an earlier run left down (`FaultInjector._wait_owed`). With the defaults
-(4,200 s and 320 s) that is 9,620 s.
+**The restore must fit the run's token margin.** The restore runs inside the outage run's attempt, at the injector's
+`running` exit, which the executor's pattern places inside the tool server's launch (`faults.py`, "Use"): after the
+restore come the collection, `finish_instruments` and the tool server's stop, whose re-verification of the tool plane
+examines the run's token and fails the run as `tool_plane_integrity` once it has expired (`toolserver._recheck`). A
+run's token outlives its whole-time ceiling by `[tokens] margin_s` only, counted from its mint. The restore always runs
+(its container start and its session gate use no run token), and a token's lifetime is the study's choice, declared
+and never implied, so a platform.toml with `[faults]` is refused at load, heal declared or not, unless it declares
+`[tokens] margin_s` and that is at least `restore_token_margin_s`: a missing margin and a short one are refused alike,
+naming the least, its derivation term by term (`restore_margin_derivation`) and the line to write, and no default is
+derived. The least is the restore's bound (`restore_bound_s`: a stop of unknown outcome waited out,
+`settle_timeout_s`; `clear_attempts` starts, each with its command and its wait for the new identity,
+`command_timeout_s` and `settle_timeout_s`, and a pause between two; the wait to serve, `ready_timeout_s`; each of
+those waits one pause, `poll_s`, past its bound, which it checks only after a reading; and the session gate,
+`gate_timeout_s`), 1,514 s with the defaults, plus `TOKEN_SLACK_S`, 300 s, for what that bound does not hold (the
+readings' own time, the injector's start after the mint, the link check after the gate, the steps before the tool
+server's check), plus the session drain a clear may wait (`restore_drain_s`), rounded up to a whole second: 2,134 s
+with the defaults, above the 900 s a platform without `[faults]` still gets when it declares nothing. The drain is
+counted because the injector can always hold an exclusive admission of its own, whatever its run holds: a clear that
+finds none held takes one (`FaultInjector._restoring`), and that wait passes a drain record still standing
+(`federation.drain`), at most `session_drain_s` after the release that wrote it, before it restores; and an injector
+that holds an admission of its own, taken at its start or for the clear, waits out its own drain before it lets go
+(`FaultInjector._drain`). That drain runs from the restore's start, so only what outlasts the restore's bound is added
+(nothing with the defaults). `session_drain_s = 0` adds nothing: a clear then takes no admission and waits for no
+drain. Not counted: a start's recovery of an injection an earlier run left, which the health gate settles before a run
+is dispatched; a start's waits for the federation (its admission, the drain record and the drain a recovery owes,
+`FaultInjector._wait_owed`), which a run's admission has passed before its attempt starts (`FederationLock.held`); in
+the clear's own admission, the wait for the lock itself and a drain record another holder raises during it, bounded by
+`admission_timeout_s` and brief while an injection is open (a shared admission refuses an unsettled journal, and
+another outage run's start fails on a target a live injector holds); a second restore, when `finish` retries a clear
+that failed at `running`'s exit; and the session drain of the run's own admission, which it publishes after the
+post-run check.
+
+**A heal is skipped while a step of the run that uses its tokens runs.** A heal may take `heal_timeout_s` more, so at
+its start the injector reads the steps of the run that use its tokens (the tool server's launch and the sandbox's,
+counted on the run's admission) and skips the heal while one still runs (`faults.py`, "The token's window"), unless the
+study declares the long margin: `margin_s` of at least `heal_token_margin_s`, the restore's margin above, two heals of
+`heal_timeout_s` (the restore's and the start's recovery's, as the injector's `cancel_wait_s` counts them) and one
+session drain of `session_drain_s`, which that start waits out after it restored a provider an earlier run left down
+(`FaultInjector._wait_owed`): 10,854 s with the defaults. A heal is never refused at load for the margin.
 
 **A declared heal needs a campaign `max_defer_s` that outlives it.** While the fault gate heals, every check answers the
 uncharged deferral, for up to `heal_timeout_s` plus `heal_settle_s` from the heal's start (`heal_wait_s`), and after an
@@ -135,7 +162,7 @@ from typing import Any
 
 from expcore.config.loading import Section, load_toml
 from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
-from expcore_onedata.config import PlatformConfig, TokenSettings
+from expcore_onedata.config import PlatformConfig
 
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # A Compose project name as Compose accepts it. Required, because Compose would otherwise take the name from the
@@ -149,7 +176,7 @@ DEFAULT_GATE_TIMEOUT_S = 240.0  # a peer session's renewal backs off to 180 s (i
 DEFAULT_HEAL_TIMEOUT_S = 4200.0  # provisional: four providers' all-links sequence and one container restart fit it
 DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measurement tunes it
 DEFAULT_SESSION_DRAIN_S = 320.0  # op-worker's 300 s mount-session grace, 15 s for a removal that retries, a margin
-TOKEN_MARGIN_BASE_S = TokenSettings().margin_s  # the token margin a platform without a heal relies on: the default
+TOKEN_SLACK_S = 300.0  # what the token margin keeps beyond the restore's bound: the start, the link check, the teardown
 HEAL_MODES = ("off", "all_links", "link_then_container", "link")
 _KEYS = (
     "sanctioned",
@@ -283,25 +310,126 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             "heal_timeout_s",
             f'must be at least {least:g} for heal = "{heal}": one round of its actions at their declared bounds',
         )
-    margin, needed = config.tokens.margin_s, heal_token_margin_s(settings)
-    if margin < needed:
-        raise table.fail(
-            "heal",
-            f'= "{heal}" needs [tokens] margin_s of at least {needed:g} s, not {margin:g} s: the base '
-            f"{TOKEN_MARGIN_BASE_S:g} s, two heals of heal_timeout_s ({settings.heal_timeout_s:g} s), the restore's "
-            f"and the start's recovery's, and the start's session_drain_s ({settings.session_drain_s:g} s), since the "
-            "tool server's stop examines the run's token after the restore",
-        )
+    _require_token_margin(table, load_toml(file), settings)
     return settings
 
 
+def _require_token_margin(table: Section, document: Mapping[str, Any], settings: FaultSettings) -> None:
+    """Refuse a platform with `[faults]` whose `[tokens] margin_s` is not declared, or is below the least the restore,
+    its gate and the session drain need (`restore_token_margin_s`); the refusal names the least, its derivation and the
+    line to write. A token's lifetime is the study's choice: none is derived for it (see the module docstring)."""
+    tokens = document.get("tokens")
+    declared = tokens.get("margin_s") if isinstance(tokens, Mapping) else None
+    needed = restore_token_margin_s(settings)
+    least = math.ceil(needed)  # margin_s is a whole number of seconds: an integer, written out in full
+    what = "the restore, its gate and the session drain" if settings.session_drain_s > 0 else "the restore and its gate"
+    why = f"the least is {least} s, {what} before the tool server's stop examines the run's token: "
+    how = f"{restore_margin_derivation(settings)}, so"
+    if declared is None:
+        raise table.fail(
+            None,
+            f"[tokens] margin_s is not declared, and a platform with [faults] must declare it: {why}{how} add: "
+            f"[tokens] margin_s = {least}",
+        )
+    if declared < needed:
+        raise table.fail(
+            None, f"[tokens] margin_s = {_seconds(declared)} is too small: {why}{how} set: [tokens] margin_s = {least}"
+        )
+
+
+def _seconds(value: float) -> str:
+    """A number of seconds written in full, never in exponent form or rounded: a whole number as an integer, any other
+    as Python writes it exactly."""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else repr(number)
+
+
+def _bound_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
+    """The terms of `restore_bound_s`, each with its declared values in words."""
+    s, attempts, n = settings, settings.clear_attempts, _seconds
+    identity_wait = s.settle_timeout_s + s.poll_s
+    return (
+        (f"a stop of unknown outcome waited out (settle_timeout_s {n(s.settle_timeout_s)} s + poll_s {n(s.poll_s)} s)",
+         identity_wait),
+        (f"{attempts} starts each with its wait ({attempts} x (command_timeout_s {n(s.command_timeout_s)} s + "
+         f"settle_timeout_s {n(s.settle_timeout_s)} s + poll_s {n(s.poll_s)} s))",
+         attempts * (s.command_timeout_s + identity_wait)),
+        (f"{attempts - 1} pause(s) between them ({attempts - 1} x poll_s {n(s.poll_s)} s)", (attempts - 1) * s.poll_s),
+        (f"the wait to serve (ready_timeout_s {n(s.ready_timeout_s)} s + poll_s {n(s.poll_s)} s)",
+         s.ready_timeout_s + s.poll_s),
+        (f"the session gate (gate_timeout_s {n(s.gate_timeout_s)} s)", s.gate_timeout_s),
+    )  # fmt: skip
+
+
+def _drain_terms(settings: FaultSettings, bound: float) -> tuple[tuple[str, float], ...]:
+    """The terms of `restore_drain_s`, each with its declared values in words; none with `session_drain_s` 0. `bound`
+    is the restore's (`restore_bound_s`)."""
+    drain, n = settings.session_drain_s, _seconds
+    if drain <= 0:
+        return ()
+    terms = [
+        (f"a drain record still standing, which a clear that takes the federation itself waits out before it "
+         f"restores (session_drain_s {n(drain)} s)", drain),
+    ]  # fmt: skip
+    if drain > bound:  # its own drain runs from the restore's start: only what outlasts the restore's bound is added
+        past = f"its own drain past the restore's bound (session_drain_s {n(drain)} s - {n(bound)} s)"
+        terms.append((past, drain - bound))
+    return tuple(terms)
+
+
+def _restore_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
+    """The terms of `restore_token_margin_s`, each with its declared values in words: the restore's bound, the slack and
+    the session drain."""
+    bound = _bound_terms(settings)
+    drain = _drain_terms(settings, sum(value for _, value in bound))
+    return (*bound, (f"slack {_seconds(TOKEN_SLACK_S)} s", TOKEN_SLACK_S), *drain)
+
+
+def restore_margin_derivation(settings: FaultSettings) -> str:
+    """`restore_token_margin_s` term by term, in words and then as a sum, every number in full: what a refusal at load
+    spells out."""
+    terms = _restore_terms(settings)
+    words = " + ".join(word for word, _ in terms)
+    total = sum(value for _, value in terms)
+    return f"{words}: {' + '.join(_seconds(value) for _, value in terms)} = {_seconds(total)}"
+
+
+def restore_bound_s(settings: FaultSettings) -> float:
+    """The longest the run's own restore may take without a heal, by its declared bounds and its pauses: a stop of
+    unknown outcome waited out (`settle_timeout_s`), `clear_attempts` starts, each with its command and its wait for
+    the new identity (`command_timeout_s` and `settle_timeout_s`) and a pause between two (`poll_s`), the wait to
+    serve (`ready_timeout_s`), each of those waits one pause (`poll_s`) past its bound, since it checks the bound only
+    after a reading, and the session gate (`gate_timeout_s`, whose pauses end at its bound). 1,514 s with the
+    defaults. A reading's own time and the link check after the gate are the slack's (`TOKEN_SLACK_S`)."""
+    return sum(value for _, value in _bound_terms(settings))
+
+
+def restore_drain_s(settings: FaultSettings) -> float:
+    """What the session drain adds to the restore's bound when the injector holds an exclusive admission of its own,
+    which it can always do (see the module docstring): a clear that holds no exclusive admission takes one
+    (`FaultInjector._restoring`), and that wait passes a drain record still standing (`federation.drain`), at most
+    `session_drain_s` after the release that wrote it, before anything is restored; and an injector that holds an
+    admission of its own, taken at its start or for the clear, waits out its own drain before it lets go
+    (`FaultInjector._drain`), which runs from the restore's start, so only what outlasts the restore's bound is added.
+    320 s with the defaults; 0 with `session_drain_s` 0, which takes no admission for a clear and waits for none."""
+    return sum(value for _, value in _drain_terms(settings, restore_bound_s(settings)))
+
+
+def restore_token_margin_s(settings: FaultSettings) -> float:
+    """The least `[tokens] margin_s` of a platform with `[faults]`, which must declare it and is refused at load below
+    it: the restore's bound, `TOKEN_SLACK_S` and the session drain a clear may wait (`restore_drain_s`; see the module
+    docstring). 2,134 s with the defaults."""
+    return restore_bound_s(settings) + TOKEN_SLACK_S + restore_drain_s(settings)
+
+
 def heal_token_margin_s(settings: FaultSettings) -> float:
-    """The least `[tokens] margin_s` the declared heal needs, so the run's token outlives its heals and the tool
-    server's stop after them (see the module docstring): the base margin, two heals of `heal_timeout_s` and one
-    session drain of `session_drain_s`; 0 with the heal off, which asks nothing of the margin."""
+    """The long token margin: the least `[tokens] margin_s` with which the injector heals while a step of the run that
+    uses its tokens still runs (see the module docstring): the restore's margin, two heals of `heal_timeout_s` and one
+    session drain of `session_drain_s`, 10,854 s with the defaults; 0 with the heal off, which asks nothing of the
+    margin."""
     if settings.heal == "off":
         return 0.0
-    return TOKEN_MARGIN_BASE_S + 2 * settings.heal_timeout_s + settings.session_drain_s
+    return restore_token_margin_s(settings) + 2 * settings.heal_timeout_s + settings.session_drain_s
 
 
 def heal_wait_s(settings: FaultSettings) -> float:

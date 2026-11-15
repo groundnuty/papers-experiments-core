@@ -17,7 +17,6 @@ from functools import partial
 
 import pytest
 from fault_support import FakeServices, faults_table
-from heal_support import heal_margin_s
 from scheduler_support import build, settings_for
 
 from expcore.config.loading import ConfigError
@@ -37,6 +36,8 @@ CORE = settings_for(**POLL)
 # and a recheck and the check after it; without one only the pair after the heal (the first deferral is then the
 # heal's own start).
 BETWEEN = CORE.recheck_s + CORE.poll_interval_s  # 31 s
+# the least `[tokens] margin_s` at the default restore bounds (`restore_token_margin_s`): no fixture here exceeds them
+RESTORE_MARGIN_S = 2134
 AFTER_A_DRAIN = 2 * BETWEEN + 2 * CORE.health_timeout_s  # 182 s
 WITHOUT_A_DRAIN = BETWEEN + CORE.health_timeout_s  # 91 s
 
@@ -44,22 +45,22 @@ WITHOUT_A_DRAIN = BETWEEN + CORE.health_timeout_s  # 91 s
 def five_providers(data, **faults):
     """Five providers, each with a service, at the designed bounds of a restore's waits; the heal's bound is declared
     (the least five providers' `"all_links"` with a container fallback needs at these bounds, 4,290 s), so no default
-    moves the figures, and the token margin is the one a declared heal needs at load."""
+    moves the figures, and the token margin is the least these restore bounds need at load."""
     for name, index in (("gamma", 3), ("delta", 4), ("epsilon", 5)):
         data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
     designed = {"settle_timeout_s": 180, "ready_timeout_s": 180, "heal_timeout_s": 4290, "session_drain_s": 320}
     data["faults"] = faults_table(**{"services": dict(FIVE_STORES), **designed, **faults})
-    data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
+    data["tokens"] = {**data.get("tokens", {}), "margin_s": RESTORE_MARGIN_S}
 
 
 def four_providers(data, **faults):
     """Four providers at the defaults of the heal: the 4,200 s and 320 s a declared heal gets with no other word, and
-    the token margin it needs."""
+    the token margin its restore bounds need."""
     for name, index in (("gamma", 3), ("delta", 4)):
         data["providers"][name] = {"url": f"https://{name}.test", "id": f"pr-{name}-{index}"}
     stores = {name: f"store-{name}" for name in FIVE[:4]}
     data["faults"] = faults_table(**{"services": stores, "heal": "all_links", "session_drain_s": 320, **faults})
-    data["tokens"] = {**data.get("tokens", {}), "margin_s": heal_margin_s(data["faults"])}
+    data["tokens"] = {**data.get("tokens", {}), "margin_s": RESTORE_MARGIN_S}
 
 
 def platform_check(tmp_path, fake, edit):
