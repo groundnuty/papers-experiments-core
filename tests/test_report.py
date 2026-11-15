@@ -1457,3 +1457,50 @@ def test_s18_a_result_whose_equivalence_families_disagree_with_its_decisions_is_
         render(bad)
     with pytest.raises(ValueError, match=message):
         summary_lines(bad)
+
+
+# Three claims each adjusted alone (at alpha / 1: adjusted p = raw p, 0.03 and 0.04 rejected), filed as one family of
+# three. Holm over the three gives levels 0.01667, 0.025, 0.05 and adjusted p 3 x 0.03 = 0.09, max(0.09, 2 x 0.04) =
+# 0.09, 0.30: none rejected, so a report showing these steps would show two claims equivalent that are not.
+ALONE_STEPS = (
+    HolmStep(1, "h1a", 0.03, 0.03, 0.05, True),
+    HolmStep(2, "h2a", 0.04, 0.04, 0.05, True),
+    HolmStep(3, "h1b", 0.30, 0.30, 0.05, False),
+)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda r: declared(families_analysis(), steps=ALONE_STEPS), "'h1a': its step in equivalence family 'h1' is"),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, equivalent=False, conclusion="not_detected") if c.name == "h2a" else c
+                    for c in r.contrasts
+                ),
+            ),
+            "'h2a': its TOST p, Holm TOST p, verdict or interval level is not its step's in equivalence family 'h1'",
+        ),
+        (
+            lambda r: dataclasses.replace(
+                r,
+                contrasts=tuple(
+                    dataclasses.replace(c, equivalence_level=0.9) if c.name == "h1a" else c for c in r.contrasts
+                ),
+            ),
+            "'h1a': its TOST p, Holm TOST p, verdict or interval level is not its step's",
+        ),
+    ],
+    ids=["adjusted-alone-shown-as-a-family-of-three", "claim-verdict", "claim-level"],
+)
+def test_s18_a_family_whose_steps_are_not_holm_over_its_own_claims_is_refused(change, message):
+    """S18: each family's steps are recomputed from its own claims' raw TOST p-values at alpha, and each claim's
+    numbers must be its step's; decisions made at another family size, or a claim showing another verdict or level,
+    are refused by the report and the summary."""
+    bad = change(declared(families_analysis()))
+    with pytest.raises(ValueError, match=message):
+        render(bad)
+    with pytest.raises(ValueError, match=message):
+        summary_lines(bad)

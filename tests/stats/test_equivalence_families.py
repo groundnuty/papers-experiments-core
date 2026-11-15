@@ -15,6 +15,7 @@ import pytest
 
 from expcore.campaign.factors import FactorSchema
 from expcore.config.loading import ConfigError
+from expcore.report import render_report, summary_lines
 from expcore.stats import estimators
 from expcore.stats.analysis import EquivalenceFamily, HolmStep, analyse, equivalence_feasibility
 from expcore.stats.estimators import EstimatorResult
@@ -375,6 +376,34 @@ def test_s18_without_the_table_analysis_json_has_no_equivalence_families_key(pla
     data = json.loads(_json_text(_holm_entries(result)))
     assert list(data) == ["holm", "holm_families"]
     assert [len(f["equivalence"]) for f in data["holm_families"]] == [3, 3, 3, 3]
+
+
+EXPORT = {  # the least export the report reads: no run, so only the contrasts' sections carry anything
+    "planned_runs": 0,
+    "exhausted_runs": [],
+    "unfinished_runs": [],
+    "analysed_attempts": [],
+    "infrastructure_by_condition": [],
+    "retries_by_kind": [],
+    "budget_holds": [],
+}
+
+
+@pytest.mark.parametrize("holm", [FOUR_BY_THREE, FLAT_HOLM], ids=["named-holm-families", "flat-holm-family"])
+def test_s18_the_report_accepts_what_the_analysis_made_and_shows_alpha_over_12_first(planted, holm):
+    """S18: the report's checks recompute each family's Holm over its own claims and accept the analysis's own
+    result, untestable claim included, under named and flat Holm families: the first TOST step is at alpha/12."""
+    rows = rows_with_tost(TOST_P)
+    for row in rows:
+        row.outcomes["h4c"] = None
+    result = analyse(rows, parsed(prereg_text(holm)))
+    code = {"commit": "c" * 40, "tree_sha256": "d" * 64, "dirty": False, "why": None}
+    report = render_report(result, EXPORT, study="a-study", code=code, core_version="1.2.3")
+    steps = report.split("TOST steps of equivalence family h1:", 1)[1]
+    assert "| 1 | h1a | 0.0010 | 0.004167 (alpha/12) | 0.0120 | yes |" in steps
+    assert "| 5 | h1b | 0.0120 | 0.00625 (alpha/8) | 0.0960 | no |" in steps
+    lines = {line.split(":")[0]: line for line in summary_lines(result)}
+    assert lines["h1a"].endswith("Holm TOST p 0.0120 (equivalence family h1)")
 
 
 def test_s18_the_equivalence_family_type_holds_name_members_and_steps():

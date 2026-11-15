@@ -13,7 +13,15 @@ over its claims' TOST p-values are shown by `equivalence_steps_lines`; without t
 
 from collections.abc import Callable, Sequence
 
-from expcore.stats.analysis import AnalysisResult, EquivalenceFamily, HolmDecision, HolmFamily, HolmStep
+from expcore.stats.analysis import (
+    AnalysisResult,
+    ContrastResult,
+    EquivalenceFamily,
+    HolmDecision,
+    HolmFamily,
+    HolmStep,
+)
+from expcore.stats.contrasts import holm
 
 Table = Callable[[Sequence[str], Sequence[Sequence[object]]], list[str]]
 Format = Callable[[float | None], str]
@@ -91,9 +99,10 @@ def _check_equivalence(result: AnalysisResult, family_of: dict[str, str]) -> Non
 def check_equivalence_families(result: AnalysisResult) -> dict[str, str]:
     """Each equivalence claim's declared equivalence family, by contrast name (S18); refuse a result whose families
     and equivalence decisions disagree: a claim with two decisions, in no family or in two, a step whose numbers are
-    not its claim's decision in `equivalence_holm`, a family member that is not an equivalence claim, or a Holm family
-    holding an equivalence decision, which would show a claim adjusted in another family than its own. A result with
-    no declared equivalence family has nothing to check."""
+    not its claim's decision in `equivalence_holm`, a family member that is not an equivalence claim, a family whose
+    steps are not Holm's over its own claims' raw TOST p-values at alpha, a claim whose numbers are not its step's,
+    or a Holm family holding an equivalence decision, which would show a claim adjusted in another family than its
+    own. A result with no declared equivalence family has nothing to check."""
     if not result.equivalence_families:
         return {}
     claims = _unique(result.equivalence_holm, "equivalence decisions")
@@ -124,6 +133,11 @@ def check_equivalence_families(result: AnalysisResult) -> dict[str, str]:
             f"contrast {unflagged[0]!r} is in equivalence family {family_of[unflagged[0]]!r} but is not an "
             "equivalence claim"
         )
+    by_name = {r.name: r for r in result.contrasts}
+    for family in result.equivalence_families:
+        _check_holm_over_own_claims(family, result.alpha)
+        for step in family.steps:
+            _check_claim(by_name[step.name], step, family.name)
     holding = [family.name for family in result.holm_families if family.equivalence]
     if holding:
         raise ValueError(
@@ -131,6 +145,35 @@ def check_equivalence_families(result: AnalysisResult) -> dict[str, str]:
             "equivalence families, apart from every Holm family"
         )
     return family_of
+
+
+def _check_holm_over_own_claims(family: EquivalenceFamily, alpha: float) -> None:
+    """Refuse a declared family whose steps are not Holm's over its own claims' raw TOST p-values at alpha (S18):
+    decisions made at another family's size, or in another order, would show a claim adjusted in a family other than
+    its own. Holm is recomputed by the kernel the analysis uses, over the members in declared order, so a result the
+    analysis made agrees to the last bit."""
+    by_step = {step.name: step for step in family.steps}
+    outcome = holm([by_step[name].p_value for name in family.members], alpha)
+    order = sorted(range(len(family.members)), key=lambda i: outcome.levels[i])
+    for number, i in enumerate(order, start=1):
+        step = by_step[family.members[i]]
+        expected = (number, outcome.levels[i], outcome.adjusted[i], outcome.reject[i])
+        if not _same((step.step, step.level, step.p_holm, step.reject), expected):
+            raise ValueError(
+                f"contrast {step.name!r}: its step in equivalence family {family.name!r} is not Holm's over the "
+                f"family's own {len(family.members)} claims at alpha {alpha:g}"
+            )
+
+
+def _check_claim(result: ContrastResult, step: HolmStep, family: str) -> None:
+    """Refuse a claim whose TOST p, Holm TOST p, verdict or interval level (1 - 2 x its step's level) is not its
+    step's in its equivalence family (S18), which the report's table would then contradict."""
+    shown = (result.tost_p, result.tost_p_holm, result.equivalent, result.equivalence_level)
+    if not _same(shown, (step.p_value, step.p_holm, step.reject, 1 - 2 * step.level)):
+        raise ValueError(
+            f"contrast {result.name!r}: its TOST p, Holm TOST p, verdict or interval level is not its step's in "
+            f"equivalence family {family!r}"
+        )
 
 
 def _numbers(decision: HolmStep | HolmDecision) -> tuple[float, float, float, bool]:
