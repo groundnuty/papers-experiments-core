@@ -62,7 +62,7 @@ step: the provider by label (`all` for the transfer readings and the all-pairs c
 them, the settle, the gate's reading and the matrix after it. Nothing a command printed is kept.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -99,12 +99,15 @@ class LinkHeal:
     """One heal of a restore's stuck links (see the module docstring).
 
     `services` maps a provider's label to its service, and `restored` is the label of the provider the restore brought
-    back. `matrix()` reads every pair; `gate(service, timeout_s)` passes the session gate for a provider and returns its
-    reading (`ok` among its keys); `transfers()` counts the active transfer listings (None when it cannot know);
-    `restart_container(label, service, budget_s)` restarts a reader's container, verified, its waits ending within
-    `budget_s` (`ok`, `how`, `serves_after_s`).
+    back (None for the fault gate's heal, which follows no restore). `matrix()` reads every pair; `gate(service,
+    timeout_s)` passes the session gate for a provider and returns its reading (`ok` among its keys); `transfers()`
+    counts the active transfer listings (None when it cannot know); `restart_container(label, service, budget_s)`
+    restarts a reader's container, verified, its waits ending within `budget_s` (`ok`, `how`, `serves_after_s`).
     `command_s` bounds one driver command, `settle_s` is the settle, and `link_s`, `all_links_s` and `container_s` are
-    the declared bounds of a ping with a link restart, of the whole all-links sequence and of a container restart."""
+    the declared bounds of a ping with a link restart, of the whole all-links sequence and of a container restart.
+    `sources_seen`, when given, are providers whose container is never restarted (the sources of the stuck pairs the
+    fault gate's check found), and the source of every failing pair of every matrix the heal reads joins them, so a
+    provider that was ever the source of a failing pair is never restarted, even once that pair passes."""
 
     def __init__(
         self,
@@ -112,7 +115,7 @@ class LinkHeal:
         mode: str,
         driver: Any,
         services: Mapping[str, str],
-        restored: str,
+        restored: str | None,
         bound_s: float,
         gate_s: float,
         poll_s: float,
@@ -130,8 +133,12 @@ class LinkHeal:
         container_fallback: bool = True,
         sleep: Callable[[float], None],
         utc: Callable[[], str] = _utc,
+        sources_seen: Iterable[str] | None = None,
     ) -> None:
         self._mode, self._driver, self._services, self._restored = mode, driver, dict(services), restored
+        self._kept = (
+            None if sources_seen is None else set(sources_seen)
+        )  # never restarted: ever a failing pair's source
         self._fallback = container_fallback  # whether all_links may restart a stuck reader's container
         self._bound_s, self._gate_s, self._poll_s, self._settle_s = bound_s, gate_s, poll_s, settle_s
         self._link_cost, self._restart_cost = link_s, link_s - 2 * command_s  # what is left once a ping is done
@@ -151,9 +158,12 @@ class LinkHeal:
 
     def _read(self) -> LinkMatrix:
         try:
-            return self._matrix()
+            matrix = self._matrix()
         except Exception as error:  # a check that cannot answer is a failed one, never a pass
             return unreadable(error)
+        if self._kept is not None:
+            self._kept |= matrix.sources()
+        return matrix
 
     def _left(self) -> float:
         return self._bound_s - (self._clock() - self._started)
@@ -367,6 +377,10 @@ class LinkHeal:
             self._restarted.add(label)  # one container restart per provider per restore, or none
             if label == self._restored:
                 self._skipped.append({"provider": label, "why": "the restored provider's container is not restarted"})
+                return None, current, ""
+            if self._kept is not None and label in self._kept:
+                why = "a provider that was the source of a failing pair is never restarted"
+                self._skipped.append({"provider": label, "why": why})
                 return None, current, ""
             if not self._fits(self._container_cost):
                 return "links_stuck", current, "heal_timeout_s leaves no time for a container restart"

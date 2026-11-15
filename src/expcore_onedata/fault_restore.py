@@ -27,7 +27,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from expcore_onedata.compose import DriverError, Observation
-from expcore_onedata.fault_heal import LinkHeal
+from expcore_onedata.fault_heal import HealResult, LinkHeal
 from expcore_onedata.fault_journal import InjectionJournal, holder
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import await_sessions
@@ -150,6 +150,40 @@ class LinkSettling:
 
     def _heal(self, entry: Mapping[str, Any], service: str, gate_probe: str | None, matrix: LinkMatrix) -> str:
         """Run the heal, record it, and clear or fail the container restarts it made; return how it ended."""
+
+        def hold(seconds: float) -> None:
+            self.hold(seconds, str(entry["id"]))  # journalled on the healed injection, for every process to wait out
+
+        result, latest, children = self._run_heal(service, str(entry["target"]), gate_probe, hold, matrix)
+        self.restore_record["heal"] = {**result.record, "first": matrix.to_json()}
+        self._close_children(result, children)
+        self.links_detail = None if result.healed else unhealed_detail(result.record, latest, self.links_detail)
+        return result.how
+
+    def heal_stuck(
+        self, service: str, first: LinkMatrix, *, hold: Callable[[float], None], gate_probe: str | None
+    ) -> tuple[HealResult, LinkMatrix]:
+        """The fault gate's heal of the stuck pairs its own link check found (`first`), with no injection open and no
+        restored provider (`expcore_onedata.fault_gate_heal`): the same heal, its bounds, settle and fallback, by the
+        caller's `hold`, never restarting the container of a provider that was ever the source of a failing pair.
+        `service` is any declared service, which the driver's link check takes. The container restarts it made are
+        cleared when every pair passes, else left open, journalled `clear_failed`. Return how it ended and the latest
+        link check that answered."""
+        result, latest, children = self._run_heal(service, None, gate_probe, hold, first, sources=first.sources())
+        self._close_children(result, children)
+        return result, latest
+
+    def _run_heal(
+        self,
+        service: str,
+        restored: str | None,
+        gate_probe: str | None,
+        hold: Callable[[float], None],
+        first: LinkMatrix,
+        sources: set[str] | None = None,
+    ) -> tuple[HealResult, LinkMatrix, list[str]]:
+        """Run one heal (`fault_heal.LinkHeal`); return how it ended, the latest link check that answered (`first`, or
+        the heal's last that did) and the journal ids of the container restarts it made."""
         settings, children = self._settings, []
 
         def restart(label: str, reader: str, budget_s: float) -> dict[str, Any]:
@@ -158,7 +192,7 @@ class LinkSettling:
                 children.append(done["entry"])
             return done
 
-        answered = [matrix]  # the latest link check that answered: the restore's own, then each of the heal's
+        answered = [first]  # the latest link check that answered: the caller's own, then each of the heal's
 
         def read() -> LinkMatrix:
             latest = self._matrix(service)  # one that cannot be read raises, and the heal reads it as unreadable
@@ -169,7 +203,7 @@ class LinkSettling:
             mode=settings.heal,
             driver=self._driver,
             services=self._labels,
-            restored=str(entry["target"]),
+            restored=restored,
             bound_s=settings.heal_timeout_s,
             gate_s=settings.gate_timeout_s,
             poll_s=settings.poll_s,
@@ -182,17 +216,20 @@ class LinkSettling:
             gate=lambda reader, timeout_s: self._gate(reader, gate_probe, timeout_s),
             transfers=self._active_transfers,
             restart_container=restart,
-            hold=lambda seconds: self.hold(seconds, str(entry["id"])),
+            hold=hold,
             container_fallback=settings.heal_container_fallback,
             clock=self._clock,
             sleep=self._sleep,
+            sources_seen=sources,
         ).run()
-        self.restore_record["heal"] = {**result.record, "first": matrix.to_json()}
-        for child in children:  # a restarted reader is restored only with every pair passing
+        return result, answered[-1], children
+
+    def _close_children(self, result: HealResult, children: list[str]) -> None:
+        """A restarted reader is restored only with every pair passing: cleared then, else journalled `clear_failed`
+        with the heal's word and left open for recovery."""
+        for child in children:
             line = {"event": "cleared", "how": "restored"} if result.healed else {"event": "clear_failed"}
             self.journal.append({**line, "id": child, **({} if result.healed else {"how": result.how})})
-        self.links_detail = None if result.healed else unhealed_detail(result.record, answered[-1], self.links_detail)
-        return result.how
 
     def _active_transfers(self) -> int | None:
         """The driver's count of transfer listings with a job not yet ended; None for a driver that cannot tell."""

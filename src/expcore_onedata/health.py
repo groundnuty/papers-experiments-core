@@ -153,17 +153,24 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
 
 
 def _fault_gate(
-    config: PlatformConfig, client: OnezoneClient, driver: FaultDriver | None, inner: HealthCheck
+    config: PlatformConfig,
+    client: OnezoneClient,
+    driver: FaultDriver | None,
+    inner: HealthCheck,
+    links: Callable[[], LinkReport | None],
 ) -> FaultGate | None:
     """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
     not valid raises ConfigError here, so a platform with an injector never runs without the gate. The Compose driver
-    it recovers through finds a restored provider serving by reading through the check's own client."""
+    it recovers through finds a restored provider serving by reading through the check's own client. `links` is the
+    check's latest link report and the providers' services are those of `[faults.services]`, by label, so the gate
+    heals the stuck pairs its own link check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
     settings = fault_settings_of(config)
     if settings is None:
         return None
     if driver is None:
         driver = compose_driver(settings, probe=provider_serves(config, settings, client))
-    return FaultGate(settings, driver, inner)
+    labels = {config.provider_label(name): service for name, service in settings.services.items()}
+    return FaultGate(settings, driver, inner, labels=labels, links=links)
 
 
 class PlatformHealth:
@@ -200,7 +207,14 @@ class PlatformHealth:
         # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
         # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
         self._gate = PreCampaignHealth(self._regular, self._measure)
-        self._faults = _fault_gate(config, client, fault_driver, self._gate)  # outermost: it holds the federation
+        # outermost: it holds the federation, and heals the stuck pairs the link check finds (`fault_gate_heal`)
+        self._faults = _fault_gate(config, client, fault_driver, self._gate, lambda: self._links)
+
+    @property
+    def gate_heal(self) -> dict | None:
+        """The record of the latest heal of stuck pairs the fault gate ran (`fault_gate_heal`), None before one or
+        without `[faults]`."""
+        return None if self._faults is None else self._faults.last_heal
 
     @property
     def content_type(self) -> ContentTypeVerdict | None:
