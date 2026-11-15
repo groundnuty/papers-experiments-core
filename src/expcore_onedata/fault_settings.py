@@ -281,45 +281,53 @@ def _require_token_margin(table: Section, document: Mapping[str, Any], settings:
     tokens = document.get("tokens")
     declared = tokens.get("margin_s") if isinstance(tokens, Mapping) else None
     needed = restore_token_margin_s(settings)
-    least = math.ceil(needed)  # margin_s is a whole number of seconds
-    why = f"the least is {least:g} s, the restore and its gate before the tool server's stop examines the run's token: "
+    least = math.ceil(needed)  # margin_s is a whole number of seconds: an integer, written out in full
+    why = f"the least is {least} s, the restore and its gate before the tool server's stop examines the run's token: "
     how = f"{restore_margin_derivation(settings)}, so"
     if declared is None:
         raise table.fail(
             None,
             f"[tokens] margin_s is not declared, and a platform with [faults] must declare it: {why}{how} add: "
-            f"[tokens] margin_s = {least:g}",
+            f"[tokens] margin_s = {least}",
         )
     if declared < needed:
         raise table.fail(
-            None, f"[tokens] margin_s = {declared:g} is too small: {why}{how} set: [tokens] margin_s = {least:g}"
+            None, f"[tokens] margin_s = {_seconds(declared)} is too small: {why}{how} set: [tokens] margin_s = {least}"
         )
+
+
+def _seconds(value: float) -> str:
+    """A number of seconds written in full, never in exponent form or rounded: a whole number as an integer, any other
+    as Python writes it exactly."""
+    number = float(value)
+    return str(int(number)) if number.is_integer() else repr(number)
 
 
 def _restore_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
     """The terms of `restore_token_margin_s`, each with its declared values in words (see `restore_bound_s`)."""
-    s, attempts = settings, settings.clear_attempts
+    s, attempts, n = settings, settings.clear_attempts, _seconds
     identity_wait = s.settle_timeout_s + s.poll_s
     return (
-        (f"a stop of unknown outcome waited out (settle_timeout_s {s.settle_timeout_s:g} s + poll_s {s.poll_s:g} s)",
+        (f"a stop of unknown outcome waited out (settle_timeout_s {n(s.settle_timeout_s)} s + poll_s {n(s.poll_s)} s)",
          identity_wait),
-        (f"{attempts} starts each with its wait ({attempts} x (command_timeout_s {s.command_timeout_s:g} s + "
-         f"settle_timeout_s {s.settle_timeout_s:g} s + poll_s {s.poll_s:g} s))",
+        (f"{attempts} starts each with its wait ({attempts} x (command_timeout_s {n(s.command_timeout_s)} s + "
+         f"settle_timeout_s {n(s.settle_timeout_s)} s + poll_s {n(s.poll_s)} s))",
          attempts * (s.command_timeout_s + identity_wait)),
-        (f"{attempts - 1} pause(s) between them ({attempts - 1} x poll_s {s.poll_s:g} s)", (attempts - 1) * s.poll_s),
-        (f"the wait to serve (ready_timeout_s {s.ready_timeout_s:g} s + poll_s {s.poll_s:g} s)",
+        (f"{attempts - 1} pause(s) between them ({attempts - 1} x poll_s {n(s.poll_s)} s)", (attempts - 1) * s.poll_s),
+        (f"the wait to serve (ready_timeout_s {n(s.ready_timeout_s)} s + poll_s {n(s.poll_s)} s)",
          s.ready_timeout_s + s.poll_s),
-        (f"the session gate (gate_timeout_s {s.gate_timeout_s:g} s)", s.gate_timeout_s),
-        (f"slack {TOKEN_SLACK_S:g} s", TOKEN_SLACK_S),
+        (f"the session gate (gate_timeout_s {n(s.gate_timeout_s)} s)", s.gate_timeout_s),
+        (f"slack {n(TOKEN_SLACK_S)} s", TOKEN_SLACK_S),
     )  # fmt: skip
 
 
 def restore_margin_derivation(settings: FaultSettings) -> str:
-    """`restore_token_margin_s` term by term, in words and then as a sum: what a refusal at load spells out."""
+    """`restore_token_margin_s` term by term, in words and then as a sum, every number in full: what a refusal at load
+    spells out."""
     terms = _restore_terms(settings)
     words = " + ".join(word for word, _ in terms)
     total = sum(value for _, value in terms)
-    return f"{words}: {' + '.join(f'{value:g}' for _, value in terms)} = {total:g}"
+    return f"{words}: {' + '.join(_seconds(value) for _, value in terms)} = {_seconds(total)}"
 
 
 def restore_bound_s(settings: FaultSettings) -> float:

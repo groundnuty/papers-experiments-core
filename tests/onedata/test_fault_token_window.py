@@ -139,6 +139,20 @@ def test_o35_a_least_margin_with_a_fraction_of_a_second_rounds_up_to_the_whole_s
     assert settings_of(write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 1804, poll_s=0.5)))
 
 
+def test_o35_a_large_least_margin_is_named_in_full_never_in_exponent_form(tmp_path):
+    """O35: the least and the line to write are whole numbers written out in full, which TOML reads as an integer, and
+    the derivation keeps every digit: a session gate of 1,000,000 s needs exactly 1,001,574 s."""
+    with pytest.raises(ConfigError) as caught:
+        settings_of(
+            write_platform(tmp_path, lambda data: at_default_bounds(data, "off", 900, gate_timeout_s=1_000_000))
+        )
+    message = str(caught.value)
+    assert "the least is 1001574 s" in message
+    assert "182 + 906 + 4 + 182 + 1000000 + 300 = 1001574" in message
+    assert message.endswith("[tokens] margin_s = 1001574")
+    assert "e+" not in message
+
+
 def test_o35_a_platform_without_faults_needs_no_token_margin_declared(tmp_path):
     """O35, O06: without `[faults]` nothing changes: a platform that declares no `[tokens]` loads with the default
     margin, and no fault settings are read."""
