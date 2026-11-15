@@ -10,10 +10,11 @@ holds the platform. A detail that does not lead with one reads exactly as it did
 import datetime as dt
 import json
 
+from campaign_support import planned_store
 from scheduler_support import FakeExecutor, build, settings_for
 
 from expcore.campaign.deferral import DEFERRAL_META, OPERATOR_ACTION, deferral_alarms, operator_reason
-from expcore.campaign.healthgate import META, Health, alarms, fact, parse
+from expcore.campaign.healthgate import FOUND, META, Health, HealthGate, alarms, fact, parse
 
 SMALL = {"tasks": ("task-a",), "seeds": (1,)}
 REASON = f"a failed heal: {OPERATOR_ACTION} (stuck pairs: providers[2] reading from providers[0])"
@@ -113,3 +114,25 @@ def test_c11_a_gate_closed_by_a_failure_that_needs_an_operator_names_it_in_the_h
         f"hold on all (health_gate): the health gate is closed: no run starts until a check passes: {REASON}; dispatch "
         "resumes when a health check passes (checked every 0.01 s)"
     ]
+
+
+def test_c11_an_outage_keeps_the_reason_it_was_last_told_after_a_check_passes(tmp_path):
+    """C11: a gate closed by an ordinary failure whose recheck then says an operator is needed (a heal the dispatcher's
+    own check began failed), and that a repair then opens, has the reason in its record: the record's detail fields
+    hold the first failure's words and the pass's, so the reason is kept apart, and an outage no such answer touched
+    has no such field."""
+    store, _, _ = planned_store(tmp_path)
+    answers = [Health(False, "the platform is unreachable"), Health(False, LEADING), Health(True, "fine")]
+    gate = HealthGate(store, lambda: answers.pop(0), lambda: NOW, recheck_s=0.01, timeout_s=5)
+    gate.load()
+    assert gate.before_run("run-a").verdict == FOUND
+    assert gate.poll() is False
+    assert gate.poll() is True
+    (outage,) = parse(store.get_meta(META))
+    assert outage["operator_reason"] == REASON
+    assert operator_reason(outage["first_detail"]) is None
+    assert operator_reason(outage["last_detail"]) is None
+    plain = HealthGate(store, lambda: Health(False, "the platform is unreachable"), lambda: LATER, timeout_s=5)
+    plain.load()
+    assert plain.before_run("run-b").verdict == FOUND
+    assert "operator_reason" not in parse(store.get_meta(META))[-1]

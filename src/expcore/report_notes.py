@@ -296,9 +296,9 @@ BUDGET_HOLD_NOTES = [
 
 HOLD_NOTES = [
     "Each row is a stretch in which the platform's health check said that only an operator could end what it found (a",
-    "repair that failed and left its fault in place), so no run started. A held run has no attempt, so these holds are",
+    "repair that failed and left its fault in place), so no run started. A held run has no attempt; the hold itself is",
     "in none of the counts above. Until: when a check passed again, or `open` when the campaign ended with the gate",
     "closed. Blocking: the wait outlasted `max_defer_s`, and a campaign that exits when blocked stopped. Charged a",
-    "run: one run was charged an attempt for the hold, the run whose check found it. The reason is the platform's own",
-    "words, naming what is stuck by label only.",
+    "run: one run was charged an attempt for the hold, the run whose check found it, and that attempt is among the",
+    "infrastructure failures above. The reason is the platform's own words, naming what is stuck by label only.",
 ]

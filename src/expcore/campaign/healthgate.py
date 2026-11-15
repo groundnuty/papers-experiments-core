@@ -21,6 +21,11 @@ it opens, so a restart in the outage restores it (`restarts` counts those) and t
      itself, the passing one included, "restarts": restarts survived while open, "last_check_utc", "first_detail",
      "last_detail"}
 
+and, when a failed answer of the outage led with a reason only an operator can end (`deferral.operator_reason`),
+`"operator_reason"`: the latest such reason, kept apart because the passing check that opens the gate overwrites
+`last_detail` and an ordinary failure can be followed by one (a heal the dispatcher's own check began failed). The
+status's alarms, the hold the run says and the export's `operator_holds` read it.
+
 **A gate state that cannot be read at a restart opens closed**: whether the platform is up is then unknown, and the
 first passing check ends it. Nothing is charged for a restart. A restored outage that was blocking does not block
 until the restored gate's first check has answered (bounded by its timeout), so a platform that is healthy again
@@ -368,6 +373,9 @@ class HealthGate:
                 record["blocking"] = True
             if not charge:
                 record["charged"] = False
+            reason = operator_reason(detail)
+            if reason is not None:
+                record["operator_reason"] = reason
             self._open = record
             self._outages.append(record)
             self.store.put_meta(META, dump(self._outages), now)
@@ -491,6 +499,9 @@ class HealthGate:
             now = self.clock()
             record["checks"] = int(record.get("checks", 0)) + 1
             record["last_check_utc"], record["last_detail"] = now, health.detail[:200]
+            reason = None if health.ok else operator_reason(health.detail)
+            if reason is not None:  # kept apart: the pass that opens the gate overwrites `last_detail`
+                record["operator_reason"] = reason
             if health.ok:
                 record["end_utc"], record["how"] = now, HOW_PASSED
                 self._open = None

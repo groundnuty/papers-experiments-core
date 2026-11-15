@@ -13,9 +13,11 @@ def outage(
     blocking: bool = False,
     charged: bool = True,
     first: str = CLOSING,
+    reason: str | None = REASON,
 ) -> dict:
     """One outage record: open when `end` is None, and then still saying what closed it; ended, its last check is the
-    pass that opened the gate, whose words are none of the reason's."""
+    pass that opened the gate, whose words are none of the reason's. `reason` is the `operator_reason` the gate kept
+    (none for an outage no answer of which led with one)."""
     record = {
         "start_utc": start,
         "end_utc": end,
@@ -30,4 +32,6 @@ def outage(
         record["blocking"] = True
     if not charged:
         record["charged"] = False
+    if reason is not None:
+        record["operator_reason"] = reason
     return record

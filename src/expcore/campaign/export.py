@@ -59,8 +59,9 @@ A campaign whose health gate was closed, or its check deferred, with a reason on
 gate's failed heal, O35) also exports `operator_holds`, after `deployment_shares`: each such outage of the store's
 `health_outages` in the order it began, with `start_utc`, `end_utc` (None while the gate is closed), `blocking`
 (the deferral outlasted `max_defer_s`), `charged` (whether a run was charged an attempt for it), `checks` and the
-`reason` its closing detail led with. A hold starts no run and leaves no attempt, so the run lists do not say it. A
-campaign with none, or whose record cannot be read, has no such key, and its export is the one it had before it.
+latest `reason` an answer of the outage led with (the gate keeps it apart from its details, `healthgate.py`). A hold
+starts no run and leaves no attempt, so the run lists do not say it. A campaign with none, or whose record cannot be
+read, has no such key, and its export is the one it had before it.
 
 A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
@@ -78,7 +79,6 @@ from contextlib import AbstractContextManager
 from pathlib import Path, PurePath
 from typing import Any, Protocol
 
-from expcore.campaign.deferral import operator_reason
 from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, deployment_shares
 from expcore.campaign.factors import FactorSchema, RunKey
 from expcore.campaign.healthgate import META as HEALTH_META
@@ -227,16 +227,14 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
 
 
 def _operator_holds(raw: str | None) -> list[dict[str, Any]]:
-    """The outages of the health gate record `raw` (the store's `health_outages`) whose closing detail led with a
-    reason only an operator can end, oldest first. An outage a check passed has the pass in its last detail, so the
-    reason is the first detail's, and that of the latest while it is open. A record that cannot be read lists none:
-    the status says it is unreadable."""
+    """The outages of the health gate record `raw` (the store's `health_outages`) that an answer led with a reason
+    only an operator can end, oldest first, each with the latest such reason the gate kept (`operator_reason`: its
+    detail fields hold the first failure's words and, once a check has passed, the pass's). A record that cannot be
+    read lists none: the status says it is unreadable."""
     holds = []
     for outage in parse_outages(raw) or []:
-        reason = operator_reason(outage.get("first_detail"))
-        if reason is None and outage.get("end_utc") is None:
-            reason = operator_reason(outage.get("last_detail"))
-        if reason is not None:
+        reason = outage.get("operator_reason")
+        if isinstance(reason, str):
             holds.append(
                 {
                     "start_utc": outage["start_utc"],

@@ -18,9 +18,9 @@ NOW = "2026-01-01T00:00:00Z"
 
 
 def test_c11_an_outage_that_needs_an_operator_is_listed_in_the_export(tmp_path):
-    """C11: each outage whose closing detail leads with an operator's reason is listed with when it began and ended,
-    whether it was blocking, whether it charged a run and its reason; one a check passed is listed with the reason
-    it closed with, not the passing check's words."""
+    """C11: each outage the gate kept an operator's reason for is listed with when it began and ended, whether it was
+    blocking, whether it charged a run and its reason; one a check passed is listed with that reason, not the passing
+    check's words."""
     store, _, _ = planned_store(tmp_path)
     open_blocking = outage("2026-01-01T02:00:00Z", None, blocking=True, charged=False)
     ended = outage("2026-01-01T00:10:00Z", "2026-01-01T01:00:00Z", how="check_passed")
@@ -46,11 +46,32 @@ def test_c11_an_outage_that_needs_an_operator_is_listed_in_the_export(tmp_path):
     ]
 
 
+def test_c11_an_outage_a_repair_opened_after_its_recheck_said_an_operator_was_needed_is_listed(tmp_path):
+    """C11: the gate closed for an ordinary failure, its dispatcher's recheck said an operator was needed, and a repair
+    then opened it: the record's details hold the first failure's words and the pass's, so the reason is the field the
+    gate kept (`operator_reason`), and the export lists the outage from it (it listed none when it read the details)."""
+    store, _, _ = planned_store(tmp_path)
+    repaired = outage(
+        "2026-01-01T00:10:00Z",
+        "2026-01-01T03:00:00Z",
+        how="check_passed",
+        first="the platform is unreachable",
+    )
+    store.put_meta(META, dump([repaired]), NOW)
+    (hold,) = export_run_state(store)["operator_holds"]
+    assert (hold["start_utc"], hold["end_utc"], hold["reason"]) == (
+        "2026-01-01T00:10:00Z",
+        "2026-01-01T03:00:00Z",
+        REASON,
+    )
+
+
 def test_c11_an_export_with_no_outage_for_an_operator_is_what_it_was(tmp_path):
     """C11: no outage, an outage that any platform failure caused and one whose record cannot be read add no key."""
     store, _, _ = planned_store(tmp_path)
     assert set(export_run_state(store)) == set(REQUIRED_KEYS)
-    store.put_meta(META, dump([outage("2026-01-01T00:10:00Z", None, first="the platform is unreachable")]), NOW)
+    plain = outage("2026-01-01T00:10:00Z", None, first="the platform is unreachable", reason=None)
+    store.put_meta(META, dump([plain]), NOW)
     assert set(export_run_state(store)) == set(REQUIRED_KEYS)
     store.put_meta(META, "{not json", NOW)
     assert set(export_run_state(store)) == set(REQUIRED_KEYS)
