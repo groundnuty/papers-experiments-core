@@ -254,6 +254,7 @@ def test_o36_the_config_file_is_the_empty_one_and_the_images_own_is_recorded_by_
     """O36: `--config /dev/null` is among the options the sandbox passed, and the metadata holds the SHA-256 of the file
     the image's oneclient would otherwise have parsed (or `unread`, when the sidecar could not read it: a failure of
     this record is a fact to look at, not of the run)."""
-    assert attempt["mount"]["options"][-2:] == ["--config", "/dev/null"]
+    options = attempt["mount"]["options"]
+    assert options[options.index("--config") : options.index("--config") + 2] == ["--config", "/dev/null"]
     digest = attempt["mount"]["image_config"]["sha256"]
     assert digest == "unread" or (len(digest) == 64 and set(digest) <= set("0123456789abcdef")), digest

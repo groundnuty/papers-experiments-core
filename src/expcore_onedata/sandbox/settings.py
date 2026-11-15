@@ -134,7 +134,7 @@ from expcore_onedata.sandbox.hostops import strict_networks
 from expcore_onedata.sandbox.oneclient_args import (
     IO_MODES,
     direct_keys_problem,
-    mode_arg_problem,
+    extra_arg_problem,
     mount_problem,
     nested,
     storages_problem,
@@ -397,7 +397,7 @@ def _mount(section: Section) -> MountSettings:
         raise section.fail("io_mode", IO_MODE_REFUSAL)
     extra = section.strings("extra_args") if "extra_args" in section.data else ()
     for argument in extra:
-        problem = mode_arg_problem(io_mode, argument)
+        problem = extra_arg_problem(argument)
         if problem is not None:
             raise section.fail("extra_args", problem)
     storages, check = _storages(section), section.data.get("direct_check_file")

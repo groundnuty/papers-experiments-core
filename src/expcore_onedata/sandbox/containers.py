@@ -32,7 +32,6 @@ from expcore_onedata.sandbox.api import DataPathMode, Endpoint
 from expcore_onedata.sandbox.oneclient_args import (
     CONFIG_NULL,
     CONFIG_OPTION,
-    DIRECT,
     DISABLE_LOG_BUFFERING,
     IO_MODE_FLAGS,
     LOG_DIR_OPTION,
@@ -170,10 +169,11 @@ def _checked_mount(settings: SandboxSettings) -> MountSettings:
 
 def sidecar_options(settings: SandboxSettings) -> list[str]:
     """The oneclient options the sandbox itself sets, in the order it passes them: the read-only mount options, the
-    mode's force-I/O option, `--log-dir SIDECAR_LOG_DIR` (O05), `--config /dev/null`, with direct I/O
-    `--disable-log-buffering` (O40), and `--insecure` when the platform's `[tls]` says so. The study's `extra_args` are
-    not here, nor the storage overrides of a direct mount (`direct_overrides`), which hold storage ids: these options
-    are what a run's record keeps (O12).
+    mode's force-I/O option, `--log-dir SIDECAR_LOG_DIR` (O05), `--config /dev/null`, `--disable-log-buffering` (O40,
+    O54: the start lines are in the log when the collection reads it, in either mode, since glog holds INFO lines up to
+    30 s otherwise; it changes when lines are written and nothing else), and `--insecure` when the platform's `[tls]`
+    says so. The study's `extra_args` are not here, nor the storage overrides of a direct mount (`direct_overrides`),
+    which hold storage ids: these options are what a run's record keeps (O12).
 
     The I/O mode is always declared (O36): oneclient 25.0 started with neither force option detects each storage's
     access type at the first read of each space, and its detection for a second space on one storage waits on a mutex
@@ -186,7 +186,7 @@ def sidecar_options(settings: SandboxSettings) -> list[str]:
     return [
         *("-o", "ro,allow_other", IO_MODE_FLAGS[mount.io_mode]),
         *(LOG_DIR_OPTION, SIDECAR_LOG_DIR, CONFIG_OPTION, CONFIG_NULL),
-        *([DISABLE_LOG_BUFFERING] if mount.io_mode == DIRECT else []),
+        DISABLE_LOG_BUFFERING,
         *(["--insecure"] if settings.tls.insecure else []),
     ]
 

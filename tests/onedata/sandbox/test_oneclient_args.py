@@ -149,13 +149,16 @@ def test_o40_a_storage_override_in_any_spelling_is_refused_as_an_extra_argument(
 
 
 @pytest.mark.parametrize("argument", ["--disable-log-buffering", "--disable-log", "--disable-log-buffering=1"])
-def test_o40_the_log_buffering_switch_is_the_cores_own_with_direct_io_and_a_studys_with_proxy(argument):
-    """O40: with direct I/O the sidecar passes `--disable-log-buffering`, so the start check reads every line the test
-    read wrote (glog holds INFO lines up to 30 s otherwise); a second one would make oneclient refuse to start."""
+@pytest.mark.parametrize("mode", ["proxy", "direct"])
+def test_o54_the_log_buffering_switch_is_the_cores_own_in_every_io_mode(mode, argument):
+    """O54: the sidecar passes `--disable-log-buffering` with every mount, proxy included, so the collection reads the
+    start lines (glog holds INFO lines up to 30 s otherwise); a second one, from a study, would make oneclient refuse to
+    start, so it is refused in either mode, at load and at the command."""
     storages, check = (("0123abcd", "/srv/a"),), "space/f"
-    assert "direct" in mount_problem("direct", (argument,), storages, check)
-    assert mount_problem("proxy", (argument,)) is None
-    assert mount_problem("direct", ("--disable-read-events",), storages, check) is None
+    extra = (storages, check) if mode == "direct" else ((), None)
+    assert "--disable-log-buffering" in extra_arg_problem(argument)
+    assert "sidecar passes it" in mount_problem(mode, (argument,), *extra)
+    assert mount_problem(mode, ("--disable-read-events",), *extra) is None  # another option that starts `--disable-`
 
 
 def test_o36_oneclients_own_options_are_kept_by_name_and_nothing_else_is():
