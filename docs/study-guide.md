@@ -876,6 +876,7 @@ def faults_document(document):
         "project": "stack-a",
         "services": {"alpha": "store-one", "beta": "store-two"},
     }
+    document["tokens"]["margin_s"] = 1814  # [faults] needs it declared: the least for these defaults (below)
 
 
 smoke_platform = write_platform(Path(tempfile.mkdtemp()), faults_document)
