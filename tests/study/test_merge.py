@@ -7,6 +7,7 @@ a copy of a finished shard, or runs a shard against another environment, and exp
 the reason and to leave nothing behind.
 """
 
+import contextlib
 import hashlib
 import json
 import re
@@ -31,9 +32,10 @@ from shard_support import (
     write_meta,
 )
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, table
-from tree_support import added, tree_of
+from tree_support import read_only, tree_of
 
 from expcore.campaign.export import export_run_state, export_text
+from expcore.campaign.lock import DispatchLock
 from expcore.campaign.merge import SHARDS_DIR
 from expcore.campaign.scheduler import STATE_FILE
 from expcore.campaign.shard import (
@@ -45,7 +47,6 @@ from expcore.campaign.shard import (
     RULE,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, StoreSnapshot, take_snapshot
-from expcore.package.spec import never_selected
 from expcore.records.record import record_filename
 from expcore.study.config import load_study
 from expcore.study.pipeline import Refused, regenerate
@@ -319,25 +320,37 @@ def _report_differs_only_in_positions(merged: str, whole: str) -> bool:
     return True
 
 
-def test_r16_a_merge_leaves_each_shards_batch_and_store_and_adds_only_the_stores_unpackaged_side_files(
+def test_r16_a_merge_reads_read_only_shards_and_leaves_each_shards_out_byte_for_byte(
     base, clean_environment, shard1, shard2
 ):
-    """R16: the merge copies a finished shard's store over a read-only connection in place, which in WAL mode makes
-    its -shm and -wal and cannot remove them. They lie beside the store in the shard's out/, outside its hashed
-    batch, and a package drops every `out/state.sqlite-*`; every other file of the shard's out/ keeps its bytes."""
+    """R16: shards fetched back from other hosts may arrive read-only. The merge reads each finished shard's store
+    from a copy in a directory of its own, so it merges them and leaves every shard's out/ as it found it: no -shm or
+    -wal is made beside a store, and no lock file."""
     shards = [copy_campaign(shard, base, f"r16-{shard.root.name}") for shard in (shard1, shard2)]
     for shard in shards:
         for leftover in (shard.root / "out").glob(f"{STATE_FILE}-*"):  # what the shard's own check left
             leftover.unlink()
     before = [tree_of(shard.root / "out") for shard in shards]
-    code, errors = merge_into(clean_environment, Campaign(make_study(base, "r16-merge")), *shards)
+    with contextlib.ExitStack() as stack:
+        for shard in shards:
+            stack.enter_context(read_only(shard.root / "out"))
+            stack.enter_context(read_only(shard.runs))
+        code, errors = merge_into(clean_environment, Campaign(make_study(base, "r16-merge")), *shards)
     assert code == 0, errors
-    for shard, was in zip(shards, before, strict=True):
-        now = tree_of(shard.root / "out")
-        new = added(was, now)
-        assert set(new) <= {f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"}, new
-        assert all(never_selected(f"out/{name}") for name in new)
-        assert {name: now[name] for name in was} == was
+    assert [tree_of(shard.root / "out") for shard in shards] == before
+
+
+def test_r16_a_merge_refuses_a_shard_a_dispatcher_still_holds(base, clean_environment, shard1, shard2):
+    """R16: a shard whose store a dispatcher holds is still being written, so no copy of it is one state: refused,
+    naming the shard, before its store is read."""
+    held = copy_campaign(shard2, base, "r16-held")
+    target = Campaign(make_study(base, "r16-merge-held"))
+    with DispatchLock(held.root / "out"):
+        code, errors = merge_into(clean_environment, target, shard1, held)
+    assert code == 1, errors
+    assert "another dispatcher holds" in errors, errors
+    assert "a shard is merged when it has finished" in errors, errors
+    assert not (target.root / "out").exists()
 
 
 def test_r16_check_analyze_and_regenerate_read_a_merged_batchs_sealed_snapshots_and_leave_it_as_it_was(

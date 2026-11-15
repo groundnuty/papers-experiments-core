@@ -63,6 +63,7 @@ from expcore.campaign.executor import default_backend_factory
 from expcore.campaign.export import export_run_state, export_text
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
+from expcore.campaign.lock import CampaignLocked, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
@@ -80,6 +81,7 @@ from expcore.campaign.shard_run import (
     share_settings_by_model,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.errors import study_kinds
@@ -472,24 +474,52 @@ def _check_batch_of(
                 f"{out_dir(study)}: holds a merged batch ({MERGE_FILE}) and a campaign store; use one or the other"
             )
         return _check_merged(study, directory, code, env, partial)
-    if store.is_file():  # without a store, take_snapshot refuses below
-        changed = differences(campaign_environment(read_fingerprint(store)), env)
-        if changed:
-            raise Refused(
-                f"{store}: the campaign ran under another environment than this check would; check under the "
-                "campaign's environment:\n  " + "\n  ".join(changed)
-            )
-    import_what_the_records_need(study, directory)
+    lock, in_place = _hold_for_check(store, partial)
     try:
-        running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
-    except SnapshotError as error:
-        raise Refused(str(error)) from None
+        if store.is_file():  # without a store, take_snapshot refuses below
+            try:
+                recorded = read_fingerprint(store, in_place=in_place)
+            except StoreChanged as error:
+                raise Refused(str(error)) from None
+            changed = differences(campaign_environment(recorded), env)
+            if changed:
+                raise Refused(
+                    f"{store}: the campaign ran under another environment than this check would; check under the "
+                    "campaign's environment:\n  " + "\n  ".join(changed)
+                )
+        import_what_the_records_need(study, directory)
+        try:
+            running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial, in_place=in_place)
+        except SnapshotError as error:
+            raise Refused(str(error)) from None
+    finally:
+        lock.release()
     check = verify_batch(
         directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
     )
     check[SNAPSHOT_KEY] = {"file": SNAPSHOT_FILE, "attempts_running": running, "partial": partial}
     write_check(directory, check)
     return check
+
+
+def _hold_for_check(store: Path, partial: bool) -> tuple[ReaderLock, bool]:
+    """How the check reads the store: a reader's hold of its lock and whether to read it in place (R16).
+
+    A finished store (no dispatcher holds it, its directory read-only too) is held as a reader, so no dispatcher
+    starts while it is read, and read from a private copy (False). A store a dispatcher holds is being written, so no
+    copy of its files is one state: the check is refused unless `partial`, and then the store is backed up in place
+    over a read-only connection (True), the one consistent read of a live store.
+    """
+    lock = ReaderLock(store.parent)
+    try:
+        return lock.acquire(), False
+    except CampaignLocked as error:
+        if not partial:
+            raise Refused(
+                f"{store}: {error}; a dispatcher holds the store while it runs: check it once the dispatcher has "
+                "stopped, or pass --partial to check the store as it stands"
+            ) from None
+        return lock, True
 
 
 def _check_merged(

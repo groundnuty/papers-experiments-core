@@ -12,9 +12,10 @@ from pathlib import Path
 
 import pytest
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish, make_copy
-from tree_support import tree_of
+from tree_support import read_only, tree_of, without
 
 from expcore.campaign.export import read_export
+from expcore.campaign.lock import DispatchLock
 from expcore.campaign.snapshot import SNAPSHOT_FILE
 from expcore.replay.check import inputs_sha256
 from expcore.study import pipeline
@@ -190,6 +191,44 @@ def test_r16_analyze_report_and_regenerate_leave_the_sealed_batch_and_out_byte_f
     assert cli(clean_environment, "report", str(copy.root))[0] == 0
     assert pipeline.regenerate(copy.root) == []
     assert tree_of(out) == sealed
+
+
+def drop_side_files(campaign: Campaign) -> Path:
+    """Remove what earlier in-place reads left beside the store, so a new one would show; return out/."""
+    out = campaign.root / "out"
+    for leftover in out.glob("state.sqlite-*"):
+        leftover.unlink()
+    return out
+
+
+def test_r16_check_reads_a_finished_store_in_a_read_only_out_and_leaves_it_byte_for_byte(copy, clean_environment):
+    """R16: no dispatcher holds a finished campaign, so check reads its store from a copy: out/ may be read-only (a
+    campaign fetched from another host) and keeps every byte outside the batch, which gains only the check and the
+    snapshot."""
+    out = drop_side_files(copy)
+    before = tree_of(out)
+    with read_only(out):
+        code, errors = cli(clean_environment, "check", str(copy.runs))
+    assert code == 0, errors
+    after = tree_of(out)
+    assert without(after, "runs/") == without(before, "runs/")
+    assert set(after) == set(before)  # the batch's check and snapshot were rewritten; no file was added anywhere
+
+
+def test_r16_check_of_a_live_store_backs_it_up_in_place_under_partial_and_is_refused_without(copy, clean_environment):
+    """R16: a store a dispatcher holds is being written, so no copy of its files is one state. Without --partial the
+    check is refused, naming the dispatcher; with it, the store is backed up in place over a read-only connection,
+    which leaves the -shm and -wal a live store has anyway."""
+    out = drop_side_files(copy)
+    with DispatchLock(out):
+        code, errors = cli(clean_environment, "check", str(copy.runs))
+        assert code == 1
+        assert "a dispatcher holds" in errors, errors
+        assert "--partial" in errors, errors
+        assert sorted(p.name for p in out.glob("state.sqlite-*")) == []
+        assert cli(clean_environment, "check", str(copy.runs), "--partial")[0] == 0
+    assert sorted(p.name for p in out.glob("state.sqlite-*")) == ["state.sqlite-shm", "state.sqlite-wal"]
+    assert stored_check(copy)["snapshot"] == {"file": SNAPSHOT_FILE, "attempts_running": 0, "partial": True}
 
 
 @pytest.mark.parametrize(

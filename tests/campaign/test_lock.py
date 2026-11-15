@@ -6,11 +6,13 @@ import sys
 import textwrap
 
 import pytest
+from tree_support import read_only, tree_of
 
 from expcore.campaign.lock import (
     CampaignLocked,
     DispatchLock,
     NetworkFilesystemWarning,
+    ReaderLock,
     filesystem_type,
     is_network_fs,
 )
@@ -93,3 +95,35 @@ def test_c07_which_file_systems_count_as_network(fs_type, network):
 def test_c07_an_unreadable_mount_table_gives_no_type(tmp_path):
     """C07: a missing table is not an error and not a network file system."""
     assert filesystem_type(tmp_path, tmp_path / "absent") is None
+
+
+# --- a reader's hold (R16) -------------------------------------------------------------------------------------------
+
+
+def test_r16_a_reader_never_creates_the_lock_file_and_where_there_is_none_holds_nothing(tmp_path):
+    """R16: a dispatcher makes the lock file before it opens the store, so a store with none beside it has no
+    dispatcher; a reader writes nothing there, a sealed snapshot's directory included."""
+    with ReaderLock(tmp_path) as lock:
+        assert not lock.held
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_r16_a_reader_is_refused_while_a_dispatcher_holds_the_store_and_keeps_one_off_while_it_reads(tmp_path):
+    """R16: a reader is refused while a dispatcher holds the store, and a dispatcher cannot start while a reader
+    holds it, so what the reader copies has no writer."""
+    with DispatchLock(tmp_path), pytest.raises(CampaignLocked, match="one dispatcher per store"):
+        ReaderLock(tmp_path).acquire()
+    with ReaderLock(tmp_path) as lock:
+        assert lock.held
+        with pytest.raises(CampaignLocked, match="one dispatcher per store"):
+            DispatchLock(tmp_path).acquire()
+    DispatchLock(tmp_path).acquire().release()  # released on exit
+
+
+def test_r16_a_reader_holds_the_lock_of_a_read_only_directory_and_changes_nothing_there(tmp_path):
+    """R16: the lock file of a finished campaign copied read-only is locked as it is; no file is made or changed."""
+    DispatchLock(tmp_path).acquire().release()
+    before = tree_of(tmp_path)
+    with read_only(tmp_path), ReaderLock(tmp_path) as lock:
+        assert lock.held
+    assert tree_of(tmp_path) == before

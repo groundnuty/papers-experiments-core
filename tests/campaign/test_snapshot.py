@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 from campaign_support import NOW, make_schema, planned_store, run_one
-from tree_support import added, tree_of
+from tree_support import added, read_only, tree_of, without
 
 from expcore.campaign.export import export_run_state
 from expcore.campaign.markers import AttemptResult
@@ -99,7 +99,7 @@ def test_the_snapshot_is_one_consistent_state_whatever_a_writer_has_open(settled
     store.db.execute("BEGIN IMMEDIATE")
     store.db.execute("INSERT INTO attempts(run_key, attempt, state) VALUES (?, 1, 'running')", (keys[2],))
     try:
-        assert take_snapshot(store.path, tmp_path / SNAPSHOT_FILE) == 0
+        assert take_snapshot(store.path, tmp_path / SNAPSHOT_FILE, in_place=True) == 0
     finally:
         store.db.execute("ROLLBACK")
 
@@ -156,13 +156,13 @@ def test_r04_a_snapshot_from_before_the_admission_column_exports_it_as_unknown(s
     assert all(entry["admission"] is None for entry in data["analysed_attempts"])
 
 
-# --- R16: a read of a finished or sealed store writes nothing into a hashed or packaged directory --------------------
+# --- R16: a read of a finished or sealed store writes nothing beside it ----------------------------------------------
 
 
 def test_r16_a_finished_store_stays_in_wal_mode_and_its_snapshot_is_one_rollback_journal_file(finished_out):
-    """R16: the campaign keeps its store in WAL mode, closed too (bytes 18 and 19 at 2), so any later open of it makes
-    a -shm and a -wal. What is sealed is the snapshot, which says rollback journal (both at 1): read in place or as
-    bytes, it never needs a side file."""
+    """R16: the campaign keeps its store in WAL mode, closed too (bytes 18 and 19 at 2), so an open of it in place may
+    make a -shm and a -wal. What is sealed is the snapshot, which says rollback journal (both at 1): read in place or
+    as bytes, it never needs a side file."""
     store = finished_out / STATE_FILE
     assert store.read_bytes()[18:20] == WAL_HEADER
     take_snapshot(store, finished_out / "runs" / SNAPSHOT_FILE)
@@ -191,16 +191,21 @@ def test_r16_reading_the_sealed_snapshot_leaves_the_batch_byte_for_byte_as_it_wa
     assert tree_of(batch) == sealed
 
 
-def test_r16_the_read_only_open_of_a_finished_store_adds_only_its_side_files_beside_it_and_no_package_takes_them(
-    finished_out,
-):
-    """R16: the store is copied over a read-only connection in place, and a read-only open of a database in WAL mode
-    makes its -shm and -wal, which it cannot remove. They lie beside the store in out/, outside the hashed batch, and
-    the package drops every `out/state.sqlite-*`; the store's own bytes do not change."""
-    store = finished_out / STATE_FILE
-    before, stored = tree_of(finished_out), store.read_bytes()
-    take_snapshot(store, finished_out / "runs" / SNAPSHOT_FILE)
-    new = [name for name in added(before, tree_of(finished_out)) if name != f"runs/{SNAPSHOT_FILE}"]
-    assert set(new) <= {f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"}, new
+def test_r16_a_snapshot_of_a_finished_store_in_a_read_only_out_leaves_it_byte_for_byte(finished_out):
+    """R16: a finished store is read from a copy in a directory of the reader's own, so its out/ may be read-only (a
+    shard's fetched from another host) and keeps every byte: no -shm or -wal is made beside the store."""
+    before = tree_of(finished_out)
+    with read_only(finished_out):
+        take_snapshot(finished_out / STATE_FILE, finished_out / "runs" / SNAPSHOT_FILE)
+    assert without(tree_of(finished_out), "runs/") == without(before, "runs/")
+
+
+def test_r16_a_live_store_is_backed_up_in_place_over_a_read_only_connection(finished_out):
+    """R16: a store a dispatcher holds is being written, so no copy of its files is one state; `in_place` takes the
+    online backup over a read-only connection, which sees one committed state, and leaves the -shm and -wal a live
+    store has beside it anyway (never selected for a package)."""
+    before = tree_of(finished_out)
+    take_snapshot(finished_out / STATE_FILE, finished_out / "runs" / SNAPSHOT_FILE, in_place=True)
+    new = added(without(before, "runs/"), without(tree_of(finished_out), "runs/"))
+    assert new == [f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"]
     assert all(never_selected(f"out/{name}") for name in new)
-    assert store.read_bytes() == stored

@@ -16,7 +16,7 @@ from campaign_support import (
     sha,
     treatment_schema,
 )
-from tree_support import added, tree_of
+from tree_support import added, read_only, tree_of
 
 from expcore.campaign.attempts import PinMismatch, ResumeRefused, SchemaMismatch
 from expcore.campaign.factors import FactorSchema, PlanError
@@ -424,12 +424,9 @@ def test_c06_a_manifest_that_runs_the_subset_condition_on_every_task_is_refused_
 # --- reading the fingerprint of a finished store (R16) ---------------------------------------------------------------
 
 
-def test_r16_reading_a_finished_stores_fingerprint_leaves_the_batch_and_the_store_and_adds_only_unpackaged_side_files(
-    tmp_path,
-):
-    """R16: the check reads the fingerprint over a read-only connection to the store in place, which in WAL mode makes
-    its -shm and -wal and cannot remove them. They lie beside the store in out/, outside the hashed batch out/runs/,
-    and the package drops every `out/state.sqlite-*`; the batch and the store keep every byte."""
+def test_r16_reading_a_finished_stores_fingerprint_in_a_read_only_out_leaves_it_byte_for_byte(tmp_path):
+    """R16: the fingerprint of a finished store is read from a copy in a directory of the reader's own, so its out/
+    may be read-only and keeps every byte: no -shm or -wal is made beside the store."""
     store, _ = start(tmp_path)
     store.close()
     out = tmp_path / "out"
@@ -437,9 +434,18 @@ def test_r16_reading_a_finished_stores_fingerprint_leaves_the_batch_and_the_stor
     (out / "runs" / "record.json").write_text("{}", encoding="utf-8")
     os.replace(tmp_path / "campaign.db", out / STATE_FILE)
     before = tree_of(out)
-    assert read_fingerprint(out / STATE_FILE) == make_fingerprint(make_schema())
-    after = tree_of(out)
-    new = added(before, after)
-    assert set(new) <= {f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"}, new
-    assert all(never_selected(f"out/{name}") for name in new)
-    assert {name: after[name] for name in before} == before
+    with read_only(out):
+        assert read_fingerprint(out / STATE_FILE) == make_fingerprint(make_schema())
+    assert tree_of(out) == before
+
+
+def test_r16_the_fingerprint_of_a_live_store_is_read_in_place(tmp_path):
+    """R16: a store a dispatcher holds is read over a read-only connection in place, which sees one committed state;
+    it leaves the -shm and -wal a live store has beside it anyway (never selected for a package)."""
+    store, _ = start(tmp_path)
+    store.close()
+    before = tree_of(tmp_path)
+    assert read_fingerprint(tmp_path / "campaign.db", in_place=True) == make_fingerprint(make_schema())
+    assert added(before, tree_of(tmp_path)) == ["campaign.db-shm", "campaign.db-wal"]
+    assert never_selected(f"out/{STATE_FILE}-shm")
+    assert never_selected(f"out/{STATE_FILE}-wal")

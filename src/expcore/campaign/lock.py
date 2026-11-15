@@ -112,3 +112,62 @@ class DispatchLock:
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
     ) -> None:
         self.release()
+
+
+class ReaderLock:
+    """A reader's hold on a store's dispatch lock, so that what it reads has no writer (R16); a context manager.
+
+    It takes the same exclusive `flock` as a dispatcher, so it is refused (CampaignLocked) while one holds the store,
+    and keeps one from starting while it reads. It never creates the lock file and writes nothing: a dispatcher makes
+    the file before it opens the store, so a store with none beside it has had no dispatcher there, and there is
+    nothing to hold (`held` stays False). The file is opened for writing where its mode allows, else for reading, so
+    the lock of a campaign copied read-only is taken as it is.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.path = Path(root) / LOCK_NAME
+        self._fd: int | None = None
+
+    def acquire(self) -> "ReaderLock":
+        """Take the lock if the file exists, or raise CampaignLocked while a dispatcher holds it."""
+        if self._fd is not None:
+            raise RuntimeError("this reader already holds the lock")
+        try:
+            fd = os.open(self.path, os.O_RDWR)
+        except PermissionError:
+            fd = os.open(self.path, os.O_RDONLY)
+        except FileNotFoundError:
+            return self
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise CampaignLocked(f"another dispatcher holds {self.path}: one dispatcher per store") from None
+        except OSError as error:
+            os.close(fd)
+            raise CampaignLocked(f"cannot lock {self.path}: the file system does not support flock ({error})") from None
+        self._fd = fd
+        return self
+
+    def release(self) -> None:
+        """Release the lock; releasing twice, or one never held, does nothing."""
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    @property
+    def held(self) -> bool:
+        """Tell whether this reader holds the lock (False where the store has no lock file)."""
+        return self._fd is not None
+
+    def __enter__(self) -> "ReaderLock":
+        return self.acquire()
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        self.release()
