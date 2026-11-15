@@ -10,6 +10,8 @@ from typing import Any
 
 NONCE = "00112233445566778899aabbccddeeff"
 UID = 1000
+GATE_PORT = 41234
+CANARY = ("127.0.0.1", GATE_PORT)  # the tests' declarations name the gate as the canary's endpoint
 CODE_TOOL = {
     "name": "python",
     "description": "Run Python code.",
@@ -37,8 +39,24 @@ def rec(op: str, address: str, port: int, *, kind: str = "tcp", pid: int = 42, f
     }
 
 
-def lines(records, *, nonce: str = NONCE, end: bool = True, malformed: int = 0, unwritten: int = 0, uid: int = UID):
-    """The collector's lines for these records: start, one record line each, `malformed` malformed lines, end."""
+def canary_records() -> list[dict[str, Any]]:
+    """The launcher's canary: a connect to the gate, in the cell, before the agent ran, and its result."""
+    return [rec("connect", *CANARY, pid=5, fd=3), rec("result", *CANARY, pid=5, fd=3)]
+
+
+def lines(
+    records,
+    *,
+    nonce: str = NONCE,
+    end: bool = True,
+    malformed: int = 0,
+    unwritten: int = 0,
+    uid: int = UID,
+    canary: bool = True,
+):
+    """The collector's lines: start, the canary's two records (unless `canary` is false), one record line each,
+    `malformed` malformed lines, end."""
+    records = (canary_records() if canary else []) + list(records)
     out: list[dict[str, Any]] = [{"event": "start", "format": "hpcop-egress/1", "nonce": nonce, "pid": 7, "uid": uid}]
     out += [{"event": "record", "peer": {"pid": r["pid"], "uid": uid}, "rec": r} for r in records]
     out += [{"event": "malformed", "peer": {"pid": 9, "uid": uid}, "bytes": 5, "sha256": "0" * 64}] * malformed

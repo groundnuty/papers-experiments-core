@@ -54,6 +54,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import condition_accounting
+from expcore.egress.sensitivity import EgressAnalysis
+from expcore.report_egress import egress_lines
 from expcore.report_notes import (
     ARM_LOST_HEADINGS,
     ARM_RUNS_NOTES,
@@ -575,7 +577,48 @@ def _budget_holds(export: Mapping[str, Any]) -> list[str]:
     ]
 
 
-def summary_lines(result: AnalysisResult) -> list[str]:
+def _sensitivity(result: AnalysisResult, level: float | None) -> list[str]:
+    """The confirmatory contrasts of a sensitivity analysis in the primary analysis's own tables (#179): the Holm
+    family's, or every contrast for a preregistration with no family (S12), each with its pairs."""
+    for r in result.contrasts:
+        _check_conclusion(r)
+    _check_no_claim(result)
+    adjusted = {d.name: d.p_holm for d in result.holm}
+    if result.exploratory_only:
+        shown = list(result.contrasts)
+        title = "#### Every contrast without the flagged runs (exploratory: the preregistration makes no claim)"
+    else:
+        shown = [r for r in result.contrasts if not _exploratory(r, adjusted)]
+        title = f"#### Preregistered contrasts without the flagged runs (Holm family of {len(shown)})"
+    if not shown:
+        return [title, "", "No contrast in the family."]
+    with_mde = any(r.minimum_detectable_effect is not None for r in shown)
+    table = _contrast_table(shown, adjusted, level, result.alpha, with_mde=with_mde)
+    return [title, "", *table, "", *_pairs(shown, "#### Pairs without the flagged runs")]
+
+
+def _egress_summary(egress: EgressAnalysis) -> list[str]:
+    """The terminal's egress lines: the flagged runs by flag, then each confirmatory contrast without them."""
+    counts = egress.counts()
+    lines = [
+        f"egress: {counts['flagged']} of {counts['analysed']} analysed run(s) flagged ({counts['outside']} outside, "
+        f"{counts['log_unknown']} unknown log, {counts['static_scan']} static scan)"
+    ]
+    if egress.refused is not None:
+        return [*lines, f"sensitivity: not computed ({egress.refused})"]
+    if egress.sensitivity is None:
+        return [*lines, "sensitivity: no run flagged, the same as the analysis above"]
+    result = egress.sensitivity
+    adjusted = {d.name: d.p_holm for d in result.holm}
+    for r in result.contrasts:
+        if result.exploratory_only or not _exploratory(r, adjusted):
+            holm = EXPLORATORY if result.exploratory_only else _p(adjusted[r.name])
+            estimate = f"estimate {_num(r.estimate)}, p {_p(r.p_value)}, Holm p {holm}"
+            lines.append(f"sensitivity {r.name}: {estimate}, {r.conclusion}")
+    return lines
+
+
+def summary_lines(result: AnalysisResult, egress: EgressAnalysis | None = None) -> list[str]:
     """One line per contrast for a terminal: the estimate, the raw p-value, the Holm-adjusted one (or the word
     exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
     printed without the basis it rests on, and `untestable` is never printed for a contrast that used a pair, or
@@ -595,7 +638,7 @@ def summary_lines(result: AnalysisResult) -> list[str]:
         kind, arm = d.kind.replace("_", " "), " + ".join(d.conditions)
         interval = f"[{_num(d.ci_low)}, {_num(d.ci_high)}]"
         lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
-    return lines
+    return lines + (_egress_summary(egress) if egress is not None else [])
 
 
 def _partial_line(export: Mapping[str, Any]) -> str:
@@ -667,12 +710,14 @@ def render_report(
     core_version: str | None,
     scorers: Mapping[str, str] | None = None,
     interval_level: float | None = None,
+    egress: EgressAnalysis | None = None,
 ) -> str:
     """Render the report as Markdown.
 
     `code` is the code identity (`provenance.codestamp.version`), `scorers` the version of each scorer by name (the
     report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
-    states one. A partial analysis is described by the export (`partial`,
+    states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
+    without it, #179). A partial analysis is described by the export (`partial`,
     `running_attempts`, `excluded_attempts`). What each number counts is stated in the report beside it. The
     text ends with a newline.
     """
@@ -702,7 +747,13 @@ def render_report(
         lines.append(f"- **Confirmatory claims**: none; {NO_CLAIM}")
     lines.append("")
     shards = shard_lines(export, _table)  # only a batch merged from shards has any (#154)
+    checked = egress_lines(egress, _table, lambda r: _sensitivity(r, interval_level))  # only a checked batch (#179)
     sections = (
-        _contrasts(result, interval_level) + _conditions(export) + shards + _deployments(export) + _left_out(left_out)
+        _contrasts(result, interval_level)
+        + _conditions(export)
+        + shards
+        + checked
+        + _deployments(export)
+        + _left_out(left_out)
     )
     return "\n".join(lines + sections)

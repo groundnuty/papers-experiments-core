@@ -5,8 +5,8 @@ from egress_logs import CODE_TOOL, record
 
 from expcore.egress import code_cells, declaration, scan_cells
 
-DECLARED = declaration([("127.0.0.1", 41234)], hosts=["provider-a.test"])
-REST = declaration([("127.0.0.1", 41234)], hosts=["provider-a.test"], network_calls=True)
+DECLARED = declaration([("127.0.0.1", 41234)], ("127.0.0.1", 41234), hosts=["provider-a.test"])
+REST = declaration([("127.0.0.1", 41234)], ("127.0.0.1", 41234), hosts=["provider-a.test"], network_calls=True)
 
 
 def hits(code: str, declared=DECLARED) -> list[tuple[str, str, bool]]:

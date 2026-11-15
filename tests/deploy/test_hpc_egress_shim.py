@@ -243,16 +243,16 @@ def test_the_collector_refuses_a_log_it_did_not_create_or_a_socket_directory_oth
 @needs_gcc
 @needs_unix
 def test_the_cores_reader_reads_the_real_collectors_log_as_intact_and_classifies_it(run):
-    """The core's `expcore.egress` reads what this collector wrote: the probe's listener declared as the gate, its UDP
-    receivers are loopback, TEST-NET-1 is outside."""
+    """The core's `expcore.egress` reads what this collector wrote: the probe's first connect, to its own listener,
+    declared as the gate and the canary; its UDP receivers are loopback, TEST-NET-1 is outside."""
     from expcore.egress import EgressLog, declaration
 
     class Source:
         def egress_log(self) -> bytes:
             return run["log"].read_bytes()
 
-    gate = declaration([("127.0.0.1", int(run["out"]["listener"]))])
-    snap = EgressLog(Source(), gate, NONCE).finish()
-    assert (snap["log"], snap["unknown"]) == ("intact", [])
-    assert snap["counts"] == {"gate": 1, "loopback": 2, "outside": 1}
+    listener = ("127.0.0.1", int(run["out"]["listener"]))
+    snap = EgressLog(Source(), declaration([listener], listener), NONCE).finish()
+    assert (snap["log"], snap["unknown"], snap["canary"]) == ("intact", [], True)
+    assert snap["counts"] == {"gate": 0, "loopback": 2, "outside": 1}
     assert [(d["address"], d["port"]) for d in snap["outside"]] == [("192.0.2.1", 9)]

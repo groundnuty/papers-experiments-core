@@ -8,7 +8,7 @@ from expcore.egress import instrument as egress_instrument
 from expcore.records.instruments import finish_instruments
 
 GATE_PORT = 41234
-DECLARED = declaration([("127.0.0.1", GATE_PORT)])
+DECLARED = declaration([("127.0.0.1", GATE_PORT)], ("127.0.0.1", GATE_PORT))
 RUN = [
     rec("connect", "127.0.0.1", GATE_PORT, fd=3),
     rec("result", "127.0.0.1", GATE_PORT, fd=3),
@@ -106,3 +106,31 @@ def test_a_log_whose_end_line_is_followed_by_more_is_unknown():
     out = lines(RUN)
     out.append({**out[1], "seq": len(out), "mono": 999.0})
     assert finish(encode(out))["log"] == UNKNOWN
+
+
+def test_a_log_that_opens_with_the_canary_and_holds_nothing_else_is_intact_with_zero_destinations():
+    """The canary proves the shim was loaded; it is the launcher's, so it is no destination of the agent's."""
+    snap = finish(log([]))
+    assert (snap["log"], snap["canary"], snap["records"]) == (INTACT, True, 0)
+    assert snap["counts"] == {"gate": 0, "loopback": 0, "outside": 0}
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        [],
+        [rec("connect", "127.0.0.1", GATE_PORT + 1)],
+        [rec("sendto", "127.0.0.1", GATE_PORT, kind="udp")],
+    ],
+)
+def test_a_log_that_does_not_open_with_the_canarys_connect_is_unknown(first):
+    """With no canary, an empty log may be a shim that never loaded: unknown (`no_canary`), never zero."""
+    snap = finish(log(first, canary=False))
+    assert snap["log"] == UNKNOWN
+    assert egress_instrument.NO_CANARY in snap["unknown"]
+    assert (snap["canary"], snap["counts"]) == (False, None)
+
+
+def test_a_canary_that_comes_after_another_record_is_no_canary():
+    snap = finish(log([rec("connect", "192.0.2.1", 443), *RUN[:2]], canary=False))
+    assert egress_instrument.NO_CANARY in snap["unknown"]

@@ -25,8 +25,10 @@ from expcore.egress.scan import code_cells, scan_cells
 OUTSIDE_FLAG, LOG_UNKNOWN, STATIC_SCAN = "outside", "log_unknown", "static_scan"
 FLAGS = (OUTSIDE_FLAG, LOG_UNKNOWN, STATIC_SCAN)
 NOT_RECORDED, INSTRUMENT_FAILED, NOT_A_SNAPSHOT = "not_recorded", "instrument_failed", "not_a_snapshot"
-SNAPSHOT_KEYS = {"version", "log", "unknown", "declared", "counts", "records", "outside", "outside_cut"}
+SNAPSHOT_KEYS = {"version", "log", "unknown", "declared", "canary", "counts", "records", "outside", "outside_cut"}
 SNAPSHOT_KEYS |= {"outside_complete"}
+# What a run without a readable snapshot is scanned with: no platform name, no gate; only loopback is not a hit.
+NOTHING_DECLARED = Declaration((), ("127.0.0.1", 1))
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,7 @@ def judge(record: Any, condition: str) -> RunEgress:
         log, unknown, outside = UNKNOWN, (why,), ()
     else:
         log, unknown, outside = data["log"], tuple(data["unknown"]), tuple(data["outside"])
-    scanned = scan_cells(code_cells(record), declared or Declaration(()))
+    scanned = scan_cells(code_cells(record), declared or NOTHING_DECLARED)
     found = set()
     if log != INTACT:
         found.add(LOG_UNKNOWN)

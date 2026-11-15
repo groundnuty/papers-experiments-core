@@ -10,11 +10,17 @@ line, and its log reads as unknown (`not_closed`).
 
 The snapshot, under `record.instruments["egress"]`:
 
-    {"version": 1, "log": "intact" | "unknown", "unknown": [<reasons>], "declared": {...},
+    {"version": 1, "log": "intact" | "unknown", "unknown": [<reasons>], "declared": {...}, "canary": true,
      "counts": {"gate": 3, "loopback": 1, "outside": 0} | None, "records": 12,
      "outside": [{"address": "192.0.2.1", "port": 443, "family": "inet", "type": "tcp", "attempts": 1,
                   "results": {"115": 1}}],
      "outside_cut": false, "outside_complete": true}
+
+**The canary.** The log's first record must be the launcher's canary connect to the declared endpoint
+(`Declaration.canary`), made in the cell under the shim before the agent ran; without it the log is unknown
+(`no_canary`), since a shim that never loaded leaves a log with a start, an end and nothing between, which would
+otherwise read as a run that connected nowhere. `canary` says whether it was there; the canary's records are left out
+of `records`, `counts` and `outside`, which hold the agent's own.
 
 `counts` are the destinations asked for (connect, and a send to a new address) by class, exact when the log is intact
 and None when it is unknown: unknown is never zero. `outside` lists each outside destination with its attempts and the
@@ -29,12 +35,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
 from expcore.egress.declare import CLASSES, OUTSIDE, Declaration, address_of
-from expcore.egress.log import ATTEMPTS, Reading, read_log
+from expcore.egress.log import ATTEMPTS, OUTCOMES, Reading, read_log
 
 NAMESPACE = "egress"
 VERSION = 1
 INTACT, UNKNOWN = "intact", "unknown"
 MAX_OUTSIDE = 1000
+NO_CANARY = "no_canary"  # a log that could be read does not open with the canary's connect: was the shim loaded?
 
 
 class EgressSource(Protocol):
@@ -61,14 +68,35 @@ def _outcomes(records: Sequence[Mapping[str, Any]]) -> dict[tuple[str, int, str,
     return results
 
 
+def _canary(reading: Reading, declared: Declaration) -> tuple[bool, list[Mapping[str, Any]], list[str]]:
+    """Whether the log opens with the canary's connect; the records after it; and the log's problems, `no_canary`
+    added when a log that could be read does not open with it."""
+    records, problems = list(reading.records), list(reading.problems)
+    first = records[0] if records else None
+    seen = first is not None and first["op"] == "connect" and declared.is_canary(first["address"], first["port"])
+    if not seen:
+        if reading.intact or records:
+            problems.append(NO_CANARY)
+        return False, records, problems
+    socket, own = (first["pid"], first["fd"]), []
+    for rec in records[1:]:  # the canary's outcomes go with it, up to its socket's next connect
+        if socket is not None and (rec["pid"], rec["fd"]) == socket:
+            if rec["op"] in OUTCOMES:
+                continue
+            socket = None
+        own.append(rec)
+    return True, own, problems
+
+
 def snapshot(reading: Reading, declared: Declaration) -> dict[str, Any]:
     """The instrument's snapshot of one log reading under one declaration (see the module's text)."""
-    attempts = [rec for rec in reading.records if rec["op"] in ATTEMPTS]
+    canary, records, problems = _canary(reading, declared)
+    attempts = [rec for rec in records if rec["op"] in ATTEMPTS]
     classes = [declared.classify(rec["address"], rec["port"]) for rec in attempts]
     seen: Counter[tuple[str, int, str, str]] = Counter(
         _key(rec) for rec, cls in zip(attempts, classes, strict=True) if cls == OUTSIDE
     )
-    results = _outcomes(reading.records)
+    results = _outcomes(records)
     listed = sorted(seen)[:MAX_OUTSIDE]
     outside = [
         {
@@ -81,17 +109,18 @@ def snapshot(reading: Reading, declared: Declaration) -> dict[str, Any]:
         }
         for address, port, family, kind in listed
     ]
-    counts = {cls: classes.count(cls) for cls in CLASSES} if reading.intact else None
+    intact = not problems
     return {
         "version": VERSION,
-        "log": INTACT if reading.intact else UNKNOWN,
-        "unknown": list(reading.problems),
+        "log": INTACT if intact else UNKNOWN,
+        "unknown": problems,
         "declared": declared.to_json(),
-        "counts": counts,
-        "records": len(reading.records),
+        "canary": canary,
+        "counts": {cls: classes.count(cls) for cls in CLASSES} if intact else None,
+        "records": len(records),
         "outside": outside,
         "outside_cut": len(seen) > MAX_OUTSIDE,
-        "outside_complete": reading.intact and len(seen) <= MAX_OUTSIDE,
+        "outside_complete": intact and len(seen) <= MAX_OUTSIDE,
     }
 
 

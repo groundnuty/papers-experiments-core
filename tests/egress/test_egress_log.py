@@ -1,12 +1,27 @@
-"""Reading the collector's log: intact only when every check holds, otherwise unknown with its reasons."""
+"""Reading the collector's log: intact only when every check holds, otherwise unknown with its reasons.
+
+The reader knows nothing of the canary (the instrument checks it against the run's declaration), so these logs are
+built without one.
+"""
 
 import json
 
 import pytest
-from egress_logs import NONCE, encode, lines, log, rec
+from egress_logs import NONCE, encode, rec
+from egress_logs import lines as canary_lines
+from egress_logs import log as canary_log
 
 from expcore.egress import log as egress_log
 from expcore.egress import read_log
+
+
+def lines(records, **options):
+    return canary_lines(records, canary=False, **options)
+
+
+def log(records, **options):
+    return canary_log(records, canary=False, **options)
+
 
 RECORDS = [rec("connect", "127.0.0.1", 41234), rec("result", "127.0.0.1", 41234)]
 

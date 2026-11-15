@@ -6,7 +6,7 @@ from egress_logs import NONCE, log, rec, record
 
 from expcore.egress import LOG_UNKNOWN, NAMESPACE, OUTSIDE_FLAG, STATIC_SCAN, EgressLog, declaration, judge
 
-DECLARED = declaration([("127.0.0.1", 41234)], hosts=["provider-a.test"])
+DECLARED = declaration([("127.0.0.1", 41234)], ("127.0.0.1", 41234), hosts=["provider-a.test"])
 GATE_ONLY = [rec("connect", "127.0.0.1", 41234), rec("result", "127.0.0.1", 41234)]
 
 
