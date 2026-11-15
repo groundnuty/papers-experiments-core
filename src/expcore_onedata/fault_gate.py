@@ -90,6 +90,7 @@ from expcore_onedata.admission import (
     current_admission,
     require_same_federation,
 )
+from expcore_onedata.fault_deferral import heal_deferral_bound
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals
 from expcore_onedata.fault_journal import holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
@@ -98,7 +99,6 @@ from expcore_onedata.fault_settings import (
     FaultSettings,
     heal_all_links_reserve,
     heal_container_reserve,
-    heal_deferral_s,
     heal_wait_s,
 )
 
@@ -242,29 +242,7 @@ class FaultGate:
         that fails with a container restart left open, which the next check recovers, owing a session drain and
         holding a settle when none is journalled, before the gate closes on the stuck pair; so each adds to its
         age."""
-        settings = self._settings
-        if settings.heal == "off":
-            return None
-        drained = settings.session_drain_s > 0
-        first = (
-            f"session_drain_s ({settings.session_drain_s:g} s) after an outage run, then one wait between two checks "
-            "(the core's recheck_s and poll_interval_s) and the check that starts the heal (its health_timeout_s), "
-            "then "
-            if drained
-            else "the check that starts the heal, then "
-        )
-        detail = (
-            f'[faults] heal = "{settings.heal}": {first}heal_timeout_s ({settings.heal_timeout_s:g} s) and '
-            f"heal_settle_s ({settings.heal_settle_s:g} s), then another wait between two checks and the check that "
-            "makes the link check afresh after the heal (its health_timeout_s), each check assumed to end within its "
-            "health_timeout_s and the heal within its own bound, and no deferral begun earlier or for another reason, "
-            "nor a wait for another holder of the federation, nor the recovery of a failed heal's container restart, "
-            "counted; lower heal_timeout_s or session_drain_s, or set "
-            'heal = "off", to shorten it'
-        )
-        return DeferralBound(
-            heal_deferral_s(settings), detail, rechecks=2 if drained else 1, checks=2 if drained else 1
-        )
+        return heal_deferral_bound(self._settings)
 
     @property
     def last_heal(self) -> dict[str, Any] | None:
