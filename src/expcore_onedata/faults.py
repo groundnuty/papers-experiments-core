@@ -55,7 +55,8 @@ file and journals it with the injection (`fault_sessions`); the restore then pas
 else `sessions_not_ready`) and checks every ordered pair (`links_stuck`), and with `[faults] heal` declared heals a stuck
 link, bounded and failing closed (`fault_heal`: `all_links` restarts every provider's link at once, then a stuck
 reader's container). Only the injector's own clear and start heal, while an exclusive admission is held; the snapshot
-gains the `gate` and `heal` steps.
+gains the `gate` and `heal` steps. Stuck pairs no restore heals are healed by the fault gate's health check, under an
+exclusive admission of its own, before any run's tokens exist (`fault_gate_heal`).
 
 **A stop of unknown outcome (O11).** When the stop command raises, typically at its timeout (`command_timeout_s`), the
 CLI is killed but the Docker daemon goes on stopping the container for up to the provider's `stop_grace_period`; the
