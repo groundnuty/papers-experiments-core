@@ -489,6 +489,20 @@ class FederationLock:
             _ADMISSION.reset(token)
             await _close_off_the_loop(admission)
 
+    def require_open(
+        self, release: Callable[[], None], timeout_s: float | None, cancel: threading.Event | None = None
+    ) -> None:
+        """What every admission checks once it holds the lock, for a use of one already held (a tool reusing its
+        context's, `expcore_onedata.tool_admission`): the journal holds no unsettled injection, and the drain record
+        has passed, waited for at most `timeout_s` (`FederationBusy`, the hold `federation_busy`, when it runs out).
+        `release` is called when either refuses."""
+        try:
+            self._require_settled()
+        except BaseException:
+            release()
+            raise
+        self._await_drain(release, None if timeout_s is None else time.monotonic() + timeout_s, cancel)
+
     def _require_settled(self) -> None:
         """Under the lock: refuse the run while the journal holds an unsettled injection, or cannot be read."""
         try:

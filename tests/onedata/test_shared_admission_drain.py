@@ -13,12 +13,12 @@ import dataclasses
 import time
 
 import pytest
-from fault_support import OUTAGE_TARGET, write_faults
+from fault_support import OUTAGE_TARGET, SERVICES, write_faults
 
 from expcore.errors import InfraError
 from expcore_onedata.admission import FederationBusy, FederationLock, current_admission
 from expcore_onedata.config import load_platform
-from expcore_onedata.fault_journal import DRAIN, InjectionJournal
+from expcore_onedata.fault_journal import DRAIN, InjectionJournal, holder
 from expcore_onedata.faults import INJECTOR_FAILURE, load_faults
 from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
 from expcore_onedata.shared_holds import SharedHolds
@@ -129,3 +129,56 @@ def test_o48_the_async_forms_bound_that_ends_inside_the_drain_is_the_uncharged_f
         asyncio.run(drive())
     assert caught.value.kind == FEDERATION_BUSY
     assert SharedHolds(settings.journal).holds() == []
+
+
+# --- a nested hold reuses its context's admission, checked as any admission is ------------------------------------
+
+
+def test_o48_a_nested_tool_waits_out_a_drain_recorded_since_the_outer_hold_began(tmp_path):
+    """O48: a tool entered inside another's hold reuses it, but a drain recorded since the outer hold began (a restore
+    that held no admission) keeps it out as it keeps a fresh admission out: past its bound it is the uncharged
+    `federation_busy`, and the outer hold is still held."""
+    config, settings = federation(tmp_path)
+    with shared_admission(config, reason=REASON, timeout_s=WAIT_S) as outer:
+        FederationLock(settings).hold_for(WAIT_S)
+        with pytest.raises(FederationBusy) as caught, shared_admission(config, reason=REASON, timeout_s=PROBE_S):
+            raise AssertionError("a nested tool was admitted inside a session drain")
+        assert caught.value.kind == FEDERATION_BUSY
+        assert outer.held
+        assert outer.shares.count == 1  # the nested try gave its share back
+
+
+def test_o48_a_nested_tool_is_refused_while_an_injection_is_open(tmp_path):
+    """O48: a nested tool is refused as `injector_failure` when the journal holds an open injection, as a fresh one
+    is."""
+    config, settings = federation(tmp_path)
+    with shared_admission(config, reason=REASON, timeout_s=WAIT_S) as outer:
+        line = {
+            "event": "injecting",
+            "id": "i1",
+            "target": OUTAGE_TARGET,
+            "service": SERVICES["beta"],
+            "holder": holder(),
+        }
+        InjectionJournal(settings.journal).append(line)
+        with pytest.raises(InfraError) as caught, shared_admission(config, reason=REASON, timeout_s=PROBE_S):
+            raise AssertionError("a nested tool was admitted beside an open injection")
+        assert caught.value.kind == INJECTOR_FAILURE
+        assert outer.shares.count == 1
+
+
+def test_o48_a_nested_async_tool_waits_out_a_drain_recorded_since_the_outer_hold_began(tmp_path):
+    """O48: the async form's nested hold waits for a drain as the synchronous form's does."""
+    config, settings = federation(tmp_path)
+
+    async def drive():
+        async with shared_admission_async(config, reason=REASON, timeout_s=WAIT_S) as outer:
+            FederationLock(settings).hold_for(WAIT_S)
+            with pytest.raises(FederationBusy) as caught:
+                async with shared_admission_async(config, reason=REASON, timeout_s=PROBE_S):
+                    raise AssertionError("a nested tool was admitted inside a session drain")
+            return caught.value, outer.shares.count
+
+    busy, shares = asyncio.run(drive())
+    assert busy.kind == FEDERATION_BUSY
+    assert shares == 1
