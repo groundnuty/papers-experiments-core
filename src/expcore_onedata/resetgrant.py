@@ -125,7 +125,8 @@ def exclusive(config: PlatformConfig, settings: PlacementSettings) -> Iterator[R
     """The exclusive section of a shortcut reset (the module docstring): yield the grant, and on leaving let the hold
     go and take the run's share back. A section inside a live one uses the outer grant. Raise `AdmissionRefused` for
     an admission of another federation or one whose share is not held, and `FederationBusy` when the share cannot be
-    taken back."""
+    taken back; when the body raised, its exception is the one raised, with the failure to take the share back noted
+    on it (the share then stays given up, and the run's infrastructure refused)."""
     outer = _GRANT.get()
     if settings.reset_shortcut and outer is not None and outer.held:
         yield outer
@@ -134,9 +135,15 @@ def exclusive(config: PlatformConfig, settings: PlacementSettings) -> Iterator[R
     token = _GRANT.set(grant)
     try:
         yield grant
-    finally:
+    except BaseException as error:  # the body's failure stays the one raised: it says why the reset failed
         _GRANT.reset(token)
-        grant.end()
+        try:
+            grant.end()
+        except Exception as ending:  # the share is still given up, so the run's infrastructure stays refused
+            error.add_note(f"and the share of the reset lock was not taken back: {type(ending).__name__}: {ending}")
+        raise
+    _GRANT.reset(token)
+    grant.end()
 
 
 def _take(config: PlatformConfig, settings: PlacementSettings) -> ResetGrant:

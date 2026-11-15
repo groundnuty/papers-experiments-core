@@ -418,6 +418,35 @@ def test_o11_a_share_that_cannot_be_taken_back_refuses_the_runs_agent(tmp_path):
     other.close()
 
 
+def test_o11_a_reset_that_fails_keeps_its_failure_when_its_share_cannot_be_taken_back(tmp_path):
+    """O11: a reset that failed inside its section raises its own failure, which says why the reset failed, with the
+    share's failure noted on it; the share stays given up, so the run's agent is refused all the same."""
+    config, _, lock = federation(tmp_path, admission_timeout_s=0.3)
+    other = lock.acquire(exclusive=False, timeout_s=PROBE_S)
+    other.reset.give_up()
+
+    def failing_reset():
+        with exclusive(config, shortcut()):
+            raise RuntimeError("the reset failed at its quiet stage")
+
+    with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
+        share = admission.reset
+        ended = share.end_exclusive
+
+        def and_taken_by_the_other():
+            ended()
+            assert other.reset.try_exclusive()
+
+        share.end_exclusive = and_taken_by_the_other
+        with pytest.raises(RuntimeError, match="quiet stage") as caught:
+            failing_reset()
+        assert any("not taken back" in note for note in caught.value.__notes__)
+        with pytest.raises(AdmissionRefused, match="reset"):
+            require_admission(config)
+    other.reset.end_exclusive()
+    other.close()
+
+
 # --- no lock outlives its holder ------------------------------------------------------------------------------------
 
 
