@@ -93,6 +93,7 @@ from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapsho
 from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
+from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
 from expcore.models.route import sdk_version
 from expcore.provenance.codestamp import require_known
@@ -160,6 +161,7 @@ class StudyAnalysis:
     rows: tuple[Row, ...]
     result: AnalysisResult
     scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
+    egress: EgressAnalysis | None = None  # a batch checked for egress: the verdicts and the sensitivity analysis
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -773,7 +775,7 @@ def _analyse_loaded(
         _require_campaign(export, verified)
     finally:
         verified.close()
-    rows, scores = [], {}
+    rows, scores, runs = [], {}, []
     for entry in export["analysed_attempts"]:
         where = (entry["digest"], Path(entry["run_dir"]).name, entry["run_key"], entry["attempt"])
         record = verified.record_for(*where)
@@ -783,12 +785,16 @@ def _analyse_loaded(
         scores[entry["run_key"]] = scored.scores
         task = study.tasks[str(entry["factors"]["task"])]
         rows.append(Row.from_export(entry, _outcomes_of(scored), task.attributes))
+        runs.append((record, entry["condition"]))
+    absent = _absent_runs(export)
     try:
-        result = analyse(rows, study.prereg, _absent_runs(export))
+        result = analyse(rows, study.prereg, absent)
     except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
+    egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
-    return StudyAnalysis(study, code, sdk_version(CORE_DISTRIBUTION), export, scores, tuple(rows), result, versions)
+    core = sdk_version(CORE_DISTRIBUTION)
+    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress)
 
 
 def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
@@ -853,7 +859,37 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         "conditions": condition_accounting(analysis.export),
         "contrasts": analysis.result.contrasts,
         **_holm_entries(analysis.result),
-    }
+    } | ({} if analysis.egress is None else {"egress": _egress_summary(analysis.egress)})
+
+
+def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch checked for egress (#179): each analysed run's verdict (its flags, its
+    log's state and reasons, its outside destinations by address and port, its static-scan hits) and the sensitivity
+    analysis without the flagged runs, or why there is none."""
+    sensitivity = egress.sensitivity
+    return {
+        "counts": egress.counts(),
+        "runs": [
+            {
+                "run_key": run.run_key,
+                "attempt": run.attempt,
+                "condition": run.condition,
+                "flags": list(run.flags),
+                "log": run.log,
+                "unknown": list(run.unknown),
+                "outside": [
+                    {key: entry.get(key) for key in ("address", "port", "type", "attempts")} for entry in run.outside
+                ],
+                "scan": dict(run.scan),
+            }
+            for run in egress.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in egress.flagged], "contrasts": sensitivity.contrasts,
+              "holm": sensitivity.holm},
+        "sensitivity_refused": egress.refused,
+    }  # fmt: skip
 
 
 def report_text(analysis: StudyAnalysis) -> str:
@@ -866,6 +902,7 @@ def report_text(analysis: StudyAnalysis) -> str:
         core_version=analysis.core_version,
         scorers=analysis.scorers,
         interval_level=analysis.study.prereg.bootstrap.ci_level,
+        egress=analysis.egress,
     )
 
 

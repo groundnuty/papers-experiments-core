@@ -1095,6 +1095,45 @@ A study that compares the two oneclient I/O modes has to show, per run and from 
 
 **A run whose modes disagree, or whose log cannot say, is refused.** The instrument's check sets the attempt aside as `io_mode_integrity` infrastructure, a kind no condition can declare, with an `instrument_refusal` that names both modes, and the attempt runs again; it is never scored as the declared mode. An unreadable or unparsable log is `unknown` and refused the same way. A study that would rather keep such a run in the record and decide itself builds `MountIoMode(sandbox, refuse=False)` and counts a run as one of its declared mode only when `agrees(snapshot)` says so, which recomputes the answer and reads anything but a matching mount snapshot as no. Count the refused attempts per condition and report them beside the analysis, as with the other instruments' refusals.
 
+### Egress on HPC: detected and reported, not blocked
+
+On an HPC batch node an unprivileged user gets no network namespace, so your agent's network cannot be restricted there. The study's PI ruled (13 Nov 2026) that egress is acceptable on such nodes if it is detected: each run's outbound connections are logged, classified and recorded, the agent's code is scanned, flagged runs are reported, and the confirmatory contrasts are run again without them. The HPC bundle's run driver logs them (`deploy/hpc-federation/bundle/egresslog.c` in the agent's cell, `egress-collector.py` outside it; `deploy/hpc-federation/run/README.md` gives the steps), and your executor records them with `expcore.egress.EgressLog`:
+
+```python
+from pathlib import Path
+
+from expcore.egress import EgressLog, declaration
+
+gate_port = 41234  # the data gate's high port on the agent's node, as the run driver chose it
+declared = declaration(
+    [("127.0.0.1", gate_port)],  # the data gate, as the agent's cell reaches it
+    ("127.0.0.1", gate_port),  # the canary: the launcher's connect before the agent ran
+    hosts=["provider-a.test"],  # the platform's names, which a URL in the agent's code may use
+    network_calls=True,  # REST: the agent's own HTTP to the gate is its data path
+)
+
+
+class CollectorLog:
+    """Where the run's collector wrote its log: its bytes, or None when there is none."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def egress_log(self) -> bytes | None:
+        return self.path.read_bytes() if self.path.is_file() else None
+
+
+nonce = "00112233445566778899aabbccddeeff"  # the value the run driver gave this run's collector
+egress = EgressLog(CollectorLog(Path("egress.jsonl")), declared, nonce)  # listed with the run's other instruments
+assert egress.finish()["log"] == "unknown"  # no log was written here: unknown, never a run that connected nowhere
+```
+
+Stop the run's collector after the agent's cell and before `finish_instruments`, as the gate is stopped before the bytes served are counted: a log without its end line is unknown. Declare `network_calls=True` only for a REST data path; otherwise every `requests`, `urllib` or `socket` in the agent's code flags its run.
+
+What you get, with nothing else to call: once one analysed record carries the `egress` instrument, `analyze` judges every analysed run, flagged for an outside connection, an unknown log or a static-scan hit, and runs the preregistered analysis again without the flagged runs. `report.md` gains a section `## Egress (detected, not prevented)` listing them, by condition and run, with that sensitivity analysis in the tables of the primary one; `analysis.json` gains `egress`; `analyze` prints a line per contrast. **A run whose log is missing or damaged, or whose record has no egress snapshot, is flagged as unknown, never counted clean.** A report without the section is a batch in which no run carried the instrument: egress was not checked, which is right on Docker hosts, whose agents have no route out, and wrong on HPC. What each field and reason means is in [`interfaces.md`](interfaces.md#egress-where-it-cannot-be-blocked-the-egress-instrument).
+
+Report the primary analysis as it stands and the sensitivity analysis beside it. Neither line of detection prevents egress, and both can be passed: a statically linked program, raw system calls or io_uring pass the shim, and code that builds a name at run time passes the scan.
+
 ### The order instruments start and finish in
 
 Instruments nest, like a setup and its teardown. `start_instruments` starts them in list order and `finish_instruments` finishes them in the reverse of it, so **an instrument listed earlier finishes later**. The first listed starts first and finishes last; one listed after another starts after it and finishes before it.

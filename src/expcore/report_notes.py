@@ -312,6 +312,24 @@ BUDGET_HOLD_NOTES = [
     "leaves out included. A model with more of them had its runs stopped by the budget more often than the others.",
 ]
 
+EGRESS_NOTES = [
+    "This batch's runs were checked for egress: their agents ran where the network could not be restricted (an HPC",
+    "batch node without network namespaces), so each run's outbound connections were logged through a shim in the",
+    "agent's cell and its code cells scanned. A run is flagged for an `outside` connection (an intact log lists a",
+    "destination that is neither the data gate nor a loopback address), a `log_unknown` (the log is missing, damaged,",
+    "of another run, without the launcher's canary, or the record has no readable egress snapshot: unknown is never",
+    "read as clean), or a `static_scan` hit (a URL off the platform, a download, or a network call in the agent's",
+    "code). Detection, not prevention: a statically linked program, raw system calls, io_uring or the C library's own",
+    "DNS queries pass the shim, which is why the scan is the second line, and neither stops a connection.",
+]
+
+SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without the flagged runs: each one is left out as an absent run (`excluded`),",
+    "so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The analysis above stands; this",
+    "says whether its conclusions hold without the runs whose network use was detected or could not be checked. A run",
+    "is left out for what was detected about it, never for its outcome.",
+]
+
 HOLD_NOTES = [
     "Each row is a stretch in which the platform's health check said that only an operator could end what it found (a",
     "repair that failed and left its fault in place), so no run started. A held run has no attempt; the hold itself is",

@@ -34,7 +34,10 @@ the cause, when Couchbase has no administrator once onepanel's Couchbase setup i
   port opening (the start of the last look that did not), and its verdict: "hpcop: Couchbase guard passed", or
   "hpcop: Couchbase guard FAILED: <cause>", after which it sends SIGTERM to START_PID if that is still its
   parent: the stock start script, whose trap stops every component. finish*.sh fails the start on FAILED, and
-  when the deployment ends without "passed". It changes nothing in Couchbase, and never connects before our
+  when the deployment ends without "passed". It also prints one `hpcop-evidence {...}` line per request of its
+  decisive round (GET /settings/web as the administrator, expected 200, and anonymously, expected 401), each with
+  the status as an integer, which finish*.sh copies into the batch job's log for the run's evidence (run/evidence.py).
+  It changes nothing in Couchbase, and never connects before our
   listener holds the port (the shim checks each connect as well). START_PID 0 (offline tests): signal nothing.
   Exit status 0 when passed, 2 when FAILED.
 --wait-listener PORT TIMEOUT:
@@ -151,6 +154,25 @@ def say(message):
     print("hpcop: " + message, flush=True)
 
 
+def evidence(request, status, expected):
+    """One request's status as data, in run.log: finish*.sh copies these lines into the batch job's log, where the
+    run's driver reads them back (run/evidence.py). A check, a moment, a request and two numbers: no secret, no host."""
+    line = {
+        "check": "cb_watch",
+        "when": "start of the service",
+        "request": request,
+        "status": status,
+        "expected": expected,
+    }
+    print("hpcop-evidence " + json.dumps(line), flush=True)
+
+
+def settled(mine, anonymous):
+    """The decisive round's two answers (not a round that was asked again after a 5xx)."""
+    evidence("GET /settings/web (administrator)", mine, 200)
+    evidence("GET /settings/web (anonymous)", anonymous, 401)
+
+
 def fail(start_pid, cause):
     """The verdict first (finish*.sh reads it from run.log), then stop the service through the start script."""
     say("%s: %s; stopping the service" % (FAILED, cause))
@@ -247,6 +269,7 @@ def watch(secrets, timeout, port, start_pid):
             time.sleep(ASK)
             continue
         if mine == 401:
+            settled(mine, anonymous)
             return fail(
                 start_pid,
                 "Couchbase on %s:%d has an administrator that is not this launch's (GET "
@@ -255,16 +278,19 @@ def watch(secrets, timeout, port, start_pid):
         if mine == 200:
             who = settings.get("username") if isinstance(settings, dict) else None
             if who != ours[0]:
+                settled(mine, anonymous)
                 return fail(
                     start_pid, "Couchbase on %s:%d names %r as its administrator, not this launch's" % (HOST, port, who)
                 )
             if anonymous == 200:
+                settled(mine, anonymous)
                 return fail(
                     start_pid,
                     "Couchbase on %s:%d answers an anonymous GET /settings/web with HTTP 200: "
                     "anyone can act as its administrator" % (HOST, port),
                 )
             if anonymous == 401:
+                settled(mine, anonymous)
                 break
         time.sleep(ASK)  # 5xx or another transient answer: ask again
     if absent is None:
