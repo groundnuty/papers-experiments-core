@@ -72,7 +72,7 @@ from expcore.campaign.export import (
 )
 from expcore.campaign.export_join import join_exports
 from expcore.campaign.lease import LeasePool
-from expcore.campaign.lock import CampaignLocked, DispatchLock
+from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
@@ -90,6 +90,7 @@ from expcore.campaign.shard_run import (
     share_settings_by_model,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE, SnapshotError, take_snapshot
+from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
@@ -486,18 +487,27 @@ def _check_batch_of(
                 f"{out_dir(study)}: holds a merged batch ({MERGE_FILE}) and a campaign store; use one or the other"
             )
         return _check_merged(study, directory, code, env, partial)
-    if store.is_file():  # without a store, take_snapshot refuses below
-        changed = differences(campaign_environment(read_fingerprint(store)), env)
+    if not store.is_file():
+        raise Refused(f"{store}: no campaign store here; run the study first")
+    lock, in_place = _hold_for_check(store, partial)
+    try:
+        try:
+            recorded = read_fingerprint(store, in_place=in_place)
+        except StoreChanged as error:
+            raise Refused(str(error)) from None
+        changed = differences(campaign_environment(recorded), env)
         if changed:
             raise Refused(
                 f"{store}: the campaign ran under another environment than this check would; check under the "
                 "campaign's environment:\n  " + "\n  ".join(changed)
             )
-    import_what_the_records_need(study, directory)
-    try:
-        running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial)
-    except SnapshotError as error:
-        raise Refused(str(error)) from None
+        import_what_the_records_need(study, directory)
+        try:
+            running = take_snapshot(store, directory / SNAPSHOT_FILE, allow_running=partial, in_place=in_place)
+        except SnapshotError as error:
+            raise Refused(str(error)) from None
+    finally:
+        lock.release()
     _settle_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
@@ -507,21 +517,50 @@ def _check_batch_of(
     return check
 
 
+def _hold_for_check(store: Path, partial: bool) -> tuple[ReaderLock, bool]:
+    """How the check reads the store: a reader's hold of its lock and whether to read it in place (R16).
+
+    A finished store (no dispatcher holds it, its directory read-only too) is held as a reader, so no dispatcher
+    starts while it is read, and read from a private copy (False). A store a dispatcher holds is being written, so no
+    copy of its files is one state: the check is refused unless `partial`, and then the store is backed up in place
+    over a read-only connection (True), the one consistent read of a live store. A store whose lock file is missing
+    or cannot be opened or locked cannot be shown to have no writer, so it is refused, `partial` or not.
+    """
+    lock = ReaderLock(store.parent)
+    try:
+        return lock.acquire(), False
+    except CampaignLocked as error:
+        if not partial:
+            raise Refused(
+                f"{store}: {error}; a dispatcher holds the store while it runs: check it once the dispatcher has "
+                "stopped, or pass --partial to check the store as it stands"
+            ) from None
+        return lock, True
+    except LockMissing as error:
+        raise Refused(
+            f"{store}: {error}; a campaign's out/ keeps the lock file its dispatcher made: copy out/ whole"
+        ) from None
+    except LockUnavailable as error:
+        raise Refused(f"{store}: {error}; the store cannot be shown to have no dispatcher") from None
+
+
 def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
     """Finish or remove what a kill left of the placement of a declared side file in the batch (R15), and say so.
 
-    A temporary file no record names is removed only while this process holds the lock of the campaign the batch
-    belongs to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with
-    no dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released.
-    A lock that cannot be taken (a campaign runs, or the file system refuses `flock`), or a batch that is not the
-    study's own, leaves such a file where it is; a rename that a record names is finished either way. A study that
-    declares no side file is not touched at all.
+    A temporary file no record names is removed only while this process holds the lock of the campaign the batch belongs
+    to (the batch lies under the study's `out/`, so a copy named with `--study` is not that campaign's): with no
+    dispatcher alive no attempt can be staging a file of its own, and none can start before the lock is released. A lock
+    that cannot be taken (a campaign runs, the file system refuses `flock`, or the lock file is read-only, as in a
+    campaign fetched read-only), or a batch that is not the study's own, leaves such a file where it is; a rename that a
+    record names is finished either way. A study that declares no side file is not touched at all.
     """
     if not study.side_files:
         return
     lock = DispatchLock(out_dir(study))
     if Path(batch).resolve().is_relative_to(out_dir(study).resolve()):
-        with contextlib.suppress(CampaignLocked):  # a dispatcher is alive: only what the records name is finished
+        # a dispatcher is alive, or the lock file cannot be opened for writing (a campaign fetched read-only, R16):
+        # either way only what the records name is finished
+        with contextlib.suppress(CampaignLocked, PermissionError):
             lock.acquire()
     try:
         for settled in settle_side_files(batch, study.side_files, remove_unnamed=lock.held):

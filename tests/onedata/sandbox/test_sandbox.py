@@ -927,6 +927,7 @@ def test_o36_the_metadata_records_the_io_mode_the_mount_runs_with_and_the_option
     assert meta["io_mode"] == "proxy"
     assert meta["options"] == [
         *("-o", "ro,allow_other", "--force-proxy-io", "--log-dir", SIDECAR_LOG_DIR, "--config", "/dev/null"),
+        "--disable-log-buffering",  # every mount passes it (O54)
     ]
     assert meta["extra_args"] == {"names": [], "sha256": hashlib.sha256(b"").hexdigest()}
     sbx.stop()
@@ -944,6 +945,7 @@ def test_o36_the_study_extra_arguments_are_recorded_only_by_name_and_hash(world)
     assert meta["mount"]["io_mode"] == "proxy"
     assert meta["mount"]["options"] == [
         *("-o", "ro,allow_other", "--force-proxy-io", "--log-dir", SIDECAR_LOG_DIR, "--config", "/dev/null"),
+        "--disable-log-buffering",  # every mount passes it (O54)
     ]
     assert meta["mount"]["extra_args"] == {
         "names": ["--provider-timeout", "--space", "-o"],  # a short option's attached value is never kept
@@ -980,7 +982,8 @@ def test_o36_the_metadata_records_the_image_config_files_hash_though_oneclient_n
     sbx = start(world, "mounted")
     meta = sbx.metadata()["mount"]
     assert meta["image_config"] == {"path": ONECLIENT_CONFIG_PATH, "sha256": ONECLIENT_CONFIG_SHA256}
-    assert meta["options"][-2:] == ["--config", "/dev/null"]
+    at = meta["options"].index("--config")
+    assert meta["options"][at : at + 2] == ["--config", "/dev/null"]
     sbx.stop()
 
 

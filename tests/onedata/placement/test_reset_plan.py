@@ -66,8 +66,8 @@ def test_o46_a_file_a_providers_own_listing_missed_is_still_read_there_by_the_pl
     missed = fake.id_of(FILES[4])
     original = resetqos.listed
 
-    def listed(p, provider):
-        entries, pages = original(p, provider)
+    def listed(p, provider, reads):
+        entries, pages = original(p, provider, reads)
         return ({k: v for k, v in entries.items() if provider != "beta" or k != missed}, pages)
 
     monkeypatch.setattr(resetqos, "listed", listed)

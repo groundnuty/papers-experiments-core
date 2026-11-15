@@ -253,7 +253,7 @@ from expcore.records.redact import register_secret
 from expcore_onedata.collectbudget import COLLECT_AFTER_BYTES, CollectBudget
 from expcore_onedata.config import PlatformConfig, Space
 from expcore_onedata.credentials import Principal
-from expcore_onedata.readretry import ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
+from expcore_onedata.readretry import ANSWERED, ONE_ATTEMPT, Attempt, Exhausted, ReadRetry, Trace, run_attempts
 from expcore_onedata.streamed import Digest, ReadOutcome, media_type
 
 API_ZONE = "/api/v3/onezone"  # [S1] the prefix of every Onezone call
@@ -417,6 +417,13 @@ log = logging.getLogger(__name__)
 # The only failures a read is retried on (`readretry.py`): a wait that ran out for the answer, the connection or a slot
 # of the pool. A write timeout, an error answer and every other transport failure are final.
 RETRIED_TIMEOUTS = (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout)
+# What a policy that declares `transport` (the reset's per-file reads, `Provisioner.reading_retry`) also retries: a
+# connection that could not be made, or was reset or closed before the answer was whole. Never an answer.
+RETRIED_TRANSPORT = (httpx.ConnectError, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError)
+# The client's pool keeps alive as many idle connections as it may open, so a bulk reading with more requests in flight
+# than httpx's default keep-alive bound (20) reuses its connections instead of closing those above it as each goes idle
+# and connecting again: a fresh TCP and TLS connection per read, each leaving a socket in TIME_WAIT here (O46).
+POOL_CONNECTIONS = 100  # httpx's default bound on the connections open at once, kept
 ERROR_BODY_BYTES = 64 * 1024  # the most of a streamed answer's error body read to find Onedata's error id
 
 
@@ -447,8 +454,10 @@ _REQUEST_COUNT = re.compile(r"Request Count: (\d+)$")  # the end of httpcore's `
 def _build_http(config: PlatformConfig, timeout_s: float) -> httpx.Client:
     """The HTTP client the layer sends through when none is injected, checking certificates as `[tls]` says. A retried
     read is sent through one more of them, made for that read alone, so it has a connection of its own
-    (`readretry.py`)."""
-    return httpx.Client(timeout=timeout_s, verify=config.tls.client_verify())
+    (`readretry.py`). Its pool keeps every idle connection it may open alive (`POOL_CONNECTIONS`), for httpx's own
+    5 s, so a reading with many requests in flight reuses its connections."""
+    limits = httpx.Limits(max_connections=POOL_CONNECTIONS, max_keepalive_connections=POOL_CONNECTIONS)
+    return httpx.Client(timeout=timeout_s, verify=config.tls.client_verify(), limits=limits)
 
 
 _NO_BODY = httpx.ByteStream(b"")  # holds nothing and points at nothing: what a released answer's stream is made
@@ -545,6 +554,11 @@ def _exchange(http: httpx.Client, budget: CollectBudget, method: str, url: str, 
     try:
         if not _is_redirect(response.status_code):  # a 3xx is refused unread (`_refuse_redirect`), whatever it holds
             response.read()
+    except Exception as error:
+        # The status had arrived: a failure now is that answer's, which a policy that retries a connection failure
+        # never asks again for when the status is an error (`readretry.ANSWERED`). Set on the error on purpose.
+        setattr(error, ANSWERED, response.status_code)
+        raise
     finally:
         try:
             _release(response)
@@ -692,6 +706,14 @@ def answered_absent(error: PlatformError) -> bool:
     if isinstance(error, NotSent):
         return False
     return error.status == 404 or (error.status, error.code, error.errno) == POSIX_ABSENT
+
+
+def sent_unanswered(error: PlatformError) -> bool:
+    """Tell whether a mutation went past the gate and no answer came back whole: a connection failure, a reset or a
+    timeout while it was sent or answered (`transport`). It may or may not have been applied, so a caller never sends
+    it again: it reads the state and decides from that (O09, O46). A request refused unsent (`NotSent`, the gate's
+    `ScopeUnread` among them) was never sent, and an answer of any status is an answer, not a lost one."""
+    return error.transport and not isinstance(error, NotSent)
 
 
 def _streamed_error_fields(response: httpx.Response) -> tuple[str | None, str | None]:
@@ -935,6 +957,8 @@ class OnezoneClient:
         except httpx.HTTPError as error:
             failed = f"{label}: {method} failed ({type(error).__name__})"
         else:
+            if method == "GET" and retry.attempts > 1 and response.status_code >= 300:
+                retry.answered(label, str(response.status_code))  # an answer, decided by the caller: tallied apart
             return _checked(response, method, label)
         # Raised here, with the handlers over: an error raised inside one has the httpx error as its context, and that
         # holds the request, its body and the frames the failure passed through, for as long as the error lives (#259).
@@ -952,7 +976,8 @@ class OnezoneClient:
         fresh: bool,
     ) -> httpx.Response:
         """Send one request as its kind asks: a GET under a policy of more than one attempt is retried when it timed
-        out, a write of content is sent once and logged with how its connection began, and any other is sent once."""
+        out, or under a `transport` policy when its connection failed too (`RETRIED_TRANSPORT`), a write of content is
+        sent once and logged with how its connection began, and any other is sent once."""
         if method == "GET" and retry.attempts > 1:
             return run_attempts(
                 send,
@@ -960,6 +985,7 @@ class OnezoneClient:
                 label=label,
                 timeout_s=wait,
                 timeouts=RETRIED_TIMEOUTS,
+                transport=RETRIED_TRANSPORT,
                 deadline_s=deadline_s,
                 served=self._served_before,
             )
@@ -1464,9 +1490,11 @@ class OnezoneClient:
         reset's, own space) the target must be that space alone: its id, its name, and its own prefixes.
 
         `gate_retry` is the policy of the gate's own reads, the ones that find the target's space, and of those alone:
-        a read that timed out is tried again under it (`readretry.py`), each attempt answered is read afresh, and after
-        the last timeout the target is unread and nothing is sent (`ScopeUnread`). The request itself is sent once,
-        whatever the policy, and a caller that measures the platform leaves the default, one attempt.
+        a read that timed out (or, under a reset's policy, failed to connect) is tried again under it (`readretry.py`),
+        each attempt answered is read afresh, and after the last failed attempt the target is unread and nothing is
+        sent (`ScopeUnread`). The request itself is sent once, whatever the policy, and a caller that measures the
+        platform leaves the default, one attempt; one whose answer is lost is the caller's to judge, never to send
+        again blindly (`sent_unanswered`).
 
         With `fresh` the request goes on a connection of its own, opened for it by a one-shot client built as the pool's
         is (the same `[tls]`) and closed when the answer is in, never on an idle connection of the pool: a write of a

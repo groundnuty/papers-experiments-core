@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from expcore_onedata import occupancy, resetqos
+from expcore_onedata.readretry import recorded
 from expcore_onedata.resetgrant import current_grant
 
 if TYPE_CHECKING:  # the reset imports this module's type; only its interface is used here
@@ -52,6 +53,7 @@ class Holdings:
     seconds: float
     read_epoch: float | None = None
     grant: Any = field(default=None, compare=False, repr=False)
+    read_retry: dict[str, Any] = field(default_factory=dict, compare=False)  # the reads' tally (`ReadRetry.facts`)
 
     def held_paths(self, provider: str) -> list[str]:
         """The paths of the files a provider holds any bytes of, sorted; none for a provider not read."""
@@ -63,7 +65,8 @@ class Holdings:
 
     def facts(self, label: Callable[[str], str]) -> dict[str, Any]:
         """The figures, every provider by its position: the files listed, per provider read the files read, the files
-        held and the bytes, the reads of the scan, and the seconds."""
+        held and the bytes, the reads of the scan, the seconds, and the tally of every read (`read_retry`: reads,
+        retries, failed attempts by error type, the answers that were no plain success, per provider)."""
         per = {
             label(q): {
                 "files_read": len(held),
@@ -77,6 +80,7 @@ class Holdings:
             "providers": per,
             "reads": dict(self.scan.reads),
             "seconds": self.seconds,
+            "read_retry": self.read_retry,
         }
 
 
@@ -90,14 +94,19 @@ def plan_scan(reset: "SpaceReset", *, never_holds: Collection[str] = ()) -> Hold
         raise ValueError("never_holds is a collection of provider names")
     for provider in never_holds:
         p.check_eviction(provider)
-    p.verify_space()
+    reads = p.reading_retry()  # every read of the reading, the space's name, its listing's and block maps', tallied
+    with recorded(reads):
+        p.verify_space(retry=reads)
     grant = current_grant()  # the section the reading is made in, held from before its listing begins
     epoch, began = reset.now(), p.clock()
-    found = resetqos.by_listing(p, providers)
-    files = sorted(found.listing.regular)  # every provider's listing's, read at each: one listing may miss a file
-    can_hold = [q for q in p.space.support.providers if q != p.settings.holder and q not in never_holds]
-    held = occupancy.read_files(p, dict.fromkeys(can_hold, files), p.client.provider_label, occupancy.Budget(p.clock()))
-    return Holdings(found, held, began, round(p.clock() - began, 3), read_epoch=epoch, grant=grant)
+    with recorded(reads):
+        found = resetqos.by_listing(p, providers, reads)
+        files = sorted(found.listing.regular)  # every provider's listing's, read at each: one listing may miss a file
+        can_hold = [q for q in p.space.support.providers if q != p.settings.holder and q not in never_holds]
+        budget = occupancy.Budget(p.clock(), retry=reads)
+        held = occupancy.read_files(p, dict.fromkeys(can_hold, files), p.client.provider_label, budget)
+    seconds = round(p.clock() - began, 3)
+    return Holdings(found, held, began, seconds, read_epoch=epoch, grant=grant, read_retry=reads.facts())
 
 
 def given_scan(reset: "SpaceReset", holdings: Holdings) -> resetqos.Found:

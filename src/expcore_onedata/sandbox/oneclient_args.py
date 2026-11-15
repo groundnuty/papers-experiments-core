@@ -4,13 +4,13 @@
 The core declares everything oneclient would otherwise decide at run time: the I/O mode (`io_mode`), the TLS check (the
 platform's `[tls]`), the configuration file (never read: `--config /dev/null`), the environment (`env -u` of the
 three variables of the image and of oneclient's own that could set an option), the log directory (`--log-dir`, where
-the run's own directory is bound so the log is part of its evidence, O05) and, for direct I/O, where each storage is
-(one `--override` per entry of `[sandbox.mount.storages]`) and the log's buffering. A study's `extra_args` reach the
-same argv, so none of them may set what the core sets. `mount_problem` also holds a mount's direct-I/O keys to its mode:
-a direct mount needs its storage mapping and its check file, a proxy mount may have neither (O40). `extra_arg_problem`
-is the one check of the extra arguments: it names the reason an argument is refused, and it runs where the settings
-are built (`MountSettings`), where the platform file is loaded and where the command is made, so settings built in
-code cannot give oneclient two force-I/O options, a second configuration or a second log directory.
+the run's own directory is bound so the log is part of its evidence, O05), the log's buffering (O54) and, for direct
+I/O, where each storage is (one `--override` per entry of `[sandbox.mount.storages]`). A study's `extra_args` reach
+the same argv, so none of them may set what the core sets. `mount_problem` also holds a mount's direct-I/O keys to its
+mode: a direct mount needs its storage mapping and its check file, a proxy mount may have neither (O40).
+`extra_arg_problem` is the one check of the extra arguments: it names the reason an argument is refused, and it runs
+where the settings are built (`MountSettings`), where the platform file is loaded and where the command is made, so
+settings built in code cannot give oneclient two force-I/O options, a second configuration or a second log directory.
 
 `LONG_OPTIONS` and `SHORT_OPTIONS` are the option names oneclient 25.0 (tag `bb8a63e3`) accepts on its command line,
 read from `src/options/options.cc`. A run's metadata keeps an extra argument's name only when it is one of them
@@ -35,8 +35,10 @@ CONFIG_NULL = "/dev/null"  # an empty file: boost's parser reads no option from 
 INSECURE_OPTION = "--insecure"
 LOG_DIR_OPTION = "--log-dir"  # the sandbox's own (`containers.sidecar_command`); oneclient takes it once
 OVERRIDE_OPTION = "--override"  # `-r`: one helper parameter of one storage, `<storage id>:<name>:<value>` (O40)
-# With direct I/O the sidecar passes it, so glog writes each INFO line as it is logged and the start check sees every
-# line its test read caused (`logging.cc`: FLAGS_logbuflevel -1; otherwise INFO waits up to 30 s in a buffer, O40)
+# Every mount's sidecar passes it, so glog writes each INFO line as it is logged: a direct mount's start check sees
+# every line its test read caused (O40) and the collection finds a mount's start lines whichever mode it declares
+# (O54); otherwise INFO waits up to 30 s in a buffer (`logging.cc`: FLAGS_logbuflevel -1). It sets when lines are
+# written and nothing else: no data path, no privilege.
 DISABLE_LOG_BUFFERING = "--disable-log-buffering"
 UNSET_ENV = ("ONECLIENT_INSECURE", "ONECLIENT_OVERRIDE", "ONECLIENT_CONFIG")  # removed from the sidecar's environment
 
@@ -80,7 +82,7 @@ OVERRIDE_REFUSAL = (
     "[sandbox.mount.storages] alone declares, for direct I/O"
 )
 LOG_BUFFERING_REFUSAL = (
-    "must not carry --disable-log-buffering with direct I/O: the sidecar passes it, and oneclient refuses a switch "
+    "must not carry --disable-log-buffering: the sidecar passes it with every mount, and oneclient refuses a switch "
     "given twice"
 )
 ENV_SETTING = re.compile(r"ONECLIENT_[A-Za-z0-9_]*=", re.IGNORECASE)
@@ -126,9 +128,9 @@ def short_letters(argument: str) -> str:
 
 def extra_arg_problem(argument: str) -> str | None:
     """Why a study's extra argument may not reach oneclient, or None when it may: it sets the TLS check, the I/O mode,
-    the configuration file, the log directory, a storage's place (O40) or oneclient's environment, which the core
-    declares. The reason never holds a value: the log directory's names the option as written (`-l`, `--log-d`), its
-    value dropped.
+    the configuration file, the log directory, the log's buffering (O54), a storage's place (O40) or oneclient's
+    environment, which the core declares. The reason never holds a value: the log directory's names the option as
+    written (`-l`, `--log-d`), its value dropped.
 
     oneclient reads its command line with boost::program_options in its default style, so the log directory has more
     forms than `-l` and `--log-dir`: an attached value (`-l/x`), switches clustered before it (`-fl /x`, which
@@ -146,18 +148,11 @@ def extra_arg_problem(argument: str) -> str | None:
         return log_dir_refusal("-l")
     if abbreviates(argument, OVERRIDE_OPTION) or "r" in short_letters(argument):
         return OVERRIDE_REFUSAL
+    if abbreviates(argument, DISABLE_LOG_BUFFERING):
+        return LOG_BUFFERING_REFUSAL
     if ENV_SETTING.match(argument):
         return ENV_REFUSAL
     return None
-
-
-def mode_arg_problem(io_mode: object, argument: str) -> str | None:
-    """Why an extra argument may not reach oneclient in this I/O mode, or None: `extra_arg_problem`'s reasons, and with
-    direct I/O the log-buffering switch, which the sidecar then passes itself."""
-    problem = extra_arg_problem(argument)
-    if problem is None and io_mode == DIRECT and abbreviates(argument, DISABLE_LOG_BUFFERING):
-        return LOG_BUFFERING_REFUSAL
-    return problem
 
 
 DIRECT_NEEDS = (
@@ -250,7 +245,7 @@ def mount_problem(
     if io_mode not in IO_MODES:
         return f"[sandbox.mount] io_mode must be one of: {', '.join(IO_MODES)}"
     for argument in extra_args:
-        problem = mode_arg_problem(io_mode, argument)
+        problem = extra_arg_problem(argument)
         if problem is not None:
             return f"[sandbox.mount] extra_args {problem}"
     found = direct_keys_problem(io_mode, tuple(storages) or None, check_file)

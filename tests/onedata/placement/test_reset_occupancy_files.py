@@ -252,8 +252,8 @@ def test_o46_a_file_a_providers_own_listing_missed_is_still_read_there(
     fake.blocks[(missed, BETA_ID)] = [[0, len(DATA)]]
     original = resetqos.tree
 
-    def tree(p, provider):
-        root, leaves = original(p, provider)
+    def tree(p, provider, reads):
+        root, leaves = original(p, provider, reads)
         return root, [leaf for leaf in leaves if provider != "beta" or leaf[0] != missed]
 
     monkeypatch.setattr(resetqos, "tree", tree)
@@ -336,7 +336,7 @@ def test_o46_one_budget_covers_every_call_of_a_reading(
     monkeypatch.setattr(occupancy, "READS_MAX", len(FILES) + 2)
     provisioner = provisioner_with(client, config, platform_file, ticker, tmp_path)
     ids = sorted(fake.id_of(path) for path in FILES)
-    budget = occupancy.Budget(ticker.now)
+    budget = occupancy.Budget(ticker.now, retry=provisioner.reading_retry())
     occupancy.read_files(provisioner, {"beta": ids}, provisioner.client.provider_label, budget)
     with pytest.raises(occupancy.ProvisionError, match=rf"needs {2 * len(FILES)} block-map read\(s\)"):
         occupancy.read_files(provisioner, {"beta": ids}, provisioner.client.provider_label, budget)
