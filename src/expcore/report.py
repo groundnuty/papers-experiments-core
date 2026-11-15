@@ -15,6 +15,11 @@ are the same text: no clock, no path and no random number enters it.
   says "outside every Holm family", the equivalence table names each claim's Holm family, and the terminal line of a
   member names its family. A result whose families and Holm decisions disagree is refused
   (`report_families.check_families`). One flat family's report is the text it was before families were named.
+- With declared equivalence families (S18) the equivalence table is headed "Equivalence families", names each claim's
+  equivalence family (and, with named Holm families, the Holm family of its significance test), and is followed by
+  each equivalence family's TOST steps; the terminal line of a claim names its equivalence family. A result whose
+  equivalence families and decisions disagree is refused (`report_families.check_equivalence_families`). A report
+  without them is the text it was before they existed.
 - A conclusion is never shown without its significance. Each row carries the raw p-value and the Holm-adjusted one
   (or the word "exploratory") beside the conclusion, and the preregistered equivalence margin with the interval at
   1 - 2 alpha that `equivalent` and `trivial_difference` rest on, and the conclusion words already encode the decision:
@@ -67,7 +72,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.accounting import condition_accounting
-from expcore.report_families import check_families, one_line, steps_lines
+from expcore.report_families import (
+    check_equivalence_families,
+    check_families,
+    equivalence_steps_lines,
+    one_line,
+    steps_lines,
+)
 from expcore.report_holds import section as operator_holds
 from expcore.report_notes import (
     ARM_LOST_HEADINGS,
@@ -412,26 +423,57 @@ def _descriptives(result: AnalysisResult, level: float | None) -> list[str]:
     return [*lines, *_table([*header, "Undefined replicates"], rows), ""]
 
 
+CLAIM_HEADER = ["Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"]
+
+
 def _equivalence_family(result: AnalysisResult) -> list[str]:
     """The equivalence family's members (S15): each one's TOST p-value, its Holm-adjusted one, and the interval at the
-    level Holm compared it with; nothing when the preregistration declares no equivalence family."""
+    level Holm compared it with; nothing when the preregistration declares no equivalence family. Declared
+    equivalence families (S18) have a table and steps of their own (`_declared_equivalence_families`)."""
+    if result.equivalence_families:
+        return _declared_equivalence_families(result)
     members = [r for r in result.contrasts if r.in_equivalence_family]
     if not members:
         return []
     family_of = check_families(result)  # several named families (S17): each claim is adjusted within its own
     rows = []
     for r in members:
-        low, high = r.equivalence_interval_adjusted or (math.nan, math.nan)
-        level = UNKNOWN if r.equivalence_level is None else percent(r.equivalence_level)
-        interval = f"[{_num(low)}, {_num(high)}]"
         family = [family_of.get(r.name, UNKNOWN)] if family_of else []
-        rows.append([r.name, *family, _margin(r), _p(r.tost_p), _p(r.tost_p_holm), level, interval, _yes(r.equivalent)])
+        rows.append([r.name, *family, *_claim_cells(r)])
     column = ["Holm family"] if family_of else []
-    header = ["Contrast", *column, "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval"]
+    header = ["Contrast", *column, *CLAIM_HEADER]
     within = ", within each Holm family" if family_of else ""
     heading = f"### Equivalence family (Holm over two one-sided tests{within})"
     notes = equivalence_family_notes(result.alpha, by_family=bool(family_of))
-    return ["", heading, "", *_table([*header, "Equivalent"], rows), "", *notes]
+    return ["", heading, "", *_table(header, rows), "", *notes]
+
+
+def _claim_cells(result: ContrastResult) -> list[str]:
+    """An equivalence claim's margin, raw and Holm-adjusted TOST p, interval level, adjusted interval and verdict."""
+    low, high = result.equivalence_interval_adjusted or (math.nan, math.nan)
+    level = UNKNOWN if result.equivalence_level is None else percent(result.equivalence_level)
+    interval = f"[{_num(low)}, {_num(high)}]"
+    return [_margin(result), _p(result.tost_p), _p(result.tost_p_holm), level, interval, _yes(result.equivalent)]
+
+
+def _declared_equivalence_families(result: AnalysisResult) -> list[str]:
+    """Each declared equivalence family's claims (S18), each beside its family and, with named Holm families, the
+    Holm family of its significance test, then each family's steps over its own claims' TOST p-values; after the check
+    that every claim's decision is its own equivalence family's."""
+    equivalence_of = check_equivalence_families(result)
+    holm_of = check_families(result)
+    by_name = {r.name: r for r in result.contrasts}
+    rows = []
+    for family in result.equivalence_families:
+        for name in family.members:
+            holm = [holm_of.get(name, UNKNOWN)] if holm_of else []
+            rows.append([name, one_line(equivalence_of[name]), *holm, *_claim_cells(by_name[name])])
+    header = ["Contrast", "Equivalence family", *(["Holm family"] if holm_of else []), *CLAIM_HEADER]
+    heading = "### Equivalence families (Holm over two one-sided tests, within each declared equivalence family)"
+    lines = ["", heading, "", *_table(header, rows), ""]
+    for family in result.equivalence_families:
+        lines += [*equivalence_steps_lines(family, _table, _p, _num), ""]
+    return [*lines, *equivalence_family_notes(result.alpha, declared=True)]
 
 
 def _yes(value: bool) -> str:
@@ -649,6 +691,7 @@ def summary_lines(result: AnalysisResult) -> list[str]:
     any other word for one that used none."""
     _check_no_claim(result)
     family_of = check_families(result)  # empty for one flat family, whose lines are as they were (S17)
+    equivalence_of = check_equivalence_families(result)  # empty without declared equivalence families (S18)
     adjusted = {d.name: d.p_holm for d in result.holm}
     lines = [f"No confirmatory claim: {NO_CLAIM}."] if result.exploratory_only else []
     for r in result.contrasts:
@@ -660,6 +703,8 @@ def summary_lines(result: AnalysisResult) -> list[str]:
         word = r.conclusion if member else f"{r.conclusion} ({EXPLORATORY})"
         scale = "" if r.ratio is None else " (ln ratio)"  # a log ratio printed bare reads as a difference (S13)
         tost = f", Holm TOST p {_p(r.tost_p_holm)}" if r.in_equivalence_family else ""  # the basis of `equivalent`
+        if r.name in equivalence_of:  # adjusted in its declared equivalence family, which the line names (S18)
+            tost += f" (equivalence family {one_line(equivalence_of[r.name])})"
         smallest = summary_suffix(r)  # the decision under a smallest effect of interest, with the signed estimate (S16)
         line = f"{r.name}: estimate {_num(r.estimate)}{scale}, p {_p(r.p_value)}, Holm p {holm}, {word}{tost}"
         lines.append(line + smallest)

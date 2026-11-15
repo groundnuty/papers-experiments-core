@@ -17,23 +17,16 @@ import pytest
 from fault_support import SERVICES, faults_table
 from gate_heal_support import (
     ANY_ACTION,
-    CRASHED,
-    EVERY,
     GONE_PROCESS,
-    OTHER,
-    READER,
-    SECOND,
     UNCHARGED_WAIT,
-    Federation,
-    ProcessEnded,
     acted,
     core_gate,
-    gate_of,
     heal_lines,
     healed,
     left_by_a_killed_process,
     next_process,
 )
+from gate_support import CRASHED, EVERY, OTHER, READER, SECOND, Federation, ProcessEnded, gate_of
 from heal_support import NAMES, STORES
 
 from expcore.campaign.healthgate import DEFER, FOUND, GO

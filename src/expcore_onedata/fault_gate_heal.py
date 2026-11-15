@@ -28,6 +28,9 @@ restored) then wait. The platform's health check runs before any attempt launche
 - **The settle holds in every process.** Each restart is held before it is sent and again from its return, in this
   process (`Recovery.hold`) and in the federation's drain record (`FederationLock.hold_for`): no admission, in any
   process, is granted before the settle could have ended, even after this one died mid-heal.
+- **A run checked before it is refused at its admission.** Before its record, the heal raises the federation's link
+  epoch (`fault_epoch`), so a run whose pre-run check passed before the heal began is refused, uncharged, at its
+  admission (`admission_recheck`); a heal that cannot raise it does not begin.
 - **Once per stuck episode, durably.** The heal is recorded before its first action (`healing`, with the gate's check
   that found the pair and the process that heals, `liveness.this_process`: its boot id, pid and start time), and when
   it ends (`ended`, the heal's record). Once a heal has begun, no heal runs again until the gate's own link check finds
@@ -66,6 +69,7 @@ from expcore.campaign.deferral import OPERATOR_ACTION
 from expcore.campaign.lease import process_gone
 from expcore.campaign.liveness import this_process
 from expcore.errors import TARGET_LABEL
+from expcore_onedata.fault_epoch import HEAL, LinkEpoch
 from expcore_onedata.fault_heal import INTERRUPTED, HealResult
 from expcore_onedata.fault_journal import InjectionJournal
 from expcore_onedata.fault_matrix import LinkMatrix, label_order
@@ -167,6 +171,11 @@ class GateHeals:
                 return line if not line.get("ok") and line.get("failing") else None
         return None
 
+    def unpassed(self) -> bool:
+        """Whether a heal has begun since the gate's link check last passed (a `healing` line in the episode), however
+        it ended: the gate has not seen every pair pass since."""
+        return any(line["event"] == "healing" for line in self._episode())
+
     def passed(self) -> None:
         """The gate's own link check found every pair passing: the episode ends, a heal cut short in it included, and
         the next stuck pair may be healed again."""
@@ -221,9 +230,11 @@ class GateHeal:
         heal_id, started = uuid.uuid4().hex, _utc()
         begun = {"id": heal_id, "start_utc": started, "mode": self._settings.heal, "trigger": trigger.to_json()}
         begun["process"] = this_process()  # its boot id, pid and start time: a heal cut short is told by it (`latched`)
-        try:  # before the first action: no heal runs again until a link check passes
+        try:  # before the first action: a run checked before it is refused at its admission (`fault_epoch`), and no
+            # heal runs again until a link check passes
+            LinkEpoch(self._settings.journal).raise_for(HEAL)
             self._record.append({"event": "healing", **begun})
-        except OSError as error:
+        except (OSError, ValueError) as error:
             return None, f"the fault gate's heal did not begin: its record cannot be written ({type(error).__name__})"
         try:
             result, latest = self._recovery.heal_stuck(

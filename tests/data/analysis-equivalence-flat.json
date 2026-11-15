@@ -1,0 +1,418 @@
+{
+ "alpha": 0.05,
+ "contrasts": [
+  {
+   "arm_runs": [
+    {
+     "arm": "cond-a",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    },
+    {
+     "arm": "cond-b",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    }
+   ],
+   "arms": [
+    "cond-a",
+    "cond-b"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": 0.016250000000000014,
+   "ci_low": -0.005640625000000002,
+   "cluster": "group",
+   "conclusion": "equivalent",
+   "counts": {
+    "zero_dropped": 1
+   },
+   "equivalence_interval": [
+    -0.0037500000000000033,
+    0.015000000000000013
+   ],
+   "equivalence_interval_adjusted": [
+    -0.010589530547819264,
+    0.020589530547819264
+   ],
+   "equivalence_level": 0.9666666666666667,
+   "equivalence_margin": 0.2,
+   "equivalent": true,
+   "estimate": 0.0050000000000000044,
+   "estimation_unit": [
+    "model",
+    "group"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": false,
+   "factor": null,
+   "in_equivalence_family": true,
+   "in_family": true,
+   "independent_unit": "group",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": null,
+   "n_cells": 8,
+   "n_clusters": 8,
+   "n_clusters_dropped": 0,
+   "n_pairs": 16,
+   "n_pairs_missing": 0,
+   "n_unpaired": 0,
+   "name": "near",
+   "outcome": "near",
+   "p_value": 0.453125,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 0
+   },
+   "per_model": [
+    {
+     "ci_high": 0.016250000000000014,
+     "ci_low": -0.005640625000000002,
+     "estimate": 0.0050000000000000044,
+     "model": "model-a",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": false,
+   "tasks_dropped": [],
+   "tost_p": 3.008374593391755e-09,
+   "tost_p_holm": 9.025123780175265e-09,
+   "treatment_outcomes": null
+  },
+  {
+   "arm_runs": [
+    {
+     "arm": "cond-a",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    },
+    {
+     "arm": "cond-b",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    }
+   ],
+   "arms": [
+    "cond-a",
+    "cond-b"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": 0.14000000000000004,
+   "ci_low": 0.048687500000000015,
+   "cluster": "group",
+   "conclusion": "equivalent",
+   "counts": {
+    "zero_dropped": 0
+   },
+   "equivalence_interval": [
+    0.05750000000000001,
+    0.1363125
+   ],
+   "equivalence_interval_adjusted": [
+    0.028451410108560143,
+    0.16654858989143984
+   ],
+   "equivalence_level": 0.95,
+   "equivalence_margin": 0.2,
+   "equivalent": true,
+   "estimate": 0.09750000000000002,
+   "estimation_unit": [
+    "model",
+    "group"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": false,
+   "factor": null,
+   "in_equivalence_family": true,
+   "in_family": true,
+   "independent_unit": "group",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": null,
+   "n_cells": 8,
+   "n_clusters": 8,
+   "n_clusters_dropped": 0,
+   "n_pairs": 16,
+   "n_pairs_missing": 0,
+   "n_unpaired": 0,
+   "name": "wide",
+   "outcome": "wide",
+   "p_value": 0.0234375,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 0
+   },
+   "per_model": [
+    {
+     "ci_high": 0.14000000000000004,
+     "ci_low": 0.048687500000000015,
+     "estimate": 0.09750000000000002,
+     "model": "model-a",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": false,
+   "tasks_dropped": [],
+   "tost_p": 0.004928400480200841,
+   "tost_p_holm": 0.009856800960401682,
+   "treatment_outcomes": null
+  },
+  {
+   "arm_runs": [
+    {
+     "arm": "cond-a",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    },
+    {
+     "arm": "cond-b",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    }
+   ],
+   "arms": [
+    "cond-a",
+    "cond-b"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": 0.19878125,
+   "ci_low": 0.055781250000000074,
+   "cluster": "group",
+   "conclusion": "not_detected",
+   "counts": {
+    "zero_dropped": 0
+   },
+   "equivalence_interval": [
+    0.05868749999999998,
+    0.19137499999999993
+   ],
+   "equivalence_interval_adjusted": [
+    0.04304050827187443,
+    0.20695949172812556
+   ],
+   "equivalence_level": 0.9,
+   "equivalence_margin": 0.2,
+   "equivalent": false,
+   "estimate": 0.125,
+   "estimation_unit": [
+    "model",
+    "group"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": false,
+   "factor": null,
+   "in_equivalence_family": true,
+   "in_family": true,
+   "independent_unit": "group",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": null,
+   "n_cells": 8,
+   "n_clusters": 8,
+   "n_clusters_dropped": 0,
+   "n_pairs": 16,
+   "n_pairs_missing": 0,
+   "n_unpaired": 0,
+   "name": "edge",
+   "outcome": "edge",
+   "p_value": 0.0390625,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 0
+   },
+   "per_model": [
+    {
+     "ci_high": 0.19878125,
+     "ci_low": 0.055781250000000074,
+     "estimate": 0.125,
+     "model": "model-a",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": false,
+   "tasks_dropped": [],
+   "tost_p": 0.06328265934396946,
+   "tost_p_holm": 0.06328265934396946,
+   "treatment_outcomes": null
+  },
+  {
+   "arm_runs": [
+    {
+     "arm": "cond-a",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    },
+    {
+     "arm": "cond-b",
+     "finished": 16,
+     "lost": {
+      "excluded": 0,
+      "exhausted": 0,
+      "outcome_none": 0,
+      "treatment_outcome_none": 0,
+      "unfinished": 0
+     },
+     "measured": 16,
+     "planned": 16
+    }
+   ],
+   "arms": [
+    "cond-a",
+    "cond-b"
+   ],
+   "cells_lost": {
+    "no_pair": 0
+   },
+   "ci_high": 0.016250000000000014,
+   "ci_low": -0.0031250000000000028,
+   "cluster": "group",
+   "conclusion": "not_detected",
+   "counts": {
+    "zero_dropped": 1
+   },
+   "equivalence_interval": null,
+   "equivalence_interval_adjusted": null,
+   "equivalence_level": null,
+   "equivalence_margin": null,
+   "equivalent": false,
+   "estimate": 0.0050000000000000044,
+   "estimation_unit": [
+    "model",
+    "group"
+   ],
+   "estimator": "wilcoxon_cluster_bootstrap",
+   "exploratory": true,
+   "factor": null,
+   "in_equivalence_family": false,
+   "in_family": false,
+   "independent_unit": "group",
+   "max_unscored_treatment": 0,
+   "minimum_detectable_effect": null,
+   "n_cells": 8,
+   "n_clusters": 8,
+   "n_clusters_dropped": 0,
+   "n_pairs": 16,
+   "n_pairs_missing": 0,
+   "n_unpaired": 0,
+   "name": "side",
+   "outcome": "near",
+   "p_value": 0.453125,
+   "pairs_missing": {
+    "exhausted": 0,
+    "outcome_none": 0,
+    "treatment_excluded": 0,
+    "treatment_outcome_none": 0,
+    "unpaired_or_left_out": 0
+   },
+   "per_model": [
+    {
+     "ci_high": 0.016250000000000014,
+     "ci_low": -0.0031250000000000028,
+     "estimate": 0.0050000000000000044,
+     "model": "model-a",
+     "n_undefined_replicates": 0
+    }
+   ],
+   "ratio": null,
+   "significant": false,
+   "tasks_dropped": [],
+   "tost_p": null,
+   "tost_p_holm": null,
+   "treatment_outcomes": null
+  }
+ ],
+ "holm": [
+  {
+   "level": 0.05,
+   "name": "near",
+   "p_holm": 0.453125,
+   "p_value": 0.453125,
+   "reject": false
+  },
+  {
+   "level": 0.016666666666666666,
+   "name": "wide",
+   "p_holm": 0.0703125,
+   "p_value": 0.0234375,
+   "reject": false
+  },
+  {
+   "level": 0.025,
+   "name": "edge",
+   "p_holm": 0.078125,
+   "p_value": 0.0390625,
+   "reject": false
+  }
+ ]
+}

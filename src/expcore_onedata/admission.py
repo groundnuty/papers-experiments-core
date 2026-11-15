@@ -52,10 +52,14 @@ begun but not ended (`token_step`, `Admission.open_steps`): the tool server's la
 end of its stop's re-verification of the plane, which examines its token, and the sandbox's (`SANDBOX_STEP`), from its
 mint up to the end of its stop. Both launches note their own, and each worker thread of theirs that uses a token
 (the tool server's checks, the sandbox's mint and start) is counted until the thread itself has ended, which a
-cancellation of the launch does not hasten. The fault injector reads them at the start of a restore
-or of its start's recovery, either of which may heal for up to `heal_timeout_s`: a step still running then could find
-its token expired after the heal (`expcore_onedata.faults`, "The token's window"). A copy of the context (a worker
-thread, a task) sees the same admission, and so the same count.
+cancellation of the launch does not hasten. On a platform with `[faults]` such a thread starts only under the run's
+admission, held now: without it the step is refused before it starts, naming it (`begin_token_step`,
+`TokenStepRefused`), so every step that uses a token is counted where the injector reads, and a token is minted only
+after the run's admission, and every wait for it, has been granted. The fault injector reads them at the start of a
+restore or of its start's recovery, either of which may heal for up to `heal_timeout_s`: a step still running then
+could find its token expired after the heal (`expcore_onedata.faults`, "The token's window"), and before it tries a
+failed restore again (`FaultInjector._clear`). A copy of the context (a worker thread, a task) sees the same
+admission, and so the same count.
 
 A tool outside a campaign (a smoke driver, a warm-up) holds the shared admission too, through
 `expcore_onedata.tool_admission.shared_admission`, so no outage can overlap it. Whoever takes the lock exclusively
@@ -81,7 +85,11 @@ let go) `federation.reset`. Who waits for what, holding what:
 - an exclusive one (an outage run, the injector, an `exclusive = true` run, the health gate's `RECOVERY`) waits for the
   turnstile holding nothing and for `federation.lock` (exclusive) holding the turnstile, and takes nothing more;
 - a shortcut reset waits for `federation.reset` (exclusive) holding `federation.lock` shared and no share of
-  `federation.reset`, and, its exclusive hold let go, for its share back holding the same.
+  `federation.reset`, and, its exclusive hold let go, for its share back holding the same;
+- `link-epoch.lock` (`fault_epoch`) comes last of all: a link check of the fault gate waits for it (shared) holding
+  its share of `federation.lock` and `federation.reset`, or the heal's exclusive admission, and a run admission's
+  re-check (`admission_recheck`) waits for it (exclusive, polled within `admission_timeout_s`) holding the admission it
+  took. No holder of it waits for anything but the journal-wide lock.
 
 No holder of `federation.reset` waits for `federation.lock` or the turnstile, and no holder of `federation.lock` waits
 for the turnstile, so no wait closes a cycle. Two resetters cannot deadlock: each gives up its share before it waits, so
@@ -121,11 +129,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign import prerun
 from expcore.campaign.attempt import RunAdmission
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.healthgate import DeferralBound
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.errors import InfraError
+from expcore_onedata.admission_recheck import HEALTH_REQUIRED, refusal, unchecked_refusal
 from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_deferral import heal_deferral_bound
 from expcore_onedata.fault_drain import SessionDrain
@@ -150,6 +160,19 @@ _STRANDED: list[HeldLock] = []
 
 class AdmissionRefused(ConfigError):
     """A run of a platform with a fault injector would start, or inject, without the admission its condition needs."""
+
+
+class TokenStepRefused(AdmissionRefused):
+    """A step that uses the run's tokens would start, on a platform with `[faults]`, without the run's admission held:
+    refused before it starts (`begin_token_step`). `step` is the step's kind (`TOOL_SERVER_STEP`, `SANDBOX_STEP`)."""
+
+    def __init__(self, config: PlatformConfig, step: str, what: str) -> None:
+        self.step = step
+        super().__init__(
+            f"{config.file}: [faults]: {what} (the run's {step} step) uses the run's tokens and starts only under the "
+            "run's admission to the federation, which this context does not hold: refused before it starts, so that "
+            "no step the fault injector cannot see runs (O35)"
+        )
 
 
 class FederationBusy(InfraError):
@@ -305,8 +328,9 @@ class Admission:
         it; when it cannot be written the drain is waited out here, the lock held. When that fails too (an interrupt of
         the wait, or anything else) the lock is not let go: it is kept for as long as this process lives (`_STRANDED`),
         with its holder record, and the failure is raised. The federation then stays closed until the process ends,
-        which is the kernel's to settle, instead of opening inside the drain. Past the drain, the endings and the holder
-        record go first, and the locks go whatever they do, an interrupt included: the reset lock (shared only), in
+        which is the kernel's to settle, instead of opening inside the drain. Past the drain, the endings (every one,
+        an interrupt of one raised after the rest, `_run_endings`) and the holder record go first, and the locks go
+        whatever they do, an interrupt included: the reset lock (shared only), in
         whatever mode it is held, then the main lock, the reverse of the order they were taken in. A forked child's copy
         of the admission holds nothing (the fork hook closed its descriptors), so it ends and clears nothing of its
         parent's."""
@@ -319,11 +343,7 @@ class Admission:
         owned = self.held
         try:
             if owned:
-                for ending in reversed(self.endings):
-                    try:
-                        ending()
-                    except Exception:  # the record of a hold only says who held it
-                        log.exception("the end of a hold could not be recorded")
+                _run_endings(self.endings)
                 if self.journal is not None and self.record is not None:
                     with contextlib.suppress(OSError):  # a record left behind is stale, and the next holder clears it
                         self.journal.clear_holder(self.record["token"])
@@ -333,6 +353,23 @@ class Admission:
                     self.reset.close(record=owned)
             finally:
                 self.lock.close()
+
+
+def _run_endings(endings: list[Callable[[], None]]) -> None:
+    """Call an admission's endings, last first, every one of them: an `Exception` is logged (the record of a hold only
+    says who held it), and an interrupt (any other `BaseException`) is kept and raised once the rest have run, so no
+    ending is skipped, a fault injector's lock on a target it handed to recovery among them
+    (`FaultInjector._hand_over`)."""
+    interrupted: BaseException | None = None
+    for ending in reversed(endings):
+        try:
+            ending()
+        except Exception:
+            log.exception("the end of a hold could not be recorded")
+        except BaseException as error:
+            interrupted = interrupted or error
+    if interrupted is not None:
+        raise interrupted
 
 
 async def _close_off_the_loop(admission: Admission) -> None:
@@ -358,20 +395,40 @@ def retain_admission() -> Callable[[], None]:
     return admission.retain() if admission is not None else (lambda: None)
 
 
-def begin_token_step(name: str) -> Callable[[], None]:
-    """Count a step of the run that uses its tokens on the running context's admission (`Admission.begin_step`), and
-    return the call that ends the count, once; nothing is counted without an admission, as on a platform without
-    `[faults]`, which has no injector to read it. A worker thread a cancellation cannot stop takes a count of its own
-    before it is dispatched and ends it as it ends, so the step outlives a launch that left without it."""
+def begin_token_step(name: str, config: PlatformConfig, what: str) -> Callable[[], None]:
+    """Start a step of the run that uses its tokens (`what`, in words: the tool server's checks, the sandbox's mint
+    and start), counted on the run's admission (`Admission.begin_step`), and return the call that ends the count, once.
+
+    On a platform with `[faults]` the step starts only under the run's admission, held now and for that federation:
+    without it the step is refused before it starts (`TokenStepRefused`, naming it), failing closed. So no such step
+    runs uncounted, where the injector's heal could not see it, and no token is minted, or examined, but after the
+    run's admission and every wait for it (O35). Without `[faults]` there is no injector and no admission: nothing is
+    counted or refused. A worker thread a cancellation cannot stop takes a count of its own before it is dispatched and
+    ends it as it ends, so the step outlives a launch that left without it."""
+    settings = fault_settings_of(config)
+    if settings is None:
+        return lambda: None
+    admission = current_admission()
+    if admission is None:
+        raise TokenStepRefused(config, name, what)
+    require_same_federation(admission, federation_of(settings))
+    return admission.begin_step(name)
+
+
+def count_token_step(name: str) -> Callable[[], None]:
+    """Count a step of the run that uses its tokens on the running context's admission when one is held, and return
+    the call that ends the count, once; never refuse. For what must run whatever is held: a launch's own span, entered
+    after or right before `require_admission` refuses an unadmitted run, and the sandbox's stop, which tears down what
+    the run started."""
     admission = current_admission()
     return admission.begin_step(name) if admission is not None else (lambda: None)
 
 
 @contextlib.contextmanager
 def token_step(name: str) -> Iterator[None]:
-    """For the body of a `with`, a step of the run that uses its tokens, counted from its start to its end however the
-    body ends (`begin_token_step`)."""
-    end = begin_token_step(name)
+    """For the body of a `with`, a launch of the run that uses its tokens, counted from its start to its end however
+    the body ends (`count_token_step`); its worker threads that use a token start with `begin_token_step`."""
+    end = count_token_step(name)
     try:
         yield
     finally:
@@ -745,7 +802,13 @@ class RunAdmit:
     `[faults]` settings with no health object between (`declared_deferral_s`). The core compares it with the health
     check it is given and refuses the campaign when that check does not carry it (`fault_deferral`). A study that
     wraps the admission in a callable of its own passes `declared_deferral_s` on too, or only the health check's own
-    declaration is read."""
+    declaration is read.
+
+    It declares that the campaign needs a health check (`requires_health_check`, the reason `HEALTH_REQUIRED`, read by
+    `expcore.campaign.health_required`): the scheduler refuses, when it is built, a campaign with this admission and no
+    health check, and a wrapper of the study's own passes the attribute on as well (`functools.wraps` does)."""
+
+    requires_health_check = HEALTH_REQUIRED
 
     def __init__(self, admit: RunAdmission, settings: FaultSettings) -> None:
         self._admit, self._settings = admit, settings
@@ -777,6 +840,13 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
     bounded by `admission_timeout_s`, ends with the campaign, and runs before the agent's clock starts; one that fails
     leaves the run unstarted.
 
+    Holding the lock, it re-reads the fault gate's state (`admission_recheck`): a run whose pre-run check a heal or a
+    failing pair has outdated since, or whose check noted nothing, is refused as `FederationBusy`, uncharged, and the
+    campaign checks it again. It declares that the campaign needs a health check (`HEALTH_REQUIRED`): the scheduler
+    refuses, when it is built, a campaign with this admission and none, and, whatever way the campaign was built, a try
+    whose note says it has none (`prerun.UNCHECKED`) is refused here as `AdmissionRefused`, which stops the campaign:
+    no run is admitted with no check behind it.
+
     Given the study's `schema`, a condition that declares `exclusive = true` on a platform without `[faults]` is
     refused, naming the study file and the key: there is no federation lock to hold.
     """
@@ -794,6 +864,9 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
     def admit(
         treatment_kinds: tuple[str, ...], treatment_targets: Mapping[str, str], cancel: threading.Event, exclusive: bool
     ) -> Iterator[str]:
+        unchecked = unchecked_refusal(prerun.current())  # a campaign with no health check is never admitted blind
+        if unchecked is not None:
+            raise AdmissionRefused(unchecked)
         outage = PROVIDER_OUTAGE in treatment_kinds
         target = treatment_targets.get(PROVIDER_OUTAGE) if outage else None
         if outage and target is None:
@@ -806,16 +879,26 @@ def run_admission(config: PlatformConfig, schema: FactorSchema | None = None) ->
         with lock.held(
             exclusive=outage or exclusive, timeout_s=timeout_s, target=target, cancel=cancel, purpose=purpose
         ) as admission:
+            # under the lock, so no heal begins while it decides: a heal or a failing pair since the run's pre-run check
+            # refuses it, uncharged, and the campaign checks it again (`admission_recheck`)
+            refused = refusal(settings.journal, prerun.current(), timeout_s, cancel)
+            if refused is not None:
+                raise FederationBusy(refused)
             yield "exclusive" if admission.exclusive else "shared"  # what it took, never what was asked
 
     return RunAdmit(admit, settings)
 
 
 def require_admission(config: PlatformConfig) -> None:
-    """Refuse to start a run's infrastructure on a platform with `[faults]` unless the run holds that federation."""
+    """Refuse to start a run's infrastructure on a platform with `[faults]` unless the run holds that federation, and
+    not in a try of a campaign that has no health check (its note says so, `prerun.UNCHECKED`): however the federation
+    was taken (the campaign's run admission, or the executor's own), no run starts with no link verdict behind it."""
     settings = fault_settings_of(config)
     if settings is None:
         return
+    unchecked = unchecked_refusal(prerun.current())
+    if unchecked is not None:
+        raise AdmissionRefused(unchecked)
     admission = current_admission()
     if admission is None:
         raise AdmissionRefused(

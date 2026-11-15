@@ -44,6 +44,7 @@ from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, def
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
+from expcore.campaign.health_required import refuse_without_health_check
 from expcore.campaign.healthgate import (
     ADMISSION_OWNER,
     DECLARED_HOOK,
@@ -162,6 +163,7 @@ class Scheduler:
                 EXCLUSIVE_KEY,
                 "declares an exclusive run, but the platform gives the campaign no run admission to hold exclusively",
             )
+        refuse_without_health_check(admission, health)  # an admission that reads the pre-run check's note: never blind
         self.store: Store | None = None
         self._campaign: str | None = None  # the store's key for the attempts' liveness (`liveness.register`)
         self.recovery: Recovery | None = None
