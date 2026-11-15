@@ -304,5 +304,22 @@ def test_o35_a_lock_that_cannot_be_taken_is_said_by_a_false_and_never_raises(tmp
 
 
 def test_o35_the_module_names_what_up_and_the_platforms_probe_import():
-    """O35: the writer's whole interface."""
-    assert set(linkrecord.__all__) == {"LOCK", "RECORD", "discard_record", "record_text", "recording", "write_record"}
+    """O35: the writer's whole interface: the writer, its lock, and where the federation's record lies (its root)."""
+    assert set(linkrecord.__all__) == {
+        "LOCK",
+        "RECORD",
+        "ROOT_FILE",
+        "discard_record",
+        "federation_root",
+        "record_path",
+        "record_text",
+        "recording",
+        "write_record",
+    }
+
+
+def test_o35_the_record_lies_in_the_parent_of_the_journal_whichever_file_names_it():
+    """O35: the federation's root is its journal's parent, and the record and the lock are in it."""
+    journal = Path("/federation/fault-journal")
+    assert linkrecord.federation_root(journal) == Path("/federation")
+    assert linkrecord.record_path(journal) == Path("/federation") / RECORD

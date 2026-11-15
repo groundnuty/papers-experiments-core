@@ -69,10 +69,10 @@ def record(tmp_path):
     return json.loads((tmp_path / RECORD).read_text(encoding="utf-8"))
 
 
-def test_o35_a_passing_check_writes_its_verdict_beside_the_platform_file_in_ups_format(tmp_path, serves, ticker):
-    """O35: the matrix of a restore's or a heal's check leaves the report it was made from, as `up` writes it,
-    beside the platform.toml the check ran through (the federation's root, where `up` writes it): every pair, its
-    seconds and bytes, and the check's window on the host's epoch clock."""
+def test_o35_a_passing_check_writes_its_verdict_in_the_federations_root_in_ups_format(tmp_path, serves, ticker):
+    """O35: the matrix of a restore's or a heal's check leaves the report it was made from, as `up` writes it, in the
+    federation's root (the journal's parent: here the platform.toml's own directory): every pair, its seconds and
+    bytes, and the check's window on the host's epoch clock."""
     assert not (tmp_path / RECORD).exists()
     before = ticker.clock()
     matrix = serves.matrix(SERVICE)

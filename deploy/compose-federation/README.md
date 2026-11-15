@@ -32,7 +32,7 @@ Compose (`up`, `reset --replicas` and `down`; see "An imported space").
   but those declared `baseline = false`), and writes `facts.json` and, from the layout's platform template,
   `platform.toml`. Last, it runs the platform layer's link check through that `platform.toml` (`fedlinks.py`, #221):
   each ordered (reading provider, source) pair of providers sharing a space must fetch a probe, a file of its own, from
-  the layout's `probe_space` within the bound, or up fails naming the pair and the remedy; the report is written as `link-check.json` beside `facts.json`, atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`): a fault injector's restore and a heal write the same file after each of their all-pairs checks, so it is always the latest check's whole report (one check at a time makes it, under a lock file `link-check.lock` beside it). Run on a federation that is up,
+  the layout's `probe_space` within the bound, or up fails naming the pair and the remedy; the report is written as `link-check.json` in the root, beside `facts.json`, atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`): a fault injector's restore, a heal and the health gate's routine check write the same file after each of their all-pairs checks, whichever platform file they ran through (the root is the parent of the `[faults] journal` the file names), so it is always the latest check's whole report (one check at a time makes it, under a lock file `link-check.lock` beside it). Run on a federation that is up,
   it starts what is stopped and checks every step again, the links included, and writes no baseline file (see "The
   baseline" for changing a space's `baseline` key).
 - **reset --clean** returns the deployment to clean: it starts what is stopped, checks every step again, removes
@@ -160,9 +160,9 @@ by placeholder (`@provider_id.<name>@`, `@space_id.<name>@`, `@user_id.<user>@`,
   | `<provider>/storage` | each provider's POSIX storage |
   | `<owner>/import/<space>` | a writable import's copy of its dataset, made by up once (see "An imported space") |
   | `facts.json` | what an integrator needs to write `platform.toml`: addresses, ids, names, where the credentials are; no secret |
-  | `link-check.json`, `link-check.lock` | the latest all-pairs link check's report (up's, and a restore's and a heal's, which write it too), and the lock that orders the checks that write it; no secret |
+  | `link-check.json`, `link-check.lock` | the latest all-pairs link check's report (up's, and a restore's, a heal's and the health gate's routine check's, which write it too, through any platform file that names this root's `fault-journal`), and the lock that orders the checks that write it; no secret |
   | `platform.toml` (0600) | rendered from the layout's template, next to the CA and the secrets it names by relative path |
-  | `fault-journal/` | the fault injector's journal, when the fault test runs |
+  | `fault-journal/` | the fault injector's journal, when the fault test runs; every platform file of this federation names it in `[faults] journal`, and its parent, this root, is where the link-check record is written (`platform.toml` must be in that parent, or the table is refused at load) |
 
   Nothing is kept between a down and the next up: up makes a new CA and new secrets every time.
 
@@ -325,7 +325,7 @@ condition's below, since the check leases from the condition's group, O31); and 
 allow-list has `get_file_distribution`, `list_space_providers`, `schedule_file_replication` and `get_transfer`, with its
 frozen manifest and the rights to schedule a replication. In the default layout `pine` owns the study space and is the local provider, so the root's file
 makes the check unknown, saying so. Derive a file with `birch` local, `pine` taken down and `cedar` the mirror (no
-value below is a secret; every path in `[faults]` is relative to the file):
+value below is a secret; every path in `[faults]` is relative to the file; the journal is explained below):
 
 ```toml
 support = { providers = ["pine", "birch", "cedar"], local = "birch" }
@@ -333,7 +333,7 @@ placement = { holder = "pine" }
 
 [faults]
 sanctioned = true
-journal = "fault-journal"              # the injection journal and the federation's lock, beside this file
+journal = "fault-journal"              # the federation's journal and lock: <root>/fault-journal (see below)
 compose_file = "outage.compose.yaml"   # federation.py compose > <root>/outage.compose.yaml, beside this file
 project = "expcore-fed"
 command = ["docker", "compose", "--project-directory", "<absolute path of deploy/compose-federation>"]
@@ -346,6 +346,16 @@ pine = "pine"                          # provider name -> Compose service
 [tokens]
 margin_s = 4360                        # outlives the restore, its gate and the drain (restore_token_margin_s, 4,354 s here), which load_faults requires
 ```
+
+**The journal names the federation, and the root with it.** Every platform file of one federation names the same
+`[faults] journal`, which is how they share its lock, and `up` makes it as `<root>/fault-journal`. The file above lies in
+the root, so the relative `fault-journal` is that directory; a file derived in another directory names it in full
+(`journal = "<absolute path of the root>/fault-journal"`). The root is the journal's parent, and the link-check record
+(`link-check.json`, which `up` writes in the root and a pre-check reads there) is written in it by every fault-gate
+check made through any such file: the restore's, the heal's and the health gate's routine pre-run check. Nothing is
+written beside a derived file. A table whose journal's parent holds no `platform.toml` is refused at load, naming the
+key (a journal that is not in a federation's root has no record to write); a platform file with no `[faults]` declares
+no root, so its link checks write no record.
 
 ```sh
 EXPCORE_FED_ROOT=/mnt/volume2/expcore-federation EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_DOCKER=1 \

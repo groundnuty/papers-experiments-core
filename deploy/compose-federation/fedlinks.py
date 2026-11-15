@@ -4,10 +4,11 @@ A provider's rtransfer link to a peer can come up stuck, with nothing logged, an
 Up runs the platform layer's own check (`expcore_onedata.linkcheck.check_links`) through the platform.toml it has just
 rendered, so the pairs, the probe space and the bounds are the ones a campaign's health gate will use, and it fails,
 naming the pair and the remedy, unless every pair passes. The report is written beside facts.json as
-`link-check.json`: each pair by position, its seconds and bytes, and the transfers the check made. It is written
-atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`), which a fault injector's restore and a
-heal write through too, under the record's lock (one check at a time makes it), so the file is always the latest
-check's whole report.
+`link-check.json` in the root: each pair by position, its seconds and bytes, and the transfers the check made. It is
+written atomically, by the platform layer's own writer (`expcore_onedata.linkrecord`), which a fault injector's restore,
+a heal and the health gate's routine check write through too (into the root, which is the parent of the
+`[faults] journal` their platform file names, whichever file that is), under the record's lock (one check at a time
+makes it), so the file is always the latest check's whole report.
 
 A layout with no platform template renders no platform.toml, so no local provider is declared and nothing is checked;
 up says so. One whose platform.toml declares provider pairs and no `[link_check]` is refused: up does not report a

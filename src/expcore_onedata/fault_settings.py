@@ -6,7 +6,7 @@ service entry, its position, never by a provider's or a service's name. The serv
 
     [faults]
     sanctioned = true                # the configuration's half of the sanction; false or absent refuses
-    journal = "fault-journal"        # directory of the injection journal and the targets' lock files
+    journal = "fault-journal"        # directory of the injection journal and the targets' lock files, in the root
     compose_file = "compose.yaml"    # the Compose file that declares the providers' services
     project = "..."                  # the Compose project name, which with a service names the container
     command = ["docker", "compose"]  # optional: the Compose command
@@ -28,6 +28,14 @@ service entry, its position, never by a provider's or a service's name. The serv
 
     [faults.services]
     <provider name> = "<service>"    # each provider that may be taken down, by its name; no two share a service
+
+`journal` names the federation: every platform file of one federation, the root's own and any derived from it, names the
+same directory, which is how they share its lock. It lies directly in the federation's root, as `up` makes it
+(`<root>/fault-journal`), so the root is its parent (`linkrecord.federation_root`), and the link-check record, which
+describes the federation's links and not a file's, is written there whichever file a check ran through (O35,
+`expcore_onedata.linkrecord`). A table whose journal's parent holds no `platform.toml` is refused, naming the key,
+rather than guess where the record goes: a platform file derived in another directory states the root's journal, by
+an absolute path or one relative to itself.
 
 `settle_timeout_s` must exceed the providers' `stop_grace_period` (the Compose file's, 120 s in the federation of
 deploy/compose-federation) by a margin. A stop that hits `command_timeout_s` kills the CLI, not the Docker daemon's
@@ -181,6 +189,7 @@ from typing import Any
 from expcore.config.loading import Section, load_toml
 from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.linkrecord import ROOT_FILE, federation_root
 
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # A Compose project name as Compose accepts it. Required, because Compose would otherwise take the name from the
@@ -293,10 +302,17 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     words = {}
     for key, default in (("command", ("docker", "compose")), ("docker", ("docker",))):
         words[key] = tuple(table.strings(key)) or default
+    journal = (file.parent / table.string("journal")).resolve()
+    if not (federation_root(journal) / ROOT_FILE).is_file():  # the link-check record's place is the root (`linkrecord`)
+        raise table.fail(
+            "journal",
+            f"must lie directly in the federation's root, the directory that holds its {ROOT_FILE} (`up` makes it as "
+            f"<root>/fault-journal), where the link-check record is written; its parent holds no {ROOT_FILE}",
+        )
     settings = FaultSettings(
         file=file,
         sanctioned=sanctioned,
-        journal=(file.parent / table.string("journal")).resolve(),
+        journal=journal,
         compose_file=(file.parent / table.string("compose_file")).resolve(),
         services=dict(services.data),
         project=project,

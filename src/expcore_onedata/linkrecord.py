@@ -1,12 +1,25 @@
 # Provenance: new
 """The link-check record, `link-check.json`: the report of one all-pairs link check, written whole or not at all (O35).
 
-`deploy/compose-federation`'s `up` writes it beside `facts.json` once its link check has run (#221), and so do a
-restore's link check and every read of the pairs a heal makes (`fault_serves.ServingProbe.matrix`), so the record on
-disk is the verdict of the latest check made, passing or failing, and an operator's pre-check that wants a check under
-an hour old finds the heal's own re-check instead of re-running `up`. They all write it through `write_record`, so
-there is one format: `record_text`, the report's JSON (`LinkReport.to_json`) with sorted keys and an indent of 2,
-and a final newline, the bytes `up` always wrote.
+`deploy/compose-federation`'s `up` writes it in the federation's root, beside `facts.json`, once its link check has run
+(#221), and so do a restore's link check, every read of the pairs a heal makes (`fault_serves.ServingProbe.matrix`) and
+the health gate's routine check (`health.PlatformHealth`), so the record on disk is the verdict of the latest check
+made, passing or failing, and an operator's pre-check that wants a check under an hour old finds the heal's own
+re-check instead of re-running `up`. They all write it through `write_record`, so there is one format: `record_text`,
+the report's JSON (`LinkReport.to_json`) with sorted keys and an indent of 2, and a final newline, the bytes `up`
+always wrote.
+
+**Where: the federation's root, whichever platform file the check ran through (`record_path`).** The record describes
+the federation's links, so it lies where `up` writes it and where a pre-check reads it, not beside whatever
+`platform.toml` a check happened to run through: a file derived elsewhere (the outage check's example, in a work
+directory) would otherwise strand it. A platform file names its federation by `[faults] journal`, the directory of the
+federation's lock and heal journal, which `up` makes as `<root>/fault-journal` (`fedlayout.Layout.journal`) and every
+file of one federation must name alike, or they would not share a lock. So the root is the journal's parent
+(`federation_root`), and `load_faults` refuses a journal whose parent holds no `platform.toml` (the one `up` renders
+there; the root's own, or any file derived beside it, is what makes a directory a federation's), rather than guess where
+the record goes. A check run without `[faults]` (a plain platform file: the root's own rendered one has no such table)
+declares no root and writes nothing; the record is the fault-gate checks' (a restore's, a heal's and the gate's
+routine check, all of which need `[faults]`).
 
 **Atomic.** The text goes to a draft of the writer's own in the record's directory (its name holds the process and a
 random part, so two writers never share one), which is flushed and fsynced and then renamed over the record, and the
@@ -17,17 +30,19 @@ is removed unless that removal fails too. The record keeps the mode a plain writ
 
 **In the order of the checks.** One check at a time makes the record: `recording` holds `link-check.lock`, beside the
 record, exclusively around a check and the writing of its record, so a check that starts while another is under way
-waits for it to end and writes after it, and the record is the latest-started check's, never an older one's that
-finished late. Under a restore's and a heal's exclusive admission the lock is never contended; it orders what the
-admission does not (`up` run on a federation another process is checking, say). No clock is read for the order. The
-lock is a leaf of the federation's lock order (`admission`). The lock file is opened read-only and its owner makes it
-0644, so every process that can write the directory can take part: `flock` needs no write permission. A lock that still
-cannot be taken is no reason to skip the check: `recording` yields False, and a caller that cannot serialize publishes
-no verdict (the probe removes the older record instead), so an unordered write never leaves an old pass standing; `up`,
-which alone runs while nothing else does, writes and says so. The residual: a lock file that something other than
-`recording` made unreadable to a process (not 0644, another user's), while a process that holds it is mid-write. The
-first runs unserialized, publishes nothing and removes the older record, which the second can still replace with its
-older pass. No lock the first cannot take orders it; the file's mode is the operator's to fix.
+waits for it and writes after it, and the record is the latest-started check's, never an older one's that finished
+late. Under a restore's and a heal's exclusive admission the lock is never contended, and nor is it between the gate's
+routine check, which holds the federation shared, and a heal, which holds it exclusively; it orders what the admission
+does not (`up` run on a federation another process is checking, say, or the routine checks of two campaigns that hold
+the federation shared together). No clock is read for the order. The lock is a leaf of the federation's lock order
+(`admission`). The lock file is opened read-only and its owner makes it 0644, so every process that can write the
+directory can take part: `flock` needs no write permission. A lock that still cannot be taken is no reason to skip the
+check: `recording` yields False, and a caller that cannot serialize publishes no verdict (`fault_serves.recorded`
+removes the older record instead), so an unordered write never leaves an old pass standing; `up`, which alone runs
+while nothing else does, writes and says so. The residual: a lock file that something other than `recording` made
+unreadable to a process (not 0644, another user's), while a process that holds it is mid-write. The first runs
+unserialized, publishes nothing and removes the older record, which the second can still replace with its older pass.
+No lock the first cannot take orders it; the file's mode is the operator's to fix.
 
 **An older verdict never stands.** `discard_record` removes the record, or, when the directory refuses that, empties it
 in place (which needs only the file's own write permission) and dates it to the epoch, so that no reader takes it, by
@@ -36,8 +51,8 @@ which a record this process cannot change stays as it was (the same permissions 
 journal too).
 
 **The record is advisory.** The federation's link epoch (`fault_epoch`) and the gate's heal journal are what a run's
-admission compares (`admission_recheck`); the record is read by no admission and lives beside `platform.toml`, not in
-the fault journal's directory. Writing it never raises or lowers the epoch.
+admission compares (`admission_recheck`); the record is read by no admission and lives in the root, not in the fault
+journal's directory. Writing it never raises or lowers the epoch.
 """
 
 import contextlib
@@ -51,10 +66,33 @@ from typing import Any
 
 from expcore_onedata.fault_journal import _fsync_directory
 
-__all__ = ["LOCK", "RECORD", "discard_record", "record_text", "recording", "write_record"]
+__all__ = [
+    "LOCK",
+    "RECORD",
+    "ROOT_FILE",
+    "discard_record",
+    "federation_root",
+    "record_path",
+    "record_text",
+    "recording",
+    "write_record",
+]
 
-RECORD = "link-check.json"  # beside facts.json (under `up`) and platform.toml, wherever that file lies
+RECORD = "link-check.json"  # in the federation's root, beside facts.json and platform.toml
 LOCK = "link-check.lock"  # beside the record: held exclusively around a check and the writing of its record
+ROOT_FILE = "platform.toml"  # what a federation's root holds: `up` renders it there (`fedlayout.Layout.platform`)
+
+
+def federation_root(journal: Path) -> Path:
+    """The federation's root, from the `[faults] journal` its platform files name: the journal's parent, since `up`
+    makes the journal as `<root>/fault-journal` (`fedlayout.Layout.journal`; a test pins the two together)."""
+    return Path(journal).parent
+
+
+def record_path(journal: Path) -> Path:
+    """Where the federation's record lies: `link-check.json` in its root (`federation_root`), the file `up` writes and
+    an operator's pre-check reads, whichever platform file the check ran through."""
+    return federation_root(journal) / RECORD
 
 
 def record_text(report: Any) -> str:

@@ -11,6 +11,7 @@ import pytest
 from federation_support import MINIMAL
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
+from expcore_onedata.linkrecord import ROOT_FILE, federation_root, record_path
 from expcore_onedata.testing import ADMIN_ENV, write_platform
 from expcore_onedata.testing.world import with_link_check
 
@@ -189,6 +190,18 @@ def test_up_writes_its_record_in_the_text_it_always_has_through_the_layers_write
     expected = json.dumps(report.to_json(), indent=2, sort_keys=True) + "\n"
     assert (tmp_path / "link-check.json").read_text(encoding="utf-8") == expected
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []  # no draft is left
+
+
+def test_the_platform_layer_finds_the_root_up_writes_its_record_in_from_the_journal(fed, fedlinks, tmp_path):
+    """O35: a restore's, a heal's and the gate's checks find the federation's root as the parent of the `[faults]
+    journal` their platform file names, and need `platform.toml` in it. `up` makes the journal as
+    `<root>/fault-journal`, renders `platform.toml` in the root and writes its record there, so the three agree: a check
+    through any platform file of the federation (a derived one included, which names the root's journal) writes the
+    record `up` writes."""
+    layout = fed.layout.Layout(tmp_path, spec=fed.spec.load_spec(write(tmp_path, MINIMAL)))
+    assert federation_root(layout.journal) == layout.root == layout.platform.parent
+    assert layout.platform.name == ROOT_FILE
+    assert record_path(layout.journal) == layout.root / fedlinks.REPORT
 
 
 def test_up_whose_record_lock_cannot_be_taken_writes_its_record_and_says_so(fed, fedlinks, tmp_path, monkeypatch):
