@@ -1058,16 +1058,35 @@ zero_denominator = "exclude"   # or "continuity", with continuity_correction = c
 cluster = "group"              # the independent unit, as for every contrast
 estimation_unit = ["model", "group"]  # optional: sums per model's cell of a group; ["group"], the default, pools them
 equivalence_margin = 0.2231    # optional: a natural-log ratio, here within a factor of 1.25 either way
+
+[contrasts.cost-per-success-adverse]  # each arm its own column: arm A at its upper bound, arm B at its lower
+conditions = ["cond-a", "cond-b"]
+estimator = "ratio"
+numerator_a = "tokens_high"    # optional, as are numerator_b, denominator_a and denominator_b: each defaults to
+numerator_b = "tokens_low"     # the shared numerator or denominator
+denominator = "success"
+zero_denominator = "exclude"
+cluster = "group"
+estimation_unit = ["model", "group"]
 ```
 
 ```python
 @dataclass(frozen=True)
 class RatioForm:                # ContrastSpec.ratio, and ContrastResult.ratio (None for a contrast of one outcome)
-    numerator: str
-    denominator: str
+    numerator: str | None       # the column both arms read; None when the arms read their own
+    denominator: str | None
     zero_denominator: str       # "exclude" or "continuity" (ZERO_RULES)
     continuity_correction: float | None = None
-    label: str                  # a property, "numerator/denominator": the contrast's `outcome`
+    numerator_a: str | None = None    # arm A's own column, None when it reads the shared one; so for the other three
+    numerator_b: str | None = None
+    denominator_a: str | None = None
+    denominator_b: str | None = None
+    def columns(self, arm: int) -> tuple[str, str]  # (numerator, denominator) arm 0 (A) or 1 (B) reads
+    per_arm: bool               # a property: the arms read different columns for either role
+    label: str                  # a property, "numerator/denominator", or "na/da vs nb/db" per arm: the contrast's `outcome`
+ROLES = ("numerator", "denominator")
+ARM_SUFFIXES = ("a", "b")
+OMIT_NONE = "omit_none"         # field metadata: analysis.json leaves the field out while it is None
 
 def log_ratio(arm_a: Totals, arm_b: Totals, form: RatioForm) -> tuple[str | None, float]  # (cause, NaN) or (None, value)
 def aggregate(cells: Mapping[str, Sequence[tuple[Totals, Totals]]], form) -> tuple[PairedDifferences, Excluded, Excluded]
@@ -1110,7 +1129,72 @@ The cells of one value share its response to the treatment and are not independe
 
 **Two analyses on two columns.** Each ratio contrast names its own `numerator` and `denominator`, so a study that bounds an outcome declares one contrast per bound, for example the estimate on lower-bound token columns and the adverse assignment on upper-bound ones, each with its own name, seed, result and Holm membership. A run whose upper bound is None at a denominator of 0 is counted, or refuses the contrast if confirmatory, only in the contrast that reads that column.
 
-**In the outputs.** `analysis.json` gives every contrast `ratio` (the form, or null), its two units, `estimation_unit` (`["model", "group"]` for a contrast of one outcome, `["group"]` by default for a ratio contrast) and `independent_unit` (the cluster), and its cells, `n_cells` and `cells_lost` by cause (`no_pair`, then a ratio contrast's `zero_denominator` and `zero_numerator`, zeros included); a ratio contrast estimated per model's cell its `per_model`, and a ratio contrast's `pairs_missing` the three `RATIO_CAUSES` after the five others, zeros included; `n_pairs_missing` counts the None causes, `numerator_none_at_zero` among them. `report.md` shows a ratio contrast's outcome as `ln(numerator/denominator)`, adds a section "Ratio contrasts" (each one's two outcomes, its estimation unit, its independent unit, its cells used and lost by cause, its rule, and exp of its estimate and interval, then, for a contrast estimated per model's cell, "Ratio contrasts by model (exploratory)" with each model's estimate, ratio and interval) and the three causes as columns of the pairs tables, `-` in the row of a contrast of one outcome, and the terminal summary marks its estimate `(ln ratio)`. A report with no ratio contrast has none of these, byte for byte as before.
+**One analysis on a column per arm.** A contrast may give each arm a column of its own, `numerator_a` and `numerator_b` for arm A's and arm B's numerators, and `denominator_a` and `denominator_b` for their denominators, each defaulting to the shared `numerator` or `denominator`. An adverse sensitivity estimate that puts arm A at its upper-bound tokens and arm B at its lower-bound ones is then a declared contrast of its own beside the main one, with `numerator_a = "tokens_high"` and `numerator_b = "tokens_low"` (or `numerator = "tokens_low"` with `numerator_a = "tokens_high"`, the same contrast). In each cell N_A and D_A are summed from arm A's columns and N_B and D_B from arm B's, ln((sum X_A / sum D_A) / (sum Y_B / sum D_B)), and the rest is as for any ratio contrast. Per-arm keys override the shared one; mixing that leaves a column unread or an arm without one is refused, naming the key:
+- the shared key beside both per-arm keys of its role, when neither names it: no arm would read it;
+- one per-arm key with no shared key: the other arm has no column;
+- an arm whose numerator and denominator would be one column;
+- a per-arm key, or any other ratio key, beside an estimator of one outcome.
+A per-arm key that names the shared column declares nothing, and its contrast is the one without it, record for record. The form is held one way whichever way it is written: a role whose arms read one column holds it as `numerator` (or `denominator`) with the per-arm fields None, and a role whose arms differ holds both arms' columns with the shared field None. Each run is read in its own arm's columns, found from the run's own condition or level of the varying factor (`pairing._columns`), for its value, a failed run's None numerator and its arm's count alike, so no part of the analysis reads a run in the other arm's column: a run of arm B need not have arm A's column, a run of arm A without its own is refused naming the column, and a failed run whose numerator is None in its own arm's column refuses a confirmatory contrast (`RatioNumeratorRefused`, naming each arm's columns), while a None in the column only the other arm reads leaves the pair used.
+
+**In the outputs.** `analysis.json` gives every contrast `ratio` (the form, or null), its two units, `estimation_unit` (`["model", "group"]` for a contrast of one outcome, `["group"]` by default for a ratio contrast) and `independent_unit` (the cluster), and its cells, `n_cells` and `cells_lost` by cause (`no_pair`, then a ratio contrast's `zero_denominator` and `zero_numerator`, zeros included); a ratio contrast estimated per model's cell its `per_model`, and a ratio contrast's `pairs_missing` the three `RATIO_CAUSES` after the five others, zeros included; `n_pairs_missing` counts the None causes, `numerator_none_at_zero` among them. `report.md` shows a ratio contrast's outcome as `ln(numerator/denominator)`, adds a section "Ratio contrasts" (each one's two outcomes, its estimation unit, its independent unit, its cells used and lost by cause, its rule, and exp of its estimate and interval, then, for a contrast estimated per model's cell, "Ratio contrasts by model (exploratory)" with each model's estimate, ratio and interval) and the three causes as columns of the pairs tables, `-` in the row of a contrast of one outcome, and the terminal summary marks its estimate `(ln ratio)`. A report with no ratio contrast has none of these, byte for byte as before. A contrast whose arms read different columns has them in its `ratio`, `numerator_a` and `numerator_b` (or `denominator_a` and `denominator_b`) with `numerator` (or `denominator`) null, and its `outcome` is `"tokens_high/success vs tokens_low/success"`, arm A's ratio first; the per-arm fields of a form are left out of `analysis.json` while they are None (`OMIT_NONE`), so a contrast that declares none is written exactly as before they existed. The report's Numerator (or Denominator) cell then names each arm's column with its arm, `cond-a: tokens_high; cond-b: tokens_low`, its outcome cell is `ln(tokens_high/success vs tokens_low/success)`, and a note after the ratio notes, only in a report with such a contrast, says each arm reads its own columns.
+
+### A smallest effect of interest
+
+`expcore.stats.smallest` (S16, #81). A contrast may declare the smallest effect that counts, in the form its estimator reads, and the sign it claims:
+
+```toml
+[contrasts.a-vs-b]             # a contrast of one outcome
+smallest_effect = 0.1          # a positive difference on the outcome's scale, here 10 points of a proportion
+direction = "higher"           # optional: "higher" (A above B) or "lower"; left out, the rule holds either way
+
+[contrasts.cost-per-success]   # a ratio contrast
+smallest_ratio = 2             # a positive ratio other than 1, a factor of two, compared as ln 2 = 0.6931
+direction = "lower"            # optional: A's cost per success at most half of B's
+```
+
+```python
+@dataclass(frozen=True)
+class Rule:                       # ContrastSpec.smallest_rule; None when the contrast declares none
+    form: str                     # "difference" (smallest_effect) or "ratio" (smallest_ratio)
+    declared: float               # as preregistered
+    direction: str                # "higher", "lower", or "either" when none is declared
+    threshold: float              # a property: the difference, or |ln ratio|, on the scale of the estimate
+
+@dataclass(frozen=True)
+class SmallestEffect:             # ContrastResult.smallest_effect; None, and absent from analysis.json, without one
+    form: str
+    declared: float
+    threshold: float              # on the estimate's scale
+    direction: str
+    decision: str                 # one of DECISIONS
+    interval: str | None          # one of INTERVAL_RELATIONS; None when the interval is undefined
+    detectable: bool | None       # the minimum detectable effect is at most the threshold; None when unknown
+    minimum_detectable_ratio: float | None  # a ratio contrast's exp(minimum detectable effect); else None
+
+DECISIONS = ("meets", "meets_either_direction", "opposite_direction", "falls_short", "not_significant", "untestable")
+INTERVAL_RELATIONS = ("beyond", "includes", "short_of")
+def rule(*, smallest_effect=None, smallest_ratio=None, direction=None, ratio: bool) -> Rule | None  # RuleError(key)
+def decide(significant, estimate, threshold, direction, untestable=False) -> str
+def interval_relation(low, high, threshold, direction) -> str | None
+def detectable(minimum_detectable_effect, threshold) -> bool | None
+```
+
+**The scale.** A ratio contrast's estimate, interval and minimum detectable effect are natural-log ratios ([above](#a-ratio-contrast)), so its smallest ratio r is compared as |ln r|: r and 1 / r are one size, and `direction` says which side the claim is on. `Rule.threshold` is the one place a declared ratio is taken to the log scale; every comparison takes that threshold and the result's own numbers, and exp serves only to show a log ratio as a ratio. A contrast of one outcome compares its difference as declared.
+
+**Refused, naming the key** (by the loader, and as a `ValueError` naming the contrast for a spec built past it): `smallest_ratio` on a contrast of one outcome and `smallest_effect` on a ratio contrast; a value that is not a finite number; a `smallest_effect` of 0 or less (it is a size; `direction = "lower"` claims a decrease); a `smallest_ratio` of 0 or less, or of 1, which is no effect; a `direction` other than `"higher"` or `"lower"`, or one with no threshold beside it; and a `smallest_ratio` below 1 beside `direction = "higher"`, which names a decrease as an increase. A contrast in the Holm family and an exploratory one may both declare one.
+
+**The decision.** The study's rule: a difference counts when it is significant and its point estimate is at least the threshold. Significant is the contrast's own `significant`, Holm's decision for a member of the family and the raw p-value at alpha for any other, so `analyse` judges the rule after Holm has decided (`run_contrast` alone judges it on the raw p-value):
+- `meets`: a direction is declared, the test is significant and the estimate is at or beyond the threshold on that side (estimate >= threshold for `"higher"`, <= -threshold for `"lower"`);
+- `meets_either_direction`: no direction is declared, the test is significant and |estimate| >= threshold; the report and the terminal write the estimate's sign beside it, so it never reads as a bare "meets";
+- `opposite_direction`: a direction is declared, the test is significant and the estimate is on the other side of zero, whatever its size: a significant drop never confirms a claimed rise;
+- `falls_short`: significant, the estimate short of the threshold on its side (zero included);
+- `not_significant`, and `untestable` for a contrast that used no pair (S11).
+
+**Beside it.** `interval` sets the contrast's reported interval (at `ci_level`) against the threshold on the direction's side (either side for `"either"`): `beyond` when every value is at or beyond it, `short_of` when every value is short of it, so the interval excludes the smallest effect either way, and `includes` otherwise. `detectable` is true when the contrast's minimum detectable effect, a size on the same scale, is at most the threshold, false when it is larger, and None when it is unknown (no `[power]` section, or a NaN figure), never false on that account. A member's minimum detectable effect is at alpha over the family size ([the estimator](#estimator)), so a true `detectable` is conservative. It says the test reaches the target power at a true effect of exactly the threshold; the estimate reaches the threshold only about half the time there, so `meets` does not reach that power. Every comparison is on the kernel's snapping grid (`contrasts.snap`), so 0.6 - 0.5 meets a threshold of 0.1.
+
+**An equivalence margin beside it.** A contrast may declare both, and neither is derived from the other or checked against it: the margin bounds the differences the study calls negligible and decides `equivalent` and `trivial_difference`, while the smallest effect is what a difference must reach to count. The conclusion word and the decision are reported side by side, each on its own rule.
+
+**In the outputs.** The declaration is in `preregistration.toml`, so in the preregistration hash every output carries (P04). `analysis.json` gives a declaring contrast `smallest_effect`, the `SmallestEffect` above; a contrast that declares none has no such key, so a study that declares none keeps the bytes of its `analysis.json`. `report.md` adds a section "Smallest effects of interest", only when a contrast declares one, with the smallest effect as declared (a ratio with its natural log), the direction, the signed estimate and its interval (a ratio contrast's with their ratios), the decision (`meets (either direction)` for the two-sided word, labelled exploratory outside the family), the interval against it, the minimum detectable effect (with its ratio) and whether the design detects it; the terminal line of a declaring contrast adds its smallest effect, the decision and the signed estimate.
 
 ### One-arm estimates and each arm's runs
 
@@ -1166,6 +1250,42 @@ class DescriptiveResult:  # AnalysisResult.descriptives, in declared order
 **Each arm's runs.** For a contrast, `arm_runs` counts each arm's planned runs of the contrast's planned pairs, those whose pairing key the other arm plans too, analysed or absent; a run with no planned partner is outside every pair and is not counted. A pair lost to one run's None is one run lost, in the arm that lost it, whatever became of its partner: the pairs table counts pairs, this counts each arm's runs.
 
 **In the outputs.** `analysis.json` gives every contrast `arm_runs` and the analysis `descriptives`. `report.md` has a table "Runs of each arm" after the missing pairs, one row per contrast and arm, with the finish rate (`n/a` for an arm with none planned), and, only when one is declared, a section "One-arm estimates (descriptive)"; the terminal summary prints each one-arm estimate as descriptive, with its interval.
+
+### Several Holm families
+
+`expcore.stats.prereg` and `expcore.stats.analysis` (S17, #76). A preregistration whose confirmatory hypotheses form distinct families, such as one per outcome or one per phase, declares them by name in place of `holm_family`:
+
+```toml
+[holm_families]                # each key a family's name, each value its contrasts; a family of one is a stand-alone test
+phase1 = ["h1a", "h1b", "h1c"]
+phase2 = ["h2a", "h2b"]
+```
+
+```python
+# expcore.stats.prereg
+Preregistration.holm_families: Mapping[str, tuple[str, ...]]  # the named families in declared order; {} for one flat family
+Preregistration.holm_family: tuple[str, ...]  # every family's members, the families in order: the confirmatory set
+Preregistration.families() -> tuple[tuple[str | None, tuple[str, ...]], ...]  # (name, members); one flat family's name is None
+Preregistration.family_of(name) -> tuple[str | None, tuple[str, ...]] | None  # the family a contrast is in, None outside all
+
+# expcore.stats.analysis
+@dataclass(frozen=True)
+class HolmStep:      # step (1 for the smallest p-value), name, p_value, p_holm, level, reject
+@dataclass(frozen=True)
+class HolmFamily:    # name, members (declared order), steps (Holm's order), equivalence (its TOST decisions, S15)
+AnalysisResult.holm_families: tuple[HolmFamily, ...]  # the named families; () for one flat family
+def equivalence_groups(prereg) -> tuple[tuple[str | None, tuple[str, ...]], ...]  # the equivalence family split by Holm family
+```
+
+**Each family on its own.** Holm runs over each family apart, at the preregistration's one `alpha`: a family of m compares its k-th smallest p-value with alpha / (m - k + 1) and stops at the first that misses, so a member's level, adjusted p-value and decision are its own family's and no family's size or p-values move another's. Families of three and two start at alpha / 3 and alpha / 2; one flat family of the same five would start at alpha / 5 and can reject other contrasts. An untestable member counts as p = 1 in its own family (S02). `AnalysisResult.holm` still holds every member's decision, the families one after the other, so whatever reads a decision by name finds its own family's; `holm_families` adds each family's members and its steps. Everything a member's family size enters follows the member's own family: its minimum detectable effect is judged at alpha over its family's size, the refusals of S10 and S13 apply to every family's members, and `power_study`'s corrected row is at alpha over the largest family's size, the hardest first step any family has, so the figure is conservative for the smaller ones.
+
+**Equivalence under several families (S15).** `equivalence_family` stays one list, and each member must be in a Holm family (refused naming `[holm_families]` otherwise). Holm over the TOST p-values runs within each Holm family, over the members of the equivalence family it holds (`equivalence_groups`), so an equivalence claim is adjusted with the other claims of its own Holm family only; `equivalence_holm` keeps the equivalence family's declared order, and each `HolmFamily.equivalence` holds its own claims' decisions. `equivalence_feasibility` judges each claim at alpha over the claims of its own Holm family. With one flat family there is one group, the whole equivalence family, as before.
+
+**What is refused.** `holm_family` and `[holm_families]` together; `[holm_families]` beside `exploratory_only = true` (S12); an empty table, an empty family or a blank family name; a family naming an undeclared contrast, or one contrast twice; a contrast in two families; and a value that is not an array of contrast names (a list of lists among them). Each refusal names the file, `[holm_families]` and the family. A `Preregistration` built in code is held to the same rules, and its `holm_family`, when given beside `holm_families`, must be exactly their union (left empty, it is filled in). `max_unscored_treatment` on a contrast in no family is refused naming `holm_families`.
+
+**The hash.** The families are in `preregistration.toml`, so in its SHA-256, which every output manifest carries (P04) and the campaign fingerprint takes with the other configuration files: the same contrasts grouped otherwise are another preregistration, and a copy made with `with_override(holm_families=...)` is marked `+override`.
+
+**In the outputs.** `analysis.json` keeps `holm` and, only for named families, adds `holm_families`: per family its `name`, its `members`, its `steps` (`step`, `name`, `p_value`, `p_holm`, `level`, `reject`) and its `equivalence` decisions. `report.md` heads the confirmatory contrasts "Preregistered contrasts (n Holm families, each adjusted on its own at alpha = ...)" and gives each family a table of its own, "Holm family <name> (k contrasts)", followed by "Holm steps of <name>" (each step's contrast, raw p, level as alpha / k, Holm p and verdict) and notes on what each family's adjustment means; the exploratory contrasts are "outside every Holm family", the equivalence table has a "Holm family" column, and the terminal summary writes a member's Holm p as `Holm p 0.0240 (family phase1)`. The report refuses a result whose families and Holm decisions disagree (a member in no family or in two, or a step that is not its member's decision). One flat `holm_family` has no named family: its `analysis.json` and `report.md` are byte for byte what they were before families were named (`tests/data/tiny_study_analysis.json` and `tests/data/tiny_study_report.md` pin them).
 
 ## The platform layer's spaces and reset
 
