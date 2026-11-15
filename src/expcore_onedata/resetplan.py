@@ -10,11 +10,14 @@ listing:
 
 - **The listing:** the recursive listing of the space root on every provider the reset reads (`resetqos.by_listing`,
   the QoS scan the reset itself makes, each provider's listing read at once), with each regular file's path.
-- **The holdings:** each regular file's block map read at each provider that can hold the space's bytes, `[placement]
-  concurrency` at a time, within `occupancy.READS_MAX` and `occupancy.READ_BOUND_S` (`occupancy.read_files`, the
-  occupancy stage's own reads). Those are every provider of the space but the data provider and the ones the caller
-  declares never hold the space's bytes (`never_holds`, as `SpaceReset.run` takes it). The space root's counter never
-  skips one: it under-counts (a placement read 0 for 9.534 s, O46).
+- **The holdings:** the block map of every regular file any provider's listing showed, read at each provider that can
+  hold the space's bytes, so a file one provider's listing missed is still read there (a provider that answers it has
+  no such file holds none of it), `[placement] concurrency` at a time, within `occupancy.READS_MAX` and
+  `occupancy.READ_BOUND_S` (`occupancy.read_files`, the occupancy stage's own reads, under a budget of their own).
+  Those are every provider of the space but the data provider and the ones the caller declares never hold the space's
+  bytes (`never_holds`, as `SpaceReset.run` takes it). The space root's counter never skips one: it under-counts (a
+  placement read 0 for 9.534 s, O46). Hard links (`LNK`) are named in no plan: the occupancy stage reads them as it
+  reads every listed file, and refuses bytes held in one (O46).
 
 `Holdings` gives each file's bytes at each provider read, by file id, the files' paths, and `plan()`, the eviction plan
 of the held files; the caller picks what to evict. **Given to the reset** (`SpaceReset.run(planned=...)`, or
@@ -73,10 +76,10 @@ class Holdings:
 
 
 def plan_scan(reset: "SpaceReset", *, never_holds: Collection[str] = ()) -> Holdings:
-    """List the space once on every provider the reset reads, as its QoS scan does, and read each regular file's
-    block map at each provider that can hold the space's bytes: every provider of the space but the data provider and
-    those in `never_holds`. Refuse a `never_holds` that names the data provider or a provider that does not support the
-    space, before anything is sent."""
+    """List the space once on every provider the reset reads, as its QoS scan does, and read the block map of every
+    regular file any listing showed at each provider that can hold the space's bytes: every provider of the space but
+    the data provider and those in `never_holds`. Refuse a `never_holds` that names the data provider or a provider
+    that does not support the space, before anything is sent."""
     p, providers = reset.provisioner, reset.providers
     if isinstance(never_holds, str) or not all(isinstance(q, str) for q in never_holds):
         raise ValueError("never_holds is a collection of provider names")
@@ -85,10 +88,9 @@ def plan_scan(reset: "SpaceReset", *, never_holds: Collection[str] = ()) -> Hold
     p.verify_space()
     began = p.clock()
     found = resetqos.by_listing(p, providers)
-    every = frozenset().union(*found.regular.values())
+    files = sorted(found.listing.regular)  # every provider's listing's, read at each: one listing may miss a file
     can_hold = [q for q in p.space.support.providers if q != p.settings.holder and q not in never_holds]
-    wanted = {q: sorted(found.regular.get(q, every)) for q in can_hold}
-    held = occupancy.read_files(p, wanted, p.client.provider_label)
+    held = occupancy.read_files(p, dict.fromkeys(can_hold, files), p.client.provider_label, occupancy.Budget(p.clock()))
     return Holdings(found, held, began, round(p.clock() - began, 3))
 
 

@@ -62,7 +62,7 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any
 
-from expcore_onedata import consistency, resetheld
+from expcore_onedata import consistency, occupancy, resetheld
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, SpaceReset
 from expcore_onedata.resetplan import Holdings, given_scan
@@ -117,7 +117,7 @@ class _Space:
             "settled": {},
             "occupancy": None,  # the occupancy stage's kept reading (`occupancy.Reading`)
             "qos_rights": rights,
-            "files": {},  # the ids of the regular files each provider's listing showed the QoS scan (O46)
+            "files": occupancy.Listing(),  # the files and hard links any listing showed the QoS scan (O46)
             "never_holds": frozenset(never_holds),
             # a planner's scan, the qos stage's first, and when its listing began (None: the stage scans itself)
             "scan": None if plan.planned is None else given_scan(reset, plan.planned),

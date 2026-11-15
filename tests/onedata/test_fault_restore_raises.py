@@ -23,7 +23,7 @@ from expcore_onedata.config import load_platform
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_journal import JOURNAL
 from expcore_onedata.faults import RestoreNotVerified, load_faults
-from expcore_onedata.sandbox.kinds import INGEST_HELD
+from expcore_onedata.sandbox.kinds import FEDERATION_BUSY, INGEST_HELD
 
 SERVICE = SERVICES["beta"]
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1}
@@ -110,8 +110,9 @@ def test_o11_a_session_whose_provider_never_serves_again_raises_and_leaves_the_p
 
 def test_o11_the_next_gate_sees_the_restore_a_session_raised_for(tmp_path):
     """O11: the failed restore stays in the journal, so the platform's health gate fails for it, by the label and how it
-    failed, and another injector's start is refused as `injector_failure` instead of running on a half-restored
-    federation."""
+    failed, and another injector's start is refused instead of running on a half-restored federation: the failed
+    injector keeps the federation held, so the start's wait runs out as the hold `federation_busy`, which charges the
+    waiting run nothing."""
     platform, injector = unserving(tmp_path, health_wait_s=0.2)
     with pytest.raises(RestoreNotVerified):
         in_session(injector)
@@ -121,7 +122,7 @@ def test_o11_the_next_gate_sees_the_restore_a_session_raised_for(tmp_path):
     assert "not_serving" in health.detail
     with pytest.raises(InfraError) as refused:
         injector_for(platform, FakeServices()).start({**RUN, "attempt": 2})
-    assert refused.value.kind == INJECTOR_FAILURE
+    assert refused.value.kind == FEDERATION_BUSY
 
 
 def test_o11_a_body_exception_and_a_failed_restore_both_surface(tmp_path):
