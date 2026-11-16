@@ -54,7 +54,34 @@ class _StubWatch:
 '''  # fmt: skip
 
 
-def prepared(tmp_path: Path, *, guard: bool) -> Path:
+# Added beside the guard for a batch checked by both: an egress log of the gate's canary alone, so every run is clean
+# to egress but those of the task `hill`, whose log was never closed (unknown).
+EGRESS = '''
+
+from expcore.egress import EgressLog, declaration
+
+_GATE = ("127.0.0.1", 41234)
+
+
+class _StubEgress:
+    def __init__(self, task):
+        self.task = task
+
+    def egress_log(self):
+        recs = [{"op": op, "pid": 5, "fd": 3, "time": "1.000000000", "type": "tcp", "family": "inet",
+                 "address": _GATE[0], "port": _GATE[1], "result": 0 if op == "result" else None, "dropped": 0}
+                for op in ("connect", "result")]
+        lines = [{"event": "start", "format": "hpcop-egress/1", "nonce": _NONCE, "pid": 7, "uid": 1000}]
+        lines += [{"event": "record", "peer": {"pid": 5, "uid": 1000}, "rec": r} for r in recs]
+        if self.task != "hill":
+            lines.append({"event": "end", "records": len(recs), "malformed": 0, "unwritten": 0})
+        for seq, line in enumerate(lines):
+            line.update(seq=seq, wall=float(seq), mono=float(seq))
+        return "".join(_json.dumps(line) + "\\n" for line in lines).encode()
+'''  # fmt: skip
+
+
+def prepared(tmp_path: Path, *, guard: bool, egress: bool = False) -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
     if guard:
@@ -62,15 +89,17 @@ def prepared(tmp_path: Path, *, guard: bool) -> Path:
         text = plugin.read_text(encoding="utf-8")
         assert INSTRUMENTS in text
         added = "instruments = [FactsServed(shelf), MountGuard(_StubWatch(factors['task']), _NONCE)]"
-        plugin.write_text(text.replace(INSTRUMENTS, added) + GUARD, encoding="utf-8")
+        if egress:
+            added = added[:-1] + ", EgressLog(_StubEgress(factors['task']), declaration([_GATE], _GATE), _NONCE)]"
+        plugin.write_text(text.replace(INSTRUMENTS, added) + GUARD + (EGRESS if egress else ""), encoding="utf-8")
     write_stamp(study, HEAD, load_study(study).scope)
     summary = run_study(study)
     assert summary.statuses == {"done": len(load_study(study).manifest.rows)}, summary.statuses
     return study
 
 
-def checked_study(tmp_path, environment, *, guard: bool):
-    study = prepared(tmp_path, guard=guard)
+def checked_study(tmp_path, environment, *, guard: bool, egress: bool = False):
+    study = prepared(tmp_path, guard=guard, egress=egress)
     code, stderr = cli(environment, "check", str(study / "out" / "runs"), process=True)
     assert code == 0, stderr
     return analyse_study(study)
@@ -117,3 +146,27 @@ def test_a_study_without_the_instrument_has_no_mount_guard_anywhere(tmp_path, cl
     assert analysis.mount_guard is None
     assert "mount_guard" not in json.loads(made[ANALYSIS_FILE])
     assert b"Mount isolation" not in made[REPORT_FILE]
+
+
+def test_a_study_checked_by_both_guards_reruns_without_the_runs_either_leaves_out(tmp_path, clean_environment):
+    """O60: `lake`'s runs touched the token's directory (the mount guard leaves them out), `hill`'s mount and egress
+    logs were never closed (both leave them out); the combined rerun leaves out every one of them, and analysis.json,
+    the report and the terminal summary carry it beside the two single-guard reruns."""
+    analysis = checked_study(tmp_path, clean_environment, guard=True, egress=True)
+    both = analysis.guards
+    assert both is not None
+    out = {run.run_key for run in both.left_out}
+    assert out == {run.run_key for run in analysis.mount_guard.left_out} | {
+        run.run_key for run in analysis.egress.flagged
+    }
+    assert {run.by for run in both.left_out} == {"mount", "both"}
+    made = output_bytes(analysis)
+    summary = json.loads(made[ANALYSIS_FILE])
+    assert summary["guards"]["counts"]["left_out"] == len(out)
+    assert set(summary["guards"]["by_condition"]) == {row.condition for row in analysis.rows}
+    assert summary["guards"]["sensitivity"]["left_out"]
+    report = made[REPORT_FILE].decode()
+    assert (
+        report.index("## Egress (detected") < report.index("## Mount isolation") < report.index("## Egress and mount")
+    )
+    assert "#### Preregistered contrasts without the runs either guard leaves out" in report
