@@ -227,7 +227,10 @@ def write_state(root: Path, services: Sequence[str]) -> Path:
     state = {
         "format": "expcore-hpc-federation/1",
         "allocation": {"name": FEDERATION},
-        "services": {name: {"kind": "op", "launch": 1, "state": "running"} for name in services},
+        "services": {
+            "zone": {"kind": "oz", "launch": 1, "state": "running"},
+            **{name: {"kind": "op", "launch": 1, "state": "running"} for name in services},
+        },
     }
     path = root / "hpc-federation.json"
     path.write_text(json.dumps(state), encoding="utf-8")

@@ -138,6 +138,7 @@ def answer(root, key):
     ("fields", "word"),
     [
         ({"service": "store-nine"}, "not_allowed"),  # a service this federation's state does not list
+        ({"service": "zone"}, "not_allowed"),  # the zone: listed, but no provider, so never stopped or exec'd into
         ({"federation": "hpcop-other-99999999"}, "other_federation"),
         ({"verb": "exec", "command": "bash"}, "not_allowed"),
         ({"verb": "exec", "command": None}, "not_allowed"),

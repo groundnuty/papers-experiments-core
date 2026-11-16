@@ -139,9 +139,16 @@ def proc_start(pid: int) -> str | None:
 
 
 def services_of(root: Path) -> set[str]:
-    """The services the state file lists, by their layout names; empty when it cannot be read."""
+    """The providers' services the state file lists, by their layout names (its `kind` "op"): what an outage or a heal
+    may act on, never the zone; empty when it cannot be read."""
     services = (_read(Path(root) / STATE_FILE) or {}).get("services")
-    return {name for name in services if isinstance(name, str)} if isinstance(services, dict) else set()
+    if not isinstance(services, dict):
+        return set()
+    return {
+        name
+        for name, entry in services.items()
+        if isinstance(name, str) and isinstance(entry, dict) and entry.get("kind") == "op"
+    }
 
 
 def beat(root: Path, wall: Callable[[], float] = time.time, stale_s: float = RELAY_STALE_S) -> dict[str, Any] | None:
