@@ -47,7 +47,7 @@ A read-only imported storage is only read: the panel skips its write test, op-wo
 - the owner of each imported file, which is the storage file's uid through LUMA, or the space's virtual owner when it maps to no user (op-worker `modules/storage/luma/luma.erl`); the agent's user reads a file as a member of the space, so the tree must be readable by its group;
 - the mode and times, which are the storage file's (`storage_import_engine.erl:888-905`: the mode's permission bits, and the creation time the least of `stat`'s three), where an uploaded file gets 664 and the upload's times.
 
-## A tree on the cluster's shared filesystem (O56)
+## A tree on the cluster's shared filesystem (O59)
 
 An HPC federation can hold a space on a directory of the cluster's shared filesystem that other federations import too,
 so several of them serve one dataset with no copy of it. The directory is declared in the layout and in `platform.toml`

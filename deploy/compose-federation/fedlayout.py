@@ -242,7 +242,7 @@ class Layout:
         return self.root / self.spec.space(space).owner / "import" / space
 
     def shared_imports(self) -> list[Space]:
-        """The spaces whose imported tree other federations import too (`import.shared`, O56), in the layout's order."""
+        """The spaces whose imported tree other federations import too (`import.shared`, O59), in the layout's order."""
         return [s for s in self.spec.spaces if s.imported is not None and s.imported.shared]
 
     def owned_imports(self, provider: str) -> list[Space]:

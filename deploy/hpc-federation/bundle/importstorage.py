@@ -1,4 +1,4 @@
-"""importstorage.py: the shared imported trees a provider mounts read-only (O56). Run with python3.11 -I, stdlib only.
+"""importstorage.py: the shared imported trees a provider mounts read-only (O59). Run with python3.11 -I, stdlib only.
 
 A tree on the cluster's shared filesystem can be the data of a space in several federations at once: each federation's
 provider imports it (Onedata's storage import) from a read-only mount, so none of them can write to it. This script
@@ -293,8 +293,9 @@ def service_processes(workdir, proc, uid):
 def check_mounts(workdir, proc="/proc", uid=None):
     """What this service's processes hold at each listed space's mountpoint: (facts, ok). `ok` is true when every listed
     space is held by at least one of them and by none with a mount writable. The mount's own options decide, never the
-    filesystem's (a read-only bind of a writable filesystem is read-only), and every mount at the mountpoint or below
-    it counts: a writable mount inside the tree makes files in it writable, whatever the mount above it says."""
+    filesystem's (a read-only bind of a writable filesystem is read-only). The mountpoint's own mount must exist, and
+    every mount at it or below it must be read-only: a writable mount inside the tree makes files in it writable,
+    whatever the mount above it says, and a read-only mount below a tree that is not mounted proves nothing."""
     uid = os.getuid() if uid is None else uid
     spaces = [space for space, _ in listed(workdir)]
     tally = {space: {"space": space, "processes": 0, "read_only": 0, "writable": 0} for space in spaces}
@@ -307,7 +308,8 @@ def check_mounts(workdir, proc="/proc", uid=None):
         for space in spaces:
             here = "%s/%s" % (MOUNT_ROOT, space)
             held = [options for point, options, _ in mounts if point == here or point.startswith(here + "/")]
-            if held:
+            # the tree's own mount must be there: a mount below it alone is no bind of the tree
+            if any(point == here for point, _, _ in mounts):
                 tally[space]["processes"] += 1
                 tally[space]["read_only" if all("ro" in options for options in held) else "writable"] += 1
     facts = [tally[space] for space in spaces]

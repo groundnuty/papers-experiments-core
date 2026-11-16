@@ -1,4 +1,4 @@
-"""hpcimport.py: what the HPC federation's `up` needs of a shared imported tree (O56), from the layout (the Compose
+"""hpcimport.py: what the HPC federation's `up` needs of a shared imported tree (O59), from the layout (the Compose
 federation's: `fedspec.py`, `fedlayout.py`). Plain functions on a loaded `fedlayout.Layout`, so the driver imports them
 and a test calls them; stdlib only, parseable by the oldest Python the bundle's tests parse with.
 

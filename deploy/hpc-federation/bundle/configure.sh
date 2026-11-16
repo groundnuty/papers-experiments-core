@@ -9,7 +9,7 @@
 #   rootfs/etc/hpcop-erlang-env      this job's epmd port (a random free one of 21300-21999), epmd and the Erlang
 #                                    distribution on loopback; sourced by every VM start path and read by
 #                                    the shim, which sends 4369 there.
-#   W/imports                        a provider's shared imported trees (O56), when it owns imported spaces: each
+#   W/imports                        a provider's shared imported trees (O59), when it owns imported spaces: each
 #                                    --import=SPACE=PATH is checked by importstorage.py, its empty mountpoint made in
 #                                    the rootfs, and run_service binds the tree there read-only. Never for the zone.
 # Usage: configure.sh op --workdir W <provider-name> <zone-fqdn> <admin-email> [peer-ip ...] [--import=SPACE=PATH ...]

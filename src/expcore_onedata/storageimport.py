@@ -8,7 +8,7 @@ space so (`[space] import`, `spaces.py`) and checks the result here, through the
 (`ImportedSpace`):
 
 1. **`check_storage`**: the data provider's Onepanel shows the space supported by an imported storage, read-only as
-   declared (and, for a directory other federations import too, `[space] import` `shared`, O56, read-only with no
+   declared (and, for a directory other federations import too, `[space] import` `shared`, O59, read-only with no
    room for doubt: the flag must be the boolean `true`), in the `auto` mode, with continuous scans off. A continuous
    scan would scan again on its own, during a run, and with the detection of modifications on it claims a file
    changed on the storage whole on the data provider
@@ -110,7 +110,7 @@ class SpaceCheck:
 
     @staticmethod
     def _shared(provisioner: Provisioner) -> bool:
-        """Whether the space's imported directory is shared with other federations (`[space] import`, O56)."""
+        """Whether the space's imported directory is shared with other federations (`[space] import`, O59)."""
         declared = provisioner.space.imported
         return declared is not None and declared.shared
 

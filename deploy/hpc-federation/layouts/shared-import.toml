@@ -1,5 +1,5 @@
 # The layout of an HPC federation whose data spaces are imported from trees on the cluster's shared filesystem, read by
-# other federations too (O56, DESIGN.md section 8). Every name is invented. It is read by deploy/compose-federation's
+# other federations too (O59, DESIGN.md section 8). Every name is invented. It is read by deploy/compose-federation's
 # `fedspec.py`, as every layout of this deployment is, and holds no path: each import names the two variables of
 # `site.env` that hold its tree's directory and its manifest's file (site.env.example), and `up` reads them when it runs.
 #

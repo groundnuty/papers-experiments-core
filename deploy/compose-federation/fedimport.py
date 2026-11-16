@@ -17,7 +17,7 @@ finished one by the next up, which would otherwise leave the space short of file
 
 `reset --clean` is refused for a layout with an imported space (`require_resettable`): it deletes through the providers.
 
-A tree that other federations import too (`import.shared`, O56) is shown, after up, to be what its manifest says
+A tree that other federations import too (`import.shared`, O59) is shown, after up, to be what its manifest says
 (`verify_imports`): the core's own check of an imported space, through the rendered platform.toml.
 """
 
@@ -176,7 +176,7 @@ def verify_imports(
     clock: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Show, once up has rendered platform.toml, that every shared import (`import.shared`, O56) holds exactly its
+    """Show, once up has rendered platform.toml, that every shared import (`import.shared`, O59) holds exactly its
     manifest, by the core's own check (`ImportedSpace.provision`): the owner's panel shows the imported storage
     read-only, the scan has completed with no failed file, the listing on every provider that supports the space holds
     exactly the manifest's paths, kinds and sizes, and every file is whole on the owner by its block map; with `hashes`,

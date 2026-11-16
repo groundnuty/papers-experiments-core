@@ -31,7 +31,7 @@ from it. A space without the key is a regular one, as every space was. The decla
 entry's digest with `[[spaces]]`, and as `storage_import` in the one-space form, whose fingerprint stays as it was
 without the key.
 
-`shared` (optional, false by default; O56) says the storage's directory is imported by other federations too, so
+`shared` (optional, false by default; O59) says the storage's directory is imported by other federations too, so
 nothing of this one may write to it: a shared import must be read-only, and `readonly = false` beside `shared = true`
 is refused at load. It enters the fingerprint only when true, so no earlier declaration's fingerprint changes.
 """
@@ -73,7 +73,7 @@ class Support:
 @dataclass(frozen=True)
 class ImportedStorage:
     """How the data provider holds an imported space: on a storage Onedata imported the files from, read-only or not,
-    and whether other federations import the same directory (`shared`, O56), in which case it is read-only."""
+    and whether other federations import the same directory (`shared`, O59), in which case it is read-only."""
 
     readonly: bool
     shared: bool = False

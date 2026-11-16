@@ -13,7 +13,7 @@ agent may reach, in a layout with a `platform_template`; `reset --replicas` leav
 the provider that wrote it, owner or not. A space with an `import` table is held by its owner on an imported POSIX
 storage (Onedata's storage import) whose directory is a dataset the layout does not hold: the table names the
 environment variable that gives its path, never the path, since a layout is public. An import may be `shared` with
-other federations (O56): it is then read-only and names the variable of its manifest. Every key is checked when the file
+other federations (O59): it is then read-only and names the variable of its manifest. Every key is checked when the file
 is read, and a refusal names the file and the key. The two images stay pinned by the deployment itself
 (fedlayout.IMAGES): a layout cannot name another.
 """
@@ -105,7 +105,7 @@ class Import:
     import mounts the directory itself, so the platform never writes to it; a writable one mounts a copy of it that
     up makes inside the root, which goes with the root.
 
-    `shared` (O56) says other federations import the same directory, so this one must not write to it: it is refused
+    `shared` (O59) says other federations import the same directory, so this one must not write to it: it is refused
     unless `readonly`, and it needs a `manifest_env`, the variable that names the file listing the tree's paths, sizes
     and hashes, which the verification compares the space with. `direct_io` says the agent's mount reads this storage
     through the filesystem itself (`[sandbox.mount] io_mode = "direct"`), which the sandbox binds read-only, so it too
@@ -303,7 +303,7 @@ def load_spec(path: Path | None = None) -> Spec:
 def _import(read: _Reader, table: Mapping[str, Any], key: str, has_baseline: bool, earlier: list[Space]) -> Import:
     """The `import` table of a space. Its space declares no baseline, which up would write into the dataset, and no two
     writable imports name one variable, since each would then copy, and write into its copy of, one source. A read-only
-    import may share its source: nothing writes to it. A shared import (O56) is read-only, names the manifest it is
+    import may share its source: nothing writes to it. A shared import (O59) is read-only, names the manifest it is
     verified against, has a tree and a manifest of its own, and a direct mount of a storage needs it read-only."""
     where = f"{key}.import"
     if has_baseline:

@@ -1,5 +1,5 @@
 """A space on a tree of the cluster's shared filesystem, imported read-only by its owner, on a live HPC federation
-(O56). Skipped unless:
+(O59). Skipped unless:
 
     EXPCORE_LIVE_HPC_IMPORT=1 EXPCORE_LIVE_PLATFORM=<root>/platform.toml \\
     EXPCORE_LIVE_IMPORT_SPACE=<the label of the shared import's entry in platform.toml> \\
@@ -113,8 +113,8 @@ def shared(tmp_path_factory):
         client.close()
 
 
-def test_o56_the_space_is_declared_shared_and_its_owners_storage_is_read_only(shared):
-    """O56: the platform file says the tree is shared, and the owner's panel shows a read-only imported storage."""
+def test_o59_the_space_is_declared_shared_and_its_owners_storage_is_read_only(shared):
+    """O59: the platform file says the tree is shared, and the owner's panel shows a read-only imported storage."""
     record = FACTS["import"]
     assert shared["provisioner"].space.imported.shared is True
     assert (record["ok"], record["shared"], record["readonly"]) == (True, True, True)
@@ -122,8 +122,8 @@ def test_o56_the_space_is_declared_shared_and_its_owners_storage_is_read_only(sh
     assert record["storage"]["readonly"] is True
 
 
-def test_o56_the_scan_completed_and_every_provider_lists_exactly_the_manifest(shared):
-    """O56: no failed file, and on the owner and every mirror the listing is the manifest's paths, kinds and sizes."""
+def test_o59_the_scan_completed_and_every_provider_lists_exactly_the_manifest(shared):
+    """O59: no failed file, and on the owner and every mirror the listing is the manifest's paths, kinds and sizes."""
     record, manifest = FACTS["import"], shared["manifest"]
     assert record["scan"]["status"] == "completed"
     assert record["scan"]["failedFiles"] == 0
@@ -134,8 +134,8 @@ def test_o56_the_scan_completed_and_every_provider_lists_exactly_the_manifest(sh
 
 
 @pytest.mark.skipif(not MUTATE, reason="EXPCORE_LIVE_MUTATE=1 is needed: a reset evicts replicas from the mirrors")
-def test_o56_a_reset_leaves_the_owners_copy_the_listing_and_the_tree_on_the_shared_filesystem_as_they_were(shared):
-    """O56: the reset evicts from the mirrors only; afterwards the owner holds every file whole, the listing is still
+def test_o59_a_reset_leaves_the_owners_copy_the_listing_and_the_tree_on_the_shared_filesystem_as_they_were(shared):
+    """O59: the reset evicts from the mirrors only; afterwards the owner holds every file whole, the listing is still
     the manifest, and the tree on the shared filesystem has the same entries, sizes, times and modes as before the
     first read."""
     provisioner, manifest = shared["provisioner"], shared["manifest"]

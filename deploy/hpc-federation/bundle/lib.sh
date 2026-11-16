@@ -334,7 +334,7 @@ config_dir() {  # <rootfs> <service>: host path of the service's config.d, behin
   printf '%s\n' "$1$t/config.d"
 }
 
-# The shared imported trees a provider mounts (O56): configure.sh's `importstorage.py prepare` checks them and writes the
+# The shared imported trees a provider mounts (O59): configure.sh's `importstorage.py prepare` checks them and writes the
 # work directory's list; the service binds exactly that list, read-only, and nothing else of the node's filesystems.
 split_imports() {  # <imports-array> <other-array> args...: the --import=SPACE=PATH arguments, then every other one
   local -n _imports=$1 _others=$2

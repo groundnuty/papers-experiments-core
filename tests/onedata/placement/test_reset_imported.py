@@ -1,4 +1,4 @@
-"""A reset of a space on a shared imported tree touches none of the tree's files (O56).
+"""A reset of a space on a shared imported tree touches none of the tree's files (O59).
 
 The reset evicts replicas from the mirrors, cancels transfers and removes the run's own QoS requirements. None of those
 reads or changes the data provider's storage, and the one thing that would (an eviction from the data provider, which
@@ -68,8 +68,8 @@ def evictions(fake):
     return [c for c in fake.provider_calls if c[1:] == ("POST", "/transfers")]
 
 
-def test_o56_a_reset_of_a_shared_imported_space_evicts_the_mirror_and_writes_no_file(provisioner, stocked, ticker):
-    """O56: every stage runs; the mirror's replicas leave; no request to `/data/` that writes or deletes is made, and
+def test_o59_a_reset_of_a_shared_imported_space_evicts_the_mirror_and_writes_no_file(provisioner, stocked, ticker):
+    """O59: every stage runs; the mirror's replicas leave; no request to `/data/` that writes or deletes is made, and
     the data provider holds every file whole, as the import made it."""
     assert provisioner.read_only is True
     record = SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
@@ -79,8 +79,8 @@ def test_o56_a_reset_of_a_shared_imported_space_evicts_the_mirror_and_writes_no_
     assert all(stocked.held(path, ALPHA_ID) == [[0, len(DATA)]] for path in FILES)
 
 
-def test_o56_every_eviction_a_reset_sends_names_the_mirror_and_none_the_data_provider(provisioner, stocked, ticker):
-    """O56: the eviction jobs of the reset carry the mirror's id as the evicting provider; the data provider's is in
+def test_o59_every_eviction_a_reset_sends_names_the_mirror_and_none_the_data_provider(provisioner, stocked, ticker):
+    """O59: the eviction jobs of the reset carry the mirror's id as the evicting provider; the data provider's is in
     none, so none takes the imported tree's blocks."""
     SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
     assert evictions(stocked)
@@ -89,16 +89,16 @@ def test_o56_every_eviction_a_reset_sends_names_the_mirror_and_none_the_data_pro
     assert {transfer.provider_id for transfer in jobs} == {BETA_ID}
 
 
-def test_o56_a_reset_plan_that_names_the_data_provider_is_refused_before_any_stage(provisioner, stocked, ticker):
-    """O56, O09: on an imported tree the data provider's copy is the only one, and an eviction of it cannot be undone
+def test_o59_a_reset_plan_that_names_the_data_provider_is_refused_before_any_stage(provisioner, stocked, ticker):
+    """O59, O09: on an imported tree the data provider's copy is the only one, and an eviction of it cannot be undone
     (nothing is replicated back onto a read-only storage): refused with nothing sent, not even a read."""
     with pytest.raises(Refused, match="own copy"):
         SpaceReset(provisioner, now=ticker.clock).run({"alpha": ["study"]})
     assert stocked.provider_calls == []
 
 
-def test_o56_a_bulk_eviction_from_the_data_provider_is_refused_on_a_shared_imported_space(provisioner, stocked):
-    """O56, O09: by name, for a directory and for files alike."""
+def test_o59_a_bulk_eviction_from_the_data_provider_is_refused_on_a_shared_imported_space(provisioner, stocked):
+    """O59, O09: by name, for a directory and for files alike."""
     with pytest.raises(Refused, match="own copy"):
         evict_tree(provisioner, "study", "alpha")
     with pytest.raises(Refused, match="own copy"):
@@ -106,8 +106,8 @@ def test_o56_a_bulk_eviction_from_the_data_provider_is_refused_on_a_shared_impor
     assert evictions(stocked) == []
 
 
-def test_o56_a_reset_removes_the_runs_own_requirement_without_touching_a_file(provisioner, stocked, ticker):
-    """O56: a QoS requirement the agent added is removed (a requirement is metadata, not a file), through the gate and
+def test_o59_a_reset_removes_the_runs_own_requirement_without_touching_a_file(provisioner, stocked, ticker):
+    """O59: a QoS requirement the agent added is removed (a requirement is metadata, not a file), through the gate and
     nothing under `/data/`; the files stay as the import made them."""
     stocked.add_qos(FILES[2])
     SpaceReset(provisioner, now=ticker.clock).run({"beta": ["study"]})
@@ -116,8 +116,8 @@ def test_o56_a_reset_removes_the_runs_own_requirement_without_touching_a_file(pr
     assert all(stocked.held(path, ALPHA_ID) == [[0, len(DATA)]] for path in FILES)
 
 
-def test_o56_the_teardown_of_a_provisioner_that_created_nothing_deletes_nothing(provisioner, stocked):
-    """O56, O09: a teardown deletes only what its own log says it created; in a space whose every file an import made,
+def test_o59_the_teardown_of_a_provisioner_that_created_nothing_deletes_nothing(provisioner, stocked):
+    """O59, O09: a teardown deletes only what its own log says it created; in a space whose every file an import made,
     that is nothing, so no request leaves and the report says everything is in place."""
     report = provisioner.teardown()
     assert report.ok is True

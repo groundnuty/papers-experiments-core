@@ -280,7 +280,7 @@ class PlatformConfig:
         (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
         The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
         declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly` (and `shared`,
-        when true: O56).
+        when true: O59).
 
         With a `[sandbox]`, it also holds every level of the data path with its kind and a REST level's listing mode
         (O21), so a resume after a level changed its data path or its listing is refused. A declared

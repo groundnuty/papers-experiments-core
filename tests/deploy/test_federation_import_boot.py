@@ -369,11 +369,11 @@ def test_the_scan_and_storage_steps_are_taken_for_a_layout_with_no_import_too(fe
     assert names[-1] == "wait_import"
 
 
-# -- what a deployment adds to an imported storage (O56) -------------------------------------------------------------
+# -- what a deployment adds to an imported storage (O59) -------------------------------------------------------------
 
 
-def test_o56_a_deployments_extra_settings_are_sent_with_the_creation_and_never_compared_after(fed, tmp_path):
-    """O56: The HPC providers run as the job's user: their bootstrap adds the user's ids and the LUMA feed to the
+def test_o59_a_deployments_extra_settings_are_sent_with_the_creation_and_never_compared_after(fed, tmp_path):
+    """O59: The HPC providers run as the job's user: their bootstrap adds the user's ids and the LUMA feed to the
     storage
     it creates. The panel need not echo them, so a storage found afterwards is checked on the declared keys alone."""
     fake = federation(fed, tmp_path)
@@ -385,8 +385,8 @@ def test_o56_a_deployments_extra_settings_are_sent_with_the_creation_and_never_c
     assert len(fake.posts()) == 1
 
 
-def test_o56_a_deployments_extra_settings_may_not_override_what_the_layout_declares(fed, tmp_path):
-    """O56: A shared tree is read-only because the layout says so: no hook turns that off."""
+def test_o59_a_deployments_extra_settings_may_not_override_what_the_layout_declares(fed, tmp_path):
+    """O59: A shared tree is read-only because the layout says so: no hook turns that off."""
     fake = federation(fed, tmp_path)
     fake.boot.import_storage_extra = lambda service: {"readonly": False}
     with pytest.raises(RuntimeError, match="may not override readonly"):
@@ -394,8 +394,8 @@ def test_o56_a_deployments_extra_settings_may_not_override_what_the_layout_decla
     assert fake.posts() == []
 
 
-def test_o56_without_a_deployments_hook_the_creation_is_what_it_was(fed, tmp_path):
-    """O56: without a deployments hook the creation is what it was."""
+def test_o59_without_a_deployments_hook_the_creation_is_what_it_was(fed, tmp_path):
+    """O59: without a deployments hook the creation is what it was."""
     fake = federation(fed, tmp_path)
     fake.boot.ensure_import_storages()
     assert fake.posts() == [("elm", "/provider/storages", {"import-fern-space": FERN})]
