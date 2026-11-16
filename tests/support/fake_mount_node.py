@@ -57,8 +57,8 @@ class Watch:
 class FakeMountNode(FakeNode):
     """The fake node with oneclient and the mount watcher (the module's docstring)."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *, own_process: bool = False) -> None:
+        super().__init__(own_process=own_process)
         self.mountpoint: str | None = None  # oneclient's, once it has started
         self.oneclient_tokens: list[str] = []
         self.oneclient_argv: list[str] | None = None

@@ -134,6 +134,7 @@ from expcore.study.config import (
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.platform_deferral import platform_deferrals
+from expcore.study.platform_legacy import legacy_fingerprint_of
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
@@ -375,6 +376,9 @@ def _build(
     leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
+    store = out_dir(study) / STATE_FILE
+    if plugin.platform_legacy is not None and store.is_file():  # C06: a store of the earlier form
+        fingerprint = legacy_fingerprint_of(read_fingerprint(store), fingerprint, plugin.platform_legacy)
     manifest, started = study.manifest, None
     if isinstance(shard, SelectionSpec):
         try:
@@ -619,6 +623,21 @@ def _settle_side_files(study: StudyIdentity, batch: Path) -> None:
         lock.release()
 
 
+def _settle_merged_side_files(study: StudyIdentity, batch: Path) -> None:
+    """Finish what a kill left of the placement of a declared side file in a merged batch (R15, #304), and say so.
+
+    Only a rename that a record names is finished (the hash is the record's, so it is safe whenever it is made), and
+    only a copy of a file already in place is removed. A file no record names is left: removing it needs the campaign's
+    lock as a proof that no attempt is staging, and a merged batch has none to take (it holds no store, `check` makes
+    no `campaign.lock` beside it, R16, and nothing prevents a campaign from being started in its out/ later); the
+    merge that wrote the batch dropped such files from its copy. Only `batch`, the merged batch's `runs/`, is walked:
+    merge.json, the shards' snapshots and the shards themselves are never touched. A directory that cannot be written
+    is reported as left, and the pairing of the check then says what is missing.
+    """
+    for settled in settle_side_files(batch, study.side_files):
+        print(f"check: {settled}", file=sys.stderr)
+
+
 def _check_merged(
     study: StudyIdentity, directory: Path, code: Mapping[str, Any], env: Mapping[str, Any], partial: bool
 ) -> dict[str, Any]:
@@ -651,6 +670,7 @@ def _check_merged(
     except MergeRefused as error:
         raise Refused(str(error)) from None
     import_what_the_records_need(study, directory)
+    _settle_merged_side_files(study, directory)
     check = verify_batch(
         directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
     )
@@ -883,7 +903,8 @@ def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
     only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
     decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named.
     Only for declared equivalence families (S18), `equivalence_families`: each one's name, members and steps over
-    their TOST p-values; a study that declares none keeps its analysis.json byte for byte."""
+    their TOST p-values; a study that declares none keeps its analysis.json byte for byte. A sensitivity analysis
+    (egress, the mount guard, both) holds the same entries of its own result beside its `left_out` and `contrasts`."""
     entries: dict[str, Any] = {"holm": result.holm}
     if result.holm_families:
         entries["holm_families"] = result.holm_families
@@ -922,7 +943,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
 def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch checked for egress (#179): each analysed run's verdict (its flags, its
     log's state and reasons, its outside destinations by address and port, its static-scan hits) and the sensitivity
-    analysis without the flagged runs, or why there is none."""
+    analysis without the flagged runs (its Holm decisions and, as the primary analysis's, its named and equivalence
+    families, S17 and S18), or why there is none."""
     sensitivity = egress.sensitivity
     return {
         "counts": egress.counts(),
@@ -944,7 +966,7 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in egress.flagged], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": egress.refused,
     }  # fmt: skip
 
@@ -967,7 +989,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guard.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guard.refused,
     }  # fmt: skip
 
@@ -987,7 +1009,7 @@ def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guards.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guards.refused,
     }  # fmt: skip
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, hpc_on_path
+from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path, pin_values
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
 from expcore_onedata.linksettings import link_pairs
@@ -33,7 +33,7 @@ def site(tmp_path):
         (images / name).write_bytes(b"tar")
         (images / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
     (tmp_path / "fed").mkdir()
-    return {**SITE, "SH": str(images), "L": str(logs)}
+    return {**SITE, **agent_site(tmp_path / "agent"), "SH": str(images), "L": str(logs)}
 
 
 class Rig:
@@ -72,7 +72,7 @@ def test_up_places_the_zone_and_each_provider_on_its_own_node_in_the_layouts_ord
     state = rig.state()
     assert state["allocation"]["job"] == "4242"
     assert state["phase"] == "linked"
-    assert state["roles"] == ["zone", *PROVIDERS]
+    assert state["roles"] == ["zone", *PROVIDERS, "sandbox"]  # the agent's node last (its template's [sandbox])
     for index, name in enumerate(["zone", *PROVIDERS]):
         record = state["services"][name]
         assert record["node"] == f"node{index + 1:02d}"
@@ -292,7 +292,8 @@ def step_layout(tmp_path):
 
 def test_the_agents_node_is_held_and_placed_last_and_nothing_runs_or_is_torn_down_there(hpc, tmp_path, site):
     """O57: [hpc] sandbox makes the agent's node one more role, placed last, as the held job's own component (its
-    shape never enters the service nodes'); it gets no service step and no teardown, and has no ports of a service."""
+    shape never enters the service nodes'); it gets no service step and no teardown, and has no ports of a service.
+    O63: down's one step there is the sweep of the shard steps' directories on its tmpfs."""
     control = 'control = { cpus = 1, memory = "1g" }'
     layout = edited_layout(tmp_path / "layout", control, control + '\nsandbox = { cpus = 8, memory = "17g" }')
     rig = Rig(hpc, tmp_path, site, layout=layout)
@@ -305,7 +306,8 @@ def test_the_agents_node_is_held_and_placed_last_and_nothing_runs_or_is_torn_dow
     assert all(s.node != "node07" for s in rig.fake.spawned)
     rig.fake.sruns.clear()
     rig.driver.down()
-    assert [s for s in rig.fake.sruns if s.node == "node07"] == []
+    assert [s for s in rig.fake.sruns if s.node == "node07"] == rig.fake.sweeps
+    assert [s.name.rsplit("-", 2)[-2:] for s in rig.fake.sweeps] == [["sandbox", "sweep"]]
 
 
 def test_with_core_step_the_core_runs_as_a_control_step_on_the_zones_node(hpc, tmp_path, site, step_layout):
@@ -388,11 +390,13 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
 
     monkeypatch.setattr(fedlinks, "check_links", check)
     out = hpc.boot.core_phase(
-        layout, (5001, 5001), hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750),
+        layout, (5001, 5001), {**hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, root),
+                               **pin_values(tmp_path / "agent")},
         rest=lambda ca: SimpleNamespace(close=lambda: None),
         bootstrap=lambda rest, layout, owner: SimpleNamespace(layout=layout, ids=ids, spec=layout.spec),
         steps=lambda boot: None,
         content=lambda boot: SimpleNamespace(reset=lambda timeout: None),
+        data=data_stand_in(),
     )  # fmt: skip
     assert len(seen[0]) == 10
     record = json.loads((root / "link-check.json").read_text(encoding="utf-8"))

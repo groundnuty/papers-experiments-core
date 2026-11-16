@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, hpc_on_path
+from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
 CONTROL = 'control = { cpus = 1, memory = "1g" }'
@@ -55,7 +55,8 @@ def up_federation(hpc, tmp_path: Path, placement: str) -> tuple[Path, FakeSlurm]
     driver.poll_s = driver.slurm.poll_s = 0.0
     driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
     driver.relay_available = lambda: False
-    driver.up(hpc.settings.site_from_environment({**SITE, "SH": str(images), "L": str(logs)}))
+    site = {**SITE, **agent_site(tmp_path / "agent"), "SH": str(images), "L": str(logs)}
+    driver.up(hpc.settings.site_from_environment(site))
     return root, fake
 
 

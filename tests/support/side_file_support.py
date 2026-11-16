@@ -71,7 +71,11 @@ def edit(path: Path, old: str, new: str) -> None:
 
 def side_study(base: Path) -> Path:
     """A stamped copy of the example whose runs write a side file, and whose study.toml declares it."""
-    root = make_copy(base, "study")
+    return declare_side_files(make_copy(base, "study"))
+
+
+def declare_side_files(root: Path) -> Path:
+    """Make a stamped copy of the example write a side file beside each record and declare it; return the copy."""
     plugin = root / "plugin.py"
     edit(plugin, "import asyncio\n", "import asyncio\nimport gzip\nimport hashlib\nimport json\n")
     edit(plugin, "\n\n# --- the stub model's script", f"{INSTRUMENT}\n\n# --- the stub model's script")

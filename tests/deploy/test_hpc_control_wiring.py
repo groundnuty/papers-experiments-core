@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeProcess, FakeSlurm, hpc_on_path
+from hpc_fed_support import LAYOUT, SITE, FakeProcess, FakeSlurm, agent_site, hpc_on_path
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
 END_TIME = "2026-11-16T12:00:00"  # the fake scontrol's EndTime: the login node's local time, with no zone
@@ -43,7 +43,7 @@ def site(tmp_path):
         (images / name).write_bytes(b"tar")
         (images / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
     (tmp_path / "fed").mkdir()
-    return {**SITE, "SH": str(images), "L": str(logs)}
+    return {**SITE, **agent_site(tmp_path / "agent"), "SH": str(images), "L": str(logs)}
 
 
 def stop_line(ended="exit", seconds=3.5):

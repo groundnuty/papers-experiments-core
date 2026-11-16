@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from hpc_fed_support import hpc_on_path, manifest_values
 
 HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 BUNDLE = HPC / "bundle"
@@ -831,7 +832,10 @@ def rendered(fed, tmp_path) -> str:
         spaces={s.name: f"space-{s.name}" for s in spec.spaces},
     )
     facts = fed.facts.facts_of(boot)
-    return fed.facts.render(TEMPLATE.read_text(encoding="utf-8"), fed.facts.placeholders(facts))
+    values = {**fed.facts.placeholders(facts), "hpc_root": str(tmp_path)}  # up's: every path into the root absolute
+    with hpc_on_path():  # the driver's modules, for the data manifests up writes
+        values |= manifest_values(tmp_path, LAYOUT_FILE)
+    return fed.facts.render(TEMPLATE.read_text(encoding="utf-8"), values)
 
 
 def test_o59_the_example_layout_declares_two_shared_read_only_imports_with_a_manifest_each(fed):

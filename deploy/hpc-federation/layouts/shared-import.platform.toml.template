@@ -1,5 +1,6 @@
 # platform.toml of the shared-import layout, rendered by up into the federation's root at every up. Each @...@ is filled
-# from facts.json, since the ids are new at every up; every path is relative to the root.
+# from facts.json, since the ids are new at every up; every path is absolute, the root's (hpc_root), so a copy of the
+# file beside a study (shards.py step) reads the root's own secrets and CA.
 #
 # Three spaces in the `[[spaces]]` form. `alpha-data` and `beta-data` are held on imported storages of trees on the
 # shared filesystem that other federations import too, so each says `import = { readonly = true, shared = true }`: the
@@ -10,17 +11,18 @@ zone = { name = "zone", url = "@zone_url@" }
 providers.pine = { url = "@provider_url.pine@", id = "@provider_id.pine@" }
 providers.birch = { url = "@provider_url.birch@", id = "@provider_id.birch@" }
 providers.cedar = { url = "@provider_url.cedar@", id = "@provider_id.cedar@" }
-credentials.admin = { file = "secrets/admin.token" }
-credentials.users = { directory = "secrets/users", pattern = "{user}.pass" }
+credentials.admin = { file = "@hpc_root@/secrets/admin.token" }
+credentials.users = { directory = "@hpc_root@/secrets/users", pattern = "{user}.pass" }
 principals.data_path = { username = "alpha-reader", user_id = "@user_id.alpha-reader@" }
 principals.toolserver = { username = "alpha-tools", user_id = "@user_id.alpha-tools@" }
 principals.service = { username = "alpha-health", user_id = "@user_id.alpha-health@" }
-tls = { ca_file = "ca/federation-ca.pem" }
+tls = { ca_file = "@hpc_root@/ca/federation-ca.pem" }
 placement = { holder = "pine" }  # each entry's holder is its data provider; a provisioner also needs the table
 
 [[spaces]]
 label = "alpha-data"
 name = "alpha-data"
+data_manifest = "@data_manifest.alpha-data@"   # C06: its data, checked at up
 id = "@space_id.alpha-data@"
 prefixes = ["alpha-"]
 providers = ["pine", "birch", "cedar"]
@@ -31,6 +33,7 @@ import = { readonly = true, shared = true }
 [[spaces]]
 label = "beta-data"
 name = "beta-data"
+data_manifest = "@data_manifest.beta-data@"   # C06: its data, checked at up
 id = "@space_id.beta-data@"
 prefixes = ["beta-"]
 providers = ["pine", "birch", "cedar"]
@@ -41,6 +44,7 @@ import = { readonly = true, shared = true }
 [[spaces]]
 label = "alpha-work"
 name = "alpha-work"
+data_manifest = "@data_manifest.alpha-work@"   # C06: its data, checked at up
 id = "@space_id.alpha-work@"
 prefixes = ["alpha-"]
 providers = ["pine", "birch", "cedar"]

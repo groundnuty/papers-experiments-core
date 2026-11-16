@@ -31,6 +31,12 @@ SETTLE_SLACK_S = 60  # what settle_timeout_s keeps beyond the stop's bound
 SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
 SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
+SHA256 = re.compile(r"[0-9a-f]{64}")
+# The site's variables of the agent's Apptainer sandbox (M5), by the Site field each fills: the files' paths and the
+# work root, and the SHA-256 each file is declared to have.
+AGENT_PATHS = {"HPC_AGENT_SIF": "agent_sif", "HPC_EGRESS_SHIM": "egress_shim", "HPC_AGENT_WORK_ROOT": "agent_work_root"}
+AGENT_PINS = {"HPC_AGENT_SIF_SHA256": "agent_sif_sha256", "HPC_EGRESS_SHIM_SHA256": "egress_shim_sha256"}
+AGENT_VARIABLES = {**AGENT_PATHS, **AGENT_PINS}
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
@@ -298,6 +304,14 @@ class Site:
     core_python: str = ""  # the core's Python on the nodes (a venv's), for [hpc] core = "step"
     admin_mail: str = "admin@example.org"
     billing_weight: Optional[float] = None  # the site's billing weight per GB of memory, for describe
+    # The agent's Apptainer sandbox (M5), for a platform template that names them (`hpcpins`): the SIF and the egress
+    # shim built for it on the filesystem the nodes see, each with the SHA-256 it is declared to have, and the
+    # sandbox's work_root on the agent's node's tmpfs. Empty when the site declares none.
+    agent_sif: str = ""
+    agent_sif_sha256: str = ""
+    egress_shim: str = ""
+    egress_shim_sha256: str = ""
+    agent_work_root: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -311,6 +325,7 @@ class Site:
             "core_python": self.core_python,
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
+            **{attribute: getattr(self, attribute) for attribute in AGENT_VARIABLES.values()},
         }
 
     @classmethod
@@ -349,6 +364,12 @@ def checked_site(site: Site) -> Site:
     weight = site.billing_weight
     if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0):
         raise SettingsError("HPC_BILLING_MEM_WEIGHT: must be a positive number")
+    for variable, attribute in AGENT_PATHS.items():
+        if getattr(site, attribute):
+            _absolute(getattr(site, attribute), variable)
+    for variable, attribute in AGENT_PINS.items():
+        if getattr(site, attribute) and not SHA256.fullmatch(getattr(site, attribute)):
+            raise SettingsError(f"{variable}: must be 64 lower-case hexadecimal digits")
     return site
 
 
@@ -377,5 +398,6 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             core_python=environ.get("HPC_CORE_PYTHON") or "",
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
+            **{attribute: environ.get(variable) or "" for variable, attribute in AGENT_VARIABLES.items()},
         )
     )
