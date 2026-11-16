@@ -22,7 +22,6 @@ import copy
 import hashlib
 import inspect
 import os
-import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -30,9 +29,9 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 from expcore.records.digest import plain
-from expcore.records.record import RunRecord, decode
+from expcore.records.record import RunRecord, decode, is_record_name
 from expcore.records.schema import SCHEMA_PREFIX, RecordError
-from expcore.replay.side_files import SideFile, SideFileTooLarge, beside, is_side_file, pair, read_side_file
+from expcore.replay.side_files import SideFile, SideFileTooLarge, beside, pair, read_side_file
 
 SIDE_FILES = "side_files"  # the parameter by which a scorer takes the record's verified side files
 _TAKES = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
@@ -126,25 +125,16 @@ def rescore(record: RunRecord, scorers: Iterable[Any], *, side_files: Mapping[st
     return replace(record, scores={**record.scores, **fresh})
 
 
-_RECORD_NAME = re.compile(r"[0-9a-f]{64}\.\d+\.json")
-
-
-def _load_if_record(path: Path) -> tuple[RunRecord, Any] | None:
-    """Load a file as a run record, with its stored JSON, or return None when it is not one: a check, a manifest, any
-    JSON without the record schema marker. A file named like a record that cannot be read as one is an error, not
-    something to skip."""
-    named_like_a_record = bool(_RECORD_NAME.fullmatch(path.name))
+def _load_record(path: Path) -> tuple[RunRecord, Any]:
+    """Load a file named as a run record, with its stored JSON. One so named that cannot be read as a record is an
+    error, not something to skip."""
     try:
         data = decode(path.read_bytes())
     except RecordError as exc:
-        if named_like_a_record:
-            raise RecordError(f"{path}: {exc}") from None
-        return None
+        raise RecordError(f"{path}: {exc}") from None
     marker = data.get("schema_version") if isinstance(data, dict) else None
     if not (isinstance(marker, str) and marker.startswith(SCHEMA_PREFIX)):
-        if named_like_a_record:
-            raise RecordError(f"{path}: named like a record, but it holds no record schema marker")
-        return None
+        raise RecordError(f"{path}: named like a record, but it holds no record schema marker")
     try:
         return RunRecord.from_json(data), data
     except RecordError as exc:
@@ -183,9 +173,12 @@ def rescore_files(
 ) -> list[Path]:
     """Re-score every run record directly under a directory; write each back, atomically, into `out_dir` or in place.
 
-    Only run records are touched: a file without the record schema marker (the replay check, a manifest) is left alone.
-    It happens in two phases. First every record is loaded, validated, scored, and rendered as it will be written, so a
-    record that is not valid, a scorer that fails on one, or a result that cannot be written stops the run before any
+    Only run records are touched, known by their names as the replay check knows them (`is_record_name`, R04): any
+    other file is left alone, a `.json` one included (the replay check, a manifest, a study's evidence, the bytes of a
+    record under another name), and a file named as a record that is not one stops the run.
+
+    It happens in two phases. First every record is loaded, validated, scored, and rendered as it will be written, so
+    a record that is not valid, a scorer that fails on one, or a result that cannot be written stops the run before any
     file is changed. Then the records are written, each atomically. Returns the paths written.
 
     `side_files` is the study's declaration (`StudyConfig.side_files`). With it, each file of a declared name directly
@@ -196,10 +189,10 @@ def rescore_files(
     """
     scorers = list(scorers)
     target = Path(out_dir) if out_dir is not None else Path(source)
-    candidates = sorted(Path(source).glob("*.json"))
-    if side_files is not None:  # a side file named like JSON is read only as a side file, within the cap
-        candidates = [path for path in candidates if not is_side_file(path.name, side_files)]
-    loaded = {path.name: found for path in candidates if (found := _load_if_record(path))}
+    # a declared side file is never named as a record (`study.config` refuses such a pattern), so it is read only as a
+    # side file, within the cap
+    candidates = sorted(path for path in Path(source).glob("*.json") if is_record_name(path.name))
+    loaded = {path.name: _load_record(path) for path in candidates}
     held = None
     if side_files is not None:
         held = _side_files_beside(Path(source), {name: data for name, (_, data) in loaded.items()}, side_files)

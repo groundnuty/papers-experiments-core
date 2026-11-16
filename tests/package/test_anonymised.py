@@ -421,7 +421,19 @@ def test_k11_a_record_changed_after_the_check_refuses_the_anonymised_build_namin
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
     record.write_bytes((campaign.root / rel).read_bytes())
     (record.parent / "extra.json").write_text("{}", encoding="utf-8")
-    with pytest.raises(PackageError, match=r"extra\.json is not what the replay check hashed"):
+    with pytest.raises(PackageError, match=r"extra\.json is not what the replay check hashed: an unexpected file"):
+        build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
+
+
+def test_k11_r04_a_file_of_any_kind_added_to_the_batch_after_the_check_refuses_the_anonymised_build(
+    campaign, hashes, anonymisation, tmp_path
+):
+    """R04 and K11: a file in out/runs that is neither a record nor one the check hashed is refused whatever its
+    suffix, before anything is rewritten, so the package never carries a file the check did not vouch for."""
+    root = copy_campaign(campaign, tmp_path, "copy").root
+    record = sorted(record_files(root))[0]
+    (record.parent / "sandbox.log").write_text("what the sandbox saw", encoding="utf-8")
+    with pytest.raises(PackageError, match=r"sandbox\.log is not what the replay check hashed: an unexpected file"):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
 
 
