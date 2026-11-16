@@ -7,8 +7,9 @@
 - `process_access`: its log shows a tracer attached to oneclient inside the window;
 - `log_unknown`: there is no snapshot (the instrument was not run), the instrument failed (`{"ok": false, ...}`), the
   snapshot is not one this code reads, or it says the log is unknown;
-- `isolation_unproven`: the snapshot says the cell's isolation was not proven (no passing start and end proof of one
-  cell: its own PID namespace, no host `/proc`, no protected directory reachable), or there is no readable snapshot.
+- `isolation_unproven`: the snapshot says the cells' isolation was not proven (no proof, or a failed one: a cell
+  without a PID namespace of its own, with the host's `/proc`, or reaching a protected directory), or there is no
+  readable snapshot.
 
 The verdict is `flagged` when a run has an access flag, whatever else it has (a damaged log that still shows an access
 says both); otherwise `unknown` when it has any flag; otherwise `clean`. **A missing or damaged log, or an unproven
@@ -89,22 +90,28 @@ def _readable(data: Any) -> tuple[Mapping[str, Any] | None, str | None]:
         return None, NOT_A_SNAPSHOT
     if not _whole(data["traced"]) or not _whole(data["proofs"]) or not (scope is None or scope in (0, 1, 2, 3)):
         return None, NOT_A_SNAPSHOT
-    if isinstance(scope, bool) or (data["isolation"] == PROVEN and data["proofs"] < 2):
-        return None, NOT_A_SNAPSHOT  # a proven isolation has its start and its end proof at least
+    if isinstance(scope, bool) or (data["isolation"] == PROVEN and data["proofs"] < 1):
+        return None, NOT_A_SNAPSHOT  # a proven isolation has a proof at least
     return data, None
 
 
 def judge(record: Any, condition: str) -> RunMountGuard:
     """The mount-guard verdict of one analysed run (see the module's text)."""
-    data, why = _readable(record.instruments.get(NAMESPACE))
+    return RunMountGuard(record.run_key, record.attempt, condition, *_assessed(record.instruments.get(NAMESPACE)))
+
+
+def verdict_of(snapshot: Any) -> str:
+    """The verdict a snapshot gives a run (`clean`, `flagged` or `unknown`), for a sandbox's own metadata."""
+    return RunMountGuard("", 0, "", *_assessed(snapshot)).verdict
+
+
+def _assessed(snapshot: Any) -> tuple[Any, ...]:
+    """A snapshot's log state and reasons, isolation and reasons, accesses, tracers and flags."""
+    data, why = _readable(snapshot)
     if data is None:
-        found = {LOG_UNKNOWN, ISOLATION_UNPROVEN}
         reasons = (str(why),)
-        accesses: Mapping[str, int] = dict.fromkeys(TARGETS, 0)
-        return RunMountGuard(
-            record.run_key, record.attempt, condition, UNKNOWN, reasons, UNPROVEN, reasons, accesses, 0,
-            tuple(flag for flag in FLAGS if flag in found),
-        )  # fmt: skip
+        both = tuple(flag for flag in FLAGS if flag in (LOG_UNKNOWN, ISOLATION_UNPROVEN))
+        return UNKNOWN, reasons, UNPROVEN, reasons, dict.fromkeys(TARGETS, 0), 0, both
     found = set()
     if sum(data["accesses"].values()):
         found.add(TOKEN_ACCESS)
@@ -114,7 +121,6 @@ def judge(record: Any, condition: str) -> RunMountGuard:
         found.add(LOG_UNKNOWN)
     if data["isolation"] != PROVEN:
         found.add(ISOLATION_UNPROVEN)
-    return RunMountGuard(
-        record.run_key, record.attempt, condition, data["log"], tuple(data["unknown"]), data["isolation"],
-        tuple(data["unproven"]), dict(data["accesses"]), data["traced"], tuple(flag for flag in FLAGS if flag in found),
-    )  # fmt: skip
+    flags = tuple(flag for flag in FLAGS if flag in found)
+    return (data["log"], tuple(data["unknown"]), data["isolation"], tuple(data["unproven"]), dict(data["accesses"]),
+            data["traced"], flags)  # fmt: skip

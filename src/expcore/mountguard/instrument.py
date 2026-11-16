@@ -19,7 +19,7 @@ The snapshot, under `record.instruments["mount_guard"]`, holds counts and reason
 tracers attached to oneclient inside it, `proofs` the isolation proofs read in it, and `ptrace_scope` the kernel's Yama
 setting (None without Yama). When the log is unknown the counts are what its readable part shows, a lower bound.
 The reasons are `expcore.mountguard.log`'s. **A missing or damaged log is `"log": "unknown"`, never intact with no
-access; a log without a passing start and end proof of one cell is `"isolation": "unproven"`.**
+access; a log without a proof, or with a failed one, is `"isolation": "unproven"`.**
 """
 
 from collections.abc import Mapping

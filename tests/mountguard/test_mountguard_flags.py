@@ -73,12 +73,12 @@ def test_a_damaged_log_is_unknown():
 def test_a_damaged_log_that_still_shows_an_access_is_flagged_and_unknown():
     run = judged(log([inotify("dir", "IN_OPEN", "IN_ISDIR")], end=False))
     assert run.verdict == FLAGGED
-    assert run.flags == (TOKEN_ACCESS, LOG_UNKNOWN)
+    assert run.flags == (TOKEN_ACCESS, LOG_UNKNOWN, ISOLATION_UNPROVEN)  # a cut log never proves the isolation
 
 
 def test_a_failed_namespace_proof_makes_the_run_unknown():
-    failed = proof("start", ok=False, problems=["same_pid_namespace"])
-    run = judged(log(proofs=([failed], [proof("end")])))
+    failed = proof(ok=False, problems=["same_pid_namespace"])
+    run = judged(log(proofs=[proof(), failed]))
     assert run.verdict == UNKNOWN_VERDICT
     assert run.flags == (ISOLATION_UNPROVEN,)
     assert "same_pid_namespace" in run.unproven
@@ -114,7 +114,7 @@ def clean_snapshot():
         {"accesses": {"token": 0, "dir": -1}},
         {"accesses": {"token": 0, "dir": True}},
         {"traced": 1.5},
-        {"proofs": 1},  # proven with fewer than the start and the end proof
+        {"proofs": 0},  # proven with no proof
         {"ptrace_scope": 9},
         {"extra": 1},
     ],
@@ -135,6 +135,12 @@ def test_the_snapshot_holds_counts_and_reasons_and_never_a_pid_or_a_path():
     text = repr(data)
     assert "4242" not in text  # the cell's pid
     assert "99" not in text  # oneclient's
+
+
+def test_the_verdict_of_a_snapshot_alone_is_the_runs():
+    assert guard_flags.verdict_of(clean_snapshot()) == CLEAN
+    assert guard_flags.verdict_of(snapshot(read_log(log([inotify("dir", "IN_OPEN")]), NONCE))) == FLAGGED
+    assert guard_flags.verdict_of(None) == UNKNOWN_VERDICT
 
 
 def test_the_instrument_refuses_an_empty_nonce():

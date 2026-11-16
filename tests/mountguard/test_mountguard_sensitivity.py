@@ -66,7 +66,7 @@ def touched():
 
 
 def unproven():
-    return guarded(log(proofs=([proof("start", ok=False, problems=["same_pid_namespace"])], [proof("end")])))
+    return guarded(log(proofs=[proof(ok=False, problems=["same_pid_namespace"])]))
 
 
 def runs_for(rows, instruments_of) -> list:
@@ -96,7 +96,7 @@ def test_with_every_run_clean_there_is_no_second_analysis(prereg):
 
 
 def test_the_sensitivity_analysis_leaves_out_the_flagged_and_the_unknown_runs(prereg):
-    """O57: one run touched the token's directory, one has an unproven isolation; each in its own pair."""
+    """O60: one run touched the token's directory, one has an unproven isolation; each in its own pair."""
     rows = rows_of_pairs(8)
     by_index = {0: touched, 3: unproven}
     done = mount_guard_analysis(runs_for(rows, lambda i: by_index.get(i, clean)()), rows, [], prereg)

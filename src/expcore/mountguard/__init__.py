@@ -37,6 +37,7 @@ from expcore.mountguard.flags import (
     VERDICTS,
     RunMountGuard,
     judge,
+    verdict_of,
 )
 from expcore.mountguard.instrument import (
     INTACT,
@@ -73,4 +74,5 @@ __all__ = [
     "judge",
     "read_log",
     "snapshot",
+    "verdict_of",
 ]
