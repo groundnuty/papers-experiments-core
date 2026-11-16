@@ -12,7 +12,9 @@ kinds of send it cannot account for:
 The campaign installs a `SpendGuard` for the length of an attempt (`watching`). The guard is told of each failed send
 that may have been billed, before the retrier waits to send again, and of each request and reply as the recording sees
 them (`expcore.records.recording.RecordingBackend`), so a refusal is recorded as the request's failure and replays as
-one. A clearance given before the wait may no longer hold after it (the model may have been taken off its reply maximum
+one. The campaign's guard also keeps the attempt's call log from them, which charges an attempt a kill interrupts what
+it recorded (C05, `expcore.campaign.interrupted_spend`): each request before it goes out, each reply with its counts.
+A clearance given before the wait may no longer hold after it (the model may have been taken off its reply maximum
 meanwhile, C27), so every resend, whatever failure it follows, is cleared again right before it goes out
 (`before_resend`).
 A guard refuses by raising `BudgetHold`, an infrastructure failure of kind `budget_hold`: the request is not sent and
@@ -54,8 +56,17 @@ class SpendGuard(Protocol):
         """Clear the next request of the attempt before it is built, or raise `BudgetHold`."""
         ...
 
-    async def after_reply(self, input_tokens: int | None, output_tokens: int | None) -> None:
-        """Take note of the counts a reply reported (None for a count it left out)."""
+    async def after_reply(
+        self,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        *,
+        cache_creation_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+        unread: bool = False,
+    ) -> None:
+        """Take note of the counts a reply reported (None for a count it left out), the cache's parts of its prompt,
+        and whether it is a reply the endpoint billed and the backend could not read (`unread`)."""
         ...
 
     async def after_failed_send(self, kind: str, *, resend: bool) -> None:
@@ -88,11 +99,25 @@ async def before_request() -> None:
         await guard.before_request()
 
 
-async def after_reply(input_tokens: int | None, output_tokens: int | None) -> None:
-    """Tell the attempt's guard, if there is one, what a reply reported."""
+async def after_reply(
+    input_tokens: int | None,
+    output_tokens: int | None,
+    *,
+    cache_creation_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    unread: bool = False,
+) -> None:
+    """Tell the attempt's guard, if there is one, what a reply reported: its counts, the cache's parts of its prompt,
+    and whether the backend could not read it."""
     guard = _guard.get()
     if guard is not None:
-        await guard.after_reply(input_tokens, output_tokens)
+        await guard.after_reply(
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
+            unread=unread,
+        )
 
 
 async def after_failed_send(kind: str, *, resend: bool) -> None:

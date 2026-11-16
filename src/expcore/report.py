@@ -44,6 +44,12 @@ are the same text: no clock, no path and no random number enters it.
   `operator_holds`) gets a section "Holds that needed an operator" after the budget holds (`expcore.report_holds`): each
   hold's start, its end or `open`, whether it blocked the campaign and whether it charged a run, and the platform's
   reason. A report of an export without them is the text it was before (C11).
+- A campaign whose store a kill took spend out of (its export has `lost_in_kill`, O62) gets a section "Spend lost in
+  kills" after that (`expcore.report_lost`): each lost attempt, top-up and probe charge counted back from the spend
+  journal, with what it was charged. A report of an export without it is the text it was before.
+- A campaign whose interrupted attempts kept a call log (its export has `interrupted_spend`, C05) gets a section
+  "Interrupted attempts' spend" after that (`expcore.report_interrupted`): per model, how many were charged measured,
+  measured plus a request in flight, or at their bound. A report of an export without it is the text it was before.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
@@ -90,6 +96,8 @@ from expcore.report_families import (
 from expcore.report_guards import LEFT_OUT as EITHER_GUARD
 from expcore.report_guards import guards_lines
 from expcore.report_holds import section as operator_holds
+from expcore.report_interrupted import section as interrupted_spend
+from expcore.report_lost import section as lost_in_kill
 from expcore.report_mountguard import LEFT_OUT as NOT_CLEAN
 from expcore.report_mountguard import mount_guard_lines
 from expcore.report_notes import (
@@ -646,6 +654,8 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         *_budget_holds(export),
         "",
         *operator_holds(export, _table),  # only an export with such a hold has it (C11)
+        *lost_in_kill(export, _table),  # only an export whose store a kill took spend out of has it (O62)
+        *interrupted_spend(export, _table),  # only an export whose interrupted attempts kept a call log has it (C05)
     ]
 
 

@@ -23,6 +23,7 @@ and the analysis reads that copy and nothing else.
   nothing is read twice. It answers what `export_run_state` asks of a store.
 """
 
+import datetime as dt
 import os
 import sqlite3
 import threading
@@ -33,6 +34,7 @@ from urllib.parse import quote
 
 from expcore.campaign.export import batch_relative
 from expcore.campaign.factors import FactorSchema
+from expcore.campaign.interrupted_spend import COPIED_BACK_KEY
 from expcore.campaign.store import column_for
 from expcore.campaign.storecopy import StoreChanged, store_copy
 
@@ -116,6 +118,35 @@ def _readable(source: Path, in_place: bool) -> Iterator[sqlite3.Connection]:
             yield connection
         finally:
             connection.close()
+
+
+def rebase_run_dirs(store: Path, runs: Path) -> int:
+    """Point every attempt's directory in the store at `store` to `runs/<digest>/try<N>`, and return how many.
+
+    A snapshot names each attempt's directory within the batch (`<digest>/try<N>`), and a store moved to another
+    directory keeps the absolute ones of the place it ran in; the recovery of a resumed store reads each running
+    attempt's marker at the path its row holds (C04). So a store copied back to run again, from a snapshot or an
+    archive (`deploy/hpc-federation/shards.py`, O62), has its directories pointed at the runs directory it now has,
+    before any dispatcher opens it. Only the last two parts of each path are kept, as the export keeps them. The store
+    must be one no process holds; its -wal, if any, replays on the open.
+
+    In the same transaction the store is marked copied back (`interrupted_spend.COPIED_BACK_KEY` in its meta, the
+    time): an attempt the copy holds as running may have gone on after the copy, so its call log is never trusted on
+    the copy's word alone, only as its spend journal confirms it (C05)."""
+    connection = sqlite3.connect(store, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute("SELECT id, run_dir FROM attempts WHERE run_dir IS NOT NULL").fetchall()
+        moved = [(str(runs / str(batch_relative(directory))), attempt) for attempt, directory in rows]
+        connection.executemany("UPDATE attempts SET run_dir = ? WHERE id = ?", moved)
+        now = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        connection.execute(
+            "INSERT OR REPLACE INTO meta(key, value, set_utc) VALUES(?, ?, ?)", (COPIED_BACK_KEY, now, now)
+        )
+        connection.execute("COMMIT")
+        return len(moved)
+    finally:
+        connection.close()
 
 
 def _relative_run_dirs(copy: sqlite3.Connection) -> None:

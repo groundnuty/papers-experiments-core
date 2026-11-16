@@ -41,6 +41,7 @@ from expcore.campaign import liveness, reply_cap
 from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
+from expcore.campaign.export import stored_fingerprint_sha256
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
@@ -57,12 +58,14 @@ from expcore.campaign.holds import ALL, Hold, HoldRegistry
 from expcore.campaign.identity import ServedIdentities
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock
-from expcore.campaign.manifest import Manifest
+from expcore.campaign.lost_spend import Pricing, open_journal
+from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.probe_spend import MeteredProbes
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard import META_SHARD
 from expcore.campaign.shard_run import ShardStart
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.topup import Ledger
@@ -134,9 +137,13 @@ class Scheduler:
         on_hold: Callable[[str], None] | None = None,
         shard: ShardStart | None = None,
         reset_settings: Mapping[str, Any] | None = None,
+        spend_journal: Path | None = None,
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
         self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
+        # this start's spend journal, new (O62): every other journal beside it is counted against the store at the open
+        self.spend_journal = None if spend_journal is None else Path(spend_journal)
+        self.lost_counted: dict[str, Any] | None = None  # what the open counted of them (`lost_spend.reconcile`)
         self.reset_settings = reset_settings  # the platform's settings in no fingerprint, recorded and compared (C35)
         self.on_hold = on_hold  # takes one line per hold that begins, changes or ends; never one per pass
         self.executor, self.agent_config, self.models = executor, agent_config, models
@@ -232,6 +239,11 @@ class Scheduler:
             reset_settings=self.reset_settings,
         )
         store = self.store
+        if self.spend_journal is not None:  # before the probes, the first spend this start can make (O62)
+            label = None if self.shard is None else self.shard.pinned()[META_SHARD]  # the whole spec, not its label
+            campaign = stored_fingerprint_sha256(store) or fingerprint_sha256(self.fingerprint)
+            pricing = Pricing({m: self.models.resolve(m) for m in self.plan_models}, self.agent_config.limits)
+            self.lost_counted = open_journal(store, self.spend_journal, campaign, label, self.stamp(), pricing)
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)
         self.units = UnitHealth(
             store,
@@ -420,8 +432,11 @@ class Scheduler:
             liveness.unregister(self._campaign)
             self._campaign = None
         if self.store is not None:
+            journal = self.store.spend_journal
             self.store.close()
             self.store = None
+            if journal is not None:
+                journal.close()
         self._lock.release()
 
     def _wait_for_workers(self) -> None:

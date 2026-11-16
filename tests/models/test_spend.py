@@ -27,6 +27,7 @@ class Guard:
 
     def __init__(self, refuse_at: int | None = None, refuse_resend: bool = False):
         self.log: list[tuple] = []
+        self.parts: list[dict] = []  # what each reply told besides its two counts: its cache parts, whether unread
         self.refuse_at, self.asked, self.refuse_resend = refuse_at, 0, refuse_resend
 
     def _clear(self, what: str) -> None:
@@ -38,8 +39,9 @@ class Guard:
         self.log.append(("request",))
         self._clear("the request")
 
-    async def after_reply(self, input_tokens, output_tokens) -> None:
+    async def after_reply(self, input_tokens, output_tokens, **parts) -> None:
         self.log.append(("reply", input_tokens, output_tokens))
+        self.parts.append(parts)
 
     async def after_failed_send(self, kind, *, resend) -> None:
         self.log.append(("failed", kind, resend))
@@ -158,6 +160,28 @@ def test_c26_the_recording_clears_each_request_with_the_guard_and_tells_it_what_
     assert guard.log == [("request",), ("reply", None, 12), ("request",), ("reply", 30, None)]
 
 
+def test_c05_the_recording_tells_the_guard_each_replys_cache_parts_for_the_call_log():
+    """C05: the attempt's call log prices a reply as a finished attempt's turn is priced, its cache writes and reads
+    apart from the rest of its prompt, so the recording hands the guard both parts; a stub's reply has none."""
+    cached = ModelTurn(
+        "first", [], 9_000, 40, "stop", 0.0, cache_creation_input_tokens=4_000, cache_read_input_tokens=3_000
+    )
+    backend = RecordingBackend(ScriptedBackend([cached, ModelTurn("second", [], 30, 5, "stop", 0.0)]))
+    guard = Guard()
+
+    async def go():
+        backend.begin("", "go", [])
+        with spend.watching(guard):
+            await backend.step()
+            await backend.step()
+
+    asyncio.run(go())
+    assert guard.parts == [
+        {"cache_creation_tokens": 4_000, "cache_read_tokens": 3_000, "unread": False},
+        {"cache_creation_tokens": None, "cache_read_tokens": None, "unread": False},
+    ]
+
+
 def test_c26_a_request_the_guard_refuses_is_recorded_as_that_requests_failure_a_budget_hold():
     """C26: the refusal is the request's own failure, so a record keeps it and a replay serves it again."""
     inner = ScriptedBackend([ModelTurn("first", [], None, 12, "stop", 0.0), "never sent"])
@@ -214,6 +238,7 @@ def test_c27_a_billed_reply_the_adapter_cannot_read_still_tells_the_guard_what_i
     with pytest.raises(InfraError, match="usage already counted"):
         asyncio.run(go())
     assert guard.log == [("request",), ("reply", counted, 5_000)]
+    assert guard.parts[-1]["unread"]  # C05: the call log never prices a reply the backend could not read as read
     assert recording.failure["kind"] == "infra"
 
 

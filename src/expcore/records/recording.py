@@ -100,9 +100,10 @@ class RecordingBackend:
         """Ask the inner backend for a reply and keep what surrounds it; a request that raises is the failure.
 
         The attempt's spend guard, if the campaign installed one, clears the request first and is told what its reply
-        reported (`expcore.models.spend`, C26). A request it refuses is this request's failure, a budget hold, which a
-        replay serves again from the record. A reply the endpoint answered, and so billed, but the backend refused to
-        read (`InfraError.billed`) is told to the guard too, so a reply past the reply maximum is never missed (C27).
+        reported, its cache parts included (`expcore.models.spend`, C26, C05). A request it refuses is this request's
+        failure, a budget hold, which a replay serves again from the record. A reply the endpoint answered, and so
+        billed, but the backend refused to read (`InfraError.billed`) is told to the guard too, marked unread, so a
+        reply past the reply maximum is never missed (C27) and the call log does not price it as read (C05).
         """
         try:
             await spend.before_request()
@@ -114,7 +115,7 @@ class RecordingBackend:
             self._fail(exc)
             billed = getattr(exc, "billed", None)
             if billed is not None:
-                await spend.after_reply(*billed)
+                await spend.after_reply(*billed, unread=True)
             raise
         conversation = self.inner.transcript()
         native = conversation[-1] if conversation else {}
@@ -122,7 +123,12 @@ class RecordingBackend:
             raise RecordError("the backend's conversation does not end with an assistant message after a reply")
         self.captured.append(Captured(turn, native, self._settings()))
         self._known = len(conversation)
-        await spend.after_reply(turn.input_tokens, turn.output_tokens)
+        await spend.after_reply(
+            turn.input_tokens,
+            turn.output_tokens,
+            cache_creation_tokens=turn.cache_creation_input_tokens,
+            cache_read_tokens=turn.cache_read_input_tokens,
+        )
         return turn
 
     def _fail(self, exc: BaseException | None) -> None:
