@@ -360,12 +360,18 @@ def test_o35_a_failure_to_open_the_lock_that_is_no_refusal_to_write_is_not_tried
 
 
 def test_o35_the_module_names_what_up_and_the_platforms_probe_import():
-    """O35: the writer's whole interface: the writer, its lock, and where the federation's record lies (its root)."""
+    """O35: the writer's whole interface: the writer, its lock, where the federation's record lies (its root), and the
+    words and the fact by which a check whose record was not written says so in the run's record (`fact`)."""
     assert set(linkrecord.__all__) == {
+        "LINK_RECORD_NOTE",
         "LOCK",
+        "LOCK_NOT_TAKEN",
+        "NOT_WRITTEN",
         "RECORD",
         "ROOT_FILE",
+        "WRITE_FAILED",
         "discard_record",
+        "fact",
         "federation_root",
         "record_path",
         "record_text",
