@@ -13,6 +13,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from fedspec import Import, Space, Spec, load_spec
 
@@ -284,6 +285,23 @@ class Layout:
                     "dataset"
                 )
         return manifest
+
+    def load_manifest(self, space: str, environ: Mapping[str, str]) -> Any:
+        """The manifest of an imported space, checked (`import_manifest`) and loaded by the core (`load_manifest`).
+
+        The core's refusal of a manifest names the file it read, which is the host's own path, so it is caught here and
+        said again with the file's place taken out: a message of this layer names the variable and never a path."""
+        from expcore.config.loading import ConfigError
+        from expcore_onedata.importmanifest import load_manifest
+
+        path = self.import_manifest(space, environ)
+        try:
+            return load_manifest(path)
+        except ConfigError as error:
+            variable = self.imported(space).manifest_env
+            raise ValueError(
+                f"the manifest named by {variable} cannot be used: {str(error).replace(str(path), 'it')}"
+            ) from None
 
     def import_source(self, space: str, environ: Mapping[str, str]) -> Path:
         """The host directory of an imported space's dataset, from the variable its layout names.

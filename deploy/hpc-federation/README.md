@@ -166,8 +166,10 @@ says where the driver calls each step, and `site.env.example` names the two vari
   over an empty mountpoint of the rootfs, which is the one thing of the node's filesystems the container sees. A refusal
   names the space, never the path.
 - **Proven read-only by the kernel**: `python3.11 -I importstorage.py mounts --workdir <W>`, in a control step on the owner's
-  node once the service is up, prints per space how many processes hold the mount read-only and how many writable, and
-  exits 0 only when each space is held and none writable. It attempts no write: a write probe is the first thing that
+  node once the service is up, reads the mount table of this service's container processes (the children of the starter
+  its supervisor, named by `service.pid`, started, so another service of the account on the node is not counted),
+  prints per space how many hold the mount, or one below it, read-only and how many writable, and exits 0 only when each
+  space is held and none writable. It attempts no write: a write probe is the first thing that
   could change the tree if a declaration were wrong.
 - **What the platform layer adds**: the Onedata storage is made `readonly` and imported by the bootstrap; the core
   refuses a shared import that is not read-only (at load, and on the owner's panel), the provisioner refuses every write
@@ -180,7 +182,9 @@ says where the driver calls each step, and `site.env.example` names the two vari
   *first* storage, which is arbitrary once a provider has an imported one beside its own. The driver's bootstrap names
   the storage; do not use those two helpers for a provider that owns an import.
 
-Written, not run. A live slot must show: Onepanel accepting the imported storage made with the job user's ids, the local
+Written, not run. A live slot must show: that the mount check finds the service's container as the (visible) child of the
+setuid starter its supervisor started, and that `/proc/<pid>/task/*/children` exists on the nodes' kernel (it fails closed,
+proving nothing, when either is otherwise); Onepanel accepting the imported storage made with the job user's ids, the local
 LUMA feed and the canonical path type; the bind read-only by the mount table on this site's filesystem; the files'
 owner and mode as the scan gives them for another account's files (the tree must be readable by the job's group); the
 scan's time and its load on the shared filesystem for a tree of 15,000 files, which the site's file quota (pending) may

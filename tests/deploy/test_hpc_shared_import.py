@@ -317,29 +317,54 @@ def mountinfo(options="ro,relatime", space="alpha", extra=""):
     )
 
 
+SUPERVISOR, STARTER, TICK = 10, 20, 555  # the supervisor is visible; the setuid starter it started is not
+
+
+class Proc:
+    """A fake /proc holding one service: its supervisor (named by `service.pid`), the starter the supervisor's
+    `children` file names (hidden: no directory), and the container processes that are the starter's children, each
+    with the mount table it holds. Other processes can be added beside them."""
+
+    def __init__(self, root: Path, workdir: Path) -> None:
+        self.root, self.workdir = root, workdir
+        root.mkdir()
+        self.process(SUPERVISOR, ppid=1, tick=TICK)
+        (root / str(SUPERVISOR) / "task" / str(SUPERVISOR)).mkdir(parents=True)
+        self.children(STARTER)
+        (workdir / "service.pid").write_text(f"{SUPERVISOR} {TICK}\n", encoding="utf-8")
+
+    def process(self, pid, ppid, tick=1, mounts=None):
+        directory = self.root / str(pid)
+        directory.mkdir(exist_ok=True)
+        fields = ["S", str(ppid)] + ["0"] * 17 + [str(tick)] + ["0"] * 30  # proc(5): state, ppid, ..., starttime at 22
+        (directory / "stat").write_text(f"{pid} (name with ) paren) {' '.join(fields)}\n", encoding="ascii")
+        if mounts is not None:
+            (directory / "mountinfo").write_text(mounts, encoding="utf-8")
+
+    def children(self, *pids):
+        task = self.root / str(SUPERVISOR) / "task" / str(SUPERVISOR)
+        task.mkdir(parents=True, exist_ok=True)
+        (task / "children").write_text(" ".join(str(p) for p in pids) + " \n", encoding="ascii")
+
+    def container(self, pid, mounts):
+        """A process of the service's container: the starter's child."""
+        self.process(pid, ppid=STARTER, mounts=mounts)
+
+
 @pytest.fixture
-def proc(base):
-    """A fake /proc: the service's processes' mount tables, by pid."""
-    root = base / "proc"
-    root.mkdir()
-
-    def add(pid, text, uid=None):
-        (root / str(pid)).mkdir()
-        (root / str(pid) / "mountinfo").write_text(text, encoding="utf-8")
-
-    add.root = root
-    return add
+def proc(base, workdir):
+    return Proc(base / "proc", workdir)
 
 
 def listed(workdir, tree, *more):
     imp.prepare(workdir, [("alpha", str(tree)), *more], mountinfo=NO_MOUNTS)
 
 
-def test_o56_a_read_only_mount_in_every_process_that_holds_it_passes(tree, workdir, proc):
-    """O56: a read only mount in every process that holds it passes."""
+def test_o56_a_read_only_mount_in_every_process_of_the_service_that_holds_it_passes(tree, workdir, proc):
+    """O56: a read only mount in every process of the service that holds it passes."""
     listed(workdir, tree)
-    proc(11, mountinfo())
-    proc(12, mountinfo())
+    proc.container(21, mountinfo())
+    proc.container(22, mountinfo())
     facts, ok = imp.check_mounts(workdir, proc.root)
     assert ok is True
     assert facts == [{"space": "alpha", "processes": 2, "read_only": 2, "writable": 0}]
@@ -348,28 +373,89 @@ def test_o56_a_read_only_mount_in_every_process_that_holds_it_passes(tree, workd
 def test_o56_a_writable_mount_in_one_process_fails_whatever_the_others_hold(tree, workdir, proc):
     """O56: a writable mount in one process fails whatever the others hold."""
     listed(workdir, tree)
-    proc(11, mountinfo())
-    proc(12, mountinfo(options="rw,relatime"))
+    proc.container(21, mountinfo())
+    proc.container(22, mountinfo(options="rw,relatime"))
     facts, ok = imp.check_mounts(workdir, proc.root)
     assert ok is False
     assert facts == [{"space": "alpha", "processes": 2, "read_only": 1, "writable": 1}]
 
 
 def test_o56_the_flag_of_the_mount_counts_never_the_flag_of_the_filesystem(tree, workdir, proc):
-    """O56: A read-only bind of a writable filesystem is `ro` in the mount's options and `rw` after the hyphen; the
-    reverse
-    is a writable mount of a read-only filesystem, which this check also reads as writable."""
+    """O56: a read-only bind of a writable filesystem is `ro` in the mount's options and `rw` after the hyphen; a
+    writable mount of a read-only filesystem is the reverse, and this check reads it as writable."""
     listed(workdir, tree)
-    proc(11, mountinfo(options="ro,relatime"))  # superblock rw: the shape of a read-only bind
+    proc.container(21, mountinfo(options="ro,relatime"))  # superblock rw: the shape of a read-only bind
     assert imp.check_mounts(workdir, proc.root)[1] is True
-    (proc.root / "11" / "mountinfo").write_text(mountinfo(options="rw,relatime").replace("rw,flock", "ro"))
+    (proc.root / "21" / "mountinfo").write_text(mountinfo(options="rw,relatime").replace("rw,flock", "ro"))
     assert imp.check_mounts(workdir, proc.root)[1] is False
 
 
-def test_o56_a_tree_no_process_holds_fails_since_nothing_is_proven(tree, workdir, proc):
-    """O56: a tree no process holds fails since nothing is proven."""
+def test_o56_a_writable_mount_below_the_tree_makes_it_writable_whatever_the_mount_above_says(tree, workdir, proc):
+    """O56: a mount at /volumes/import/alpha/nested that is writable makes the files below it writable, so the proof
+    counts every mount at the mountpoint or below it, and one that merely shares the name's prefix is another space."""
     listed(workdir, tree)
-    proc(11, "100 99 0:50 / / rw,relatime - overlay overlay rw\n")
+    nested = "102 101 0:61 / /volumes/import/alpha/nested rw,relatime - lustre fs rw\n"
+    proc.container(21, mountinfo(extra=nested))
+    facts, ok = imp.check_mounts(workdir, proc.root)
+    assert (ok, facts[0]["writable"]) == (False, 1)
+    (proc.root / "21" / "mountinfo").write_text(mountinfo(extra=nested.replace(" rw,relatime", " ro,relatime")))
+    assert imp.check_mounts(workdir, proc.root)[1] is True
+    sibling = "102 101 0:61 / /volumes/import/alpha-other rw,relatime - lustre fs rw\n"
+    (proc.root / "21" / "mountinfo").write_text(mountinfo(extra=sibling))
+    assert imp.check_mounts(workdir, proc.root)[1] is True
+
+
+def test_o56_a_mount_stacked_over_the_tree_that_is_writable_makes_it_writable(tree, workdir, proc):
+    """O56: two mounts at the mountpoint: the later one is what the process sees, so any writable one fails."""
+    listed(workdir, tree)
+    stacked = "102 101 0:61 / /volumes/import/alpha rw,relatime - lustre fs rw\n"
+    proc.container(21, mountinfo(extra=stacked))
+    assert imp.check_mounts(workdir, proc.root)[1] is False
+
+
+def test_o56_another_service_of_this_user_holding_the_same_mount_does_not_prove_this_one(tree, workdir, proc):
+    """O56: two federations of one account on one node: the other's container holds a read-only mount of the same
+    space name, and this service's container holds none. The proof is of the service `service.pid` names, so the other's
+    mount is not counted and the check fails."""
+    listed(workdir, tree)
+    proc.container(21, "100 99 0:50 / / rw,relatime - overlay overlay rw\n")  # this service: no mount at all
+    proc.process(31, ppid=30, mounts=mountinfo())  # another service's container: a child of another starter
+    facts, ok = imp.check_mounts(workdir, proc.root)
+    assert ok is False
+    assert facts == [{"space": "alpha", "processes": 0, "read_only": 0, "writable": 0}]
+
+
+def test_o56_a_process_that_is_not_a_child_of_the_services_starter_is_not_the_services(tree, workdir, proc):
+    """O56: a grandchild, the supervisor itself and a process of the host are not the container's first processes."""
+    listed(workdir, tree)
+    proc.process(41, ppid=21, mounts=mountinfo())  # a child of a container process
+    proc.process(42, ppid=1, mounts=mountinfo())
+    proc.root.joinpath(str(SUPERVISOR), "mountinfo").write_text(mountinfo())
+    assert imp.check_mounts(workdir, proc.root)[0][0]["processes"] == 0
+
+
+def test_o56_a_service_that_is_not_running_proves_nothing(tree, workdir, proc):
+    """O56: no service.pid, a supervisor whose start tick is not the recorded one (its pid was reused), a supervisor
+    of another user, and a supervisor with no child each give no process: the check fails closed."""
+    listed(workdir, tree)
+    proc.container(21, mountinfo())
+    assert imp.check_mounts(workdir, proc.root)[1] is True
+    (workdir / "service.pid").write_text(f"{SUPERVISOR} {TICK + 1}\n", encoding="utf-8")
+    assert imp.check_mounts(workdir, proc.root)[1] is False
+    (workdir / "service.pid").write_text(f"{SUPERVISOR} {TICK}\n", encoding="utf-8")
+    assert imp.check_mounts(workdir, proc.root, uid=os.getuid() + 1)[1] is False
+    proc.children()
+    assert imp.check_mounts(workdir, proc.root)[1] is False
+    (workdir / "service.pid").unlink()
+    assert imp.check_mounts(workdir, proc.root)[1] is False
+    (workdir / "service.pid").write_text("not a pid", encoding="utf-8")
+    assert imp.check_mounts(workdir, proc.root)[1] is False
+
+
+def test_o56_a_tree_the_service_does_not_hold_fails_since_nothing_is_proven(tree, workdir, proc):
+    """O56: a tree the service does not hold fails since nothing is proven."""
+    listed(workdir, tree)
+    proc.container(21, "100 99 0:50 / / rw,relatime - overlay overlay rw\n")
     facts, ok = imp.check_mounts(workdir, proc.root)
     assert ok is False
     assert facts == [{"space": "alpha", "processes": 0, "read_only": 0, "writable": 0}]
@@ -380,50 +466,71 @@ def test_o56_every_space_the_service_lists_is_checked_and_another_mountpoint_is_
     second = base / "shared" / "beta"
     second.mkdir(parents=True)
     listed(workdir, tree, ("beta", str(second)))
-    proc(11, mountinfo() + mountinfo(space="beta", options="rw")[len(mountinfo("rw", "beta").split("\n")[0]) + 1 :])
-    proc(12, mountinfo(space="gamma", options="rw"))  # a space this service does not list
+    beta = "102 101 0:61 /shared/beta /volumes/import/beta rw,relatime - lustre fs rw\n"
+    gamma = "103 101 0:62 /shared/gamma /volumes/import/gamma rw,relatime - lustre fs rw\n"  # not listed
+    proc.container(21, mountinfo(extra=beta + gamma))
     facts, ok = imp.check_mounts(workdir, proc.root)
     assert ok is False
     assert [f["space"] for f in facts] == ["alpha", "beta"]
     assert [f["writable"] for f in facts] == [0, 1]
 
 
-def test_o56_a_process_that_is_gone_or_not_a_process_is_skipped(tree, workdir, proc):
-    """O56: a process that is gone or not a process is skipped."""
+def test_o56_a_process_that_ended_is_skipped(tree, workdir, proc):
+    """O56: a process that ended between the listing and the read has no mountinfo and is skipped."""
     listed(workdir, tree)
-    proc(11, mountinfo())
-    (proc.root / "self").mkdir()
-    (proc.root / "13").mkdir()  # a process that ended between the listing and the read: no mountinfo
-    assert imp.check_mounts(workdir, proc.root)[1] is True
+    proc.container(21, mountinfo())
+    proc.process(22, ppid=STARTER)  # no mountinfo
+    assert imp.check_mounts(workdir, proc.root)[0][0]["processes"] == 1
 
 
-def test_o56_the_processes_of_another_user_are_not_counted(tree, workdir, proc):
-    """O56: the processes of another user are not counted."""
-    listed(workdir, tree)
-    proc(11, mountinfo())
-    facts, ok = imp.check_mounts(workdir, proc.root, uid=os.getuid() + 1)
-    assert (ok, facts[0]["processes"]) == (False, 0)
-
-
-def test_o56_the_mount_table_decodes_the_escapes_the_kernel_writes(tree, workdir, proc):
+def test_o56_the_mount_table_decodes_the_escapes_the_kernel_writes():
     """O56: the mount table decodes the escapes the kernel writes."""
-    listed(workdir, tree)
-    proc(11, mountinfo().replace("/volumes/import/alpha", "/volumes/import/alpha", 1))
     assert imp.parse_mountinfo("1 0 0:1 / /a\\040b ro - ext4 x rw\n") == [("/a b", {"ro"}, "ext4")]
 
 
 def test_o56_the_mounts_command_prints_counts_and_never_a_path(tree, workdir, proc):
     """O56: the mounts command prints counts and never a path."""
     listed(workdir, tree)
-    proc(11, mountinfo())
+    proc.container(21, mountinfo())
     done = cli("mounts", "--workdir", str(workdir), "--proc", str(proc.root))
     assert done.returncode == 0
     assert json.loads(done.stdout) == [{"space": "alpha", "processes": 1, "read_only": 1, "writable": 0}]
     assert str(tree) not in done.stdout + done.stderr
-    proc(12, mountinfo(options="rw"))
+    proc.container(22, mountinfo(options="rw"))
     failed = cli("mounts", "--workdir", str(workdir), "--proc", str(proc.root))
     assert failed.returncode == 1
     assert "FAIL" in failed.stderr
+
+
+def test_o56_the_list_is_never_written_through_a_link_and_is_replaced_whole(tree, workdir, base):
+    """O56: a draft that is a link into the shared tree is not written through: the draft's name is one no one made,
+    created exclusively, and a readable list from before is replaced by a private one."""
+    victim = tree / "day-01.csv"
+    before = victim.read_text(encoding="utf-8")
+    (workdir / "imports.draft").symlink_to(victim)
+    (workdir / "imports").write_text("old\n", encoding="utf-8")
+    (workdir / "imports").chmod(0o644)
+    imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
+    assert victim.read_text(encoding="utf-8") == before
+    assert stat.S_IMODE((workdir / "imports").stat().st_mode) == 0o600
+    assert (workdir / "imports").read_text(encoding="utf-8") == f"alpha\t{tree}\n"
+    assert sorted(p.name for p in tree.iterdir()) == ["day-01.csv"]
+
+
+def test_o56_a_list_that_is_a_link_or_readable_by_others_is_refused_when_read(tree, workdir, base):
+    """O56: the list names the trees the service binds, so it is opened without following a link and must be a private
+    file of this user."""
+    imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
+    real = workdir / "imports"
+    real.chmod(0o640)
+    with pytest.raises(imp.ImportRefused, match="readable by no one else"):
+        imp.binds(workdir)
+    real.chmod(0o600)
+    moved = base / "moved-list"
+    real.rename(moved)
+    real.symlink_to(moved)
+    with pytest.raises(imp.ImportRefused, match="cannot be opened"):
+        imp.binds(workdir)
 
 
 # -- the shell wiring --------------------------------------------------------------------------------------------------
@@ -507,19 +614,20 @@ def test_o56_the_script_never_removes_renames_links_or_truncates_and_writes_only
 
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
     forbidden = {"rmtree", "remove", "unlink", "rmdir", "rename", "renames", "symlink", "link", "truncate", "utime"}
-    writers = {"mkdir", "makedirs", "chmod", "replace", "fdopen"}
+    writers = {"mkdir", "makedirs", "chmod", "replace"}
     where = {}
     for function in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
         for node in ast.walk(function):
             if isinstance(node, ast.Call):
                 name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
                 where.setdefault(name, set()).add(function.name)
-                if name == "open" and any(isinstance(a, ast.Constant) and a.value in ("w", "a") for a in node.args):
+                modes = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+                if name in ("open", "fdopen") and any(m[:1] in ("w", "a", "x") for m in modes):
                     where.setdefault("open-for-write", set()).add(function.name)
     assert not forbidden & set(where)
     assert {f for name in writers for f in where.get(name, ())} <= {"make_mountpoint", "prepare"}
-    assert where.get("open-for-write", set()) == set()
-    assert "O_WRONLY" in SCRIPT.read_text(encoding="utf-8")  # the list is made with os.open, in prepare
+    assert where.get("open-for-write", set()) == {"prepare"}  # the list, made with os.open(O_EXCL | O_NOFOLLOW)
+    assert "O_EXCL" in SCRIPT.read_text(encoding="utf-8")
 
 
 # -- what `up` takes from the layout ----------------------------------------------------------------------------------
@@ -824,3 +932,24 @@ def test_o56_a_tree_whose_manifest_holds_more_bytes_than_the_support_is_refused_
         hpcimport.check_support(layout, environ)
     assert "support is 1048576" in str(caught.value)
     assert str(base) not in str(caught.value)
+
+
+def test_o56_a_manifest_that_cannot_be_used_stops_the_preflight_naming_its_variable_and_never_its_path(fed, base):
+    """O56, O12: the preflight reads each manifest through the layout, so an unusable one is refused naming its
+    variable, with the file's place taken out of the core's message."""
+    from federation_support import import_layout
+
+    layout, data = import_layout(fed, base, LAYOUT)
+    (data / "alpha").mkdir()
+    (data / "beta").mkdir()
+    (data / "alpha.json").write_text("{not json", encoding="utf-8")
+    (data / "beta.json").write_text('{"version": 1, "files": [], "directories": []}', encoding="utf-8")
+    environ = {
+        "EXPCORE_FED_IMPORT_ALPHA": str(data / "alpha"),
+        "EXPCORE_FED_IMPORT_ALPHA_MANIFEST": str(data / "alpha.json"),
+        "EXPCORE_FED_IMPORT_BETA": str(data / "beta"),
+        "EXPCORE_FED_IMPORT_BETA_MANIFEST": str(data / "beta.json"),
+    }
+    with pytest.raises(ValueError, match="EXPCORE_FED_IMPORT_ALPHA_MANIFEST cannot be used") as found:
+        hpcimport.check_support(layout, environ)
+    assert str(base) not in str(found.value)

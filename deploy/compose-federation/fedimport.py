@@ -182,7 +182,8 @@ def verify_imports(
     exactly the manifest's paths, kinds and sizes, and every file is whole on the owner by its block map; with `hashes`,
     every file's bytes read back. Return each space's record by its name.
 
-    Before any call: every manifest variable is checked (`Layout.import_manifest`), and the rendered platform.toml must
+    Before any call: every manifest is checked and loaded (`Layout.load_manifest`, which names a variable and never a
+    path), and the rendered platform.toml must
     declare each space as the layout does (`import = { readonly = true, shared = true }`), so a platform file that
     leaves the sharing out, and so would not refuse a writable storage, is refused. A space that fails is a
     RuntimeError naming it; the message holds no path (the core's never does). Nothing is written to a space: the
@@ -190,20 +191,20 @@ def verify_imports(
     spaces = layout.shared_imports()
     if not spaces:
         return {}
-    manifests = {space.name: layout.import_manifest(space.name, environ) for space in spaces}
+    loaded = {space.name: layout.load_manifest(space.name, environ) for space in spaces}
     from expcore.config.loading import ConfigError
     from expcore_onedata.client import OnezoneClient
     from expcore_onedata.config import load_platform
     from expcore_onedata.provision import Provisioner, resolve_provider_ids
     from expcore_onedata.rangemap import load_placement
-    from expcore_onedata.storageimport import ImportedSpace, ImportFailed, load_manifest
+    from expcore_onedata.storageimport import ImportedSpace, ImportFailed
 
     try:
         config = load_platform(layout.platform)
         settings = load_placement(layout.platform, config).settings
-        loaded = {name: load_manifest(path) for name, path in manifests.items()}
     except ConfigError as error:
-        raise RuntimeError(f"the import check cannot start: {error}") from None
+        said = str(error).replace(str(layout.root), "<root>")  # the root is the host's own place
+        raise RuntimeError(f"the import check cannot start: {said}") from None
     entries = {entry.space.name: entry for entry in config.spaces}
     for space in spaces:
         declared = entries[space.name].imported if space.name in entries else None

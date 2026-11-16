@@ -70,8 +70,10 @@ as **shared**, which means read-only everywhere, for every federation, always:
   list is checked again at every start. Nothing in the bundle writes below the tree, and the work directory's removal
   (`rm -rf --one-file-system`) never enters it: the bind exists only in the container's own mount namespace.
 - **The proof that it is read-only** is the kernel's: `importstorage.py mounts`, a control step on the owner's node, reads
-  the mount table of every process of its user that holds the mountpoint and exits 0 only when each holds it with `ro`
-  in the mount's own options. No write is attempted to find out: if the declarations were wrong, a probe would be the
+  the mount table of this service's container processes (the children of the Apptainer starter that the service's own
+  supervisor, named by `service.pid`, started; another service of the same account on the node is never counted) and
+  exits 0 only when each holds the mountpoint, and every mount below it, with `ro` in the mount's own options. A
+  service that is not running, or whose starter has no visible child, proves nothing, and the check fails. No write is attempted to find out: if the declarations were wrong, a probe would be the
   first write into a tree other federations read. The panel's flag and the core's refusal of every write
   (`Provisioner.read_only`) are the other two layers; op-worker's own test suite shows a read-only storage answering
   EROFS (`readonly_storage_test_SUITE`, above).
@@ -94,7 +96,8 @@ agent's own provider (`local` in the platform file; O40's start check reads a fi
 `direct_io` belongs on a space that provider owns: the layout has no `local`, and the platform template carries it. The
 sandbox node must see the same directory, which the sandbox milestone's step provides.
 
-Not shown by anything in this repository, and for a live slot: that Onepanel accepts the imported storage with the job
+Not shown by anything in this repository, and for a live slot: that the mount check finds the service's container as the
+visible child of the setuid starter its supervisor started (it fails closed when it does not); that Onepanel accepts the imported storage with the job
 user's ids, the local LUMA feed and the canonical path type; that the apptainer bind is read-only on the site's
 filesystem as the mount table shows it; the owner and mode the scan gives files owned by another account (the
 agent's user reads as a member of the space; the tree must be readable by its group); the scan's time and load for a

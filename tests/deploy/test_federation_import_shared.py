@@ -408,3 +408,37 @@ def test_o56_the_check_sends_nothing_that_could_write_to_the_tree(checked):
     writes = [c for c in checked.fake.provider_calls if c[1] in ("POST", "PUT", "PATCH", "DELETE")]
     assert writes == []
     assert [c for c in checked.fake.panel_calls if c[1] != "GET"] == []
+
+
+def test_o56_a_manifest_that_cannot_be_used_is_refused_naming_its_variable_and_never_its_path(fed, tmp_path):
+    """O56, O12: the core's refusal of a manifest names the file it read, which is the host's own path; the layout
+    says it again with the place taken out, for invalid JSON and for a manifest of the wrong shape alike."""
+    layout, _, manifest = shared_layout(fed, tmp_path)
+    for body in ("{not json", '{"version": 2, "files": [], "directories": []}', "[]"):
+        manifest.write_text(body, encoding="utf-8")
+        with pytest.raises(
+            ValueError, match="the manifest named by EXPCORE_FED_IMPORT_FERN_MANIFEST cannot be used"
+        ) as found:
+            layout.load_manifest("fern-space", manifest_env(manifest))
+        assert str(manifest) not in str(found.value)
+        assert str(tmp_path) not in str(found.value)
+
+
+def test_o56_the_check_after_up_refuses_a_manifest_that_cannot_be_used_before_any_call_and_names_no_path(checked):
+    """O56, O12: an unusable manifest is refused before the platform file is read or any panel is called."""
+    manifest = Path(checked.environ["EXPCORE_FED_IMPORT_STUDY_MANIFEST"])
+    manifest.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="EXPCORE_FED_IMPORT_STUDY_MANIFEST cannot be used") as found:
+        checked.run()
+    assert str(manifest.parent) not in str(found.value)
+    assert checked.fake.panel_calls == []
+
+
+def test_o56_the_check_after_up_names_no_path_when_the_platform_file_cannot_be_loaded(checked):
+    """O56, O12: the platform file lies in the federation's root, a host path: a refusal to load it is said with the
+    root taken out."""
+    (checked.layout.root / "platform.toml").write_text("this is not toml = [", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="the import check cannot start") as found:
+        checked.run()
+    assert str(checked.layout.root) not in str(found.value)
+    assert str(checked.layout.root.parent) not in str(found.value)

@@ -56,13 +56,11 @@ def provider_import_args(layout, provider, environ):
 def check_support(layout, environ):
     """Refuse a shared import whose manifest holds more bytes than the support the layout gives its space
     (`support_bytes`, 10 GiB by default), before the scan finds it out half way; return each shared space's manifest
-    bytes by its name. The message names the space and the two figures, never a path. Needs the core (the manifest is
-    read by its `load_manifest`, which checks it), so it runs in the driver, not on a node."""
-    from expcore_onedata.importmanifest import load_manifest
-
+    bytes by its name. The message names the space and the two figures, never a path; a manifest that cannot be used is
+    refused by `Layout.load_manifest`, naming its variable. Needs the core, so it runs in the driver, not on a node."""
     found = {}
     for space in layout.shared_imports():
-        wanted = load_manifest(layout.import_manifest(space.name, environ)).bytes
+        wanted = layout.load_manifest(space.name, environ).bytes
         if wanted > space.support_bytes:
             raise HpcImportRefused(
                 f"spaces.{space.name}: the tree holds {wanted} bytes and its support is {space.support_bytes}: "

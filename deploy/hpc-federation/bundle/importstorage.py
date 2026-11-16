@@ -11,10 +11,11 @@ holds what the node does for that, and nothing about Onedata's panel (the federa
       run_service's step. Check the list again, since a start may come long after prepare, and print the arguments
       for `apptainer exec`, one per line: `--bind` and `PATH:/volumes/import/SPACE:ro`.
   importstorage.py mounts --workdir W [--proc DIR]
-      After the service is up, in a control step on its node: read the mount table of every process of this user
-      that holds /volumes/import/SPACE, and print, per space, how many hold it read-only and how many writable, as
-      JSON. Exit 0 only when every listed space is held by at least one process and by none writable: the kernel's
-      own answer to "is the tree read-only", not Onedata's.
+      After the service is up, in a control step on its node: read the mount table of this service's container
+      processes (the children of the starter its supervisor, `W/service.pid`, started) and print, per space, how many
+      hold /volumes/import/SPACE, or a mount below it, read-only and how many writable, as JSON. Exit 0 only when every
+      listed space is held by at least one process and by none writable: the kernel's own answer to "is the tree
+      read-only", not Onedata's.
 
 A tree is accepted only as a plain absolute path of characters that cannot end a bind option, with no symbolic link on
 the way (a link could be re-pointed between the check and the mount), an existing directory this user can read, not on
@@ -25,6 +26,7 @@ named as a read-only bind source.
 
 import os
 import re
+import secrets
 import stat
 import sys
 
@@ -195,21 +197,30 @@ def prepare(workdir, imports, mountinfo=None):
     if imports:
         body = "".join("%s\t%s\n" % pair for pair in sorted(imports))
         target = os.path.join(workdir, LIST)
-        draft = target + ".draft"
-        fd = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # A name no one has made, created exclusively and never through a link: a draft that was a link into a tree
+        # would otherwise be truncated and written through.
+        draft = "%s.draft.%d.%s" % (target, os.getpid(), secrets.token_hex(4))
+        fd = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(body)
         os.replace(draft, target)
 
 
 def listed(workdir):
-    """The list as (space, path) pairs, each line read as strictly as an argument; empty when there is none."""
+    """The list as (space, path) pairs, each line read as strictly as an argument; empty when there is none. The file
+    must be a regular file of this user that no one else can read, and is never opened through a link."""
     private_workdir(workdir)
     try:
-        with open(os.path.join(workdir, LIST), encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
+        fd = os.open(os.path.join(workdir, LIST), os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return []
+    except OSError:
+        raise ImportRefused("the list of imports cannot be opened (a link, or unreadable)") from None
+    with os.fdopen(fd, encoding="utf-8") as handle:
+        status = os.fstat(handle.fileno())
+        if not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077:
+            raise ImportRefused("the list of imports is not a regular file of this user, readable by no one else")
+        lines = handle.read().splitlines()
     pairs = []
     for line in lines:
         space, tab, path = line.partition("\t")
@@ -229,25 +240,73 @@ def binds(workdir):
     return out
 
 
+def proc_stat(proc, pid):
+    """(parent pid, start tick) of a process from its stat (proc(5), fields 4 and 22), or None when unreadable."""
+    try:
+        with open(os.path.join(proc, str(pid), "stat"), encoding="ascii", errors="replace") as handle:
+            text = handle.read()
+        rest = text[text.rindex(")") + 1 :].split()
+        return int(rest[1]), int(rest[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def owned_by(proc, pid, uid):
+    try:
+        return os.stat(os.path.join(proc, str(pid))).st_uid == uid
+    except OSError:
+        return False
+
+
+def service_processes(workdir, proc, uid):
+    """The pids of this service's container processes: the children of the Apptainer starter that the service's own
+    supervisor started. The supervisor is the one `service.pid` names (its pid and start tick, as run_service wrote
+    them); the starter is setuid root, so hidden from this user under hidepid, but the supervisor's `children` file
+    names it, and the container's first process, which this user can see, has it as its parent. Nothing is guessed:
+    no running supervisor or no child of it is no process, and a mount held only by another service of this user on
+    the node is never this service's."""
+    try:
+        with open(os.path.join(workdir, "service.pid"), encoding="ascii") as handle:
+            pid, tick = handle.read().split()
+        if not (pid.isdigit() and tick.isdigit()):
+            return []
+    except (OSError, ValueError):
+        return []
+    supervisor = proc_stat(proc, pid)
+    if supervisor is None or str(supervisor[1]) != tick or not owned_by(proc, pid, uid):
+        return []
+    starters = set()
+    try:
+        for task in os.listdir(os.path.join(proc, pid, "task")):
+            with open(os.path.join(proc, pid, "task", task, "children"), encoding="ascii") as handle:
+                starters.update(int(child) for child in handle.read().split())
+    except (OSError, ValueError):
+        return []
+    found = []
+    for name in sorted(os.listdir(proc)):
+        stat_of = proc_stat(proc, name) if name.isdigit() else None
+        if stat_of is not None and stat_of[0] in starters and owned_by(proc, name, uid):
+            found.append(name)
+    return found
+
+
 def check_mounts(workdir, proc="/proc", uid=None):
-    """What this user's processes hold at each listed space's mountpoint: (facts, ok). `ok` is true when every listed
-    space is held by at least one process and by none with the mount writable. The mount's own options decide, never
-    the filesystem's: a read-only bind of a writable filesystem is read-only."""
+    """What this service's processes hold at each listed space's mountpoint: (facts, ok). `ok` is true when every listed
+    space is held by at least one of them and by none with a mount writable. The mount's own options decide, never the
+    filesystem's (a read-only bind of a writable filesystem is read-only), and every mount at the mountpoint or below
+    it counts: a writable mount inside the tree makes files in it writable, whatever the mount above it says."""
     uid = os.getuid() if uid is None else uid
     spaces = [space for space, _ in listed(workdir)]
     tally = {space: {"space": space, "processes": 0, "read_only": 0, "writable": 0} for space in spaces}
-    for name in sorted(os.listdir(proc)):
-        if not name.isdigit():
-            continue
+    for name in service_processes(workdir, proc, uid):
         try:
-            if os.stat(os.path.join(proc, name)).st_uid != uid:
-                continue
             with open(os.path.join(proc, name, "mountinfo"), encoding="utf-8") as handle:
                 mounts = parse_mountinfo(handle.read())
         except OSError:
             continue  # a process that ended since the listing
         for space in spaces:
-            held = [options for point, options, _ in mounts if point == "%s/%s" % (MOUNT_ROOT, space)]
+            here = "%s/%s" % (MOUNT_ROOT, space)
+            held = [options for point, options, _ in mounts if point == here or point.startswith(here + "/")]
             if held:
                 tally[space]["processes"] += 1
                 tally[space]["read_only" if all("ro" in options for options in held) else "writable"] += 1
