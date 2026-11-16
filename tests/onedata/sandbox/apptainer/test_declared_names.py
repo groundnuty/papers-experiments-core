@@ -6,10 +6,10 @@ import json
 from pathlib import Path
 
 import pytest
-from apptainer_support import PROVIDER, ZONE, make_settings, start
+from apptainer_support import PROVIDER, ZONE, make_settings, make_spec, start
 from fake_node import FakeNode
 
-from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.api import Endpoint, SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import gaterun
 from expcore_onedata.sandbox.settings import FederationNetwork
@@ -109,6 +109,41 @@ def test_o69_without_the_table_the_cell_is_given_the_urls_hosts_as_before(node, 
         assert node.execs[-1].env["ONEDATA_ONEZONE_HOST"] == ZONE.host
         assert set(node.gates[-1].config["hosts"]) == {ZONE.host, PROVIDER.host}
         assert box.metadata()["gate"]["names"] == "urls"
+    finally:
+        box.stop()
+
+
+def test_o69_declared_names_without_the_zone_s_refuse_a_rest_start_before_anything_exists(node, tmp_path):
+    """O69: the gate serves the zone too, so names that lack the zone's (settings made in code) refuse the start, and
+    no gate is given the URLs' hosts in their place."""
+    settings = dataclasses.replace(make_settings(tmp_path), federation=FederationNetwork(None, DECLARED_PROVIDER))
+    with pytest.raises(StartRefused, match="names no zone"):
+        start(node, settings)
+    assert not node.spawned
+    assert not node.gates
+
+
+def test_o69_declared_names_in_capitals_are_served_in_lower_case(node, tmp_path):
+    """O69: the gate matches Host and SNI in lower case, so names given in capitals (settings made in code) are served,
+    certified and given to the cell in lower case."""
+    capitals = FederationNetwork(None, DECLARED_PROVIDER.upper(), DECLARED_ZONE.title())
+    box = start(node, dataclasses.replace(make_settings(tmp_path), federation=capitals))
+    try:
+        box.exec("print(1)", 30)
+        assert set(node.gates[-1].config["hosts"]) == {DECLARED_ZONE, DECLARED_PROVIDER}
+        assert node.execs[-1].env["ONEDATA_ONEZONE_HOST"] == DECLARED_ZONE
+    finally:
+        box.stop()
+
+
+def test_o69_without_the_table_a_zone_on_its_provider_s_host_starts_as_before(node, tmp_path):
+    """O69: with no names declared, a zone whose URL has the provider's host on another port is given to the cell by
+    its URL's host, as before; the change of names never makes such a platform refuse its start."""
+    spec = dataclasses.replace(make_spec(), zone=Endpoint(PROVIDER.host, 9443, True))
+    box = start(node, make_settings(tmp_path), spec)
+    try:
+        box.exec("print(1)", 30)
+        assert node.execs[-1].env["ONEDATA_ONEZONE_HOST"] == PROVIDER.host
     finally:
         box.stop()
 

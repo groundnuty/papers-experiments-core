@@ -542,16 +542,17 @@ def _apptainer_federation(
     """`[sandbox.federation]` on the Apptainer backend (O69): the zone's and the local provider's names alone, which the
     gate serves the agent on 443 with the URLs' hosts and ports behind them. It has no network to join, and nothing
     but the REST data path's gate reads the names (the host mount dials the provider's URL), so a network and a table
-    without a rest level are refused, and so is one name for both, which would serve the agent one host for two."""
+    without a rest level are refused, and so is one name for both, which would serve the agent one host for two. The
+    names are kept in lower case, as a URL's host is: the gate matches a request's `Host` and SNI in lower case."""
     if "network" in section.data:
         raise section.fail("network", 'is read by the Docker backend alone, and backend is "apptainer"')
     if DataPathMode.REST not in data_paths.values():
         raise section.fail(None, "is read by the REST data path's gate alone on this backend, and no data path is rest")
     section.reject_unknown(("zone", "providers"))
-    names = FederationNetwork(None, _federation_provider(section, providers, local), _federation_zone(section, True))
-    if names.zone is not None and names.zone.lower() == names.local_provider.lower():
+    provider, zone = _federation_provider(section, providers, local).lower(), str(_federation_zone(section, True))
+    if zone.lower() == provider:
         raise section.fail("zone", "must differ from the local provider's name: the gate serves each name one host")
-    return names
+    return FederationNetwork(None, provider, zone.lower())
 
 
 def _space_path(section: Section, key: str) -> str | None:

@@ -119,6 +119,13 @@ def test_o69_the_names_are_checked_as_docker_s_are_and_are_two(tmp_path, change,
     assert DECLARED_PROVIDER.lower() not in str(raised.value).lower()
 
 
+def test_o69_the_names_are_kept_in_lower_case_as_the_gate_matches_them(tmp_path):
+    """O69: the gate matches a request's Host and SNI in lower case, as a URL's host is, so a name declared in capitals
+    is served all the same."""
+    loaded = _load_named(tmp_path, _named(zone=DECLARED_ZONE.upper(), providers={"alpha": DECLARED_PROVIDER.title()}))
+    assert loaded.federation == FederationNetwork(network=None, local_provider=DECLARED_PROVIDER, zone=DECLARED_ZONE)
+
+
 def test_o69_the_federation_table_needs_the_zone_s_name(tmp_path):
     """O69: a REST data path's gate serves the zone too, so its name is required."""
     document = _named()
