@@ -558,26 +558,29 @@ def test_o63_no_line_is_made_from_a_plan_that_has_not_pinned_its_post_run_script
 # -- collect and the merge refuse a shard that is not final ---------------------------------------------------------
 
 
-def two_shards(shards, tmp_path, monkeypatch, texts, extra=f'post_run = "{POST}"', declared=(True, True)):
-    """Run both shards' steps with the post-run script `texts[i]` each (None: its line carries no script, as one edited
-    by hand), against a plan that declares `extra`; the plan."""
+FED_B_FAILS = "import sys\nraise SystemExit(0 if sys.argv[1] == 'fed-a' else 6)\n"  # the study's one script, per label
+
+
+def two_shards(shards, tmp_path, monkeypatch, script=PASS, declared=(True, True)):
+    """Run both shards' steps with the study's one post-run script `script` (`declared[i]` False: the line of shard i
+    carries no script, as one edited by hand), against a plan that declares it; the plan, pinned."""
     monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
-    plan = shards.load_plan(manifest_file(tmp_path, extra))
+    plan = shards.load_plan(manifest_file(tmp_path, f'post_run = "{POST}"', script))
     pinned = shards.pinned(plan)
-    for index, (label, text, kept) in enumerate(zip(("fed-a", "fed-b"), texts, declared, strict=True), 1):
-        args = step_args(tmp_path, text if text is not None else PASS, index=index, label=label)
+    for index, (label, kept) in enumerate(zip(("fed-a", "fed-b"), declared, strict=True), 1):
+        args = step_args(tmp_path, script, index=index, label=label)
         if not kept:
             for key in ("post_run", "post_run_sha256", "post_run_timeout"):
                 delattr(args, key)
         run, _ = dispatcher()
         shards.step(args, runner=run, core_found=lambda path: True)
-    assert (tmp_path / "study" / POST).read_text() == PASS  # what the plan hashed is what the study holds
+    assert pinned.post_run_sha256 == sha(script)  # what the plan hashed is what the study holds
     return pinned
 
 
 def test_o63_collect_unpacks_shards_that_are_final_and_names_the_merge(shards, tmp_path, monkeypatch):
     """O63: every shard final, each having run the plan's script: collected as ever."""
-    plan = two_shards(shards, tmp_path, monkeypatch, [PASS, PASS])
+    plan = two_shards(shards, tmp_path, monkeypatch)
     outs = shards.collect(plan, tmp_path / "into")
     assert [o.parent.name for o in outs] == ["fed-a", "fed-b"]
     assert not any((o / "NOT-FINAL.json").exists() for o in outs)
@@ -588,7 +591,7 @@ def test_o63_collect_refuses_a_shard_that_is_not_final_naming_it_and_leaves_noth
 ):
     """O63: one shard's script did not pass: `collect` refuses the whole, naming that shard (its label) and the
     reason, and the directory to collect into is not left behind."""
-    plan = two_shards(shards, tmp_path, monkeypatch, [PASS, "raise SystemExit(6)\n"])
+    plan = two_shards(shards, tmp_path, monkeypatch, FED_B_FAILS)
     with pytest.raises(shards.ShardsError, match=r"shard fed-b: its results are not final .*exited with status 6"):
         shards.collect(plan, tmp_path / "into")
     assert not (tmp_path / "into").exists()
@@ -609,7 +612,7 @@ def test_o63_collect_refuses_a_not_final_shard_of_a_plan_that_declares_no_script
 def test_o63_collect_refuses_a_shard_whose_step_did_not_run_the_plans_script_to_a_pass(shards, tmp_path, monkeypatch):
     """O63: a plan that declares the script refuses a shard whose manifest does not say it passed: a step whose line
     dropped the three words (a hand-edited line), or one that ran another script than the plan's."""
-    plan = two_shards(shards, tmp_path, monkeypatch, [PASS, PASS], declared=(True, False))
+    plan = two_shards(shards, tmp_path, monkeypatch, declared=(True, False))
     with pytest.raises(shards.ShardsError, match="shard fed-b: its step did not run the plan's post-run script"):
         shards.collect(plan, tmp_path / "into")
     assert not (tmp_path / "into").exists()
@@ -618,7 +621,7 @@ def test_o63_collect_refuses_a_shard_whose_step_did_not_run_the_plans_script_to_
 def test_o63_collect_refuses_an_unpacked_out_that_holds_the_mark(shards, tmp_path, monkeypatch):
     """O63: an archive whose manifest says final but whose out/ holds NOT-FINAL.json (edited by hand) is refused once
     unpacked, naming the shard, so the merge never sees it."""
-    plan = two_shards(shards, tmp_path, monkeypatch, [PASS, PASS])
+    plan = two_shards(shards, tmp_path, monkeypatch)
     work = tmp_path / "forge"
     work.mkdir()
     with tarfile.open(tmp_path / "results" / "fed-b.out.tar") as source:
