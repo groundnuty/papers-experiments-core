@@ -830,7 +830,7 @@ def test_o16_the_harnesss_own_stop_of_the_gate_is_no_death_in_a_healthy_rest_run
     written = json.loads((tmp_path / "evidence" / "metadata.json").read_text())
     for meta in (written, sbx.metadata()):
         assert (meta["container_deaths"], meta["infra_death"]) == ([], [])
-    check = sbx.infra_container_check()
+    check = sbx.infra_check()
     assert check["containers"]["gate"]["stopped_by_harness"] is True
     assert check["containers"]["gate"]["end"]["status"] == "running"  # its state just before the harness's stop
     sbx.stop()

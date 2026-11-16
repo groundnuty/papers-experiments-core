@@ -120,6 +120,7 @@ class Teardown:
         def stop() -> None:
             box = self.box
             helper = box._helpers[role]
+            box.infra.stopping(role)  # the harness's own stop: a check read after it is no death (`infra_check`)
             if box.node.alive(helper.process.pid, helper.process.start) is False:
                 return  # stopped by the collection, or ended by itself: shown gone
             helpers.stop(box.node, helper, sleep=box._sleep, clock=box._clock)
