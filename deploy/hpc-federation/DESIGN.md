@@ -114,7 +114,12 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   id reached the state file.
 - **A finished step's srun client can hang on the login node** with its work done (another study saw 25 minutes). A
   control step's client is ended only when its step has been gone from `squeue -s` for three polls in a row; a step
-  still listed at the bound is cancelled by its own id (`scancel <job>.<step>`), never more.
+  still listed at the bound is cancelled by its own id (`scancel <job>.<step>`), never more. Both ends of a token's
+  pipe are finished whatever the first does. Ending a client is verified (SIGTERM, then SIGKILL, each only while the
+  pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the login node that
+  no record names (one spawned just before a crash).
+- **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
+  step runs takes `-I -B`.
 - **The core the driver imports is recorded**: `up` writes the resolved paths of `expcore_onedata`, `fedlayout` and
   `hpcfed` into the state file, and refuses to run when `expcore_onedata` is not imported from this checkout's `src`.
   The core's step (`[hpc] core = "step"`) makes the same check on the node and exits 97 on a mismatch, which fails
@@ -199,7 +204,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    <seconds of --time>'`. **The read-back:** `scontrol show job -o <id>` must report what was asked (TimeLimit,
    Requeue=0, Account, Partition, NumNodes, NumCPUs, MinMemoryNode, JobName); otherwise `up` cancels that one job id
    and fails, naming the field. sbatch's stderr is kept apart from the id it prints.
-3. **Wait for it to run**, bounded (30 min); at the bound, or if it ends first, it is cancelled by its id.
+3. **Wait for it to run**, bounded (30 min); at the bound, or if it ends first, it is cancelled by its id. **The read-back
+   runs again on the running job**: a scheduler that allocated more than the pending request showed is caught there,
+   and the job cancelled before any step.
 4. **Place** (section 1), then one control step per node prints the node's FQDN and its IPv4 address on the
    cluster's network (`nodefacts.py`, Python 3.9-compatible, stdlib only).
 5. **The zone**: a detached service step, `zone.sbatch <bundle> <zone tar> <zone name> <every provider's address>`,
@@ -228,19 +235,26 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
+**`up` and `down` each hold the root's lifecycle lock** (`hpc-federation.lifecycle.lock`, `flock`, never waited
+for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job and
+remove the root); the service verbs do not take it.
+
 **`down`** (login node), whatever `up` reached:
 
 0. **Stop the fault relay first** (`fault_relay stop --root <root>`, when the core has it), so no service verb launches
    a step while the federation goes down; a relay that will not stop is reported, and `down` goes on. Its directory
    `<root>/fault-relay/` goes with the root.
-1. Read the state file. When it is missing or unreadable, find the allocation by its name among this user's jobs
+1. Read the state file. A recorded job id whose job now carries another name is not ours (Slurm reuses ids): nothing
+   is torn down or cancelled. When the id is missing, find the allocation by its name among this user's jobs
    (`squeue -u <user> -h -n <allocation name> -o %i`, an exact name holding `up`'s random part); with no state file and
    no name, there is nothing of `up`'s to find, and `down` says so. **Never `scancel -u`.**
 2. If the job runs: a `teardown.sh` control step per service with a recorded work directory (providers first, then
    the zone), each bounded by `stop_seconds`; then wait until no step but `batch` and `extern` is listed in `squeue -s`
    (ending each service step's srun client only then); a step still listed at the bound is cancelled by its own id.
 3. One read-only control step per node checks that no recorded work directory is left on it.
-4. `scancel <job>`, by the recorded id only; wait until `squeue -j` lists it no more.
+4. `scancel <job>`, by the recorded id only; wait until `squeue -j` lists it no more. **Whatever fails in 0 to 3 (a
+   relay that will not stop, a failed `squeue`, a work directory the driver refuses), the job is still cancelled and
+   every client ended; the failure is reported as unverified.**
 5. Remove the root, as Compose's `down` does. The service logs stay in the log directory (no secret: the bundle
    redacts them), named in the run's output.
 
@@ -258,6 +272,9 @@ serves both:
 - `tls.ca_file = "ca/federation-ca.pem"` holds the **Onedata test CA** here (each service's web certificate is the
   image's generated test certificate for its node's FQDN; the bundle README lists what that CA's public key means);
 - `credentials.admin` is `secrets/admin.token`, minted by the bootstrap; `credentials.users` the users' passwords;
+- **storages are found by name**, never by place in a list: finish.sh's `posix-local` for a provider's support, and
+  `import-<space>` for an owner's support of an imported space (M3: such an owner has two); the LUMA mappings are
+  made on the storage the support names;
 - `[faults] journal = "fault-journal"`, when the template declares faults, so the link-check record lands in the root
   (`linkrecord.record_path`);
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
@@ -295,7 +312,9 @@ argv prefix and `down` stops first; section 5), which runs the verb and answers.
 
 - `launcher` (`hpclaunch.Launcher`): `control(node, argv, *, name, timeout_s)` runs a bounded control step (`--exact
   -c <control cpus> --mem <control memory>`, the allowlist, stdin `/dev/null`) and returns `returncode`, `stdout` and
-  `stderr`, or raises `TimeoutError` at its bound after cancelling that step by its id; `service(node, argv, *, kind,
+  `stderr`, or raises `TimeoutError` at its bound after cancelling that step by its id (`returncode` is None when
+  its client was ended after its step vanished and the accounting holds no status for it, and a step a signal ended
+  reads as `128 + signal`, never 0); `service(node, argv, *, kind,
   name, log)` launches a detached service step of the kind's size (`"oz"` or `"op"`) and records its srun client;
   `listed(name)` is the step id `squeue -s` lists under that name, or None; `cancel(step_id)` cancels that one step of
   the held job. Every step runs on one of the held job's own nodes, or is refused.
@@ -368,7 +387,11 @@ service steps through `zone.sbatch` and `provider.sbatch` unchanged):
 M3 replaces a provider's tmpfs posix storage for an imported space with a directory on the shared filesystem, bound
 read-only into that provider's container. It changes the service step's binds and the support's storage, not the
 process model: the step, the state file and the verbs stay as above. `up` refuses a layout with an imported space
-until then.
+until then. M3's calls (`provider_import_args` on the owner's `provider.sbatch` argv, the `import_storage_extra` hook
+of the bootstrap, `luma_requests` on the storage `storage_for` names, `check_support`, `mount_check_argv` as a
+control step on the owner's node, `direct_storages`, and `fedimport.verify_imports` after the bootstrap) live in
+M3's branch; they are wired into `hpcdriver.py` when it merges this driver, and the pilot-shape layout's data spaces
+gain their `import` tables and template lines then.
 
 **The agent's node S (M5).** The campaign's dispatcher runs as one step on S, launched from the login node like any
 step here; the gate is on S's loopback and every cell a local `apptainer exec` on S, so S hosts no Onedata service.

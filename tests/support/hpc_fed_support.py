@@ -143,6 +143,10 @@ class FakeSlurm:
     relay_calls: list = field(default_factory=list)  # alive, stop, ... in order
     relay_rc: dict = field(default_factory=dict)  # a relay verb's exit status, when not 0
     relays: list = field(default_factory=list)  # each relay started: its argv
+    stray_clients: list = field(default_factory=list)  # srun clients of the job found on the host, never recorded
+    unkillable: list = field(default_factory=list)  # clients that survive their end
+    running_recorded: dict = field(default_factory=dict)  # fields scontrol reports once the job has been read twice
+    reads: int = 0
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -158,6 +162,7 @@ class FakeSlurm:
         if argv[:3] == ["scontrol", "show", "job"]:
             if self.state == "GONE" or self.job_id in self.cancelled:
                 return Completed(1, "", "slurm_load_jobs error: Invalid job id specified\n")
+            self.reads += 1
             return Completed(0, self.scontrol_line(), "")
         if argv[:3] == ["scontrol", "show", "hostnames"]:
             count = int(self.asked.get("--nodes", "0"))
@@ -208,6 +213,7 @@ class FakeSlurm:
             "StartTime": "2026-11-16T10:00:00",
             "EndTime": "2026-11-16T12:00:00",
             **self.recorded,
+            **(self.running_recorded if self.reads > 2 else {}),
         }
         return " ".join(f"{key}={value}" for key, value in fields.items()) + "\n"
 
@@ -230,7 +236,7 @@ class FakeSlurm:
     def answer(self, srun: Srun) -> tuple:
         command = srun.command
         script = Path(command[1]).name if len(command) > 1 else command[0]
-        if script == "nodefacts.py" or (len(command) > 2 and Path(command[2]).name == "nodefacts.py"):
+        if any(Path(word).name == "nodefacts.py" for word in command):
             index = self.nodes.index(srun.node)
             facts = {
                 "fqdn": f"{srun.node}.cluster.example.org",
@@ -293,8 +299,12 @@ class FakeSlurm:
     def client_alive(self, client) -> bool:
         return client not in self.ended_clients
 
-    def end_client(self, client) -> None:
+    def clients_of(self, job):
+        return list(self.stray_clients)
+
+    def end_client(self, client) -> bool:
         self.ended_clients.append(client)
+        return client not in self.unkillable
 
     # -- what the tests read ---------------------------------------------------------------------------------------
 

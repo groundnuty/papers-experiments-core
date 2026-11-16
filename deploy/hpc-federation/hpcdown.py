@@ -39,34 +39,49 @@ class Down:
             return "down: the root is gone already"
         if not self.layout.owned:
             raise RuntimeError(f"the root is not marked as this federation's ({ROOT_MARKER}); nothing stopped")
+        with self.store.lifecycle("down"):  # never beside an up that may be between its state and its sbatch
+            return self.take_down()
+
+    def take_down(self) -> str:
+        """Whatever fails on the way, the held job is cancelled and every client ended before down returns or raises:
+        a failure is reported as unverified, never a reason to leave the job billing."""
         if not self.store.exists():
             remove_tree(self.root)
             return "down: no state file, so up never submitted a job; the root removed"
         state = self.set(lambda s: s.update(phase="stopping"))
         unverified: List[str] = []
-        if self.relay_available() and not hpcrelay.stop(self.slurm.runner, sys.executable, self.root):
-            unverified.append("the fault relay")  # first: no verb may launch a step while the federation goes down
+        if self.relay_available():  # first: no verb may launch a step while the federation goes down
+            try:
+                if not hpcrelay.stop(self.slurm.runner, sys.executable, self.root):
+                    unverified.append("the fault relay")
+            except (RuntimeError, OSError) as error:
+                self.say(f"the fault relay's stop failed: {error}")
+                unverified.append("the fault relay")
         job = state["allocation"].get("job") or self.job_by_name(state)
-        if job is not None:
-            info = self.slurm.job(job)
-            if info is not None and info.get("JobState") == "RUNNING":
+        info = self.slurm.job(job) if job is not None else None
+        if info is not None and info.get("JobName") != state["allocation"]["name"]:
+            self.say(f"job {job} now names another job: ours ended long ago, and that one is not touched")
+            job, info = None, None
+        if info is not None and info.get("JobState") == "RUNNING":
+            try:
                 unverified += self.stop_services(job)
-            elif any(r["workdir"] and r["state"] != "removed" for r in state["services"].values()):
-                self.say(
-                    "the held job had ended: its nodes could not be checked (the next job's sweep removes leftovers)"
-                )
-            if info is not None:
-                self.slurm.cancel(job)
-                self.wait_gone(job)
-        self.end_clients()
+            except (RuntimeError, OSError, ValueError) as error:
+                self.say(f"stopping the services failed ({error}); the held job is cancelled all the same")
+                unverified.append("the services")
+        elif any(r.get("workdir") and r.get("state") != "removed" for r in state["services"].values()):
+            self.say("the held job had ended: its nodes could not be checked (the next job's sweep removes leftovers)")
+        if info is not None:
+            self.slurm.cancel(job)
+            self.wait_gone(job)
+        unverified += self.end_clients(job)
         if unverified:
             self.set(lambda s: s.update(phase="down"))
             raise RuntimeError(
-                f"the held job is cancelled, but {', '.join(unverified)} could not be verified clean; the root and its "
+                f"the held job is gone, but {', '.join(unverified)} could not be verified clean; the root and its "
                 "state are kept: run down again to remove them"
             )
         remove_tree(self.root)
-        return f"down: the held job {job or '(never submitted)'} is gone, and so is the root"
+        return f"down: the held job {job or '(never submitted, or no longer ours)'} is gone, and so is the root"
 
     def job_by_name(self, state: Mapping[str, Any]) -> Optional[str]:
         """The held job by its allocation's name, when its id never reached the state: an exact name holding up's
@@ -94,7 +109,10 @@ class Down:
         if record["workdir"] is None and record["log"] and Path(record["log"]).is_file():
             text = Path(record["log"]).read_text(encoding="utf-8", errors="replace")
             if WORKDIR_LINE.search(text):
-                self.record_workdir(service, text)
+                try:
+                    self.record_workdir(service, text)
+                except RuntimeError as error:  # a directory not as the bundle makes one: never removed by name
+                    self.say(f"{service}: {error}; its step is cancelled instead")
                 record = self.store.read()["services"][service]
         if record["workdir"] is None:
             listed = self.launcher.listed(record["step"]["name"]) if record["step"] else None
@@ -145,7 +163,13 @@ class Down:
                 )
             self.sleep(self.poll_s)
 
-    def end_clients(self) -> None:
-        """End every recorded srun client still running: their steps are gone by now."""
-        for client in self.store.read().get("clients", {}).values():
-            self.slurm.runner.end_client(Client(int(client["pid"]), int(client["start"])))
+    def end_clients(self, job: Optional[str]) -> List[str]:
+        """End every srun client of the job still running on this host, verified: the recorded ones, the relay's when
+        its stop failed, and any other `srun --jobid=<job>` of ours (one spawned just before a crash). Their steps are
+        gone by now. Returns what could not be ended."""
+        state = self.store.read()
+        recorded = [*state.get("clients", {}).values(), *([state["relay"]] if state.get("relay") else [])]
+        clients = {Client(int(c["pid"]), int(c["start"])) for c in recorded}
+        if job is not None:
+            clients |= set(self.slurm.runner.clients_of(job))
+        return [f"the client {c.pid}" for c in sorted(clients) if not self.slurm.runner.end_client(c)]

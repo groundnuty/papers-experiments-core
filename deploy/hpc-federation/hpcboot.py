@@ -25,7 +25,7 @@ import tomllib
 from fedboot import Bootstrap
 from fedcontent import Content
 from fedfacts import facts_of, placeholders, render, write_private
-from fedlayout import Layout
+from fedlayout import Layout, import_storage_name
 from fedlinks import check_after_up
 from fedrest import Rest, RestError
 from fedspec import Service, Space, Spec
@@ -33,6 +33,7 @@ from fedspec import Service, Space, Spec
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
 
 HTTPS_PORT = 8443  # every service's public port: its 443, moved by the port shim
+HPC_STORAGE = "posix-local"  # the posix storage bundle/finish.sh adds to every provider, owned by the job's uid
 ZONE_TIMEOUT_S = 900.0
 PROVIDER_TIMEOUT_S = 900.0
 SUPPORT_TIMEOUT_S = 600.0
@@ -82,14 +83,17 @@ class HpcBootstrap(Bootstrap):
     def __init__(self, rest: Rest, layout: Layout, owner: Tuple[int, int]) -> None:
         super().__init__(rest, layout)
         self.owner = owner  # the uid and gid the storage belongs to (finish.sh adds it as the job user)
-        self._mapped: set = set()  # the providers whose users are mapped already
+        self._mapped: set = set()  # the (provider, storage) pairs whose users are mapped already
 
     def storage_for(self, service: Service, space: Space) -> str:
-        """The provider's one storage: `finish.sh` adds exactly one, whatever its name."""
-        found = self.storages(service)
-        if len(found) != 1:
-            raise RuntimeError(f"{service.name} has {len(found)} storages, not the one posix storage finish.sh adds")
-        return next(iter(found.values()))[0]
+        """The storage a provider supports a space on, found by its name, never by its place in a list (an owner of an
+        imported space has two): the import storage named for the space for its owner, `finish.sh`'s posix storage for
+        every other support."""
+        name = import_storage_name(space.name) if space.imported and service.name == space.owner else HPC_STORAGE
+        found = self.storages(service).get(name)
+        if found is None:
+            raise RuntimeError(f"{service.name} has no storage named {name}, which its support of {space.name} needs")
+        return found[0]
 
     def support(self, service: Service, space: Space, sid: str) -> None:
         """Support the space, then map its default credentials, and every user of the federation, to the job's uid on
@@ -99,9 +103,9 @@ class HpcBootstrap(Bootstrap):
         uid, gid = self.owner
         path = LUMA.format(storage=storage) + f"/posix_compatible/default_credentials/{sid}"
         self.panel(service, "PUT", path, "space credentials", json={"uid": uid, "gid": gid})
-        if service.name not in self._mapped:
+        if (service.name, storage) not in self._mapped:  # each storage of the provider maps the users itself
             self.map_users(service, storage)
-            self._mapped.add(service.name)
+            self._mapped.add((service.name, storage))
 
     def map_users(self, service: Service, storage: str) -> None:
         """Map the admin and every principal to the job's uid on the storage; a mapping already there is read back and
@@ -158,20 +162,23 @@ def rule_margin_s(rendered: str, settle_timeout_s: float) -> int:
     return math.ceil(restore_token_margin_s(settings))
 
 
+def has_hpc_backend() -> bool:
+    """Whether this core's `[faults]` loader knows the HPC backend (M4): its settings carry a `backend`."""
+    return "backend" in {item.name for item in fields(FaultSettings)}
+
+
 def least_margin_s(path: Path, rendered: str, settle_timeout_s: float) -> int:
     """The least `[tokens] margin_s` the platform layer's own loader accepts for the platform file at `path`, written
     with a provisional margin no rule refuses: `load_faults` reads it as a campaign would, and its rule gives the least
-    (so a term the loader adds, or a measured stop bound, moves it with no change here). A core whose loader refuses
-    this `[faults]` for another reason has no HPC backend yet; the rule over the keys it knows stands in."""
-    from expcore.config.loading import ConfigError
+    (so a term the loader adds, or a measured stop bound, moves it with no change here). Its refusal of the file fails
+    up: a platform.toml the campaign would refuse is never reported ready. Only a core without the HPC backend, or a
+    file without `[faults]`, takes the restore's rule over the keys it knows."""
+    if not has_hpc_backend() or "faults" not in tomllib.loads(rendered):
+        return rule_margin_s(rendered, settle_timeout_s)
     from expcore_onedata.config import load_platform
     from expcore_onedata.fault_settings import load_faults
 
-    try:
-        settings = load_faults(path, load_platform(path))
-    except ConfigError:
-        return rule_margin_s(rendered, settle_timeout_s)
-    return math.ceil(restore_token_margin_s(settings))
+    return math.ceil(restore_token_margin_s(load_faults(path, load_platform(path))))
 
 
 def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int) -> Dict[str, str]:

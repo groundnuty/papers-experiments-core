@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
+sys.dont_write_bytecode = True  # nothing of the checkout or the venv is written on the login node or a node
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 for _path in (HERE, REPO / "deploy" / "compose-federation"):  # python -I leaves the script's directory out of sys.path

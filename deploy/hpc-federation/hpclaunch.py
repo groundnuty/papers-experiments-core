@@ -22,7 +22,8 @@ import hpcstate
 from hpcsettings import HpcSettings, Site
 from hpcslurm import Completed, Slurm, Step, allowlist
 
-LOCK = "hpc-federation.lock"
+LOCK = "hpc-federation.lock"  # held around each change of the state file
+LIFECYCLE = "hpc-federation.lifecycle.lock"  # held for a whole up or down
 STEP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
 
@@ -46,6 +47,21 @@ class StateStore:
         descriptor = os.open(self.root / LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
+    @contextlib.contextmanager
+    def lifecycle(self, what: str) -> Iterator[None]:
+        """Hold the root's lifecycle lock for a whole `up` or `down`, never waiting for it: an `up` between its state
+        and its `sbatch` must not meet a `down` that finds no job yet and removes the root. The kernel lets it go with a
+        process that dies. The service verbs do not take it."""
+        descriptor = os.open(self.root / LIFECYCLE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise hpcstate.StateError(f"another up or down of this root is running; {what} refused") from None
             yield
         finally:
             os.close(descriptor)

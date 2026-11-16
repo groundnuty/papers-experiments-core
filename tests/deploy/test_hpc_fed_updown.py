@@ -50,6 +50,7 @@ class Rig:
         self.driver.slurm.poll_s = 0.0
         self.core_calls = []
         self.driver.core = self.core
+        self.driver.relay_available = lambda: False  # a test of the relay says so; M4's module may be importable
 
     def core(self, layout, owner, values):
         self.core_calls.append((layout, owner, values))
@@ -312,8 +313,8 @@ def test_with_core_step_the_core_runs_as_a_control_step_on_the_zones_node(hpc, t
     assert rig.up().startswith("core: the link check passed")
     core = next(s for s in rig.fake.sruns if "hpcfed.py" in " ".join(s.command))
     assert core.node == "node01"
-    assert core.command[:2] == ["/shared/venv/bin/python", "-I"]
-    assert core.command[3:] == ["--layout", str(step_layout.resolve()), "--root", str(rig.root), "core"]
+    assert core.command[:3] == ["/shared/venv/bin/python", "-I", "-B"]  # isolated, and no bytecode written
+    assert core.command[4:] == ["--layout", str(step_layout.resolve()), "--root", str(rig.root), "core"]
     assert rig.core_calls == []
 
 
@@ -477,3 +478,87 @@ def test_a_core_without_the_relay_starts_and_stops_none(hpc, tmp_path, site):
     assert "fault relay: none" in rig.up()
     rig.driver.down()
     assert rig.fake.relay_calls == []
+
+
+# -- what down must survive (Codex round 1) ----------------------------------------------------------------------
+
+
+def test_down_never_touches_a_job_whose_id_now_names_another_job(hpc, tmp_path, site):
+    """O57: Slurm reuses job ids: a recorded id whose job now carries another name is not ours, so down tears nothing
+    down and cancels nothing, and removes the root (ours ended long ago)."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    rig.fake.recorded["JobName"] = "someone-elses-job"
+    rig.fake.sruns.clear()
+    rig.driver.down()
+    assert rig.fake.cancelled == []
+    assert rig.fake.sruns == []
+    assert not rig.root.exists()
+
+
+def test_down_cancels_the_job_even_when_stopping_the_services_fails(hpc, tmp_path, site):
+    """O57: a zone whose log names a work directory the driver refuses (not under the node's tmpfs) fails up; down
+    still cancels the held job by its id and reports the zone unverified, keeping the root."""
+    fake = FakeSlurm()
+    real = fake.spawn
+
+    def elsewhere(argv, client_log):
+        client = real(argv, client_log)
+        log = Path(fake.sruns[-1].output)
+        log.write_text("hpcop: work directory /scratch/hpcop-oz.abcdef\nhpcop: OK zone\n", encoding="utf-8")
+        return client
+
+    fake.spawn = elsewhere
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(hpc.state.StateError):
+        rig.up()
+
+    def broken(argv, timeout):
+        if argv[:2] == ["squeue", "-s"]:
+            raise hpc.slurm.SlurmError("squeue failed")
+        return FakeSlurm.run(fake, argv, timeout)
+
+    fake.run = broken
+    with pytest.raises(RuntimeError, match="could not be verified clean"):
+        rig.driver.down()
+    assert fake.cancelled[-1] == "4242"
+    assert rig.root.exists()
+
+
+def test_a_running_job_larger_than_asked_is_cancelled_before_any_step(hpc, tmp_path, site):
+    """O57: the read-back runs again once the job runs: a scheduler that allocated more cores than the pending
+    request showed is caught, and the job cancelled by its id before any step bills on it."""
+    fake = FakeSlurm(running_recorded={"NumCPUs": "36"})
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(hpc.slurm.SlurmError, match="NumCPUs"):
+        rig.up()
+    assert fake.cancelled == ["4242"]
+    assert fake.sruns == []
+
+
+def test_down_ends_a_client_that_was_never_recorded_and_reports_one_that_survives(hpc, tmp_path, site):
+    """O57: down ends every srun client of the job on this host, recorded or not (one spawned just before a crash),
+    each verified gone; one that survives is reported and the root kept."""
+    from hpcslurm import Client
+
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    stray = Client(31337, 5)
+    rig.fake.stray_clients = [stray]
+    rig.fake.unkillable = [stray]
+    with pytest.raises(RuntimeError, match="the client 31337"):
+        rig.driver.down()
+    assert stray in rig.fake.ended_clients
+    assert rig.fake.cancelled == ["4242"]
+
+
+def test_down_is_refused_while_an_up_of_the_root_runs(hpc, tmp_path, site):
+    """O57: up holds the root's lifecycle lock from its state to its end, so a down between up's state and its sbatch
+    (which would find no job and remove the root) is refused instead."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.prepare_root()
+    with rig.driver.store.lifecycle("up"):
+        other = Rig(hpc, tmp_path, site, fake=rig.fake)
+        with pytest.raises(hpc.state.StateError, match="another up or down"):
+            other.driver.down()
+    assert rig.root.exists()

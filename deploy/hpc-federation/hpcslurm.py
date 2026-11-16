@@ -87,14 +87,36 @@ class Process:
         )
 
 
-def proc_start(pid: int) -> Optional[int]:
-    """Field 22 of /proc/<pid>/stat (the start tick), or None when the process is gone."""
+def proc_start(pid: int, proc: str = "/proc") -> Optional[int]:
+    """Field 22 of /proc/<pid>/stat (the start tick), or None when the process is gone or a zombie."""
     try:
-        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        with open(f"{proc}/{pid}/stat", encoding="ascii") as handle:
             text = handle.read()
     except OSError:
         return None
-    return int(text[text.rindex(")") + 2 :].split()[19])
+    fields = text[text.rindex(")") + 2 :].split()
+    return None if fields[0] in ("Z", "X") else int(fields[19])
+
+
+def clients_of(job: str, proc: str = "/proc") -> List[Client]:
+    """This user's srun clients on this host for the job: every `srun` process of our uid whose argv names
+    `--jobid=<job>`, recorded or not (a client spawned just before a crash, say). Only this job's are ever named."""
+    found = []
+    for entry in os.listdir(proc):
+        if not entry.isdigit():
+            continue
+        try:
+            if os.stat(f"{proc}/{entry}").st_uid != os.getuid():
+                continue
+            with open(f"{proc}/{entry}/cmdline", "rb") as handle:
+                argv = handle.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == b"srun" and f"--jobid={job}".encode() in argv:
+            start = proc_start(int(entry), proc)
+            if start is not None:
+                found.append(Client(int(entry), start))
+    return found
 
 
 class Runner:
@@ -140,10 +162,21 @@ class Runner:
     def client_alive(self, client: Client) -> bool:
         return client.start >= 0 and proc_start(client.pid) == client.start
 
-    def end_client(self, client: Client) -> None:
-        if self.client_alive(client):
+    def clients_of(self, job: str) -> List[Client]:
+        return clients_of(job)
+
+    def end_client(self, client: Client, grace_s: float = 10.0) -> bool:
+        """End a client of ours, verified: SIGTERM, then SIGKILL after `grace_s`, each only while the process is still
+        the one recorded (pid and start tick). True once it is gone."""
+        for sig, wait_s in ((signal.SIGTERM, grace_s), (signal.SIGKILL, 5.0)):
+            if not self.client_alive(client):
+                return True
             with contextlib.suppress(ProcessLookupError):
-                os.kill(client.pid, signal.SIGTERM)
+                os.kill(client.pid, sig)
+            deadline = time.monotonic() + wait_s
+            while self.client_alive(client) and time.monotonic() < deadline:
+                time.sleep(0.2)
+        return not self.client_alive(client)
 
 
 @dataclass(frozen=True)
@@ -408,7 +441,8 @@ class Slurm:
         for line in done.stdout.splitlines():
             parts = line.split("|")
             if len(parts) == 3 and parts[1] == name and re.fullmatch(r"[0-9]+:[0-9]+", parts[2]):
-                return int(parts[2].split(":")[0])
+                status, killed = (int(part) for part in parts[2].split(":"))
+                return 128 + killed if killed else status  # a step a signal ended never reads as a success
         return None
 
     def _finish(self, process: Process, step: Step, timeout_s: float) -> Completed:
@@ -440,7 +474,16 @@ class Slurm:
     def control_pipe(self, first: Step, second: Step, timeout_s: float) -> Tuple[Completed, Completed]:
         """`first | second`, two control steps joined by a pipe of this process: a payload that never touches a file."""
         left, right = self.runner.pipe(first.argv(), second.argv())
-        return self._finish(left, first, timeout_s), self._finish(right, second, timeout_s)
+        results, failure = [], None
+        for process, step in ((left, first), (right, second)):  # both, whatever the first does
+            try:
+                results.append(self._finish(process, step, timeout_s))
+            except (SlurmError, OSError) as error:
+                process.kill()
+                failure = failure or error
+        if failure is not None:
+            raise failure
+        return results[0], results[1]
 
     def service(self, step: Step, client_log: str) -> Client:
         """Launch a service step detached; it holds its service for the step's life."""

@@ -5,7 +5,7 @@ Nothing here reaches a cluster: Slurm is the fake of hpc_fed_support."""
 import json
 import math
 import os
-from dataclasses import fields, replace
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -193,23 +193,25 @@ def test_the_token_margin_is_the_least_the_loader_of_this_core_accepts(hpc, tmp_
         return loaded
 
     monkeypatch.setattr(fault_settings, "load_faults", load_faults)
+    monkeypatch.setattr(hpc.boot, "has_hpc_backend", lambda: True)
     document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
     assert seen == [tmp_path / "platform.toml"]
     assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(loaded))
 
 
-def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_settle_and_poll(hpc, tmp_path, make_ca):
+def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_settle_and_poll(
+    hpc, tmp_path, make_ca, monkeypatch
+):
     """O57: a core whose loader cannot read the HPC [faults] (no backend "hpc" yet) still gets a margin: the restore's
     rule over the keys it knows, with the HPC settle time (stop bound + 60 s) and poll (10 s)."""
     import tomllib
 
+    monkeypatch.setattr(hpc.boot, "has_hpc_backend", lambda: False)
     document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
     rule = FaultSettings(
         file=Path("p"), sanctioned=False, journal=Path("j"), compose_file=Path("c"), services={},
         settle_timeout_s=750.0, poll_s=10.0,
     )  # fmt: skip
-    if "stop_bound_s" in {f.name for f in fields(FaultSettings)}:
-        pytest.skip("this core's loader reads the HPC backend: the loader's own rule applies (the test above)")
     assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(rule))
 
 
@@ -380,3 +382,104 @@ def test_a_cancel_takes_one_job_id_and_nothing_else(hpc):
             slurm.cancel(bad)
     with pytest.raises(hpc.slurm.SlurmError):
         slurm.cancel_step("12")
+
+
+def test_a_platform_the_hpc_loader_refuses_fails_up_instead_of_passing(hpc, tmp_path, make_ca, monkeypatch):
+    """O57: with a core whose loader knows the HPC backend, its refusal of the rendered [faults] fails up: a
+    platform.toml the campaign would refuse at load is never reported ready."""
+    import expcore_onedata.fault_settings as fault_settings
+    from expcore.config.loading import ConfigError
+
+    def refuse(path, config):
+        raise ConfigError("platform.toml: [faults]: stop_bound_s is too small")
+
+    monkeypatch.setattr(fault_settings, "load_faults", refuse)
+    monkeypatch.setattr(hpc.boot, "has_hpc_backend", lambda: True)
+    with pytest.raises(ConfigError, match="stop_bound_s"):
+        rendered_pilot(hpc, tmp_path, make_ca)
+
+
+def test_a_step_a_signal_ended_never_reads_as_a_success(hpc):
+    """O57: the accounting's ExitCode is status:signal; a step killed by a signal (0:9) reads as 128 + 9."""
+    fake = FakeSlurm()
+    rows = "4242.3|hpcop-x-core|0:9\n4242.4|hpcop-x-check|0:0\n4242.5|hpcop-x-mint|2:0\n"
+    fake.run = lambda argv, timeout: hpc.slurm.Completed(0, rows, "") if argv[0] == "sacct" else None
+    slurm = hpc.slurm.Slurm(fake)
+    assert slurm.step_status("4242", "hpcop-x-core") == 137
+    assert slurm.step_status("4242", "hpcop-x-check") == 0
+    assert slurm.step_status("4242", "hpcop-x-mint") == 2
+
+
+def test_a_pipe_whose_first_step_fails_still_ends_the_second(hpc):
+    """O57: a token's mint that times out never leaves the delivery's client behind: both ends are finished, the
+    second killed, and the first failure raised."""
+    from hpcslurm import Completed
+
+    fake = FakeSlurm()
+    left = FakeProcess(Completed(None, "", ""), hangs=True)
+    right = FakeProcess(Completed(None, "", ""), hangs=True)
+    fake.pipe = lambda first, second: (left, right)
+    clock = iter(range(0, 10**6, 10))
+    slurm = hpc.slurm.Slurm(fake, poll_s=0.0, sleep=lambda s: None, clock=lambda: next(clock))
+    slurm.steps = lambda job: {"hpcop-x-mint": "4242.7", "hpcop-x-deliver": "4242.8"}
+    first = hpc.slurm.Step("4242", "node01", "hpcop-x-mint", 1, 1024, (), ("true",))
+    second = hpc.slurm.Step("4242", "node02", "hpcop-x-deliver", 1, 1024, (), ("true",))
+    with pytest.raises(TimeoutError):
+        slurm.control_pipe(first, second, 0.0)
+    assert left.killed
+    assert right.killed
+    assert fake.cancelled == ["4242.7", "4242.8"]
+
+
+def test_the_real_runner_pipes_waits_kills_and_ends_a_detached_client(hpc, tmp_path):
+    """O57: the login node's Runner, on local commands: a pipe carries its payload, a bound that passes leaves the
+    process for a kill, a detached client is alive by pid and start tick, and its end is verified."""
+    runner = hpc.slurm.Runner()
+    left, right = runner.pipe(["printf", "x"], ["cat"])
+    assert left.wait(10)
+    assert right.wait(10)
+    assert right.result().stdout == "x"
+    slow = runner.start(["sleep", "30"])
+    assert not slow.wait(0.1)
+    slow.kill()
+    assert slow.result().returncode is not None
+    client = runner.spawn(["sleep", "30"], str(tmp_path / "client.log"))
+    assert runner.client_alive(client)
+    assert oct((tmp_path / "client.log").stat().st_mode & 0o777) == "0o600"
+    assert runner.end_client(client, grace_s=5.0)
+    assert not runner.client_alive(client)
+
+
+def test_the_clients_of_a_job_are_this_users_srun_processes_naming_it(hpc, tmp_path):
+    """O57: down finds an unrecorded client by its argv: an srun of our uid naming --jobid=<job>, nothing else."""
+    proc = tmp_path / "proc"
+
+    def process(pid, argv):
+        (proc / str(pid)).mkdir(parents=True)
+        (proc / str(pid) / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+        (proc / str(pid) / "stat").write_text(f"{pid} (x) S " + " ".join(["0"] * 18) + " 777 0\n", encoding="ascii")
+
+    process(101, ["/usr/bin/srun", "--jobid=4242", "--exact", "-J", "hpcop-x-run-1"])
+    process(102, ["/usr/bin/srun", "--jobid=4243", "--exact"])
+    process(103, ["/usr/bin/sleep", "--jobid=4242"])
+    found = hpc.slurm.clients_of("4242", str(proc))
+    assert found == [hpc.slurm.Client(101, 777)]
+
+
+def test_storages_are_found_by_name_and_each_maps_its_users(hpc):
+    """O57: an owner of an imported space has two storages: its support of that space names the import storage, every
+    other support finish.sh's posix storage, by name, never by place in a list."""
+    import fedspec
+
+    spec = fedspec.load_spec(LAYOUT)
+    boot = hpc.boot.HpcBootstrap.__new__(hpc.boot.HpcBootstrap)
+    boot.storages = lambda service: {"import-alpha-space": ("st-import", {}), "posix-local": ("st-posix", {})}
+    owner = spec.provider("larch")
+    plain = spec.space("alpha-space")
+    imported = replace(plain, imported=object())
+    assert boot.storage_for(owner, plain) == "st-posix"
+    assert boot.storage_for(owner, imported) == "st-import"
+    assert boot.storage_for(spec.provider("aspen"), imported) == "st-posix"
+    boot.storages = lambda service: {"posix": ("st-other", {})}
+    with pytest.raises(RuntimeError, match="no storage named posix-local"):
+        boot.storage_for(owner, plain)

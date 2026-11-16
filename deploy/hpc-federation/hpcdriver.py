@@ -188,6 +188,10 @@ class Driver(Down):
     def up(self, site: Site) -> str:
         self.preflight(site)
         self.prepare_root()
+        with self.store.lifecycle("up"):  # a down cannot run between the state and the sbatch
+            return self.bring_up(site)
+
+    def bring_up(self, site: Site) -> str:
         state = self.store.create(self.initial_state(site))
         asked = self.allocation(state, site)
         job = self.slurm.submit(asked)
@@ -195,11 +199,14 @@ class Driver(Down):
         self.say(f"held job {job} submitted ({asked.nodes} nodes); reading back what Slurm recorded")
         readback = self.slurm.readback(job, asked)
         self.set(lambda s: s["allocation"].update(readback=readback))
-        info = self.slurm.wait_running(job, self.timeouts["queue"])
+        self.slurm.wait_running(job, self.timeouts["queue"])
+        # Once more on the running job: the scheduler may allocate more than a pending request showed.
+        readback = self.slurm.readback(job, asked)
+        info = self.slurm.job(job) or {}
         nodes = self.slurm.hostnames(info.get("NodeList", ""))
         if len(nodes) != asked.nodes:
             raise SlurmError(f"the held job runs on {len(nodes)} node(s), not the {asked.nodes} asked for")
-        self.set(lambda s: self.place(s, nodes, info))
+        self.set(lambda s: (self.place(s, nodes, info), s["allocation"].update(readback=readback)))
         self.node_facts()
         self.zone_up()
         self.providers_up()
@@ -232,7 +239,7 @@ class Driver(Down):
         state = self.store.read()
         site, prefix = Site.from_json(state["site"]), state["allocation"]["name"]
         for role in state["roles"]:
-            argv = [site.node_python, "-I", str(BUNDLE / "nodefacts.py")]
+            argv = [site.node_python, "-I", "-B", str(BUNDLE / "nodefacts.py")]
             node = state["services"][role]["node"]
             done = self.launcher.control(node, argv, name=f"{prefix}-{role}-facts", timeout_s=self.timeouts["step"])
             owner = load_owner(done.stdout) if done.returncode == 0 else None
@@ -388,7 +395,7 @@ class Driver(Down):
             return self.core_here()
         state = self.store.read()
         zone, site = state["services"]["zone"], Site.from_json(state["site"])
-        argv = [site.core_python, "-I", str(HERE / "hpcfed.py"), "--layout", str(self.layout_path)]
+        argv = [site.core_python, "-I", "-B", str(HERE / "hpcfed.py"), "--layout", str(self.layout_path)]
         argv += ["--root", str(self.root), "core"]
         name = f"{state['allocation']['name']}-core"
         done = self.launcher.control(zone["node"], argv, name=name, timeout_s=self.timeouts["core"])
