@@ -170,7 +170,8 @@ def federation(shard: Shard) -> dict[str, Any]:
     The state's `sandbox` record says how the sandbox node was placed: `het`, a component of the federation's own
     heterogeneous job (the step needs `--het-group`, or it lands in component 0, the services' node shape), or
     `separate`, a held job of its own (its `job`). A state with no `sandbox` record is the federation's job alone, its
-    node named by the manifest. Either way the manifest's `sandbox_node`, when given, must be the record's."""
+    node the `sandbox` role `up` placed there (`services.sandbox`), or the manifest's. Either way the manifest's
+    `sandbox_node`, when given, must be the state's."""
     try:
         state = json.loads((shard.root / STATE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -195,7 +196,11 @@ def federation(shard: Shard) -> dict[str, Any]:
             job, name = record.get("job"), record.get("name") or name
             if not _job_id(job):
                 raise ShardsError(f"shard {shard.label}: its separate sandbox has no held job on record")
-    node = (record or {}).get("node") or shard.node
+    if record is not None:  # the record's own node: never one placed in another job, nor the manifest's alone
+        node = record.get("node")
+    else:  # the federation's own job: the sandbox role its up placed there (`services.sandbox`), or the manifest's
+        held = (state.get("services") or {}).get("sandbox") or {}
+        node = (held.get("node") if held.get("kind") == "sandbox" else None) or shard.node
     if not isinstance(node, str) or not node:
         raise ShardsError(f"shard {shard.label}: no sandbox node: the state file names none and the manifest neither")
     if shard.node and node != shard.node:
