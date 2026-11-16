@@ -87,6 +87,7 @@ from expcore_onedata.sandbox.api import (
 )
 from expcore_onedata.sandbox.cells import OUTPUT_CAP_BYTES as CELL_OUTPUT_CAP_BYTES
 from expcore_onedata.sandbox.cells import CellRunner
+from expcore_onedata.sandbox.completion import ExecIncomplete
 from expcore_onedata.sandbox.containers import (
     GATE_CA_PATH,
     GATE_TOKEN_PATH,
@@ -986,13 +987,23 @@ class DockerSandbox:
 
         A cell's limit is a hard deadline (deadline.py, O34): a process of the cell that outlives its kill has the
         mount aborted from the sidecar (`_abort_mount`), or the sandbox stopped (`_stop_at_deadline`), and the run is
-        over: every later `exec` and the collection of a stopped run raise `InfraError("cell_unkillable")`."""
+        over: every later `exec` and the collection of a stopped run raise `InfraError("cell_unkillable")`.
+
+        An exec not known to have completed, its program not delivered whole or its exit not recorded, that no timeout
+        or kill explains, raises `completion.ExecIncomplete` (kind `sandbox`) naming why, a harness step's recorded
+        first with its cause (O55): never a cell that ran and printed nothing."""
         self._refuse_if_ended()
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
         self._enter(record)
         try:
-            res = self._cells.run(code, timeout_s, record=record)
+            try:
+                res = self._cells.run(code, timeout_s, record=record)
+            except ExecIncomplete as incomplete:  # the gate's refusals and a step's record are taken all the same
+                incomplete.result.gate_refusals = self._new_refusals()
+                if not record:
+                    self._record_step(incomplete.result, incomplete=incomplete.cause)
+                raise
             res.gate_refusals = self._new_refusals()
             if not record:
                 self._record_step(res)
@@ -1082,9 +1093,10 @@ class DockerSandbox:
         new, self._refusals_seen = tuple(seen[self._refusals_seen :]), len(seen)
         return new
 
-    def _record_step(self, res: ExecResult) -> None:
+    def _record_step(self, res: ExecResult, *, incomplete: str | None = None) -> None:
         """A harness step's record (O24), with the host killer's kills it met, read now so no cell of the agent's takes
-        them (None when its journal could not be read)."""
+        them (None when its journal could not be read), what its completion record showed (`exec_check`, O55), and, for
+        one that did not complete, why (`incomplete`)."""
         steps = self._meta.setdefault("harness_steps", [])
         steps.append(
             {
@@ -1097,6 +1109,8 @@ class DockerSandbox:
                 "gate_refusals": list(res.gate_refusals),
                 **({"output_cut": res.output_cut} if res.output_cut else {}),  # only a step that was cut (O43)
                 "earlyoom_kills": self._cells.step_earlyoom(),
+                "exec_check": res.exec_check,
+                **({"incomplete": incomplete} if incomplete else {}),  # only a step that did not complete (O55)
             }
         )
 

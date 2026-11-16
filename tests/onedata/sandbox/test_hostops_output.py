@@ -170,15 +170,15 @@ def test_o42_a_command_that_does_not_die_after_its_kill_is_given_up_on_and_never
 def test_o42_the_docker_host_runs_every_command_through_the_bounded_runner(monkeypatch):
     seen = []
 
-    def bounded(argv, timeout_s, *, env=None, input=None, output_cap=None):
-        seen.append((list(argv), timeout_s, output_cap))
+    def bounded(argv, timeout_s, *, env=None, input=None, output_cap=None, marker=None):
+        seen.append((list(argv), timeout_s, output_cap, marker))
         return CmdResult(0, "ok")
 
     monkeypatch.setattr(hostops, "run_bounded", bounded)
     host = hostops.DockerHost()
-    assert host.docker("ps", output_cap=7, timeout=9).stdout == "ok"
+    assert host.docker("ps", output_cap=7, timeout=9, marker=b"\x1em ").stdout == "ok"
     assert host.run(["echo", "x"], 3).stdout == "ok"
-    assert seen == [(["docker", "ps"], 9, 7), (["echo", "x"], 3, None)]
+    assert seen == [(["docker", "ps"], 9, 7, b"\x1em "), (["echo", "x"], 3, None, None)]
 
 
 def test_o43_the_cap_applies_to_a_result_the_same_way_whoever_made_it():

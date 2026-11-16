@@ -48,19 +48,28 @@ class ToolOutput:
     `source_truncated` is for the data source's own limit (L07): True when the source hit its row or size limit, so
     the result may be cut by the source; False when the provider checked and it was not; None when the provider says
     nothing. The record keeps it apart from the flag for the harness's output cap, which the loop sets on what it cut.
+
+    `exec_check` is what a code tool verified of the exec that ran the call's program (O55): `source_whole`, whether
+    the program arrived whole; `exit_status`, the status its completion record saw; `nonce_matched`, whether a record
+    of that exec came back. The record keeps it on the call as given (`tool_calls[i].exec_check`); None, the default,
+    for a tool that runs no program, and the call then has none.
     """
 
     text: str
     is_error: bool = False
     error_class: str | None = None
     source_truncated: bool | None = None
+    exec_check: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        """Refuse an error class on a result that is not an error, and a source flag that is not a boolean."""
+        """Refuse an error class on a result that is not an error, a source flag that is not a boolean, and an exec
+        check that is not an object."""
         if self.error_class is not None and not self.is_error:
             raise ValueError("error_class is only for a result with is_error set")
         if self.source_truncated is not None and not isinstance(self.source_truncated, bool):
             raise ValueError(f"source_truncated must be True, False or None, not {self.source_truncated!r}")
+        if self.exec_check is not None and not isinstance(self.exec_check, Mapping):
+            raise ValueError(f"exec_check must be an object or None, not {type(self.exec_check).__name__}")
 
 
 # The kinds of wait on infrastructure, a closed vocabulary. Each is time the agent neither controls nor causes: the

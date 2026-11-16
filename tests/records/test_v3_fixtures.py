@@ -360,3 +360,28 @@ def test_l17_the_sixth_fixture_pins_a_declared_tool_server_call_bound_and_each_s
         assert "tool_server_tools" not in held.agent_config
         assert all("elapsed_s" not in call for call in held.tool_calls)
         assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_o55_the_seventh_fixture_pins_each_code_cells_exec_check_and_a_call_without_one():
+    """O55 and R03: the seventh merge point added the optional `exec_check` of a tool call, what a code tool verified of
+    the exec that ran the call's program. Its fixture, written by the code of that merge on the record tests' fake
+    clock, holds a code tool's three calls, a verified success that printed nothing, a verified failure with its exit
+    status and a cell its time limit ended, with no completion record (nothing known, no nonce matched), and a call of
+    another tool, which has none. It validates and replays to its own bytes (the parametrized tests above); the six
+    fixtures before it hold none, and a record without it gains nothing."""
+    seventh = [p for p in FIXTURES if p.name.startswith("07-")]
+    assert [p.name for p in seventh] == ["07-exec-check.json"]
+    record = load_record(seventh[0])
+    assert [(c["name"], c["status"], c.get("exec_check")) for c in record.tool_calls] == [
+        ("python", "ok", {"source_whole": True, "exit_status": 0, "nonce_matched": True}),
+        ("python", "error", {"source_whole": True, "exit_status": 1, "nonce_matched": True}),
+        ("python", "error", {"source_whole": None, "exit_status": None, "nonce_matched": False}),
+        ("echo", "ok", None),
+    ]
+    assert "exec_check" not in record.tool_calls[3]
+    assert list(record.tool_calls[0])[-2:] == ["elapsed_s", "exec_check"]
+    assert replay_record(record).dumps().encode("utf-8") == seventh[0].read_bytes()
+    for earlier in FIXTURES[:6]:
+        held = load_record(earlier)
+        assert all("exec_check" not in call for call in held.tool_calls)
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
