@@ -155,7 +155,8 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     assert owner == (5001, 5001)
     assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
     command = json.loads(values["hpc_command"])
-    assert command[1:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
+    assert command[1] == "-B"
+    assert command[2:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
 
 
 def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancels_only_its_job(hpc, tmp_path, site):
@@ -437,7 +438,8 @@ def test_up_starts_the_fault_relay_last_with_no_environment_but_its_own_and_wait
     assert rig.up().endswith("fault relay: serving")
     (argv,) = rig.fake.relays
     cut = argv.index("-m")
-    assert argv[:cut] == ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "HOME=/home/someone", "LC_ALL=C", sys.executable]
+    environment = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "HOME=/home/someone", "LC_ALL=C"]
+    assert argv[:cut] == [*environment, sys.executable, "-B"]
     command = rig.state()["command"]
     assert argv[cut:] == ["-m", "expcore_onedata.fault_relay", "serve", "--root", str(rig.root), "--", *command]
     assert rig.fake.relay_calls[:2] == ["serve", "alive"]
@@ -454,6 +456,7 @@ def test_an_up_whose_relay_never_beats_fails_and_ends_the_relay(hpc, tmp_path, s
     with pytest.raises(RuntimeError, match="did not beat"):
         rig.up()
     assert [c.pid for c in rig.fake.ended_clients] == [9999]
+    assert rig.state()["relay"]["pid"] == 9999  # recorded at once: down ends it if this end failed
 
 
 def test_down_stops_the_fault_relay_before_anything_else(hpc, tmp_path, site):
@@ -467,7 +470,7 @@ def test_down_stops_the_fault_relay_before_anything_else(hpc, tmp_path, site):
     with pytest.raises(RuntimeError, match="the fault relay"):
         rig.driver.down()
     first = rig.fake.calls[0]
-    assert first[1:4] == ["-m", "expcore_onedata.fault_relay", "stop"]
+    assert first[1:5] == ["-B", "-m", "expcore_onedata.fault_relay", "stop"]
     assert rig.fake.cancelled == ["4242"]
 
 

@@ -190,9 +190,9 @@ class FakeSlurm:
             return Completed(0, "", "")
         if tool == "sacct":
             return Completed(0, "", "")
-        if argv[1:3] == ["-m", "expcore_onedata.fault_relay"]:
-            self.relay_calls.append(argv[3])
-            return Completed(self.relay_rc.get(argv[3], 0), "", "")
+        if argv[1:4] == ["-B", "-m", "expcore_onedata.fault_relay"]:
+            self.relay_calls.append(argv[4])
+            return Completed(self.relay_rc.get(argv[4], 0), "", "")
         raise AssertionError(f"an unexpected command: {argv}")
 
     def scontrol_line(self) -> str:

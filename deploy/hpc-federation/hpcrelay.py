@@ -48,22 +48,28 @@ def start(
     log: Path,
     environ: Mapping[str, str],
     *,
+    record: Callable[[object], None],
     clock: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> object:
-    """Start the relay detached (one per root: it takes a lock) and wait for its heartbeat; return its client."""
-    argv = [ENV, "-i", *relay_environment(environ), python, "-m", RELAY, "serve", "--root", str(root), "--", *command]
-    client = runner.spawn(argv, str(log))
+    """Start the relay detached (one per root: it takes a lock), `record` its client at once (so `down` can end it
+    whatever happens next), and wait for its heartbeat; return its client."""
+    serve = [python, "-B", "-m", RELAY, "serve", "--root", str(root), "--", *command]
+    client = runner.spawn([ENV, "-i", *relay_environment(environ), *serve], str(log))
+    record(client)
     deadline = clock() + ALIVE_TIMEOUT_S
     while True:
-        if runner.run([python, "-m", RELAY, "alive", "--root", str(root)], ALIVE_TIMEOUT_S).returncode == 0:
+        if runner.run([python, "-B", "-m", RELAY, "alive", "--root", str(root)], ALIVE_TIMEOUT_S).returncode == 0:
             return client
         if clock() >= deadline:
-            runner.end_client(client)
-            raise RuntimeError(f"the fault relay did not beat within {ALIVE_TIMEOUT_S:.0f} s (its log: {log.name})")
+            ended = runner.end_client(client)
+            state = "it was ended" if ended else "it could not be ended: down ends it"
+            raise RuntimeError(
+                f"the fault relay did not beat within {ALIVE_TIMEOUT_S:.0f} s ({state}; its log: {log.name})"
+            )
         sleep(2.0)
 
 
 def stop(runner: Runner, python: str, root: Path) -> bool:
     """Stop the relay of this root; True once no heartbeat beats (or none ever did)."""
-    return runner.run([python, "-m", RELAY, "stop", "--root", str(root)], STOP_TIMEOUT_S).returncode == 0
+    return runner.run([python, "-B", "-m", RELAY, "stop", "--root", str(root)], STOP_TIMEOUT_S).returncode == 0

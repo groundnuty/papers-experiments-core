@@ -221,11 +221,14 @@ class Driver(Down):
             return f"fault relay: none, this core has no {hpcrelay.RELAY}"
         state = self.store.read()
         log = Path(state["site"]["logs"]) / f"{state['allocation']['name']}-fault-relay.log"
-        client = hpcrelay.start(
+
+        def record(client: Client) -> None:
+            self.set(lambda s: s.update(relay={"pid": client.pid, "start": client.start, "log": str(log)}))
+
+        hpcrelay.start(
             self.slurm.runner, state["command"][0], self.root, state["command"], log, self.environ,
-            clock=self.clock, sleep=self.sleep,
+            record=record, clock=self.clock, sleep=self.sleep,
         )  # fmt: skip
-        self.set(lambda s: s.update(relay={"pid": client.pid, "start": client.start, "log": str(log)}))
         return "fault relay: serving"
 
     def place(self, state: Dict[str, Any], nodes: List[str], info: Mapping[str, str]) -> None:

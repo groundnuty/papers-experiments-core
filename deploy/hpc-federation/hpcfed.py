@@ -90,7 +90,7 @@ def make_driver(layout_path: Path, root: Optional[str], runner: Optional[Runner]
     settings = load_settings(spec.hpc)
     slurm = Slurm(runner or Runner())
     store = StateStore(layout.root)
-    command = [sys.executable, str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root", str(layout.root)]
+    command = [sys.executable, "-B", str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root", str(layout.root)]
     return Driver(
         layout_path=layout_path,
         layout=layout,
