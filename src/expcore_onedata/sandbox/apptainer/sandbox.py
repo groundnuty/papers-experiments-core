@@ -663,6 +663,18 @@ class ApptainerSandbox:
         could not be read (`expcore.egress.EgressSource`)."""
         return self.collection.egress_bytes
 
+    def mount_watch_log(self) -> bytes | None:
+        """The mount guard's log (`expcore.mountguard.MountWatchSource`), its window closed first (O60); None without a
+        mount helper that keeps one. Read after the run's cells have ended: the collection does, and so may the
+        instrument."""
+        read = getattr(self._mount, "mount_watch_log", None)
+        return None if read is None else read()
+
+    @property
+    def mount_guard_nonce(self) -> str | None:
+        """The nonce of the mount guard's watcher (`expcore.mountguard.MountGuard`), once the helper exists."""
+        return getattr(self._mount, "nonce", None)
+
     def mount_io_mode(self) -> dict[str, Any]:
         if self.spec.mode is not DataPathMode.MOUNT or self._mount is None:
             return {"mount": False}
