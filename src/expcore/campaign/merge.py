@@ -408,7 +408,9 @@ def copy_runs(source: Path, target: Path) -> None:
             return []
         return [name for name in names if name in _SKIPPED and os.path.isfile(os.path.join(directory, name))]
 
-    shutil.copytree(source, target, ignore=left_behind)
+    # links are copied as links (`symlinks=True`), never followed: a link in a shard is evidence the replay check
+    # must see and refuse (R04), and following one would copy what it points at, outside the shard, into the batch
+    shutil.copytree(source, target, ignore=left_behind, symlinks=True)
     make_writable(target)
 
 
