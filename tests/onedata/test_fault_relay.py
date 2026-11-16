@@ -1,4 +1,4 @@
-"""O56: the fault relay of an HPC federation (`expcore_onedata.fault_relay`): the dispatcher's requests, as files on the
+"""O58: the fault relay of an HPC federation (`expcore_onedata.fault_relay`): the dispatcher's requests, as files on the
 federation's root, run by a relay on the login node, which runs only its own federation's fault verbs.
 
 Each test runs the relay in this process: a client's wait for an answer serves the relay once (`serving`), so a request
@@ -79,8 +79,8 @@ def client_of(root, relay, clock, **options):
     return RelayClient(root, wait_s=5, clock=clock, sleep=serving(relay, clock), **options)
 
 
-def test_o56_a_request_is_run_by_the_relay_as_the_federations_verb_and_answered_as_its_end(tmp_path):
-    """O56: the client writes the request, the relay takes it, runs `hpcfed.py <verb> <service>` with the prefix it
+def test_o58_a_request_is_run_by_the_relay_as_the_federations_verb_and_answered_as_its_end(tmp_path):
+    """O58: the client writes the request, the relay takes it, runs `hpcfed.py <verb> <service>` with the prefix it
     was started with, within the request's bound, and answers with the command's end; every file is the user's alone,
     and none is left once the answer is read."""
     root, verbs = root_of(tmp_path), Verbs()
@@ -99,8 +99,8 @@ def test_o56_a_request_is_run_by_the_relay_as_the_federations_verb_and_answered_
         assert stat.S_IMODE((directory / "heartbeat.json").stat().st_mode) == 0o600
 
 
-def test_o56_an_exec_runs_only_the_allowed_command_by_its_name(tmp_path):
-    """O56: an exec request carries a command's name, never an argv; the relay runs that command's fixed argv inside
+def test_o58_an_exec_runs_only_the_allowed_command_by_its_name(tmp_path):
+    """O58: an exec request carries a command's name, never an argv; the relay runs that command's fixed argv inside
     the service through the federation's exec verb."""
     root, verbs = root_of(tmp_path), Verbs(CommandResult(0, "pong\n"))
     relay, clock = relay_of(root, verbs), FakeClock()
@@ -147,10 +147,10 @@ def answer(root, key):
         ({"bound_s": "10"}, "malformed"),
     ],
 )
-def test_o56_the_relay_refuses_another_federations_service_an_unlisted_command_and_anything_else(
+def test_o58_the_relay_refuses_another_federations_service_an_unlisted_command_and_anything_else(
     tmp_path, fields, word
 ):
-    """O56: the relay runs only the fault verbs, for its own federation's services, with an allowed command for an
+    """O58: the relay runs only the fault verbs, for its own federation's services, with an allowed command for an
     exec; anything else, a free-form argv among them, is answered refused, with a word, and nothing runs."""
     root, verbs = root_of(tmp_path), Verbs()
     relay = relay_of(root, verbs)
@@ -161,8 +161,8 @@ def test_o56_the_relay_refuses_another_federations_service_an_unlisted_command_a
     assert verbs.calls == []
 
 
-def test_o56_a_relay_restart_never_replays_a_request_made_for_the_relay_before_it(tmp_path):
-    """O56: a request names the relay it was made for (its heartbeat's nonce). A relay that stopped before it took one
+def test_o58_a_relay_restart_never_replays_a_request_made_for_the_relay_before_it(tmp_path):
+    """O58: a request names the relay it was made for (its heartbeat's nonce). A relay that stopped before it took one
     leaves it waiting; the next relay of the same root answers it refused (`other_relay`) and runs nothing, so a
     restart never runs an old request."""
     root, verbs = root_of(tmp_path), Verbs()
@@ -177,8 +177,8 @@ def test_o56_a_relay_restart_never_replays_a_request_made_for_the_relay_before_i
     assert verbs.calls == []
 
 
-def test_o56_a_request_the_relay_never_takes_is_withdrawn_and_reads_as_not_sent(tmp_path):
-    """O56: no answer by the request's deadline, and the relay never took it: the client withdraws it (the file is
+def test_o58_a_request_the_relay_never_takes_is_withdrawn_and_reads_as_not_sent(tmp_path):
+    """O58: no answer by the request's deadline, and the relay never took it: the client withdraws it (the file is
     gone, so nothing will ever run it) and fails as nothing sent; a stop that fails so is still of unknown outcome to
     the injector, which never takes it for done."""
     root, verbs = root_of(tmp_path), Verbs()
@@ -192,8 +192,8 @@ def test_o56_a_request_the_relay_never_takes_is_withdrawn_and_reads_as_not_sent(
     assert verbs.calls == []
 
 
-def test_o56_a_request_the_relay_took_and_never_answered_is_unknown_never_done(tmp_path):
-    """O56: the relay took the request (it may have run it, or still runs it) and no answer came by its deadline: the
+def test_o58_a_request_the_relay_took_and_never_answered_is_unknown_never_done(tmp_path):
+    """O58: the relay took the request (it may have run it, or still runs it) and no answer came by its deadline: the
     client cannot withdraw it and raises a command with no answer (`TimeoutExpired`), which the driver never reads as
     done."""
     root, verbs = root_of(tmp_path), Verbs()
@@ -214,8 +214,8 @@ def test_o56_a_request_the_relay_took_and_never_answered_is_unknown_never_done(t
         assert driver.restart_link(SERVICE) == "command_timeout"
 
 
-def test_o56_an_outage_whose_stop_the_relay_never_answers_is_journalled_unknown_and_stays_open(tmp_path):
-    """O56: the relay takes every request and answers none: the injector's stop is of unknown outcome (journalled
+def test_o58_an_outage_whose_stop_the_relay_never_answers_is_journalled_unknown_and_stays_open(tmp_path):
+    """O58: the relay takes every request and answers none: the injector's stop is of unknown outcome (journalled
     `stop_unknown`), its restore never sees the provider down (every status unanswered), so the injection stays open,
     `stop_unsettled`, and the start fails as `injector_failure`: never a stop or a restore taken for done."""
     platform = write_hpc_platform(tmp_path)
@@ -254,8 +254,8 @@ def test_o56_an_outage_whose_stop_the_relay_never_answers_is_journalled_unknown_
     assert "cleared" not in [event for event, _ in events]
 
 
-def test_o56_a_dead_relay_refuses_the_next_outage_run_at_its_admission_uncharged(tmp_path):
-    """O56: the fault gate's pre-run check notes whether the relay beats; with none, an outage run is refused at its
+def test_o58_a_dead_relay_refuses_the_next_outage_run_at_its_admission_uncharged(tmp_path):
+    """O58: the fault gate's pre-run check notes whether the relay beats; with none, an outage run is refused at its
     admission as the hold `federation_busy` (no attempt used), while a baseline run is admitted; once a relay beats
     and a fresh check saw it, the outage run is admitted."""
     platform = write_hpc_platform(tmp_path)
@@ -280,8 +280,8 @@ def test_o56_a_dead_relay_refuses_the_next_outage_run_at_its_admission_uncharged
             assert mode == "exclusive"
 
 
-def test_o56_a_relay_that_stops_beating_after_the_check_refuses_the_outage_run_at_its_admission(tmp_path):
-    """O56: the check saw the relay, which then stopped: the admission reads the heartbeat again and refuses."""
+def test_o58_a_relay_that_stops_beating_after_the_check_refuses_the_outage_run_at_its_admission(tmp_path):
+    """O58: the check saw the relay, which then stopped: the admission reads the heartbeat again and refuses."""
     platform = write_hpc_platform(tmp_path)
     config = load_platform(platform, require_secrets=False)
     settings = load_faults(platform, config)
@@ -296,8 +296,8 @@ def test_o56_a_relay_that_stops_beating_after_the_check_refuses_the_outage_run_a
             pass
 
 
-def test_o56_a_stale_heartbeat_is_a_relay_not_answering(tmp_path):
-    """O56: a heartbeat whose wall time is more than 30 s from the reader's is no live relay."""
+def test_o58_a_stale_heartbeat_is_a_relay_not_answering(tmp_path):
+    """O58: a heartbeat whose wall time is more than 30 s from the reader's is no live relay."""
     root = root_of(tmp_path)
     relay = relay_of(root, Verbs())
     with relay.holding():
@@ -306,8 +306,8 @@ def test_o56_a_stale_heartbeat_is_a_relay_not_answering(tmp_path):
         assert beat(root, lambda: written + 31) is None
 
 
-def test_o56_the_relay_never_holds_a_secret_in_its_environment_and_its_verbs_get_a_clean_one(tmp_path):
-    """O56: a relay started with a secret-like name in its environment refuses to start (names only in the refusal),
+def test_o58_the_relay_never_holds_a_secret_in_its_environment_and_its_verbs_get_a_clean_one(tmp_path):
+    """O58: a relay started with a secret-like name in its environment refuses to start (names only in the refusal),
     and the verbs it runs get a few plain names of its environment, never anything else."""
     root = root_of(tmp_path)
     with pytest.raises(PermissionError, match="ONEZONE_TOKEN") as refused:
@@ -319,10 +319,35 @@ def test_o56_the_relay_never_holds_a_secret_in_its_environment_and_its_verbs_get
     }
 
 
-def test_o56_a_second_relay_of_the_same_root_refuses_to_start(tmp_path):
-    """O56: one relay per federation: a second one finds the first's lock held and refuses, so no request is taken
+def test_o58_a_second_relay_of_the_same_root_refuses_to_start(tmp_path):
+    """O58: one relay per federation: a second one finds the first's lock held and refuses, so no request is taken
     twice."""
     root = root_of(tmp_path)
     first, second = relay_of(root, Verbs()), relay_of(root, Verbs())
     with first.holding(), pytest.raises(PermissionError, match="another fault relay"), second.holding():
         pass
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_o58_the_relay_is_stopped_only_while_its_pid_is_still_the_relay_and_without_the_python_pidfd_calls(
+    tmp_path, monkeypatch, raw
+):
+    """O58: `down` stops the relay by its heartbeat's pid and start tick, through a pidfd held across the check, so a
+    PID another process took is never signalled; a Python built without `os.pidfd_open` (uv's standalone builds) uses
+    the raw system calls instead."""
+    from expcore_onedata import fault_relay
+
+    if raw:
+        monkeypatch.delattr(fault_relay.os, "pidfd_open", raising=False)
+        monkeypatch.delattr(fault_relay.signal, "pidfd_send_signal", raising=False)
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        start = fault_relay.proc_start(child.pid)
+        assert start is not None
+        assert fault_relay.signal_if_started(child.pid, str(int(start) + 1), fault_relay.signal.SIGTERM) is False
+        assert child.poll() is None
+        assert fault_relay.signal_if_started(child.pid, start, fault_relay.signal.SIGTERM) is True
+        assert child.wait(timeout=10) == -fault_relay.signal.SIGTERM
+    finally:
+        child.kill()
+        child.wait()

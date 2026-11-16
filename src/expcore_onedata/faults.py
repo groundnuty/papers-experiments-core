@@ -216,7 +216,7 @@ runs it is handed to recovery, see "The token's window"): call it inside the blo
 message and in every failure. Identities are recorded as SHA-256 digests. The settings are `[faults]` of
 platform.toml (`expcore_onedata.fault_settings`).
 
-**An HPC federation (O56).** With `[faults] backend = "hpc"` the driver is `hpc_driver(settings, probe=...)`
+**An HPC federation (O58).** With `[faults] backend = "hpc"` the driver is `hpc_driver(settings, probe=...)`
 (`expcore_onedata.fault_hpc`): the same injector, journal, restore, settle, recovery and heal, its requests run by the
 federation's fault relay on the login node (`expcore_onedata.fault_relay`), and its stop's evidence journalled with the
 injection (`injected`: how the stop ended and its seconds).

@@ -1,4 +1,4 @@
-"""O56: a provider outage on an HPC federation, through the injector over the HPC driver (`fault_hpc.HpcDriver`), on
+"""O58: a provider outage on an HPC federation, through the injector over the HPC driver (`fault_hpc.HpcDriver`), on
 the fake federation of `hpc_support` and a fake clock.
 
 The injector, its journal, the restore and its settle are the Compose federation's: the same lines in the same order,
@@ -55,8 +55,8 @@ def settings_of(tmp_path):
     return load_faults(platform, load_platform(platform, require_secrets=False))
 
 
-def test_o56_an_outage_on_hpc_journals_restores_and_settles_exactly_as_on_compose(tmp_path):
-    """O56: the same outage, its provider slow to serve after the restore, run once over the Compose driver and once
+def test_o58_an_outage_on_hpc_journals_restores_and_settles_exactly_as_on_compose(tmp_path):
+    """O58: the same outage, its provider slow to serve after the restore, run once over the Compose driver and once
     over the HPC driver, with the same REST side: the journal holds the same lines in the same order, the snapshot
     the same steps with the same words, and both restores are verified once the provider served, the session gate
     passed and every pair transferred. The HPC journal's `injected` line adds the stop's evidence: how it ended and
@@ -96,8 +96,8 @@ def test_o56_an_outage_on_hpc_journals_restores_and_settles_exactly_as_on_compos
     assert hpc_shot["injections"] == compose_shot["injections"]
 
 
-def test_o56_the_stop_and_the_start_reach_the_target_service_alone_and_the_identity_changes(tmp_path):
-    """O56: the outage stops the target's service and nothing else, and the restore starts it again: a new launch,
+def test_o58_the_stop_and_the_start_reach_the_target_service_alone_and_the_identity_changes(tmp_path):
+    """O58: the outage stops the target's service and nothing else, and the restore starts it again: a new launch,
     so a new identity, which the snapshot records only as its digest."""
     injector, federation = hpc(tmp_path)
     injector.start(RUN)
@@ -127,8 +127,8 @@ def crashed(tmp_path, *, stopping):
     return recovery, federation, clock
 
 
-def test_o56_a_stop_journalled_but_never_sent_is_never_down_once_the_whole_bound_shows_the_service_as_it_was(tmp_path):
-    """O56: nothing but `injecting` is journalled and the service runs with its identity through the whole settle
+def test_o58_a_stop_journalled_but_never_sent_is_never_down_once_the_whole_bound_shows_the_service_as_it_was(tmp_path):
+    """O58: nothing but `injecting` is journalled and the service runs with its identity through the whole settle
     bound, so nothing took it down: recovery calls it `never_down` only once the bound is over, starts nothing and
     does not wait for it to serve."""
     recovery, federation, clock = crashed(tmp_path, stopping=False)
@@ -143,8 +143,8 @@ def test_o56_a_stop_journalled_but_never_sent_is_never_down_once_the_whole_bound
     assert recovery.journal.open_entries() == []
 
 
-def test_o56_a_stop_that_was_asked_for_and_never_seen_down_is_not_taken_for_never_down(tmp_path):
-    """O56: with the `stopping` line the stop may have been sent, so a service seen up through the bound is no proof
+def test_o58_a_stop_that_was_asked_for_and_never_seen_down_is_not_taken_for_never_down(tmp_path):
+    """O58: with the `stopping` line the stop may have been sent, so a service seen up through the bound is no proof
     it never went down: the injection stays open (`stop_unsettled`), nothing is started, and recovery fails closed."""
     recovery, federation, _ = crashed(tmp_path, stopping=True)
     with pytest.raises(InfraError, match="not cleared"):
@@ -154,8 +154,8 @@ def test_o56_a_stop_that_was_asked_for_and_never_seen_down_is_not_taken_for_neve
     assert federation.acted("start") == []
 
 
-def test_o56_a_stop_that_returned_and_never_took_effect_is_never_down_and_nothing_is_started(tmp_path):
-    """O56: the stop command answered, but the service was never seen down within the bound: the start fails as
+def test_o58_a_stop_that_returned_and_never_took_effect_is_never_down_and_nothing_is_started(tmp_path):
+    """O58: the stop command answered, but the service was never seen down within the bound: the start fails as
     `injector_failure`, its clear finds the service running as it was (`never_down`), starts nothing, and closes
     the injection."""
     injector, federation = hpc(tmp_path)
@@ -172,8 +172,8 @@ def test_o56_a_stop_that_returned_and_never_took_effect_is_never_down_and_nothin
     assert open_injections(tmp_path) == []
 
 
-def test_o56_a_stop_killed_at_its_timeout_while_the_service_goes_on_stopping_is_waited_out_then_restored(tmp_path):
-    """O56: the stop command is killed at its timeout (3 s) while the service stops 5 s after the request: the
+def test_o58_a_stop_killed_at_its_timeout_while_the_service_goes_on_stopping_is_waited_out_then_restored(tmp_path):
+    """O58: the stop command is killed at its timeout (3 s) while the service stops 5 s after the request: the
     restore must not start a service that still runs and take it for never down; it waits for it to show down,
     starts it, sees a new identity and verifies the restore."""
     injector, federation = hpc(tmp_path)
@@ -188,8 +188,8 @@ def test_o56_a_stop_killed_at_its_timeout_while_the_service_goes_on_stopping_is_
     assert restore == [("injected", False, None), ("cleared", True, "restored"), ("verified", True, None)]
 
 
-def test_o56_a_restore_that_does_not_serve_stays_open_and_a_later_clear_verifies_it_without_a_second_start(tmp_path):
-    """O56: the service started anew but its provider does not serve within `ready_timeout_s`: `not_serving`, the
+def test_o58_a_restore_that_does_not_serve_stays_open_and_a_later_clear_verifies_it_without_a_second_start(tmp_path):
+    """O58: the service started anew but its provider does not serve within `ready_timeout_s`: `not_serving`, the
     injection open and the run's record refused; once it serves, a later clear verifies it with no second start."""
     injector, federation = hpc(tmp_path)
     federation.never_serving.add(SERVICE)
@@ -206,8 +206,8 @@ def test_o56_a_restore_that_does_not_serve_stays_open_and_a_later_clear_verifies
     assert open_injections(tmp_path) == []
 
 
-def test_o56_a_start_that_fails_leaves_the_injection_open_and_the_fault_gate_closed_until_it_is_restored(tmp_path):
-    """O56: the start command fails on every attempt: the restore is `start_failed`, the injection stays open, and
+def test_o58_a_start_that_fails_leaves_the_injection_open_and_the_fault_gate_closed_until_it_is_restored(tmp_path):
+    """O58: the start command fails on every attempt: the restore is `start_failed`, the injection stays open, and
     the fault gate, once the injector's process is gone, tries the restore again and fails while it still fails;
     once a start succeeds, the gate's own recovery restores and verifies the provider and the gate opens."""
     injector, federation = hpc(tmp_path)

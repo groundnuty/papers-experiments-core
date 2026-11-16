@@ -1,5 +1,5 @@
 # Provenance: new
-"""The fault relay: the HPC federation's fault verbs, run on the login node for a campaign that runs on a node (O56).
+"""The fault relay: the HPC federation's fault verbs, run on the login node for a campaign that runs on a node (O58).
 
 A Slurm step can only be launched from the cluster's login node, and the campaign's dispatcher runs as a step on the
 sandbox node, so it cannot run the federation's verbs (`hpcfed.py stop|start|status|exec`) itself. The relay is a
@@ -39,6 +39,7 @@ reader's: the login node and the nodes keep the cluster's time.
 """
 
 import contextlib
+import ctypes
 import fcntl
 import json
 import os
@@ -432,6 +433,41 @@ def main(argv: Sequence[str]) -> int:
     return 2
 
 
+PIDFD_OPEN, PIDFD_SEND_SIGNAL = 434, 424  # the generic syscall numbers (x86_64 and aarch64 alike)
+
+
+def _syscall(number: int, *args: int) -> int:
+    """A raw system call through the C library, for a Python built without the pidfd calls (uv's standalone builds,
+    made against an old glibc); raise OSError with its errno when it fails."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    done = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(arg) for arg in args))
+    if done < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return int(done)
+
+
+def signal_if_started(pid: int, start: str, signum: int) -> bool:
+    """Send `signum` to `pid` only while it is the process that started at clock tick `start`: a pidfd is opened first
+    and held across the check, so a PID reused before it shows another start and is never signalled (pidfd_open(2),
+    pidfd_send_signal(2), through `os` and `signal` where this Python has them, else the raw calls). Return whether it
+    was sent; raise ProcessLookupError when the process is gone."""
+    opener = getattr(os, "pidfd_open", None)
+    handle = opener(pid) if opener is not None else _syscall(PIDFD_OPEN, pid, 0)
+    try:
+        if proc_start(pid) != start:  # another process holds the PID now
+            return False
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if sender is not None:
+            sender(handle, signum)
+        else:
+            _syscall(PIDFD_SEND_SIGNAL, handle, int(signum), 0, 0)
+        return True
+    finally:
+        os.close(handle)
+
+
 def _stop(root: Path, timeout_s: float = 3 * BEAT_S) -> int:
     live = beat(root)
     if live is None:
@@ -439,12 +475,7 @@ def _stop(root: Path, timeout_s: float = 3 * BEAT_S) -> int:
     pid, start = live.get("pid"), live.get("start")
     if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and isinstance(start, str):
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            handle = os.pidfd_open(pid)  # held across the check: a PID reused before it shows another start
-            try:
-                if proc_start(pid) == start:  # the relay that wrote the heartbeat, and no other process
-                    signal.pidfd_send_signal(handle, signal.SIGTERM)
-            finally:
-                os.close(handle)
+            signal_if_started(pid, start, signal.SIGTERM)
     end = time.monotonic() + timeout_s
     while time.monotonic() < end:
         if not (relay_dir(root) / "heartbeat.json").exists():

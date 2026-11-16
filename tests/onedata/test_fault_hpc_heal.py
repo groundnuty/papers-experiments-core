@@ -1,4 +1,4 @@
-"""O56: the restore's link heal on an HPC federation, through the injector over the HPC driver, on the four-provider
+"""O58: the restore's link heal on an HPC federation, through the injector over the HPC driver, on the four-provider
 federation of the heal's tests (`heal_support`) run by the fake federation of `hpc_support`, on a fake clock.
 
 `restart_link` and `ping` are exec'd into each provider's Apptainer service, and the container fallback is the
@@ -49,10 +49,10 @@ def execs(federation, inner):
     return [(argv[2], bound) for argv, bound in federation.calls if argv[1] == "exec" and argv[4:] == inner]
 
 
-def test_o56_all_links_execs_restart_link_into_every_providers_service_and_fetches_nothing_inside_the_settle(
+def test_o58_all_links_execs_restart_link_into_every_providers_service_and_fetches_nothing_inside_the_settle(
     tmp_path,
 ):
-    """O56: the all-links sequence on HPC: every provider's node pinged, then its link restarted, each by an exec into
+    """O58: the all-links sequence on HPC: every provider's node pinged, then its link restarted, each by an exec into
     its Apptainer service (the ping within the command bound, the restart within the RPC's 150 s and 60 s for its
     step), in label order and one after another; then the settle, with no read through any provider (no serving probe,
     no session gate, no link check) from the first restart to its end, and only then the gate and every pair, which
@@ -80,8 +80,8 @@ def test_o56_all_links_execs_restart_link_into_every_providers_service_and_fetch
     assert (lines[-1]["event"], lines[-1]["how"]) == ("cleared", "restored")
 
 
-def test_o56_the_container_fallback_restarts_the_readers_service_journalled_and_verified(tmp_path):
-    """O56: link restarts that mend nothing leave the pair stuck, so the reader's service is restarted, through the
+def test_o58_the_container_fallback_restarts_the_readers_service_journalled_and_verified(tmp_path):
+    """O58: link restarts that mend nothing leave the pair stuck, so the reader's service is restarted, through the
     injector's own stop and start: journalled as an injection of its own before the stop (`heal`), the service seen
     down, started anew (a new identity) and serving before the settle, its gate and every pair; the pair passes, so
     the restart and the restore are cleared and verified."""
@@ -107,8 +107,8 @@ def test_o56_the_container_fallback_restarts_the_readers_service_journalled_and_
     assert injector.snapshot()["restore_verified"] is True
 
 
-def test_o56_a_fallback_restart_that_fails_keeps_the_gate_closed_until_the_gates_recovery_verifies_it(tmp_path):
-    """O56: the reader's service, stopped by the fallback, does not start again: the restart is unverified
+def test_o58_a_fallback_restart_that_fails_keeps_the_gate_closed_until_the_gates_recovery_verifies_it(tmp_path):
+    """O58: the reader's service, stopped by the fallback, does not start again: the restart is unverified
     (`heal_restart_failed`), its settle is held all the same, the restore fails closed and both injections stay open.
     The fault gate's recovery, once the injector's process is gone, tries the start again and fails closed while it
     still fails; once it starts, the gate restarts the reader, holds a settle before any read through it (a wait

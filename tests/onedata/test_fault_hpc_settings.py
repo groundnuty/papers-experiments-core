@@ -1,4 +1,4 @@
-"""O56: `[faults]` of an HPC federation (`backend = "hpc"`): its keys, its defaults and refusals, the least token margin
+"""O58: `[faults]` of an HPC federation (`backend = "hpc"`): its keys, its defaults and refusals, the least token margin
 its stop and relay add, the heal's reserves, and the driver the platform builds for it. A table without `backend` is
 the Compose one, loaded exactly as before.
 """
@@ -40,8 +40,8 @@ def settings_of(platform):
     return load_faults(platform, load_platform(platform, require_secrets=False))
 
 
-def test_o56_a_table_without_backend_is_the_compose_one_loaded_as_before(tmp_path):
-    """O56: no `backend` key is `"compose"`: its file, project and defaults as before, no HPC bound read, and its
+def test_o58_a_table_without_backend_is_the_compose_one_loaded_as_before(tmp_path):
+    """O58: no `backend` key is `"compose"`: its file, project and defaults as before, no HPC bound read, and its
     fingerprint still hashes each target's project and service."""
     platform = write_faults(tmp_path)
     settings = settings_of(platform)
@@ -53,8 +53,8 @@ def test_o56_a_table_without_backend_is_the_compose_one_loaded_as_before(tmp_pat
     assert targets["providers[1]"] == hashlib.sha256(f"stack-a/{SERVICES['beta']}".encode()).hexdigest()
 
 
-def test_o56_an_hpc_table_has_no_compose_file_and_its_own_defaults(tmp_path):
-    """O56: `backend = "hpc"`: no Compose file or project; a service's stop bounded at 690 s (the layout's 600 s stop,
+def test_o58_an_hpc_table_has_no_compose_file_and_its_own_defaults(tmp_path):
+    """O58: `backend = "hpc"`: no Compose file or project; a service's stop bounded at 690 s (the layout's 600 s stop,
     the kill's 30 s, the step's end 60 s) and waited for 60 s more (750 s), a reading every 10 s (each is a Slurm
     step), and 30 s for the relay beyond each command's bound."""
     settings = settings_of(write_hpc_platform(tmp_path, **DEFAULTS))
@@ -68,34 +68,34 @@ def test_o56_an_hpc_table_has_no_compose_file_and_its_own_defaults(tmp_path):
     ("key", "value"),
     [("compose_file", "compose.yaml"), ("project", "stack-a"), ("command", ["docker", "compose"]), ("docker", ["x"])],
 )
-def test_o56_an_hpc_table_refuses_every_compose_key_naming_it(tmp_path, key, value):
-    """O56: a Compose key in an HPC table would do nothing, so it is refused, by its name."""
+def test_o58_an_hpc_table_refuses_every_compose_key_naming_it(tmp_path, key, value):
+    """O58: a Compose key in an HPC table would do nothing, so it is refused, by its name."""
     with pytest.raises(ConfigError, match=f"key '{key}' is read only with backend = \"compose\""):
         settings_of(write_hpc_platform(tmp_path, **{key: value}))
 
 
 @pytest.mark.parametrize(("key", "value"), [("stop_bound_s", 690), ("relay_wait_s", 30)])
-def test_o56_a_compose_table_refuses_the_hpc_keys_naming_them(tmp_path, key, value):
+def test_o58_a_compose_table_refuses_the_hpc_keys_naming_them(tmp_path, key, value):
     with pytest.raises(ConfigError, match=f"key '{key}' is read only with backend = \"hpc\""):
         settings_of(write_faults(tmp_path, **{key: value}))
 
 
-def test_o56_a_backend_that_is_not_known_is_refused(tmp_path):
+def test_o58_a_backend_that_is_not_known_is_refused(tmp_path):
     with pytest.raises(ConfigError, match='key \'backend\' must be one of "compose", "hpc"'):
         settings_of(write_faults(tmp_path, backend="slurm"))
 
 
 @pytest.mark.parametrize("settle", [690, 600, 5])
-def test_o56_an_hpc_settle_that_does_not_outlast_the_stop_bound_is_refused_naming_the_figure(tmp_path, settle):
-    """O56: a stop of unknown outcome is waited for `settle_timeout_s`; one at or below the stop's own bound would
+def test_o58_an_hpc_settle_that_does_not_outlast_the_stop_bound_is_refused_naming_the_figure(tmp_path, settle):
+    """O58: a stop of unknown outcome is waited for `settle_timeout_s`; one at or below the stop's own bound would
     never see a slow stop end, so it is refused at load, naming the bound and the default."""
     with pytest.raises(ConfigError, match=r"settle_timeout_s.*must exceed stop_bound_s, 690 s.*leave it out for 750"):
         settings_of(write_hpc_platform(tmp_path, **{**DEFAULTS, "settle_timeout_s": settle}))
     assert settings_of(write_hpc_platform(tmp_path, **{**DEFAULTS, "settle_timeout_s": 691})).settle_timeout_s == 691
 
 
-def test_o56_the_least_token_margin_on_hpc_counts_the_relay_and_the_starts_stop(tmp_path):
-    """O56: with every default, the least `[tokens] margin_s` is 5,340 s (2,134 s on Compose): the restore's bound with
+def test_o58_the_least_token_margin_on_hpc_counts_the_relay_and_the_starts_stop(tmp_path):
+    """O58: with every default, the least `[tokens] margin_s` is 5,340 s (2,134 s on Compose): the restore's bound with
     each start's command and the relay's wait (3,940 s), the slack (300 s), the session drain (320 s), and the
     injector's start's stop, which may run to its own bound and the relay's wait (780 s). A platform declaring less is
     refused, naming the figure and the derivation."""
@@ -110,8 +110,8 @@ def test_o56_the_least_token_margin_on_hpc_counts_the_relay_and_the_starts_stop(
     assert settings_of(write_hpc_platform(tmp_path, margin_s=5340, **DEFAULTS)).backend == "hpc"
 
 
-def test_o56_the_heals_reserves_count_the_relay_the_exec_and_the_stop_on_hpc_and_not_on_compose(tmp_path):
-    """O56: a link restart's reserve on HPC holds each command's relay wait and the exec's step (870 s against 690 s on
+def test_o58_the_heals_reserves_count_the_relay_the_exec_and_the_stop_on_hpc_and_not_on_compose(tmp_path):
+    """O58: a link restart's reserve on HPC holds each command's relay wait and the exec's step (870 s against 690 s on
     Compose), and a reader's restart its stop's own bound (3,540 s against 1,560 s)."""
     root = tmp_path / "hpc"
     root.mkdir()
@@ -122,8 +122,8 @@ def test_o56_the_heals_reserves_count_the_relay_the_exec_and_the_stop_on_hpc_and
     assert (heal_container_reserve(hpc), heal_container_reserve(compose)) == (3540.0, 1560.0)
 
 
-def test_o56_each_backend_has_its_own_driver_and_refuses_the_other(tmp_path):
-    """O56: an HPC table builds the HPC driver, its stop bounded by `settle_timeout_s`; a Compose driver is never built
+def test_o58_each_backend_has_its_own_driver_and_refuses_the_other(tmp_path):
+    """O58: an HPC table builds the HPC driver, its stop bounded by `settle_timeout_s`; a Compose driver is never built
     from it, nor an HPC driver from a Compose table. The fingerprint names an HPC target by its service alone."""
     platform = write_hpc_platform(tmp_path)
     settings = settings_of(platform)
@@ -139,8 +139,8 @@ def test_o56_each_backend_has_its_own_driver_and_refuses_the_other(tmp_path):
     assert targets["providers[1]"] == hashlib.sha256(f"hpc:{SERVICES['beta']}".encode()).hexdigest()
 
 
-def test_o56_the_platforms_health_check_recovers_an_hpc_federation_through_the_hpc_driver(tmp_path, monkeypatch):
-    """O56: the fault gate that `PlatformHealth` builds for an HPC table recovers through the HPC driver, whose probe
+def test_o58_the_platforms_health_check_recovers_an_hpc_federation_through_the_hpc_driver(tmp_path, monkeypatch):
+    """O58: the fault gate that `PlatformHealth` builds for an HPC table recovers through the HPC driver, whose probe
     reads through the check's client, and never builds a Compose driver."""
     federation = make_federation()
     monkeypatch.setenv(ADMIN_ENV, federation.admin_token)

@@ -1,4 +1,4 @@
-"""O56: the HPC driver of the fault injector and the heal, on a fake runner (`hpc_support.FakeHpc`).
+"""O58: the HPC driver of the fault injector and the heal, on a fake runner (`hpc_support.FakeHpc`).
 
 The driver asks for four verbs on a provider's service (`status`, `stop`, `start`, and `exec` of one command of a fixed
 set inside the running Apptainer service), each a request a transport carries to the federation's `hpcfed.py`. No test
@@ -49,8 +49,8 @@ def status(**record):
     return CommandResult(0, json.dumps(record) + "\n")
 
 
-def test_o56_each_verb_is_the_federations_command_for_the_service_within_its_bound():
-    """O56: status and start are `hpcfed.py <verb> <service>` within the command bound, and the stop within its own
+def test_o58_each_verb_is_the_federations_command_for_the_service_within_its_bound():
+    """O58: status and start are `hpcfed.py <verb> <service>` within the command bound, and the stop within its own
     bound, which outlasts a service's graceful stop, its kill and its step's end; nothing names a container."""
     fake, driver = federation(stop_timeout_s=750.0)
     driver.stop(SERVICE)
@@ -63,8 +63,8 @@ def test_o56_each_verb_is_the_federations_command_for_the_service_within_its_bou
     ]
 
 
-def test_o56_the_identity_is_the_services_own_and_changes_with_every_start_of_a_stopped_service():
-    """O56: the status carries an identity that stays while the service is left alone and changes when it is started
+def test_o58_the_identity_is_the_services_own_and_changes_with_every_start_of_a_stopped_service():
+    """O58: the status carries an identity that stays while the service is left alone and changes when it is started
     anew, which is what lets a restore be told from readiness (O11); a start of a running service changes nothing."""
     _, driver = federation()
     first = driver.observe(SERVICE)
@@ -97,8 +97,8 @@ def test_o56_the_identity_is_the_services_own_and_changes_with_every_start_of_a_
         FileNotFoundError("hpcfed.py"),
     ],
 )
-def test_o56_a_status_that_cannot_be_read_raises_naming_the_step_and_never_its_output(answer):
-    """O56: a status that fails, has no answer in its bound, cannot be sent or answers anything but one line of the
+def test_o58_a_status_that_cannot_be_read_raises_naming_the_step_and_never_its_output(answer):
+    """O58: a status that fails, has no answer in its bound, cannot be sent or answers anything but one line of the
     status record is a reading that failed (DriverError), never a guess; its message names the step, not the service
     or the output, which can name a node."""
     driver, _ = answering(answer)
@@ -108,8 +108,8 @@ def test_o56_a_status_that_cannot_be_read_raises_naming_the_step_and_never_its_o
     assert "srun" not in str(caught.value)
 
 
-def test_o56_running_with_no_identity_reads_as_none_and_readiness_as_a_health_check():
-    """O56: a status of a running service whose identity is null cannot show a restore (O11); `ready` reads as a
+def test_o58_running_with_no_identity_reads_as_none_and_readiness_as_a_health_check():
+    """O58: a status of a running service whose identity is null cannot show a restore (O11); `ready` reads as a
     container's health check, `healthy` once the service's own checks passed for this launch, `starting` before, and
     nothing when the status does not say."""
     assert answering(status(running=True, identity=None))[0].observe(SERVICE) == Observation(True, None)
@@ -129,8 +129,8 @@ def test_o56_running_with_no_identity_reads_as_none_and_readiness_as_a_health_ch
         (PermissionError("hpcfed.py"), "could not run (PermissionError)"),
     ],
 )
-def test_o56_a_stop_or_start_that_fails_raises_as_the_compose_drivers_does(verb, answer, said):
-    """O56: a stop or start that fails, has no answer in its bound or cannot be sent raises DriverError, naming the
+def test_o58_a_stop_or_start_that_fails_raises_as_the_compose_drivers_does(verb, answer, said):
+    """O58: a stop or start that fails, has no answer in its bound or cannot be sent raises DriverError, naming the
     step and how it ended, as the Compose driver's do, so the injector's journal and recovery treat it exactly alike (a
     stop that raised is of unknown outcome, O11)."""
     driver, _ = answering(answer)
@@ -149,16 +149,16 @@ def test_o56_a_stop_or_start_that_fails_raises_as_the_compose_drivers_does(verb,
         lambda: Request("status", SERVICE, "ping"),
     ],
 )
-def test_o56_a_request_is_one_verb_on_one_service_and_an_exec_one_allowed_command(request_):
-    """O56: a request names a verb of the four, a service name (never an option or words), and, for an exec only, one
+def test_o58_a_request_is_one_verb_on_one_service_and_an_exec_one_allowed_command(request_):
+    """O58: a request names a verb of the four, a service name (never an option or words), and, for an exec only, one
     command of the allowed set (the heal's ping and link restart); anything else is refused before it is sent."""
     with pytest.raises(DriverError):
         request_()
     assert set(EXEC_COMMANDS) == {"ping", "restart_link"}
 
 
-def test_o56_a_transport_that_cannot_send_is_told_by_its_errors_type_only():
-    """O56: a request that cannot be sent (the relay's directory unreadable, say) fails naming the step and the
+def test_o58_a_transport_that_cannot_send_is_told_by_its_errors_type_only():
+    """O58: a request that cannot be sent (the relay's directory unreadable, say) fails naming the step and the
     error's type, never a path."""
 
     def unreadable(request, *, timeout_s):
@@ -170,8 +170,8 @@ def test_o56_a_transport_that_cannot_send_is_told_by_its_errors_type_only():
     assert "/private" not in str(caught.value)
 
 
-def test_o56_serves_asks_the_probe_only_of_a_running_ready_service_and_raises_when_its_status_cannot_be_read():
-    """O56: a service serves when it runs, its own checks passed for this launch, and the probe finds its provider
+def test_o58_serves_asks_the_probe_only_of_a_running_ready_service_and_raises_when_its_status_cannot_be_read():
+    """O58: a service serves when it runs, its own checks passed for this launch, and the probe finds its provider
     answering REST; a stopped or not yet ready one is not asked about, and a status that cannot be read raises."""
     fake, driver = federation()
     assert driver.serves(SERVICE) is True
@@ -190,8 +190,8 @@ def test_o56_serves_asks_the_probe_only_of_a_running_ready_service_and_raises_wh
     assert asked == [SERVICE]
 
 
-def test_o56_the_stops_evidence_is_kept_checked_and_nothing_else_of_its_answer():
-    """O56: the stop's answer says how it ended and how long it took from the request to the stop confirmed; the
+def test_o58_the_stops_evidence_is_kept_checked_and_nothing_else_of_its_answer():
+    """O58: the stop's answer says how it ended and how long it took from the request to the stop confirmed; the
     driver keeps those two, checked, for the journal, and nothing else (the answer may name a node)."""
     fake, driver = federation()
     fake.exit_after_s = 4.5
@@ -206,8 +206,8 @@ def test_o56_the_stops_evidence_is_kept_checked_and_nothing_else_of_its_answer()
     assert driver.last_stop is None
 
 
-def test_o56_ping_execs_the_runner_inside_the_providers_service_and_is_true_only_for_pong():
-    """O56: the heal's ping is op-worker's runner exec'd inside the provider's Apptainer service, within the command
+def test_o58_ping_execs_the_runner_inside_the_providers_service_and_is_true_only_for_pong():
+    """O58: the heal's ping is op-worker's runner exec'd inside the provider's Apptainer service, within the command
     bound, True only when it prints `pong`; a failure, no answer in time or any other answer is no pong."""
     fake, driver = federation()
     assert driver.ping(SERVICE) is True
@@ -218,8 +218,8 @@ def test_o56_ping_execs_the_runner_inside_the_providers_service_and_is_true_only
         assert answering(answer)[0].ping(SERVICE) is False
 
 
-def test_o56_restart_link_execs_the_nodetool_call_inside_the_providers_service_with_its_bound():
-    """O56: the link restart is the Compose driver's very command (`RESTART_LINK_SCRIPT`: rtransfer_config's
+def test_o58_restart_link_execs_the_nodetool_call_inside_the_providers_service_with_its_bound():
+    """O58: the link restart is the Compose driver's very command (`RESTART_LINK_SCRIPT`: rtransfer_config's
     restart_link through nodetool's rpcterms, arity 0, a 120 s RPC), exec'd inside the provider's Apptainer service so
     env.sh finds the service's own epmd port and cookie, bounded 30 s above the RPC and 60 s more for the step."""
     fake, driver = federation()
@@ -241,16 +241,16 @@ def test_o56_restart_link_execs_the_nodetool_call_inside_the_providers_service_w
         (FileNotFoundError("hpcfed.py"), "not_run"),
     ],
 )
-def test_o56_the_link_restarts_result_is_the_same_word_as_on_compose(answer, word):
-    """O56: the result is one word of the Compose driver's (`link_result`): a failure the exec does not describe, a
+def test_o58_the_link_restarts_result_is_the_same_word_as_on_compose(answer, word):
+    """O58: the result is one word of the Compose driver's (`link_result`): a failure the exec does not describe, a
     step that could not be made among them, may have reached the node and is never `not_run`, so it is never retried;
     the output, which names the node, is never kept."""
     driver, _ = answering(answer)
     assert driver.restart_link(SERVICE) == word
 
 
-def test_o56_the_rest_side_is_the_probes_as_on_compose():
-    """O56: the session gate, the link check, the transfer listings and the gate's probe file are the probe's, read
+def test_o58_the_rest_side_is_the_probes_as_on_compose():
+    """O58: the session gate, the link check, the transfer listings and the gate's probe file are the probe's, read
     over REST as the Compose driver reads them; a probe without them leaves the driver without them too."""
     fake, driver = federation()
     assert driver.has_sessions is True
@@ -266,7 +266,7 @@ def test_o56_the_rest_side_is_the_probes_as_on_compose():
     assert (bare.link_matrix(SERVICE), bare.restored_links(SERVICE), bare.active_transfers()) == (None, None, None)
 
 
-def test_o56_the_driver_is_never_built_without_a_probe():
-    """O56: as the Compose driver, it cannot take a running service for one that serves without asking."""
+def test_o58_the_driver_is_never_built_without_a_probe():
+    """O58: as the Compose driver, it cannot take a running service for one that serves without asking."""
     with pytest.raises(TypeError):
         HpcDriver(VerbCommand([TOOL], Answer(CommandResult(0, ""))))  # type: ignore[call-arg]
