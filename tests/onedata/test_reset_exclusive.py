@@ -64,7 +64,7 @@ from expcore_onedata.tool_admission import shared_admission
 WAIT_S = 10.0  # the bound of a wait that must be granted
 SHORT_S = 0.4  # the bound of a wait that must run out
 PROBE_S = 0.2
-REASON = "smoke: warm-up of the first space"
+REASON = "smoke_warmup"
 SRC = Path(__file__).resolve().parents[2] / "src"
 
 
@@ -192,7 +192,7 @@ def test_o11_a_tools_hold_past_the_bound_refuses_the_section_and_names_the_holde
     id, start time), never by its reason (O12), and the run has its share back for its agent."""
     config, _settings, lock = federation(tmp_path, admission_timeout_s=SHORT_S)
     release = threading.Event()
-    thread, _ = tool_in_thread(config, release, reason="a reason that names the first space")
+    thread, _ = tool_in_thread(config, release, reason="warmup_first_run")
     try:
         with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
             with pytest.raises(ResetLockBusy) as refused, exclusive(config, shortcut()):
@@ -205,7 +205,7 @@ def test_o11_a_tools_hold_past_the_bound_refuses_the_section_and_names_the_holde
             assert holder["start_time"]
             assert holder["in_campaign"] is False
             assert f"pid {os.getpid()} (live)" in refused.value.detail
-            assert "first space" not in str(refused.value)
+            assert "warmup_first_run" not in str(refused.value)
             assert admission.reset.shared  # the run's agent may start: its share is back
             require_admission(config)
     finally:
@@ -218,7 +218,7 @@ def test_o11_a_dead_holder_beside_a_live_one_is_shown_as_holder_gone(tmp_path):
     `holder_gone`, beside the live holder whose hold refused the section."""
     config, _settings, lock = federation(tmp_path, admission_timeout_s=SHORT_S)
     platform = Path(config.file)
-    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(platform), "a killed tool"))
+    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(platform), "killed_tool"))
     child.start()
     child.join(120)
     assert child.exitcode == 0
@@ -244,7 +244,7 @@ def test_o11_a_grant_that_finds_a_dead_holder_gives_no_shortcut_and_ends_its_rec
     and the dead holder's line is ended as `holder_gone`. The hold is kept for the whole section (O66: the run's share
     used to be taken back at once, and the full reset then ran beside every holder); the share is back after it."""
     config, settings, lock = federation(tmp_path)
-    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(config.file), "a killed tool"))
+    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(config.file), "killed_tool"))
     child.start()
     child.join(120)
     with lock.held(exclusive=False, timeout_s=PROBE_S) as admission:
@@ -417,7 +417,7 @@ def test_o11_a_dead_holder_keeps_refusing_the_shortcut_for_its_quiet_window(tmp_
     may outlive the section that found it: the next sections refuse the shortcut too, naming it, until
     `DEAD_HOLDER_QUIET_S` has passed since it was found."""
     config, _, lock = federation(tmp_path)
-    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(config.file), "a killed tool"))
+    child = multiprocessing.get_context("spawn").Process(target=hold_and_die, args=(str(config.file), "killed_tool"))
     child.start()
     child.join(120)
     with lock.held(exclusive=False, timeout_s=PROBE_S):

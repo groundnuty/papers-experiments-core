@@ -15,6 +15,7 @@ import dataclasses
 import fcntl
 import multiprocessing
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from expcore_onedata.rangemap import load_placement
 from expcore_onedata.reset import STAGES, ResetFailed, SpaceReset
 from expcore_onedata.resetlock import FEDERATION_RESET
 from expcore_onedata.resetspaces import ResetPlan, SpacesReset
+from expcore_onedata.shortcode import checked_code
 from expcore_onedata.testing import DATA, write_platform
 from expcore_onedata.tool_admission import shared_admission
 
@@ -114,7 +116,7 @@ def shared_free(journal: Path) -> bool:
     return True
 
 
-def tool_in_thread(config, release, reason="smoke: a warm-up"):
+def tool_in_thread(config, release, reason="smoke_warmup"):
     """A tool outside a campaign holding the shared admission in a thread until `release` is set."""
     holding = threading.Event()
 
@@ -232,7 +234,7 @@ def test_o66_a_reset_at_its_bound_refuses_uncharged_names_the_holder_and_sends_n
     the holder by its process (pid), never by its reason (O12); nothing was sent; and the run has its share back."""
     p = provisioner(client, config, platform_file, ticker, tmp_path, shortcut=True)
     release = threading.Event()
-    thread = tool_in_thread(config, release, reason="a reason that names the first space")
+    thread = tool_in_thread(config, release, reason="warmup_first_run")
     try:
         with lock.held(exclusive=False, timeout_s=1.0) as admission:
             before = len(fake.sent)
@@ -249,7 +251,7 @@ def test_o66_a_reset_at_its_bound_refuses_uncharged_names_the_holder_and_sends_n
     assert error.kind in uncharged_kinds()
     assert "reset lock" in error.detail
     assert f"pid {os.getpid()}" in error.detail
-    assert "first space" not in str(error)
+    assert "warmup_first_run" not in str(error)
     (holder,) = error.holders
     assert (holder["pid"], holder["status"]) == (os.getpid(), "live")
     assert error.wait_s >= SHORT_S
@@ -367,7 +369,7 @@ def test_o66_a_dead_holder_refuses_the_shortcut_but_the_reset_keeps_the_hold(
 ):
     """O66: a holder that died leaves its line open: the shortcut is refused (`holder_gone`, full reads), and the reset
     keeps the exclusive hold for its whole run instead of letting it go at once."""
-    child = SPAWN.Process(target=hold_and_die, args=(str(platform_file), "a killed tool"))
+    child = SPAWN.Process(target=hold_and_die, args=(str(platform_file), "killed_tool"))
     child.start()
     child.join(120)
     assert child.exitcode == 0
@@ -571,13 +573,23 @@ def test_o66_a_reset_with_no_admission_on_a_platform_with_faults_is_refused_and_
     client, config, platform_file, ticker, tmp_path, fake
 ):
     """O66: on a platform with `[faults]` a reset outside every admission could run beside any holder, and an outage
-    run's agent holds no share of the reset lock to wait for: it is refused, naming the hold to take, before anything
-    is sent (a thread that did not inherit the run's context is one such reset)."""
+    run's agent holds no share of the reset lock to wait for: it is refused before anything is sent (a thread that did
+    not inherit the run's context is one such reset), and the refusal names the exact remedy, the hold to wrap the
+    reset in with its argument's form, whose example code is one `shared_admission` accepts."""
     p = provisioner(client, config, platform_file, ticker, tmp_path)
     before = len(fake.sent)
-    with pytest.raises(AdmissionRefused, match="shared_admission"):
+    with pytest.raises(AdmissionRefused) as refused:
         SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)
     assert len(fake.sent) == before
+    message = str(refused.value)
+    assert "wrap the reset in shared_admission(config, reason=<code>)" in message
+    assert "expcore_onedata.tool_admission" in message
+    example = re.search(r"a short code such as (\w+)", message)
+    assert example is not None, message
+    assert checked_code(example.group(1), config, what="reason", says="what the hold is for") == example.group(1)
+    assert "run_in_executor" in message  # inside a campaign: reset in the run's own context
+    with shared_admission(config, reason=example.group(1)):
+        assert SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)["ok"] is True
 
 
 def test_o66_a_reset_under_a_tools_shared_admission_holds_the_lock(
@@ -587,7 +599,7 @@ def test_o66_a_reset_under_a_tools_shared_admission_holds_the_lock(
     holding the reset lock exclusively."""
     p = provisioner(client, config, platform_file, ticker, tmp_path)
     seen = hold_seen_at(monkeypatch, journal)
-    with shared_admission(config, reason="smoke: reset the space"):
+    with shared_admission(config, reason="smoke_reset"):
         record = SpaceReset(p, now=ticker.clock).run(allowed=ALLOWED, qos_rights=True)
     assert record["ok"] is True
     assert seen == [False, False]

@@ -167,7 +167,7 @@ def emptied(provisioner, path: str, file_id: str, mirror: str) -> None:
 def held_reset(provisioner, plan) -> dict:
     """The space's reset under the tools' shared admission: every reset holds the federation's reset lock (O66), and
     on a platform with `[faults]` it takes it only under an admission."""
-    with shared_admission(provisioner.config, reason="live: the imported space's reset"):
+    with shared_admission(provisioner.config, reason="live_import_reset"):
         return SpaceReset(provisioner).run(plan)
 
 

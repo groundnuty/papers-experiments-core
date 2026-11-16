@@ -143,7 +143,7 @@ def test_o59_a_reset_leaves_the_owners_copy_the_listing_and_the_tree_on_the_shar
     mirrors = [p for p in shared["providers"] if p != provisioner.settings.holder]
     tops = sorted({path.split("/")[0] for path in (f.path for f in manifest.files)})
     began = time.monotonic()
-    with shared_admission(provisioner.config, reason="live: the shared import's reset"):  # it holds the reset lock
+    with shared_admission(provisioner.config, reason="live_shared_import_reset"):  # it holds the reset lock
         FACTS["reset_ok"] = SpaceReset(provisioner).run(dict.fromkeys(mirrors, tops))["ok"]
     FACTS["reset_s"] = round(time.monotonic() - began, 3)
     assert FACTS["reset_ok"] is True

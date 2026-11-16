@@ -160,7 +160,7 @@ def test_o51_a_tools_hold_past_the_bound_refuses_the_reset_naming_the_holder_and
     holding, release = threading.Event(), threading.Event()
 
     def tool():
-        with shared_admission(config, reason="smoke: a warm-up"):
+        with shared_admission(config, reason="smoke_warmup"):
             holding.set()
             release.wait(10)
 
@@ -178,7 +178,7 @@ def test_o51_a_tools_hold_past_the_bound_refuses_the_reset_naming_the_holder_and
     assert refused.value.wait_s >= 0.3
     (holder,) = refused.value.holders
     assert holder["status"] == "live"
-    assert "warm-up" not in str(refused.value)
+    assert "smoke_warmup" not in str(refused.value)
 
 
 def test_o51_a_transfer_since_the_reading_on_a_directory_gives_the_full_reads(
