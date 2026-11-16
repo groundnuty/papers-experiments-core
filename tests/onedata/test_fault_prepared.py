@@ -29,8 +29,9 @@ from record_support import hand_made
 
 from expcore.errors import InfraError
 from expcore.records.instruments import finish_instruments, start_instruments
-from expcore_onedata.admission import OUTAGE_RUN, FederationLock, current_admission
+from expcore_onedata.admission import OUTAGE_RUN, FederationLock, current_admission, retain_admission
 from expcore_onedata.config import load_platform
+from expcore_onedata.fault_epoch import LINKS_FAILED, LinkEpoch
 from expcore_onedata.fault_journal import JOURNAL, InjectionJournal
 from expcore_onedata.faults import INJECTOR_FAILURE, load_faults
 from expcore_onedata.sandbox.kinds import FEDERATION_BUSY
@@ -169,6 +170,36 @@ def test_o11_start_is_prepared_then_inject_with_the_same_journal_steps_calls_and
     injected = next(step for step in started["snapshot"]["steps"] if step["step"] == "injected")
     assert injected["at_s"] >= DRAIN_S + 79  # the drain record, not only the recovery's drain, was waited out
     assert started["snapshot"]["ok"] is True
+
+
+def legacy_start(injector, identity):
+    """`start` as it was before the block existed (at ac11fb5e): its first half and its second, which this change
+    moved unchanged into `_prepare` and `_inject`, under the injector's lock and one share of the run's admission, with
+    nothing between them and nothing read again."""
+    with injector._mutex:
+        give_up = retain_admission()
+        try:
+            injector._prepare(identity)
+            injector._inject()
+        except BaseException:
+            if injector._pending is None:
+                injector._release_admission()
+            raise
+        finally:
+            give_up()
+
+
+def test_o11_start_differs_from_the_start_before_the_block_only_by_the_wall_clock_read_of_its_re_check(tmp_path):
+    """O11: against `start` as it was before the block, the new one journals the same lines, records the same
+    snapshot, makes the same driver calls and reads the injector's clock and sleeps alike; what `inject` reads again
+    (the admission, the journal, the drain record, the link epoch) adds one reading of the wall clock, the drain
+    record's, and nothing else."""
+    before = one_outage_run(tmp_path / "legacy", lambda injector: legacy_start(injector, RUN))
+    now = one_outage_run(tmp_path / "start", lambda injector: injector.start(RUN))
+    assert {key: value for key, value in now.items() if key != "wall_reads"} == {
+        key: value for key, value in before.items() if key != "wall_reads"
+    }
+    assert now["wall_reads"] == before["wall_reads"] + 1
 
 
 # --- the pilot's shape: a probe's start inside the block --------------------------------------------------------------
@@ -446,6 +477,96 @@ def test_o11_a_clear_from_another_thread_during_the_baseline_returns_at_once_and
     assert federation_free(platform) is True
 
 
+class SlowStop(FakeServices):
+    """A stop command that takes effect only once the test lets it: `inject` holds the injector's lock meanwhile."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stopping, self.release = threading.Event(), threading.Event()
+
+    def stop(self, service):
+        self.stopping.set()
+        self.release.wait(10)
+        super().stop(service)
+
+
+def injecting_slowly(services, injector):
+    """A worker whose block injects; return it once its stop command is under way, `inject` holding the lock."""
+
+    def block():
+        with injector.prepared(RUN) as prepared:
+            prepared.inject()
+
+    worker = threading.Thread(target=block)
+    worker.start()
+    assert services.stopping.wait(10)
+    return worker
+
+
+def at_once(call):
+    """Run `call` in a thread and return what it raised, or None; fail when it has not ended within 5 s."""
+    raised: list[BaseException | None] = []
+
+    def run():
+        try:
+            call()
+            raised.append(None)
+        except BaseException as error:
+            raised.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive(), "it waited for the block's inject instead of being refused at once"
+    return raised[0]
+
+
+def test_o11_a_start_a_block_and_a_recovery_are_refused_at_once_while_the_blocks_inject_holds_the_lock(tmp_path):
+    """O11: a block's `inject` holds the injector's lock through its stop; a `start`, a second block and a recovery
+    from another thread meanwhile are refused at once (`RuntimeError`), before they wait for that lock, so none of them
+    can run on once the block has ended; the block's injection goes on and is restored as usual."""
+    platform, services = write_faults(tmp_path), SlowStop()
+    injector = injector_for(platform, services)
+    worker = injecting_slowly(services, injector)
+    try:
+
+        def second_block():
+            with injector.prepared({**RUN, "attempt": 3}):
+                pass
+
+        refused = [at_once(call) for call in (lambda: injector.start({**RUN, "attempt": 3}), second_block)]
+        refused.append(at_once(injector.recover))
+    finally:
+        services.release.set()
+        worker.join(10)
+    assert [type(error) for error in refused] == [RuntimeError] * 3
+    assert all("prepared" in str(error) for error in refused)
+    assert stops(services) == [("stop", OUTAGE_SERVICE)]
+    assert injector.finish()["ok"] is True
+
+
+def test_o11_a_clear_while_the_blocks_inject_runs_waits_for_it_and_restores_what_it_took_down(tmp_path):
+    """O11: a `clear` that comes while `inject` holds the lock waits for it, as it waits for a start, and then restores
+    the target the injection took down: nothing is down once it has returned True."""
+    platform, services = write_faults(tmp_path), SlowStop()
+    injector = injector_for(platform, services)
+    worker = injecting_slowly(services, injector)
+    answers: list[bool] = []
+    clearing = threading.Thread(target=lambda: answers.append(injector.clear()))
+    try:
+        clearing.start()
+        clearing.join(0.3)
+        assert clearing.is_alive()  # it waits for the injection under way
+    finally:
+        services.release.set()
+        worker.join(10)
+        clearing.join(10)
+    assert answers == [True]
+    assert services.running(OUTAGE_SERVICE) is True
+    assert open_targets(platform) == []
+    assert federation_free(platform) is True
+
+
 # --- what inject re-checks after an unbounded baseline ----------------------------------------------------------------
 
 
@@ -463,6 +584,104 @@ def test_o11_a_drain_record_raised_during_the_baseline_holds_the_injection_back_
     assert stops(services) == []
     assert journal_lines(platform) == []
     assert services.running(OUTAGE_SERVICE) is True
+
+
+@pytest.mark.parametrize("how", ["raised", "made_anew"])
+def test_o11_a_link_epoch_moved_during_the_baseline_holds_the_injection_back_as_federation_busy(tmp_path, how):
+    """O11: the link epoch the preparation read (`fault_epoch`) moved during the baseline: a link check, in the run's
+    own context, found a pair failing and raised it, or the record was made anew (a raise that could not be written
+    spoiled it). `inject` refuses as the hold `federation_busy` before it locks, journals or stops anything, so no
+    target is stopped on a federation whose links a check found failing after the run was admitted."""
+    platform, services = write_faults(tmp_path), FakeServices()
+    injector = injector_for(platform, services)
+    epochs = LinkEpoch(settings_of(platform).journal)
+    if how == "raised":
+        epochs.ensure()
+    with injector.prepared(RUN) as prepared:
+        if how == "raised":
+            epochs.raise_for(LINKS_FAILED)
+        else:
+            epochs.ensure()
+        with pytest.raises(InfraError) as caught:
+            prepared.inject()
+    assert caught.value.kind == FEDERATION_BUSY
+    assert "link epoch" in caught.value.detail
+    assert stops(services) == []
+    assert journal_lines(platform) == []
+    assert federation_free(platform) is True
+
+
+def test_o11_inject_waits_for_a_link_check_under_way_and_refuses_when_it_found_a_pair_failing(tmp_path):
+    """O11: a link check under way holds `link-epoch.lock` shared from before it reads the pairs until it has raised
+    the epoch; `inject` reads the epoch holding that lock exclusively, as a run's admission does, so it waits for the
+    check to end and then sees its raise, instead of reading between the finding and the raise and stopping the
+    target."""
+    platform, services = write_faults(tmp_path, admission_timeout_s=10), FakeServices()
+    injector = injector_for(platform, services)
+    epochs = LinkEpoch(settings_of(platform).journal)
+    epochs.ensure()
+    checking, found = threading.Event(), threading.Event()
+
+    def link_check():
+        with epochs.checking():
+            checking.set()
+            found.wait(10)
+            epochs.raise_for(LINKS_FAILED)
+
+    errors: list[BaseException] = []
+
+    def inject(prepared):
+        try:
+            prepared.inject()
+        except BaseException as error:
+            errors.append(error)
+
+    with injector.prepared(RUN) as prepared:
+        check = threading.Thread(target=link_check)
+        check.start()
+        try:
+            assert checking.wait(10)
+            injecting = threading.Thread(target=inject, args=(prepared,))
+            injecting.start()
+            injecting.join(0.3)
+            assert injecting.is_alive()  # waiting for the check (secondary: a slow start would pass it too)
+        finally:
+            found.set()
+            check.join(10)
+        injecting.join(10)
+    (error,) = errors
+    assert isinstance(error, InfraError)
+    assert error.kind == FEDERATION_BUSY
+    assert stops(services) == []
+    assert journal_lines(platform) == []
+
+
+def test_o11_a_link_check_that_outlasts_the_wait_holds_the_injection_back_as_federation_busy(tmp_path):
+    """O11: a link check under way past `admission_timeout_s` leaves the epoch unknown; `inject` refuses as the hold
+    `federation_busy`, with nothing locked, journalled or stopped."""
+    platform, services = write_faults(tmp_path, admission_timeout_s=0.3), FakeServices()
+    injector = injector_for(platform, services)
+    epochs = LinkEpoch(settings_of(platform).journal)
+    checking, done = threading.Event(), threading.Event()
+
+    def link_check():
+        with epochs.checking():
+            checking.set()
+            done.wait(10)
+
+    check = threading.Thread(target=link_check)
+    check.start()
+    try:
+        assert checking.wait(10)
+        with injector.prepared(RUN) as prepared, pytest.raises(InfraError) as caught:
+            prepared.inject()
+    finally:
+        done.set()
+        check.join(10)
+    assert caught.value.kind == FEDERATION_BUSY
+    assert "outlasted" in caught.value.detail
+    assert stops(services) == []
+    assert journal_lines(platform) == []
 
 
 def test_o11_an_injection_journalled_during_the_baseline_refuses_the_injection(tmp_path):
