@@ -10,6 +10,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+from fake_elf import bundle_members, write_tar
 from fake_node import FakeNode
 from sandbox_support import TOKEN, SleptClock
 
@@ -35,6 +36,12 @@ def pinned(directory: Path, name: str, content: bytes) -> Pinned:
     path = directory / name
     path.write_bytes(content)
     return Pinned(path, hashlib.sha256(content).hexdigest())
+
+
+def pinned_bundle(directory: Path) -> Pinned:
+    """oneclient's bundle as the build writes it (an invented tar: fake_elf), pinned by its SHA-256."""
+    path = directory / "oneclient-bundle.tar"
+    return Pinned(path, write_tar(path, bundle_members()))
 
 
 def app_settings(files: Path, **changes: Any) -> ApptainerSettings:
@@ -84,4 +91,4 @@ def start(node: FakeNode, settings: SandboxSettings, spec: SandboxSpec | None = 
 
 
 __all__ = ["LEVELS", "LIMITS", "PLACEHOLDER", "PROVIDER", "TOKEN", "ZONE", "make_settings", "make_spec", "options",
-           "pinned", "start"]  # fmt: skip
+           "pinned", "pinned_bundle", "start"]  # fmt: skip

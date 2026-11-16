@@ -103,3 +103,5 @@ egress_shim = "@hpc_egress_shim@"            # bundle/egresslog.c, built for the
 egress_shim_sha256 = "@hpc_egress_shim_sha@"
 egress_collector = "@hpc_egress_collector@"  # bundle/egress-collector.py of this checkout
 egress_collector_sha256 = "@hpc_egress_collector_sha@"
+oneclient_bundle = "@hpc_oneclient_bundle@"  # the host mount's oneclient (oneclient_bundle.py), for the mount level
+oneclient_bundle_sha256 = "@hpc_oneclient_bundle_sha@"

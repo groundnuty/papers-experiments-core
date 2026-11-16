@@ -561,7 +561,8 @@ def _words(section: Section, key: str, default: tuple[str, ...]) -> tuple[str, .
 def _apptainer_sandbox(section: Section, base: Path, tls: TlsSettings | None) -> SandboxSettings:
     """`[sandbox]` of the Apptainer backend (O56): `[sandbox.apptainer]` names the image and the egress logger, and the
     Docker backend's images, network, federation, user, privilege command and earlyoom are refused, since nothing here
-    would read them. A mount level needs `[sandbox.mount]`'s path; its start is refused until the mount lands."""
+    would read them. A mount level needs `[sandbox.mount]`'s path and `[sandbox.apptainer]`'s oneclient bundle (the host
+    mount's oneclient, pinned)."""
     for key in (*DOCKER_ONLY, "sudo", "agent_uid", "earlyoom_comm", "python", "label_namespace"):
         if key in section.data:
             raise section.fail(key, 'is read by the Docker backend alone, and backend is "apptainer"')
@@ -576,6 +577,11 @@ def _apptainer_sandbox(section: Section, base: Path, tls: TlsSettings | None) ->
     mount = _mount(section.section("mount")) if "mount" in section.data else None
     if DataPathMode.MOUNT in data_paths.values() and mount is None:
         raise section.fail("mount", "is required when a data path is a mount")
+    if DataPathMode.MOUNT in data_paths.values() and app.oneclient_bundle is None:
+        raise section.fail(
+            "apptainer", "needs oneclient_bundle and oneclient_bundle_sha256 when a data path is a mount: the host "
+            "mount runs that pinned oneclient on the node (deploy/hpc-federation/README.md)"
+        )  # fmt: skip
     check_file = _space_path(section, "content_check_file")
     if DataPathMode.REST in data_paths.values() and check_file is None:
         raise section.fail("content_check_file", "is required when a data path is rest")
