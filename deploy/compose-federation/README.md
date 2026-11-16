@@ -354,7 +354,9 @@ the root, so the relative `fault-journal` is that directory; a file derived in a
 (`link-check.json`, which `up` writes in the root and a pre-check reads there) is written in it by every fault-gate
 check made through any such file: the restore's, the heal's and the health gate's routine pre-run check. Nothing is
 written beside a derived file. A table whose journal's parent holds no `platform.toml` is refused at load, naming the
-key (a journal that is not in a federation's root has no record to write); a platform file with no `[faults]` declares
+key (a journal that is not in a federation's root has no record to write), and so is a relative journal in a file that
+lies beside a `study.toml` (it would resolve into the study, where the copy of `platform.toml` satisfies that check
+vacuously): there the journal is written in full; a platform file with no `[faults]` declares
 no root, so its link checks write no record.
 
 ```sh
