@@ -313,3 +313,14 @@ def test_a_manifest_node_that_is_not_the_state_s_is_refused(shards, tmp_path):
     plan = shards.load_plan(path)
     with pytest.raises(shards.ShardsError, match="not the one its state file names"):
         shards.federation(plan.shards[0])
+
+
+def test_a_state_whose_job_holds_the_sandbox_role_names_its_node(shards, tmp_path):
+    """O56: `up` places the agent's node as the `sandbox` role of the federation's own job (`services.sandbox`)."""
+    plan = shards.load_plan(_manifest(tmp_path, placement="none"))
+    state_file = plan.shards[0].root / "hpc-federation.json"
+    state = json.loads(state_file.read_text())
+    state["services"] = {"sandbox": {"kind": "sandbox", "node": "node-r1"}}
+    state_file.write_text(json.dumps(state))
+    found = shards.federation(plan.shards[0])
+    assert (found["job"], found["node"], found["het_group"]) == ("101", "node-r1", None)
