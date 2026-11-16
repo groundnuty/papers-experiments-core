@@ -119,6 +119,15 @@ class Down:
         root and the state for a second down, which finishes what is left: the removal is idempotent."""
         state = self.store.read()
         if state.get("storage") is None:
+            if state.get("site", {}).get(
+                "storage_root"
+            ):  # up always records the storage it makes: this one lost its record
+                self.set(lambda s: s.update(phase="down"))
+                raise RuntimeError(
+                    f"{gone}, but the state records a scratch root and no provider storage on it, which up always "
+                    "records: nothing on scratch was removed, and the root and its state are kept; look at the "
+                    "scratch root, then restore the record or remove the scratch root's key from the state"
+                )
             return ""
         try:
             return hpcstorage.remove(state["storage"], state, **self.removal_ops())

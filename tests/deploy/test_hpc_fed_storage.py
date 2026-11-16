@@ -146,6 +146,10 @@ def test_up_makes_one_directory_of_its_own_and_one_per_provider_below_the_scratc
         assert not path.is_symlink()
     marker = json.loads((rig.parent() / ".hpcop-storage-owner").read_text(encoding="utf-8"))
     assert marker == {"allocation": name, "token": record["token"]}
+    for provider, directory in rig.provider_dirs().items():  # each provider's directory proves itself, too
+        assert listing(directory) == {".hpcop-storage-owner"}
+        held = json.loads((directory / ".hpcop-storage-owner").read_text(encoding="utf-8"))
+        assert held == {**marker, "provider": provider}
     assert rig.state()["site"]["storage_root"] == site["HPC_STORAGE_ROOT"]
 
 
@@ -226,7 +230,7 @@ def test_a_marker_that_cannot_be_written_for_want_of_inodes_leaves_no_unproven_d
 
     rig = Rig(hpc, tmp_path, site)
 
-    def full(record):
+    def full(content, **kwargs):
         raise OSError(errno.EDQUOT, os.strerror(errno.EDQUOT))
 
     monkeypatch.setattr(hpc.storage, "_write_marker", full)
@@ -395,11 +399,11 @@ def test_a_removal_that_fails_keeps_the_root_and_the_state_and_the_second_down_f
     real = os.unlink
     calls = []
 
-    def unlink(path):
+    def unlink(path, **kwargs):
         calls.append(path)
         if len(calls) == 4:
             raise PermissionError(13, "Permission denied", str(path))
-        return real(path)
+        return real(path, **kwargs)
 
     rig.driver.removal = {"unlink": unlink}
     with pytest.raises(RuntimeError, match="provider storage on scratch could not be removed"):
@@ -420,7 +424,7 @@ def test_a_removal_that_reports_success_but_leaves_entries_fails_on_the_count(hp
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     (rig.provider_dirs()["aspen"] / "kept.dat").write_bytes(b"z")
-    rig.driver.removal = {"unlink": lambda path: None, "rmdir": lambda path: None}
+    rig.driver.removal = {"unlink": lambda *args, **kwargs: None, "rmdir": lambda *args, **kwargs: None}
     with pytest.raises(RuntimeError, match=r"[0-9]+ entries of the provider storage remain"):
         rig.driver.down()
     assert rig.root.exists()
@@ -477,6 +481,118 @@ def test_a_storage_directory_replaced_by_a_link_is_refused(hpc, tmp_path, site, 
     assert untouched(outside)
     assert parent.is_symlink()
     assert moved.is_dir()
+
+
+def test_a_providers_directory_swapped_for_another_of_this_users_is_not_removed(hpc, tmp_path, site, outside):
+    """O57: the storage's own directory holds this up's marker, but that proves nothing of each child: a provider's
+    directory replaced by an unrelated directory of this user (no marker of this up for it) is refused before any
+    removal, and the replacement's files are whole."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    target = rig.provider_dirs()["larch"]
+    target.rename(target.with_name("larch-moved"))
+    target.mkdir()
+    (target / "unrelated.dat").write_text("not up's\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match=r"larch.*holds no owner marker"):
+        rig.driver.down()
+    assert (target / "unrelated.dat").read_text(encoding="utf-8") == "not up's\n"
+    assert all((d / ".hpcop-storage-owner").is_file() for n, d in rig.provider_dirs().items() if n != "larch")
+    assert rig.root.exists()
+
+
+def test_a_directory_swapped_for_a_link_after_it_was_proved_is_never_followed(hpc, tmp_path, site, outside):
+    """O57: what is removed is the proved directory (held open, its contents removed through its descriptor), whatever
+    its path names a moment later: swapped for a link to another directory between the proof and the removal, the
+    link's target is whole, the link stays, and `down` fails saying the directory could not be removed."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    populate(rig, outside)
+    real, swapped = hpc.storage.remove_tree, []
+
+    def remove_tree(directory, **kwargs):
+        if not swapped:
+            target = Path(os.readlink(directory))  # the path the held descriptor was opened by
+            swapped.append(target)
+            target.rename(target.with_name(target.name + "-moved"))
+            target.symlink_to(outside)
+        return real(directory, **kwargs)
+
+    hpc.storage.remove_tree = remove_tree
+    try:
+        with pytest.raises(RuntimeError, match="could not be removed"):
+            rig.driver.down()
+    finally:
+        hpc.storage.remove_tree = real
+    assert untouched(outside)
+    assert swapped[0].is_symlink()
+    assert swapped[0].with_name(swapped[0].name + "-moved").is_dir()
+
+
+def test_a_directory_that_cannot_be_retired_gets_its_marker_back_and_the_second_down_finishes(hpc, tmp_path, site):
+    """O57: a provider's directory emptied but not removed (its `rmdir` refused) is left holding its marker again, so
+    the second `down` can still prove it up's and finish."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    refused = []
+
+    def rmdir(path, **kwargs):
+        if kwargs.get("dir_fd") is not None and not refused:
+            refused.append(path)
+            raise PermissionError(13, "Permission denied")
+        return os.rmdir(path, **kwargs)
+
+    rig.driver.removal = {"rmdir": rmdir}
+    with pytest.raises(RuntimeError, match="its owner marker is kept"):
+        rig.driver.down()
+    held = [d for d in rig.provider_dirs().values() if d.exists()]
+    assert [listing(d) for d in held if d.name == refused[0]] == [{".hpcop-storage-owner"}]
+    rig.driver.removal = {}
+    rig.fake.state = "GONE"
+    assert "0 entries remain" in rig.driver.down()
+    assert listing(rig.scratch) == set()
+
+
+@pytest.mark.parametrize(
+    "edit", [lambda s: s.pop("storage"), lambda s: s.update(storage=None)], ids=["deleted", "null"]
+)
+def test_a_state_that_names_a_scratch_root_but_no_storage_is_refused_not_read_as_nothing_to_remove(
+    hpc, tmp_path, site, edit
+):
+    """O57: `up` always records the storage it makes, so a state with the site's scratch root and no `storage` (the key
+    deleted, or null) is not one that made none: `down` refuses, saying nothing on scratch was removed, and keeps the
+    root and the state."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    parent = rig.parent()
+    rig.edit_state(edit)
+    with pytest.raises(RuntimeError, match="records a scratch root and no provider storage"):
+        rig.driver.down()
+    assert parent.is_dir()
+    assert all(d.is_dir() for d in parent.iterdir() if d.name != ".hpcop-storage-owner")
+    assert rig.root.exists()
+
+
+def test_a_provider_marker_that_cannot_be_written_removes_that_empty_directory(hpc, tmp_path, site, monkeypatch):
+    """O57: a provider's marker that cannot be written (the quota ran out) removes the empty directory just made; the
+    marked directories before it are the state's, and `down` removes them."""
+    import errno
+
+    rig = Rig(hpc, tmp_path, site)
+    real, calls = hpc.storage._write_marker, []
+
+    def write(content, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 3:  # the storage's own, one provider's, then this one
+            raise OSError(errno.EDQUOT, os.strerror(errno.EDQUOT))
+        return real(content, **kwargs)
+
+    monkeypatch.setattr(hpc.storage, "_write_marker", write)
+    with pytest.raises(RuntimeError, match="could not be made"):
+        rig.up()
+    monkeypatch.undo()
+    assert len(listing(rig.parent())) == 2  # its marker and the one provider's directory, the third removed
+    assert "0 entries remain" in rig.driver.down()
+    assert listing(rig.scratch) == set()
 
 
 def test_a_marker_that_is_not_this_ups_is_refused(hpc, tmp_path, site):

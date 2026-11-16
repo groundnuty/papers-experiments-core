@@ -244,19 +244,22 @@ the full contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   plus the estimate passes 95% of the quota**, naming the used count, the estimate, the quota and the 95% line. A total
   exactly at the line passes. **It fails closed:** a command or pattern that is not set, a pattern that does not compile or
   lacks a group, a command that cannot run, fails or does not answer in 120 s, an output the pattern does not match exactly
-  once, a figure that is no count (`unlimited` is none) and a quota of 0 all refuse `up`, naming why; only
+  once, a figure that is no count (`unlimited` is none) or that the pattern cut out of a longer one (`1000.5`, `2G`: the
+  pattern must capture the whole figure) and a quota of 0 all refuse `up`, naming why; only
   `HPC_QUOTA_CHECK=off` turns the check off. For the ingest layout the estimate is a handful (its spaces declare no data);
   for `layouts/pilot-shape-import.toml` it is the four imported manifests.
 - **`up` then makes the federation's storage:** below `HPC_STORAGE_ROOT`, one directory of its own named for its allocation
-  (0700, with an owner marker) and one per provider, each by an exclusive `mkdir` that never adopts what is already there,
-  recorded in the state file before the first is made. **Not built yet:** the bundle's bind of each directory onto its
+  (0700) and one per provider, each by an exclusive `mkdir` that never adopts what is already there and each holding an
+  owner marker, recorded in the state file before the first is made. **Not built yet:** the bundle's bind of each directory onto its
   provider's `/volumes/posix`; until it is, a provider's posix storage is on its node's tmpfs and the directories are
   empty. The guard and the removal are written for that bind.
 - **`down` removes exactly those directories,** after the job is gone and every service verified clean, and counts what
   remains: any entry fails it loudly, with the root and the state kept for a second `down`. It reads the paths from the
-  state file alone, refuses a record that is not the exact form `up` writes, and removes nothing it cannot prove `up`
-  made: a directory already there when `up` ran, a marker that is not this `up`'s, a link in a directory's place, an entry
-  it did not make. A link inside a directory is removed, never followed.
+  state file alone, refuses a record that is not the exact form `up` writes (a state with the scratch root and no record
+  is refused too), and removes nothing it cannot prove `up` made: a directory already there when `up` ran, one without
+  this `up`'s marker (a provider's directory replaced by another of yours included), a link in a directory's place, an
+  entry it did not make. Each directory is held open and proved before any is removed, and emptied through its
+  descriptor, so a path swapped afterwards is never followed. A link inside a directory is removed, never followed.
 
 ## A shared imported tree
 

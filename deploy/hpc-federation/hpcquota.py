@@ -24,6 +24,7 @@ ingest is outside every manifest `up` knows.
 
 import re
 import shlex
+import string
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import hpcdata
@@ -34,6 +35,9 @@ LINE_PERCENT = 95  # up refuses a federation whose inodes would pass this share 
 QUOTA_TIMEOUT_S = 120.0  # the command's bound
 STDERR_TAIL = 200  # the most of its stderr a message repeats
 COUNT = re.compile(r"[0-9]+(?:,[0-9]{3})*")  # a count, with "," as a thousands separator
+# What a figure may not touch in the output: a figure the pattern cut out of a longer one (`1000.5`, `2G`, `1e6`,
+# `12-3`, `95%`) would read as a smaller count, so each is refused where the pattern stopped short of the token.
+TOUCHING = frozenset(string.ascii_letters + string.digits + "_.,+-%")
 MAX_COUNT = 10**15  # no inode quota is above this: a figure that is, is not one
 GROUPS = ("used", "quota")
 
@@ -92,7 +96,15 @@ def parse_quota(text: str, pattern: "re.Pattern[str]") -> Tuple[int, int]:
     if len(matches) != 1:
         found = "nothing" if not matches else f"{len(matches)} times"
         raise QuotaRefused(f"HPC_QUOTA_PATTERN matched {found} in the quota command's output (it must match once)")
-    used, quota = (count_of(matches[0].group(name), name) for name in GROUPS)
+    found = matches[0]
+    used, quota = (count_of(found.group(name), name) for name in GROUPS)
+    for name in GROUPS:
+        start, end = found.span(name)
+        if text[max(start - 1, 0) : start] in TOUCHING or text[end : end + 1] in TOUCHING:
+            raise QuotaRefused(
+                f"the {name} figure the quota command printed is cut out of a longer one (a decimal point, a unit or a "
+                "longer number touches it): HPC_QUOTA_PATTERN must capture the whole figure"
+            )
     if quota == 0:
         raise QuotaRefused("a quota of 0 sets no line to check against (HPC_QUOTA_CHECK=off skips the check)")
     return used, quota

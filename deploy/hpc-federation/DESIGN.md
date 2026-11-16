@@ -637,7 +637,10 @@ is built and run live; the directories `up` makes are the ones that bind will ta
 
 1. Read the account's inode usage and quota through the command `site.env` names, `HPC_QUOTA_CMD`, split as a shell
    would split it and **run without a shell** on the login node (bounded: 120 s), and read its output with
-   `HPC_QUOTA_PATTERN`, a regular expression with the named groups `used` and `quota`, which must match exactly once.
+   `HPC_QUOTA_PATTERN`, a regular expression with the named groups `used` and `quota`, which must match exactly once and
+   capture each figure whole: a figure the pattern cut out of a longer one (a `1000.5` read as `1000`, a `2G`, a `95%`, a
+   digit run on) is refused, so the characters touching a captured figure may not be a letter, a digit, `_`, `.`, `,`,
+   `+`, `-` or `%`.
    The repository holds neither the site's tool nor its output: the tests run an invented command and an invented format.
 2. **Estimate** the federation's inodes from its data manifests: every space's manifest once, **files and directories**
    (each is an inode). A shared import's manifest is its layout's own file; every other space's is the baseline `up`
@@ -653,7 +656,8 @@ is built and run live; the directories `up` makes are the ones that bind will ta
 
 **It fails closed.** The guard refuses `up`, naming why, when: `HPC_QUOTA_CMD` or `HPC_QUOTA_PATTERN` is unset; the
 pattern does not compile or lacks `used` or `quota`; the command cannot run, exits non-zero or does not answer in time;
-the pattern matches the output never or more than once; a figure is no count (including `unlimited`); the quota is 0.
+the pattern matches the output never or more than once; a figure is no count (including `unlimited`) or is cut out of a
+longer one; the quota is 0.
 Only `HPC_QUOTA_CHECK=off` skips the check (the one value; any other, `OFF` and `0` included, is refused at the
 start; unset is not off), and `up` says it was skipped. A site that sets `HPC_STORAGE_ROOT` and neither names a
 command nor turns the check off cannot `up`.
@@ -662,8 +666,10 @@ command nor turns the check off cannot `up`.
 federation's root nor inside it, and is no shared tree and holds or lies inside none, since `down` removes below it and
 nothing may be written to a shared tree) `up` makes `<root>/<allocation name>` (0700; the name's random part is the
 allocation's) and in it one directory per provider (0700), each by an exclusive `mkdir`: anything already there refuses
-`up`, and is never adopted. The first holds the owner marker `.hpcop-storage-owner` (0600): the allocation's name and a
-random token the state file also holds. The state file records every path **before** the first `mkdir`, and the
+`up`, and is never adopted. Each directory holds the owner marker `.hpcop-storage-owner` (0600): the allocation's name and
+a random token the state file also holds, and a provider's directory's also names the provider. (The marker lies in the
+provider's storage directory, which is to become its posix mount point: a hidden file at its root, outside any space.)
+A marker that cannot be written, for want of inodes, removes the empty directory just made. The state file records every path **before** the first `mkdir`, and the
 directories are made after the state exists and before the job is submitted, so a failure here leaves no job billing.
 
 **`down` removes exactly what `up` made.** After the job is gone and every service verified clean (section 5, step 5):
@@ -671,13 +677,18 @@ directories are made after the state exists and before the job is submitted, so 
 - the recorded `storage` must be, character for character, the form `up` writes: the site's recorded scratch root (normal,
   absolute, not `/`), the allocation's own name below it, the owner token, and a directory of each provider of the layout
   below that, nothing else. A state edited to name any other path is refused, before anything is touched;
-- the storage's own directory must be a real directory (never a link) of this user that holds this `up`'s marker, and each
-  provider's directory a real directory of this user; all are checked **before any is removed**, so a bad one stops the
-  whole removal. A directory already at the path when `up` ran (it refused it), a marker that is not this `up`'s and a
+- the storage's own directory and each provider's are **opened without following a link, held open, and proved** (a real
+  directory of this user that holds this `up`'s marker for it) **before any is removed**, so a bad one stops the whole
+  removal. A directory already at the path when `up` ran (it refused it), one with no marker or another `up`'s, an
+  unrelated directory of this user put in a provider's place (the parent's marker proves nothing of its children), and a
   link in a directory's place are not `up`'s: nothing is removed and `down` fails saying so, keeping the root and state;
-- each provider's directory is removed whole by `hpcremove.remove_tree` (never through a link, a link inside is removed
-  and its target never touched, a read-only directory made writable first), then the marker, then the storage's own
-  directory by `rmdir`. An entry in it that `up` did not make is kept with the marker, and fails `down` naming how many;
+- each provider's directory is **emptied through its descriptor** (`hpcremove.remove_tree` on `/proc/self/fd/<n>`: never
+  through a link, a link inside is removed and its target never touched, a read-only directory made writable first), then
+  retired (its marker, then the directory by `rmdir` through its parent's descriptor; a failed `rmdir` puts the marker
+  back), then the storage's own directory the same way. A path swapped for a link or another directory after the proof is
+  never followed: the proved directory is the one emptied, and the `rmdir` of the swapped name fails. A concurrent change
+  inside the 0700 tree by this same user is not defended against. An entry in the storage's directory that `up` did not
+  make is kept with the marker, and fails `down` naming how many;
 - **what remains of the recorded paths is then counted** and any entry fails `down` loudly, naming the count (a removal
   that raised nothing and left entries is caught there). `down` prints `provider storage: <n> directories removed, 0 entries
   remain`.
@@ -685,4 +696,6 @@ directories are made after the state exists and before the job is submitted, so 
 The removal is idempotent: a `down` cut short, or one that failed, is finished by the next (the marker goes only when
 nothing else is left, and is put back if the last `rmdir` fails). A `down` over a root with no state file removes
 nothing on scratch: there is no record of what `up` made. A state written before this key (no `storage`, no
-`storage_root`) goes down as it did.
+`storage_root`) goes down as it did; a state with the site's `storage_root` and no `storage` (the record deleted, or
+null) is **refused**, since `up` always records what it makes: nothing on scratch is removed and the root and state are
+kept.

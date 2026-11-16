@@ -225,10 +225,17 @@ def test_a_quota_command_that_cannot_run_or_does_not_answer_is_refused(hpc, tmp_
         ("inodes used 5 of 100\ninodes used 6 of 100\n", "matched 2 times"),
         ("inodes used 5 of 0\n", "quota of 0"),
         ("inodes used 99999999999999999999999 of 100\n", "not a count"),
+        ("inodes used 5 of 1000.5\n", "cut out of a longer one"),
+        ("inodes used 5 of 1000unlimited\n", "cut out of a longer one"),
+        ("inodes used 5 of 2G\n", "cut out of a longer one"),
+        ("inodes used 1.5 of 100\n", "matched nothing"),
+        ("inodes used 5 of 100%\n", "cut out of a longer one"),
+        ("inodes used 5 of 1,000,\n", "not a count"),
     ],
 )
 def test_output_that_is_not_one_used_count_and_one_quota_is_refused(hpc, tmp_path, site, text, why):
-    """O57: no match, two matches, an unlimited quota, a quota of 0 and a count that is no integer all fail closed."""
+    """O57: no match, two matches, an unlimited quota, a quota of 0, a count that is no integer and a figure the pattern
+    cut out of a longer one (a decimal, a unit, a percent: it would read as a smaller count) all fail closed."""
     refused(hpc, tmp_path, site, Quota(hpc, text=text), why)
 
 
