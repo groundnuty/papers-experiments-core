@@ -42,6 +42,7 @@ reader's: the login node and the nodes keep the cluster's time.
 
 import contextlib
 import ctypes
+import errno
 import fcntl
 import json
 import math
@@ -479,13 +480,44 @@ def _syscall(number: int, *args: int) -> int:
     return int(done)
 
 
+def _open_pidfd(pid: int) -> int:
+    """pidfd_open(2): `os.pidfd_open` where this Python has it, else the raw call. Raise OSError with ENOSYS when the
+    kernel has no such call (Linux before 5.3), ProcessLookupError when the process is gone."""
+    opener = getattr(os, "pidfd_open", None)
+    return opener(pid) if opener is not None else _syscall(PIDFD_OPEN, pid, 0)
+
+
+def _kill_if_started(pid: int, start: str, signum: int) -> bool:
+    """`signal_if_started` where the kernel has no pidfd: read `pid`'s start tick and, only while it is `start`, send
+    `signum` with `os.kill`; the pattern `hpcslurm.Runner.end_client` follows, whose caller rechecks that the process
+    went (`_stop` waits for its heartbeat to go). A PID taken over since the process ended shows another tick and is
+    never signalled. Weaker than the pidfd, which holds the process across the check: a PID reused in the instant
+    between the read and the kill is not caught, and a PID is reused only once the whole PID space has cycled."""
+    seen = proc_start(pid)
+    if seen is None:  # no /proc entry: the process is gone, or its start cannot be shown to be ours
+        raise ProcessLookupError(errno.ESRCH, f"no process {pid} with a readable start tick")
+    if seen != start:  # another process holds the PID now
+        return False
+    os.kill(pid, signum)
+    return True
+
+
 def signal_if_started(pid: int, start: str, signum: int) -> bool:
     """Send `signum` to `pid` only while it is the process that started at clock tick `start`: a pidfd is opened first
     and held across the check, so a PID reused before it shows another start and is never signalled (pidfd_open(2),
-    pidfd_send_signal(2), through `os` and `signal` where this Python has them, else the raw calls). Return whether it
-    was sent; raise ProcessLookupError when the process is gone."""
-    opener = getattr(os, "pidfd_open", None)
-    handle = opener(pid) if opener is not None else _syscall(PIDFD_OPEN, pid, 0)
+    pidfd_send_signal(2), through `os` and `signal` where this Python has them, else the raw calls). A kernel that
+    answers ENOSYS to `pidfd_open` (a login node older than Linux 5.3) has no pidfd: the start tick is then checked
+    and the signal sent with `os.kill` (`_kill_if_started`); any other failure is raised. No process group (PID 0 or
+    below), no init (PID 1) and no process without a recorded start tick is ever signalled. Return whether it was
+    sent; raise ProcessLookupError when the process is gone."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or not isinstance(start, str) or not start:
+        return False
+    try:
+        handle = _open_pidfd(pid)
+    except OSError as error:
+        if error.errno != errno.ENOSYS:  # a gone process (ESRCH), too many open files, ...: never worked around
+            raise
+        return _kill_if_started(pid, start, signum)
     try:
         if proc_start(pid) != start:  # another process holds the PID now
             return False

@@ -5,11 +5,14 @@ Each test runs the relay in this process: a client's wait for an answer serves t
 is answered as the relay would answer it between two of the client's looks, and nothing runs but a fake runner.
 """
 
+import errno
 import json
 import os
 import stat
 import subprocess
+import sys
 import threading
+import time
 import uuid
 
 import pytest
@@ -400,26 +403,194 @@ def test_o58_a_second_relay_of_the_same_root_refuses_to_start(tmp_path):
         pass
 
 
+@pytest.fixture
+def kills(monkeypatch):
+    """Every `os.kill` made while the test runs, recorded as (pid, signal) and then really made, so a test's own cleanup
+    still works."""
+    sent: list[tuple[int, int]] = []
+    real = os.kill
+
+    def kill(pid, signum):
+        sent.append((pid, signum))
+        real(pid, signum)
+
+    monkeypatch.setattr(os, "kill", kill)
+    return sent
+
+
+def refused_by_the_kernel(*_args, **_kwargs):
+    raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+
+
+def without_pidfd_open(monkeypatch, fault_relay, python_has_it):
+    """A kernel with no `pidfd_open` system call (ENOSYS): `os.pidfd_open` raises it where this Python has the function,
+    else the raw call does. No other pidfd call is allowed after it."""
+    if python_has_it:
+        monkeypatch.setattr(fault_relay.os, "pidfd_open", refused_by_the_kernel, raising=False)
+    else:
+        monkeypatch.delattr(fault_relay.os, "pidfd_open", raising=False)
+
+        def syscall(number, *args):
+            assert number == fault_relay.PIDFD_OPEN, f"system call {number} tried after pidfd_open was refused"
+            raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+
+        monkeypatch.setattr(fault_relay, "_syscall", syscall)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("pidfd_send_signal tried after pidfd_open was refused")
+
+    monkeypatch.setattr(fault_relay.signal, "pidfd_send_signal", forbidden, raising=False)
+
+
+@pytest.fixture
+def sleeper():
+    """A process of ours to signal, ended and reaped whatever the test does."""
+    child = subprocess.Popen(["sleep", "30"])
+    yield child
+    child.kill()
+    child.wait()
+
+
 @pytest.mark.parametrize("raw", [False, True])
 def test_o58_the_relay_is_stopped_only_while_its_pid_is_still_the_relay_and_without_the_python_pidfd_calls(
-    tmp_path, monkeypatch, raw
+    tmp_path, monkeypatch, kills, sleeper, raw
 ):
     """O58: `down` stops the relay by its heartbeat's pid and start tick, through a pidfd held across the check, so a
     PID another process took is never signalled; a Python built without `os.pidfd_open` (uv's standalone builds) uses
-    the raw system calls instead."""
+    the raw system calls instead. The signal goes through the pidfd, never through `os.kill`."""
     from expcore_onedata import fault_relay
 
+    try:
+        fault_relay.os.close(fault_relay._open_pidfd(os.getpid()))
+    except OSError as error:
+        if error.errno == errno.ENOSYS:
+            pytest.skip("this kernel has no pidfd_open: the fallback's tests run instead")
+        raise
     if raw:
         monkeypatch.delattr(fault_relay.os, "pidfd_open", raising=False)
         monkeypatch.delattr(fault_relay.signal, "pidfd_send_signal", raising=False)
+    start = fault_relay.proc_start(sleeper.pid)
+    assert start is not None
+    assert fault_relay.signal_if_started(sleeper.pid, str(int(start) + 1), fault_relay.signal.SIGTERM) is False
+    assert sleeper.poll() is None
+    assert fault_relay.signal_if_started(sleeper.pid, start, fault_relay.signal.SIGTERM) is True
+    assert sleeper.wait(timeout=10) == -fault_relay.signal.SIGTERM
+    assert [pid for pid, _ in kills if pid == sleeper.pid] == []
+
+
+@pytest.mark.parametrize("python_has_it", [True, False])
+def test_o58_where_the_kernel_has_no_pidfd_open_the_relay_is_signalled_through_its_start_tick(
+    monkeypatch, kills, sleeper, python_has_it
+):
+    """O58: a login node whose kernel lacks `pidfd_open` answers ENOSYS (whether `os.pidfd_open` raises it or the raw
+    call does): the stop then checks the process's start tick and sends the signal with `os.kill`, once, and the
+    process ends. The first live `down` found the stop failing on the ENOSYS and leaving a running relay unverified."""
+    from expcore_onedata import fault_relay
+
+    without_pidfd_open(monkeypatch, fault_relay, python_has_it)
+    start = fault_relay.proc_start(sleeper.pid)
+    assert start is not None
+    assert fault_relay.signal_if_started(sleeper.pid, start, fault_relay.signal.SIGTERM) is True
+    assert sleeper.wait(timeout=10) == -fault_relay.signal.SIGTERM
+    sent = [(pid, signum) for pid, signum in kills if pid == sleeper.pid]
+    assert sent == [(sleeper.pid, fault_relay.signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("python_has_it", [True, False])
+def test_o58_without_pidfd_open_a_pid_whose_start_tick_differs_is_never_signalled(
+    monkeypatch, kills, sleeper, python_has_it
+):
+    """O58: on the fallback path too, a PID that shows another start tick than the recorded one (the relay died and the
+    PID went to another process) is not signalled: nothing is sent and the process is untouched."""
+    from expcore_onedata import fault_relay
+
+    without_pidfd_open(monkeypatch, fault_relay, python_has_it)
+    start = fault_relay.proc_start(sleeper.pid)
+    assert start is not None
+    assert fault_relay.signal_if_started(sleeper.pid, str(int(start) + 1), fault_relay.signal.SIGTERM) is False
+    assert sleeper.poll() is None
+    assert [pid for pid, _ in kills if pid == sleeper.pid] == []
+
+
+def test_o58_without_pidfd_open_a_process_that_is_gone_is_reported_gone_and_nothing_is_sent(monkeypatch, kills):
+    """O58: the fallback reads the start tick first: a process that is gone (no /proc entry) raises
+    `ProcessLookupError`, as the pidfd path does, and no signal is sent."""
+    from expcore_onedata import fault_relay
+
+    without_pidfd_open(monkeypatch, fault_relay, False)
     child = subprocess.Popen(["sleep", "30"])
+    start = fault_relay.proc_start(child.pid)
+    assert start is not None
+    child.kill()
+    child.wait()
+    kills.clear()  # the test's own kill above
+    with pytest.raises(ProcessLookupError):
+        fault_relay.signal_if_started(child.pid, start, fault_relay.signal.SIGTERM)
+    assert kills == []
+
+
+@pytest.mark.parametrize(
+    ("pid", "start"),
+    [(0, "1"), (-1, "1"), (1, "1"), ("ours", None), ("ours", ""), ("ours", 123)],
+)
+def test_o58_without_pidfd_open_no_pid_that_names_a_group_or_init_and_no_missing_tick_reaches_os_kill(
+    monkeypatch, pid, start
+):
+    """O58: `os.kill` takes 0 and negative numbers for a process group or every process, and a missing start tick would
+    equal an unreadable one: the fallback sends nothing for either, and nothing for PID 1 (pidfd_open refused them)."""
+    from expcore_onedata import fault_relay
+
+    without_pidfd_open(monkeypatch, fault_relay, True)
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda target, signum: sent.append((target, signum)))  # never delegates
+    target = os.getpid() if pid == "ours" else pid
+    assert fault_relay.signal_if_started(target, start, fault_relay.signal.SIGTERM) is False
+    assert sent == []
+
+
+def test_o58_a_refusal_of_pidfd_open_other_than_no_such_call_is_raised_and_nothing_is_sent(monkeypatch, kills, sleeper):
+    """O58: only ENOSYS (the call does not exist here) falls back to the start tick; any other failure of the pidfd
+    (here too many open files) is raised, and nothing is sent by another way."""
+    from expcore_onedata import fault_relay
+
+    def full(*_args, **_kwargs):
+        raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+
+    monkeypatch.setattr(fault_relay.os, "pidfd_open", full, raising=False)
+    start = fault_relay.proc_start(sleeper.pid)
+    assert start is not None
+    with pytest.raises(OSError, match=os.strerror(errno.EMFILE)) as raised:
+        fault_relay.signal_if_started(sleeper.pid, start, fault_relay.signal.SIGTERM)
+    assert raised.value.errno == errno.EMFILE
+    assert sleeper.poll() is None
+    assert [pid for pid, _ in kills if pid == sleeper.pid] == []
+
+
+def test_o58_the_stop_command_ends_a_running_relay_where_the_kernel_has_no_pidfd_open(tmp_path, monkeypatch):
+    """O58: `fault_relay stop --root R` ends a real relay and exits 0 once its heartbeat is gone, on a kernel without
+    `pidfd_open`, where it exited 1 on the ENOSYS and left `down` unable to call a running relay stopped."""
+    from expcore_onedata import fault_relay
+
+    root, log = root_of(tmp_path), tmp_path / "relay.log"
+    with log.open("wb") as sink:
+        relay = subprocess.Popen(
+            [sys.executable, "-B", "-m", "expcore_onedata.fault_relay", "serve", "--root", str(root), "--", *PREFIX],
+            env=clean_environment(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=sink,
+            stderr=sink,
+        )
     try:
-        start = fault_relay.proc_start(child.pid)
-        assert start is not None
-        assert fault_relay.signal_if_started(child.pid, str(int(start) + 1), fault_relay.signal.SIGTERM) is False
-        assert child.poll() is None
-        assert fault_relay.signal_if_started(child.pid, start, fault_relay.signal.SIGTERM) is True
-        assert child.wait(timeout=10) == -fault_relay.signal.SIGTERM
+        deadline = time.monotonic() + 30
+        while beat(root) is None:
+            assert relay.poll() is None, f"the relay ended at its start: {log.read_text()}"
+            assert time.monotonic() < deadline, f"the relay never beat: {log.read_text()}"
+            time.sleep(0.1)
+        without_pidfd_open(monkeypatch, fault_relay, False)
+        assert fault_relay.main(["stop", "--root", str(root)]) == 0
+        assert relay.wait(timeout=30) == 0
+        assert not (relay_dir(root) / "heartbeat.json").exists()
     finally:
-        child.kill()
-        child.wait()
+        if relay.poll() is None:
+            relay.kill()
+        relay.wait()
