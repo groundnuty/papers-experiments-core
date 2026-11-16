@@ -395,6 +395,23 @@ def test_o11_no_worker_takes_a_share_while_a_section_is_held(tmp_path):
         assert admission.may_act
 
 
+def test_o11_no_section_joins_a_grant_its_last_user_is_ending(tmp_path, monkeypatch):
+    """O11: once the last section using a grant has left, the grant is ending: a nested section that would join it in
+    that window is not given it, so no reset begins under a hold about to be let go."""
+    config, _, lock = federation(tmp_path)
+    joined: list[bool] = []
+    end = resetgrant.ResetGrant.end
+
+    def ending(self):
+        joined.append(self.join())
+        end(self)
+
+    monkeypatch.setattr(resetgrant.ResetGrant, "end", ending)
+    with lock.held(exclusive=False, timeout_s=PROBE_S), exclusive(config, shortcut()) as grant:
+        assert grant.held
+    assert joined == [False]
+
+
 def test_o11_a_dead_holder_keeps_refusing_the_shortcut_for_its_quiet_window(tmp_path, monkeypatch):
     """O11: what a dead holder left behind (a tool server in a session of its own, a read the provider still serves)
     may outlive the section that found it: the next sections refuse the shortcut too, naming it, until

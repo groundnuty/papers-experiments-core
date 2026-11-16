@@ -8,6 +8,7 @@ reset that cannot take the shortcut still holds the lock; only the reads change.
 locks are real, on the fixture's journal directory, and their waits are real seconds.
 """
 
+import asyncio
 import contextlib
 import contextvars
 import dataclasses
@@ -25,7 +26,7 @@ from reset_lock_support import hold_until_told
 from shared_support import hold_and_die
 
 from expcore.errors import uncharged_kinds
-from expcore_onedata.admission import AdmissionRefused, FederationBusy, FederationLock
+from expcore_onedata.admission import AdmissionRefused, FederationBusy, FederationLock, run_admission
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.faults import load_faults
@@ -515,6 +516,52 @@ def test_o66_an_outer_section_that_ends_while_its_nested_reset_runs_leaves_the_h
         assert seen == [False]
         assert not grant.held
         assert admission.reset.shared
+
+
+# --- the campaign's own path ------------------------------------------------------------------------------------------
+
+
+def test_o66_a_reset_in_the_campaigns_attempt_through_to_thread_holds_the_lock(
+    client, config, platform_file, ticker, tmp_path, fake, journal, monkeypatch
+):
+    """O66: the campaign enters the run admission (`run_admission`) in its dispatch thread and runs the executor with
+    `asyncio.run`, so a study's reset made from the executor through `asyncio.to_thread` sees the run's admission:
+    it holds the reset lock exclusively from its first stage to its last, and passes."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    seen = hold_seen_at(monkeypatch, journal)
+    admit = run_admission(config)
+    assert admit is not None
+
+    async def executor():
+        return await asyncio.to_thread(SpaceReset(p, now=ticker.clock).run, allowed=ALLOWED, qos_rights=True)
+
+    with admit((), {}, threading.Event(), False):
+        record = asyncio.run(executor())
+    assert record["ok"] is True
+    assert record["reset_lock"]["mode"] == "exclusive"
+    assert seen == [False, False]
+
+
+def test_o66_a_reset_in_a_thread_pool_that_did_not_inherit_the_run_is_refused_and_sends_nothing(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O66: `loop.run_in_executor` does not carry the run's context, so a reset made through it holds no admission:
+    on a platform with `[faults]` it is refused, nothing sent, rather than waiting on its own run's share or running
+    beside another holder."""
+    p = provisioner(client, config, platform_file, ticker, tmp_path)
+    admit = run_admission(config)
+    assert admit is not None
+    reset = SpaceReset(p, now=ticker.clock)
+
+    async def executor():
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: reset.run(allowed=ALLOWED, qos_rights=True))
+
+    with admit((), {}, threading.Event(), False):
+        before = len(fake.sent)
+        with pytest.raises(AdmissionRefused, match="run_in_executor"):
+            asyncio.run(executor())
+        assert len(fake.sent) == before
 
 
 # --- no reset without the federation's admission --------------------------------------------------------------------

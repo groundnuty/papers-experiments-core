@@ -164,7 +164,7 @@ class ResetGrant:
         """Count one more section using this grant (a nested one, maybe in a thread that inherited the context), while
         its hold is in force; False, counting nothing, once it is not."""
         with self._guard:
-            if self._ended or not self.held:
+            if self._ended or self._users == 0 or not self.held:  # 0: its last user is ending it
                 return False
             self._users += 1
             return True
