@@ -420,6 +420,19 @@ def test_o59_a_log_directory_that_holds_a_tree_is_refused_too(hpc, tmp_path, sit
     assert rig.fake.calls == []
 
 
+def test_o59_directories_whose_names_share_a_prefix_do_not_overlap(hpc):
+    """O59: the overlap of two real paths is by whole components: /data/a and /data/ab are two trees, /data/a/b is
+    inside /data/a, and a path is its own overlap."""
+    import hpcimport
+
+    assert not hpcimport.overlap("/data/a", "/data/ab")
+    assert hpcimport.overlap("/data/a", "/data/a/b")
+    assert hpcimport.overlap("/data/a/b", "/data/a")
+    assert hpcimport.overlap("/data/a", "/data/a")
+    assert hpcimport.overlap("/data", "/data/a")
+    assert not hpcimport.overlap("/data/a", "/home/a")
+
+
 @pytest.mark.parametrize("nested", [False, True], ids=["one directory", "one inside the other"])
 def test_o59_two_imports_may_not_name_one_tree_by_two_variables(hpc, tmp_path, site, environ, nested):
     """O59: each import has a tree of its own: the layout compares the variables' names, and the driver compares what
