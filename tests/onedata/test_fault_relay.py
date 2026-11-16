@@ -460,12 +460,8 @@ def test_o58_the_relay_is_stopped_only_while_its_pid_is_still_the_relay_and_with
     the raw system calls instead. The signal goes through the pidfd, never through `os.kill`."""
     from expcore_onedata import fault_relay
 
-    try:
-        fault_relay.os.close(fault_relay._open_pidfd(os.getpid()))
-    except OSError as error:
-        if error.errno == errno.ENOSYS:
-            pytest.skip("this kernel has no pidfd_open: the fallback's tests run instead")
-        raise
+    if not kernel_has_pidfd(fault_relay):
+        pytest.skip("this kernel has no pidfd_open: the fallback's tests run instead")
     if raw:
         monkeypatch.delattr(fault_relay.os, "pidfd_open", raising=False)
         monkeypatch.delattr(fault_relay.signal, "pidfd_send_signal", raising=False)
@@ -564,6 +560,67 @@ def test_o58_a_refusal_of_pidfd_open_other_than_no_such_call_is_raised_and_nothi
     assert raised.value.errno == errno.EMFILE
     assert sleeper.poll() is None
     assert [pid for pid, _ in kills if pid == sleeper.pid] == []
+
+
+def kernel_has_pidfd(fault_relay):
+    try:
+        os.close(fault_relay._open_pidfd(os.getpid()))
+    except OSError as error:
+        if error.errno == errno.ENOSYS:
+            return False
+        raise
+    return True
+
+
+@pytest.mark.parametrize("how", ["pidfd", "enosys_python", "enosys_raw"])
+def test_o58_a_process_with_the_recorded_start_tick_is_signalled_only_when_its_command_line_is_the_relays(
+    monkeypatch, kills, sleeper, how
+):
+    """O58: the heartbeat is a file; a start tick that matches does not make a process the relay. When the caller names
+    the words of the relay's command line, a process that lacks one is never signalled, through the pidfd or by the
+    start tick (ENOSYS), and one that has them all is."""
+    from expcore_onedata import fault_relay
+
+    if how == "pidfd" and not kernel_has_pidfd(fault_relay):
+        pytest.skip("this kernel has no pidfd_open")
+    if how != "pidfd":
+        without_pidfd_open(monkeypatch, fault_relay, how == "enosys_python")
+    start = fault_relay.proc_start(sleeper.pid)
+    assert start is not None
+    term = fault_relay.signal.SIGTERM
+    assert fault_relay.signal_if_started(sleeper.pid, start, term, argv=("sleep", "fault_relay")) is False
+    assert fault_relay.signal_if_started(sleeper.pid, start, term, argv=("fault_relay",)) is False
+    assert sleeper.poll() is None
+    assert [pid for pid, _ in kills if pid == sleeper.pid] == []
+    assert fault_relay.signal_if_started(sleeper.pid, start, term, argv=("sleep", "30")) is True
+    assert sleeper.wait(timeout=10) == -term
+
+
+@pytest.mark.parametrize("how", ["pidfd", "enosys_raw"])
+def test_o58_the_stop_never_signals_the_process_a_heartbeat_names_when_it_is_not_a_relay(
+    tmp_path, monkeypatch, kills, sleeper, how
+):
+    """O58: a heartbeat that names another process of the user's and its real start tick (written by mistake, or left
+    by a relay of another host that shares the root) is no relay: `fault_relay stop` signals nothing, fails, and leaves
+    the heartbeat to the end of its client."""
+    from expcore_onedata import fault_relay
+
+    if how == "pidfd" and not kernel_has_pidfd(fault_relay):
+        pytest.skip("this kernel has no pidfd_open")
+    if how != "pidfd":
+        without_pidfd_open(monkeypatch, fault_relay, False)
+    root = root_of(tmp_path)
+    relay_dir(root).mkdir(mode=0o700)
+    start = fault_relay.proc_start(sleeper.pid)
+    assert start is not None
+    fault_relay._write(
+        relay_dir(root) / "heartbeat.json",
+        {"format": FORMAT, "nonce": uuid.uuid4().hex, "pid": sleeper.pid, "start": start, "wall": time.time()},
+    )
+    assert fault_relay._stop(root, timeout_s=0.5) == 1
+    assert sleeper.poll() is None
+    assert [pid for pid, _ in kills if pid == sleeper.pid] == []
+    assert (relay_dir(root) / "heartbeat.json").exists()
 
 
 def test_o58_the_stop_command_ends_a_running_relay_where_the_kernel_has_no_pidfd_open(tmp_path, monkeypatch):

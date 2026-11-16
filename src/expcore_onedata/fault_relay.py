@@ -66,6 +66,7 @@ RELAY_DIR = "fault-relay"
 STATE_FILE = "hpc-federation.json"
 BEAT_S = 5.0
 RELAY_STALE_S = 30.0  # a heartbeat older than this, by the reader's wall clock, is a relay not answering
+RELAY_MODULE = "expcore_onedata.fault_relay"  # the relay is `python -m` this, `serve`: how its process is told
 RELAY_NOTE = "fault_relay"  # the try's note key: what the fault gate's pre-run check saw of the relay
 POLL_S = 0.5  # between two looks for an answer, or for a request
 OUTPUT_CAP = 65536  # the most of a command's output an answer carries, per stream
@@ -487,29 +488,42 @@ def _open_pidfd(pid: int) -> int:
     return opener(pid) if opener is not None else _syscall(PIDFD_OPEN, pid, 0)
 
 
-def _kill_if_started(pid: int, start: str, signum: int) -> bool:
-    """`signal_if_started` where the kernel has no pidfd: read `pid`'s start tick and, only while it is `start`, send
-    `signum` with `os.kill`; the pattern `hpcslurm.Runner.end_client` follows, whose caller rechecks that the process
-    went (`_stop` waits for its heartbeat to go). A PID taken over since the process ended shows another tick and is
-    never signalled. Weaker than the pidfd, which holds the process across the check: a PID reused in the instant
-    between the read and the kill is not caught, and a PID is reused only once the whole PID space has cycled."""
-    seen = proc_start(pid)
+def proc_has_args(pid: int, words: Sequence[str]) -> bool:
+    """Whether every one of `words` is an argument of the process's command line (/proc/PID/cmdline); False when it
+    cannot be read."""
+    try:
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+    return all(word.encode() in args for word in words)
+
+
+def _kill_if_started(pid: int, start: str, signum: int, argv: Sequence[str]) -> bool:
+    """`signal_if_started` where the kernel has no pidfd: read `pid`'s command line, then its start tick and, only while
+    it is `start`, send `signum` with `os.kill` at once; the pattern `hpcslurm.Runner.end_client` follows, whose caller
+    rechecks that the process went (`_stop` waits for its heartbeat to go). A PID taken over since the process ended
+    shows another tick and is never signalled. Weaker than the pidfd, which holds the process across the checks: a PID
+    reused in the instant between the tick's read and the kill is not caught, and a PID is reused only once the whole
+    PID space has cycled."""
+    named = proc_has_args(pid, argv)
+    seen = proc_start(pid)  # the last read: the kill follows it at once, and a PID reused since `named` shows another
     if seen is None:  # no /proc entry: the process is gone, or its start cannot be shown to be ours
         raise ProcessLookupError(errno.ESRCH, f"no process {pid} with a readable start tick")
-    if seen != start:  # another process holds the PID now
+    if seen != start or not named:  # another process holds the PID now, or this one is not what was recorded
         return False
     os.kill(pid, signum)
     return True
 
 
-def signal_if_started(pid: int, start: str, signum: int) -> bool:
-    """Send `signum` to `pid` only while it is the process that started at clock tick `start`: a pidfd is opened first
-    and held across the check, so a PID reused before it shows another start and is never signalled (pidfd_open(2),
-    pidfd_send_signal(2), through `os` and `signal` where this Python has them, else the raw calls). A kernel that
-    answers ENOSYS to `pidfd_open` (a login node older than Linux 5.3) has no pidfd: the start tick is then checked
-    and the signal sent with `os.kill` (`_kill_if_started`); any other failure is raised. No process group (PID 0 or
-    below), no init (PID 1) and no process without a recorded start tick is ever signalled. Return whether it was
-    sent; raise ProcessLookupError when the process is gone."""
+def signal_if_started(pid: int, start: str, signum: int, *, argv: Sequence[str] = ()) -> bool:
+    """Send `signum` to `pid` only while it is the process that started at clock tick `start` and, when `argv` names
+    words, whose command line holds each as an argument (a heartbeat is a file: its start tick alone does not make a
+    process the relay). A pidfd is opened first and held across the checks, so a PID reused before it shows another
+    start and is never signalled (pidfd_open(2), pidfd_send_signal(2), through `os` and `signal` where this Python has
+    them, else the raw calls). A kernel that answers ENOSYS to `pidfd_open` (a login node older than Linux 5.3) has no
+    pidfd: the checks are then made and the signal sent with `os.kill` (`_kill_if_started`); any other failure is
+    raised. No process group (PID 0 or below), no init (PID 1) and no process without a recorded start tick is ever
+    signalled. Return whether it was sent; raise ProcessLookupError when the process is gone."""
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or not isinstance(start, str) or not start:
         return False
     try:
@@ -517,9 +531,9 @@ def signal_if_started(pid: int, start: str, signum: int) -> bool:
     except OSError as error:
         if error.errno != errno.ENOSYS:  # a gone process (ESRCH), too many open files, ...: never worked around
             raise
-        return _kill_if_started(pid, start, signum)
+        return _kill_if_started(pid, start, signum, argv)
     try:
-        if proc_start(pid) != start:  # another process holds the PID now
+        if proc_start(pid) != start or not proc_has_args(pid, argv):  # another process holds the PID now, or not ours
             return False
         sender = getattr(signal, "pidfd_send_signal", None)
         if sender is not None:
@@ -538,7 +552,7 @@ def _stop(root: Path, timeout_s: float = 3 * BEAT_S) -> int:
     pid, start = live.get("pid"), live.get("start")
     if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and isinstance(start, str):
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            signal_if_started(pid, start, signal.SIGTERM)
+            signal_if_started(pid, start, signal.SIGTERM, argv=(RELAY_MODULE, "serve"))
     end = time.monotonic() + timeout_s
     while time.monotonic() < end:
         if not (relay_dir(root) / "heartbeat.json").exists():
