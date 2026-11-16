@@ -385,6 +385,12 @@ class Driver(Down):
                 f"{provider}'s shared imported tree(s) of {spaces} are not proven read-only (status {done.returncode})"
                 + "".join(f"; {line}" for line in failed)
             )
+        # the script exits 0 for a work directory with no list of imports: read its report against what was asked
+        problems = hpcimport.mount_check_problems(done.stdout, [space.name for space in owned])
+        if problems:
+            raise RuntimeError(
+                f"{provider}'s shared imported tree(s) of {spaces} are not proven read-only: " + "; ".join(problems)
+            )
         self.say(f"{provider}: the shared imported tree(s) of {spaces} are held read-only")
 
     def register(self, provider: str, workdir: str) -> None:

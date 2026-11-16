@@ -5,6 +5,8 @@ driver will not run, and a down that is the down of any federation. Over the fak
 fake's, and the proof that a tree is read-only is what a fake step reports. The bootstrap's and the core phase's share
 is in test_hpc_fed_import_core.py."""
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -66,7 +68,7 @@ class Rig:
 
         self.fake = FakeSlurm()
         self.fake.on_control = self.answer
-        self.mounts = mounts or (lambda srun: (0, "[]\n", "ok: shared import mounted read-only\n"))
+        self.mounts = mounts or self.held_read_only
         self.mount_steps = []
         self.completed = Completed
         self.root = tmp_path / "fed" / "root"
@@ -80,6 +82,20 @@ class Rig:
         self.core_calls = []
         self.driver.core = self.core
         self.driver.relay_available = lambda: False
+
+    def held_read_only(self, srun):
+        """The check's report for a node whose owner holds its tree: one process of three, none writable."""
+        owner = next(name for name, node in NODES.items() if node == srun.node)
+        facts = [
+            {"space": space, "processes": 3, "read_only": 3, "writable": 0}
+            for space, (who, _) in SPACES.items()
+            if who == owner
+        ]
+        return (
+            0,
+            json.dumps(facts) + "\n",
+            "".join(f"ok: shared import {f['space']} is mounted read-only\n" for f in facts),
+        )
 
     def answer(self, srun):
         if any(Path(word).name == "importstorage.py" for word in srun.command):
@@ -211,7 +227,7 @@ def test_o59_a_mount_check_that_fails_stops_up_naming_the_provider_and_space_and
 
     def mounts(srun):
         if srun.node != NODES["rowan"]:
-            return 0, "[]\n", "ok\n"
+            return rig.held_read_only(srun)
         return 1, "[]\n", f"importstorage: ERROR: {tmp_path}/somewhere is writable\n{fail}\n"
 
     rig = Rig(hpc, tmp_path, site, environ, mounts=mounts)
@@ -224,6 +240,68 @@ def test_o59_a_mount_check_that_fails_stops_up_naming_the_provider_and_space_and
     rig.driver.down()
     assert rig.fake.cancelled == ["4242"]
     assert not rig.root.exists()
+
+
+@pytest.mark.parametrize(
+    ("report", "message"),
+    [
+        ("[]", r"beta-space is not reported exactly once"),
+        ("not json", r"the report is not JSON"),
+        ('{"space": "beta-space"}', r"the report is not a list of objects"),
+        (
+            '[{"space": "beta-space", "processes": 0, "read_only": 0, "writable": 0}]',
+            r"beta-space is held by no process",
+        ),
+        (
+            '[{"space": "beta-space", "processes": 2, "read_only": 1, "writable": 1}]',
+            r"beta-space is not read-only in every process",
+        ),
+        (
+            '[{"space": "beta-space", "processes": 2, "read_only": 2}]',
+            r"beta-space is not read-only in every process",
+        ),
+        (
+            '[{"space": "beta-space", "processes": true, "read_only": 1, "writable": 0}]',
+            r"beta-space is held by no process",
+        ),
+        (
+            '[{"space": "beta-space", "processes": 1, "read_only": 1, "writable": 0},'
+            ' {"space": "alpha-space", "processes": 1, "read_only": 1, "writable": 0}]',
+            r"names a space that was not asked for",
+        ),
+        (
+            '[{"space": "beta-space", "processes": 1, "read_only": 1, "writable": 0},'
+            ' {"space": "beta-space", "processes": 1, "read_only": 1, "writable": 0}]',
+            r"beta-space is not reported exactly once",
+        ),
+    ],
+    ids=[
+        "empty list",
+        "not json",
+        "not a list",
+        "no process",
+        "writable",
+        "no writable count",
+        "boolean count",
+        "another space",
+        "twice",
+    ],
+)
+def test_o59_a_report_that_exits_0_but_proves_nothing_fails_up_too(hpc, tmp_path, site, environ, report, message):
+    """O59: the node-side script exits 0 for a work directory with no list of imports, so the driver reads its report
+    against the spaces it asked the provider to mount: an empty list, one that is not JSON, a space held by no process
+    or writable in any, one reported twice or not at all, or one nobody asked for, each fails up before the bootstrap.
+    """
+
+    def mounts(srun):
+        return (0, report, "") if srun.node == NODES["rowan"] else rig.held_read_only(srun)
+
+    rig = Rig(hpc, tmp_path, site, environ, mounts=mounts)
+    with pytest.raises(RuntimeError, match=r"rowan's shared imported tree\(s\) of beta-space are not proven") as caught:
+        rig.up()
+    assert re.search(message, str(caught.value))
+    assert str(tmp_path) not in str(caught.value)
+    assert rig.core_calls == []
 
 
 def test_o59_a_layout_with_no_import_runs_no_mount_check(hpc, tmp_path, site):

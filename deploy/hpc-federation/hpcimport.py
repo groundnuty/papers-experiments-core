@@ -12,7 +12,8 @@ The hooks, in the order `up` meets them (DESIGN.md, section 8):
 0. `check_support`, in the preflight: the support the layout gives a space is no smaller than its tree's manifest.
 1. `provider_import_args`: appended to a provider's `provider.sbatch` command, so its service mounts the trees it owns.
 2. `mount_check_argv`: the control step on each owner's node, once every provider is up, that proves from the mounts
-   the service holds that each tree is read-only; before the bootstrap starts any scan.
+   the service holds that each tree is read-only; before the bootstrap starts any scan. `mount_check_problems` reads
+   its report against the trees the provider was asked to mount, since the script exits 0 for none.
 3. `import_storage_extra`: returned by the HPC bootstrap's `Bootstrap.import_storage_extra`, so an imported storage is
    made for a provider that runs as the job's user.
 4. `luma_requests`: the panel calls that map the space and its members to the job's user on a storage, sent for the
@@ -22,6 +23,7 @@ The hooks, in the order `up` meets them (DESIGN.md, section 8):
 6. `fedimport.verify_imports`, after the platform file is rendered: the core's check that the space holds its manifest.
 """
 
+import json
 import os
 
 
@@ -101,6 +103,37 @@ def mount_check_argv(bundle, workdir, python="python3.11"):
     when every listed tree is held read-only (`importstorage.py mounts`). `python` is the node's own
     (`site.node_python`), and `-I -B` as every Python a step runs takes them (DESIGN.md, section 3)."""
     return [python, "-I", "-B", os.path.join(bundle, "importstorage.py"), "mounts", "--workdir", workdir]
+
+
+def mount_check_problems(report, spaces):
+    """What the mount check's report (`importstorage.py mounts`, its standard output: a JSON list with one object per
+    listed space) leaves unproven for the spaces a provider is expected to hold: none, in a list, when every expected
+    space is reported once, held by at least one of the service's processes and writable by none, and nothing else is
+    reported. The node-side script exits 0 for an empty list (a work directory with no list of imports proves nothing
+    about any tree), so the driver reads the report against what it asked the provider to mount. Each problem names a
+    space and never a path."""
+    try:
+        facts = json.loads(report)
+    except ValueError:
+        return ["the report is not JSON"]
+    if not isinstance(facts, list) or not all(isinstance(fact, dict) for fact in facts):
+        return ["the report is not a list of objects"]
+    problems = []
+    named = [fact.get("space") for fact in facts]
+    for space in spaces:
+        if named.count(space) != 1:
+            problems.append("%s is not reported exactly once" % space)
+    if [name for name in named if name not in spaces]:
+        problems.append("the report names a space that was not asked for")
+    for fact in facts:
+        if fact.get("space") not in spaces:
+            continue
+        held, writable = fact.get("processes"), fact.get("writable")
+        if type(held) is not int or held < 1:
+            problems.append("%s is held by no process of the service" % fact["space"])
+        if type(writable) is not int or writable != 0:
+            problems.append("%s is not read-only in every process that holds it" % fact["space"])
+    return problems
 
 
 def direct_storages(layout, storage_ids, environ):
