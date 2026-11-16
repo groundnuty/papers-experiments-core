@@ -72,4 +72,8 @@ def mark_unheld(store: Store, model: str, now: str, kind: str, detail: str) -> N
         marks[model] = {"since_utc": now, "reason": detail}
         return json.dumps(marks, sort_keys=True), event, None
 
-    store.update_meta(UNHELD_KEY, change, now)
+    def go() -> None:
+        store.update_meta(UNHELD_KEY, change, now)  # joins this transaction
+        store.note_unheld(model)  # journaled once it commits: a store copied back must not forget it (O62)
+
+    store.transact(go)

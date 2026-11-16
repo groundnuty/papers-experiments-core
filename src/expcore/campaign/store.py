@@ -52,6 +52,7 @@ from expcore.campaign.attempts import (
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
+from expcore.campaign.spend_journal import PROBE, UNHELD, SpendJournal, attempt_entry
 
 _FIXED_SQL = """
 CREATE TABLE IF NOT EXISTS attempts(
@@ -128,6 +129,9 @@ class Store:
         self.schema = schema
         self._lock = threading.RLock()
         self._writing = False  # a write transaction of this store is open on the thread that holds the lock
+        # The spend journal (O62): None, or what `transact` writes a transaction's spend lines to once it commits.
+        self.spend_journal: SpendJournal | None = None
+        self._spend_lines: list[dict[str, Any]] = []
         self.db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=lock_timeout_s)
         self.db.row_factory = sqlite3.Row
         try:
@@ -240,6 +244,10 @@ class Store:
 
         Called while this thread's own write transaction is open (from the `also` step of `finish_attempt`, say), `fn`
         joins it: it commits or rolls back with the caller's steps, so they stand or fall together.
+
+        With a spend journal, the lines the transaction noted (`_note_spend`) are written once it has committed, and
+        dropped when it rolls back (O62); a line that cannot be written raises `SpendJournalError` here, after the
+        commit and before the caller spends anything on it.
         """
         with self._lock:
             if self._writing:
@@ -249,12 +257,44 @@ class Store:
             try:
                 result = fn()
                 self.db.execute("COMMIT")
-                return result
             except BaseException:
+                self._spend_lines = []
                 self.db.execute("ROLLBACK")
                 raise
             finally:
                 self._writing = False
+            lines, self._spend_lines = self._spend_lines, []
+            if lines and self.spend_journal is not None:
+                self.spend_journal.write(lines)
+            return result
+
+    def _note_spend(self, line: Callable[[], dict[str, Any]]) -> None:
+        """Keep a spend line for the journal, built now, inside the open transaction; nothing without a journal."""
+        if self.spend_journal is not None:
+            self._spend_lines.append(line())
+
+    def note_probe_charge(self, model: str, usd: float) -> None:
+        """Journal a charge of admission's probes (O62), called inside the transaction that wrote it and its event,
+        the store's latest: the line names that event, so a resume tells the store's charges from lost ones."""
+
+        def line() -> dict[str, Any]:
+            event_id = self.db.execute("SELECT MAX(id) FROM events").fetchone()[0]
+            return {"kind": PROBE, "event_id": event_id, "model": model, "usd": float(usd)}
+
+        self._note_spend(line)
+
+    def note_unheld(self, model: str) -> None:
+        """Journal that the model is taken off the reply maximum (O62, C27), inside the transaction that marked it: the
+        mark raises what its attempts are charged, so a store copied back from before it takes it from the journal."""
+        self._note_spend(lambda: {"kind": UNHELD, "model": model})
+
+    def _attempt_line(self, attempt_id: int) -> dict[str, Any]:
+        """The journal's `attempt` line of an attempt's row as the open transaction holds it."""
+        row = self.db.execute(
+            f"SELECT a.*, r.{column_for('model')} AS model FROM attempts a JOIN runs r USING(run_key) WHERE a.id=?",
+            (attempt_id,),
+        ).fetchone()
+        return attempt_entry(row)
 
     def q(self, sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]:
         """Run a read and return all rows."""
@@ -468,7 +508,9 @@ class Store:
                     admission,
                 ),
             )
-            return BegunAttempt(int(cursor.lastrowid), number, int(sequence))
+            attempt_id = int(cursor.lastrowid)
+            self._note_spend(lambda: self._attempt_line(attempt_id))  # written before the run can start (O62)
+            return BegunAttempt(attempt_id, number, int(sequence))
 
         return self.transact(go)
 
@@ -489,6 +531,7 @@ class Store:
             if cursor.rowcount != 1:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
             self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
+            self._note_spend(lambda: self._attempt_line(attempt_id))  # written before the send it pays for (O62)
 
         self.transact(go)
 
@@ -580,6 +623,7 @@ class Store:
             self.db.execute("UPDATE runs SET status=? WHERE run_key=?", (status, row["run_key"]))
             if also is not None:
                 also()
+            self._note_spend(lambda: self._attempt_line(attempt_id))  # the counts it ended with (O62)
             return status
 
         return self.transact(go)

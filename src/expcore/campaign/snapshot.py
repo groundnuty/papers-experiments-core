@@ -118,6 +118,27 @@ def _readable(source: Path, in_place: bool) -> Iterator[sqlite3.Connection]:
             connection.close()
 
 
+def rebase_run_dirs(store: Path, runs: Path) -> int:
+    """Point every attempt's directory in the store at `store` to `runs/<digest>/try<N>`, and return how many.
+
+    A snapshot names each attempt's directory within the batch (`<digest>/try<N>`), and a store moved to another
+    directory keeps the absolute ones of the place it ran in; the recovery of a resumed store reads each running
+    attempt's marker at the path its row holds (C04). So a store copied back to run again, from a snapshot or an
+    archive (`deploy/hpc-federation/shards.py`, O62), has its directories pointed at the runs directory it now has,
+    before any dispatcher opens it. Only the last two parts of each path are kept, as the export keeps them. The store
+    must be one no process holds; its -wal, if any, replays on the open."""
+    connection = sqlite3.connect(store, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute("SELECT id, run_dir FROM attempts WHERE run_dir IS NOT NULL").fetchall()
+        moved = [(str(runs / str(batch_relative(directory))), attempt) for attempt, directory in rows]
+        connection.executemany("UPDATE attempts SET run_dir = ? WHERE id = ?", moved)
+        connection.execute("COMMIT")
+        return len(moved)
+    finally:
+        connection.close()
+
+
 def _relative_run_dirs(copy: sqlite3.Connection) -> None:
     """Write each attempt's directory in the copy as `<digest>/try<N>`, then rebuild the copy so no old path stays.
 

@@ -23,6 +23,12 @@ declares them; nothing here knows what a key is). A lease is an exclusive `flock
   used has one and two runs first using a key at once cannot see each other's empty file. An empty note, or one that
   cannot be read, can then only be a holder that died between taking the key and writing it, or mid-write: it is
   indeterminate and the key needs the same proof, never "a key never used".
+- **put back from a snapshot, every key needs the proof** (O62). A lease directory copied back with a campaign's
+  `out/` after a kill (`out_snapshot.restore`) holds the notes of the moment it was copied: a key released then may
+  have been taken afterwards and its resource still be live, and a key first taken afterwards has no file at all.
+  `mark_rolled_back` turns every note that says released into one that names no holder, and leaves `ROLLED_BACK` in
+  the directory, which makes every lock file created there from then on start with such a note: each key of the
+  directory goes to a new holder only once `resource_gone` has answered True for it, as a dead holder's does.
 
 Every key whose resource **may still be live** is counted against the cap of the **unit** whose run held it, so that a
 surviving sandbox on one key cannot let a run of the same unit start on another: a quarantined lease, a key held back
@@ -63,6 +69,7 @@ log = logging.getLogger(__name__)
 WAIT_LOG = "waits.jsonl"
 QUARANTINE_LOG = "quarantines.jsonl"  # one line per quarantine ("q") and per end of one ("free")
 DEAD_LOG = "dead_holders.jsonl"  # one line per look at a holder that died without releasing its key
+ROLLED_BACK = "ROLLED_BACK"  # in a directory put back from a snapshot: every key needs its resource shown gone (O62)
 POLL_S = 0.25
 DEAD_RETRY_S = 30.0  # a key whose dead holder's resource was not shown gone is tried again this often
 QUARANTINE_RETRY_S = 60.0  # a quarantine's proof is asked again this often
@@ -274,6 +281,36 @@ class Lease:
         }
 
 
+def mark_rolled_back(directory: Path, now: float | None = None) -> int:
+    """Make every key of a lease directory put back from a snapshot need the proof a dead holder's does (O62): each
+    note that says released becomes one that names no holder, and `ROLLED_BACK` makes every lock file created there
+    later start so. Returns how many notes it turned; written whole (a draft, fsynced, renamed). Call it with no pool
+    open on the directory."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    when = time.time() if now is None else now
+    _replace_whole(directory / ROLLED_BACK, json.dumps({"rolled_back": when}))
+    turned = 0
+    for path in sorted(directory.glob("*.lock")):
+        try:
+            note = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # unreadable: already a key to be shown gone
+        if isinstance(note, dict) and "released" in note:
+            _replace_whole(path, json.dumps({"key": note.get("key"), "rolled_back": when}, sort_keys=True))
+            turned += 1
+    return turned
+
+
+def _replace_whole(path: Path, text: str) -> None:
+    draft = path.with_name(f".{path.name}.{os.getpid()}.rolled")
+    with open(draft, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(draft, path)
+
+
 def _write_note(handle: Any, note: Mapping[str, Any]) -> None:
     """Replace the note in a lock file, flushed and fsynced; raise OSError if it cannot be written.
 
@@ -366,10 +403,13 @@ class LeasePool:
         path = self._lock_path(key)
         if path.exists():
             return
+        note: dict[str, Any] = {"released": 0.0, "key": key, "created": time.time()}
+        if (self.dir / ROLLED_BACK).exists():  # put back from a snapshot: the key may have been taken since (O62)
+            note = {"key": key, "created": note["created"], "rolled_back": True}
         scratch = self.dir / f".{key}.{os.getpid()}.{secrets.token_hex(4)}.new"
         fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         try:
-            os.write(fd, json.dumps({"released": 0.0, "key": key, "created": time.time()}, sort_keys=True).encode())
+            os.write(fd, json.dumps(note, sort_keys=True).encode())
             os.fsync(fd)
             with contextlib.suppress(FileExistsError):  # lost the race: the file that is there is complete too
                 os.link(scratch, path)
@@ -655,10 +695,13 @@ class LeasePool:
     def sweep_dead_holders(self, groups: Iterable[str]) -> list[str]:
         """Look at every key of the groups for a dead holder's leftovers, at a campaign's start and again while any is
         stuck. Return the keys still held back: free to lock, but the holder's resource is not shown gone. A key
-        whose lock is busy has a live holder and is not one of them."""
+        whose lock is busy has a live holder and is not one of them. In a directory put back from a snapshot
+        (`ROLLED_BACK`, O62) a key with no lock file may have been first taken after the copy, so it is looked at
+        too, its file created needing the proof, and until the proof it counts in `may_be_live` like any other."""
         out = []
+        rolled_back = (self.dir / ROLLED_BACK).exists()
         for key in dict.fromkeys(k for g in groups for k in self.keys_of(g)):
-            if not self._lock_path(key).exists():
+            if not rolled_back and not self._lock_path(key).exists():
                 continue
             handle = self._flock(key)
             if handle is None:
