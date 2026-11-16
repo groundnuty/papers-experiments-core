@@ -35,6 +35,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
+from fake_elf import bundle_members, write_tar
 
 HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 LAYOUT = HPC / "layouts" / "pilot-shape.toml"
@@ -68,17 +69,21 @@ PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"  # no cer
 
 def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: bytes = b"an invented egress shim\n",
                work_root: Path | None = None) -> dict:  # fmt: skip
-    """The site's variables of the agent's Apptainer sandbox (the pilot template's `[sandbox]`), its two files written
-    into `directory` and pinned by their SHA-256; the work root `work_root`, or one under `directory` (made by the
-    shard step on the agent's node, never here)."""
+    """The site's variables of the agent's Apptainer sandbox (the pilot template's `[sandbox]`), its files written
+    into `directory` and pinned by their SHA-256 (oneclient's bundle an invented tar a host mount can unpack:
+    fake_elf); the work root `work_root`, or one under `directory` (made by the shard step on the agent's node, never
+    here)."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "agent.sif").write_bytes(sif)
     (directory / "egresslog.so").write_bytes(shim)
+    bundle = directory / "oneclient-bundle.tar"
     return {
         "HPC_AGENT_SIF": str(directory / "agent.sif"),
         "HPC_AGENT_SIF_SHA256": hashlib.sha256(sif).hexdigest(),
         "HPC_EGRESS_SHIM": str(directory / "egresslog.so"),
         "HPC_EGRESS_SHIM_SHA256": hashlib.sha256(shim).hexdigest(),
+        "HPC_ONECLIENT_BUNDLE": str(bundle),
+        "HPC_ONECLIENT_BUNDLE_SHA256": write_tar(bundle, bundle_members()),
         "HPC_AGENT_WORK_ROOT": str(work_root or directory / "agent-work"),
     }
 

@@ -67,6 +67,8 @@ class FakeMountNode(FakeNode):
         self.stuck_mount = False
         self.watches: list[Watch] = []
         self.spawn_env: list[dict[str, str]] = []
+        self.oneclient_version = "Oneclient: 25.0\nFUSE library: 3.2\n"  # what the bundle's `--version` prints
+        self.version_runs: list[list[str]] = []
 
     # ------------------------------------------------------------------------------------------------ the mount
     @property
@@ -161,6 +163,9 @@ class FakeMountNode(FakeNode):
         return super().signal(pid, start, sig)
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
+        if len(argv) >= 2 and argv[-1] == "--version" and argv[-2].endswith("/bin/oneclient"):
+            self.version_runs.append(list(argv))  # the bundle's launcher, as the host mount runs it before the mount
+            return CmdResult(0, self.oneclient_version, "")
         if argv and argv[0] == "fusermount3" and self.stuck_mount:
             self.unmounts.append(list(argv))
             return CmdResult(1, "", "fusermount3: failed to unmount: Device or resource busy\n")

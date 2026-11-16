@@ -3,8 +3,8 @@ scorer, each run in the Apptainer sandbox on a fake HPC node, with the egress an
 
 The rehearsal copies this file into its study as `hpc_plugin.py`, beside the example's `plugin.py`, which it imports
 relatively. Its settings are `hpc_rehearsal.json` beside it, which the study's code lists: where the fakes are (the
-dispatcher runs under `python -I`, so nothing of the test tree is on its path), the control directory, and the pinned
-oneclient the mount helper starts.
+dispatcher runs under `python -I`, so nothing of the test tree is on its path) and the control directory. The mount
+helper's oneclient is the platform's: the bundle its `[sandbox.apptainer]` pins, as `up` rendered it from the site.
 
 **The platform** is the `platform.toml` beside `study.toml`: the shard step copies its federation's there (the file
 the federation's `up` rendered, its paths absolute into the root), so no path of a federation is in the study's own
@@ -111,13 +111,11 @@ class Sandboxes:
         from expcore_onedata.sandbox.api import Endpoint, SandboxSpec
         from expcore_onedata.sandbox.apptainer.hostmount import host_mount_factory
         from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
-        from expcore_onedata.sandbox.apptainer.settings import Pinned
         from expcore_onedata.tokens import Secret
 
         config = self.config()
         node = FakeMountNode(own_process=True)  # its driver this dispatcher, so a killed one's record is reaped
         node.cell_handler = cell_handler(node)
-        oneclient = Pinned(Path(SETTINGS["oneclient"]["path"]), SETTINGS["oneclient"]["sha256"])
         spec = SandboxSpec(
             run_key=run_key,
             mode=config.sandbox.mode_of(DATA_PATH),
@@ -125,7 +123,7 @@ class Sandboxes:
             zone=Endpoint.from_url(config.zone.url),
             provider=Endpoint.from_url(config.local_provider.url),
         )
-        factory = host_mount_factory(oneclient, mountinfo=node.mountinfo)
+        factory = host_mount_factory(mountinfo=node.mountinfo)
         return ApptainerSandbox.start(node, config.sandbox, spec, mount_helper=factory)
 
 
