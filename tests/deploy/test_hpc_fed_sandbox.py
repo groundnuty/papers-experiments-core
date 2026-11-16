@@ -5,6 +5,7 @@ components, or both jobs, are read back, every step on the agent's node runs in 
 file records where the agent's node is (`sandbox.node`, M5's shard driver reads it), and down cancels both after a
 whole or a partial up, never a job that is not ours. Slurm is the fake of hpc_fed_support."""
 
+import itertools
 import json
 import os
 from pathlib import Path
@@ -448,6 +449,41 @@ def test_het_up_whose_agents_component_is_recorded_otherwise_cancels_the_job_and
     assert fake.sruns == []
     rig.driver.down()
     assert fake.cancelled == ["4242"]
+    assert not rig.root.exists()
+
+
+@pytest.mark.parametrize(("placement", "listed_as"), [("het", "4243"), ("separate", "4343")])
+def test_a_step_on_the_agents_node_is_found_by_name_under_the_id_squeue_lists_it_under(
+    hpc, tmp_path, site, placement, listed_as
+):
+    """O57: squeue -s lists a step of a heterogeneous job's agent's component under the component's own id alone,
+    never the leader's (seen live), and one of the agent's own job under that job's: the launcher's lookup by name
+    asks each, and a service step is still found under the held job's id."""
+    rig = Rig(hpc, tmp_path, site, placement)
+    rig.up()
+    prefix = rig.state()["allocation"]["name"]
+    rig.fake.steps[f"{prefix}-shard-1"] = f"{listed_as}.17"
+    rig.fake.calls.clear()
+    assert rig.driver.launcher.listed(f"{prefix}-shard-1") == f"{listed_as}.17"
+    assert rig.driver.launcher.listed(f"{prefix}-zone-run-1") == rig.fake.steps[f"{prefix}-zone-run-1"]
+    assert rig.driver.launcher.listed("hpcop-not-a-step") is None
+    asked = {c[c.index("-j") + 1] for c in rig.fake.calls if c[:2] == ["squeue", "-s"]}
+    assert asked == {"4242", listed_as}
+
+
+def test_down_waits_for_a_step_on_the_agents_component_and_cancels_it_by_its_own_id(hpc, tmp_path, site):
+    """O57: down's wait for every step to leave asks the agent's component's own id too, where alone its steps are
+    listed: one still running there at the stop's bound (a shard step, say) is cancelled by its own id before the
+    held job is, and the root goes."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    prefix = rig.state()["allocation"]["name"]
+    rig.fake.steps[f"{prefix}-shard-1"] = "4243.17"
+    ticks = itertools.count(0, 60)
+    rig.driver.clock = lambda: next(ticks)
+    rig.driver.down()
+    assert rig.fake.cancelled.index("4243.17") < rig.fake.cancelled.index("4242")
+    assert rig.fake.steps == {}
     assert not rig.root.exists()
 
 

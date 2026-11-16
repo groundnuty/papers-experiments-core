@@ -162,8 +162,16 @@ class Down:
         node; return the services that could not be verified."""
         order = [p.name for p in self.spec.providers] + ["zone"]
         unverified = [service for service in order if not self.teardown(service)]
-        self.wait_steps(job)
+        self.wait_steps(self.listed_under(job))
         return unverified + [s for s in order if s not in unverified and not self.node_clean(s)]
+
+    def listed_under(self, job: str) -> List[str]:
+        """The ids `squeue -s` lists the held job's steps under: its own, and under `het` its agent's component's own,
+        under which alone a step on the agent's node is listed (seen live). The agent's own job under `separate` is
+        cancelled whole, and its id is never asked here: it may name another job by now (`ours`)."""
+        record = self.store.read().get("sandbox") or {}
+        component = record.get("component_job") if record.get("placement") == "het" else None
+        return [job] + ([component] if component and component != job else [])
 
     def teardown(self, service: str) -> bool:
         """teardown.sh in a control step on the service's node; a service whose work directory never reached the state
@@ -194,14 +202,15 @@ class Down:
         self.set(lambda s: s["services"][service].update(state="removed" if ok else "failed"))
         return ok
 
-    def wait_steps(self, job: str) -> None:
-        """Until no step but the batch and extern steps is listed, within the stop's whole bound; a step still listed
-        then is cancelled by its own id."""
+    def wait_steps(self, jobs: List[str]) -> None:
+        """Until no step but the batch and extern steps is listed under any of the ids, within the stop's whole bound
+        (one deadline for them all); a step still listed then is cancelled by its own id."""
         deadline = self.clock() + self.settings.stop_bound_s
-        while self.slurm.steps(job) and self.clock() < deadline:
+        while any(self.slurm.steps(job) for job in jobs) and self.clock() < deadline:
             self.sleep(self.poll_s)
-        for step_id in self.slurm.steps(job).values():
-            self.slurm.cancel_step(step_id)
+        for job in jobs:
+            for step_id in self.slurm.steps(job).values():
+                self.slurm.cancel_step(step_id)
 
     def node_clean(self, service: str) -> bool:
         """A read-only control step: the service's work directory is gone from its node."""

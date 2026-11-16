@@ -9,7 +9,8 @@ service verbs (`hpcfed_control.py`, M4) through the hook in `hpcfed.py` (DESIGN.
   runs a bounded control step (`--exact`, the control reserve's size, the environment allowlist, stdin /dev/null)
   and raises `TimeoutError` at its bound after cancelling that step by its id; `service(node, argv, *, kind, name,
   log)` launches a detached service step of the kind's size; `listed(name)` is the step id `squeue -s` lists under a
-  name; `cancel(step_id)` cancels that one step.
+  name, asked of every id the federation's steps are listed under (`listings`: the held job's, and its agent's
+  component's own or the agent's own job's); `cancel(step_id)` cancels that one step.
 """
 
 import contextlib
@@ -18,7 +19,7 @@ import fcntl
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import hpcstate
 from hpcsettings import HpcSettings, Site
@@ -86,6 +87,16 @@ class StateStore:
         return state
 
 
+def listings(state: Dict[str, Any]) -> List[str]:
+    """Every job id `squeue -s` lists the federation's steps under, the held job's first: under `het`, also its agent's
+    component's own id (`sandbox.component_job`), under which alone a step on the agent's node is listed; under
+    `separate`, the agent's own job's id. None of an id the state does not hold yet."""
+    sandbox = state.get("sandbox") or {}
+    found = [state["allocation"].get("job")]
+    found.append(sandbox.get("component_job") if sandbox.get("placement") == "het" else sandbox.get("job"))
+    return [job for index, job in enumerate(found) if job is not None and job not in found[:index]]
+
+
 class Launcher:
     """Steps of the federation's held job, on its own nodes, sized by the layout's `[hpc]` table."""
 
@@ -149,9 +160,14 @@ class Launcher:
         self.store.update(record)
 
     def listed(self, name: str) -> Optional[str]:
-        state = self.store.read()
-        job = state["allocation"].get("job")
-        return None if job is None else self.slurm.steps(job).get(name)
+        """The id `squeue -s` lists a step of the federation's under, by its name, or None: asked of every id its
+        steps are listed under (`listings`), one `squeue -s -j` each, since a step of a heterogeneous job's further
+        component is listed under that component's own id alone, never the leader's (seen live)."""
+        for job in listings(self.store.read()):
+            step = self.slurm.steps(job).get(name)
+            if step is not None:
+                return step
+        return None
 
     def cancel(self, step_id: str) -> None:
         """Cancel one step of the federation's own jobs: the held job, a component of it, or the agent's own job."""

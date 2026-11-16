@@ -164,7 +164,9 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   `^<tmpfs>/hpcop-o[pz]\.[A-Za-z0-9]{6}$`.
 - **Every step has a name** (`-J`), `<prefix>-<service>-<verb>-<n>`, where `<prefix>` is the allocation's name (section
   5). The step id is read back by name from `squeue -s -j <job> -o '%i %j'`, so `down` finds a step whether or not its
-  id reached the state file.
+  id reached the state file; under `het` from `squeue -s -j <component 1's own id>` too, since a step of component 1
+  is listed there alone, as `<component id>.<n>`, never under the leader's id (seen live), and under `separate` from
+  the agent's own job's.
 - **A finished step's srun client can hang on the login node** with its work done (another study saw 25 minutes). A
   control step's client is ended only when its step has been gone from `squeue -s` for three polls in a row; a step
   still listed at the bound is cancelled by its own id (`scancel <job>.<step>`), never more. Both ends of a token's
@@ -338,7 +340,9 @@ remove the root); the service verbs do not take it.
    never touched once its id names another job; a lookup that fails is reported, and the other job is still cancelled.
 2. If the job runs: a `teardown.sh` control step per service with a recorded work directory (providers first, then
    the zone), each bounded by `stop_seconds`; then wait until no step but `batch` and `extern` is listed in `squeue -s`
-   (ending each service step's srun client only then); a step still listed at the bound is cancelled by its own id.
+   under the held job's id and, under `het`, its component 1's own id (S's steps, a shard step's among them, are listed
+   there alone), one deadline for both (ending each service step's srun client only then); a step still listed at the
+   bound is cancelled by its own id.
 3. One read-only control step per node checks that no recorded work directory is left on it.
 4. `scancel <job>`, by the recorded id only; wait until `squeue -j` lists it no more (nor any `<job>+<k>`: a
    heterogeneous job's leader's cancel ends every component, S's included). Under `separate`, the agent's own job too,
@@ -567,13 +571,15 @@ federation whose step is gone), then releases it.
 5. **The pair count**: the rendered `platform.toml` of the pilot's layout gives ten pairs (`link_pairs`), and each
    passes over the cluster's network.
 6. **The heterogeneous job** (`sandbox_placement = "het"`). Proven on the site: `sbatch --test-only` accepted two such
-   jobs, with `--wrap` in component 0 and component 1 naming only `-N`, `-c` and `--mem`. Not proven: that
-   `scontrol show job -o <leader>` answers one line per component with `HetJobId` and `HetJobOffset` and each
-   component's `Requeue` and `TimeLimit` as asked; that `squeue -h -j <leader> -o %i` lists `<leader>+<k>`; that an
-   `srun --jobid=<leader> --het-group=1 -w <S>` from the login node lands on S; the form squeue -s gives a component's
-   step (`<leader>+1.<n>` or `<component id>.<n>`; both are read, and `scancel` gets the one listed); and that a
-   leader's `scancel` ends component 1 (without `whole_hetjob` a component's own id would cancel only that
-   component, which the driver never does). **The fallback is a setting:** `sandbox_placement = "separate"`.
+   jobs, with `--wrap` in component 0 and component 1 naming only `-N`, `-c` and `--mem`. **Proven by the first live
+   slot (16 Nov 2026):** `scontrol show job -o <leader>` answers one line per component with `HetJobId` and
+   `HetJobOffset` and each component's `Requeue` and `TimeLimit` as asked; `squeue -h -j <leader> -o %i` lists
+   `<leader>+<k>` (the leader as `+0`); an `srun --jobid=<leader> --het-group=1 -w <S>` from the login node lands on S;
+   a step of component 1 is listed by `squeue -s -j <component id>` alone, as `<component id>.<n>`; and a leader's
+   `scancel` ends component 1. **Found by it:** a step that names no `--het-group` is refused, component 0 included
+   (section 1). Not seen yet: how `squeue -s -j <leader>` lists a step of component 0 (read as `<leader>.<n>` or
+   `<leader>+0.<n>`), `scancel <component id>.<n>`, and `sacct -j <component id>` for a step's status. **The fallback
+   is a setting:** `sandbox_placement = "separate"`.
 
 ## 10. Who builds what
 
