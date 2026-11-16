@@ -405,7 +405,7 @@ class HostMount:
                 if data is not None and token in data:
                     path.unlink()
                     removed += 1
-        self._meta["log_files_with_token"] = removed
+        self._meta["log_files_scrubbed"] = removed
 
     # ------------------------------------------------------------------------------------------------ record
     def metadata(self) -> dict[str, Any]:
@@ -428,7 +428,7 @@ class HostMount:
             "extra_args": extra_args_record(extra),
             "log_dir_from": "sandbox",
             "guard": guard,
-            **{key: value for key, value in self._meta.items() if key in ("wait_s", "log_files_with_token")},
+            **{key: value for key, value in self._meta.items() if key in ("wait_s", "log_files_scrubbed")},
         }
 
 

@@ -47,7 +47,7 @@ def test_a_run_that_touched_the_token_directory_is_flagged():
     run = judged(log([inotify("dir", "IN_OPEN", "IN_ISDIR")]))
     assert run.verdict == FLAGGED
     assert run.flags == (TOKEN_ACCESS,)
-    assert run.accesses == {"token": 0, "dir": 1}
+    assert run.accesses == {"token_file": 0, "token_dir": 1}
     assert run.left_out
 
 
@@ -110,9 +110,9 @@ def clean_snapshot():
         {"log": "unknown"},  # unknown without one
         {"isolation": "unproven"},  # unproven without a reason
         {"unproven": ["no_end_proof"]},  # proven with one
-        {"accesses": {"token": 0}},
-        {"accesses": {"token": 0, "dir": -1}},
-        {"accesses": {"token": 0, "dir": True}},
+        {"accesses": {"token_file": 0}},
+        {"accesses": {"token_file": 0, "token_dir": -1}},
+        {"accesses": {"token_file": 0, "token_dir": True}},
         {"traced": 1.5},
         {"proofs": 0},  # proven with no proof
         {"ptrace_scope": 9},
@@ -129,7 +129,7 @@ def test_a_snapshot_that_is_not_one_this_code_reads_is_unknown(change):
 def test_the_snapshot_holds_counts_and_reasons_and_never_a_pid_or_a_path():
     data = snapshot(read_log(log([inotify("dir", "IN_OPEN", "IN_ISDIR")]), NONCE))
     assert set(data) == guard_flags.SNAPSHOT_KEYS
-    assert data["accesses"] == {"token": 0, "dir": 1}
+    assert data["accesses"] == {"token_file": 0, "token_dir": 1}
     assert data["log"] == "intact"
     assert data["isolation"] == "proven"
     text = repr(data)

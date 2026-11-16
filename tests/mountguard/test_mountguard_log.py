@@ -14,7 +14,7 @@ def test_a_complete_log_of_this_run_is_intact_with_no_access_and_proven_isolatio
     reading = read_log(log(), NONCE)
     assert reading.intact
     assert reading.problems == ()
-    assert reading.accesses == {"token": 0, "dir": 0}
+    assert reading.accesses == {"token_file": 0, "token_dir": 0}
     assert reading.traced == 0
     assert reading.isolation_problems == ()
     assert reading.proofs == 1
@@ -23,24 +23,24 @@ def test_a_complete_log_of_this_run_is_intact_with_no_access_and_proven_isolatio
 
 def test_the_canary_before_the_window_is_the_hosts_own_and_never_an_access():
     """The host's removal of the token file comes before `armed`: it shows the watches live, nothing more."""
-    assert read_log(log(), NONCE).accesses == {"token": 0, "dir": 0}
+    assert read_log(log(), NONCE).accesses == {"token_file": 0, "token_dir": 0}
 
 
 def test_an_event_on_the_token_directory_inside_the_window_is_an_access():
     reading = read_log(log([TOUCH, inotify("dir", "IN_ACCESS", "IN_ISDIR")]), NONCE)
     assert reading.intact
-    assert reading.accesses == {"token": 0, "dir": 2}
+    assert reading.accesses == {"token_file": 0, "token_dir": 2}
 
 
 def test_an_event_on_the_token_file_inside_the_window_is_an_access():
     reading = read_log(log([inotify("token", "IN_OPEN")]), NONCE)
-    assert reading.accesses == {"token": 1, "dir": 0}
+    assert reading.accesses == {"token_file": 1, "token_dir": 0}
 
 
 def test_events_after_the_window_closes_are_the_hosts_teardown_and_not_accesses():
     reading = read_log(log(after=[inotify("dir", "IN_DELETE_SELF"), inotify("dir", "IN_IGNORED")]), NONCE)
     assert reading.intact
-    assert reading.accesses == {"token": 0, "dir": 0}
+    assert reading.accesses == {"token_file": 0, "token_dir": 0}
 
 
 def test_a_tracer_attached_to_oneclient_inside_the_window_is_counted():
@@ -175,7 +175,7 @@ def test_a_log_armed_twice_is_unknown():
 def test_a_log_whose_window_never_closed_is_unknown_and_counts_to_its_end():
     reading = read_log(log([TOUCH], disarmed=False), NONCE)
     assert guard_log.NOT_DISARMED in reading.problems
-    assert reading.accesses == {"token": 0, "dir": 1}
+    assert reading.accesses == {"token_file": 0, "token_dir": 1}
 
 
 def test_oneclient_not_seen_before_the_window_is_unknown():
@@ -197,7 +197,7 @@ def test_sampling_that_stopped_because_oneclient_ended_is_not_a_gap():
 def test_a_damaged_log_still_counts_the_accesses_it_shows_as_a_lower_bound():
     reading = read_log(log([TOUCH], end=False), NONCE)
     assert not reading.intact
-    assert reading.accesses == {"token": 0, "dir": 1}
+    assert reading.accesses == {"token_file": 0, "token_dir": 1}
 
 
 def test_every_proof_passing_proves_the_isolation():

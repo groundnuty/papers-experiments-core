@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from expcore.mountguard.instrument import INTACT, NAMESPACE, PROVEN, UNKNOWN, UNPROVEN, VERSION
-from expcore.mountguard.log import TARGETS
+from expcore.mountguard.log import ACCESS_KEYS
 
 TOKEN_ACCESS, PROCESS_ACCESS = "token_access", "process_access"
 LOG_UNKNOWN, ISOLATION_UNPROVEN = "log_unknown", "isolation_unproven"
@@ -86,7 +86,8 @@ def _readable(data: Any) -> tuple[Mapping[str, Any] | None, str | None]:
     if (data["log"] == INTACT) == bool(data["unknown"]) or (data["isolation"] == PROVEN) == bool(data["unproven"]):
         return None, NOT_A_SNAPSHOT
     accesses, scope = data["accesses"], data["ptrace_scope"]
-    if not isinstance(accesses, Mapping) or set(accesses) != set(TARGETS) or not all(map(_whole, accesses.values())):
+    keys = set(ACCESS_KEYS.values())
+    if not isinstance(accesses, Mapping) or set(accesses) != keys or not all(map(_whole, accesses.values())):
         return None, NOT_A_SNAPSHOT
     if not _whole(data["traced"]) or not _whole(data["proofs"]) or not (scope is None or scope in (0, 1, 2, 3)):
         return None, NOT_A_SNAPSHOT
@@ -111,7 +112,7 @@ def _assessed(snapshot: Any) -> tuple[Any, ...]:
     if data is None:
         reasons = (str(why),)
         both = tuple(flag for flag in FLAGS if flag in (LOG_UNKNOWN, ISOLATION_UNPROVEN))
-        return UNKNOWN, reasons, UNPROVEN, reasons, dict.fromkeys(TARGETS, 0), 0, both
+        return UNKNOWN, reasons, UNPROVEN, reasons, dict.fromkeys(ACCESS_KEYS.values(), 0), 0, both
     found = set()
     if sum(data["accesses"].values()):
         found.add(TOKEN_ACCESS)

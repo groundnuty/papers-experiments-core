@@ -55,6 +55,9 @@ from typing import Any
 FORMAT = "expcore-mountwatch/1"
 MAX_BYTES = 64 * 1024 * 1024  # a log past this is not read: unknown (`log_too_large`)
 TARGETS = ("token", "dir")
+# Each watch's count of accesses, as the record keeps it: a key `token`, or one ending in `_token`, is a secret's to the
+# record's redaction (`expcore.records.redact`), and a count is none.
+ACCESS_KEYS = {"token": "token_file", "dir": "token_dir"}
 ENTRIES = ("self", "token", "other")
 MASK_NAMES = frozenset(
     {
@@ -98,12 +101,12 @@ LOG_INCOMPLETE = "log_incomplete"  # the log was cut, damaged or never closed: w
 
 @dataclass(frozen=True)
 class Reading:
-    """What a log shows: why it is not intact (empty when it is), the accesses inside the window by watch, the tracers
-    attached to oneclient inside it, the proofs read in it, why the isolation is not proven (empty when it is), and
-    the kernel's ptrace scope."""
+    """What a log shows: why it is not intact (empty when it is), the accesses inside the window by watch (on the token
+    file, `token_file`, and on its directory, `token_dir`), the tracers attached to oneclient inside it, the proofs
+    read in it, why the isolation is not proven (empty when it is), and the kernel's ptrace scope."""
 
     problems: tuple[str, ...]
-    accesses: Mapping[str, int] = field(default_factory=lambda: dict.fromkeys(TARGETS, 0))
+    accesses: Mapping[str, int] = field(default_factory=lambda: dict.fromkeys(ACCESS_KEYS.values(), 0))
     traced: int = 0
     proofs: int = 0
     isolation_problems: tuple[str, ...] = (NO_PROOF,)
@@ -316,10 +319,10 @@ def read_log(data: bytes | None, nonce: str, *, max_bytes: int = MAX_BYTES) -> R
         problems.append(SAMPLING_FAILED)
     if any(x["event"] == "proof" for x in setup + body[closed:]):
         problems.append(PROOF_OUTSIDE_WINDOW)
-    accesses = dict.fromkeys(TARGETS, 0)
+    accesses = dict.fromkeys(ACCESS_KEYS.values(), 0)
     for x in inside:
         if x["event"] == "inotify":
-            accesses[x["target"]] += 1
+            accesses[ACCESS_KEYS[x["target"]]] += 1
     tracers = [x["attached"] for x in setup if x["event"] == "tracer"]
     traced = int(bool(tracers) and tracers[-1]) + sum(1 for x in inside if x["event"] == "tracer" and x["attached"])
     proofs = [x for x in inside if x["event"] == "proof"]

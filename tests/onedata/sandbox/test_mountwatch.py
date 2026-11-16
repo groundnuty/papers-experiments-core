@@ -74,7 +74,7 @@ def test_a_run_that_never_touches_the_token_reads_clean(run, capsys):
     reading = read_log(finish(w, run), NONCE)
     assert reading.problems == ()
     assert reading.isolation_problems == ()
-    assert reading.accesses == {"token": 0, "dir": 0}
+    assert reading.accesses == {"token_file": 0, "token_dir": 0}
     assert verdict_of(snapshot(reading)) == "clean"
 
 
@@ -87,7 +87,7 @@ def test_a_listing_of_the_token_directory_in_the_window_flags_the_run(run):
     w.tick()
     reading = read_log(finish(w, run), NONCE)
     assert reading.intact
-    assert reading.accesses["dir"] >= 1
+    assert reading.accesses["token_dir"] >= 1
     assert verdict_of(snapshot(reading)) == "flagged"
 
 
@@ -98,7 +98,7 @@ def test_a_file_made_in_the_token_directory_in_the_window_flags_the_run(run):
     w.tick()
     Path(run.token).write_text("x")
     reading = read_log(finish(w, run), NONCE)
-    assert reading.accesses["dir"] >= 1
+    assert reading.accesses["token_dir"] >= 1
 
 
 def test_a_tracer_on_oneclient_in_the_window_flags_the_run(run):
@@ -201,6 +201,6 @@ def test_the_watcher_as_its_own_process_writes_a_log_the_core_reads(run, tmp_pat
         stand_in.wait()
     reading = read_log(Path(run.log).read_bytes(), NONCE)
     assert reading.problems == ()
-    assert reading.accesses["dir"] >= 1
+    assert reading.accesses["token_dir"] >= 1
     assert guard_log.MOUNT_UNSEEN in reading.isolation_problems
     assert verdict_of(snapshot(reading)) == "flagged"

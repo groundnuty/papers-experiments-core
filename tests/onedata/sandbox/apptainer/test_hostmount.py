@@ -193,7 +193,7 @@ def test_a_run_without_access_and_with_a_proved_cell_is_clean_in_the_metadata(no
         mount.close_watch()
         after = mount.metadata()
         assert after["guard"]["verdict"] == "clean"
-        assert after["guard"]["snapshot"]["accesses"] == {"token": 0, "dir": 0}
+        assert after["guard"]["snapshot"]["accesses"] == {"token_file": 0, "token_dir": 0}
     finally:
         mount.stop()
 
@@ -241,7 +241,7 @@ def test_a_log_file_of_oneclient_that_holds_the_token_is_removed_at_the_stop(nod
     leaked.write_text(f"a line with {TOKEN}\n")
     mount.stop()
     assert not leaked.exists()
-    assert mount.metadata()["log_files_with_token"] == 1
+    assert mount.metadata()["log_files_scrubbed"] == 1
 
 
 def test_through_the_sandbox_every_cell_binds_the_mount_point_alone_and_the_collection_closes_the_window(

@@ -323,6 +323,31 @@ EGRESS_NOTES = [
     "DNS queries pass the shim, which is why the scan is the second line, and neither stops a connection.",
 ]
 
+MOUNT_GUARD_NOTES = [
+    "This batch's mount was guarded: its agents shared a uid with the oneclient that held the mount's token (an HPC",
+    "batch node, with no root and no user namespace), so the token could not be kept from them as a separate",
+    "container keeps it. oneclient ran on the node outside every cell, its token in a file no cell bound, removed",
+    "once the mount was up. A watcher outside the cells logged every event on that file and its directory, sampled",
+    "oneclient for a tracer, and proved from the node's `/proc` that each cell it caught ran in a PID namespace of",
+    "its own, with no host `/proc` and no private directory in its mounts. A run is `flagged` for a `token_access`",
+    "(an event on the token's file or directory while its cells could run) or a `process_access` (a tracer on",
+    "oneclient); `unknown` for a `log_unknown` (the log is missing, damaged, of another run or without its canary, or",
+    "the record has no readable snapshot) or an `isolation_unproven` (no cell was proved, or a proof failed);",
+    "otherwise `clean`. Unknown is never read as clean. Detection, not prevention: inotify names no process, so every",
+    "event counts as the agent's; a tracer is sampled, so one that comes and goes between samples is missed;",
+    "oneclient's environment and memory are covered only by the proof that no cell can see its process, never",
+    "watched; and a cell that starts and ends between two polls is not proved itself.",
+]
+
+MOUNT_SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without the runs that are not clean (flagged and unknown): each one is left",
+    "out as an absent run (`excluded`), so its pairs count as `Unpaired or left out` and its arm's runs as `Left",
+    "out`. The analysis above stands; this says whether its conclusions hold without the runs that touched the",
+    "mount's token or oneclient's process, or could not be shown not to. A run is left out for what was detected",
+    "about it, never for its outcome. The egress section, if any, leaves out its own runs: a run flagged by both is",
+    "left out of both reruns.",
+]
+
 SENSITIVITY_NOTES = [
     "The preregistered analysis again, without the flagged runs: each one is left out as an absent run (`excluded`),",
     "so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The analysis above stands; this",
