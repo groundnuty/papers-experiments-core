@@ -37,6 +37,8 @@ and a record holds the hashes alone (`record`).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from collections.abc import Mapping
@@ -111,7 +113,9 @@ class ApptainerSettings:
             "disk_poll_s": self.disk_poll_s,
             "preload_sha256": [p.sha256 for p in self.preload],
             "binds": [{"target": b.target, "sha256": b.file.sha256} for b in self.binds],
-            "gate_options": sorted(self.gate_options),
+            "gate_options": hashlib.sha256(
+                json.dumps(dict(self.gate_options), sort_keys=True, default=str).encode()
+            ).hexdigest(),  # by value, never shown: a changed option is another experiment
         }
 
 

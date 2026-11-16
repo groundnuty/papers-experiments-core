@@ -298,7 +298,7 @@ class ApptainerSandbox:
         argv = [self._host_python(), "-I", str(egress / "egress-collector.py"), str(self.dir / "egress-sock"),
                 str(egress / "egress.jsonl"), self.egress_nonce]  # fmt: skip
         helpers.start(self.node, "collector", argv, egress, COLLECTOR_READY, noted=self._note_helper,
-                      sleep=self._sleep, clock=self._clock)  # fmt: skip
+                      env={AV.RUN_TAG: self.sid}, sleep=self._sleep, clock=self._clock)  # fmt: skip
 
     def _start_mount(self) -> Path:
         """Hook (c): the mount's helper, started before any cell; the node directory bound at the mount path."""
@@ -330,7 +330,8 @@ class ApptainerSandbox:
             gaterun.write_token(token, sp.token.reveal())
             try:
                 helpers.start(self.node, "gate", gaterun.argv(self._host_python(), config), gate_dir,
-                              gaterun.READY, noted=self._note_helper, sleep=self._sleep, clock=self._clock)  # fmt: skip
+                              gaterun.READY, noted=self._note_helper, env={AV.RUN_TAG: self.sid}, sleep=self._sleep,
+                              clock=self._clock)  # fmt: skip
             except SandboxError:
                 self._remove_token_files()
                 said = helpers.output(self._helpers["gate"])
@@ -345,8 +346,9 @@ class ApptainerSandbox:
 
     def _retire_gate(self) -> None:
         """A gate that failed to start: shown gone before another is tried (a stop that cannot show it raises)."""
-        gate = self._helpers.pop("gate")
-        helpers.stop(self.node, gate, sleep=self._sleep, clock=self._clock)
+        gate = self._helpers["gate"]
+        helpers.stop(self.node, gate, sleep=self._sleep, clock=self._clock)  # raises, and stays for the teardown
+        del self._helpers["gate"]
         os.rename(gate.stdout, gate.stdout.with_suffix(f".failed-{gate.process.pid}"))
         os.rename(gate.stderr, gate.stderr.with_suffix(f".failed-{gate.process.pid}"))
         self.run_record()
@@ -424,9 +426,11 @@ class ApptainerSandbox:
         return AV.exec_argv(self.app.apptainer, self.app.image.path, self._binds, self._env, command)
 
     def _start_cells(self) -> None:
-        limits = self.s.limits
+        limits, own = self.s.limits, self.node.own_pidns()
+        if own is None:  # the driver's and the helpers' namespace could not be told from a cell's
+            raise SandboxError("the driver's own PID namespace could not be read")
         self._watch = Watch(
-            self.node, run_tag=self.run_tag, own_pidns=self.node.own_pidns(), memory_bytes=limits.memory_bytes,
+            self.node, run_tag=self.run_tag, own_pidns=own, memory_bytes=limits.memory_bytes,
             spaces=spaces_of(self.dir, {"work": limits.work_disk_bytes, "tmp": limits.tmp_bytes,
                                         "shm": limits.shm_bytes}),
             memory_poll_s=self.app.memory_poll_s, disk_poll_s=self.app.disk_poll_s,

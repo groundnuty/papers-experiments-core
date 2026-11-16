@@ -134,3 +134,19 @@ def test_a_worker_a_cell_left_running_is_killed_at_the_cell_s_end(node, box):
     box.exec("start_a_daemon()", 30)
     assert not node.cell_left[0].alive
     assert box._cells.cells[-1]["left_after_exec"] == 1
+
+
+def test_an_oom_of_the_step_s_cgroup_comes_before_the_watch_s_kill(node, box):
+    """O56, O17: infrastructure first: a cell the watch killed while the shared cgroup counted an OOM kill is
+    `host_oom`, never the agent's `memory_limit`."""
+
+    def both(cell):
+        node.cgroup["events"]["oom_kill"] += 1
+        cell.procs[1].rss = 200 << 20
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "", "")
+
+    node.cell_handler = both
+    result = box.exec("x = bytearray(200 << 20)", 30)
+    assert result.kill["reason"] == "host_oom"
+    assert result.kill["watch_kills"]

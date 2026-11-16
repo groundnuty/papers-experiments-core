@@ -128,3 +128,20 @@ def test_a_run_with_no_data_path_has_no_gate_and_still_logs_its_egress(node, set
         assert snapshot["canary"] is True
     finally:
         box.stop()
+
+
+def test_a_kept_run_never_keeps_a_file_that_holds_the_token(node, settings, tmp_path):
+    """O56, O05: a run kept as evidence after a failed collection has every file holding the token removed first."""
+    box = start(node, settings)
+    with open(box.dir / "gate" / "requests.jsonl", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": "leak", "value": TOKEN}) + "\n")
+    with pytest.raises(InfraError):
+        box.collect(tmp_path / "out")
+    box.stop()
+    kept = settings.work_root / "_kept_evidence" / box.sid
+    assert kept.is_dir()
+    assert not (kept / "gate" / "requests.jsonl").exists()
+    for path in kept.rglob("*"):
+        if path.is_file():
+            assert TOKEN.encode() not in path.read_bytes(), path
+    assert box.metadata()["evidence_kept"]["files_holding_the_token_removed"] == 1

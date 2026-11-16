@@ -90,7 +90,37 @@ def test_usage_never_follows_a_link_and_stops_past_its_entry_cap(tmp_path):
     (tmp_path / "link").symlink_to("/")
     for n in range(10):
         (tmp_path / f"f{n}").touch()
-    used, entries = usage(tmp_path, 1000)
+    used, entries, whole = usage(tmp_path, 1000)
     assert used >= 8192
     assert entries == 12
+    assert whole
     assert usage(tmp_path, 3)[1] == 4
+
+
+def test_a_directory_the_walk_may_not_list_makes_it_incomplete(tmp_path):
+    """O56: a directory its owner made 0000 hides what is under it: unknown, never nothing."""
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    (hidden / "big").write_bytes(b"x" * 8192)
+    hidden.chmod(0)
+    try:
+        assert usage(tmp_path, 1000)[2] is False
+    finally:
+        hidden.chmod(0o700)
+
+
+def test_a_space_the_watch_cannot_walk_kills_the_run_as_a_disk_limit(node, tmp_path):
+    """O56: a cell that hides a directory from the walk (and writes on through a descriptor it holds) is taken as
+    past its size."""
+    ns = node.new_namespace()
+    proc = node._new_proc(ns, "python3", environ=(TAG,))
+    watch = _watch(node, tmp_path)
+    hidden = tmp_path / "work" / "hidden"
+    hidden.mkdir()
+    hidden.chmod(0)
+    try:
+        watch.poll()
+    finally:
+        hidden.chmod(0o700)
+    assert not proc.alive
+    assert watch.kills[0]["what"] == "work_unwalkable"

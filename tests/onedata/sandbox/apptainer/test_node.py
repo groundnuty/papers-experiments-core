@@ -70,3 +70,19 @@ def test_the_node_s_identity_and_a_free_port():
     node = LocalNode()
     assert node.identity().pid > 0
     assert 1024 <= node.free_port() <= 65535
+
+
+def test_a_pid_an_ended_helper_held_is_not_taken_for_that_helper_once_another_process_holds_it(child, monkeypatch):
+    """O56: the node's own record of an ended child answers only for that child's start: another start of the same
+    pid (a process that took it over) is read from /proc."""
+    from expcore_onedata.sandbox.apptainer import node as N
+
+    node, process = child
+    node.signal(process.pid, process.start, signal.SIGKILL)
+    until = time.monotonic() + 10
+    while node.alive(process.pid, process.start) and time.monotonic() < until:
+        time.sleep(0.02)
+    other = str(int(process.start) + 7)
+    monkeypatch.setattr(N, "_start_of", lambda pid: other if pid == process.pid else None)
+    assert node.alive(process.pid, other) is True
+    assert node.alive(process.pid, process.start) is False

@@ -237,7 +237,8 @@ class AppCellRunner(CellRunner):
             res.kill = self._cause(fired, gave_up, watched, cgroup_before, timeout_s)
             incomplete = None
             if check.cause is not None and not gave_up and not fired:
-                incomplete = APPTAINER_FAILED.format(rc=rc) if AV.apptainer_failed(rc, err) else check.cause
+                said = check.cause.replace("docker exec", "apptainer exec")  # the shared check's words, this exec's
+                incomplete = APPTAINER_FAILED.format(rc=rc) if AV.apptainer_failed(rc, err) else said
             if record:
                 self._record_cell(res, cell, deadline, watched, left, incomplete, gave_up)
                 res.bound = bound if res.timed_out else None
@@ -261,6 +262,11 @@ class AppCellRunner(CellRunner):
     ) -> dict[str, Any] | None:
         """The one cause of a cell's kill from the harness's own evidence (the module's docstring), None for none."""
         kills = watched["kills"]
+        after = self.node.cgroup_memory() if before is not None else None
+        if _oom_rose(before, after):  # infrastructure comes first (killcause.PRECEDENCE), whatever the watch did
+            basis = "the step's memory cgroup, which the harness, the gate and the cell share, counted an OOM kill"
+            return {"reason": "host_oom", "category": KC.CATEGORY["host_oom"], "basis": basis, "timer_fired": fired,
+                    "watch_kills": kills}  # fmt: skip
         if kills:
             first = kills[0]
             reason = first["reason"]
@@ -270,10 +276,6 @@ class AppCellRunner(CellRunner):
             )
             return {"reason": reason, "category": KC.CATEGORY[reason], "basis": basis, "watch_kills": kills,
                     "timer_fired": fired}  # fmt: skip
-        after = self.node.cgroup_memory() if before is not None else None
-        if _oom_rose(before, after):
-            basis = "the step's memory cgroup, which the harness, the gate and the cell share, counted an OOM kill"
-            return {"reason": "host_oom", "category": KC.CATEGORY["host_oom"], "basis": basis, "timer_fired": fired}
         if fired:
             basis = f"the harness's timer fired at the cell's limit of {timeout_s:g} s"
             return {"reason": "time_limit", "category": KC.CATEGORY["time_limit"], "basis": basis, "timer_fired": True}
