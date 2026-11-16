@@ -22,11 +22,15 @@ NOTES = [
     "without a price). A top-up or probe row is charged its dollars. A lost attempt is in none of the counts above:",
     "its run was run again.",
 ]
-# With a Basis column (an export whose journal kept call logs, C05): how an attempt whose end was not seen was charged
-BASIS_NOTE = [
-    "Basis: since the call log (C05), an attempt whose end the journal did not see is charged by its journaled log,",
-    "measured (every request answered) or measured plus one request in flight at that request's bound, and its",
-    "reserved bound (bound) only when no log could be read.",
+# With a Basis column (an export whose journal kept call logs, C05), how an attempt whose end was not seen is charged
+BASIS_NOTES = [
+    "Each row is spend a killed dispatcher made after its store's last copy, which the copy put back lacked, counted",
+    "once from its spend journal and charged to the budget (its shard's share in a sharded campaign). An attempt whose",
+    "end the journal did not see is charged by its journaled call log (Basis: measured, every request answered; or",
+    "measured_plus_inflight, one request in flight at that request's bound), or its reserved bound (Basis: bound) when",
+    "no log could be read; one that ended, its measured cost (its bound when its counts were not complete); top-ups on",
+    "top; USD charged is that figure when it was counted (`-`: a model without a price). A top-up or probe row is",
+    "charged its dollars. A lost attempt is in none of the counts above: its run was run again.",
 ]
 UNKNOWN = "-"
 
@@ -57,7 +61,7 @@ def section(export: Mapping[str, Any], table: Table) -> list[str]:
     if any("basis" in entry for entry in entries):  # an export from before the call log has no such column (C05)
         header.append("Basis")
         rows = [[*row, entry.get("basis", UNKNOWN)] for entry, row in zip(entries, rows, strict=True)]
-        notes = [*NOTES, *BASIS_NOTE]
+        notes = BASIS_NOTES
     if any("shard" in entry for entry in entries):
         header.insert(0, "Shard")
         rows = [[entry.get("shard", UNKNOWN), *row] for entry, row in zip(entries, rows, strict=True)]

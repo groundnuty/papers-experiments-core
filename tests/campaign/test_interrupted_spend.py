@@ -27,6 +27,7 @@ from expcore.campaign.recovery import recover
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price, PriceTier, TieredPrice
+from expcore.errors import BudgetHold
 from expcore.models.adapters import ModelTurn, ToolCall
 
 # The stub's bound is 30 USD: a 1.9M-token cap and its 100,000-token window, both at the dearest 15 USD per million,
@@ -270,6 +271,34 @@ def test_c05_the_attempts_spend_guard_counts_each_request_before_it_goes_out_and
     [row] = store.q("SELECT calls_sent, calls_usage FROM attempts WHERE id=?", (begun.id,))
     assert row["calls_sent"] == 3
     assert json.loads(row["calls_usage"]) == [[10_000, 500, 4_000, 5_000], None]
+
+
+@pytest.mark.parametrize("max_usd", [1_000.0, BOUND_USD + 0.1])
+def test_c05_a_request_whose_last_send_failed_is_charged_once_by_its_top_up_not_again_as_in_flight(tmp_path, max_usd):
+    """C05 and C26: a send that failed after it may have been billed, with nothing sent after it (the retries ran out,
+    or the resend did not fit the budget), is charged a top-up of one request's bound, and the same transaction closes
+    the request in the log: a kill then charges it that top-up once, never a second request's bound as in flight."""
+    store, _, manifest = planned_store(tmp_path)
+    key = keys_of(manifest)[0]
+    begun = store.begin_attempt(key, NOW, 1, "", calls_logged=True)
+    gate = BudgetGate(store, {"m1": SPEC}, Budget(max_usd=max_usd), LIMITS)
+    ledger = Ledger(gate, store, lambda: NOW, (threading.Lock(),), lambda: ["m1"])
+    guard = AttemptSpend(ledger, begun.id, key, "m1", reserved_capped=False, calls_logged=True)
+
+    async def go():
+        await guard.before_request()
+        await guard.after_reply(*FIRST[:2])
+        await guard.before_request()
+        if max_usd > 100:
+            await guard.after_failed_send("server", resend=False)  # the retries ran out
+        else:
+            with pytest.raises(BudgetHold):  # the resend's top-up does not fit: not sent again
+                await guard.after_failed_send("server", resend=True)
+
+    asyncio.run(go())
+    recover(store, LATER, 3)
+    cost = charged(store)
+    assert (cost.basis, cost.usd) == (MEASURED, pytest.approx(FIRST_USD + REQUEST_USD))  # its top-up, once
 
 
 def test_c05_a_request_the_guard_refuses_is_not_counted(tmp_path):

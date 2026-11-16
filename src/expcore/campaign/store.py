@@ -54,6 +54,8 @@ from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
 from expcore.campaign.spend_journal import PROBE, UNHELD, SpendJournal, attempt_entry
 
+FAILED = "failed"  # `interrupted_spend.FAILED`: a request closed by its last failed send, which its top-up paid for
+
 _FIXED_SQL = """
 CREATE TABLE IF NOT EXISTS attempts(
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_key TEXT NOT NULL REFERENCES runs(run_key), attempt INTEGER NOT NULL,
@@ -524,11 +526,16 @@ class Store:
 
         return self.transact(go)
 
-    def add_topup(self, attempt_id: int, usd: float, now: str, event: tuple[str, str | None, str]) -> None:
+    def add_topup(
+        self, attempt_id: int, usd: float, now: str, event: tuple[str, str | None, str], *, close_call: bool = False
+    ) -> None:
         """Charge a running attempt one top-up of `usd` dollars and append its event, in one transaction (C26).
 
         A top-up is charged when it is reserved and never refunded, so it is part of what was spent from that moment,
         whatever comes of the attempt; `finish_attempt` leaves it as it is. An attempt that is not running is refused.
+        With `close_call` (the top-up of a request's last failed send, nothing sent after it), the request is closed
+        in the attempt's call log in the same transaction (`"failed"`, C05), so a kill never charges it again as a
+        request in flight.
         """
         if isinstance(usd, bool) or not isinstance(usd, int | float) or not usd >= 0 or usd == float("inf"):
             raise ValueError(f"a top-up is a finite number of dollars, not below zero, not {usd!r}")
@@ -541,9 +548,30 @@ class Store:
             if cursor.rowcount != 1:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
             self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
+            if close_call:
+                self._close_call(attempt_id, FAILED)
             self._note_spend(lambda: self._attempt_line(attempt_id))  # written before the send it pays for (O62)
 
         self.transact(go)
+
+    def _close_call(self, attempt_id: int, entry: Any) -> bool:
+        """Append how a request of a running attempt closed to its call log, inside the open transaction; False when
+        the attempt keeps no log, or one that cannot be read (it stays so, and charges the bound)."""
+        row = self.db.execute(
+            "SELECT calls_usage FROM attempts WHERE id=? AND state='running' AND calls_usage IS NOT NULL",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            usage = json.loads(row["calls_usage"])
+        except ValueError:
+            return False
+        if not isinstance(usage, list):
+            return False
+        usage.append(entry)
+        self.db.execute("UPDATE attempts SET calls_usage=? WHERE id=?", (json.dumps(usage), attempt_id))
+        return True
 
     def note_call_sent(self, attempt_id: int) -> None:
         """Count a request of a running attempt in its call log before it goes out (C05): committed, and journaled
@@ -571,21 +599,13 @@ class Store:
             raise ValueError(f"a reply's counts are input, output, cache writes and cache reads, not {counts!r}")
 
         def go() -> None:
-            row = self.db.execute(
-                "SELECT calls_usage FROM attempts WHERE id=? AND state='running' AND calls_usage IS NOT NULL",
-                (attempt_id,),
+            running = self.db.execute(
+                "SELECT 1 FROM attempts WHERE id=? AND state='running' AND calls_usage IS NOT NULL", (attempt_id,)
             ).fetchone()
-            if row is None:
+            if running is None:
                 raise AttemptRefused(f"attempt {attempt_id} is not running with a call log, so no reply is noted")
-            try:
-                usage = json.loads(row["calls_usage"])
-            except ValueError:
-                return  # unreadable: it stays so, and charges the bound
-            if not isinstance(usage, list):
-                return
-            usage.append(entry)
-            self.db.execute("UPDATE attempts SET calls_usage=? WHERE id=?", (json.dumps(usage), attempt_id))
-            self._note_spend(lambda: self._attempt_line(attempt_id))
+            if self._close_call(attempt_id, entry):  # a log that cannot be read stays so, and charges the bound
+                self._note_spend(lambda: self._attempt_line(attempt_id))
 
         self.transact(go)
 

@@ -164,12 +164,14 @@ class Ledger:
                 self._add(attempt_id, run_key, model, rest, extra)
         return cleared + extra, None
 
-    def charge(self, attempt_id: int, run_key: str, model: str, why: str) -> None:
-        """Charge one top-up for a send already made, whether or not it fits: what it may have cost is spent."""
+    def charge(self, attempt_id: int, run_key: str, model: str, why: str, *, close_call: bool = False) -> None:
+        """Charge one top-up for a send already made, whether or not it fits: what it may have cost is spent. With
+        `close_call` the send was its request's last, and the same transaction closes the request in the attempt's
+        call log (C05), so a kill never charges it again as in flight."""
         with self._held():
             usd = self.bound(model)
             if usd:  # free, or unpriced: a model without a price never runs under a budget (C12)
-                self._add(attempt_id, run_key, model, why, usd)
+                self._add(attempt_id, run_key, model, why, usd, close_call=close_call)
 
     def probe_bound(self, model: str) -> float | None:
         """What one send of an admission probe can cost: one request's bound by the window, whatever the model is held
@@ -206,9 +208,12 @@ class Ledger:
         with self._held():
             probe_spend.add(self.store, model, cost - reserved, self.stamp(), ("probe_settled", model, detail))
 
-    def _add(self, attempt_id: int, run_key: str, model: str, why: str, usd: float) -> None:
+    def _add(
+        self, attempt_id: int, run_key: str, model: str, why: str, usd: float, *, close_call: bool = False
+    ) -> None:
         """Charge the attempt one top-up, with its event; call with the locks held."""
-        self.store.add_topup(attempt_id, usd, self.stamp(), ("topup", model, f"{run_key}: {why}; {usd:.6f} USD"))
+        event = ("topup", model, f"{run_key}: {why}; {usd:.6f} USD")
+        self.store.add_topup(attempt_id, usd, self.stamp(), event, close_call=close_call)
 
     def note(self, model: str, kind: str, detail: str) -> None:
         """Append an event about one of the model's requests."""
@@ -329,8 +334,11 @@ class AttemptSpend:
 
     def _failed_send(self, kind: str, resend: bool) -> None:
         why = f"a send that failed ({kind}) after it may have been billed"
+        last = self.calls_logged  # nothing goes out after it: its top-up closes the request in the call log (C05)
         if not resend:
-            self.ledger.charge(self.attempt_id, self.run_key, self.model, f"{why}, the last of its request")
+            self.ledger.charge(
+                self.attempt_id, self.run_key, self.model, f"{why}, the last of its request", close_call=last
+            )
             return
         usd, refusal = self.ledger.reserve_send(
             self.attempt_id, self.run_key, self.model, f"{why}, before it is sent again"
@@ -338,7 +346,7 @@ class AttemptSpend:
         if refusal is None:
             self.cleared = usd
             return
-        self.ledger.charge(self.attempt_id, self.run_key, self.model, f"{why}, not sent again")
+        self.ledger.charge(self.attempt_id, self.run_key, self.model, f"{why}, not sent again", close_call=last)
         raise BudgetHold(f"the request was not sent again after a {kind} failure: {refusal}")
 
 

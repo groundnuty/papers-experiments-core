@@ -11,7 +11,7 @@ from pathlib import Path
 
 from expcore.campaign import lost_ledger
 from expcore.campaign.attempts import TreatmentKindsMismatch
-from expcore.campaign.interrupted_spend import BASES, BOUND, basis_of, read_log
+from expcore.campaign.interrupted_spend import BASES, BOUND, COPIED_BACK_KEY, basis_of, read_log
 from expcore.campaign.markers import read_marker
 from expcore.campaign.store import Store
 
@@ -31,9 +31,10 @@ def recover(store: Store, now: str, max_attempts: int) -> Recovery:
     An attempt with a marker that names it is committed from the marker and never run again. Every other running
     attempt becomes interrupted, uncharged against the attempt limit, with its usage marked incomplete, and its run
     stays pending to be run again under the same number. An attempt that kept a call log gets the basis it is charged
-    on (`spend_basis`, C05): the one its log says when the store was never journaled, so it is the store that ran it,
-    and `bound` when the store's ledger names a spend journal (the store may be a snapshot whose log the attempt
-    outgrew, which only that journal's count can confirm, `lost_spend.reconcile`) or cannot be read. Only then do
+    on (`spend_basis`, C05): the one its log says when the store was never journaled nor copied back to run again, so
+    it is the store that ran it, and `bound` when the store's ledger names a spend journal or the store was copied
+    back (it may be a snapshot whose log the attempt outgrew, which only its journal's count can confirm,
+    `lost_spend.reconcile`) or the ledger cannot be read. Only then do
     harness-error runs go back to pending, from the same row, their failed
     attempts kept: a kill after the marker and a kill after the metadata write leave the same state after one
     recovery, because a marker that ends as a harness error is requeued like a result that was stored. A marker that
@@ -62,7 +63,8 @@ def recover(store: Store, now: str, max_attempts: int) -> Recovery:
             )
         committed += 1
     ledger = lost_ledger.read(store)
-    trusted = ledger is not None and ledger.journal is None  # never journaled: the store that ran the attempts
+    # never journaled and never copied back to run again: the store that ran the attempts, its logs whole
+    trusted = ledger is not None and ledger.journal is None and store.get_meta(COPIED_BACK_KEY) is None
     interrupted = store.transact(lambda: _interrupt(store, orphans, now, trusted))
     requeued = store.transact(lambda: _requeue_harness_errors(store, now))
     return Recovery(committed, interrupted, requeued)

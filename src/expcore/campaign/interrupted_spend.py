@@ -7,8 +7,11 @@ could then hold every later run of its model on the budget. So, with a budget, e
 runs (`Store.note_call_sent`, `Store.note_call_answered`, written by the attempt's spend guard,
 `campaign.topup.AttemptSpend`): `calls_sent`, the requests it sent, each counted before it goes out, and
 `calls_usage`, the counts each reply reported (`[input, output, cache writes, cache reads]`, or `null` for a reply the
-endpoint billed and the backend could not read). The spend journal carries both on every `attempt` line (O62), so the
-log outlives a host whose store a kill took.
+endpoint billed and the backend could not read), or `"failed"` for a request whose last send failed after it may have
+been billed, with nothing sent after it: that send is charged a top-up of one request's bound (C26) in the same
+transaction that closes the request here (`Store.add_topup(close_call=True)`), so it is never charged again as a
+request in flight. The spend journal carries both on every `attempt` line (O62), so the log outlives a host whose
+store a kill took.
 
 An interrupted attempt is charged on one of three **bases**:
 
@@ -39,7 +42,11 @@ an attempt at `bound`, and only the start's count of its own journal (`lost_spen
 log, the longer of the two when one extends the other, and the basis that log says. An attempt the journal lists and
 the store lacks is charged from the journal's log directly, which is complete up to the kill: each line is written
 before the send it allows. The basis recorded on the row (`spend_basis`) is what the budget gate charges by; a row
-whose log no longer says the basis it records is charged its bound.
+whose log no longer says the basis it records is charged its bound. A store copied back to run again (a snapshot's
+restore, the shard driver's resume from its archive) has its attempts' directories pointed at its new `runs/`
+(`snapshot.rebase_run_dirs`), which marks it copied back (`COPIED_BACK_KEY` in its meta): its own log is never
+trusted then, journal or none. A store never journaled and copied back by hand from a backup, with neither, is outside
+this, as it is outside every guarantee about what was spent after the copy.
 """
 
 import json
@@ -47,29 +54,32 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from expcore.campaign.store import column_for
+from expcore.campaign.store import FAILED, column_for  # FAILED: a request closed by a failed last send (C26)
 from expcore.config.models import ModelSpec
 
 MEASURED, INFLIGHT, BOUND = "measured", "measured_plus_inflight", "bound"
 BASES = (MEASURED, INFLIGHT, BOUND)
+COPIED_BACK_KEY = "copied_back_utc"  # meta: the store was copied back to run again (`snapshot.rebase_run_dirs`)
 Counts = tuple[int | None, int | None, int | None, int | None]
+Entry = Counts | str | None  # a reply's counts, FAILED, or None for a reply billed and not read
 
 
 @dataclass(frozen=True)
 class CallLog:
-    """An attempt's call log as read: the requests it sent and each answered one's counts (None: unreadable)."""
+    """An attempt's call log as read: the requests it sent and how each closed one ended: its reply's counts, FAILED,
+    or None for a reply that was not read."""
 
     sent: int
-    answered: tuple[Counts | None, ...]
+    answered: tuple[Entry, ...]
 
     @property
     def in_flight(self) -> int:
-        """The requests sent and not answered."""
+        """The requests sent and not closed."""
         return self.sent - len(self.answered)
 
     def as_columns(self) -> tuple[int, str]:
         """The log as the store's `calls_sent` and `calls_usage` hold it."""
-        return self.sent, json.dumps([None if c is None else list(c) for c in self.answered])
+        return self.sent, json.dumps([c if c is None or isinstance(c, str) else list(c) for c in self.answered])
 
     def extends(self, other: "CallLog") -> bool:
         """Whether this log is `other` with nothing changed and perhaps more after it."""
@@ -89,10 +99,10 @@ def read_log(sent: Any, usage: Any) -> CallLog | None:
         return None
     if not isinstance(entries, list):
         return None
-    answered: list[Counts | None] = []
+    answered: list[Entry] = []
     for entry in entries:
-        if entry is None:
-            answered.append(None)
+        if entry is None or entry == FAILED:
+            answered.append(entry)
             continue
         counts = _counts(entry)
         if counts is None:
@@ -114,23 +124,30 @@ def _counts(entry: Any) -> Counts | None:
     return prompt, reply, written, read
 
 
+def _unknown(entry: Entry) -> bool:
+    """Whether a closed request's cost is unknown: a reply not read, or one whose prompt or reply count is missing."""
+    return entry is None or (not isinstance(entry, str) and (entry[0] is None or entry[1] is None))
+
+
 def basis_of(log: CallLog | None) -> str:
     """The basis a log charges on: `bound` without a log, with no request in it (a kill before the first request and
     an executor whose requests bypass the recording look the same), or with a reply whose prompt or reply count is
     unknown."""
-    if log is None or log.sent == 0 or any(c is None or c[0] is None or c[1] is None for c in log.answered):
+    if log is None or log.sent == 0 or any(_unknown(c) for c in log.answered):
         return BOUND
     return MEASURED if log.in_flight == 0 else INFLIGHT
 
 
-def measured_usd(spec: ModelSpec, answered: Sequence[Counts | None]) -> float | None:
+def measured_usd(spec: ModelSpec, answered: Sequence[Entry]) -> float | None:
     """What the answered requests cost at the model's price, each at its own tier; None when unpriced or a count is
-    unknown. A cache count left out is none, as for a finished attempt."""
+    unknown. A cache count left out is none, as for a finished attempt. A request closed by a failed send costs
+    nothing here: its top-up, charged with the attempt's, is what it cost."""
     if spec.free:
         return 0.0
-    if spec.price is None or any(c is None or c[0] is None or c[1] is None for c in answered):
+    if spec.price is None or any(_unknown(c) for c in answered):
         return None
-    return sum(spec.price.request_usd(c[0], c[1], c[2] or 0, c[3] or 0) for c in answered if c is not None)
+    replies = [c for c in answered if c is not None and not isinstance(c, str)]
+    return sum(spec.price.request_usd(c[0], c[1], c[2] or 0, c[3] or 0) for c in replies)
 
 
 def logged_cost(

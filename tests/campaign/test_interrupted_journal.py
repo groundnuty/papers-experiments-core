@@ -15,6 +15,7 @@ from expcore.campaign.interrupted_spend import BOUND, EXPORT_KEY, INFLIGHT, MEAS
 from expcore.campaign.lost_ledger import KEY, read
 from expcore.campaign.lost_spend import Pricing, costs, open_journal
 from expcore.campaign.recovery import recover
+from expcore.campaign.snapshot import rebase_run_dirs
 from expcore.campaign.store import Store
 from expcore.config.models import Limits
 from expcore.config.prices import Price
@@ -107,6 +108,27 @@ def test_c05_a_restored_snapshot_resumed_without_its_journal_keeps_the_bound(tmp
     recover(snapshot, NOW, 3)
     cost = interrupted_cost(snapshot)
     assert (cost.basis, cost.usd) == (BOUND, pytest.approx(BOUND_USD))
+
+
+def test_c05_a_store_copied_back_to_run_again_without_a_journal_does_not_trust_its_own_log(tmp_path):
+    """C05: a store never journaled and copied while an attempt ran holds a log the attempt outgrew. Every copy put back
+    to run again has its directories pointed at its new `runs/` (`rebase_run_dirs`, as a snapshot's restore and the
+    shard driver's archive resume do), which marks it copied back: recovery then records the bound, not the copy's
+    one reply."""
+    live, _, manifest = planned_store(tmp_path / "live")
+    begun = live.begin_attempt(manifest.rows[0].key.text, NOW, 4321, "try1", calls_logged=True)
+    calls(live, begun.id, "sent", REPLY)
+    (tmp_path / "copy").mkdir()
+    with sqlite3.connect(tmp_path / "copy" / "campaign.db") as backup:
+        live.db.backup(backup)
+    calls(live, begun.id, "sent", REPLY)  # the attempt goes on after the copy
+    rebase_run_dirs(tmp_path / "copy" / "campaign.db", tmp_path / "copy" / "runs")
+    copy = Store(tmp_path / "copy" / "campaign.db", make_schema())
+    recover(copy, NOW, 3)
+    cost = interrupted_cost(copy)
+    assert (cost.basis, cost.usd) == (BOUND, pytest.approx(BOUND_USD))
+    recover(live, NOW, 3)  # the store that ran it, never copied, trusts its log
+    assert interrupted_cost(live).basis == MEASURED
 
 
 def test_c05_a_journal_that_disagrees_with_the_store_charges_the_bound(tmp_path):
