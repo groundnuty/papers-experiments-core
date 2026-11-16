@@ -26,8 +26,10 @@ to the dispatcher, and ends with the dispatcher's exit status.
 **How a shard comes back.** Once the dispatcher has exited (its lock released), `step` writes the copy's `out/` whole,
 `campaign.lock` included, to `<results>/<label>.out.tar` with a manifest beside it (`<label>.out.json`: its SHA-256,
 bytes, files, the shard's spec and the dispatcher's exit status), each written whole and renamed into place, and removes
-its tmpfs directory. A later start of the same shard (`--resume`) unpacks that archive into its copy first. `collect`
-verifies every shard's archive against its manifest and the manifest against the plan, unpacks each into
+its tmpfs directory; an archive that cannot be written leaves that directory in place (exit 75), since it holds the
+only whole `out/`. A start of a shard that has results is refused unless it is `--resume`, which unpacks that archive
+into its copy first, so a repeated launch line never replaces a finished shard. `collect` verifies a private copy of
+every shard's archive against its manifest and the manifest against the plan, unpacks that copy into
 `<into>/<label>/out`, read-only, and prints (or with `--run` runs) `python -m expcore merge`. A shard whose archive has
 no `campaign.lock`, does not verify, or is missing is refused, naming its label: the merge would refuse it too.
 
@@ -83,6 +85,7 @@ STATE_FILE = "hpc-federation.json"
 LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuses a shard without it
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
+ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
 CHUNK = 1 << 20
 
 
@@ -234,8 +237,10 @@ def archive(out: Path, results: Path, spec: Mapping[str, Any], exit_status: int)
     return manifest
 
 
-def verified(results: Path, shard: Shard) -> tuple[Path, dict[str, Any]]:
-    """A shard's archive and manifest, shown to be this shard's and whole; `ShardsError` naming the label otherwise."""
+def verified(results: Path, shard: Shard, scratch: Path) -> tuple[Path, dict[str, Any]]:
+    """A shard's archive, as a private copy in `scratch` whose bytes are the ones hashed, and its manifest, shown to be
+    this shard's and whole; `ShardsError` naming the label otherwise. The copy, never the original, is what is
+    unpacked, so an archive replaced after its check is never taken for the one checked."""
     tar_path, json_path = results / f"{shard.label}.out.tar", results / f"{shard.label}.out.json"
     try:
         manifest = json.loads(json_path.read_text(encoding="utf-8"))
@@ -250,9 +255,20 @@ def verified(results: Path, shard: Shard) -> tuple[Path, dict[str, Any]]:
         )
     if manifest.get("lock") is not True:
         raise ShardsError(f"shard {shard.label}: its out/ has no {LOCK_NAME}, which the merge needs")
-    if not tar_path.is_file() or _sha256(tar_path) != manifest.get("sha256"):
-        raise ShardsError(f"shard {shard.label}: its archive is missing or not the one its manifest names")
-    return tar_path, manifest
+    copy = scratch / f".{shard.label}.out.tar"
+    digest = hashlib.sha256()
+    try:
+        with open(tar_path, "rb") as source, open(copy, "xb") as target:
+            while chunk := source.read(CHUNK):
+                digest.update(chunk)
+                target.write(chunk)
+    except FileNotFoundError:
+        copy.unlink(missing_ok=True)
+        raise ShardsError(f"shard {shard.label}: its archive is missing") from None
+    if digest.hexdigest() != manifest.get("sha256"):
+        copy.unlink()
+        raise ShardsError(f"shard {shard.label}: its archive is not the one its manifest names")
+    return copy, manifest
 
 
 def unpack(tar_path: Path, into: Path) -> Path:
@@ -277,12 +293,22 @@ def _read_only(root: Path) -> None:
 
 def collect(plan: Plan, into: Path) -> list[Path]:
     """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails."""
-    found = [verified(plan.results, shard) for shard in plan.shards]
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
+    created = not into.exists()
+    into.mkdir(parents=True, exist_ok=True)
+    try:
+        found = [verified(plan.results, shard, into) for shard in plan.shards]
+    except ShardsError:  # refused whole: nothing of it is left behind
+        for leftover in into.glob(".*.out.tar"):
+            leftover.unlink()
+        if created:
+            into.rmdir()
+        raise
     outs = []
     for shard, (tar_path, _) in zip(plan.shards, found, strict=True):
         out = unpack(tar_path, into / shard.label)
+        tar_path.unlink()
         if not (out / LOCK_NAME).is_file():
             raise ShardsError(f"shard {shard.label}: its unpacked out/ has no {LOCK_NAME}")
         _read_only(out)
@@ -389,15 +415,21 @@ def step(
         return 2
     spec = {"index": args.index, "count": args.count, "label": args.label}
     _label_ok(args.index, args.count, args.label)
+    published = [args.results / f"{args.label}.out.{kind}" for kind in ("tar", "json")]
+    if not args.resume and any(path.exists() for path in published):
+        print(f"shards: ERROR: shard {args.label} has results already: --resume continues it", file=sys.stderr)
+        return 2
     work = Path(tempfile.mkdtemp(prefix=f"expcore-shard-{args.label}.", dir=args.tmpfs))
+    keep = False
     try:
         work.chmod(0o700)
         copy = work / "study"
         shutil.copytree(args.study, copy, symlinks=True)
         if args.resume and (args.results / f"{args.label}.out.tar").exists():
             shard = Shard(args.index, args.count, args.label, Path("/"))
-            tar_path, _ = verified(args.results, shard)
+            tar_path, _ = verified(args.results, shard, work)
             shutil.move(unpack(tar_path, work / "previous"), copy / "out")
+            tar_path.unlink()
         for name in ("home", "tmp"):
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
@@ -412,14 +444,21 @@ def step(
         finally:
             if snapshots is not None:
                 snapshots.stop(out)
-        if out.is_dir():
-            manifest = archive(out, args.results, spec, status)
-            print(f"shards: shard {args.label} archived: {manifest['files']} files, sha256 {manifest['sha256']}")
-        else:
+        if not out.is_dir():
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
+            return status
+        try:
+            manifest = archive(out, args.results, spec, status)
+        except (OSError, tarfile.TarError) as error:  # the only whole out/ is the tmpfs copy: kept, never removed
+            keep = True
+            print(f"shards: ERROR: shard {args.label}'s out/ could not be archived ({type(error).__name__}); it is "
+                  f"kept at {out} until it is archived by hand", file=sys.stderr)  # fmt: skip
+            return ARCHIVE_FAILED
+        print(f"shards: shard {args.label} archived: {manifest['files']} files, sha256 {manifest['sha256']}")
         return status
     finally:
-        remove_tree(work)
+        if not keep:
+            remove_tree(work)
 
 
 # ------------------------------------------------------------------------------------------------ the command line

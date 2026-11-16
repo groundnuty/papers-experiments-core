@@ -222,3 +222,41 @@ def test_collect_refuses_another_shard_s_archive_under_a_label(shards, tmp_path)
     _archived(shards, tmp_path, "fed-b", 1)
     with pytest.raises(shards.ShardsError, match="another shard"):
         shards.collect(plan, tmp_path / "merge")
+
+
+def test_an_archive_that_cannot_be_written_keeps_the_shard_s_out_on_the_node(shards, tmp_path, monkeypatch):
+    """O56: the tmpfs copy holds the only whole `out/`: a failed archive never removes it."""
+    run, _ = _dispatcher()
+
+    def full(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(shards, "archive", full)
+    assert shards.step(_step_args(tmp_path), runner=run, core_found=lambda path: True) == shards.ARCHIVE_FAILED
+    kept = list((tmp_path / "tmpfs").iterdir())
+    assert len(kept) == 1
+    assert (kept[0] / "study" / "out" / "campaign.lock").is_file()
+
+
+def test_a_fresh_start_of_a_shard_that_has_results_is_refused(shards, tmp_path):
+    """O56: a repeated launch line never replaces a finished shard's archive; only `--resume` continues it."""
+    run, _ = _dispatcher()
+    shards.step(_step_args(tmp_path), runner=run, core_found=lambda path: True)
+    before = (tmp_path / "results" / "fed-a.out.tar").read_bytes()
+    again, seen = _dispatcher()
+    assert shards.step(_step_args(tmp_path), runner=again, core_found=lambda path: True) == 2
+    assert not seen
+    assert (tmp_path / "results" / "fed-a.out.tar").read_bytes() == before
+
+
+def test_collect_unpacks_the_private_copy_it_verified_and_leaves_none_behind(shards, tmp_path):
+    """O56: what is unpacked is a copy whose bytes were hashed, never the original read a second time."""
+    plan = shards.load_plan(_manifest(tmp_path))
+    for shard in plan.shards:
+        _archived(shards, tmp_path, shard.label, shard.index)
+    copy, _ = shards.verified(plan.results, plan.shards[0], tmp_path)
+    assert copy.parent == tmp_path
+    assert copy.read_bytes() == (plan.results / "fed-a.out.tar").read_bytes()
+    copy.unlink()
+    shards.collect(plan, tmp_path / "merge")
+    assert not list((tmp_path / "merge").glob(".*.tar"))
