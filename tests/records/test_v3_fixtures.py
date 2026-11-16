@@ -385,3 +385,24 @@ def test_o55_the_seventh_fixture_pins_each_code_cells_exec_check_and_a_call_with
         held = load_record(earlier)
         assert all("exec_check" not in call for call in held.tool_calls)
         assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_o60_the_eighth_fixture_pins_a_mount_guard_snapshot_and_the_seven_before_it_hold_none():
+    """O60 and R03: the eighth merge point added the `mount_guard` instrument of a mount run on an HPC node, an entry
+    of `instruments` (an object under a lower-case namespace, as every instrument's), so no field of the schema
+    changes. Its fixture, written by the code of that merge, is the seventh's record with the snapshot of a clean run's
+    watcher log put in by the record's own API: it validates and replays to its own bytes (the parametrized tests
+    above), the record's redaction leaves its counts as they are (none is under a key it takes for a secret's), and
+    the judge reads it as clean. The seven fixtures before it hold none."""
+    from expcore.mountguard import NAMESPACE, judge
+
+    eighth = [p for p in FIXTURES if p.name.startswith("08-")]
+    assert [p.name for p in eighth] == ["08-mount-guard.json"]
+    record = load_record(eighth[0])
+    snapshot = record.instruments[NAMESPACE]
+    assert snapshot["accesses"] == {"token_file": 0, "token_dir": 0}
+    assert judge(record, "cond").verdict == "clean"
+    assert record.redacted_paths == load_record(FIXTURES[6]).redacted_paths
+    assert replay_record(record).dumps().encode("utf-8") == eighth[0].read_bytes()
+    for earlier in FIXTURES[:7]:
+        assert NAMESPACE not in load_record(earlier).instruments

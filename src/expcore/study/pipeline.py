@@ -95,7 +95,9 @@ from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
+from expcore.guards import GuardsAnalysis, guards_analysis
 from expcore.models.route import sdk_version
+from expcore.mountguard.sensitivity import MountGuardAnalysis, mount_guard_analysis
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.provenance.environment import EnvironmentUnknown, differences, environment
@@ -162,6 +164,8 @@ class StudyAnalysis:
     result: AnalysisResult
     scorers: Mapping[str, str]  # the version of each scorer that scored the records, by name
     egress: EgressAnalysis | None = None  # a batch checked for egress: the verdicts and the sensitivity analysis
+    mount_guard: MountGuardAnalysis | None = None  # a batch whose mount was guarded: the same, of the mount (O60)
+    guards: GuardsAnalysis | None = None  # a batch checked by both: the rerun without the runs either leaves out
 
 
 def out_dir(study: StudyConfig | StudyIdentity) -> Path:
@@ -792,9 +796,11 @@ def _analyse_loaded(
     except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
     egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
+    guard = mount_guard_analysis(runs, rows, absent, study.prereg)  # None for a batch whose mount was not guarded
+    both = guards_analysis(rows, absent, study.prereg, egress, guard)  # None unless both guards checked the batch
     versions = {scorer_name(s): scorer_version(s) for s in plugin.scorers}
     core = sdk_version(CORE_DISTRIBUTION)
-    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress)
+    return StudyAnalysis(study, code, core, export, scores, tuple(rows), result, versions, egress, guard, both)
 
 
 def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
@@ -846,20 +852,25 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
     Holm decision, with each named family's steps (S17) and each declared equivalence family's (S18). `exploratory_only`
     is true when the preregistration makes no confirmatory claim (S12): there is then no Holm decision, and every
     contrast is exploratory."""
-    return {
-        "preregistration": dict(analysis.result.manifest),
-        "exploratory_only": analysis.result.exploratory_only,
-        "alpha": analysis.result.alpha,
-        "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
-        "core_version": analysis.core_version,
-        "scorers": dict(analysis.scorers),
-        "partial": analysis.export["partial"],
-        "running_attempts": analysis.export["running_attempts"],
-        "excluded_attempts": analysis.export["excluded_attempts"],
-        "conditions": condition_accounting(analysis.export),
-        "contrasts": analysis.result.contrasts,
-        **_holm_entries(analysis.result),
-    } | ({} if analysis.egress is None else {"egress": _egress_summary(analysis.egress)})
+    return (
+        {
+            "preregistration": dict(analysis.result.manifest),
+            "exploratory_only": analysis.result.exploratory_only,
+            "alpha": analysis.result.alpha,
+            "code": {key: analysis.code.get(key) for key in ("commit", "tree_sha256", "dirty")},
+            "core_version": analysis.core_version,
+            "scorers": dict(analysis.scorers),
+            "partial": analysis.export["partial"],
+            "running_attempts": analysis.export["running_attempts"],
+            "excluded_attempts": analysis.export["excluded_attempts"],
+            "conditions": condition_accounting(analysis.export),
+            "contrasts": analysis.result.contrasts,
+            **_holm_entries(analysis.result),
+        }
+        | ({} if analysis.egress is None else {"egress": _egress_summary(analysis.egress)})
+        | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
+        | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
+    )
 
 
 def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
@@ -892,6 +903,49 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
     }  # fmt: skip
 
 
+def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch whose mount was guarded (O60): each analysed run's verdict (its flags, its
+    log's and its isolation's state and reasons, its accesses and tracers) and the sensitivity analysis without the
+    runs that are not clean, or why there is none."""
+    sensitivity = guard.sensitivity
+    return {
+        "counts": guard.counts(),
+        "runs": [
+            {
+                "run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "verdict": run.verdict,
+                "flags": list(run.flags), "log": run.log, "unknown": list(run.unknown), "isolation": run.isolation,
+                "unproven": list(run.unproven), "accesses": dict(run.accesses), "traced": run.traced,
+            }
+            for run in guard.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in guard.left_out], "contrasts": sensitivity.contrasts,
+              "holm": sensitivity.holm},
+        "sensitivity_refused": guard.refused,
+    }  # fmt: skip
+
+
+def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
+    """What `analysis.json` holds of a batch checked by both guards (O60): the runs either leaves out, overall and per
+    condition, each run as both found it, and the rerun without the left-out runs, or why there is none."""
+    sensitivity = guards.sensitivity
+    return {
+        "counts": guards.counts(),
+        "by_condition": guards.by_condition(),
+        "runs": [
+            {"run_key": run.run_key, "attempt": run.attempt, "condition": run.condition, "egress": run.egress,
+             "mount": run.mount, "left_out_by": run.by}
+            for run in guards.runs
+        ],
+        "sensitivity": None
+        if sensitivity is None
+        else {"left_out": [run.run_key for run in guards.left_out], "contrasts": sensitivity.contrasts,
+              "holm": sensitivity.holm},
+        "sensitivity_refused": guards.refused,
+    }  # fmt: skip
+
+
 def report_text(analysis: StudyAnalysis) -> str:
     """The Markdown report of an analysis (`expcore.report`)."""
     return render_report(
@@ -903,6 +957,8 @@ def report_text(analysis: StudyAnalysis) -> str:
         scorers=analysis.scorers,
         interval_level=analysis.study.prereg.bootstrap.ci_level,
         egress=analysis.egress,
+        mount_guard=analysis.mount_guard,
+        guards=analysis.guards,
     )
 
 

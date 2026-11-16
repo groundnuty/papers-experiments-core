@@ -367,6 +367,22 @@ Direct I/O changes what the provider sees. It no longer serves the reads of data
 
 The sandbox never creates, changes or removes the federation's network: a mount or REST run whose network is not on the host is refused before anything exists, and removing the sidecar or the gate at teardown takes it off the network. The agent never joins it. Each mount run's metadata records the kind of network the sidecar was on (`mount.network`: `default bridge` or `federation`), never its name.
 
+### The sandbox on an HPC batch node
+
+On an HPC batch node there is no Docker and no namespace of your own, so set `[sandbox] backend = "apptainer"`. Pin the agent's SIF and the HPC bundle's egress shim and collector in `[sandbox.apptainer]` (`docs/interfaces.md`, "The Apptainer backend on an HPC batch node"), and give the platform the node (`expcore_onedata.sandbox.apptainer.node.LocalNode()`) as its host.
+
+How a run works there:
+- Your agent's code runs as one `apptainer exec` per cell.
+- The data gate runs on the node's loopback and holds the token; the agent never sees it.
+- The harness keeps the memory limit and the sizes of `/work`, `/tmp` and `/dev/shm`. A cell past one of them is killed as `memory_limit` or `disk_limit`, the agent's own outcome.
+
+Three things differ from Docker, and the record says so (`infrastructure_facts`):
+- **Detached workers end with their cell.** A process a cell starts in the background is killed when that cell ends, where Docker's container keeps it until the next cap.
+- **The network is the node's.** The agent can reach the internet, so declare the `egress` instrument (below).
+- **A mount data path is refused at its start** until its helper lands.
+
+Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
+
 ### What the code tool tells the agent of its output
 
 A model reads these strings, and a study freezes them, so they are given exactly. The Onedata layer's code tool keeps the first 1 MiB (1,048,576 bytes, cut at a whole character) of each of a cell's stdout and stderr and drops the rest. When it cut a stream, the text the tool returns ends with a line after a newline, `[output cut by the sandbox: the first K of the P bytes of stdout were kept]`, where P is what the cell wrote and K what was kept, both plain digits; when both streams were cut, the line has the clause for stdout, then `; `, then the same clause with `stderr`. The call's `source_truncated` is then `True`, and the run's record keeps the same numbers (`output_cut` on the cell, `cell_output_cuts` in the sandbox's metadata). A cell that prints 3 MiB gives a text of 1 MiB of its output followed by `[output cut by the sandbox: the first 1048576 of the 3145728 bytes of stdout were kept]`.
@@ -1138,11 +1154,38 @@ egress = EgressLog(CollectorLog(Path("egress.jsonl")), declared, nonce)  # liste
 assert egress.finish()["log"] == "unknown"  # no log was written here: unknown, never a run that connected nowhere
 ```
 
-Stop the run's collector after the agent's cell and before `finish_instruments`, as the gate is stopped before the bytes served are counted: a log without its end line is unknown. Declare `network_calls=True` only for a REST data path; otherwise every `requests`, `urllib` or `socket` in the agent's code flags its run.
+Stop the run's collector after the agent's cell and before `finish_instruments`, as the gate is stopped before the bytes served are counted: a log without its end line is unknown. On the Apptainer backend the sandbox is the source and gives the declaration and the nonce, and its `collect` stops the collector: `EgressLog(sandbox, sandbox.egress_declaration(), sandbox.egress_nonce)`. Declare `network_calls=True` only for a REST data path; otherwise every `requests`, `urllib` or `socket` in the agent's code flags its run.
 
 What you get, with nothing else to call: once one analysed record carries the `egress` instrument, `analyze` judges every analysed run, flagged for an outside connection, an unknown log or a static-scan hit, and runs the preregistered analysis again without the flagged runs. `report.md` gains a section `## Egress (detected, not prevented)` listing them, by condition and run, with that sensitivity analysis in the tables of the primary one; `analysis.json` gains `egress`; `analyze` prints a line per contrast. **A run whose log is missing or damaged, or whose record has no egress snapshot, is flagged as unknown, never counted clean.** A report without the section is a batch in which no run carried the instrument: egress was not checked, which is right on Docker hosts, whose agents have no route out, and wrong on HPC. What each field and reason means is in [`interfaces.md`](interfaces.md#egress-where-it-cannot-be-blocked-the-egress-instrument).
 
 Report the primary analysis as it stands and the sensitivity analysis beside it. Neither line of detection prevents egress, and both can be passed: a statically linked program, raw system calls or io_uring pass the shim, and code that builds a name at run time passes the scan.
+
+**Run nothing else of your account on a sandbox node while runs are live: no interactive login and no other job step.** A process of your user outside the cells is outside every check: the egress shim is loaded only in the cells, and the mount guard proves only the cells, so such a process could connect anywhere, or read oneclient's environment, which holds the token, without a line in either log.
+
+### The mount on HPC: guarded and reported, not isolated
+
+On an HPC batch node your agent's cells and the oneclient that holds the mount's token run as one user, so the token cannot be kept from the agent as the Docker sidecar keeps it. The study's PI ruled (16 Nov 2026) that mount runs stay on HPC with detection and report, as for egress. Give the Apptainer backend its mount helper, `host_mount_factory(Pinned(<oneclient on the node>, <its SHA-256>))` from `expcore_onedata.sandbox.apptainer.hostmount`, as `sandbox_options={"mount_helper": ...}`: oneclient then runs on the node outside every cell, its token in a private file no cell binds and removed once the mount is up, and a watcher outside the cells logs every access to that file and its directory, watches oneclient for a tracer, and proves from the node's `/proc` that each cell runs in a PID namespace of its own, with no view of the node's processes or of the private files. Record it with `expcore.mountguard.MountGuard(sandbox, sandbox.mount_guard_nonce)` beside the run's other instruments:
+
+```python
+from expcore.mountguard import MountGuard
+
+
+class UnguardedMount:
+    """A sandbox whose mount kept no guard log."""
+
+    def mount_watch_log(self) -> bytes | None:
+        return None
+
+
+guard = MountGuard(UnguardedMount(), "00112233445566778899aabbccddeeff")
+assert guard.finish()["log"] == "unknown"  # no log: unknown, never a clean run
+```
+
+What you get, with nothing else to call: once one analysed record carries the `mount_guard` instrument, `analyze` judges every analysed run `clean`, `flagged` (an access to the token's file or directory while cells could run, or a tracer on oneclient) or `unknown` (a missing or damaged log, or a cell isolation that was not proven), and runs the preregistered analysis again without every run that is not clean. `report.md` gains `## Mount isolation (detected, not prevented)` after the egress section, `analysis.json` gains `mount_guard`, and `analyze` prints a line per contrast. A batch checked by both guards also gets `## Egress and mount isolation together`: the analysis again without every run either guard leaves out (flagged or unknown to either, so a run unknown to one and clean to the other is left out), with the runs left out per condition and by which guard, in `analysis.json` (`guards`) and the terminal too. **A run whose guard log is missing or damaged, or whose isolation was not proven, is unknown, never counted clean.** What each field and reason means is in [`interfaces.md`](interfaces.md#the-mount-on-hpc-guarded-the-mount_guard-instrument).
+
+Report the primary analysis as it stands and the sensitivity analysis beside it. The guard detects, it does not prevent: inotify does not say which process touched the file, so every touch while cells can run counts as the agent's; a tracer is sampled, so a short one is missed; oneclient's environment and memory are covered only by the proof that no cell can see its process; and a process of your user outside the cells (an ssh login into the node) is outside every check.
+
+**Run nothing else of your account on a sandbox node while runs are live: no interactive login and no other job step.** A process of your user outside the cells is outside every check: the egress shim is loaded only in the cells, and the mount guard proves only the cells, so such a process could connect anywhere, or read oneclient's environment, which holds the token, without a line in either log.
 
 ### The order instruments start and finish in
 
