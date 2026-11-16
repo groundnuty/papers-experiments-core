@@ -84,12 +84,16 @@ def root_layout(value: Optional[str], spec: Spec) -> Layout:
     return Layout(checked_root(value, parent, strict=True), parent, spec)
 
 
-def make_driver(layout_path: Path, root: Optional[str], runner: Optional[Runner] = None) -> Driver:
-    """The driver of one layout and one root; the runner is the tests' fake Slurm, or the real one."""
+def make_driver(
+    layout_path: Path, root: Optional[str], runner: Optional[Runner] = None, *, agent: bool = True
+) -> Driver:
+    """The driver of one layout and one root; the runner is the tests' fake Slurm, or the real one. `agent`: whether
+    the agent's limits in the layout's template size the agent's node, which only up and describe need; down and the
+    verbs work from the state file, so a template edited since up never stops them."""
     layout_path = layout_path.resolve()
     spec = load_spec(layout_path)
     layout = root_layout(root, spec)
-    settings = load_settings(spec.hpc, agent_limits(spec.platform_template))
+    settings = load_settings(spec.hpc, agent_limits(spec.platform_template) if agent else None)
     slurm = Slurm(runner or Runner())
     store = StateStore(layout.root)
     command = [sys.executable, "-B", str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root", str(layout.root)]
@@ -140,7 +144,8 @@ def main(
     args = parser.parse_args(words)
     environ = os.environ if environ is None else environ
     try:
-        driver = make_driver(args.layout, args.root or environ.get("EXPCORE_FED_ROOT"), runner)
+        root = args.root or environ.get("EXPCORE_FED_ROOT")
+        driver = make_driver(args.layout, root, runner, agent=args.command in ("up", "describe"))
     except (LayoutError, SettingsError, ValueError) as error:
         print(f"error: {args.command}: {error}", file=sys.stderr)
         return 2

@@ -159,6 +159,20 @@ def test_the_layouts_template_gives_the_driver_the_agents_node(hpc, tmp_path):
     assert driver.settings.sandbox == hpc.settings.Size(10, 17 * 1024)
 
 
+def test_down_never_reads_the_agents_limits_so_an_edited_template_cannot_keep_a_job_billing(hpc, tmp_path):
+    """O57: the agent's limits are read for up and describe alone: after the template's limits outgrew [hpc] sandbox
+    (or it stopped parsing), up and describe refuse, naming the key, while down still runs."""
+    (tmp_path / "fed").mkdir()
+    layout = agent_layout(tmp_path / "layout", template_extra=apptainer_limits(memory=64 * GIB))
+    root = str(tmp_path / "fed" / "root")
+    for command in ("up", "describe"):
+        assert hpc.cli.main(["--layout", str(layout), "--root", root, command], {}, runner=FakeSlurm()) == 2
+    assert hpc.cli.main(["--layout", str(layout), "--root", root, "down"], {}, runner=FakeSlurm()) == 0
+    template = layout.parent / "pilot-shape.platform.toml.template"
+    template.write_text(template.read_text(encoding="utf-8") + "\nnot = toml = at all\n", encoding="utf-8")
+    assert hpc.cli.main(["--layout", str(layout), "--root", root, "down"], {}, runner=FakeSlurm()) == 0
+
+
 # -- Slurm: a heterogeneous job --------------------------------------------------------------------------------
 
 
