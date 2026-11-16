@@ -6,12 +6,13 @@ default and in one canonical form, and nothing that is one federation's own (O12
 every setting of platform.toml that shapes a run, and only those: what the agent sees and can do (its images, its
 interpreter and user, the mount's path and I/O mode, the placeholder it is given, its tool server's conditions), the
 limits and timings it runs under (the sandbox's limits, the kill's grace, the token lifetime, the fault injector's
-waits and heal), the code and images it runs (by digest), the data it reads and where it lies (the spaces, the data
-provider, the declared range map). A setting is out when it is one federation's or one host's own (an address, an id, a
-port, a host, network or Compose project name, a path, the command that starts a tool on that host), a secret or where
-one is read from, or when it decides only what is checked before a campaign (`[link_check]`, `content_check_file`) or
-how the reset reaches a state it then verifies (`[placement]`'s waits and concurrency, which the core records and
-compares at every resume instead, C35). Two renders of one template on two federations, with their own addresses, ids,
+waits and heal, the bounds its instruments read during the run), the code and images it runs (by digest), the data it
+reads and where it lies (the spaces, the data provider, the declared range map). A setting is out when it is one
+federation's or one host's own (an address, an id, a port, a host, network or Compose project name, a path, the
+command that starts a tool on that host), a secret or where one is read from, or when it decides only what is checked
+before a campaign (`[link_check]`, `content_check_file`) or how a reset reaches a state it then verifies, or how many
+requests are in flight (`[placement]`'s concurrency, QoS scan and reset settings, which the core records and compares
+at every resume instead, C35). Two renders of one template on two federations, with their own addresses, ids,
 ports and roots, so give one fingerprint, and a changed setting that shapes a run gives another.
 
 Canonical: each value is the effective one, after its default, so a key declared at its default and one left out are
@@ -56,16 +57,17 @@ def tokens_record(tokens: TokenSettings) -> dict[str, Any]:
 
 
 def support_record(config: PlatformConfig) -> dict[str, Any]:
-    """The one-space form's `[support]` and its space's prefixes: the providers that support the space, in the file's
-    order of `[providers]`, and the agent's own, each by its label (`providers[i]`), and the prefixes a mutation's
-    target must start with, by their SHA-256, since a prefix is the start of the space's name (O12). The space's name
-    and id are the federation's (`up` makes the id anew); the `[[spaces]]` form holds all of this in each entry's
-    digest."""
+    """The one-space form's `[space]` and `[support]`: the providers that support the space, in the file's order of
+    `[providers]`, and the agent's own, each by its label (`providers[i]`); the space's name, under which the agent
+    sees it on a mount, and the prefixes a mutation's target must start with, each by its SHA-256, since a name is
+    private (O12). A layout declares the name, so every federation of it has the same one; the id is the federation's
+    (`up` makes it anew) and is not here. The `[[spaces]]` form holds all of this in each entry's digest."""
     entry: StudySpace = config.spaces[0]
     supporting = [name for name in config.providers if name in entry.support.providers]
     return {
         "providers": [config.provider_label(name) for name in supporting],
         "local": config.provider_label(entry.support.local),
+        "name_sha256": hashlib.sha256(entry.space.name.encode("utf-8")).hexdigest(),
         "prefixes_sha256": digest_of(sorted(entry.space.prefixes)),
     }
 
@@ -138,20 +140,49 @@ def toolserver_record(server: ToolServer, file: Any) -> dict[str, Any]:
     }
 
 
+# `[placement]`'s bounds that a run's own instruments read inside its attempt, by their type: the platform probes and
+# their transfer log, whose snapshot is the run's record (`probes.py`, `transferlog.py`: the run's window's allowance,
+# the listing's settle, a probe's retries), and progressive ingest, which writes and confirms the parts that arrive
+# during the run (`ingest.py`, `ingestbase.py`: its polls, waits, chunks and connections). They decide what the record
+# can show and when a part is confirmed, or the run is set aside.
+PLACEMENT_IN_RUN = {
+    "clock_skew_allowance_s": float,
+    "transfer_settle_s": float,
+    "transfer_settle_polls": int,
+    "probe_attempts": int,
+    "probe_backoff_s": float,
+    "poll_s": float,
+    "settle_timeout_s": float,
+    "consecutive_polls": int,
+    "transfer_timeout_s": float,
+    "request_timeout_s": float,
+    "chunk_bytes": int,
+    "fresh_connection_bytes": int,
+}
+
+
 def placement_record(config: PlatformConfig) -> dict[str, Any] | None:
     """`[placement]`'s settings that shape a run, or None without the table: the data provider by its label and the
-    declared range map by its digest (`RangeMap.digest`), which say where the bytes a run reads lie. Its waits,
-    concurrency, QoS scan and shortcut decide how a reset reaches a state it then verifies, not that state: they are
+    declared range map by its digest (`RangeMap.digest`), which say where the bytes a run reads lie, and every bound a
+    run's instruments read inside its attempt (`PLACEMENT_IN_RUN`), after its default. Its concurrency, its QoS scan
+    and its fulfilment wait, and the reset's concurrency, shortcut and wait for the reset lock, decide only how a reset
+    reaches a state it then verifies, or how many requests are in flight, and change no reading's result: they are
     recorded and compared at every resume (`Placement.reset_settings`, C35), never here."""
     if "placement" not in load_toml(config.file):
         return None
     from expcore_onedata.rangemap import load_placement  # it reads this module's config: import when used
 
     placement = load_placement(config.file, config)
-    return {"holder": config.provider_label(placement.settings.holder), "map_sha256": placement.map.digest()}
+    bounds = {key: kind(getattr(placement.settings, key)) for key, kind in PLACEMENT_IN_RUN.items()}
+    return {
+        "holder": config.provider_label(placement.settings.holder),
+        "map_sha256": placement.map.digest(),
+        **bounds,
+    }
 
 
 __all__ = [
+    "PLACEMENT_IN_RUN",
     "digest_of",
     "placement_record",
     "sandbox_record",

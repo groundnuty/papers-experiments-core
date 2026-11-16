@@ -72,8 +72,9 @@ def load(template: dict, root: Path, ca: bytes, values: dict = FEDERATIONS[0]):
 @pytest.mark.parametrize("name", sorted(TEMPLATES))
 def test_c06_two_renders_of_one_template_on_two_federations_give_one_fingerprint(tmp_path, cas, name):
     """C06: one template rendered for two federations, with their own addresses, ids, ports, host and network names,
-    registry, address pool, Compose project and root, and the image's one CA, gives one fingerprint, and none of
-    those values is in it (O12)."""
+    registry, address pool, Compose project and root, gives one fingerprint, and none of those values is in it (O12).
+    Both roots hold the same CA bundle, as an HPC federation's `up` exports the image's own test CA (`hpcca.py`); a
+    Compose federation's `up` makes a CA of its own, so two of those differ in `tls`, as `tls.ca_file` below shows."""
     one, two = (load(TEMPLATES[name], tmp_path / f"fed-{i}" / "root", cas[0], values) for i, values in
                 enumerate(FEDERATIONS))  # fmt: skip
     assert one.file.read_text() != two.file.read_text()
@@ -188,6 +189,20 @@ def test_c06_a_store_recorded_before_the_settings_were_in_the_fingerprint_is_ref
     absent = "absent when the campaign started"
     assert any(line.startswith(f"platform.tokens.margin_s: {absent}") for line in compared.refused)
     assert any(line.startswith("platform.sandbox.limits.cpus: absent") for line in compared.refused)
+
+
+def test_c06_a_new_tool_server_condition_is_refused_at_a_resume_and_is_no_growth(tmp_path, cas):
+    """C06, a known limit: a condition added to `[toolserver.conditions]` is a new leaf of the platform's half, which
+    the core never counts as growth (only the schema's sections grow), so a campaign that adds a condition needing a
+    tool-server entry of its own is refused a resume and starts a new store."""
+    base = load(DOCKER, tmp_path / "root", cas[0]).fingerprint()
+    entry = '[toolserver.conditions.lookup]\nallow = ["list_files"]\nrights = ["space_view", "space_read_data"]\n'
+    entry += 'manifest = "@root@/manifests/other.json"\n\n[slots.one]'
+    grown = load(edited(DOCKER, [platform("[slots.one]", entry)]), tmp_path / "root", cas[0]).fingerprint()
+    compared = compare_fingerprints({"platform": base}, {"platform": grown})
+    assert compared.refused
+    assert not compared.grown
+    assert all(line.startswith("platform.toolserver.conditions.") for line in compared.refused)
 
 
 def test_c06_a_tool_servers_manifest_that_cannot_be_read_is_refused_by_its_position_never_its_path(tmp_path, cas):

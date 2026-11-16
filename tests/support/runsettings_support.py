@@ -33,7 +33,7 @@ principals.service = {{ username = "alpha-health", user_id = "@health_id@" }}
 tls = {{ ca_file = "@root@/ca/federation-ca.pem" }}
 
 [space]
-name = "alpha-@space_suffix@"
+name = "alpha-space"
 id = "@space_id@"
 prefixes = ["alpha-"]
 import = {{ readonly = true }}
@@ -437,7 +437,7 @@ IN = {
                                                                 "gate_memory_bytes = 1073741825")),
     "sandbox.mount.path": edit("docker", platform('path = "/data"', 'path = "/space"')),
     "sandbox.mount.io_mode": edit("docker", platform('io_mode = "proxy"', 'io_mode = "direct"\n'
-                                                     'direct_check_file = "alpha-@space_suffix@/f"\n'
+                                                     'direct_check_file = "alpha-space/f"\n'
                                                      'storages = { "st1" = "/srv/storage-1" }')),
     "sandbox.mount.extra_args": edit("docker", platform('["--provider-timeout=60"]', '["--provider-timeout=61"]')),
     "sandbox.data_paths": edit("docker", platform('mounted = "mount"\n', 'mounted = "mount"\nbare = "none"\n')),
@@ -496,14 +496,50 @@ IN = {
                                                               "heal_container_fallback = false")),
     "faults.stop_bound_s": edit("apptainer", platform("stop_bound_s = 690", "stop_bound_s = 691")),
     "faults.relay_wait_s": edit("apptainer", platform("relay_wait_s = 30", "relay_wait_s = 31")),
+    "space.name": edit("docker", platform('name = "alpha-space"', 'name = "alpha-other"')),
+    "placement.clock_skew_allowance_s": edit("docker", platform("clock_skew_allowance_s = 5.0",
+                                                                "clock_skew_allowance_s = 6.0")),
+    "placement.transfer_settle_s": edit("docker", platform("transfer_settle_s = 30.0", "transfer_settle_s = 31.0")),
+    "placement.transfer_settle_polls": edit("docker", platform("transfer_settle_polls = 4",
+                                                             "transfer_settle_polls = 5")),
+    "placement.probe_attempts": edit("docker", platform("probe_attempts = 3", "probe_attempts = 4")),
+    "placement.probe_backoff_s": edit("docker", platform("probe_backoff_s = 1.0", "probe_backoff_s = 1.5")),
+    "placement.poll_s": edit("docker", platform("poll_s = 2.0\ntransfer", "poll_s = 2.5\ntransfer")),
+    "placement.settle_timeout_s": edit("docker", platform("settle_timeout_s = 300", "settle_timeout_s = 301")),
+    "placement.consecutive_polls": edit("docker", platform("consecutive_polls = 2", "consecutive_polls = 3")),
+    "placement.transfer_timeout_s": edit("docker", platform("transfer_timeout_s = 3600", "transfer_timeout_s = 3601")),
+    "placement.request_timeout_s": edit("docker", platform("request_timeout_s = 900", "request_timeout_s = 901")),
+    "placement.chunk_bytes": edit("docker", platform("chunk_bytes = 16777216", "chunk_bytes = 8388608")),
+    "placement.fresh_connection_bytes": edit("docker", platform("fresh_connection_bytes = 16777216",
+                                                                "fresh_connection_bytes = 8388608")),
 }  # fmt: skip
+
+# Why each key that is in is in, by the table (the longest prefix that names it): what the PR's table says.
+IN_REASONS = {
+    "tls": "every client's certificate check, by its mode and the CA bundle's SHA-256",
+    "space": "the one-space form's space as the agent sees it: its name (hashed), prefixes (hashed), import, data",
+    "support": "the providers that hold the space and the agent's own, by label",
+    "spaces": "each [[spaces]] entry's declared identity, in its digest (C06)",
+    "tokens": "a run's token lifetime: a token that expires fails the run's last check of its tool plane (O06)",
+    "toolserver": "the tool server's code (its commit), its start's bound, each condition's tools, rights, manifest",
+    "sandbox": "what the agent runs in and is held to: images by id, limits, mount, interpreter, user, grace, pins",
+    "sandbox.data_paths": "each level's data path, listing and I/O mode (O21, O36)",
+    "sandbox.served_bytes": "the caps of a run's tables of the bytes served, which bound its evidence (O22)",
+    "sandbox.apptainer": "the Apptainer backend's pins and watch: image, egress shim and collector, memory guard (O56)",
+    "placement": "where a run's bytes lie (data provider, range map), and the bounds its probes and ingest read",
+    "faults": "the injector's sanction, targets and every bound of its restore and heal, which decide a run's fate",
+}
+
 
 PER_FEDERATION = "per federation: an address, an id, a port, or a host's, network's or deployment's name, each up's own"
 PATH = "a path on the host or in the federation's root (what lies there is in by its digest where it shapes a run)"
 SECRET = "a secret, or where one is read from"
 HOST = "the host's or the site's own: how a host step is run or named, never what the agent sees or is held to"
 PRECAMPAIGN = "decides only what is checked before a campaign, never a run's input (O35)"
-C35 = "how a reset reaches a state it then verifies, not that state: recorded and compared at every resume (C35)"
+C35 = (
+    "how a reset reaches a state it then verifies, or how many requests are in flight, and no reading's result: "
+    "recorded and compared at every resume (C35)"
+)
 USER = "a platform user's name (O12): who holds a plane is the federation's; what it may do is its condition's rights"
 
 OUT = {
@@ -511,7 +547,6 @@ OUT = {
     "zone.url": PER_FEDERATION,
     "providers.*.url": PER_FEDERATION,
     "providers.*.id": PER_FEDERATION,
-    "space.name": PER_FEDERATION + " (a Compose template fills it at every up)",
     "space.id": PER_FEDERATION,
     "spaces.*.id": PER_FEDERATION + "; in its id-bearing digest while the entry declares no data, so such shards never "
                                     "merge (C06)",
@@ -523,8 +558,9 @@ OUT = {
     **{f"principals.{plane}.username": USER for plane in ("data_path", "toolserver", "service")},
     **{f"principals.{plane}.user_id": PER_FEDERATION for plane in ("data_path", "toolserver", "service")},
     "toolserver.command": PATH,
-    "toolserver.args": PATH + "; often the federation's address too (the code is the commit's, the tools the "
-                              "manifest's)",
+    "toolserver.args": "carries the federation's address and the host's paths beside any option, so no part of it is "
+                       "one experiment's; a known limit: a server's own options are in only through its commit and "
+                       "its manifest, and with no commit pinned the manifest alone names it",
     "toolserver.clone": PATH,
     "sandbox.work_root": PATH,
     "sandbox.name_prefix": HOST,
@@ -551,10 +587,8 @@ OUT = {
     "sandbox.apptainer.preload.*.path": PATH,
     "sandbox.apptainer.binds.*.path": PATH,
     **{f"placement.{key}": C35 for key in (
-        "poll_s", "transfer_timeout_s", "settle_timeout_s", "consecutive_polls", "request_timeout_s", "chunk_bytes",
-        "fresh_connection_bytes", "probe_attempts", "probe_backoff_s", "transfer_settle_s", "transfer_settle_polls",
-        "clock_skew_allowance_s", "concurrency", "qos_scan", "qos_fulfil_timeout_s", "reset_concurrency",
-        "reset_shortcut", "reset_exclusive_wait_s", "provider_concurrency",
+        "concurrency", "qos_scan", "qos_fulfil_timeout_s", "reset_concurrency", "reset_shortcut",
+        "reset_exclusive_wait_s", "provider_concurrency",
     )},
     "slots.*.data_path.username": USER,
     "slots.*.data_path.user_id": PER_FEDERATION,

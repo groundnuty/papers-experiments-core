@@ -30,8 +30,8 @@ def several(count=2, **override):
 
 def test_o12_the_one_space_form_is_the_single_space_labelled_space_with_its_fingerprint_unchanged(tmp_path):
     """O12, C06: [space] and [support] read as one space, `spaces[0]` labelled `space`, and the fingerprint holds its
-    support set, local provider and prefixes (`support`), each provider by its label, and no `spaces`: never the
-    space's name or id, which each federation's up makes anew."""
+    support set and local provider by label and its name and prefixes by their SHA-256 (`support`), and no `spaces`:
+    never the space's name in the clear, nor its id, which each federation's up makes anew."""
     config = load(tmp_path)
     assert [(e.label, e.position) for e in config.spaces] == [("space", "spaces[0]")]
     assert config.space_named() is config.spaces[0]
@@ -42,9 +42,11 @@ def test_o12_the_one_space_form_is_the_single_space_labelled_space_with_its_fing
     assert config.prefixes == ("study-a-",)
     fingerprint = config.fingerprint()
     prefixes = hashlib.sha256(json.dumps(["study-a-"], separators=(",", ":")).encode()).hexdigest()
+    name = hashlib.sha256(SPACE_NAME.encode()).hexdigest()
     assert fingerprint["support"] == {
         "providers": ["providers[0]"],
         "local": "providers[0]",
+        "name_sha256": name,
         "prefixes_sha256": prefixes,
     }
     assert not {"spaces", "space_data", "storage_import"} & set(fingerprint)

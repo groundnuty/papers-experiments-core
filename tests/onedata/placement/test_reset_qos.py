@@ -201,7 +201,7 @@ def test_o33_a_study_that_declares_no_scan_has_the_fingerprint_of_one_that_decla
         file = write_platform(tmp_path / name, lambda d, extra=extra: with_placement(d, **extra))
         fingerprints.append(load_platform(file).fingerprint())
     assert fingerprints[0] == fingerprints[1] == fingerprints[2]
-    assert set(fingerprints[0]["placement"]) == {"holder", "map_sha256"}  # the data provider and the map alone (C35)
+    assert "qos_scan" not in fingerprints[0]["placement"]  # a reset's way to find requirements (C35)
 
 
 def test_o33_a_reset_on_the_default_settings_finds_the_requirements_by_the_listing(provisioner, fake, ticker):
