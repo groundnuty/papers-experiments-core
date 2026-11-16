@@ -138,7 +138,10 @@ uv run python deploy/hpc-tests/hpctests.py renew once --until ...               
 ```
 
 `never` (`renew.never`) wins over `want` (`renew.wanted`, until its time), and either replaces the other; `auto`
-removes both and `unwant` the want alone. `jobs` shows the mode (`renewal auto|want|never`).
+removes both and `unwant` the want alone. `jobs` shows the mode (`renewal auto|want|never`). A change of an override and a
+decision of the loop never overlap: both take the login directory's `override.lock` without waiting, the loop from
+reading the overrides to the end of the submit or release they allow; a command that finds it held is refused
+(exit 3, retry it), and the loop decides again at its next poll.
 
 **The idle release:** every poll, the loop also releases a RUNNING allocation of ours that has run no test step for
 `--idle-hours` (3; from its start when it never ran one), by its id through `release`'s own ledger and name checks,

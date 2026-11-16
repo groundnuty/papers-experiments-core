@@ -397,3 +397,27 @@ def test_o64_no_idle_release_while_a_run_holds_the_use_lock(login):
     assert fakes.calls(login.fake / "scancel.jsonl") == []
     renew_once(login, wanted=None, idle="10800")
     assert fakes.calls(login.fake / "scancel.jsonl") == [["500"]]
+
+
+def test_o64_no_override_changes_under_a_decision_and_no_decision_under_an_override_change(login):
+    """O64: the override lock serialises a change of `want`/`never` with the loop's decisions: while one side holds
+    it the other does nothing (an operator's command is refused and retried by hand, the loop decides again at its
+    next poll), so neither a submit against a fresh `never` nor an idle release under a fresh `want` can happen."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 3600))
+    steps(login, 500, *IDLE_STEPS)
+    with (login.dir / "override.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert "the renewer is deciding now" in login.alloc("never", check=3).stderr
+        assert not (login.dir / "renew.never").exists()
+        out = renew_once(login, wanted=NOW + 86400, idle="10800")
+    assert "an override is being changed" in out.stdout
+    assert fakes.calls(login.fake / "sbatch.jsonl") == []
+    assert fakes.calls(login.fake / "scancel.jsonl") == []
+    login.alloc("never", check=0)
+    assert (login.dir / "renew.never").exists()
+
+
+def test_an_expired_want_shows_as_auto(login):
+    (login.dir / "renew.wanted").write_text(f"{NOW - 1}\n")
+    assert "mode=auto" in login.alloc("list", check=0).stdout

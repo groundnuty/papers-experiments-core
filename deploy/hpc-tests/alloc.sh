@@ -27,6 +27,10 @@ LOCK=$DIR/renew.lock
 STOP=$DIR/renew.stop
 WANTED=$DIR/renew.wanted
 NEVER=$DIR/renew.never
+# Held exclusively by every change of an override (want, never, auto, unwant) and by the loop from reading the
+# overrides to the end of the submit or release they allow, so no override can change under a decision. Taken without
+# waiting: an operator's command is retried by hand, and the loop decides again at its next poll.
+OVERRIDE_LOCK=$DIR/override.lock
 BUSY=10800  # a test step of ours within this many seconds makes the allocation busy: renewal is on by default then
 
 die() { echo "alloc.sh: $1" >&2; exit "${2:-2}"; }
@@ -178,8 +182,9 @@ renewer_status() {
   elif [ -n "$words" ]; then
     status=ended
   fi
-  local mode=auto
-  if [ -e "$NEVER" ]; then mode=never; elif [ -n "$(wanted_until)" ]; then mode=want; fi
+  local mode=auto want
+  want=$(wanted_until)
+  if [ -e "$NEVER" ]; then mode=never; elif [ -n "$want" ] && [ "$(date +%s)" -lt "$want" ]; then mode=want; fi
   echo "status=$status mode=$mode wanted=$(wanted_until || echo -) $(printf '%s\n' "$words" | tr ' ' '\n' | grep -v -E '^(pid|status)=' | tr '\n' ' ')"
 }
 
@@ -284,6 +289,8 @@ renewal_wanted() { # renewal_wanted <now> <alive rows>
 
 renew_once() {
   local now rows pending end begin out rc reason situation
+  exec 6> "$OVERRIDE_LOCK"
+  flock -n 6 || { echo "NOTE an override is being changed: no decision this round"; return 0; }
   now=$(date +%s)
   rows=$(alive) || { log "squeue failed: no decision this round"; return 0; }
   pending=$(printf '%s\n' "$rows" | awk -F'|' '$3 == "PENDING" || $3 == "CONFIGURING" {n++} END {print n + 0}')
@@ -297,7 +304,7 @@ renew_once() {
   else
     begin=$((end - OVERLAP))
     [ "$begin" -gt "$now" ] || begin=$now
-    situation="the allocation of ours ends in $((end - now)) s"
+    situation="the allocation of ours ends at $(date -u -d "@$end" +%FT%TZ)"
   fi
   reason=$(renewal_wanted "$now" "$rows")
   case $? in
@@ -347,8 +354,19 @@ last_activity() { # last_activity <id> <start>: when a step of the job last ran 
 # never ran one) is released, by its id, through release's own ledger and name checks; renew.wanted is cleared with it,
 # so the loop does not submit another at once, and a successor of ours still queued is released too (nobody needs it).
 idle_release() {
-  local now rows id name state start end cpus mem began last live want released=0
   [ "$IDLE" -gt 0 ] || return 0
+  exec 6> "$OVERRIDE_LOCK"
+  if ! flock -n 6; then
+    log "an override is being changed: no idle decision this round"
+    exec 6>&-
+    return 0
+  fi
+  idle_release_locked
+  exec 6>&-
+}
+
+idle_release_locked() {
+  local now rows id name state start end cpus mem began last live want released=0
   now=$(date +%s)
   # `renew want` keeps the allocation even when idle, so no idle release while it lasts.
   want=$(wanted_until)
@@ -452,7 +470,13 @@ cmd_renew_start() {
   echo "RENEWER $(renewer_status)"
 }
 
+override_lock() {
+  exec 6> "$OVERRIDE_LOCK"
+  flock -n 6 || die "the renewer is deciding now: nothing changed; try again in a few seconds" 3
+}
+
 cmd_want() {
+  override_lock
   [ "${1:-}" = --until ] && is_count "${2:-}" || die "want takes --until <seconds since the epoch>"
   [ "$2" -gt "$(date +%s)" ] || die "want: that time has passed"
   printf '%s\n' "$2" > "$WANTED.new" && mv -f "$WANTED.new" "$WANTED"
@@ -461,17 +485,20 @@ cmd_want() {
 }
 
 cmd_unwant() {
+  override_lock
   rm -f "$WANTED"
   echo "UNWANTED: the want override is gone; renewal follows the default (renew while a test step ran within 3 h)"
 }
 
 cmd_never() {
+  override_lock
   : > "$NEVER"
   rm -f "$WANTED"
   echo "NEVER: no successor is submitted, even when busy; the running allocation ends at its time limit"
 }
 
 cmd_auto() {
+  override_lock
   rm -f "$WANTED" "$NEVER"
   echo "AUTO: no override; renewal is on while a test step of ours ran within 3 h"
 }
