@@ -229,3 +229,18 @@ def test_a_peer_uid_check_asked_of_a_gate_without_it_refuses_the_start(node, tmp
     with pytest.raises(StartRefused, match="does not have it"):
         start(node, settings)
     assert not node.spawned
+
+
+def test_this_core_s_gate_has_the_peer_uid_check_so_the_apptainer_gate_asks_for_it(node, settings):
+    """O56, O61: in this tree `gatepeer.py` sits beside `gate.py`, so every Apptainer gate is asked for the check and
+    the run's metadata says it is in effect."""
+    from expcore_onedata.sandbox.apptainer import gaterun
+
+    assert gaterun.PEER_CHECK.is_file()
+    assert gaterun.PEER_CHECK.parent == gaterun.GATE_PY.parent
+    box = start(node, settings)
+    try:
+        assert node.gates[-1].config[gaterun.PEER_CHECK_KEY] is True
+        assert box.metadata()["gate"]["peer_uid_check"] is True
+    finally:
+        box.stop()
