@@ -14,22 +14,28 @@ for the platform and the configuration file they read. The pipeline collects tho
   same files with no study build open and leaves nothing: it is no study start and is never refused.
 - **The module and the path only.** A record holds the module's name and the file's path: no value of the file, no
   secret. A refusal names the file's own name, never its directory.
-- **The process's, not a thread's.** A plugin that builds its platform in a thread of its own is seen. Watches may
-  overlap, each keeping its own record, and a file loaded again in one watch is one record.
+- **The process's, with the thread's own first.** A loader records into the watches its own thread opened, so two
+  builds in one process, each in its own thread, never receive each other's records, and a build that loads nothing is
+  not refused for another's platform. A thread with no watch of its own (a worker the plugin started to build its
+  platform) records into every build now open, so it is seen. Watches may overlap, each keeping its own record, and a
+  file loaded again in one watch is one record.
 - **A record changes nothing.** No loader returns anything different, and no record, fingerprint or state file holds it.
 
 A platform layer other than the Onedata one calls `record_platform_load(module, path)` from its own loader, with the
 module name its study lists in `[study] platforms` for it, the one whose `declared_deferral_from_config` the core calls.
 
 The record covers the study's build: the plugin's import and its `build`, and what the pipeline derives from the
-plugin before the scheduler starts. A platform loaded after that (a health check that loads its configuration at its
-first call, say) is outside it, as is a `PlatformConfig` made by hand without the loader.
+plugin before the scheduler starts. Outside it are a platform loaded after that (a health check that loads its
+configuration at its first call, say), a `PlatformConfig` made by hand without the loader, and one that a module outside
+the study's own code (an installed helper, which stays imported between builds) loaded in an earlier build of the same
+process and retains: the later build runs no loader, so it records nothing.
 """
 
 import os
 import threading
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
@@ -43,14 +49,20 @@ class PlatformLoad(NamedTuple):
     config: Path
 
 
+@dataclass(frozen=True)
+class _Watch:
+    thread: int  # the thread that opened it: its own loaders record here
+    loads: list[PlatformLoad]  # the record, in order, which the block's loaders append to
+    seen: set[PlatformLoad]  # the same, to keep a file loaded again one record
+
+
 _LOCK = threading.Lock()
-_WATCHES: dict[
-    object, tuple[list[PlatformLoad], set[PlatformLoad]]
-] = {}  # each open watch: its record, and a set of it
+_WATCHES: dict[object, _Watch] = {}  # every open watch, by a token of its own
 
 
 def record_platform_load(module: str, config: str | os.PathLike[str]) -> None:
-    """Record, in every study build now watching, that a loader ran for `module` on the file `config`; do nothing when
+    """Record that a loader ran for `module` on the file `config`, in the study builds watching the loader's thread, or
+    in every build now watching when the thread has none of its own (a worker thread a plugin started); do nothing when
     no study build is open. A platform's loader calls it at its entry, so a loader that then refuses its file still
     counts as run. Raise ValueError, naming the argument, for a module that is not a non-empty name or a file that is
     not a path."""
@@ -59,11 +71,13 @@ def record_platform_load(module: str, config: str | os.PathLike[str]) -> None:
     if not isinstance(config, str | os.PathLike):
         raise ValueError(f"record_platform_load: config must be a path, not a {type(config).__name__}")
     load = PlatformLoad(module, Path(config))
+    me = threading.get_ident()
     with _LOCK:
-        for loads, seen in _WATCHES.values():
-            if load not in seen:
-                seen.add(load)
-                loads.append(load)
+        own = [watch for watch in _WATCHES.values() if watch.thread == me]
+        for watch in own or _WATCHES.values():
+            if load not in watch.seen:
+                watch.seen.add(load)
+                watch.loads.append(load)
 
 
 @contextmanager
@@ -71,9 +85,10 @@ def watching_platform_loads() -> Iterator[list[PlatformLoad]]:
     """Collect, in order, the loads of the platform loaders that run in the block: the study's build. Each watch starts
     empty and keeps its own record (watches may overlap), a list that the block's loaders append to as they run."""
     token = object()
-    loads: list[PlatformLoad] = []
+    watch = _Watch(threading.get_ident(), [], set())
+    loads = watch.loads
     with _LOCK:
-        _WATCHES[token] = (loads, set())
+        _WATCHES[token] = watch
     try:
         yield loads
     finally:

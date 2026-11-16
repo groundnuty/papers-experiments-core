@@ -91,9 +91,32 @@ def test_c11_a_loader_run_again_on_the_same_file_is_one_record(tmp_path):
     assert len(loads) == 1
 
 
+def test_c11_builds_in_two_threads_do_not_receive_each_others_records(tmp_path):
+    """C11: a study build that loads nothing is not refused for another build's platform: a loader records into the
+    watches its own thread opened, so two builds in one process, each in its own thread, keep their own record."""
+    loaded, done, kept = threading.Event(), threading.Event(), {}
+
+    def other_build():
+        with watching_platform_loads() as loads:
+            record_platform_load(OTHER, tmp_path / "other.toml")
+            kept["other"] = loads
+            loaded.set()
+            done.wait(10)
+
+    with watching_platform_loads() as mine:
+        worker = threading.Thread(target=other_build)
+        worker.start()
+        assert loaded.wait(10)
+        record_platform_load(MODULE, tmp_path / "mine.toml")
+        done.set()
+        worker.join()
+    assert mine == [PlatformLoad(MODULE, tmp_path / "mine.toml")]
+    assert kept["other"] == [PlatformLoad(OTHER, tmp_path / "other.toml")]
+
+
 def test_c11_a_loader_in_another_thread_is_recorded_too(tmp_path):
-    """C11: the registry is the process's, not a thread's: a plugin that builds its platform in a worker thread of its
-    own is seen."""
+    """C11: a plugin that builds its platform in a worker thread of its own is seen: a thread with no watch of its own
+    records into every build now open."""
     with watching_platform_loads() as loads:
         worker = threading.Thread(target=record_platform_load, args=(MODULE, tmp_path / "platform.toml"))
         worker.start()
