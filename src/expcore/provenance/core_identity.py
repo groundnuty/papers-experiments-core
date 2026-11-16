@@ -24,7 +24,7 @@ same way however one commit is installed, and the campaign's environment records
 `python_sha256` is over every `*.py` file of the packages `expcore` and `expcore_onedata`, by its path below the
 directory holding them (`expcore/cli.py`) and its content, without the example study the wheel carries under
 `expcore/examples/` (the study's own code once written out). A running core walks its directories, a checkout's
-`src/` as an installed core's site directory, following links (once each): the digest is of what is imported. A build
+`src/` as an installed core's site directory, following links (a cycle once): the digest is of what is imported. A build
 leaves out the files git ignores there, as the wheel does, so it records what its install will walk. The two agree on
 every checkout that is not dirty, and a link in a checkout's packages is dirt, since git holds where it points and not
 what it leads to. Two dirty trees at one commit therefore differ when their code does.
@@ -126,27 +126,35 @@ def package_files(parent: Path) -> tuple[list[tuple[str, Path]], list[str]]:
     """The Python files of the packages below `parent` (a site directory, or a checkout's `src/`), each by its name
     below `parent`, and the links among them, files or directories, by the same names.
 
-    A linked directory is walked like any other, since its code is imported like any other; one reached again (a link
-    back up the tree) is walked once, by its resolved path, so a cycle ends.
+    A linked directory is walked like any other, under its own name, since its code is imported under that name; a
+    directory is left only when it is one of the directories on its own path (a link back up the tree), so a cycle ends
+    and every other path is hashed, however many lead to one directory. The example study under `expcore/examples/` is
+    not walked: it is no part of the digest, and a link inside it cannot stand in for a package.
     """
     files: list[tuple[str, Path]] = []
     links: list[str] = []
-    walked: set[Path] = set()
+
+    def walk(directory: Path, name: str, ancestors: frozenset[Path]) -> None:
+        real = directory.resolve()
+        if real in ancestors:
+            return
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError:
+            return
+        for entry in entries:
+            child, path = f"{name}/{entry.name}", Path(entry.path)
+            if entry.is_symlink():
+                links.append(child)
+            if entry.is_dir():  # a link to a directory too
+                if entry.name not in _SKIPPED_DIRS and not f"{child}/".startswith(EXAMPLES):
+                    walk(path, child, ancestors | {real})
+            elif _counted(child) and entry.is_file():
+                files.append((child, path))
+
     for package in PACKAGES:
-        for here, dirs, names in os.walk(parent / package, followlinks=True):
-            real = Path(here).resolve()
-            if real in walked:
-                dirs[:] = []
-                continue
-            walked.add(real)
-            dirs[:] = sorted(d for d in dirs if d not in _SKIPPED_DIRS)
-            for entry in [*dirs, *names]:
-                path = Path(here) / entry
-                name = path.relative_to(parent).as_posix()
-                if path.is_symlink() and not name.startswith(EXAMPLES):
-                    links.append(name)
-                if entry in names and _counted(name) and path.is_file():
-                    files.append((name, path))
+        if (parent / package).is_dir():
+            walk(parent / package, package, frozenset())
     return files, sorted(links)
 
 
@@ -162,6 +170,15 @@ def checkout_digest(root: Path) -> str | None:
     if ignored is None:
         return None
     return _digest([(name, path) for name, path in package_files(root / "src")[0] if f"src/{name}" not in ignored])
+
+
+def _tracked_links(root: Path) -> set[str] | None:
+    """The links git tracks in a checkout's packages (mode 120000), by path from its top; None when git cannot say."""
+    listing = _git(root, "ls-files", "-z", "-s", "--", *(f"src/{p}" for p in PACKAGES), raw=True)
+    if listing is None:
+        return None
+    rows = (item.split("\t", 1) for item in listing.split("\0") if "\t" in item)
+    return {path for stage, path in rows if stage.startswith("120000 ")}
 
 
 def _ignored(root: Path) -> set[str] | None:
@@ -200,7 +217,11 @@ def _dirt(root: Path) -> str | None:
     if hidden:
         more = f" and {len(hidden) - 3} more" if len(hidden) > 3 else ""
         return f"Python files in the packages that git ignores: {', '.join(hidden[:3])}{more}"
-    links = [f"src/{name}" for name in package_files(root / "src")[1]]
+    links = sorted(
+        {f"src/{name}" for name in package_files(root / "src")[1]}  # walked: what the packages import through
+        | (_tracked_links(root) or set())  # held by git, under the example's place too
+        | {item for item in ignored if (root / item).is_symlink()}  # a link git ignores imports like any other
+    )
     if links:
         more = f" and {len(links) - 3} more" if len(links) > 3 else ""
         return f"links in the packages, whose targets no commit holds: {', '.join(links[:3])}{more}"

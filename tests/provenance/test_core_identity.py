@@ -23,6 +23,7 @@ from expcore.provenance.core_identity import (
     from_checkout,
     identity_of,
     installed_digest,
+    package_files,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -109,6 +110,29 @@ def test_c06_a_linked_subpackage_is_walked_and_its_link_is_dirt(repo, tmp_path):
     assert not identity_of(package).stale  # the link leads to the code the build hashed
     (outside / "__init__.py").write_text("RATE = 3\n", encoding="utf-8")
     assert identity_of(package).stale
+
+
+def test_c06_a_link_to_a_package_directory_never_takes_it_out_of_the_digest(repo, tmp_path):
+    """C06: a link under the example's place (which the digest leaves out) or a second name for a subpackage leaves
+    the subpackage hashed under its own name, so a change to its code changes the digest; in a checkout, a link git
+    holds is dirt even under the example's place."""
+    site = tmp_path / "site"
+    (site / "expcore" / "stats").mkdir(parents=True)
+    (site / "expcore" / "examples").mkdir()
+    (site / "expcore" / "__init__.py").write_text("", encoding="utf-8")
+    (site / "expcore" / "stats" / "__init__.py").write_text("RATE = 1\n", encoding="utf-8")
+    (site / "expcore" / "examples" / "alias").symlink_to(site / "expcore" / "stats", target_is_directory=True)
+    (site / "expcore" / "second").symlink_to(site / "expcore" / "stats", target_is_directory=True)
+    names = [name for name, _ in package_files(site)[0]]
+    assert names == ["expcore/__init__.py", "expcore/second/__init__.py", "expcore/stats/__init__.py"]
+    before = installed_digest(site)
+    (site / "expcore" / "stats" / "__init__.py").write_text("RATE = 2\n", encoding="utf-8")
+    assert installed_digest(site) != before
+    root = core_project(repo)
+    (root / "src" / "expcore" / "examples").mkdir()
+    (root / "src" / "expcore" / "examples" / "alias").symlink_to(tmp_path / "anywhere", target_is_directory=True)
+    repo.commit("a link under the example's place")
+    assert "links in the packages" in str(from_checkout(root).why)
 
 
 def test_c06_two_dirty_trees_at_one_commit_are_told_apart_by_their_python_digest(repo):
