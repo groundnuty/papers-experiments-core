@@ -34,11 +34,10 @@ is, and the check's pairing still verifies every file that is in place against t
 campaign is a snapshot of a batch that is changing: an attempt it finds between its record and its rename is
 settled when the check lists it, and one that reaches that point after is the next check's to settle.
 
-`merge` runs `settle_side_files` over each shard's `runs/` before it replays the shard, and `check` of a merged batch
-runs it over the batch (#304), both without `remove_unnamed`: neither holds the campaign's lock, so a file that no
-record names may be an attempt's own, and only a rename that a record names, which is safe whenever it is made, is
-finished. A directory that cannot be written is never written to: what would have been done there is returned with
-`Settled.left` set, for the caller to report.
+`merge` runs `settle_side_files` over a private copy of each shard's `runs/` (never the shard's own), with
+`remove_unnamed`, since no attempt can be writing in a copy only the merge holds; `check` of a merged batch runs it
+over the batch without it (#304), since it holds no lock to prove that. A directory that cannot be written is never
+written to: what would have been done there is returned with `Settled.left` set, for the caller to report.
 """
 
 import errno

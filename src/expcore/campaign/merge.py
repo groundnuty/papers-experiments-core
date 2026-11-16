@@ -10,9 +10,9 @@
 A shard's snapshot is made from its store with the online backup (`take_snapshot`), so a shard with attempts still
 running is refused, and everything the checks read is read from the copy the batch keeps. A shard's `out/` is only
 read: its store is backed up from a private copy of its files, under a reader's hold of its lock, so nothing is
-written beside it, a read-only `out/` is merged as it is, and a shard a dispatcher still holds is refused (R16). The
-one write the merge may make into a shard is in its `runs/`: the finish of a kill's rename of a declared side file
-(`study.merge`, R15, #304).
+written beside it, a read-only `out/` is merged as it is, and a shard a dispatcher still holds is refused (R16). Its
+records are read from a private copy too (`copy_runs`, #304): the replay check settles what a kill left of a declared
+side file in that copy (R15), never in the shard, and the batch is laid out from the copy that was verified.
 
 **What a merge refuses, naming the shard and the reason (C29).** The checks run in the order that costs least, the
 replay check (`study.merge`) last:
@@ -392,11 +392,37 @@ def merge_text(document: Mapping[str, Any]) -> str:
     return json.dumps(document, indent=1, sort_keys=True) + "\n"
 
 
-def lay_out(stage: Path, shards: Sequence[ShardFacts]) -> dict[str, Any]:
+def copy_runs(source: Path, target: Path) -> None:
+    """Copy the batch of a shard (its `runs/`) into `target`, a private copy that the merge may write in (#304).
+
+    A shard's own `replay-check.json` and snapshot (`_SKIPPED`) are left behind, as `lay_out` leaves them: they are not
+    part of the union. Every directory of the copy is writable whatever the shard's modes are, so a shard fetched
+    read-only gives a copy that can be settled and removed. Raises OSError (`shutil.Error` included) for a file that
+    cannot be read; a copy that failed halfway is the caller's to remove (`make_writable`, then `shutil.rmtree`).
+    """
+
+    def left_behind(directory: str, names: list[str]) -> list[str]:
+        return [name for name in names if name in _SKIPPED] if Path(directory) == source else []
+
+    shutil.copytree(source, target, ignore=left_behind)
+    make_writable(target)
+
+
+def make_writable(root: Path) -> None:
+    """Give the owner access to every directory below `root` (and `root`), so that it can be written and removed."""
+    for directory, _, _ in os.walk(root):
+        mode = os.stat(directory).st_mode
+        if mode & 0o700 != 0o700:
+            os.chmod(directory, mode | 0o700)
+
+
+def lay_out(stage: Path, shards: Sequence[ShardFacts], *, move: bool = False) -> dict[str, Any]:
     """Write the merged batch into the empty directory `stage` and return merge.json's content.
 
-    The runs are the shards' `runs/<digest>` directories, copied; two shards holding one directory is refused. A
-    shard's own `replay-check.json` and snapshot are left behind: the merged batch is checked as a whole.
+    The runs are the shards' `runs/<digest>` directories, copied, or moved with `move` when each shard's `out/` is a
+    private copy the merge made (`copy_runs`, which a rename out of it does not duplicate); two shards holding one
+    directory is refused. A shard's own `replay-check.json` and snapshot are left behind: the merged batch is checked
+    as a whole.
     """
     runs = stage / RUNS_DIR
     runs.mkdir(parents=True)
@@ -409,7 +435,10 @@ def lay_out(stage: Path, shards: Sequence[ShardFacts]) -> dict[str, Any]:
                 continue
             if (runs / entry.name).exists():
                 raise MergeRefused(f"{shard.name}: {RUNS_DIR}/{entry.name} is already there from another shard")
-            shutil.copytree(entry, runs / entry.name)
+            if move:
+                os.replace(entry, runs / entry.name)
+            else:
+                shutil.copytree(entry, runs / entry.name)
         target = shard_snapshot_path(stage, shard.spec.index)
         target.parent.mkdir(parents=True)
         os.replace(shard.snapshot, target)

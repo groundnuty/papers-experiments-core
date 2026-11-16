@@ -4,17 +4,19 @@
 The study is the one above `OUT` (or `--study`), and `OUT` is normally its `out/`. The merge loads the study for the
 whole plan, so that "every run belongs to its shard" and "no run is missing" are checked against it, and replays each
 shard's records the way `check` does (`verify_batch`, under the code and environment in use), then writes the batch
-(`campaign.merge`). Nothing is written to `OUT` unless every check passes. A shard's `out/` is read, not written, but
-for one case below: its store is copied with the online backup, and its records are copied into the batch.
+(`campaign.merge`). Nothing is written to `OUT` unless every check passes. A shard's `out/` is only read: its store is
+copied with the online backup, and its records are copied into a private staging directory, inside the directory
+beside `OUT` that the merge writes the batch in, which nothing but this merge can write to.
 
-The one thing the merge may write into a shard is the finish of a kill, the way `check` settles it (R15, #304): a side
-file left under its temporary name, which a record beside it names by its SHA-256, is renamed to its declared name
-before the shard's records are replayed, so that a shard copied back from another host is merged, not refused as
-missing a file. It removes nothing a record does not name: a partial file of a killed attempt stays in the shard, where
-`check` removes it under the campaign's lock. A shard whose directory cannot be written is not written to: the merge
-says what it left and, if the replay then fails for it, what to do (`_unsettled`).
+**The records are replayed in that copy, never in the shard** (R15, #304). The merge settles the copy's declared side
+files the way `check` settles a batch (`settle_side_files`): a file a kill left under its temporary name, which the one
+record beside it names by its SHA-256, is renamed to its declared name, and a partial file no record names is removed
+(no attempt can be writing in a copy that only this merge holds). So a shard copied back from another host, read-only
+as it may be, is merged and not refused as missing a file, and it keeps every byte it had, the partial files included,
+as the evidence they are. The batch is laid out from the copy that was verified.
 """
 
+import dataclasses
 import os
 import shutil
 import sys
@@ -28,7 +30,9 @@ from expcore.campaign.merge import (
     MergeRefused,
     ShardFacts,
     check_shards,
+    copy_runs,
     lay_out,
+    make_writable,
     read_shard,
     refuse_non_empty,
 )
@@ -36,7 +40,7 @@ from expcore.errors import study_kinds
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.environment import differences
 from expcore.replay.check import BatchNotVerified, verify_batch
-from expcore.replay.side_file_placement import FINISHED, Settled, settle_side_files
+from expcore.replay.side_file_placement import settle_side_files
 from expcore.study.config import StudyConfig, find_study_root, load_study
 from expcore.study.pipeline import (
     HASHED_ONLY,
@@ -47,6 +51,7 @@ from expcore.study.pipeline import (
 from expcore.study.selection_start import pricing_of
 
 _SHOWN_FAILURES = 3
+REPLAY_DIR = "replay"  # the private copies of the shards' runs/, in the merge's staging directory
 
 
 @dataclass(frozen=True)
@@ -88,25 +93,30 @@ def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: b
         pricing = pricing_of(study)  # what a selection's spend is counted with (C38); a shard's is not read
         facts = [read_shard(path, stage / f"read-{n}.sqlite", pricing) for n, path in enumerate(shard_outs)]
         shards = check_shards(facts, study.manifest, pricing)
-        for shard in shards:
-            _replay(study, shard, code, env)
-        lay_out(stage, shards)
+        copies = stage / REPLAY_DIR
+        copies.mkdir(mode=0o700)
+        staged = [_replay(study, shard, code, env, copies / str(n)) for n, shard in enumerate(shards)]
+        lay_out(stage, staged, move=True)  # what was verified is what is laid out: a rename, never a second copy
+        shutil.rmtree(copies)
         try:
             os.replace(stage, out)
         except OSError as error:
             raise MergeRefused(f"{out}: cannot be written ({type(error).__name__}: {error})") from None
     finally:
+        if stage.exists():  # a halfway copy of a read-only shard has directories no removal can enter
+            make_writable(stage)
         shutil.rmtree(stage, ignore_errors=True)
     return Merged(out, len(shards), sum(len(shard.runs) for shard in shards))
 
 
-def _replay(study: StudyConfig, shard: ShardFacts, code: Any, env: Any) -> None:
+def _replay(study: StudyConfig, shard: ShardFacts, code: Any, env: Any, copy: Path) -> ShardFacts:
     """5: the shard's own records pass the replay check `check` makes, under the environment its campaign ran in.
 
-    The shard's side files are settled first, as `check` does (`settle_side_files`, R15, #304), but never removed: the
-    merge holds no campaign lock, and without it a file no record names may be an attempt's own, staging. A rename
-    changes the listing of the shard's `runs/`, so a `replay-check.json` the shard already holds stops vouching for it;
-    the merge reads no check of a shard (`lay_out` leaves it behind), and the merged batch is checked as a whole.
+    The check runs on a private copy of the shard's `runs/` (`copy` is its directory, whose `runs/` is made here), after
+    its side files are settled there as `check` settles a batch (R15, #304), so the shard itself is never written, and
+    what is verified is what `lay_out` moves into the merged batch. Returns the shard with `out` set to that copy. A
+    rename changes the listing of a `runs/`, so a `replay-check.json` the shard holds would stop vouching for it; the
+    merge leaves it behind (`copy_runs`) and the merged batch is checked as a whole.
     """
     changed = differences(campaign_environment(shard.fingerprint), env)
     if changed:
@@ -114,11 +124,17 @@ def _replay(study: StudyConfig, shard: ShardFacts, code: Any, env: Any) -> None:
             f"{shard.name}: its campaign ran under another environment than this merge would; merge under the "
             "campaign's environment:\n  " + "\n  ".join(changed)
         )
-    batch = shard.out / RUNS_DIR
-    if not batch.is_dir():
+    source = shard.out / RUNS_DIR
+    if not source.is_dir():
         raise MergeRefused(f"{shard.name}: no {RUNS_DIR}/ directory of records in its out/")
+    batch = copy / RUNS_DIR
+    try:
+        copy_runs(source, batch)
+    except OSError as error:  # shutil.Error too: a file that cannot be read cannot be replayed either
+        reason = getattr(error, "strerror", None) or type(error).__name__
+        raise MergeRefused(f"{shard.name}: its {RUNS_DIR}/ cannot be copied to be replayed ({reason})") from None
     import_what_the_records_need(study, batch)
-    left = _settle(study, shard, batch)
+    _settle(study, shard, batch)
     try:
         check = verify_batch(
             batch, code=code, hashed_only=list(HASHED_ONLY), environment=env, side_files=study.side_files
@@ -131,29 +147,27 @@ def _replay(study: StudyConfig, shard: ShardFacts, code: Any, env: Any) -> None:
         more = " and more" if len(failures) > _SHOWN_FAILURES else ""
         raise MergeRefused(
             f"{shard.name}: {len(failures)} of {check['n_records']} records fail the replay check: {shown}{more}"
-            f"{_unsettled(left)}"
         )
+    return dataclasses.replace(shard, out=copy)
 
 
-def _settle(study: StudyConfig, shard: ShardFacts, batch: Path) -> list[Settled]:
-    """Finish what a kill left of the placement of the shard's declared side files, say what was done on stderr, and
-    return what could not be done because the shard's directory cannot be written."""
-    settled = settle_side_files(batch, study.side_files)
+def _settle(study: StudyConfig, shard: ShardFacts, batch: Path) -> None:
+    """Finish or remove what a kill left of the placement of the shard's declared side files, in the merge's copy, and
+    say so on stderr.
+
+    The copy is private, so no attempt can be staging a file in it: a partial file no record names is removed from the
+    copy, as `check` removes it under the campaign's lock (`remove_unnamed`), and the shard keeps it. A file that could
+    not be settled (the staging directory beside `OUT` cannot be written) refuses the merge, naming it.
+    """
+    settled = settle_side_files(batch, study.side_files, remove_unnamed=True)
     for done in settled:
-        print(f"merge: {shard.name}: {done}", file=sys.stderr)
-    return [done for done in settled if done.left]
-
-
-def _unsettled(left: Sequence[Settled]) -> str:
-    """What the refusal of a shard adds when a rename it could not make may be the cause: the files and the fix.
-
-    A removal left undone (a redundant copy of a file in place) refuses nothing, so only a rename is named."""
-    renames = [done.path for done in left if done.action == FINISHED]
-    if not renames:
-        return ""
-    listed = ", ".join(renames[:_SHOWN_FAILURES]) + (" and more" if len(renames) > _SHOWN_FAILURES else "")
-    return (
-        f"; the merge did not settle {len(renames)} side file(s) that a kill left under a temporary name a record "
-        f"names ({listed}), because the shard's out/ is read-only: make the shard's out/ writable (chmod -R u+w on "
-        "it), or copy it to a disk that is, and merge again"
-    )
+        if not done.left:
+            note = "in the merge's copy: the shard's out/ is not written"
+            print(f"merge: {shard.name}: {done} ({note})", file=sys.stderr)
+    stuck = [done.path for done in settled if done.left]
+    if stuck:
+        listed = ", ".join(stuck[:_SHOWN_FAILURES]) + (" and more" if len(stuck) > _SHOWN_FAILURES else "")
+        raise MergeRefused(
+            f"{shard.name}: {len(stuck)} side file(s) that a kill left under a temporary name cannot be settled "
+            f"({listed}): the staging directory the merge copies into, beside OUT, cannot be written"
+        )

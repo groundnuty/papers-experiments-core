@@ -606,8 +606,10 @@ def _settle_merged_side_files(study: StudyIdentity, batch: Path) -> None:
     Only a rename that a record names is finished (the hash is the record's, so it is safe whenever it is made), and
     only a copy of a file already in place is removed. A file no record names is left: removing it needs the campaign's
     lock as a proof that no attempt is staging, and a merged batch has none to take (it holds no store, `check` makes
-    no `campaign.lock` beside it, R16, and nothing prevents a campaign from being started in its out/ later). A
-    directory that cannot be written is reported as left, and the pairing of the check then says what is missing.
+    no `campaign.lock` beside it, R16, and nothing prevents a campaign from being started in its out/ later); the
+    merge that wrote the batch dropped such files from its copy. Only `batch`, the merged batch's `runs/`, is walked:
+    merge.json, the shards' snapshots and the shards themselves are never touched. A directory that cannot be written
+    is reported as left, and the pairing of the check then says what is missing.
     """
     for settled in settle_side_files(batch, study.side_files):
         print(f"check: {settled}", file=sys.stderr)
