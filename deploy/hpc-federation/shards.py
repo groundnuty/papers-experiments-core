@@ -39,9 +39,21 @@ no `campaign.lock`, does not verify, or is missing is refused, naming its label:
 through request and answer files in `<root>/fault-relay/` on the shared root (M4's `HpcDriver`), never a step of its
 own, and `EXPCORE_FED_ROOT` is how it finds that root. Outage runs on HPC depend on that relay.
 
-**Limits.** A step killed outright (SIGKILL, a node's end) loses what its shard did since its last archive, its `out/`
-being on the node's tmpfs: `Snapshots` is the hook a periodic snapshot plugs into, not built yet. The shard's step
-must be sized for the sandbox, the dispatcher and the store together.
+**Snapshots, and a step killed outright (O62).** The step's `out/` is on the node's tmpfs, so a step killed outright
+(walltime, a node's end, an OOM in the step's cgroup) would lose all of it. While the dispatcher runs, `step`
+snapshots it into `<results>/<label>/snapshots/` (`expcore.campaign.out_snapshot`): every `--snapshot-every` seconds
+(the manifest's `snapshot_every_s`, 900 by default) and after each run's end (a change in the store's count of ended
+attempts, read every `POLL_S`), one at a time, and once more after the dispatcher exits, before the archive. A
+snapshot copies the store first (the core's online backup) and `runs/` after it, verifies both, and is swapped in by
+rename; the newest two are kept. The dispatcher also journals what it spends to `<results>/<label>/journals/`
+(`expcore run --spend-journal`, `expcore.campaign.spend_journal`), a new file per step. `--resume` restores the newest
+snapshot that verifies, unless the shard's archive is newer (a snapshot names the archive its step started from, and
+one taken before the archive was written names an older one or none): then the archive, as before. Either way the
+store's attempt directories are pointed at the new copy's `runs/`, and the dispatcher's start counts what the
+journals hold that the restored store lacks (attempts begun, top-ups and probe sends after the snapshot) as
+`lost_in_kill`, once, against the shard's share of the budget. A start without `--resume` is refused when the shard
+has a snapshot, as when it has results. A snapshot or a journal of another shard is refused, naming it. The shard's
+step must be sized for the sandbox, the dispatcher and the store together.
 
 The manifest (`shards.toml`, operator-local, never committed, since it names the site's paths):
 
@@ -53,6 +65,7 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     step_path = "/usr/bin:/bin"       # the step's PATH
     cpus = 6
     memory = "18g"
+    snapshot_every_s = 900            # optional: seconds between snapshots of a running shard's out/ (also at run ends)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
     root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml
@@ -65,6 +78,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
@@ -74,6 +88,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +105,9 @@ ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
 CHUNK = 1 << 20
+SNAPSHOT_EVERY_S = 900.0  # a running shard's out/ is snapshotted this often, and after each run's end
+POLL_S = 30.0  # how often the snapshot thread looks for a run's end in the store
+SNAPSHOTS, JOURNALS = "snapshots", "journals"  # under <results>/<label>/
 
 
 class ShardsError(Exception):
@@ -116,6 +134,7 @@ class Plan:
     cpus: int
     memory: str
     shards: tuple[Shard, ...]
+    snapshot_every_s: float = SNAPSHOT_EVERY_S
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -136,8 +155,11 @@ def load_plan(path: Path) -> Plan:
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
-    if set(data) != keys:
-        raise ShardsError(f"the manifest's keys must be exactly: {', '.join(sorted(keys))}")
+    if not keys <= set(data) <= keys | {"snapshot_every_s"}:
+        raise ShardsError(f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps snapshot_every_s")
+    every = data.get("snapshot_every_s", SNAPSHOT_EVERY_S)
+    if isinstance(every, bool) or not isinstance(every, int | float) or not 60 <= every < float("inf"):
+        raise ShardsError("snapshot_every_s must be a number of seconds, at least 60")
     for key in ("study", "core_src", "results", "tmpfs"):
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
@@ -160,7 +182,8 @@ def load_plan(path: Path) -> Plan:
     if len(set(labels)) != len(labels):
         raise ShardsError("a label is given to two shards")
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
-                Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards))  # fmt: skip
+                Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
+                float(every))  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -219,7 +242,8 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
            f"EXPCORE_FED_ROOT={shard.root}"]  # fmt: skip
     step = [plan.python, "-I", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
-            "--results", str(plan.results), "--core-src", str(plan.core_src)]  # fmt: skip
+            "--results", str(plan.results), "--core-src", str(plan.core_src),
+            "--snapshot-every", f"{plan.snapshot_every_s:g}"]  # fmt: skip
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
@@ -395,15 +419,24 @@ def run_dispatcher(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> in
 
 
 class Snapshots:
-    """The hook of a periodic snapshot of a running shard's `out/` (not built yet: the coordinator's limit 1).
+    """When a running shard's `out/` is snapshotted (O62; `snapshot` is what a snapshot is).
 
-    `take(out)` is called every `every_s` seconds from a thread of its own while the dispatcher runs, and once after
-    it has exited, before the archive; one that raises is reported and never ends the run. A snapshot is to copy
-    `out/runs/` first and the store after it, into a fresh directory, verified, then swapped in by rename, so a kill
-    at any point leaves the last good one."""
+    `take(out)` is called from a thread of its own while the dispatcher runs: every `every_s` seconds, and, given
+    `progress` (a reading that changes when a run ends, None while there is none), within `poll_s` of a change, one
+    snapshot at a time; and once after the dispatcher has exited, before the archive. One that raises is reported
+    and never ends the run: the last good snapshot stands."""
 
-    def __init__(self, take: Callable[[Path], None], every_s: float = 900.0) -> None:
-        self.take, self.every_s = take, every_s
+    def __init__(
+        self,
+        take: Callable[[Path], None],
+        every_s: float = SNAPSHOT_EVERY_S,
+        *,
+        progress: Callable[[], Any] | None = None,
+        poll_s: float = POLL_S,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.take, self.every_s, self.progress, self.clock = take, every_s, progress, clock
+        self.poll_s = min(poll_s, every_s) if progress is not None else every_s
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -411,13 +444,23 @@ class Snapshots:
         try:
             self.take(out)
         except Exception as error:  # a snapshot that failed leaves the last good one: reported, the run goes on
-            print(f"shards: a snapshot of out/ failed ({type(error).__name__})", file=sys.stderr)
+            print(f"shards: a snapshot of out/ failed ({type(error).__name__}: {error})", file=sys.stderr)
+
+    def _seen(self) -> Any:
+        try:
+            return None if self.progress is None else self.progress()
+        except Exception:  # a reading that fails says nothing ended: the clock still takes the next one
+            return None
 
     def start(self, out: Path) -> None:
         def loop() -> None:
-            while not self._stop.wait(self.every_s):
-                if out.is_dir():
+            last, seen = self.clock(), self._seen()
+            while not self._stop.wait(self.poll_s):
+                now = self._seen()
+                ended = now is not None and now != seen
+                if (ended or self.clock() - last >= self.every_s) and out.is_dir():
                     self._once(out)
+                    last, seen = self.clock(), now if now is not None else seen
 
         self._thread = threading.Thread(target=loop, daemon=True, name="shard-snapshots")
         self._thread.start()
@@ -430,6 +473,87 @@ class Snapshots:
             self._once(out)
 
 
+def _stamp() -> str:
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def taker(snapdir: Path, scratch: Path, facts: Mapping[str, Any], live: threading.Event) -> Callable[[Path], None]:
+    """The default snapshot of `out/` into `snapdir` (`expcore.campaign.out_snapshot.take`): its store read in place
+    while `live` is set (the dispatcher holds it), from a private copy once it is not."""
+
+    def take(out: Path) -> None:
+        from expcore.campaign import out_snapshot
+
+        made = out_snapshot.take(out, snapdir, scratch=scratch, facts=facts, live=live.is_set(), now=_stamp())
+        print(f"shards: snapshot {made.name} of shard {facts['shard']['label']} taken", file=sys.stderr)
+
+    return take
+
+
+def settle_store(out: Path) -> None:
+    """Close the store as its dispatcher's own last close does, when a snapshot's read in place, made as the
+    dispatcher exited, left its -shm (and -wal) beside it: one connection, opened, read and closed, checkpoints the
+    -wal into the store and removes both, so the archive holds what the dispatcher left. Nothing for a store without
+    a -shm, which a dispatcher that closed its store leaves none of."""
+    import sqlite3
+
+    store = out / "state.sqlite"
+    if not store.is_file() or not store.with_name(store.name + "-shm").exists():
+        return
+    connection = sqlite3.connect(store)
+    try:
+        connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    finally:
+        connection.close()
+
+
+def archive_named(results: Path, label: str) -> str | None:
+    """The SHA-256 the shard's archive manifest names: None when there is none; a value no snapshot names when it
+    cannot be read, so that the archive, which then fails its check, is never passed over for an older snapshot."""
+    path = results / f"{label}.out.json"
+    if not path.exists():
+        return None
+    try:
+        named = json.loads(path.read_text(encoding="utf-8")).get("sha256")
+    except (OSError, ValueError, AttributeError):
+        named = None
+    return named if isinstance(named, str) else "unreadable"
+
+
+def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | None, work: Path, out: Path) -> None:
+    """Put the shard's latest `out/` at `out`: the newest snapshot that verifies, unless the archive is newer (a
+    snapshot that does not name it was taken before it), else the archive, else nothing (a fresh start). Either way the
+    store's attempt directories are pointed at `out/runs`. A snapshot of another shard is `ShardsError`."""
+    from expcore.campaign import out_snapshot
+    from expcore.campaign.snapshot import rebase_run_dirs
+
+    for snapshot in out_snapshot.snapshots(args.results / args.label / SNAPSHOTS):
+        try:
+            facts = out_snapshot.manifest_of(snapshot)["facts"]
+        except out_snapshot.OutSnapshotError as error:
+            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
+            continue
+        if facts.get("shard") != dict(spec):
+            raise ShardsError(f"shard {args.label}: snapshot {snapshot.name} is of shard {facts.get('shard')}")
+        if base is not None and facts.get("base") != base:
+            break  # taken before the archive: the archive is newer than it and every older one
+        try:
+            out_snapshot.restore(snapshot, out)
+        except out_snapshot.OutSnapshotError as error:
+            print(f"shards: snapshot {snapshot.name} is not used: {error}", file=sys.stderr)
+            continue
+        print(f"shards: shard {args.label} resumes from snapshot {snapshot.name}", file=sys.stderr)
+        return
+    if (args.results / f"{args.label}.out.tar").exists():
+        shard = Shard(args.index, args.count, args.label, Path("/"))
+        tar_path, _ = verified(args.results, shard, work)
+        shutil.move(unpack(tar_path, work / "previous"), out)
+        tar_path.unlink()
+        if (out / out_snapshot.STORE).is_file():
+            rebase_run_dirs(out / out_snapshot.STORE, out / out_snapshot.RUNS)
+        print(f"shards: shard {args.label} resumes from its archive", file=sys.stderr)
+
+
 def step(
     args: argparse.Namespace,
     *,
@@ -437,11 +561,14 @@ def step(
     core_found: Callable[[Path], bool] = imports_core_from,
     snapshots: Snapshots | None = None,
 ) -> int:
-    """One shard on its node (the module's docstring): copy, run, archive, clean up; the dispatcher's exit status.
-    `snapshots` is the hook of limit 1, None until it is built."""
+    """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
+    status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
+    end, into `<results>/<label>/snapshots/`."""
     if not core_found(args.core_src):
         print("shards: ERROR: this interpreter does not import the core from --core-src", file=sys.stderr)
         return CORE_MISMATCH
+    from expcore.campaign import out_snapshot
+
     if args.tmpfs.is_symlink() or not args.tmpfs.is_dir():
         print("shards: ERROR: --tmpfs must be a directory, not a link", file=sys.stderr)
         return 2
@@ -451,34 +578,46 @@ def step(
     spec = {"index": args.index, "count": args.count, "label": args.label}
     _label_ok(args.index, args.count, args.label)
     published = [args.results / f"{args.label}.out.{kind}" for kind in ("tar", "json")]
-    if not args.resume and any(path.exists() for path in published):
-        print(f"shards: ERROR: shard {args.label} has results already: --resume continues it", file=sys.stderr)
+    snapdir = args.results / args.label / SNAPSHOTS
+    if not args.resume and (any(path.exists() for path in published) or out_snapshot.snapshots(snapdir)):
+        print(f"shards: ERROR: shard {args.label} has results or a snapshot already: --resume continues it",
+              file=sys.stderr)  # fmt: skip
         return 2
+    base = archive_named(args.results, args.label)  # the archive this step starts from: its snapshots name it
     work = Path(tempfile.mkdtemp(prefix=f"expcore-shard-{args.label}.", dir=args.tmpfs))
     keep = False
     try:
         work.chmod(0o700)
         copy = work / "study"
         shutil.copytree(args.study, copy, symlinks=True)
-        if args.resume and (args.results / f"{args.label}.out.tar").exists():
-            shard = Shard(args.index, args.count, args.label, Path("/"))
-            tar_path, _ = verified(args.results, shard, work)
-            shutil.move(unpack(tar_path, work / "previous"), copy / "out")
-            tar_path.unlink()
+        if args.resume:
+            resume_into(args, spec, base, work, copy / "out")
         for name in ("home", "tmp"):
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
         env |= {"HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
-        argv = [sys.executable, "-I", "-m", "expcore", "run", str(copy), "--shard", f"{args.index}/{args.count}",
-                "--shard-label", args.label]  # fmt: skip
+        journals = args.results / args.label / JOURNALS
+        journals.mkdir(parents=True, exist_ok=True)
+        journal = journals / f"{_stamp()}-{os.getpid()}-{secrets.token_hex(4)}.jsonl"
+        argv = [sys.executable, "-I", "-m", "expcore", "run", str(copy), "--spend-journal", str(journal),
+                "--shard", f"{args.index}/{args.count}", "--shard-label", args.label]  # fmt: skip
         out = copy / "out"
-        if snapshots is not None:
-            snapshots.start(out)
+        live = threading.Event()
+        live.set()
+        if snapshots is None:
+            facts = {"shard": spec, "base": base}
+            snapshots = Snapshots(
+                taker(snapdir, work / "snapshot-scratch", facts, live),
+                getattr(args, "snapshot_every", SNAPSHOT_EVERY_S),
+                progress=lambda: out_snapshot.ended_attempts(out),
+            )
+        snapshots.start(out)
         try:
             status = runner(argv, env, work)
         finally:
-            if snapshots is not None:
-                snapshots.stop(out)
+            live.clear()  # the dispatcher has exited: the last snapshot reads a private copy of the store
+            snapshots.stop(out)
+        settle_store(out)
         if not out.is_dir():
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
             return status
@@ -513,6 +652,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--count", type=int, required=True)
     one.add_argument("--label", required=True)
     one.add_argument("--resume", action="store_true")
+    one.add_argument("--snapshot-every", dest="snapshot_every", type=float, default=SNAPSHOT_EVERY_S)
     args = parser.parse_args(argv)
     try:
         if args.command == "step":
