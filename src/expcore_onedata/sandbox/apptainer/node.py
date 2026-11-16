@@ -126,6 +126,23 @@ class NodeOps(Protocol):
         job)."""
         ...
 
+    def own_cgroup(self) -> str | None:
+        """This process's own cgroup v2 path, where the cells it starts are charged, hidden processes and all; None on
+        a v1 or hybrid host or when it cannot be read. Held to tell which processes it counts, never recorded (it
+        names a job)."""
+        ...
+
+    def cgroup_anon(self, path: str) -> int | None:
+        """The `anon` bytes of the `memory.stat` of the cgroup at `path` (v2: every process in it and below); None when
+        it cannot be read."""
+        ...
+
+    def hidden_children(self, pid: int, start: str) -> list[int] | None:
+        """The children of the process that started at `start` that `/proc` does not show as this uid's while they
+        exist (`procs.hidden_children`); [] when the process is gone or another holds its pid, None when its
+        children cannot be read while it lives."""
+        ...
+
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         """Facts of the node for a record: its kernel and the version of `apptainer` (the command words). No name
         and no address."""
@@ -171,6 +188,53 @@ def _start_of(pid: int) -> str | None:
     except OSError:
         return None
     return None if parsed is None else parsed[3]
+
+
+def _children(pid: int) -> set[int] | None:
+    """Every child of `pid`'s threads (`/proc/<pid>/task/<tid>/children`); empty when the process is gone (or hidden:
+    its own parent's children name it then), None when a living thread's children cannot be read."""
+    tasks = PROC / str(pid) / "task"
+    try:
+        tids = os.listdir(tasks)
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    found: set[int] = set()
+    for tid in tids:
+        try:
+            listed = P.parse_children(_read(tasks / tid / "children"))
+        except FileNotFoundError:
+            if (tasks / tid).exists():  # a living thread without the file: the kernel does not keep it
+                return None
+            continue  # the thread ended between the listing and the read
+        except OSError:
+            return None
+        if listed is None:
+            return None
+        found |= listed
+    return found
+
+
+def _shown_ours(pid: int) -> bool:
+    """Whether `/proc` shows `pid` as a process of this uid (a non-dumpable one's entry is root's, or missing)."""
+    try:
+        return (PROC / str(pid)).stat().st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def _exists(pid: int) -> bool | None:
+    """Whether a process holds `pid`, whatever `/proc` shows of it; None when that cannot be told."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
 
 
 class LocalNode:
@@ -277,15 +341,19 @@ class LocalNode:
             except OSError:
                 pidns = None
             cmdline = environ = b""
+            cgroup = None
             with contextlib.suppress(OSError):
                 cmdline = (base / "cmdline").read_bytes()
             with contextlib.suppress(OSError):
                 environ = (base / "environ").read_bytes()
+            with contextlib.suppress(OSError):
+                cgroup = P.cgroup_path(_read(base / "cgroup"))
             found.append(
                 P.Proc(
-                    int(name), start, ppid, state, comm, pidns, P.parse_rss(status), P.tags_in(cmdline, environ, tags)
+                    int(name), start, ppid, state, comm, pidns, P.parse_rss(status), P.tags_in(cmdline, environ, tags),
+                    P.parse_anon(status), cgroup,
                 )
-            )
+            )  # fmt: skip
         return found
 
     def signal(self, pid: int, start: str, sig: int) -> bool | None:
@@ -371,6 +439,24 @@ class LocalNode:
             return {"depth": depth, "max_bytes": int(limit) if limit.isdigit() else None, "events": events,
                     "peak_bytes": peak}  # fmt: skip
         return None
+
+    def own_cgroup(self) -> str | None:
+        try:
+            return P.cgroup_path(_read(PROC / "self" / "cgroup"))
+        except OSError:
+            return None
+
+    def cgroup_anon(self, path: str) -> int | None:
+        parts = [p for p in path.split("/") if p]
+        try:
+            return P.stat_value(_read(CGROUP_ROOT.joinpath(*parts) / "memory.stat"), "anon")
+        except OSError:
+            return None
+
+    def hidden_children(self, pid: int, start: str) -> list[int] | None:
+        if _start_of(pid) != start:  # gone, hidden itself (its parent's children name it), or another process now
+            return []
+        return P.hidden_children(lambda: _children(pid), _shown_ours, _exists)
 
     def node_facts(self, apptainer: Sequence[str]) -> dict[str, Any]:
         done = self.apptainer([*apptainer, "--version"], VERSION_S)

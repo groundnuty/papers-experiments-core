@@ -47,6 +47,35 @@ def test_a_spawned_helper_is_alive_listed_with_its_tag_and_in_this_namespace(chi
     assert found[process.pid].pidns == node.own_pidns()
 
 
+def test_o56_a_listed_process_has_its_anonymous_memory_and_its_cgroup(child):
+    """O56: the hidden-memory check subtracts each process's RssAnon alone, and only of those in the driver's cgroup."""
+    node, process = child
+    found = {p.pid: p for p in node.processes()}
+    assert found[process.pid].anon is not None
+    assert found[process.pid].anon <= found[process.pid].rss
+    own = node.own_cgroup()
+    if own is not None:  # a cgroup v2 host: the helper was started in the driver's own cgroup
+        assert found[process.pid].cgroup == own
+
+
+def test_o56_a_visible_child_is_never_a_hidden_one(child):
+    """O56: this process's helper is its child and /proc shows it: no hidden child; a gone process has none."""
+    node, _process = child
+    me = node.identity()
+    assert node.hidden_children(me.pid, me.start) == []
+    assert node.hidden_children(me.pid, str(int(me.start) + 1)) == []
+
+
+def test_o56_the_cgroup_s_anonymous_memory_is_read_from_its_memory_stat_or_is_unknown(tmp_path, monkeypatch):
+    from expcore_onedata.sandbox.apptainer import node as N
+
+    (tmp_path / "job" / "step").mkdir(parents=True)
+    (tmp_path / "job" / "step" / "memory.stat").write_text("anon 536870912\nfile 0\n")
+    monkeypatch.setattr(N, "CGROUP_ROOT", tmp_path)
+    assert LocalNode().cgroup_anon("/job/step") == 536870912
+    assert LocalNode().cgroup_anon("/job/other") is None
+
+
 def test_a_signal_reaches_only_the_process_that_started_when_it_was_named(child):
     """O56: a pid with another start time is another process: never signalled."""
     node, process = child

@@ -50,6 +50,12 @@ GONE_POLL_S = 0.2
 APPTAINER_FAILED = (
     "apptainer could not run the cell's container (exit {rc}, its own FATAL line on stderr): its program did not run"
 )
+EXEC = "apptainer exec"  # the exec a completion cause names on this backend (`completion.Completion.runner`)
+HIDDEN_BASIS = (
+    "the harness's watch killed the run's processes: the cgroup charged {amount} bytes more anonymous memory during "
+    "the cell than any process /proc shows explains, past the margin of {limit}, and memory the watch cannot see is "
+    "taken as past the limit"
+)
 
 
 class _RunProcesses:
@@ -198,7 +204,7 @@ class AppCellRunner(CellRunner):
         if not timeout_s >= 1:
             raise ValueError("timeout_s must be at least 1 second (GNU timeout treats 0 as no limit)")
         entered = time.monotonic()
-        completion = Completion.for_source(code)
+        completion = Completion.for_source(code, runner=EXEC)
         self._before_exec()  # the image is still the one pinned (O13)
         cgroup_before = self.node.cgroup_memory() if record else None
         remaining = timeout_s - (time.monotonic() - entered)
@@ -210,7 +216,7 @@ class AppCellRunner(CellRunner):
         with self.meta_lock:
             self._deadline = None
         timer = CellTimer(remaining, lambda: self._kill_at_the_cap(cell))
-        self.watch.begin_cell(cell, completion.nonce)
+        self.watch.begin_cell(cell, completion.nonce, calibration=not record)  # the start's cells: the harness's code
         fired = timer_ended = watch_ended = False
         try:
             if record:
@@ -237,8 +243,7 @@ class AppCellRunner(CellRunner):
             res.kill = self._cause(fired, gave_up, watched, cgroup_before, timeout_s)
             incomplete = None
             if check.cause is not None and not gave_up and not fired:
-                said = check.cause.replace("docker exec", "apptainer exec")  # the shared check's words, this exec's
-                incomplete = APPTAINER_FAILED.format(rc=rc) if AV.apptainer_failed(rc, err) else said
+                incomplete = APPTAINER_FAILED.format(rc=rc) if AV.apptainer_failed(rc, err) else check.cause
             if record:
                 self._record_cell(res, cell, deadline, watched, left, incomplete, gave_up)
                 res.bound = bound if res.timed_out else None
@@ -271,7 +276,9 @@ class AppCellRunner(CellRunner):
             first = kills[0]
             reason = first["reason"]
             basis = (
-                f"the harness's watch killed the run's processes: {first['what']} at {first['amount']}, over its "
+                HIDDEN_BASIS.format(amount=first["amount"], limit=first["limit"])
+                if first["what"] == "memory_hidden"
+                else f"the harness's watch killed the run's processes: {first['what']} at {first['amount']}, over its "
                 f"limit of {first['limit']}"
             )
             return {"reason": reason, "category": KC.CATEGORY[reason], "basis": basis, "watch_kills": kills,
@@ -300,7 +307,7 @@ class AppCellRunner(CellRunner):
             "exit_code": res.exit_code,
             "duration_s": res.duration_s,
             "exec_check": res.exec_check,
-            "watched": {"seen": watched["seen"], "peak_bytes": watched["peak_bytes"]},
+            "watched": {"seen": watched["seen"], "peak_bytes": watched["peak_bytes"], "memory": watched["memory"]},
             "left_after_exec": left,
         }
         if res.kill:
