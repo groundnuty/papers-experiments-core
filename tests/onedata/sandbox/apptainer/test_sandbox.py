@@ -110,6 +110,62 @@ def test_a_cell_with_no_completion_record_raises_the_exit_not_recorded(node, set
         box.stop()
 
 
+def test_o56_guard_a_completion_cause_through_the_sandbox_names_apptainer_exec(node, settings):
+    """O56 (a guard, not the fix's test): through the sandbox, the cause of an exec with no record names `apptainer
+    exec`, never `docker exec`. This held before the fix, when the cell runner rewrote the shared check's words with a
+    `.replace`, and it must keep holding now the check names the runner itself; it pins the end-to-end text. The fix
+    is tested in `test_exec_completion.py` (`Completion.runner`), which fails without it. The fake node's
+    `Unrecorded(137)` does not reproduce the text the HPC probe's C5 read as `docker exec`: that text's source is not
+    reproduced here."""
+    box = start(node, settings)
+    try:
+        node.cell_handler = lambda cell: Unrecorded(137, "", "")
+        with pytest.raises(completion.ExecIncomplete) as raised:
+            box.exec("print('x')", 30)
+        assert "apptainer exec reported exit 137" in raised.value.cause
+        assert "docker" not in raised.value.cause
+    finally:
+        box.stop()
+
+
+def test_o56_a_cell_has_no_name_server_and_the_record_says_dns_none(node, settings):
+    """O56: every cell binds a resolv.conf naming no server and an nsswitch.conf whose hosts are files alone, read-only,
+    so the C library resolves the names of /etc/hosts and no other; every run records `dns: none`."""
+    box = start(node, settings)
+    try:
+        box.exec("print(1)", 30)
+        binds = node.execs[-1].binds
+        for target, text in ((AV.RESOLV_CONF, AV.RESOLV_TEXT), (AV.NSSWITCH_CONF, AV.NSSWITCH_TEXT)):
+            source, writable = binds[target]
+            assert not writable
+            assert Path(source).read_text(encoding="utf-8") == text
+        resolv = [line.split() for line in AV.RESOLV_TEXT.splitlines() if line and not line.startswith("#")]
+        assert not any(words[0] == "nameserver" for words in resolv)
+        assert "hosts: files\n" in AV.NSSWITCH_TEXT
+        facts = box.metadata()["infrastructure_facts"]
+        assert facts["dns"] == "none"
+        assert "dns_none" in facts["facts"]
+        assert "hidden_memory" in facts["facts"]
+    finally:
+        box.stop()
+
+
+def test_o56_a_normal_run_s_memory_reading_is_within_in_its_infrastructure_facts(node, settings):
+    """O56: a run whose cgroup holds what its visible processes hold reads `within`, with its figures, in the
+    metadata's infrastructure facts and in the source of the `process_visibility` instrument."""
+    box = start(node, settings)
+    try:
+        box.exec("print(1)", 30)
+        memory = box.metadata()["infrastructure_facts"]["memory"]
+        assert (memory["reading"], memory["unknown"]) == ("within", [])
+        assert memory["margin_bytes"] == settings.apptainer.hidden_memory_margin_bytes
+        assert memory["start_unexplained_bytes"] == 0
+        seen = box.process_visibility()
+        assert (seen["memory"], seen["hidden_process"], seen["hidden_memory"]) == ("within", 0, 0)
+    finally:
+        box.stop()
+
+
 def test_a_cell_apptainer_could_not_start_raises_naming_apptainer(node, settings):
     """O56: apptainer's own FATAL exit is never a cell's exit: the exec raises, saying its program did not run."""
     box = start(node, settings)
