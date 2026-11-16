@@ -22,6 +22,7 @@ placement = { holder = "pine" }  # each entry's holder is its data provider; a p
 [[spaces]]
 label = "alpha-data"
 name = "alpha-data"
+data_manifest = "@data_manifest.alpha-data@"   # C06: its data, checked at up
 id = "@space_id.alpha-data@"
 prefixes = ["alpha-"]
 providers = ["pine", "birch", "cedar"]
@@ -32,6 +33,7 @@ import = { readonly = true, shared = true }
 [[spaces]]
 label = "beta-data"
 name = "beta-data"
+data_manifest = "@data_manifest.beta-data@"   # C06: its data, checked at up
 id = "@space_id.beta-data@"
 prefixes = ["beta-"]
 providers = ["pine", "birch", "cedar"]
@@ -42,6 +44,7 @@ import = { readonly = true, shared = true }
 [[spaces]]
 label = "alpha-work"
 name = "alpha-work"
+data_manifest = "@data_manifest.alpha-work@"   # C06: its data, checked at up
 id = "@space_id.alpha-work@"
 prefixes = ["alpha-"]
 providers = ["pine", "birch", "cedar"]

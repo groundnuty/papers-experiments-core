@@ -37,7 +37,7 @@ from urllib.parse import quote
 
 import pytest
 import shard_support
-from hpc_fed_support import HPC, LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path
+from hpc_fed_support import HPC, LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path
 from study_support import HEAD
 from tls_support import make_federation_ca
 
@@ -48,7 +48,8 @@ REPO = HPC.parents[1]
 SUPPORT = Path(__file__).resolve().parent
 SHARDS_SCRIPT = HPC / "shards.py"
 LABELS = ("fed-a", "fed-b")  # one shard per federation, in the manifest's order
-JOBS = {"fed-a": ("4242", "4343"), "fed-b": ("5252", "5353")}  # each fake cluster's held job (and a second's) ids
+# each fake cluster's held job (and a second's) ids
+JOBS = {"fed-a": ("4242", "4343"), "fed-b": ("5252", "5353"), "fed-c": ("6262", "6363")}
 PLUGIN = "hpc_plugin.py"
 PLUGIN_SETTINGS = "hpc_rehearsal.json"
 SNAPSHOT_EVERY_S = 3600  # the manifest's: no clock snapshot within the rehearsal, so only a run's end takes one
@@ -103,6 +104,8 @@ class Federation:
     printed: dict[str, str] = field(default_factory=dict)
     codes: dict[str, int] = field(default_factory=dict)
     pairs: list = field(default_factory=list)
+    data: Any = field(default_factory=data_stand_in)  # what each space holds, read back (`hpcboot.core_phase`)
+    sif: bytes = b"an invented SIF image\n"  # the agent's image this federation's site declares
 
     def __post_init__(self) -> None:
         self.root = self.base / "fed" / "root"
@@ -114,7 +117,7 @@ class Federation:
         for name in ("onezone.tar", "oneprovider.tar"):
             (self.base / "images" / name).write_bytes(b"tar")
             (self.base / "images" / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
-        self.agent = agent_site(self.base / "agent", work_root=self.work_root)  # the SIF and the shim, pinned
+        self.agent = agent_site(self.base / "agent", sif=self.sif, work_root=self.work_root)  # pinned files
 
     @property
     def work_root(self) -> Path:
@@ -183,6 +186,7 @@ def driver_maker(deploy: Deploy, fed: Federation) -> Any:
             bootstrap=BootStandIn(fed.label),
             steps=lambda b: None,
             content=lambda b: SimpleNamespace(reset=lambda timeout: None),
+            data=fed.data,
         )
         return driver
 
@@ -228,7 +232,7 @@ def make_study(base: Path, oneclient: Mapping[str, str], control: Path) -> Path:
 
 def write_manifest(path: Path, study: Path, results: Path, tmpfs: Path, feds: Mapping[str, Federation]) -> Path:
     """shards.toml, as an operator writes it: the study, the core's interpreter and source, where results come back,
-    the node's tmpfs, and one shard per federation by the root its `up` wrote."""
+    the node's tmpfs, and one shard per federation by the root its `up` wrote, in `feds`' order."""
     lines = [
         f'study = "{study}"',
         f'python = "{sys.executable}"',
@@ -240,8 +244,8 @@ def write_manifest(path: Path, study: Path, results: Path, tmpfs: Path, feds: Ma
         'memory = "4g"',
         f"snapshot_every_s = {SNAPSHOT_EVERY_S}",
     ]
-    for label in LABELS:
-        lines += ["[[shards]]", f'label = "{label}"', f'root = "{feds[label].root}"']
+    for label, fed in feds.items():
+        lines += ["[[shards]]", f'label = "{label}"', f'root = "{fed.root}"']
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 

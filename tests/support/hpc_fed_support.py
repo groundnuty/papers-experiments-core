@@ -26,7 +26,8 @@ import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 import pytest
 
@@ -75,6 +76,47 @@ def agent_site(directory: Path, sif: bytes = b"an invented SIF image\n", shim: b
         "HPC_EGRESS_SHIM_SHA256": hashlib.sha256(shim).hexdigest(),
         "HPC_AGENT_WORK_ROOT": str(work_root or directory / "agent-work"),
     }
+
+
+def data_stand_in(differ: str | None = None) -> Any:
+    """`hpcboot.core_phase`'s `data`: each space's data read back as a live federation holds it once up wrote its
+    baseline (`fedcontent.Content.reset`, which reads every file back itself): the baseline plan's files. With `differ`,
+    one file of that space has one byte other, as a federation whose data is not its declared manifest's."""
+    from fedlayout import baseline_plan
+
+    def reader(boot: Any) -> Any:
+        plan = baseline_plan(boot.layout.spec)
+
+        def read(space: str) -> Any:
+            files = {f.path: (f.size, hashlib.sha256(f.content()).hexdigest()) for f in plan[space]}
+            if space == differ and files:
+                first = sorted(files)[0]
+                files[first] = (files[first][0], hashlib.sha256(b"one byte other").hexdigest())
+            dirs = {str(d) for f in plan[space] for d in PurePosixPath(f.path).parents if str(d) != "."}
+            return files, dirs
+
+        return read
+
+    return reader
+
+
+def manifest_values(root: Path, layout: Path = LAYOUT) -> dict:
+    """The `@data_manifest.<space>@` placeholders of a layout's template, each a manifest of the space's baseline
+    written into `root` as `up` writes it (an imported space's too: a stand-in for the layout's own manifest)."""
+    import fedspec
+    import hpcdata
+    from fedlayout import baseline_plan
+
+    from expcore_onedata.importmanifest import write_manifest
+
+    spec = fedspec.load_spec(layout)
+    plan, directory = baseline_plan(spec), root / "data-manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    found = {}
+    for space in spec.spaces:
+        found[space.name] = directory / f"{space.name}.json"
+        write_manifest(hpcdata.baseline_manifest(plan.get(space.name, ())), found[space.name])
+    return hpcdata.values(found)
 
 
 def pin_values(directory: Path) -> dict:

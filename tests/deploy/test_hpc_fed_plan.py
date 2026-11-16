@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, FakeProcess, FakeSlurm, hpc_on_path, parse_srun, pin_values
+from hpc_fed_support import LAYOUT, FakeProcess, FakeSlurm, hpc_on_path, manifest_values, parse_srun, pin_values
 
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import FaultSettings, restore_token_margin_s
@@ -138,6 +138,7 @@ def rendered_pilot(hpc, root: Path, make_ca) -> Path:
     values = {
         **hpc.boot.hpc_values(command, settings.stop_bound_s, settings.settle_timeout_s, root),
         **pin_values(root / "agent"),
+        **manifest_values(root),
     }
     hpc.boot.write_platform(root / "platform.toml", spec.platform_template.read_text(encoding="utf-8"), facts, values)
     return root / "platform.toml"

@@ -28,6 +28,13 @@ declares the Apptainer sandbox, `step` makes its `work_root` (mode 0700) before 
 not start without; it refuses one that is a link, not this user's, open to others, or not under `--tmpfs` (the node's
 tmpfs: never the shared filesystem).
 
+**One campaign across federations (C06).** A space is the same experimental condition across federations only when
+its declared identity and its data identity match, and the campaign fingerprint holds a space's data identity only when
+its federation's `platform.toml` declares it (`data_manifest`, which `up` renders and checks): otherwise it holds the
+space's Onezone id, which every federation's `up` makes anew, and the shards never merge. So `plan` and `lines` refuse
+a manifest of more than one federation whose platform files leave a space's data undeclared, naming each shard and
+space, before anything runs.
+
 **The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
 holds a record of its step (`step.json`: its pid and start time, its shard and its federation's root). A step killed
 outright leaves its directory; `--resume` removes each earlier one of its shard whose step is shown gone (by pid and
@@ -115,6 +122,7 @@ import tomllib
 FORMAT = "expcore-hpc-shard/1"
 STATE_FORMAT = "expcore-hpc-federation/1"
 STATE_FILE = "hpc-federation.json"
+LINKED = "linked"  # the state's phase once up has finished: every space's data checked, every link
 PLACEMENTS = ("het", "separate")  # the sandbox record's placements: a het component, or a held job of its own
 LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuses a shard without it
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
@@ -225,6 +233,8 @@ def federation(shard: Shard) -> dict[str, Any]:
     job, name = allocation.get("job"), allocation.get("name")
     if not (_job_id(job) and isinstance(name, str) and name):
         raise ShardsError(f"shard {shard.label}: its federation has no held job on record")
+    if state.get("phase") != LINKED:  # an up that failed (its data check, its link check) left a federation not ready
+        raise ShardsError(f"shard {shard.label}: its federation's up has not finished (phase {state.get('phase')})")
     record = state.get("sandbox")
     placement, group = "allocation", None
     if record is not None:
@@ -249,6 +259,28 @@ def federation(shard: Shard) -> dict[str, Any]:
     if shard.node and node != shard.node:
         raise ShardsError(f"shard {shard.label}: the manifest's sandbox_node is not the one its state file names")
     return {"job": job, "name": name, "node": node, "placement": placement, "het_group": group}
+
+
+def undeclared_data(plan: Plan) -> list[str]:
+    """For a campaign on more than one federation, each shard whose federation's `platform.toml` leaves a space's data
+    undeclared (`data_manifest`, C06), as `<label>: <space>, ...`; empty on one federation, or when every space of every
+    federation declares it. A space is one experimental condition across federations only by its data identity, so
+    such shards would never merge: refused before anything runs, never found at the merge after the spend."""
+    if len({shard.root for shard in plan.shards}) < 2:
+        return []
+    found = []
+    for shard in plan.shards:
+        try:
+            data = tomllib.loads((shard.root / PLATFORM).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            found.append(f"{shard.label}: its federation's {PLATFORM} could not be read")
+            continue
+        entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+        missing = [str(e.get("name")) if isinstance(e, Mapping) else "[space]" for e in entries
+                   if not (isinstance(e, Mapping) and e.get("data_manifest"))]  # fmt: skip
+        if missing:
+            found.append(f"{shard.label}: {', '.join(missing)}")
+    return found
 
 
 def _job_id(job: Any) -> bool:
@@ -881,6 +913,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             line = merge_argv(plan, collect(plan, args.into))
             print(shlex.join(line))
             return subprocess.run(line, check=False).returncode if args.run else 0
+        missing = undeclared_data(plan)
+        if missing:
+            raise ShardsError(
+                f"a campaign on {len(plan.shards)} federations is one only where each declares every space's data "
+                f"(data_manifest in its platform.toml, C06); undeclared: {'; '.join(missing)}"
+            )
         script = Path(__file__).resolve()
         for shard in plan.shards:
             fed = federation(shard)

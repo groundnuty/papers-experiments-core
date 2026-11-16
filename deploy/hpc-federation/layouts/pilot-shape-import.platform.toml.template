@@ -29,6 +29,7 @@ margin_s = @hpc_token_margin_s@
 [[spaces]]
 label = "alpha"
 name = "alpha-space"
+data_manifest = "@data_manifest.alpha-space@"   # C06: its data, checked at up
 id = "@space_id.alpha-space@"
 prefixes = ["alpha-"]
 providers = ["larch", "aspen", "rowan"]
@@ -39,6 +40,7 @@ import = { readonly = true, shared = true }
 [[spaces]]
 label = "beta"
 name = "beta-space"
+data_manifest = "@data_manifest.beta-space@"   # C06: its data, checked at up
 id = "@space_id.beta-space@"
 prefixes = ["beta-"]
 providers = ["rowan", "aspen"]
@@ -49,6 +51,7 @@ import = { readonly = true, shared = true }
 [[spaces]]
 label = "gamma"
 name = "gamma-space"
+data_manifest = "@data_manifest.gamma-space@"   # C06: its data, checked at up
 id = "@space_id.gamma-space@"
 prefixes = ["gamma-"]
 providers = ["alder", "aspen"]
@@ -59,6 +62,7 @@ import = { readonly = true, shared = true }
 [[spaces]]
 label = "delta"
 name = "delta-space"
+data_manifest = "@data_manifest.delta-space@"   # C06: its data, checked at up
 id = "@space_id.delta-space@"
 prefixes = ["delta-"]
 providers = ["hazel", "aspen"]

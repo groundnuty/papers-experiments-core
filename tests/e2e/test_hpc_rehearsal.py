@@ -27,6 +27,7 @@ import contextlib
 import io
 import json
 import shlex
+import shutil
 import stat
 import subprocess
 from dataclasses import dataclass, field
@@ -57,6 +58,7 @@ from tls_support import HAS_OPENSSL
 
 from expcore.campaign.interrupted_spend import EXPORT_KEY as INTERRUPTED_KEY
 from expcore.campaign.lost_ledger import KEY as LOST_KEY
+from expcore.campaign.resume import read_fingerprint
 from expcore_onedata.config import load_platform
 
 __all__ = ["clean_environment"]  # a fixture the stages below use, imported from the support module
@@ -341,9 +343,79 @@ def test_the_report_shows_the_shards_both_guards_and_the_spend_the_kill_took(mer
     assert "Basis" in lost
 
 
+def collected_fingerprint(plan, label: str) -> dict:
+    return read_fingerprint(plan.results.parent / "collected" / label / "out" / "state.sqlite")
+
+
+def test_c06_both_shards_ran_one_campaign_with_each_spaces_data_identity_and_the_agents_pins(plan, merged):
+    """C06, O63: the two federations' platform files differ (every Onezone id, the work root), yet both shards record
+    one campaign fingerprint: each space by its declared identity and its data's content hash (`data_manifest`, which
+    up rendered and checked), never its id, and the sandbox's pins; so the merge above is evidence, not a default."""
+    one, two = (collected_fingerprint(plan, label) for label in LABELS)
+    assert one == two
+    platform = one["platform"]
+    assert len(platform["spaces"]) == 4
+    assert set(platform["sandbox_backend"]) >= {"image_sha256", "egress_shim_sha256", "egress_collector_sha256"}
+    assert merged.read("export.json")["campaign_fingerprint"]["fingerprint"] == one
+
+
+def test_o63_the_campaign_fingerprint_holds_no_site_value_but_the_declared_pins(plan, merged, federations):
+    """O63: of every value site.env gives either federation, only the two declared SHA-256s reach the fingerprint, under
+    the sandbox's pins; no path (the SIF, the shim, the work root, SH, L, the node's tmpfs), account or partition."""
+    text = json.dumps(collected_fingerprint(plan, KILLED), sort_keys=True)
+    for fed in federations.values():
+        for variable, value in fed.site().items():
+            if variable.endswith("_SHA256"):
+                assert text.count(value) == 1, variable
+            elif variable not in ("HPC_STEP_PATH",):  # "/usr/bin:/bin": no site's own words
+                assert value not in text, variable
+
+
+@pytest.fixture(scope="module")
+def other_build(deploy, plan, shards, merged, federations, shared, tmp_path_factory, clean_environment):
+    """fed-c: a third federation of the same layout and data whose site declares another build of the agent's image;
+    shard 2 of a second manifest run there, beside fed-a's shard 1, and the merge of the two."""
+    fed = Federation("fed-c", tmp_path_factory.mktemp("fed-c"), shared.node_tmp, federations[KILLED].ca_pem,
+                     sif=b"another build of the agent's image\n")  # fmt: skip
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
+        hpcfed(deploy, fed, "up", fed.site())
+    base = shared.base / "other"
+    study = make_study(base / "studies", shared.oneclient, shared.control.path)
+    (base / "results").mkdir()
+    for kind in ("tar", "json"):  # fed-a's shard as it came back, shard 1 of the second manifest too
+        shutil.copyfile(plan.results / f"{KILLED}.out.{kind}", base / "results" / f"{KILLED}.out.{kind}")
+    feds = {KILLED: federations[KILLED], fed.label: fed}
+    manifest = write_manifest(base / "shards.toml", study, base / "results", shared.node_tmp, feds)
+    code, printed = printing(deploy.shards.main, ["plan", "--manifest", str(manifest)])
+    assert code == 0, printed
+    entry = json.loads(printed.splitlines()[1])
+    step = StepLine.parse(entry["shard"], entry["argv"]).start(plan.logs / "fed-c.log")
+    stepped = wait_step(step)
+    collected = printing(deploy.shards.main, ["collect", "--manifest", str(manifest), "--into", str(base / "in")])
+    line = shlex.split(collected[1].splitlines()[0])
+    merge = subprocess.run(line, capture_output=True, text=True, env=clean_environment, check=False)
+    hpcfed(deploy, fed, "down", {})
+    return SimpleNamespace(fed=fed, stepped=stepped, collected=collected[0], merge=merge, study=study)
+
+
+def test_c06_a_shard_on_another_build_of_the_agents_image_is_another_campaign_and_the_merge_refuses(other_build):
+    """C06, O63: the same layout and the same data, another SIF declared (and checked) at up: the step runs, its archive
+    is collected, and the merge refuses it beside fed-a's shard, by the image's pin alone, writing nothing."""
+    assert other_build.stepped == 0
+    assert other_build.collected == 0
+    assert other_build.merge.returncode == 1, other_build.merge.stdout + other_build.merge.stderr
+    said = other_build.merge.stderr
+    assert "shard 2 (fed-c): ran another campaign than shard 1 (fed-a)" in said
+    assert "platform.sandbox_backend.image_sha256" in said
+    assert "platform.spaces" not in said
+    assert not (other_build.study / "out").exists()
+    assert other_build.fed.codes["down"] == 0, other_build.fed.printed["down"]
+
+
 # ------------------------------------------------------------------------------------------------ stage 5: down
 @pytest.fixture(scope="module")
-def downed(deploy, federations, merged) -> dict[str, Federation]:
+def downed(deploy, federations, merged, other_build) -> dict[str, Federation]:
     for fed in federations.values():
         fed.fake.calls.clear()
         hpcfed(deploy, fed, "down", {})

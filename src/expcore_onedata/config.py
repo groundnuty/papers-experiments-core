@@ -280,7 +280,8 @@ class PlatformConfig:
         (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
         An entry that declares its data (`data_manifest`) is there by its declared identity and its data's content hash,
         without its Onezone id: a space is the same experimental condition across federations when its declared
-        identity and its data identity match (C06); one that does not is there with its id, as it always was.
+        identity and its data identity match (C06); one that does not is there with its id, as it always was. The
+        one-space form holds its space's data identity (`space_data`) only when `[space]` declares `data_manifest`.
         The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
         declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly` (and `shared`,
         when true: O59).
@@ -301,8 +302,11 @@ class PlatformConfig:
         out: dict[str, Any] = {"tls": self.tls.record()}
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
-        elif self.spaces[0].imported is not None:  # the one-space form's: only when declared, so the old one stands
-            out["storage_import"] = self.spaces[0].imported.record()
+        else:  # the one-space form's: each only when declared, so the old one stands
+            if self.spaces[0].imported is not None:
+                out["storage_import"] = self.spaces[0].imported.record()
+            if self.spaces[0].data is not None:  # its data identity (C06): two federations agree only on the same data
+                out["space_data"] = self.spaces[0].data
         if self.sandbox is not None:
             out["data_paths"] = self.sandbox.data_path_record()
             if self.sandbox.served_caps_declared:

@@ -28,6 +28,7 @@ from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
+import hpcdata
 import hpcimport
 import tomllib
 from fedboot import Bootstrap
@@ -259,11 +260,13 @@ def core_phase(
     content: Callable[[Bootstrap], Any] = Content,
     links: Callable[[Layout, Dict[str, str]], str] = check_after_up,
     verify: Callable[..., Any] = verify_imports,
+    data: Callable[[Bootstrap], Callable[[str], Any]] = hpcdata.content_reader,
 ) -> str:
-    """Bootstrap the federation, write its baseline, its facts and platform.toml, verify every shared import against
-    its manifest over the rendered file, and run the link check; return what up prints, or raise naming the step that
-    failed. The services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the
-    imports' variables are read (this process's when None): a core step's own is an allowlist that carries none."""
+    """Bootstrap the federation, write its baseline, each space's data manifest, its facts and platform.toml, verify
+    every shared import against its manifest over the rendered file and every other space's data against its own (read
+    back through `data`, O63), and run the link check; return what up prints, or raise naming the step that failed. The
+    services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the imports'
+    variables are read (this process's when None): a core step's own is an allowlist that carries none."""
     passphrase = layout.passphrase(layout.spec.zone.name)
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")
@@ -274,14 +277,17 @@ def core_phase(
         steps(boot)
         if not layout.facts.exists():
             content(boot).reset(TRANSFER_TIMEOUT_S)
-        filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env)}
+        manifests = hpcdata.data_manifests(layout, env)
+        filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env),
+                  **hpcdata.values(manifests)}  # fmt: skip
         written = write_facts(layout, boot, filled)
         # before the link check, so a platform file that leaves the sharing out fails up with no link record written
         verify(layout, env, timeout_s=VERIFY_TIMEOUT_S)
+        held = hpcdata.check(layout, manifests, data(boot))  # no space is ready on a claim: its data is read back
         checked = links(layout, dict(boot.ids.spaces))
     finally:
         client.close()
-    return f"{written}\n{checked}"
+    return f"{written}\n{held}\n{checked}"
 
 
 def load_owner(text: str) -> Optional[Tuple[int, int]]:

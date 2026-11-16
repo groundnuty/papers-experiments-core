@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, hpc_on_path, pin_values
+from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path, pin_values
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
 from expcore_onedata.linksettings import link_pairs
@@ -396,6 +396,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
         bootstrap=lambda rest, layout, owner: SimpleNamespace(layout=layout, ids=ids, spec=layout.spec),
         steps=lambda boot: None,
         content=lambda boot: SimpleNamespace(reset=lambda timeout: None),
+        data=data_stand_in(),
     )  # fmt: skip
     assert len(seen[0]) == 10
     record = json.loads((root / "link-check.json").read_text(encoding="utf-8"))

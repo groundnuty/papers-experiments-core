@@ -9,7 +9,16 @@ import os
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import LAYOUT, PILOT_TEMPLATE, SITE, FakeSlurm, agent_site, hpc_on_path, services_only
+from hpc_fed_support import (
+    LAYOUT,
+    PILOT_TEMPLATE,
+    SITE,
+    FakeSlurm,
+    agent_site,
+    hpc_on_path,
+    manifest_values,
+    services_only,
+)
 
 from expcore_onedata.config import load_platform
 
@@ -87,7 +96,7 @@ def render(hpc, pins, root: Path, site: dict, ca: bytes) -> Path:
     values = hpc.boot.hpc_values(
         ["/venv/python", "/repo/hpcfed.py"], settings.stop_bound_s, settings.settle_timeout_s, root
     )
-    values |= pins.values(hpc.settings.site_from_environment(site))
+    values |= pins.values(hpc.settings.site_from_environment(site)) | manifest_values(root)
     hpc.boot.write_platform(root / "platform.toml", PILOT_TEMPLATE.read_text(encoding="utf-8"), facts, values)
     return root / "platform.toml"
 

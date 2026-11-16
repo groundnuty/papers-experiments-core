@@ -298,6 +298,7 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   is the bundle's own, hashed from this checkout. The rendered file's pins are in the campaign fingerprint
   (`sandbox_backend`), no path is. Every path `up` renders into the root is absolute (`@hpc_root@`), so a copy of the
   file (the one a shard step places beside a study) reads the root's secrets, CA and journal.
+- **The data each space holds** (C06, O63): every template's `[[spaces]]` entry names its `data_manifest`. A shared import's is the manifest its layout names; every other space's is written by `up` into `<root>/data-manifests/` from its baseline, the same for every federation of a layout. Before the link check `up` reads every space back through its owner (directories, sizes, bytes; a shared import by `verify_imports`) and fails, naming the space, when it is not exactly its manifest. So shards on two federations of one layout record one campaign fingerprint (each space by its declared identity and its data, never its Onezone id), and `shards.py plan` refuses federations whose platform files leave a space's data undeclared.
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each

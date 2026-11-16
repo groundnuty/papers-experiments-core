@@ -195,9 +195,13 @@ class HpcExecutor:
 
 
 def build(context: StudyContext) -> StudyPlugin:
-    """The example's plugin with this executor, its scorer, hashes and hooks unchanged.
-
-    It declares no platform half of the campaign fingerprint yet: `PlatformConfig.fingerprint()` holds each space's
-    Onezone id, which every federation's `up` makes anew, so two shards on two federations would be two campaigns.
-    The fix of the space digest (its own pull request) lets the plugin declare it."""
-    return dataclasses.replace(example_build(context), executor=HpcExecutor(context))
+    """The example's plugin with this executor, its scorer, hashes and hooks unchanged; in a shard step, with the
+    platform's half of the campaign fingerprint (`PlatformConfig.fingerprint`): the Apptainer sandbox's pins, and each
+    space by its declared identity and its data's content hash (`data_manifest`, which `up` rendered and checked), so
+    two federations holding the same data are one campaign, and another image or another file of data is another. On
+    the login node (`check`, `analyze`, `report`) the study has no platform file and no run is made: none is read."""
+    executor = HpcExecutor(context)
+    plugin = dataclasses.replace(example_build(context), executor=executor)
+    if not PLATFORM.is_file():
+        return plugin
+    return dataclasses.replace(plugin, platform=executor.sandboxes.config().fingerprint())
