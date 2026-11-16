@@ -159,6 +159,18 @@ def test_R13_only_run_records_are_re_scored_a_check_and_a_manifest_are_left_alon
         assert after[name] == before[name]
 
 
+def test_R13_a_record_is_re_scored_only_under_the_name_the_core_writes_it_under(corpus):
+    """R04 and R13: a record is known by its name, as the replay check knows it, so the bytes of one under another name
+    (a study's copy, evidence beside it) are left alone and nothing is written under its record name."""
+    stray = dataclasses.replace(SCENARIOS["tools"][0](), run_key="run-elsewhere")
+    (corpus / "evidence.json").write_text(stray.dumps(), encoding="utf-8")
+    before = written_files(corpus)
+    written = rescore_files(corpus, [TurnCount()])
+    assert sorted(p.name for p in written) == sorted(n for n in before if n != "evidence.json")
+    assert written_files(corpus)["evidence.json"] == before["evidence.json"]
+    assert stray.filename not in written_files(corpus)
+
+
 def test_R13_a_file_named_like_a_record_that_is_not_one_stops_the_run(corpus):
     """R13: a corrupt record or one without the marker is an error, not a file to skip."""
     name = "a" * 64 + ".1.json"

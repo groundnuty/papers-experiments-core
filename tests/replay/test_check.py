@@ -18,9 +18,11 @@ from expcore.replay.archive import ARCHIVE_GLOB, archive_batch, archived_records
 from expcore.replay.check import (
     CHECK_FILE,
     CHECK_SCHEMA,
+    UNEXPECTED_STAGE,
     BatchNotVerified,
     HashedOnlyRecord,
     RecomputeHook,
+    batch_files,
     check_record,
     input_hashes,
     inputs_sha256,
@@ -28,12 +30,17 @@ from expcore.replay.check import (
     main,
     require_current_check,
     verify_batch,
+    what_records_need,
     write_check,
 )
 from expcore.replay.divergence import ReplayDivergence
 
 NAMES = ("tools", "malformed", "infra_turn_three", "tool_crash")
-REFUSAL_FIXTURE = Path(__file__).parent.parent / "data" / "record-v3" / "04-instrument-refusal.json"
+DATA = Path(__file__).parent.parent / "data"
+REFUSAL_FIXTURE = DATA / "record-v3" / "04-instrument-refusal.json"
+# Files named as records whose bytes are no good record: a record is known by its name, so these are replayed and fail.
+GARBAGE = "a" * 64 + ".1.json"
+REFORMATTED = "b" * 64 + ".1.json"
 
 
 @pytest.fixture
@@ -213,13 +220,14 @@ def test_a_check_file_that_is_not_json_is_refused_not_crashed_on(checked):
 
 
 def test_the_stages_a_record_can_fail_at_are_load_roundtrip_and_replay(batch):
-    """A file that is not a record fails at load; bytes that load but do not write back fail at roundtrip."""
-    (batch / "garbage.json").write_text("not json", encoding="utf-8")
+    """A file named as a record that is not one fails at load; bytes that load but do not write back fail at
+    roundtrip."""
+    (batch / GARBAGE).write_text("not json", encoding="utf-8")
     other = first_record(batch)
     data = json.loads(other.read_text(encoding="utf-8"))
-    (batch / "reformatted.json").write_text(json.dumps(data, indent=4), encoding="utf-8")
+    (batch / REFORMATTED).write_text(json.dumps(data, indent=4), encoding="utf-8")
     stages = {f["file"]: f["stage"] for f in verify_batch(batch, code=CODE)["failures"]}
-    assert stages == {"garbage.json": "load", "reformatted.json": "roundtrip"}
+    assert stages == {GARBAGE: "load", REFORMATTED: "roundtrip"}
 
 
 def test_R04_check_record_reports_the_stage_and_a_message_that_names_the_path(batch):
@@ -235,7 +243,7 @@ def test_R04_check_record_reports_the_stage_and_a_message_that_names_the_path(ba
 
 def test_a_failure_message_never_holds_a_secret_from_the_environment(batch, monkeypatch):
     monkeypatch.setenv("SOME_API_KEY", "sk-test-0123456789abcdefghij")
-    (batch / "bad.json").write_text('{"schema_version": "sk-test-0123456789abcdefghij"}', encoding="utf-8")
+    (batch / GARBAGE).write_text('{"schema_version": "sk-test-0123456789abcdefghij"}', encoding="utf-8")
     check = verify_batch(batch, code=CODE)
     assert "sk-test-0123456789abcdefghij" not in json.dumps(check)
 
@@ -246,8 +254,9 @@ def test_a_failure_message_never_holds_a_secret_from_the_environment(batch, monk
 def test_a_file_the_analysis_reads_that_is_not_a_record_is_hashed_not_replayed(batch):
     """A manifest is named by pattern: it is not a record, and a change to it invalidates the check."""
     (batch / "manifest.json").write_text('{"cells": 3}', encoding="utf-8")
-    unnamed = verify_batch(batch, code=CODE)  # without the pattern it is taken for a record, and fails to load
-    assert (unnamed["n_records"], unnamed["n_ok"], unnamed["failures"][0]["stage"]) == (5, 4, "load")
+    unnamed = verify_batch(batch, code=CODE)  # without the pattern it is no record but unexpected, and fails the check
+    assert (unnamed["n_records"], unnamed["n_ok"], unnamed["failures"][0]["stage"]) == (4, 4, UNEXPECTED_STAGE)
+    assert "manifest.json" not in unnamed["inputs"]
     check = verify_batch(batch, code=CODE, hashed_only=["manifest.json"])
     assert (check["n_records"], check["n_ok"], check["hashed_only"]) == (4, 4, ["manifest.json"])
     write_check(batch, check)
@@ -300,12 +309,12 @@ def test_R04_a_record_is_taken_for_one_by_its_name_or_by_its_schema_marker(tmp_p
 
 def test_R04_the_check_lists_the_records_it_replayed_and_not_the_ones_that_failed_or_were_hashed_only(batch):
     (batch / "manifest.json").write_text('{"cells": 3}', encoding="utf-8")
-    (batch / "garbage.json").write_text("nope", encoding="utf-8")
+    (batch / GARBAGE).write_text("nope", encoding="utf-8")
     check = verify_batch(batch, code=CODE, hashed_only=["manifest.json"])
-    assert [f["file"] for f in check["failures"]] == ["garbage.json"]
-    assert "garbage.json" not in check["replayed"]
+    assert [f["file"] for f in check["failures"]] == [GARBAGE]
+    assert GARBAGE not in check["replayed"]
     assert "manifest.json" not in check["replayed"]
-    assert sorted(check["replayed"]) == sorted(set(check["inputs"]) - {"manifest.json", "garbage.json"})
+    assert sorted(check["replayed"]) == sorted(set(check["inputs"]) - {"manifest.json", GARBAGE})
 
 
 def test_R04_a_stored_check_that_calls_a_record_hashed_only_is_refused_whoever_made_it(checked):
@@ -335,6 +344,113 @@ def test_hidden_files_and_the_check_itself_are_not_inputs(checked):
     (checked / ".record.json.partial.tmp").write_text("x", encoding="utf-8")
     assert CHECK_FILE not in input_hashes(checked)
     assert require_current_check(checked, code=CODE)
+    assert batch_files(checked).unexpected == []
+
+
+# --- R04: a record is known by its name, and every other file is accounted for ------------------------------------
+
+
+def unexpected_of(check):
+    return [f["file"] for f in check["failures"] if f["stage"] == UNEXPECTED_STAGE]
+
+
+def test_R04_a_json_file_not_named_as_a_record_is_never_read_as_one_and_fails_the_check_as_unexpected(batch):
+    """R04: a study's own evidence beside a record (sandbox metadata, say) is no record: it is not replayed, hashed or
+    counted, and the check fails against its path at stage `unexpected`, never at `load` as a record that is not one."""
+    (batch / "shard-2" / "sandbox.json").write_text('{"backend": "apptainer", "sif": "agent.sif"}', encoding="utf-8")
+    check = verify_batch(batch, code=CODE)
+    assert (check["n_records"], check["n_ok"]) == (4, 4)
+    assert [(f["file"], f["stage"]) for f in check["failures"]] == [("shard-2/sandbox.json", UNEXPECTED_STAGE)]
+    assert "side_files" in check["failures"][0]["error"]  # says how to declare it
+    assert "shard-2/sandbox.json" not in check["inputs"]
+    assert "shard-2/sandbox.json" not in check["replayed"]
+
+
+def test_R04_a_file_of_any_other_kind_in_the_batch_fails_the_check_as_unexpected_wherever_it_lies(batch):
+    """R04: a file the check would not have read before (no `.json` suffix) is no longer passed over in silence."""
+    (batch / "notes.txt").write_text("what the operator saw", encoding="utf-8")
+    (batch / "shard-2" / "evidence").mkdir()
+    (batch / "shard-2" / "evidence" / "mounts.bin").write_bytes(b"\x00\x01")
+    check = verify_batch(batch, code=CODE)
+    assert unexpected_of(check) == ["notes.txt", "shard-2/evidence/mounts.bin"]
+    assert (check["n_records"], check["n_ok"]) == (4, 4)
+
+
+def test_R04_a_record_under_a_name_the_core_never_writes_one_under_is_not_replayed_but_unexpected(batch):
+    """R04: the bytes of a good record copied to another name are not a second record: the core reads a record only
+    under its own name (`<SHA-256 of the run key>.<attempt>.json`)."""
+    (batch / "renamed.json").write_bytes(first_record(batch).read_bytes())
+    check = verify_batch(batch, code=CODE)
+    assert (check["n_records"], check["replayed"].count("renamed.json")) == (4, 0)
+    assert unexpected_of(check) == ["renamed.json"]
+
+
+def test_R04_a_check_that_found_an_unexpected_file_is_refused_naming_it_and_not_as_a_record_that_failed(batch):
+    """R04: the refusal names the file and what to do, and does not count it among the records."""
+    (batch / "sandbox.json").write_text("{}", encoding="utf-8")
+    write_check(batch, verify_batch(batch, code=CODE))
+    error = refused(batch, "found 1 unexpected file in the batch")
+    assert "sandbox.json" in str(error)
+    assert "failed for" not in str(error)
+
+
+def test_R04_an_unexpected_file_added_after_a_passing_check_is_refused_by_the_analysis_and_the_archive(
+    checked, tmp_path
+):
+    """R04 and R08: a file that is not an input changes no input hash, so the batch is walked again for one: a file
+    added after the check is refused whatever its kind, and nothing is archived."""
+    for name in ("sandbox.json", "notes.txt"):
+        stray = checked / "shard-2" / name
+        stray.write_text("{}", encoding="utf-8")
+        refused(checked, f"unexpected file.*shard-2/{name}")
+        with pytest.raises(BatchNotVerified, match="unexpected"):
+            archive_batch(checked, tmp_path / "records.tar.gz", code=CODE)
+        assert not (tmp_path / "records.tar.gz").exists()
+        stray.unlink()
+    assert require_current_check(checked, code=CODE)
+
+
+def test_R04_the_check_file_hidden_files_and_hashed_only_files_are_not_unexpected(batch):
+    """R04: what the core writes beside the records is accounted for: the check itself, a temporary dot-name, and the
+    files the caller's hashed-only patterns name (the campaign's markers and snapshot)."""
+    (batch / "shard-2" / "attempt-marker.json").write_text('{"schema": 3}', encoding="utf-8")
+    (batch / "campaign-snapshot.sqlite").write_bytes(b"SQLite format 3\x00")
+    (batch / "shard-2" / ".attempt-marker.json.123.tmp").write_text("{", encoding="utf-8")
+    check = verify_batch(batch, code=CODE, hashed_only=["*attempt-marker.json", "campaign-snapshot.sqlite"])
+    assert check["failures"] == []
+    write_check(batch, check)
+    assert batch_files(batch, check["hashed_only_patterns"]).unexpected == []
+    assert require_current_check(batch, code=CODE)
+
+
+def test_R04_the_backends_and_kinds_a_batch_needs_are_read_from_its_records_alone(batch):
+    """R04: a stray file that names a backend is no record, so it never makes the check import a study's code."""
+    (batch / "sandbox.json").write_text(json.dumps({"route": {"backend": "stray_backend"}}), encoding="utf-8")
+    assert "stray_backend" not in what_records_need(batch).backends
+
+
+def test_R04_every_record_fixture_verifies_in_a_batch_under_the_name_the_core_writes_it_under(tmp_path):
+    """R04, R01 and R03: the golden records of versions 1 and 2 and every merge-point fixture of version 3, each laid
+    out as a campaign lays a record out (`<digest>/try<N>/<record name>`), are found by their names and all pass."""
+    fixtures = [DATA / "golden-record-v1.json", DATA / "golden-record-v2.json", *sorted(DATA.glob("record-v3/*.json"))]
+    assert len(fixtures) >= 10
+    root = tmp_path / "batch"
+    for n, path in enumerate(fixtures, start=1):
+        record = RunRecord.from_json(decode(path.read_bytes()))
+        target = root / record.filename.split(".")[0] / f"try{n}" / record.filename
+        target.parent.mkdir(parents=True)
+        target.write_bytes(path.read_bytes())
+    check = verify_batch(root, code=CODE)
+    assert (check["n_records"], check["n_ok"], check["failures"]) == (len(fixtures), len(fixtures), [])
+
+
+def test_R08_an_archive_yields_its_records_alone_never_a_hashed_only_file(batch, tmp_path):
+    """R08: the records an archive holds are found by their names, so a hashed-only manifest is not taken for one."""
+    (batch / "manifest.json").write_text('{"cells": 3}', encoding="utf-8")
+    write_check(batch, verify_batch(batch, code=CODE, hashed_only=["manifest.json"]))
+    archive_batch(batch, tmp_path / "records.tar.gz", code=CODE)
+    names = [name.split(":", 1)[1] for name, _ in archived_records(tmp_path)]
+    assert sorted(names) == sorted(stored_check(batch)["replayed"])
 
 
 # --- R05: decisions served during replay ------------------------------------------------------------------------------
@@ -518,11 +634,25 @@ def test_the_command_checks_a_batch_writes_the_check_and_exits_zero(batch, code_
 
 
 def test_the_command_exits_one_and_lists_the_records_that_failed(batch, code_repo, capsys):
-    (batch / "garbage.json").write_text("nope", encoding="utf-8")
+    (batch / GARBAGE).write_text("nope", encoding="utf-8")
     assert run_cli(batch, code_repo) == 1
     out = capsys.readouterr().out
-    assert "FAIL garbage.json [load]" in out
+    assert f"FAIL {GARBAGE} [load]" in out
     assert "4 of 5 records passed" in out
+    assert "unexpected" not in out
+
+
+def test_R04_the_command_lists_each_unexpected_file_and_counts_them_apart_from_the_records(batch, code_repo, capsys):
+    """R04: every record passes, so the count of records says so; the unexpected file is listed and counted on a line
+    of its own, and the command exits 1."""
+    (batch / "shard-2" / "sandbox.json").write_text('{"backend": "apptainer"}', encoding="utf-8")
+    assert run_cli(batch, code_repo) == 1
+    out = capsys.readouterr().out
+    assert f"FAIL shard-2/sandbox.json [{UNEXPECTED_STAGE}]" in out
+    assert "4 of 4 records passed" in out
+    assert "1 unexpected file in the batch" in out
+    assert run_cli(batch, code_repo, "--require") == 1
+    assert "unexpected" in capsys.readouterr().err
 
 
 def test_the_command_refuses_dirty_code_unless_told_otherwise(batch, code_repo, capsys):

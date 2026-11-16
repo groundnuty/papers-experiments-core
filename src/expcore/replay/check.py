@@ -20,11 +20,19 @@ record when it is named as one or holds the record schema marker; one larger tha
 its size and a prefix only, and refused when that prefix opens a JSON object, which could be a record.
 
 `stage` is `load`, `roundtrip`, `secret` (the record holds a value of this environment's secrets), `replay`,
-`decision` (a failure at `decision` also names the `hook`) or `side_file`. Paths are relative to the batch, so a batch
-extracted from an archive elsewhere has the same digest. An input is a record (a `.json` file anywhere under the batch,
-the check file excepted) or a file named by `hashed_only` patterns, which is hashed but not replayed, such as a manifest
-the analysis reads. A `.json` file that is not a record must therefore be named in `hashed_only`, or it fails the check
-at `load`.
+`decision` (a failure at `decision` also names the `hook`), `side_file` or `unexpected`. Paths are relative to the
+batch, so a batch extracted from an archive elsewhere has the same digest. An input is a record or a file named by
+`hashed_only` patterns, which is hashed but not replayed, such as a manifest the analysis reads.
+
+**A record is known by its name (R04):** a file anywhere under the batch named as `records.record.record_filename`
+names one, `<SHA-256 of the run key>.<attempt>.json`, the one form the core has ever written a record under
+(`records.record.is_record_name`), and nothing else is ever read as a record, whatever its suffix or content. Every
+other file of the batch is either a hashed-only input (the campaign's outcome markers and snapshot, a declared side
+file, a caller's pattern), the check file at the top of the batch, or a name starting with a dot (the temporary file of
+an interrupted write, which the check never reads); anything else is **unexpected**: it is not hashed or replayed, and
+it fails the check against its own path at stage `unexpected`, so the check passes only a batch in which every file is
+accounted for. A study's own evidence enters a batch only as a declared side file. `require_current_check` walks the
+batch again and refuses one added since, since a file that is no input changes no input's hash.
 
 Side files (`replay.side_files`): a study may declare files its runs write beside each record, each named by its SHA-256
 in that record. Every file of a declared name in the batch is a hashed-only input, found by the patterns the
@@ -61,7 +69,6 @@ import fnmatch
 import hashlib
 import json
 import os
-import re
 import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -75,7 +82,7 @@ from expcore.errors import infra_kinds
 from expcore.provenance.codestamp import UNKNOWN, CodeScope, CodeVersionUnknown, require_known
 from expcore.provenance.codestamp import version as code_version
 from expcore.provenance.environment import differences
-from expcore.records.record import RunRecord, decode
+from expcore.records.record import RunRecord, decode, is_record_name
 from expcore.records.redact import Redactor, redact_text
 from expcore.records.schema import SCHEMA_PREFIX, SCHEMAS, RecordError, SchemaVersion
 from expcore.replay import side_files as side_module
@@ -94,6 +101,14 @@ EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
 # at by instead. Both are read where they are used, never bound as defaults.
 RECORD_PROBE_BYTES = 64 * 1024 * 1024
 RECORD_PREFIX_BYTES = 4096
+UNEXPECTED_STAGE = "unexpected"  # the stage of a check failure for a file of the batch that nothing accounts for
+UNEXPECTED = (
+    "neither a run record (the core writes one only as <SHA-256 of the run key>.<attempt>.json) nor a file the check "
+    "hashes (an outcome marker, the campaign's snapshot, a declared side file): evidence nothing vouches for. Declare "
+    "a file the analysis reads as a side file ([[study.side_files]] in study.toml, its SHA-256 named in the record), "
+    "or keep it out of the batch"
+)
+_SHOWN = 3  # the unexpected files a refusal names before it says how many more there are
 
 
 class BatchNotVerified(Exception):
@@ -102,14 +117,6 @@ class BatchNotVerified(Exception):
 
 class HashedOnlyRecord(BatchNotVerified):
     """A run record was named by a hashed-only pattern: it would be hashed but never replayed."""
-
-
-_RECORD_FILE = re.compile(r"[0-9a-f]{64}\.\d+\.json")
-
-
-def is_record_name(name: str) -> bool:
-    """Tell whether a file name is the name a run record is written under (`records.record.record_filename`)."""
-    return _RECORD_FILE.fullmatch(name) is not None
 
 
 def is_run_record(rel: str, raw: bytes) -> bool:
@@ -205,21 +212,56 @@ def _hooks(recompute: Sequence[Recompute]) -> list[Recompute]:
     return hooks
 
 
-def input_files(batch: Path, hashed_only: Sequence[str] = ()) -> tuple[list[str], list[str]]:
-    """Return the records and the hashed-only files of a batch, as sorted paths relative to it.
+class BatchFiles(NamedTuple):
+    """Every file of a batch, sorted into what the check makes of it; each a sorted list of paths relative to it."""
 
-    The check file and the temporary files an interrupted write leaves (names starting with a dot) are not inputs.
+    records: list[str]  # named as a run record: replayed
+    hashed: list[str]  # named by a hashed-only pattern: hashed, never replayed
+    unexpected: list[str]  # neither: fails the check at stage `unexpected`
+
+
+def batch_files(batch: Path, hashed_only: Sequence[str] = ()) -> BatchFiles:
+    """Sort every file of a batch into its records, its hashed-only files and the files nothing accounts for (R04).
+
+    A hashed-only pattern is matched first, so that a record a pattern names is found and refused
+    (`HashedOnlyRecord`); then a file is a record only when it is named as one (`is_record_name`). The check file at
+    the top of the batch and the temporary files an interrupted write leaves (names starting with a dot) are none of
+    the three: the check never reads them.
     """
-    records, hashed = [], []
+    records, hashed, unexpected = [], [], []
     for path in batch.rglob("*"):
         rel = path.relative_to(batch).as_posix()
         if not path.is_file() or rel == CHECK_FILE or path.name.startswith("."):
             continue
         if any(fnmatch.fnmatchcase(rel, pattern) for pattern in hashed_only):
             hashed.append(rel)
-        elif path.suffix == ".json":
+        elif is_record_name(path.name):
             records.append(rel)
-    return sorted(records), sorted(hashed)
+        else:
+            unexpected.append(rel)
+    return BatchFiles(sorted(records), sorted(hashed), sorted(unexpected))
+
+
+def input_files(batch: Path, hashed_only: Sequence[str] = ()) -> tuple[list[str], list[str]]:
+    """Return the records and the hashed-only files of a batch, as sorted paths relative to it (`batch_files`)."""
+    found = batch_files(batch, hashed_only)
+    return found.records, found.hashed
+
+
+def describe_unexpected(files: Sequence[str]) -> str:
+    """Name the unexpected files of a batch, a few of them, and say what they are not and what to do about them."""
+    shown = ", ".join(files[:_SHOWN]) + (f" and {len(files) - _SHOWN} more" if len(files) > _SHOWN else "")
+    return f"{len(files)} unexpected file{'s' if len(files) != 1 else ''} in the batch ({shown}): {UNEXPECTED}"
+
+
+def unexpected_in(check: Mapping[str, Any]) -> list[str]:
+    """The files a check failed as unexpected, in its order."""
+    failures = check.get("failures")
+    return [
+        str(f.get("file"))
+        for f in (failures if isinstance(failures, list) else [])
+        if isinstance(f, Mapping) and f.get("stage") == UNEXPECTED_STAGE
+    ]
 
 
 class RecordNeeds(NamedTuple):
@@ -364,13 +406,14 @@ def verify_batch(
     The bytes hashed are the bytes checked. Each of the `recompute` hooks runs on every record that loads, writes back
     and replays, and the check says which ran, on how many records, and how many decisions each recomputed. Each of
     the declared `side_files` found in the batch is hashed and paired with the record beside it (`side_files.pair`);
-    what does not pair fails at stage `side_file`.
+    what does not pair fails at stage `side_file`. A file that is neither a record nor hashed only fails at stage
+    `unexpected` (`batch_files`).
     """
     root = Path(batch)
     hooks = _hooks(recompute)
     ran = {h.name: {"name": h.name, "version": h.version, "records": 0, "decisions": 0, "failures": 0} for h in hooks}
     patterns = with_side_files(hashed_only, side_files)
-    records, hashed = input_files(root, patterns)
+    records, hashed, unexpected = batch_files(root, patterns)
     hashes: dict[str, str] = {}
     failures: list[dict[str, Any]] = []
     stored: dict[str, Any] = {}  # each record's stored JSON for the pairing; None for a record that failed on its own
@@ -404,6 +447,7 @@ def verify_batch(
             for rel in side
             if (root / rel).stat().st_size > side_module.MAX_SIDE_FILE_BYTES
         ]
+    failures += [{"file": rel, "stage": UNEXPECTED_STAGE, "error": UNEXPECTED} for rel in unexpected]
     failed_files = {f["file"] for f in failures}  # an orphan side file fails against its own path, not a record's
     check = {
         "schema": CHECK_SCHEMA,
@@ -481,6 +525,31 @@ def _changed_inputs(stored: Mapping[str, str], current: Mapping[str, str]) -> st
     return "; ".join(parts)
 
 
+def outcome_lines(check: Mapping[str, Any]) -> list[str]:
+    """What a command prints of a check it made: a line per failure, how many records passed, and, when the check
+    found any, the unexpected files, counted apart from the records and explained once."""
+    lines = [
+        f"FAIL {f['file']} [{f['stage']}]" + ("" if f["stage"] == UNEXPECTED_STAGE else f" {f['error']}")
+        for f in check["failures"]
+    ]
+    lines.append(f"{check['n_ok']} of {check['n_records']} records passed")
+    unexpected = unexpected_in(check)
+    if unexpected:
+        lines.append(describe_unexpected(unexpected))
+    return lines
+
+
+def _failed(check: Mapping[str, Any]) -> str:
+    """What a failed check found: how many of its records failed, and the unexpected files, each when there are any."""
+    unexpected = unexpected_in(check)
+    failures = check.get("failures")
+    failed = len(failures if isinstance(failures, list) else []) - len(unexpected)
+    parts = [f"failed for {failed} of {check.get('n_records')} records"] if failed or not unexpected else []
+    if unexpected:
+        parts.append(f"found {describe_unexpected(unexpected)}")
+    return "; and ".join(parts)
+
+
 def _require_recompute(root: Path, check: Mapping[str, Any], required: Sequence[str], rerun: str) -> None:
     """Refuse a check that lacks a required recompute hook, ran it on too few records, or whose hook disagreed."""
     ran = {entry.get("name"): entry for entry in check.get("recompute") or [] if isinstance(entry, dict)}
@@ -527,7 +596,8 @@ def require_current_check(
     the distributions' versions, as a replication package installed from its own wheels does. With `side_files`, the
     declaration in use (empty for a study that declares none), a check made under another declaration is refused.
     The side files the check's declaration names are inputs like any other, so one changed, removed or added since is
-    refused whether the caller declares them or not.
+    refused whether the caller declares them or not. A file of the batch that is neither a record nor hashed only,
+    added since the check, is refused too (R04): the batch is walked again, since such a file changes no input's hash.
     """
     root = Path(batch)
     rerun = f"run `{rerun_command or f'python -m expcore.replay.check {root}'}` first"
@@ -547,18 +617,18 @@ def require_current_check(
             f"study.toml) than the one in use; {rerun}"
         )
     if check.get("n_ok") != check.get("n_records") or check.get("failures"):
-        raise BatchNotVerified(
-            f"{root}: the replay check failed for {len(check.get('failures') or [])} of {check.get('n_records')} "
-            f"records (see {CHECK_FILE}); fix them, then {rerun}"
-        )
+        raise BatchNotVerified(f"{root}: the replay check {_failed(check)} (see {CHECK_FILE}); fix them, then {rerun}")
     stored = check.get("inputs")
     if not isinstance(stored, dict) or check.get("inputs_sha256") != inputs_sha256(stored):
         raise BatchNotVerified(f"{root}: the list of inputs in {CHECK_FILE} was altered; {rerun}")
-    current = input_hashes(root, with_side_files(check.get("hashed_only_patterns") or (), recorded))
+    found = batch_files(root, with_side_files(check.get("hashed_only_patterns") or (), recorded))
+    current = {rel: file_sha256(root / rel) for rel in [*found.records, *found.hashed]}
     if current != stored:
         raise BatchNotVerified(
             f"{root}: inputs changed since the replay check ({_changed_inputs(stored, current)}); {rerun}"
         )
+    if found.unexpected:  # no input's hash changes for a file that is no input: it is found by the walk alone
+        raise BatchNotVerified(f"{root}: since the replay check, {describe_unexpected(found.unexpected)}; {rerun}")
     hashed = check.get("hashed_only") or []
     replayed = check.get("replayed")
     if replayed is not None and (set(replayed) & set(hashed) or set(replayed) | set(hashed) != set(stored)):
@@ -646,9 +716,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     path = write_check(args.batch, check)
-    for failure in check["failures"]:
-        print(f"FAIL {failure['file']} [{failure['stage']}] {failure['error']}")
-    print(f"{check['n_ok']} of {check['n_records']} records passed; check written to {path}")
+    for line in outcome_lines(check):
+        print(line)
+    print(f"check written to {path}")
     if args.require_recompute and not check["failures"]:
         try:  # this command runs no recompute hook, so a check it made cannot satisfy a requirement for one
             _require_recompute(args.batch, check, args.require_recompute, "run the check from the study's own code")

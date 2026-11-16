@@ -27,7 +27,7 @@ from expcore.campaign.merge import (
 from expcore.errors import study_kinds
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.environment import differences
-from expcore.replay.check import BatchNotVerified, verify_batch
+from expcore.replay.check import UNEXPECTED_STAGE, BatchNotVerified, describe_unexpected, unexpected_in, verify_batch
 from expcore.study.config import StudyConfig, find_study_root, load_study
 from expcore.study.pipeline import (
     HASHED_ONLY,
@@ -109,10 +109,14 @@ def _replay(study: StudyConfig, shard: ShardFacts, code: Any, env: Any) -> None:
         )
     except BatchNotVerified as error:
         raise MergeRefused(f"{shard.name}: {error}") from None
-    failures = check["failures"]
+    unexpected = unexpected_in(check)  # a file nothing accounts for: named apart, never counted as a record (R04)
+    failures = [f for f in check["failures"] if f["stage"] != UNEXPECTED_STAGE]
+    found = []
     if failures:
         shown = "; ".join(f"{f['file']} [{f['stage']}] {f['error']}" for f in failures[:_SHOWN_FAILURES])
         more = " and more" if len(failures) > _SHOWN_FAILURES else ""
-        raise MergeRefused(
-            f"{shard.name}: {len(failures)} of {check['n_records']} records fail the replay check: {shown}{more}"
-        )
+        found.append(f"{len(failures)} of {check['n_records']} records fail the replay check: {shown}{more}")
+    if unexpected:
+        found.append(describe_unexpected(unexpected))
+    if found:
+        raise MergeRefused(f"{shard.name}: " + "; and ".join(found))
