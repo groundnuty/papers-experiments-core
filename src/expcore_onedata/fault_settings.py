@@ -187,8 +187,9 @@ from pathlib import Path
 from typing import Any
 
 from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.config.platform_loads import record_platform_load
 from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
-from expcore_onedata.config import PlatformConfig
+from expcore_onedata.config import PLATFORM_MODULE, PlatformConfig
 from expcore_onedata.fault_hpc import HPC_EXEC_MARGIN_S, HPC_POLL_S, HPC_STOP_BOUND_S, HpcDriver
 from expcore_onedata.fault_relay import RelayClient
 from expcore_onedata.linkrecord import ROOT_FILE, federation_root
@@ -281,9 +282,11 @@ def _number(table: Section, key: str, default: float, minimum: float, *, integer
 def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSettings:
     """Read `[faults]` of a platform.toml against its loaded configuration; raise ConfigError naming the file and key.
 
-    A message names a service entry by its position, never by the provider's or the service's name.
+    A message names a service entry by its position, never by the provider's or the service's name. While a study's
+    build is open it records that it ran, with the platform's module and the file (`platform_loads`, C11, O35).
     """
     file = Path(path).resolve()
+    record_platform_load(PLATFORM_MODULE, file)  # at the entry: a load that then refuses its file still ran
     table = Section(load_toml(file), file, "platform.toml").section("faults")
     table.reject_unknown(_KEYS)
     sanctioned = table.data.get("sanctioned", False)

@@ -220,7 +220,8 @@ def make_study(base: Path, oneclient: Mapping[str, str], control: Path) -> Path:
     (root / PLUGIN_SETTINGS).write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     text = (root / "study.toml").read_text(encoding="utf-8")
     for old, new in (
-        ('plugin = "plugin.py"', f'plugin = "{PLUGIN}"'),
+        # every study that builds the Onedata platform through the core's loaders lists its module (C11, #329)
+        ('plugin = "plugin.py"', f'plugin = "{PLUGIN}"\nplatforms = ["expcore_onedata.sandbox.kinds"]'),
         ('"plugin.py", "prompt.txt"]', f'"plugin.py", "{PLUGIN}", "{PLUGIN_SETTINGS}", "prompt.txt"]'),
     ):
         assert text.count(old) == 1, f"study.toml: {old!r}"

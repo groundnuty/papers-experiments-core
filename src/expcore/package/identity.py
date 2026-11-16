@@ -61,8 +61,8 @@ from expcore.provenance.codestamp import STAMP, CodeScope, covered_files, is_sha
 from expcore.provenance.environment import without_sources
 from expcore.provenance.gitobjects import GitError, run_git
 from expcore.provenance.redact import Redactor
-from expcore.records.record import RunRecord, decode
-from expcore.replay.check import CHECK_FILE, inputs_sha256, recorded_side_files, verify_batch, write_check
+from expcore.records.record import RunRecord, decode, is_record_name
+from expcore.replay.check import CHECK_FILE, UNEXPECTED, inputs_sha256, recorded_side_files, verify_batch, write_check
 from expcore.study.pipeline import EXPORT_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DIR, Refused, analyse_study, output_bytes
 
 PREFIX_DIGITS = 12
@@ -100,26 +100,34 @@ def stamp_bytes(
 def verify_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
     """Refuse a batch whose files are not exactly the inputs the replay check hashed, naming the first that differs.
 
-    An input is what the check counts as one: a `.json` file other than the check, or a file its hashed-only patterns
-    name, never a name starting with a dot.
+    An input is what the check counts as one (`replay.check.batch_files`): a file its hashed-only patterns name, or a
+    file named as a run record, never the check or a name starting with a dot. Any other file of the batch is one the
+    check fails as unexpected (R04), so it is refused here too, whatever its suffix: a package carries no file of the
+    batch that the check did not vouch for.
     """
     recorded = check.get("inputs")
     if not isinstance(recorded, dict) or check.get("inputs_sha256") != inputs_sha256(recorded):
         raise PackageError(f"{BATCH}/{CHECK_FILE}: its list of inputs was altered; run `python -m expcore check` again")
     patterns = check.get("hashed_only_patterns") or ()
-    current = {}
+    current, unexpected = {}, []
     for path, data in files.items():
         rel = path[len(BATCH) + 1 :] if path.startswith(f"{BATCH}/") else None
         if rel is None or rel == CHECK_FILE or Path(rel).name.startswith("."):
             continue
-        if rel.endswith(".json") or any(fnmatch.fnmatchcase(rel, pattern) for pattern in patterns):
+        if any(fnmatch.fnmatchcase(rel, pattern) for pattern in patterns) or is_record_name(Path(rel).name):
             current[rel] = hashlib.sha256(data).hexdigest()
+        else:
+            unexpected.append(rel)
     for rel in sorted(set(current) | set(recorded)):
         if current.get(rel) != recorded.get(rel):
             state = "is not" if rel not in recorded else "is missing" if rel not in current else "differs from"
             raise PackageError(
                 f"{BATCH}/{rel} {state} what the replay check hashed; run `python -m expcore check` again"
             )
+    if unexpected:
+        raise PackageError(
+            f"{BATCH}/{min(unexpected)} is not what the replay check hashed: an unexpected file, {UNEXPECTED}"
+        )
 
 
 def verify_merged_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
