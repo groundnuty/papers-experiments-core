@@ -388,9 +388,10 @@ cannot launch a step: its fault injector asks the login node's **fault relay** (
 argv prefix and `down` stops first; section 5), which runs the verb and answers.
 
 **The hook** (stable; `hpcfed_control.py` is M4's, `hpcfed.py` M1's): after parsing `--layout`, `--root` and the verb,
-`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds)` for a verb in
+`hpcfed.py` calls `hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds, mounts)` for a verb in
 `hpcfed_control.VERBS = ("stop", "start", "status", "exec")` and exits with its status; `argv` is what follows `--`
-(for `exec`), else `[]`; `stop_seconds` is the layout's. What it is given:
+(for `exec`), else `[]`; `stop_seconds` is the layout's; `mounts` is the read-only proof of a shared import's owner
+(`hpcfed.mount_check`: None in a core without `hpcimport`, section 8). What it is given:
 
 - `launcher` (`hpclaunch.Launcher`): `control(node, argv, *, name, timeout_s)` runs a bounded control step (`--exact
   -c <control cpus> --mem <control memory>`, the allowlist, stdin `/dev/null`) and returns `returncode`, `stdout` and
@@ -402,17 +403,38 @@ argv prefix and `down` stops first; section 5), which runs the verb and answers.
   the held job. Every step runs on one of the held job's own nodes, or is refused.
 - `state` (`hpclaunch.StateStore`): `read()` and `update(fn)` (section 4).
 
+The verbs read a work directory only as `hpcstate.checked_workdir` accepts it, name every step as the launcher's
+`STEP_NAME` allows, and read a `returncode` of None (an end not known) as a failure, never a success. A stop or a start
+holds `hpc-federation.verbs.lock` in the root, never waiting for it, from the state read that decides it to its last
+record, so two never interleave; status and exec take no lock. A verb acts on a service of kind `oz` or `op` alone:
+the agent's node (`services.sandbox`, kind `sandbox`, and the state's `sandbox` record, section 4) is refused, exit 2,
+with no step run, and the fault relay lists the providers alone.
+
 **(a) STOP** `hpcfed.py stop <service>`: a control step on the service's node runs `teardown.sh <oz|op> --workdir W
 --keep --timeout <stop_seconds>`: `stop-requested` is written with `keep` in it, SIGTERM goes to the recorded service
 process (`service.pid`: PID and start tick, through a pidfd, as today), and the service step's script, seeing `keep`,
 **removes nothing**: not the work directory, the secrets directory, the Couchbase data, the registration, the storage.
 Its step then ends, which frees the service's CPUs and memory; the node stays in the job. `hpcfed.py` waits for the
-step to leave `squeue -s`, records `stopped`, and returns. On a stopped service it returns at once (idempotent).
+step to leave `squeue -s`, records `stopped`, and returns. On a stopped service it returns at once (idempotent). The
+stop is confirmed only once teardown exited 0 and the step is gone (for a step never seen listed, once its srun
+client has ended too: a pending step is not in the list and could still be made), and its `stopped` is recorded only
+for the launch it stopped. `--keep-until` is the allocation's end: Slurm's `EndTime` as `up` recorded it, in the login
+node's local time, as `scontrol` printed it. **Every stop's evidence** is printed and appended to `stops` in the
+state, confirmed or not: `stopped`, `ended` (`exit`, `kill`, `none`), `seconds` (from the request to the verb's
+verdict) and `service_seconds` (the service's own end after its SIGTERM, as teardown measured it on the node); the
+core journals it (section (e)).
 
 **(b) START** `hpcfed.py start <service>`: a new detached service step, the same size, on the same node, running
 `restart.sh <oz|op> --workdir W`: no `node-init.sh`, no `configure.sh`, no token wait; `run_service` again on the same
 rootfs, so the same config, cookie, epmd port, ports, address and registration. `launch` is incremented. A start of a
-running service does nothing.
+running service does nothing. A start follows a recorded `stopped`, and also `stopping`, `starting` or `running` once
+`status.sh` finds the process not alive and its step is not listed (a stop whose verdict never reached the state, its
+verb killed at the relay's bound; a start whose step ended), so a restore is never refused for a provider that is
+down; it never launches beside a live process, nor while an earlier start's step was never listed and its srun client
+still runs. **A restarted owner of shared imported trees (O59)** has `mounts_proven` cleared in the state change that
+claims its launch, and is `ready` only once a status has run `hpcimport.mount_check_argv` on its node and read the
+report against the spaces it owns: the start returns once its step is listed, before the service holds its mounts, so
+the proof is taken by the first status that finds it otherwise ready, and recorded for that launch alone.
 
 **(c) STATUS** `hpcfed.py status <service>`: one JSON line, no secret: `{"service", "state", "running", "ready",
 "identity", "launch", "node", "step"}`. `running` is true only when the service step is listed in `squeue -s` **and**
@@ -439,7 +461,9 @@ provider stopped in about 30 s live. For backend `"hpc"` (M4's loader): the core
 start's stop entering it as its own term (5,340 s with the defaults); `poll_s` defaults to 10 s (every status is a
 step on the one control core);
 `restart_link`'s bound gets 60 s more (the step's launch and the client's end polling), and the heal's reserves count
-it.
+it. **`stop_seconds` is to be set from live measurement**: the core journals every stop's evidence, confirmed or not
+(the injection's `injected` line, or its `stop_unknown` line for a stop that answered unconfirmed, key `stop`), so a
+live slot's journal gives each stop's `seconds` and the service's own `service_seconds`.
 
 **(f) The state file**: section 4. `services.<name>` gives the job, the step, the node, the work directory and the
 identity; it holds no secret.
@@ -482,7 +506,7 @@ read from the driver's own environment** (`Driver.environ`, which `hpcfed.py mai
 |---|---|---|
 | Preflight (section 5, step 1) | `Driver.check_imports`: `hpcimport.shared_imports_of(layout, provider)` for every provider, then for each of `layout.shared_imports()` `Layout.import_source(space, environ)` and `Layout.import_manifest(space, environ)`, then `hpcimport.check_support(layout, environ)` and `hpcimport.check_separate(layout, environ, {root, L})` | refuses an import a provider owns that is not shared (a writable one copies its tree into the root, and one not marked shared would leave the sharing out of the platform file the core checks), a variable that is unset, relative, with a `..` step or a link on the way, a source that is not a directory, a manifest that is not a file or lies in a tree, and a manifest of more bytes than the space's `support_bytes`, two trees that are one directory or one inside the other, and a root or a log directory `L` that is, holds or lies inside a tree (the real paths are compared: the driver writes both on the host, which the container's read-only bind never reaches, and a root beneath a link into a tree would have `up` write its state there); **and `[hpc] core = "step"`**: the node's `env -i` allowlist carries none of the variables, so the core's phase there cannot read a manifest. Nothing is submitted: no sbatch, no state file, no root |
 | A provider's service step (step 6) | `hpcimport.provider_import_args(layout, provider, environ)` appended to the `provider.sbatch` argv, after the peers | `--import=SPACE=PATH` per tree the provider owns; none for a mirror. The path travels as an argument and never in a step's environment (every step's `env -i` list is the same three names). The bundle checks each tree again on the node, makes the mountpoint in the rootfs and binds it `:ro` at every start of the service, a restart (section 7) included, since the list is in the work directory |
-| After every provider's verdict (step 6) | `Driver.check_mounts(provider)`, for each owner: a control step named `<allocation>-<provider>-mounts` on its node, `hpcimport.mount_check_argv(bundle, workdir, python=site.node_python)` | exits 0 only when every listed tree, and every mount below it, is held with `ro` in the mount's own options by the service's container processes (the children of the starter `service.pid`'s supervisor started; nothing else of the account's on the node counts). A failure fails `up` before the bootstrap starts any scan, naming the provider and the spaces and repeating only the check's own `FAIL: shared import <space>` lines. **The driver also reads the report** (`hpcimport.mount_check_problems`) against the spaces it asked the provider to mount, since the script exits 0 for a work directory with no list of imports: an empty or unparsable report, a space reported twice, not at all or not asked for, held by no process, or writable in any, fails `up` too. Each owner that passes is recorded in the state (`services.<name>.mounts_proven`), and the core's phase refuses to start, naming the provider, for an owner with no such record, so `hpcfed.py core` run by hand over a partial `up` never starts a scan. M4's `start` runs the same check after a start (section 7), and clears the record while it does |
+| After every provider's verdict (step 6) | `Driver.check_mounts(provider)`, for each owner: a control step named `<allocation>-<provider>-mounts` on its node, `hpcimport.mount_check_argv(bundle, workdir, python=site.node_python)` | exits 0 only when every listed tree, and every mount below it, is held with `ro` in the mount's own options by the service's container processes (the children of the starter `service.pid`'s supervisor started; nothing else of the account's on the node counts). A failure fails `up` before the bootstrap starts any scan, naming the provider and the spaces and repeating only the check's own `FAIL: shared import <space>` lines. **The driver also reads the report** (`hpcimport.mount_check_problems`) against the spaces it asked the provider to mount, since the script exits 0 for a work directory with no list of imports: an empty or unparsable report, a space reported twice, not at all or not asked for, held by no process, or writable in any, fails `up` too. Each owner that passes is recorded in the state (`services.<name>.mounts_proven`), and the core's phase refuses to start, naming the provider, for an owner with no such record, so `hpcfed.py core` run by hand over a partial `up` never starts a scan. M4's `start` clears the record in the state change that claims the new launch, and the first `status` that finds the restarted owner otherwise ready runs the same check and records it for that launch, `ready` false until then (section 7) |
 | The bootstrap (step 8) | `HpcBootstrap.import_storage_extra(service)` returns `hpcimport.import_storage_extra(uid, gid)`; `hpcboot.bring_up` calls `boot.ensure_import_storages()` between `ensure_spaces` and `ensure_support`, and `boot.wait_import(1800)` after the members | the imported storage is made with the job user's ids, the local LUMA feed and the canonical path type, and `fedboot` names it `import-<space>` and supports the space on it with the one-scan import configuration, as the Compose federation does; the scan is awaited, and one that failed or did not complete fails `up`. Both calls are the bootstrap's own no-ops for a layout with no import |
 | The bootstrap's LUMA step (step 8) | `HpcBootstrap.support` sends `hpcimport.luma_requests(storage_id, space_id, member_ids, uid, gid)` for the storage `storage_for(service, space)` returns | the space's default credentials on **that storage**, and each member's mapping on it once per (provider, storage): an owner of an imported space has two storages. A user mapping that is already there is read back and must name the job's uid |
 | After `platform.toml` is rendered (step 9), before the link check | `fedimport.verify_imports(layout, environ, timeout_s=1800)`, inside `hpcboot.core_phase` | the core's `ImportedSpace.provision` over the rendered file: read-only imported storage on the owner's panel, scan completed, every provider's listing is the manifest, every file whole on the owner. A space the layout shares and the file does not is refused unsent, so a template that leaves `shared = true` out fails `up` before the link check runs |
