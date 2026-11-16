@@ -157,7 +157,9 @@ def test_o64_every_cancel_in_the_script_is_of_one_job_id(login):
     assert all(re.search(r'scancel "\$id"', x) for x in calls), calls
 
 
-def renew_once(login, until=NOW + 86400):
+def renew_once(login, until=NOW + 86400, wanted=NOW + 86400):
+    if wanted is not None:
+        (login.dir / "renew.wanted").write_text(f"{wanted}\n")
     return login.alloc("renew", "--until", str(until), "--once", check=0)
 
 
@@ -198,9 +200,29 @@ def test_o64_with_no_allocation_of_ours_alive_one_is_submitted_now(login):
     assert f"--begin={slurm_time(NOW)}" in call["argv"]
 
 
+@pytest.mark.parametrize("wanted", [None, NOW, NOW + 60])
+def test_o64_no_successor_is_submitted_unless_lanes_said_they_need_it_until_after_it_begins(login, wanted):
+    """O64: renewal is a deliberate step: billing runs idle or busy, so the loop submits a successor only while
+    renew.wanted names a time still ahead and after the successor's begin; without it (or after it) the running
+    allocation simply ends."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 3600))
+    renew_once(login, wanted=wanted)
+    assert fakes.calls(login.fake / "sbatch.jsonl") == []
+
+
+def test_want_and_unwant_set_and_clear_the_marker_the_listing_shows(login):
+    login.alloc("want", "--until", str(NOW - 1), check=2)
+    assert login.alloc("want", "--until", str(NOW + 7200), check=0).stdout.strip() == f"WANTED until {NOW + 7200}"
+    assert f"wanted={NOW + 7200}" in login.alloc("list", check=0).stdout
+    login.alloc("unwant", check=0)
+    assert "wanted=-" in login.alloc("list", check=0).stdout
+
+
 def test_the_renewer_stops_after_a_submit_that_was_not_as_asked(login):
     (login.fake / "record").write_text(fakes.RECORD.replace("Requeue=0", "Requeue=1"))
     login.ledger(400)
+    login.alloc("want", "--until", str(NOW + 86400), check=0)
     login.alloc("renew", "--until", str(NOW + 86400), "--poll", "1", check=0)
     assert len(fakes.calls(login.fake / "sbatch.jsonl")) == 1
     assert "status=ended:submit-not-as-asked" in (login.dir / "renew.state").read_text()

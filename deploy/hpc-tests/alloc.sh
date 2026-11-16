@@ -11,6 +11,8 @@
 #                                        keep an allocation of ours alive until <epoch> (the loop; README, "Renewal")
 #   alloc.sh renew-start <renew options> start that loop detached (setsid nohup), from a frozen copy of this script
 #   alloc.sh renew-stop                  ask the loop to stop at its next poll
+#   alloc.sh want --until <epoch>        lanes need the allocation until <epoch>: the loop may submit successors
+#   alloc.sh unwant                      lanes no longer need it: the loop submits nothing (the running job ends)
 #
 # "Ours" is the ledger AND the name: a job of the account that this ledger does not list (another study's, another
 # lane's) is never listed, renewed or cancelled, and no command here cancels by user. The clock is read (date +%s) at
@@ -21,6 +23,7 @@ LEDGER=$DIR/ledger
 STATE=$DIR/renew.state
 LOCK=$DIR/renew.lock
 STOP=$DIR/renew.stop
+WANTED=$DIR/renew.wanted
 
 die() { echo "alloc.sh: $1" >&2; exit "${2:-2}"; }
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -167,7 +170,7 @@ renewer_status() {
   elif [ -n "$words" ]; then
     status=ended
   fi
-  echo "status=$status $(printf '%s\n' "$words" | tr ' ' '\n' | grep -v -E '^(pid|status)=' | tr '\n' ' ')"
+  echo "status=$status wanted=$(wanted_until || echo -) $(printf '%s\n' "$words" | tr ' ' '\n' | grep -v -E '^(pid|status)=' | tr '\n' ' ')"
 }
 
 cmd_release() {
@@ -224,9 +227,18 @@ take_lock() {
 drop_lock() { [ "$(cat "$LOCK/owner" 2> /dev/null)" != "$$" ] || rm -rf "$LOCK"; }
 
 # One decision, from the clock and squeue read now. Prints SUBMIT-FAILED/STOP on stdout for the loop; 0 otherwise.
+wanted_until() { # the epoch renew.wanted names, when it exists and holds one; nothing otherwise
+  local value
+  value=$(head -c 32 "$WANTED" 2> /dev/null | tr -d ' \n')
+  is_count "$value" && echo "$value"
+}
+
 renew_once() {
-  local now rows pending end begin out rc
+  local now rows pending end begin out rc want
   now=$(date +%s)
+  # A deliberate step: billing runs idle or busy, so a successor is submitted only while the marker says lanes need it.
+  want=$(wanted_until)
+  if [ -z "$want" ] || [ "$now" -ge "$want" ]; then return 0; fi
   rows=$(alive) || { log "squeue failed: no decision this round"; return 0; }
   pending=$(printf '%s\n' "$rows" | awk -F'|' '$3 == "PENDING" || $3 == "CONFIGURING" {n++} END {print n + 0}')
   if [ "$pending" -gt 0 ]; then return 0; fi
@@ -242,6 +254,7 @@ renew_once() {
     log "the allocation of ours ends in $((end - now)) s: submitting its successor to begin at $(date -u -d "@$begin" +%FT%TZ)"
   fi
   [ "$begin" -lt "$UNTIL" ] || { log "a successor would begin at or after --until: none submitted"; return 0; }
+  [ "$begin" -lt "$want" ] || { log "a successor would begin after renew.wanted's time: none submitted"; return 0; }
   out=$(cmd_submit --begin "$begin" 2>&1)
   rc=$?
   printf '%s\n' "$out" | sed 's/^/  /'
@@ -311,12 +324,24 @@ cmd_renew_start() {
   echo "RENEWER $(renewer_status)"
 }
 
+cmd_want() {
+  [ "${1:-}" = --until ] && is_count "${2:-}" || die "want takes --until <seconds since the epoch>"
+  [ "$2" -gt "$(date +%s)" ] || die "want: that time has passed"
+  printf '%s\n' "$2" > "$WANTED.new" && mv -f "$WANTED.new" "$WANTED"
+  echo "WANTED until $2"
+}
+
+cmd_unwant() {
+  rm -f "$WANTED"
+  echo "UNWANTED: no successor is submitted; the running allocation ends at its time limit (release ends it now)"
+}
+
 cmd_renew_stop() {
   : > "$STOP"
   echo "the renewer stops at its next poll (renew.stop written)"
 }
 
-[ $# -ge 1 ] || die "usage: alloc.sh submit|list|release|renew|renew-start|renew-stop ..."
+[ $# -ge 1 ] || die "usage: alloc.sh submit|list|release|renew|renew-start|renew-stop|want|unwant ..."
 umask 077
 sub=$1
 shift
@@ -327,5 +352,7 @@ case "$sub" in
   renew) cmd_renew "$@" ;;
   renew-start) cmd_renew_start "$@" ;;
   renew-stop) cmd_renew_stop ;;
+  want) cmd_want "$@" ;;
+  unwant) cmd_unwant ;;
   *) die "unknown subcommand $sub" ;;
 esac

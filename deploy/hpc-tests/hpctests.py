@@ -7,6 +7,7 @@ and bring its results back (README.md).
     hpctests.py jobs                            our allocations, their ends in UTC, and the renewer's state
     hpctests.py release JOB                     cancel one allocation of ours (the ledger's, under our name)
     hpctests.py renew start --until ISO | stop  the login node's renewal loop (README, "Renewal")
+    hpctests.py renew want --until ISO | unwant whether lanes need the allocation: the loop renews only while wanted
     hpctests.py run [--rev REV] [--cores N] [--mem SIZE] [--time MIN] [--job JOB] -- <pytest arguments>
     hpctests.py clean [--stale MIN | --all]     remove what killed steps left on the allocation's node
 
@@ -363,8 +364,10 @@ def parser() -> argparse.ArgumentParser:
     release = sub.add_parser("release")
     release.add_argument("job")
     renew = sub.add_parser("renew")
-    renew.add_argument("action", choices=["start", "stop", "once"])
-    renew.add_argument("--until", help="ISO time (UTC) after which no allocation is submitted (start, once)")
+    renew.add_argument("action", choices=["start", "stop", "once", "want", "unwant"])
+    renew.add_argument(
+        "--until", help="ISO time (UTC): the loop's end (start, once), or until when lanes need it (want)"
+    )
     renew.add_argument("--max", type=int, default=4, help="at most this many submits (start)")
     run = sub.add_parser("run")
     run.add_argument("--repo", default=".", help="the repository or worktree whose commit is shipped")
@@ -398,8 +401,12 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "renew":
         if args.action == "stop":
             return passthrough(remote.alloc("renew-stop"))
+        if args.action == "unwant":
+            return passthrough(remote.alloc("unwant"))
         if not args.until:
-            raise lib.HpcTestsError("renew start and once need --until")
+            raise lib.HpcTestsError("renew start, once and want need --until")
+        if args.action == "want":
+            return passthrough(remote.alloc("want", "--until", str(epoch_of(args.until))))
         words = ["--until", str(epoch_of(args.until)), "--max", str(args.max)]
         if args.action == "once":
             return passthrough(remote.alloc("renew", *words, "--once"))

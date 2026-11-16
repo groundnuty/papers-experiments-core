@@ -94,25 +94,31 @@ its own input variables (`SBATCH_ACCOUNT`, `SBATCH_PARTITION`), never its comman
 
 ## Renewal
 
-The standard partition queues a job behind a running one, so the next allocation is requested before the current one
-ends, with `--begin` so that it cannot start (and bill) early:
+Renewal is a deliberate step, taken only while lanes need the allocation: billing runs idle or busy. The standard
+partition queues a job behind a running one, so the next allocation is requested before the current one ends, with
+`--begin` so that it cannot start (and bill) early, and only while the login directory's marker says lanes need it:
 
 ```
-uv run python deploy/hpc-tests/hpctests.py renew start --until 2026-11-20T18:00Z   # the loop, detached on the login node
-uv run python deploy/hpc-tests/hpctests.py renew stop                              # it stops at its next poll
-uv run python deploy/hpc-tests/hpctests.py renew once --until ...                  # one decision, now
+uv run python deploy/hpc-tests/hpctests.py renew want --until 2026-11-18T18:00Z   # lanes need it until then
+uv run python deploy/hpc-tests/hpctests.py renew unwant                          # they don't: no successor
+uv run python deploy/hpc-tests/hpctests.py renew start --until 2026-11-20T18:00Z  # the loop, detached on the login node
+uv run python deploy/hpc-tests/hpctests.py renew stop                             # it stops at its next poll
+uv run python deploy/hpc-tests/hpctests.py renew once --until ...                 # one decision, now
 ```
+
+Without the marker (`renew.wanted`), or once its time has passed, the loop submits nothing and the running
+allocation ends at its time limit; `release` ends it sooner, which is what to do when lanes are idle.
 
 `renew start` runs `alloc.sh renew` with `setsid nohup` on the login node, from a frozen copy of `alloc.sh` (bash reads a
 script as it runs, so a later `install` never changes a running loop), so it outlives the ssh session and any agent
 session. Every `--poll` (300 s) it reads the clock (`date +%s`) and squeue, never trusting a timer, and:
 
-- does nothing while a successor of ours is queued;
+- does nothing unless `renew.wanted` names a time still ahead, or while a successor of ours is queued;
 - when our running allocation ends within `--lead` (3 h), submits its successor to begin `--overlap` (15 min) before
   that end, or now if that is past;
 - when no allocation of ours is alive (the loop was down, or the queue was slow), submits one to begin now, so a gap
   lasts one poll;
-- submits nothing that would begin at or after `--until`, nothing beyond `--max` (4) submits, nothing past
+- submits nothing that would begin at or after `--until` or the marker's time, nothing beyond `--max` (4) submits, nothing past
   `HPCT_MAX_ALIVE`; it stops at `--until`, on `renew.stop`, after a submit that was not as asked (that job cancelled), or
   after three failed submits in a row.
 
