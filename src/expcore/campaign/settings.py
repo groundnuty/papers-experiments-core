@@ -121,16 +121,22 @@ class SchedulerConfig:
         )
 
     def check_declared_deferral(
-        self, declared: DeferralBound | None, reported: DeferralBound | None, *, exposed: bool
+        self,
+        declared: DeferralBound | None,
+        reported: DeferralBound | None,
+        *,
+        exposed: bool,
+        source: str = "the platform",
     ) -> None:
         """Refuse a health check that does not carry what the platform declares: `declared` is the platform's own
         declaration of its longest deferral (the run admission's `declared_deferral_s`, read from its settings, with no
-        health object between), `reported` what the health check passed to the scheduler declares (`max_deferral_s`),
-        and `exposed` whether it has that method at all. A study's own check around the platform's that leaves the
-        method out would hold `max_defer_s` to nothing, and one that declares less would hold it to less: both are
-        refused, naming the platform's figure, what the check declares and the fix, compared as the `max_defer_s` each
-        needs under this campaign's own waits (`deferral_needed`). A check that declares more, or the same, agrees.
-        Nothing is asked of a platform that declares none."""
+        health object between, or what the platform's module answers from its configuration, read by the core through
+        `[study] platforms`: `source` names which), `reported` what the health check passed to the scheduler declares
+        (`max_deferral_s`), and `exposed` whether it has that method at all. A study's own check around the platform's
+        that leaves the method out would hold `max_defer_s` to nothing, and one that declares less would hold it to
+        less: both are refused, naming the platform's figure, what the check declares and the fix, compared as the
+        `max_defer_s` each needs under this campaign's own waits (`deferral_needed`). A check that declares more, or the
+        same, agrees. Nothing is asked of a platform that declares none."""
         if declared is None:
             return
         platform, platform_words = self._deferral_words(declared)
@@ -149,7 +155,7 @@ class SchedulerConfig:
                 f"({self._deferral_words(reported)[1]}), shorter than the platform's"
             )
         raise ConfigError(
-            f"{reason}, but the platform declares a deferral of {platform:g} s ({platform_words}); pass the method "
+            f"{reason}, but {source} declares a deferral of {platform:g} s ({platform_words}); pass the method "
             "on: a study's own check around the platform's must have a max_deferral_s() that returns the wrapped "
             f"check's, or campaign.toml [scheduler] max_defer_s ({self.max_defer_s:g} s) is not held to what the "
             "platform declares, and a deferral past it closes the health gate as blocking"
