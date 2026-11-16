@@ -105,6 +105,7 @@ POLL_S = 0.05  # seconds between two tries for the exclusive hold
 # session of its own, a read the provider still serves, an agent's cell in its sandbox) ends within its own bounds,
 # which the core does not know, so the refusal outlasts every bound the platform declares (`admission_timeout_s`).
 DEAD_HOLDER_QUIET_S = 3600.0
+SCRIPTED_REASON = "reset_between_batches"  # the example reason the refusal of a reset with no admission names
 _GRANT: ContextVar["ResetGrant | None"] = ContextVar("expcore_onedata_reset_grant", default=None)
 
 
@@ -271,9 +272,12 @@ def _take(config: PlatformConfig, settings: PlacementSettings) -> ResetGrant:
     if admission is None:
         raise AdmissionRefused(
             f"{config.file}: [faults]: a reset runs only under the federation's admission, which this context does not "
-            "hold: a campaign run's (reset in the run's own context; a thread pool's run_in_executor does not carry "
-            "it, asyncio.to_thread does), or, outside a campaign, shared_admission(config, reason=...) around it. "
-            "Without one it could run beside another holder of the federation; refused before anything was sent"
+            f"hold. Outside a campaign, wrap the reset in shared_admission(config, reason=<code>) "
+            f"(expcore_onedata.tool_admission; <code> a short code such as {SCRIPTED_REASON}): "
+            f'with shared_admission(config, reason="{SCRIPTED_REASON}"): SpaceReset(provisioner).run(...). '
+            "Inside a campaign, reset in the run's own context (asyncio.to_thread carries it; a thread pool's "
+            "run_in_executor does not). Without an admission it could run beside another holder of the federation; "
+            "refused before anything was sent"
         )
     federation = federation_of(faults)
     require_same_federation(admission, federation)

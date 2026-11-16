@@ -6,8 +6,17 @@ outage (`expcore_onedata.admission`). A tool that is no campaign attempt (a stud
 an ad hoc check) held none, so it could read and write through a provider that an outage is taking down or restoring.
 `shared_admission(config, reason=...)` is the hold such a tool takes, around everything it does on the federation:
 
-    with shared_admission(config, reason="smoke: warm-up of the first space"):
-        ...  # start the sandbox and the tool server, read, write
+    with shared_admission(config, reason="smoke_warmup"):
+        ...  # start the sandbox and the tool server, read, write, reset
+
+`reason` goes into the record of the holds, which is published with the study, so it is a short code
+(`shortcode.checked_code`): a lower-case letter, then up to 63 lower-case letters, digits or underscores, holding no
+name the platform's configuration gives, ignoring case and separators; anything else is `ValueError` before anything is
+taken. A script that resets a space outside a campaign wraps the reset in it (on a platform with `[faults]` a reset
+with no admission is refused, `resetgrant.py`):
+
+    with shared_admission(config, reason="reset_between_batches"):
+        SpaceReset(provisioner).run(evict)
 
 It takes the same lock a campaign attempt takes, shared, so tools and attempts hold the federation together and an
 outage run, which needs it exclusively, never overlaps one; and the same turnstile, so a stream of tools cannot keep an
@@ -73,8 +82,9 @@ from expcore_onedata.fault_recovery import failure
 from expcore_onedata.fault_settings import FaultSettings
 from expcore_onedata.ingesthealth import baseline_health
 from expcore_onedata.shared_holds import SharedHolds
+from expcore_onedata.shortcode import checked_code
 
-MAX_REASON = 200  # characters
+REASON_SAYS = "what the tool holds the federation for, e.g. smoke_warmup or reset_between_batches"
 
 
 @dataclass(frozen=True)
@@ -90,8 +100,7 @@ class _Plan:
 
 def _plan(config: PlatformConfig, reason: object, timeout_s: object, ingest_journals: Iterable[Path | str]) -> _Plan:
     """Validate the arguments of a hold, and read the platform's `[faults]`; `ValueError` names the argument."""
-    if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON or not reason.isprintable():
-        raise ValueError(f"reason must be one printable line of text of 1 to {MAX_REASON} characters")
+    code = checked_code(reason, config, what="reason", says=REASON_SAYS)  # it goes into the published record of holds
     if timeout_s is not None and (
         isinstance(timeout_s, bool)
         or not isinstance(timeout_s, int | float)
@@ -101,7 +110,7 @@ def _plan(config: PlatformConfig, reason: object, timeout_s: object, ingest_jour
         raise ValueError("timeout_s must be a finite number of seconds, 0 or more, or None for the platform's bound")
     settings = fault_settings_of(config)
     bound = float(timeout_s) if timeout_s is not None else settings.admission_timeout_s if settings else None
-    return _Plan(reason, bound, settings, tuple(Path(journal) for journal in ingest_journals))
+    return _Plan(code, bound, settings, tuple(Path(journal) for journal in ingest_journals))
 
 
 def _require_baselines(plan: _Plan) -> None:
@@ -170,8 +179,10 @@ def shared_admission(
     ingest_journals: Iterable[Path | str] = (),
 ) -> Iterator[Admission | None]:
     """Hold the federation shared for the body of a `with`, as the running context's admission, recording who holds it
-    (see the module docstring). `reason` is the tool's own words, one printable line of at most 200 characters, which
-    goes into the record and nowhere else. Yields the admission, or None for a platform without `[faults]`.
+    (see the module docstring). `reason` is a short code that says what the tool holds it for (a lower-case letter,
+    then up to 63 lower-case letters, digits or underscores, holding no configured name: `shortcode.checked_code`),
+    which goes into the published record of the holds and nowhere else. Yields the admission, or None for a platform
+    without `[faults]`.
 
     Raises `ValueError` for a reason or a bound that is not valid, `FederationBusy` (kind `federation_busy`) when an
     outage run held the federation, or its session drain kept it closed, past the bound, `InfraError` of kind
