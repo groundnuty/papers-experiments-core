@@ -56,6 +56,14 @@ observations leaves its target's bound unknown, `listing_not_settled`. The wait 
 time. A job that lags for longer than the settle time and also stays out of the next observation is not seen; the
 setting is what bounds that.
 
+**The harness's own jobs (O08).** A job the provisioner scheduled that the accepted listing does not show proves the
+listing incomplete, and what else it misses could be into any provider: every bound is unknown, `harness_unlisted`
+counts them. The provisioner's log holds the jobs it scheduled before the run too, a reset's evictions among them, and
+the ended walk never keeps a job that ended before the cutoff, so for each harness job the listing lacks, its record is
+read on the tracked providers in turn: one that says it ended (a final state) with a finish time after 0 and before the
+cutoff is absent by design and flags nothing (`harness_before_window` counts them). A record that cannot be read, has
+not ended, or ended at or after the cutoff leaves the job missing.
+
 **Fail closed.** A page or record that cannot be read, or one not in the documented shape (`transferrecord.py`), makes
 the whole listing `probe_ok` false with the reason and no records, never fewer or no transfers. A listing longer than
 its bound (`MAX_LISTED` distinct ids read: the waiting, the ongoing and the ended ones down to the cutoff, never the
@@ -284,7 +292,9 @@ class TransferLog:
 
     def read(self, window: Window | None, file_ids: Mapping[str, str], harness: Collection[str]) -> Reading:
         """Return the snapshot's record of the space's transfers in the window, with the jobs in it and those that leave
-        a bound unknown. `file_ids` labels a tracked file's id, and `harness` holds the ids the provisioner scheduled.
+        a bound unknown. `file_ids` labels a tracked file's id, and `harness` holds the ids the provisioner scheduled,
+        before the run as well as in it: one the accepted listing does not show leaves every bound unknown
+        (`harness_unlisted`), unless its own record says it ended before the cutoff (`harness_before_window`).
         When the listing is unknown the jobs are None and the section's `probe_ok` is false with the reason."""
         self._pages = 0
         section: dict[str, Any] = {
@@ -324,18 +334,40 @@ class TransferLog:
         everywhere = set() if clock["known"] else {CLOCK_UNKNOWN}
         if changed:
             everywhere.add(NOT_SETTLED)
-        # A transfer the harness itself scheduled that the accepted listing does not show proves the listing
-        # incomplete, and what else it misses could be into any provider.
         listed = _ids(observation, self._providers)
         # A job an earlier observation showed that the accepted one does not: the listing dropped it, so it is not to
         # be trusted to hold every job, and what it dropped could be into any provider.
         if self._seen - listed:
             everywhere.add(LISTING_DROPPED)
             section["left_listing"] = len(self._seen - listed)
-        if set(harness) - listed:
+        # A transfer the harness itself scheduled that the accepted listing does not show proves the listing
+        # incomplete, and what else it misses could be into any provider; but not one whose record says it ended
+        # before the cutoff, such as a reset's eviction before the run: the ended walk never keeps such a job, so the
+        # listing lacks it by design (O32).
+        missing = sorted(set(harness) - listed)
+        before = [tid for tid in missing if self._ended_before_cutoff(tid)]
+        if before:
+            section["harness_before_window"] = len(before)
+        if len(missing) > len(before):
             everywhere.add(HARNESS_UNLISTED)
-            section["harness_unlisted"] = len(set(harness) - listed)
+            section["harness_unlisted"] = len(missing) - len(before)
         return Reading(reading.section, reading.inside, reading.flagged, frozenset(everywhere))
+
+    def _ended_before_cutoff(self, tid: str) -> bool:
+        """Tell whether a job's record, on a tracked provider, says it ended (a final state) with a finish time after 0
+        and before the cutoff: a job the ended walk never keeps (`transferorder.newest_first`), whose absence from the
+        listing says nothing of it. Each tracked provider's record is read in turn until one says so. One that cannot
+        be read, has not ended, gives no finish time or 0, or ended at or after the cutoff vouches for nothing, and the
+        job stays a harness job the listing does not show."""
+        for provider in self._providers:
+            try:
+                body = self._record(provider, tid)
+            except Unreadable:
+                continue  # this provider's record was not read: it vouches for nothing, and the next is asked
+            finish = _finished(body)
+            if state_of(body) in FINAL_STATES and finish is not None and 0 < finish < self._cutoff:
+                return True
+        return False
 
     def _edges(self, window: Window) -> tuple[Edges, dict[str, Any]]:
         """Move the window onto the global clock, the one a job's times are stamped on, by the readings of it, and

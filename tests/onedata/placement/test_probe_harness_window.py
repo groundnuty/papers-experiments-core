@@ -73,19 +73,27 @@ def test_o08_a_reset_eviction_before_the_window_leaves_the_split_known(client, p
     assert eviction not in {r["transfer_id"] for r in snapshot["space_transfers"]["records"]}
 
 
-def test_o08_a_harness_job_pages_past_the_walks_stop_is_read_on_its_own(client, provisioner, seeded, ticker):
-    """O08 with O32: with 8 ids a page, the harness's eviction, older than the 64 jobs of the history, is listed on
-    the eleventh page, past the third, which holds the walk's stop, and the fourth, which it checks after it, so the
-    walk never reads it. Its own record says it ended before the cutoff: beta's split is known all the same."""
-    seeded.clock = ticker.clock
-    files = tracked(seeded)
-    provisioner.evict(PATH, "beta")  # the oldest job of the space
+def deep_eviction(client, provisioner, seeded, ticker, files) -> tuple[str, PlatformProbes]:
+    """The harness's eviction as the oldest job of the space, the 64 of the history after it, all before the run, and
+    probes asking 8 ids a page: the eviction is listed on the eleventh page, past the third, which holds the walk's
+    stop, and the fourth, which it checks after it, so the walk never reads its record. Return its id and the probes."""
+    provisioner.evict(PATH, "beta")
+    (eviction,) = [tid for _, tid, kind in provisioner.transfers() if kind == "eviction"]
     ticker.sleep(INSIDE_S + OLDER)
     history(seeded, first=ticker.now - OLDER)  # every one ended after the eviction, and before the run
     ticker.sleep(BEFORE_S)
     probes = PlatformProbes(
         client, provisioner, files, ["alpha", "beta"], sleep=ticker.sleep, now=ticker.clock, page_limit=8
     )
+    return eviction, probes
+
+
+def test_o08_a_harness_job_pages_past_the_walks_stop_is_read_on_its_own(client, provisioner, seeded, ticker):
+    """O08 with O32: the harness's eviction lies pages past the walk's stop, so the walk never reads it. Its own
+    record says it ended before the cutoff: beta's split is known all the same."""
+    seeded.clock = ticker.clock
+    files = tracked(seeded)
+    _, probes = deep_eviction(client, provisioner, seeded, ticker, files)
     snapshot = run_window(probes, seeded, client, ticker, files)
     assert_split_known(snapshot)
     assert snapshot["space_transfers"]["harness_before_window"] == 1
@@ -96,19 +104,18 @@ def test_o08_a_harness_job_pages_past_the_walks_stop_is_read_on_its_own(client, 
 
 
 def test_o08_a_harness_job_whose_record_cannot_be_read_still_flags_every_bound(client, provisioner, seeded, ticker):
-    """O08: the harness's eviction before the window is missing from the listing and its record answers 500 on every
-    provider: nothing says it ended before the cutoff, so the listing may be incomplete and every bound is unknown."""
+    """O08: the harness's eviction before the window, pages past the walk's stop, is missing from the listing, and
+    its record answers 500 on every provider: nothing says it ended before the cutoff, so the listing may be
+    incomplete and every bound is unknown. The listing itself was read: only the eviction's record failed."""
     seeded.clock = ticker.clock
     files = tracked(seeded)
-    history(seeded, first=100)
-    provisioner.evict(PATH, "beta")
-    (eviction,) = [tid for _, tid, kind in provisioner.transfers() if kind == "eviction"]
+    eviction, probes = deep_eviction(client, provisioner, seeded, ticker, files)
     seeded.statuses.append([f"/transfers/{eviction}", 99, 500])
-    ticker.sleep(BEFORE_S)
-    probes = PlatformProbes(client, provisioner, files, ["alpha", "beta"], sleep=ticker.sleep, now=ticker.clock)
     snapshot = run_window(probes, seeded, client, ticker, files)
-    assert snapshot["space_transfers"]["harness_unlisted"] == 1
-    assert "harness_before_window" not in snapshot["space_transfers"]
+    section = snapshot["space_transfers"]
+    assert section["probe_ok"] is True, section["error"]
+    assert section["harness_unlisted"] == 1
+    assert "harness_before_window" not in section
     for provider in ("providers[0]", "providers[1]"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "harness_transfer_not_listed" in snapshot["on_demand"][provider]["unknown"]
