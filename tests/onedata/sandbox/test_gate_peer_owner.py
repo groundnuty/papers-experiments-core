@@ -199,6 +199,24 @@ def test_with_the_flag_on_a_peer_no_table_lists_is_refused(world, tmp_path):
     assert (found["reason"], found["peer_uid"]) == ("not_found", None)
 
 
+@needs_proc
+def test_a_log_that_cannot_be_written_neither_ends_the_accept_loop_nor_leaves_the_connection_open(world, monkeypatch):
+    """O61: `_log` falls back to stderr, and that may be a pipe nobody reads: the error it raises must not leave the
+    accept loop, and the refused connection is closed all the same."""
+    httpd = world.start(True)
+    ours, real_log = gate._PEER_CHECK, gate._log
+
+    def broken(rec):
+        raise BrokenPipeError("stderr is gone")
+
+    gate._PEER_CHECK = peer().OwnerCheck(other_uid())
+    monkeypatch.setattr(gate, "_log", broken)
+    assert bytes_from(httpd.server_port) == b""  # closed: a connection left open would time out here
+    monkeypatch.setattr(gate, "_log", real_log)
+    gate._PEER_CHECK = ours
+    assert write_answer(world, httpd.server_port) == 403  # and the loop is alive
+
+
 def test_a_check_that_fails_refuses_the_connection_and_says_so(world):
     """O61: a fault in the check is a refusal, logged with its error: never a connection served unchecked."""
 

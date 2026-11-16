@@ -1422,7 +1422,8 @@ def _admit_peer(conn, listen: int) -> bool:
     """True if `conn`, just accepted, is from a socket of the gate's own uid. Otherwise one `peer_refused` line says why
     (it carries no `error_origin`, so no summary counts it as an error: a refusal is the check working) and the
     connection is reset, unread and unwritten. A fault in the check refuses too. This runs in the accept loop and never
-    raises: an exception out of it would end the loop."""
+    raises: an exception out of it would end the loop, so a log that cannot be written (`_log` falls back to stderr,
+    which may be gone too) loses the line and still closes the connection."""
     detail = None
     try:
         verdict = _PEER_CHECK.decide(conn)
@@ -1435,7 +1436,8 @@ def _admit_peer(conn, listen: int) -> bool:
     rec["peer"] = verdict.peer
     if detail:
         rec["error"] = detail
-    _log(rec)
+    with contextlib.suppress(Exception):  # nowhere is left to report a log that failed twice; the refusal stands
+        _log(rec)
     with contextlib.suppress(OSError):
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # close() is then a reset
     with contextlib.suppress(OSError):

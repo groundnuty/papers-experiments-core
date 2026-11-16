@@ -11,6 +11,7 @@ the destination the shim passes on and fails, so no packet leaves; and the egres
 one), which logs what it is asked to connect to. Nothing leaves the machine.
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -26,6 +27,7 @@ HPC = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation"
 SHIM = HPC / "bundle" / "gateport.c"
 EGRESS = HPC / "bundle" / "egresslog.c"
 FAKE = HPC / "tests" / "fake_next_connect.c"
+PROBE = HPC / "tests" / "gateport_probe.c"
 GCC = shutil.which("gcc")
 FLAGS = [
     "-shared",
@@ -90,12 +92,14 @@ def built():
     _compile([GCC, *FLAGS, "-o", str(root / "shipped.so"), str(SHIM), "-ldl"])
     _compile([GCC, *FLAGS, f'-DHPCOP_EGRESS_SOCKET="{sock}"', "-o", str(root / "egresslog.so"), str(EGRESS)])
     _compile([GCC, "-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(root / "fake.so"), str(FAKE)])
+    _compile([GCC, "-O2", "-Wall", "-Wextra", "-Werror", "-o", str(root / "probe"), str(PROBE)])
     yield {
         "root": root,
         "gateport": root / "gateport.so",
         "shipped": root / "shipped.so",
         "egress": root / "egresslog.so",
         "fake": root / "fake.so",
+        "probe": root / "probe",
         "sock": sock,
         "file": root / "gate.json",
     }
@@ -133,7 +137,13 @@ out = []
 for kind, host, port in steps:
     result = {"kind": kind, "host": host, "port": port}
     family = socket.AF_UNIX if kind == "unix" else socket.AF_INET6 if ":" in host else socket.AF_INET
-    s = socket.socket(family, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM)
+    protocol = int(kind[5:]) if kind.startswith("proto") else 0
+    try:
+        s = socket.socket(family, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM, protocol)
+    except OSError as e:
+        result["no_socket"] = e.errno
+        out.append(result)
+        continue
     s.settimeout(5)
     try:
         if kind == "mapped":
@@ -154,19 +164,21 @@ print(json.dumps(out))
 """
 
 
-def run_client(steps, preload, env=None):
-    """Run the client under LD_PRELOAD=`preload` with `env` added; (its results by step, its stderr)."""
+def run_client(steps, preload, env=None, stderr=None):
+    """Run the client under LD_PRELOAD=`preload` with `env` added; (its results by step, its stderr). With `stderr`, a
+    file descriptor of the test's, the client's stderr goes there and is not captured (its text is then "")."""
     base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LD_PRELOAD": ":".join(str(p) for p in preload)}
     done = subprocess.run(
         [sys.executable, "-I", "-c", CLIENT, json.dumps(steps)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE if stderr is None else stderr,
         text=True,
         timeout=60,
         env={**base, **(env or {})},
         check=False,
     )
-    assert done.returncode == 0, done.stderr
-    return json.loads(done.stdout), done.stderr
+    assert done.returncode == 0, (done.returncode, done.stderr)
+    return json.loads(done.stdout), done.stderr or ""
 
 
 def listener(family=socket.AF_INET, host="127.0.0.1") -> socket.socket:
@@ -377,6 +389,47 @@ def test_every_other_ipv6_destination_reaches_the_next_connect_unchanged(built, 
     ]
 
 
+@pytest.mark.parametrize(("name", "protocol"), [("sctp", 132), ("mptcp", 262)])
+def test_a_stream_socket_that_is_not_tcp_is_untouched(built, tmp_path, name, protocol):
+    """O61: SOCK_STREAM is also SCTP and MPTCP; only TCP is the REST client's, and a plain TCP socket given by its
+    protocol number is still mapped (the control)."""
+    steps = [[f"proto{protocol}", "127.0.0.1", 443], ["proto6", "127.0.0.1", 443]]
+    results, _, seen = via_the_stand_in(built, tmp_path, steps, {ENV: "34567"})
+    if "no_socket" in results[0]:
+        pytest.skip(f"this host has no {name} sockets (errno {results[0]['no_socket']})")
+    assert seen == [("tcp", "inet", "127.0.0.1", "443"), ("tcp", "inet", "127.0.0.1", "34567")]
+
+
+def test_a_socket_address_shorter_than_its_family_needs_is_never_read_past_its_length(built):
+    """O61: the shim reads nothing of the address before its length allows: every short length, at the end of the last
+    readable page, comes back EINVAL from the kernel, and the process lives."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LD_PRELOAD": str(built["gateport"]), ENV: "34567"}
+    done = subprocess.run(
+        [str(built["probe"]), "short"], capture_output=True, text=True, timeout=60, env=env, check=False
+    )
+    assert done.returncode == 0, (done.returncode, done.stderr)
+    lines = [line.split() for line in done.stdout.splitlines()]
+    assert len(lines) == 16 + 24
+    assert {(r[2], r[3]) for r in lines} == {("-1", "22")}  # EINVAL, every one
+
+
+@needs_ipv6
+def test_the_short_ipv6_address_the_kernel_accepts_is_mapped_and_read_no_further(built):
+    """O61: [::1]:443 as the 24-byte address (no scope id) is rewritten from those 24 bytes alone."""
+    gate = listener(socket.AF_INET6, "::1")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LD_PRELOAD": str(built["gateport"]),
+        ENV: str(port_of(gate)),
+    }
+    done = subprocess.run(
+        [str(built["probe"]), "v6short"], capture_output=True, text=True, timeout=60, env=env, check=False
+    )
+    assert done.returncode == 0, (done.returncode, done.stderr)
+    assert done.stdout.split() == ["0", str(port_of(gate))]
+    assert len(taken(gate)) == 1
+
+
 # --------------------------------------------------------------------------------------- a variable or file unusable
 
 
@@ -488,6 +541,38 @@ def test_a_path_that_is_no_regular_file_leaves_every_connection_alone_and_says_s
     assert taken(gate) == []
     assert len(stderr.splitlines()) == 1, stderr
     assert "gate.json" in stderr
+
+
+def test_a_stderr_pipe_nobody_reads_does_not_kill_the_process_that_loads_the_shim(built):
+    """O61: the line is written in a constructor, before main(): a pipe whose reader has gone must not end the process
+    with SIGPIPE (run_client asserts the exit status 0)."""
+    read, write = os.pipe()
+    os.close(read)
+    try:
+        results, _ = run_client([["udp", "127.0.0.1", 443]], [built["gateport"]], {ENV: "not-a-port"}, stderr=write)
+    finally:
+        os.close(write)
+    assert results[0]["peer"] == 443
+
+
+def test_a_stderr_pipe_that_is_full_does_not_hold_the_process_that_loads_the_shim(built):
+    """O61: a write to a full pipe blocks, and a process that waited for its reader before main() would hang: the
+    client has 60 s, and finishes at once."""
+    read, write = os.pipe()
+    flags = fcntl.fcntl(write, fcntl.F_GETFL)
+    fcntl.fcntl(write, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        while True:  # fill it
+            try:
+                os.write(write, b"x" * 4096)
+            except BlockingIOError:
+                break
+        fcntl.fcntl(write, fcntl.F_SETFL, flags)  # the client's stderr is this same description: blocking again
+        results, _ = run_client([["udp", "127.0.0.1", 443]], [built["gateport"]], {ENV: "not-a-port"}, stderr=write)
+    finally:
+        os.close(write)
+        os.close(read)
+    assert results[0]["peer"] == 443
 
 
 # ----------------------------------------------------------------------------- with the egress shim (O52, order)

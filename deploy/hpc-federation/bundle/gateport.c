@@ -5,7 +5,8 @@
  * federation's names to 127.0.0.1: the client's connect to <name>:443 is a connect to 127.0.0.1:443. This shim sends that
  * one connect to the gate. Everything else the cell connects to is left exactly as it is.
  *
- *   connect()  of a TCP socket to 127.0.0.1:443 or to [::1]:443  -> the same address, on the gate's port
+ *   connect()  of a TCP socket (SOCK_STREAM, protocol TCP: SCTP and MPTCP are not) to 127.0.0.1:443 or to [::1]:443
+ *                                                  -> the same address, on the gate's port
  *   connect()  anything else (any other address or port, [::ffff:127.0.0.1]:443 included, UDP, a Unix socket) -> untouched
  *
  * The gate's port comes from two places, read once, when the shim loads (a constructor, before any thread of the
@@ -24,7 +25,8 @@
  *   2. EXPCORE_GATE_PORT, when there is no such file: a decimal port, digits only, from 1 to 65535, no sign, space or
  *      suffix. Unset, the shim is inert and silent (a process that dropped its environment keeps its connections as
  *      they are); set to anything else, it is inert and says so on stderr once, by one line naming the variable.
- * The shim never guesses a port. A path other than /etc/expcore/gate.json is for the tests' build only
+ * A line on stderr is written only if stderr can take it at once, with SIGPIPE held back: a closed or full pipe loses
+ * the line and never kills or blocks the process that loads the shim. The shim never guesses a port. A path other than /etc/expcore/gate.json is for the tests' build only
  * (-DEXPCORE_GATE_CONFIG_FILE="...").
  *
  * Only the port changes, never the address, and the result is the real connect()'s: the shim fabricates no success and
@@ -56,12 +58,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef EXPCORE_GATE_CONFIG_FILE
@@ -87,13 +92,32 @@ static void note(const char *line) {
     struct stat st;
     size_t n = strlen(line);
     int saved = errno;
-    if (syscall(SYS_fstat, 2, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode) || S_ISCHR(st.st_mode)))
-        while (n > 0) {
-            long w = syscall(SYS_write, 2, line, n);
-            if (w < 0 && errno == EINTR) continue;
-            if (w <= 0) break;
-            line += w; n -= (size_t)w;
+    if (syscall(SYS_fstat, 2, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode) || S_ISCHR(st.st_mode))) {
+        /* This runs in a constructor, before main() of every process that loads the shim, so it must neither kill nor
+         * hold one: a pipe whose reader has gone raises SIGPIPE, and a full pipe blocks the write. The line is written
+         * only if stderr can take it at once (poll), with SIGPIPE held back for the write and, if it came, taken away. */
+        struct pollfd ready = {2, POLLOUT, 0};
+        sigset_t pipe_signal, before, pending;
+        int was_pending;
+        sigemptyset(&pipe_signal);
+        sigaddset(&pipe_signal, SIGPIPE);
+        sigprocmask(SIG_BLOCK, &pipe_signal, &before);
+        sigpending(&pending);
+        was_pending = sigismember(&pending, SIGPIPE);
+        if (poll(&ready, 1, 0) == 1 && (ready.revents & POLLOUT) && !(ready.revents & (POLLERR | POLLHUP | POLLNVAL)))
+            while (n > 0) {
+                long w = syscall(SYS_write, 2, line, n);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) break;
+                line += w; n -= (size_t)w;
+            }
+        sigpending(&pending);
+        if (!was_pending && sigismember(&pending, SIGPIPE)) {
+            struct timespec none = {0, 0};
+            sigtimedwait(&pipe_signal, NULL, &none);
         }
+        sigprocmask(SIG_SETMASK, &before, NULL);
+    }
     errno = saved;
 }
 
@@ -355,17 +379,20 @@ __attribute__((constructor)) static void gateport_init(void) {
 
 /* ---- connect() ---- */
 
-static int is_stream(int fd) {   /* a system call: this shim must not call the connect it replaces */
-    int type = 0;
-    socklen_t n = sizeof type;
-    return syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_TYPE, &type, &n) == 0 && type == SOCK_STREAM;
+/* TCP and nothing else: a SOCK_STREAM socket may also be SCTP or MPTCP, whose connect to 127.0.0.1:443 is not the REST
+ * client's. Two system calls: this shim must not call the connect it replaces. */
+static int is_tcp(int fd) {
+    int type = 0, protocol = 0;
+    socklen_t n = sizeof type, m = sizeof protocol;
+    return syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_TYPE, &type, &n) == 0 && type == SOCK_STREAM
+           && syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &m) == 0 && protocol == IPPROTO_TCP;
 }
 
 /* 1 if a connect() of fd to addr is the one this shim redirects, with *to the destination to use instead: the same
  * address and the gate's port. Everything else, and anything that is not a well-formed address, is 0. */
 static int redirect(int fd, const struct sockaddr *addr, socklen_t len, struct sockaddr_storage *to) {
     memset(to, 0, sizeof *to);
-    if (!addr) return 0;
+    if (!addr || len < (socklen_t)sizeof(sa_family_t)) return 0;   /* nothing of addr may be read before its length is */
     if (addr->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
         struct sockaddr_in *s = (struct sockaddr_in *)to;
         memcpy(s, addr, sizeof *s);
@@ -379,7 +406,7 @@ static int redirect(int fd, const struct sockaddr *addr, socklen_t len, struct s
     } else {
         return 0;
     }
-    return is_stream(fd);
+    return is_tcp(fd);
 }
 
 /* The next connect() after this one: egresslog.so's when it is loaded after this shim, else libc's. Looked up on the

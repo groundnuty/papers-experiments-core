@@ -36,7 +36,7 @@ DEFAULT_OVERFLOW_UID = 65534  # the kernel's default, used when its file cannot 
 TIME_WAIT = 0x06  # the state of a finished connection's leftover row, which never has an owner
 LOOKUPS = 2  # a row not found is looked up once more: a table read a page at a time can miss a row that moves
 
-Endpoint = "tuple[bytes, int]"  # an address as 16 bytes, an IPv4 address as ::ffff:a.b.c.d, and a port (a string: 3.8)
+Endpoint = tuple[bytes, int]  # an address as 16 bytes, an IPv4 address as ::ffff:a.b.c.d, and a port
 _V4_PREFIX = b"\x00" * 10 + b"\xff\xff"
 
 _HEX = "[0-9A-Fa-f]"
