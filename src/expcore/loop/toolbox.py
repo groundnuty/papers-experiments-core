@@ -20,7 +20,7 @@ from expcore.loop.arguments import argument_problems
 from expcore.loop.capping import cap_error, cap_text, describe_cap, render_error
 from expcore.loop.records import ToolCallRecord
 from expcore.models.adapters import ToolCall, ToolResult
-from expcore.plugin import NO_WAITS, CallContext, ToolProvider, ToolSpec
+from expcore.plugin import NO_WAITS, CallContext, ToolOutput, ToolProvider, ToolSpec
 
 SKIPPED_CLASS = "skipped"
 SKIP_REASONS = {
@@ -46,6 +46,7 @@ class ToolRun:
     error_class: str | None
     ends_attempt: bool  # a successful call of a terminal tool
     source_truncated: bool | None = None  # the data source's own limit was hit, as the provider says (L07)
+    exec_check: dict[str, Any] | None = None  # what a code tool verified of its exec, as the provider says (O55)
 
     def record(
         self,
@@ -86,10 +87,16 @@ class ToolRun:
             elapsed_s=elapsed_s,
             detail=detail,
             source_truncated=self.source_truncated,
+            exec_check=self.exec_check,
             waits_left_open=waits_left_open,
             terminal=terminal,
             infra_wait_by_kind=dict(waited_by_kind or {}),
         )
+
+
+def _checked(output: ToolOutput) -> dict[str, Any] | None:
+    """The provider's exec check as the record keeps it: a plain copy, or None when it gave none (O55)."""
+    return None if output.exec_check is None else dict(output.exec_check)
 
 
 def serves_a_tool_server(provider: ToolProvider) -> bool:
@@ -227,6 +234,7 @@ class ToolBox:
                 error_class,
                 False,
                 output.source_truncated,
+                _checked(output),
             )
         text, truncated = cap_text(output.text, self.cap_chars)
         return ToolRun(
@@ -238,4 +246,5 @@ class ToolBox:
             None,
             spec.terminal,
             output.source_truncated,
+            _checked(output),
         )
