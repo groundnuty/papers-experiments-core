@@ -381,11 +381,13 @@ starts.
 step makes its `work_root` (0700) before the dispatcher and refuses one that is a link, another user's, open to others
 or not under `--tmpfs`. It copies the federation's `platform.toml` beside the study's `study.toml` in its copy, where
 the study's plugin loads it, so no federation's path is ever in `study.toml`; a study that holds a `platform.toml` of
-its own is refused. The node's tmpfs is the node's, not the job's: each step's directory there records its process and
-its federation (`step.json`); `--resume` removes its shard's earlier ones whose step is shown gone (by pid and start
-time) and refuses while one still runs, and `down` sweeps the agent's node. One whose `out/` could not be archived
-(exit 75) is marked and kept: `--resume` refuses while it is there, and `shards.py step ... --archive-left` archives it
-with the same manifest and that step's exit status, then removes it.
+its own is refused. The node's tmpfs is the node's, not the job's: each step's directory there records its process,
+its campaign and its federation, and whether its dispatcher has ended (`step.json`). Only a step killed while its
+dispatcher ran is removed, once it and every process naming its directory are shown gone: by `--resume` (its own
+shard's, of its own campaign; it refuses while one still runs) and by `down`'s sweep of the agent's node. One whose
+dispatcher ended and whose `out/` was not archived (exit 75, or killed before the archive) is kept and named:
+`--resume` refuses while it is there, and `shards.py step ... --archive-left` archives it with the same manifest and that
+step's exit status, then removes it, unless an archive was published after that step started.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into

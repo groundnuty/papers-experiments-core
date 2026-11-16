@@ -597,11 +597,13 @@ def test_a_state_whose_agents_job_is_not_a_job_id_is_refused(hpc, tmp_path, site
 
 def step_directory(node_tmp: Path, name: str, root: Path, *, start: str = "0", failed: bool = False) -> Path:
     """A shard step's directory on the agent's node's tmpfs, as shards.py step makes it: its owner record (by default
-    of a step that is gone: this process's pid with another start time) and, with `failed`, its archive-failed mark."""
+    of a step killed while its dispatcher ran: this process's pid with another start time) and, with `failed`, the
+    record of a dispatcher that ended and its archive-failed mark."""
     path = node_tmp / f"expcore-shard-fed-a.{name}"
     (path / "study" / "out").mkdir(parents=True)
     shard = {"index": 1, "count": 2, "label": "fed-a"}
-    record = {"shard": shard, "pid": os.getpid(), "start": start, "root": str(root)}
+    record = {"shard": shard, "pid": os.getpid(), "start": start, "root": str(root),
+              "phase": "archiving" if failed else "running"}  # fmt: skip
     (path / "step.json").write_text(json.dumps(record), encoding="utf-8")
     if failed:
         (path / "ARCHIVE-FAILED.json").write_text(json.dumps({"shard": shard, "exit_status": 0}), encoding="utf-8")
@@ -630,7 +632,7 @@ def test_o63_down_sweeps_the_agents_node_removing_gone_steps_and_naming_a_kept_o
     assert swept.command[swept.command.index("--root") + 1] == str(rig.root)
     assert not gone.exists()
     assert kept.is_dir()
-    assert f"{kept.name} (its out/ could not be archived" in printed
+    assert f"{kept.name} (its out/ was not archived" in printed
     assert not rig.root.exists()
 
 
