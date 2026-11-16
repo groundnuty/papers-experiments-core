@@ -43,6 +43,7 @@ def make_study(tmp_path: Path, guard: str | None = "") -> Path:
     """A stamped study copy with its campaign.toml and, unless `guard` is None, its guard script."""
     study = tmp_path / "study"
     (study / "guards").mkdir(parents=True, exist_ok=True)
+    study.chmod(0o755)  # whatever the umask: the step refuses a root that group or others can write
     (study / "study.toml").write_text("[study]\n")
     (study / "campaign.toml").write_text("[scheduler]\nworkers = 1\n")
     if guard is not None:
@@ -269,6 +270,35 @@ def test_o63_a_guard_killed_by_a_signal_refuses_the_step_naming_the_signal(shard
     assert not seen
     assert "signal 9" in capsys.readouterr().err
     nothing_made(tmp_path)
+
+
+@pytest.mark.parametrize("case", ["group-writable", "world-writable", "not this user's", "a file", "missing"])
+def test_o63_a_study_root_that_is_shared_or_not_ours_refuses_the_step_before_the_guard_runs(
+    shards, tmp_path, monkeypatch, capsys, case
+):
+    """O63: the guard's working directory is the study's root, so a root another user could write to (group or other
+    write bit, owned by another user), a file or no path at all refuses the step with nothing made, and the guard,
+    which would write a marker, never runs."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    marker = tmp_path / "ran"
+    args = step_args(tmp_path, f"open({str(marker)!r}, 'w').close()\n")
+    if case == "group-writable":
+        args.study.chmod(0o775)
+    elif case == "world-writable":
+        args.study.chmod(0o757)
+    elif case == "not this user's":
+        uid = os.getuid()
+        monkeypatch.setattr(shards.os, "getuid", lambda: uid + 1)
+    elif case == "a file":
+        args.study = tmp_path / "study" / "study.toml"
+    else:
+        args.study = tmp_path / "no-study"
+    code, seen = run_step(shards, args)
+    assert code == shards.PRE_STEP_REFUSED
+    assert not seen
+    assert not marker.exists()
+    nothing_made(tmp_path)
+    assert GUARD in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("path", ["/abs/pre_step.py", "../outside.py", "guards/../pre_step.py", "./guards/pre_step.py",

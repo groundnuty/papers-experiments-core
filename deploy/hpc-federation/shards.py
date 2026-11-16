@@ -50,7 +50,8 @@ else, before the core check, before a `--resume` removes a killed step's directo
 work root, its own directory, the journals or an archive: it opens the guard part by part below `--study` (no link
 followed), refuses a file whose SHA-256 is not the one on its line, and runs those same bytes, never the file read
 again, as `<python> -I - <label> <study>/campaign.toml` (the script on the interpreter's stdin) with the study's root,
-`--study` (the stamped copy, since its tmpfs copy does not exist yet), as its working directory, in an environment of
+`--study` (the stamped copy, since its tmpfs copy does not exist yet; refused unless it is a directory of this
+user's that no group or other can write to), as its working directory, in an environment of
 `ALLOWLIST` and the step's home below a path nobody can make, and in a session of its own, killed with everything it
 started when it does not end within `pre_step_timeout_s` (60 s by default, above 0 and at most 600). A non-zero exit, a
 signal, a timeout, a hash mismatch or a guard that cannot be read refuses the step with `PRE_STEP_REFUSED` (73), naming
@@ -443,6 +444,23 @@ def read_guard(study: Path, path: str) -> bytes:
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def study_root_problem(study: Path) -> str | None:
+    """Why the study's root cannot be the guard's working directory, or None: it must be a directory of this user's that
+    no group or other can write to (a shared directory would let another user swap the campaign.toml the guard reads, or
+    anything it opens by a relative name). The check is of the directory the path leads to."""
+    try:
+        info = os.stat(study)
+    except OSError:
+        return "the study's root cannot be read"
+    if not stat.S_ISDIR(info.st_mode):
+        return "the study's root is not a directory"
+    if info.st_uid != os.getuid():
+        return "the study's root is not this user's"
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        return "the study's root can be written by its group or others"
+    return None
 
 
 def pinned(plan: Plan) -> Plan:
@@ -1076,7 +1094,8 @@ def run_pre_step(args: argparse.Namespace) -> dict[str, Any] | None:
     """The step's first act (the module's docstring): None when its line declares no guard, else the record
     `{path, sha256, exit_status: 0}` of the guard that passed. `PreStepRefused`, naming the guard and why, for a
     declaration that is incomplete or not a plain path of the study, a file that cannot be read or is not the one the
-    plan hashed, a study with no campaign.toml of its own, a guard that cannot start, does not end in its bound or does
+    plan hashed, a study root that is not this user's or that group or others can write, a study with no campaign.toml
+    of its own, a guard that cannot start, does not end in its bound or does
     not exit 0. It runs the bytes it hashed, in the study's root, given the shard's label and campaign.toml's path."""
     path, wanted, bound = (getattr(args, key, None) for key in ("pre_step", "pre_step_sha256", "pre_step_timeout"))
     if path is None:
@@ -1092,6 +1111,8 @@ def run_pre_step(args: argparse.Namespace) -> dict[str, Any] | None:
     if problem := bound_problem(bound):
         raise PreStepRefused(f"{name}: --pre-step-timeout {problem}")
     study = Path(os.path.abspath(args.study))
+    if problem := study_root_problem(study):
+        raise PreStepRefused(f"{name} cannot run: {problem}; the guard's working directory must be this user's alone")
     try:
         source = read_guard(study, path)
     except ShardsError as error:

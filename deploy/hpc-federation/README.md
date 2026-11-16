@@ -469,7 +469,7 @@ by part below `--study` with no link followed, refuses a file whose SHA-256 is n
 bytes, never the file read a second time: `<python> -I - <label> <study>/campaign.toml`, the script on the
 interpreter's stdin, so the guard's `sys.argv[1:]` is the shard's label and the path of the stamped `campaign.toml`.
 It runs with `-I`, the same interpreter as the step, in the study's root (`--study`, the stamped copy: the step's tmpfs
-copy does not exist yet), in an environment of the step's allowlist (`PATH`, `LC_ALL`, `EXPCORE_FED_ROOT_PARENT`,
+copy does not exist yet; refused unless it is a directory of this user's that no group or other can write to), in an environment of the step's allowlist (`PATH`, `LC_ALL`, `EXPCORE_FED_ROOT_PARENT`,
 `EXPCORE_FED_ROOT`) and the step's no-home variables and nothing else, and in a session of its own, killed with
 everything it started when it does not end within its bound. Its stdout and stderr are the step's. A non-zero exit, a
 signal, a timeout, a hash that is not the plan's or a guard that cannot be read refuses the step with exit status 73
