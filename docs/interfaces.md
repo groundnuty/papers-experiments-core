@@ -592,6 +592,40 @@ instruments = [..., MountGuard(sandbox, sandbox.mount_guard_nonce)]  # sandbox.m
 - **Both guards together** (`expcore.guards.guards_analysis`): a batch whose records carry both `egress` and `mount_guard` also gets the preregistered analysis again without every run either guard leaves out, flagged or unknown to either (a run unknown to one and clean to the other is left out). Each run is `GuardedRun` (`egress`: `clean`, `flagged`, or `unknown` for an unknown log alone; `mount`: the mount guard's verdict; `by`: `egress`, `mount`, `both` or None). `StudyAnalysis.guards` holds it (`GuardsAnalysis`: `runs`, `sensitivity`, `refused`, `left_out`, `counts()`, `by_condition()`, each with `analysed`, `left_out`, `egress_only`, `mount_only`, `both`); `analysis.json` gains `guards`; the report gains `## Egress and mount isolation together (detected, not prevented)` after the mount section (`expcore.report_guards`), its rerun's tables titled "without the runs either guard leaves out"; the terminal gains `both guards:` and `both-guards sensitivity` lines. A batch checked by one guard has none: that guard's rerun is the combined one.
 - **Limits.** Detection, not prevention. inotify names no process, so every event in the window counts as the agent's, and it never sees a read of memory the file was mapped into. A tracer is sampled, so one that attaches and leaves between two samples is missed. oneclient's environment (which holds the token) and memory are covered only by the proof that no cell can see its process, never watched. A cell that starts and ends between two polls is not proved itself: the run's proof rests on the cells caught (the start's canary cell holds on for a second) and on every cell's identical command line. A process of the uid that is not a cell (an ssh login into the node, a job step) is outside every check: **no interactive login and no other job step of the account may run on a sandbox node while runs are live** (the study guide's rule, for egress too). oneclient and the watcher carry the run's tag, so the reaper of a driver killed outright kills them as it kills the gate and the collector, after removing the token's file; it unmounts the FUSE mount a killed oneclient leaves (`fusermount3 -u`, then `-uz`), and keeps the run for a later reap when the mount stays.
 
+### Processes hidden from the watch: the `process_visibility` instrument
+
+`expcore.visibility` and the Apptainer backend's watch (O56). On an HPC batch node the agent's memory limit is a watch of the harness's over the cell's processes in `/proc`, which hides a process of the agent's that makes itself non-dumpable. The watch checks from outside (see "The Apptainer backend on an HPC batch node"), and the core reads what it found.
+
+```python
+from expcore.visibility import ProcessVisibility
+
+instruments = [..., ProcessVisibility(sandbox)]  # sandbox.process_visibility() -> Mapping | None
+```
+
+- **The snapshot** (version 1, under `instruments["process_visibility"]`) has these keys:
+  - `memory`: `within`, `over` or `unknown`;
+  - `unknown`: the reasons;
+  - `hidden_process`: the hidden processes found;
+  - `hidden_memory`: the cells killed for hidden memory;
+  - `figures`: `margin_bytes`, `start_unexplained_bytes`, `unexplained_peak_bytes`, `cgroup_anon_bytes` and `visible_anon_bytes`, each bytes or None.
+
+  An unknown reading has a reason, and a reading `within` has no reason and nothing hidden. No reading is unknown (`not_watched`), and so is one this code does not read (`not_a_reading`). The record's schema is unchanged (fixture `09-process-visibility.json`).
+- **The verdict** (`judge(record, condition)`, `verdict_of(snapshot)`) has three flags:
+  - `hidden_process` and `hidden_memory` (a cell the watch killed for hidden memory, whatever its kill reached) make a run `flagged`, whatever else it has: an agent's code that makes itself invisible to the harness is a finding;
+  - `memory_unknown` (also `not_recorded`, `instrument_failed` and `not_a_snapshot`) makes it `unknown`;
+  - with no flag it is `clean`.
+
+  **A run whose memory reading is unknown is never clean, and its limit condition is unknown, never within its limit.**
+- **The analysis** (`study.pipeline.analyse_study`). Once one analysed record carries the namespace, every analysed run is judged, and the preregistered analysis runs again without every run that is not clean (each an absent run of reason `excluded`). It lands in five places:
+  - `StudyAnalysis.visibility` (`expcore.visibility.sensitivity.VisibilityAnalysis`: `runs`, `sensitivity`, `refused`, `left_out`, `counts()` with `memory_within`, `memory_over` and `memory_unknown_reading` beside the verdicts and flags);
+  - `analysis.json`, under `process_visibility`;
+  - the report, as `## Process visibility (detected, not prevented)` after the guards' sections (`expcore.report_visibility`), whose runs table gives each run's memory reading as its limit condition;
+  - its rerun's tables, titled "without the runs that hid from the watch or whose memory is unknown";
+  - the terminal, as `process visibility:` and `visibility sensitivity` lines.
+
+  A batch in which no record carries it has none of these, byte for byte. The rerun of both guards together (`guards.py`) still combines the egress and mount guards alone.
+- **Limits.** Detection, not prevention: hidden memory under the margin, a hidden process's shared memory, pages a visible process shares with its forked children (counted once per process in the visible sum), and a process forked twice under the cell's hidden init (for the `hidden_process` signal) are missed; the step's limit bounds them, and every hidden process ends with its cell.
+
 ### Refusing an attempt: the first-turn hook and the post-run check
 
 A manipulation can be defined on the agent's clock: at the agent's first turn, the arriving files are in their declared start state. An instrument that measures it needs a call at that moment to read the state, and a way to say, after the run, that the manipulation was not realised (the start state was wrong, or the plan failed mid-run), so that the attempt is not scored. Two optional methods give it both (C31). An instrument without them is called as it always was.
@@ -1129,17 +1163,32 @@ egress_shim = "egresslog.so"        # deploy/hpc-federation/bundle/egresslog.c, 
 egress_shim_sha256 = "<64 hex>"
 egress_collector = "egress-collector.py"
 egress_collector_sha256 = "<64 hex>"
+hidden_memory_margin_bytes = 134217728   # optional, 1 MiB to 64 GiB: the default
 ```
 
 - **Its egress:** `EgressLog(sandbox, sandbox.egress_declaration(), sandbox.egress_nonce)`. The declaration names the gate at `127.0.0.1:<its port>`, the canary's listener, and the gate's names. `egress_log()` returns the collector's log once `collect` has stopped the collector, and None before that.
 - **Hook (a):** `[sandbox.apptainer.gate_options]` adds keys to the gate's configuration. A key the sandbox writes itself is refused. The gate's peer-uid check (`peer_uid_check`, #317) is on by default whenever the gate's directory holds `gatepeer.py`, and `metadata()["gate"]["peer_uid_check"]` says whether it was asked for.
 - **Hook (b):** `preload = [{ path, sha256 }]` lists libraries each cell preloads before the egress shim. A connect hook rewrites first and calls the next `connect`, so the shim logs the destination actually dialled. `binds = [{ path, sha256, target }]` adds read-only files. A REST cell also gets `/etc/expcore/gate.json` (`{"address", "port", "names"}`) and `EXPCORE_GATE_PORT`.
 - **Hook (c):** `ApptainerSandbox(..., mount_helper=factory)` with `apptainer.mounthook.MountHelper` (`start() -> Path` bound read-only at `[sandbox.mount] path`, then `stop()`, then `metadata()`). Without a factory a mount run raises `StartRefused(MOUNT_REFUSED)` before anything exists.
-- **Departures** from the Docker sandbox are listed by key in every run's `metadata()["infrastructure_facts"]` (`apptainer.facts.FACTS`):
+- **What `/proc` hides** (`apptainer.hidden`, O56). Under `hidepid=invisible` a cell process that makes itself non-dumpable has no `/proc` entry, so the watch cannot count or kill it. At every poll the watch reads `anon` of the `memory.stat` of the driver's own cgroup (`NodeOps.own_cgroup`, `cgroup_anon`) before and after its listing, and subtracts the RssAnon of every process of the uid the listing shows in that cgroup or below (`Proc.anon`, `Proc.cgroup`). The rest is memory nothing visible explains. Its growth during a cell, from the last reading with no cell's PID namespace in the cgroup (never below 0), past `hidden_memory_margin_bytes` for the running cell and once more for each other run's cell in the cgroup (a namespace of the run's own adds none), for `HIDDEN_CONFIRM` (2) polls in a row, each confirmed by a second listing taken after the cgroup's second reading, the visible memory being the larger of the two listings' totals (so a worker that frees memory and takes it again around a read is never taken for hidden memory, and two processes that hold memory in turn are never counted twice):
+  - with no other run's cell in the cgroup, it kills the run's processes once per cell as `memory_limit` with `what: "memory_hidden"`, `amount` the growth, `limit` the allowance and `figures` (`cgroup_anon_bytes`, `visible_anon_bytes`): memory the watch cannot see is taken as past the limit;
+  - with another run's cell there, it is `unattributed`; after a start whose own cells (the canary and the read-only probe, `begin_cell(..., calibration=True)`) grew past the margin, it is `margin_exceeded_at_start`; neither is a kill.
+
+  A pid that a visible process of the running cell's `children` files list and `/proc` does not show as the uid's while a process holds it, confirmed by a second read (`NodeOps.hidden_children`), is a `hidden_process`: recorded, never a kill. A double fork under the cell's hidden init is no visible process's child, so this supplements the cgroup's check and never replaces it.
+- **The memory reading** (`Watch.reading()`, in `metadata()["watch"]["memory"]` and `metadata()["infrastructure_facts"]["memory"]`):
+  - `reading`: `over` once a kill of the watch's for memory reached a process; `unknown` with every reason that held (`hidden_process`, `unattributed`, `margin_exceeded_at_start`, `cgroup_unreadable` for a v1 host or a failed read, `proc_unreadable`, `children_unreadable`, `kill_reached_none`, for a kill of either kind that signalled no process); otherwise `within`;
+  - `unknown`, `margin_bytes`, `start_unexplained_bytes`, `peak` (`unexplained_bytes`, `cgroup_anon_bytes`, `visible_anon_bytes`, `baseline_bytes`, `allowance_bytes`), `hidden_processes`, `hidden_memory_cells`, `children_unreadable_polls` and `cgroup_unreadable_polls`.
+
+  Each cell's record has its own (`watched.memory`). `process_visibility()` gives the same reading to the `process_visibility` instrument. A hidden process's shared memory (a memfd, a shared anonymous mapping) is not compared, since the cgroup counts it with the run's tmpfs files.
+- **No name server:** every cell binds a `/etc/resolv.conf` that names none and a `/etc/nsswitch.conf` whose databases are `files`, read-only (`argv.RESOLV_TEXT`, `argv.NSSWITCH_TEXT`; a hook (b) bind onto either is refused). So the C library resolves the names of `/etc/hosts` alone, and `infrastructure_facts.dns` is `"none"`. A program with a resolver of its own can still send a query, which is egress like any other. This is no departure from Docker: the agent's network is `--internal` with `--add-host` entries and no `--dns`; the engine's embedded resolver (127.0.0.11) answers every outside name with SERVFAIL at once (no addresses, no timeout), the `--add-host` names resolve only through `/etc/hosts`, and a connect to an outside address fails at once with ENETUNREACH (no default route); measured on engine 29.2.1.
+- **Completion causes** name `apptainer exec` (`Completion.for_source(code, runner="apptainer exec")`).
+- **Facts** are listed by key in every run's `metadata()["infrastructure_facts"]` (`apptainer.facts.FACTS`): the departures from the Docker sandbox, and one fact that is no departure (`dns_none`):
   - the network is shared;
   - the gate is on the node's loopback;
   - the cell runs as the driver's uid;
   - memory and disks are kept by a watch;
+  - what `/proc` hides is checked from the cgroup (`hidden_memory`);
+  - a cell has no name server (`dns_none`; a Docker cell resolves the same, so no departure);
   - cpus, pids and nofile are not enforced;
   - a cell's processes end with its exec;
   - no freezer;

@@ -128,10 +128,13 @@ from expcore.report_notes import (
 from expcore.report_shards import shard_lines
 from expcore.report_smallest import section as smallest_section
 from expcore.report_smallest import summary_suffix
+from expcore.report_visibility import LEFT_OUT as HID_OR_UNKNOWN
+from expcore.report_visibility import visibility_lines
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.armruns import LOST_CAUSES
 from expcore.stats.pairing import MISSING_CAUSES
 from expcore.stats.ratio import RATIO_CAUSES, RatioForm
+from expcore.visibility.sensitivity import VisibilityAnalysis
 
 EXPLORATORY = "exploratory"
 NO_MARGIN = "-"  # the margin and the equivalence interval of a contrast that preregistered no margin
@@ -856,11 +859,28 @@ def _guards_summary(guards: GuardsAnalysis) -> list[str]:
     return lines + _rerun_lines(guards.sensitivity, "both-guards sensitivity")
 
 
+def _visibility_summary(seen: VisibilityAnalysis) -> list[str]:
+    """The terminal's process-visibility lines (O56): the runs that are not clean by verdict and flag, then each
+    confirmatory contrast without them."""
+    n = seen.counts()
+    lines = [
+        f"process visibility: {n['left_out']} of {n['analysed']} analysed run(s) not clean ({n['flagged']} flagged: "
+        f"{n['hidden_process']} hidden process, {n['hidden_memory']} hidden memory; {n['unknown']} unknown); "
+        f"memory reading within {n['memory_within']}, over {n['memory_over']}, unknown {n['memory_unknown_reading']}"
+    ]
+    if seen.refused is not None:
+        return [*lines, f"visibility sensitivity: not computed ({seen.refused})"]
+    if seen.sensitivity is None:
+        return [*lines, "visibility sensitivity: every run clean, the same as the analysis above"]
+    return lines + _rerun_lines(seen.sensitivity, "visibility sensitivity")
+
+
 def summary_lines(
     result: AnalysisResult,
     egress: EgressAnalysis | None = None,
     mount_guard: MountGuardAnalysis | None = None,
     guards: GuardsAnalysis | None = None,
+    visibility: VisibilityAnalysis | None = None,
 ) -> list[str]:
     """One line per contrast for a terminal: the estimate, the raw p-value, the Holm-adjusted one (or the word
     exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
@@ -891,7 +911,8 @@ def summary_lines(
         lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
     lines += _egress_summary(egress) if egress is not None else []
     lines += _mount_guard_summary(mount_guard) if mount_guard is not None else []
-    return lines + (_guards_summary(guards) if guards is not None else [])
+    lines += _guards_summary(guards) if guards is not None else []
+    return lines + (_visibility_summary(visibility) if visibility is not None else [])
 
 
 def _partial_line(export: Mapping[str, Any]) -> str:
@@ -966,6 +987,7 @@ def render_report(
     egress: EgressAnalysis | None = None,
     mount_guard: MountGuardAnalysis | None = None,
     guards: GuardsAnalysis | None = None,
+    visibility: VisibilityAnalysis | None = None,
 ) -> str:
     """Render the report as Markdown.
 
@@ -973,9 +995,10 @@ def render_report(
     report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
     states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
     without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
-    `guards` the rerun without the runs either guard leaves out (a batch checked by both, O60). A
-    partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`). What each number
-    counts is stated in the report beside it. The text ends with a newline.
+    `guards` the rerun without the runs either guard leaves out (a batch checked by both, O60), `visibility` the
+    process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
+    it, O56). A partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
+    What each number counts is stated in the report beside it. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
     planned = export["planned_runs"]
@@ -1006,6 +1029,7 @@ def render_report(
     checked = egress_lines(egress, _table, lambda r: _sensitivity(r, interval_level))  # only a checked batch (#179)
     guarded = mount_guard_lines(mount_guard, _table, lambda r: _sensitivity(r, interval_level, NOT_CLEAN))  # O60
     both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, EITHER_GUARD))  # O60
+    seen = visibility_lines(visibility, _table, lambda r: _sensitivity(r, interval_level, HID_OR_UNKNOWN))  # O56
     sections = (
         _contrasts(result, interval_level)
         + _conditions(export)
@@ -1013,6 +1037,7 @@ def render_report(
         + checked
         + guarded
         + both
+        + seen
         + _deployments(export)
         + _left_out(left_out)
     )
