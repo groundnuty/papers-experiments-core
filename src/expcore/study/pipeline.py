@@ -363,6 +363,7 @@ def _run_campaign(
             shard=started,
             reset_settings=plugin.reset_settings,
             platform_deferrals=declared,
+            listed_platforms=study.platforms,
             **options,
         ) as scheduler:
             _say_lost(scheduler.lost_counted)

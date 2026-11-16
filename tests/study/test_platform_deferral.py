@@ -333,12 +333,14 @@ def stamped(study: Path, plugin_addition: str = "", campaign_edit: tuple[str, st
     return study
 
 
-def carrying(addition: str, carry: bool) -> str:
-    """The plugin's wrapping, with the health check wrapped in a closure, or in one that passes `max_deferral_s` on."""
+def carrying(addition: str, carry: bool, platform: str = "") -> str:
+    """The plugin's wrapping, with the health check wrapped in a closure, or in one that passes `max_deferral_s` on, the
+    bound naming the module of `platform` it comes from (none: a bound that names no module)."""
     carry_with = "lambda inner: _Carrying(inner, _DECLARED)" if carry else "None"
     return (
         "\n_DECLARED = __import__('expcore.campaign.healthgate', fromlist=['x']).DeferralBound("
-        '4000.0, "the toy platform\'s heal: lower heal_timeout_s", rechecks=0, checks=0)\n'
+        '4000.0, "the toy platform\'s heal: lower heal_timeout_s", rechecks=0, checks=0, '
+        f"platform={platform!r})\n"
         f"_CARRY = {carry_with}\n" + addition
     )
 
@@ -389,4 +391,45 @@ def test_c11_a_study_listing_no_hooked_platform_runs_as_before(tmp_path, monkeyp
     """C11: a platform without the hook declares nothing: the study, with the same wrappers, starts and runs."""
     module = platform_module(tmp_path, monkeypatch, UNHOOKED)
     study = stamped(study_with(tmp_path / "s", module), carrying(WRAPPING, carry=False))
+    assert set(run_study(study).statuses) == {"done"}
+
+
+MAX_DEFER = ("lease_timeout_s = 30", "lease_timeout_s = 30\nmax_defer_s = 4000")
+
+
+def test_c11_a_study_whose_health_check_declares_from_a_module_it_does_not_list_is_refused_before_anything_runs(
+    tmp_path, monkeypatch
+):
+    """C11: the plugin's health check declares a deferral that comes from a platform module the study does not list in
+    `[study] platforms`, so the core never asked that platform for it: the run is refused when the scheduler is built,
+    before its store is opened, naming the module and saying to list it."""
+    module = platform_module(tmp_path, monkeypatch, HOOKED)
+    study = stamped(
+        study_with(tmp_path / "s", platform="deferral_s = 4000\n"), carrying(WRAPPING, True, platform=module), MAX_DEFER
+    )
+    assert module not in load_study(study).platforms
+    with pytest.raises(ConfigError) as caught:
+        run_study(study)
+    text = str(caught.value)
+    for part in (repr(module), "health check", "[study] platforms", "list"):
+        assert part in text, text
+    assert not (study / "out" / "state.sqlite").exists()
+
+
+def test_c11_a_study_that_lists_the_module_its_health_check_declares_from_runs(tmp_path, monkeypatch):
+    """C11: the same declaration from a module the study lists is read through the registry as before, and the campaign
+    runs when its health check carries the platform's figure."""
+    module = platform_module(tmp_path, monkeypatch, HOOKED)
+    study = stamped(
+        study_with(tmp_path / "s", module, platform="deferral_s = 4000\n"),
+        carrying(WRAPPING, True, platform=module),
+        MAX_DEFER,
+    )
+    assert set(run_study(study).statuses) == {"done"}
+
+
+def test_c11_a_study_whose_platform_declares_no_deferral_from_a_module_is_unaffected(tmp_path):
+    """C11: a bound that names no module (a platform that does not say, a study's own check) is no use of a platform
+    the study left out: it runs without listing any."""
+    study = stamped(study_with(tmp_path / "s", platform=None), carrying(WRAPPING, True), MAX_DEFER)
     assert set(run_study(study).statuses) == {"done"}

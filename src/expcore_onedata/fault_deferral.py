@@ -24,6 +24,8 @@ from expcore.config.loading import load_toml
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_settings import FaultSettings, heal_deferral_s, load_faults
 
+PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
+
 
 def declared_from_file(path: str | os.PathLike[str]) -> DeferralBound | None:
     """The longest the platform's health check may stay deferred under the `[faults]` of the platform.toml at `path`
@@ -62,4 +64,10 @@ def heal_deferral_bound(settings: FaultSettings) -> DeferralBound | None:
         "counted; lower heal_timeout_s or session_drain_s, or set "
         'heal = "off", to shorten it'
     )
-    return DeferralBound(heal_deferral_s(settings), detail, rechecks=2 if drained else 1, checks=2 if drained else 1)
+    return DeferralBound(
+        heal_deferral_s(settings),
+        detail,
+        rechecks=2 if drained else 1,
+        checks=2 if drained else 1,
+        platform=PLATFORM_MODULE,
+    )

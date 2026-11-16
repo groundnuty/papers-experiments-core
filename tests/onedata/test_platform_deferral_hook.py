@@ -21,6 +21,7 @@ from expcore.campaign.healthgate import DeferralBound, Health, PlatformDeferral
 from expcore.config.loading import ConfigError
 from expcore.study.config import load_study
 from expcore.study.platform_deferral import PLATFORM_HOOK, platform_deferrals
+from expcore_onedata import fault_deferral
 from expcore_onedata.admission import run_admission
 from expcore_onedata.client import OnezoneClient
 from expcore_onedata.config import load_platform
@@ -71,6 +72,12 @@ def test_o35_the_module_a_study_lists_exposes_the_hook_under_the_cores_name():
     assert PLATFORM_HOOK in kinds.__all__
 
 
+def test_o35_the_bound_names_the_module_a_study_lists_for_the_platform():
+    """O35: the module the platform's bounds name is the one the study lists in `[study] platforms` and whose function
+    the core calls: the module's own name."""
+    assert fault_deferral.PLATFORM_MODULE == kinds.__name__ == MODULE
+
+
 def test_o35_the_hook_answers_what_the_health_check_and_the_admission_declare_of_the_same_file(tmp_path, fake):
     """O35: one file, three declarations (the hook's, the standard health check's and the run admission's) that agree
     by construction, since all three come from `heal_deferral_bound` over the file's `[faults]`."""
@@ -86,6 +93,7 @@ def test_o35_the_hook_answers_what_the_health_check_and_the_admission_declare_of
     )
     hook = getattr(kinds, PLATFORM_HOOK)(platform)
     assert hook == health.max_deferral_s() == run_admission(config).declared_deferral_s() == bound_of(platform)
+    assert hook.platform == MODULE  # each names the module a study must list for it to be read through the registry
     settings = load_faults(platform, config)
     assert hook.seconds == settings.session_drain_s + settings.heal_timeout_s + settings.heal_settle_s > 0
     assert hook.rechecks == hook.checks == 2  # a session drain comes first: two rechecks and two checks
@@ -169,16 +177,17 @@ class Carrying:
         return self.bound
 
 
-def listing_the_platform(tmp_path: Path, writer=compose_platform) -> Path:
-    """A copy of the example that lists `expcore_onedata.sandbox.kinds` and holds a `platform.toml` that `writer`
-    writes: the study directory the core reads the platform's declaration from."""
+def listing_the_platform(tmp_path: Path, writer=compose_platform, *, listed: bool = True) -> Path:
+    """A copy of the example that lists `expcore_onedata.sandbox.kinds` (unless `listed` is false) and holds a
+    `platform.toml` that `writer` writes: the study directory the core reads the platform's declaration from."""
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
-    toml = study / "study.toml"
-    line = 'plugin = "plugin.py"\n'
-    toml.write_text(
-        toml.read_text(encoding="utf-8").replace(line, f'{line}platforms = ["{MODULE}"]\n', 1), encoding="utf-8"
-    )
+    if listed:
+        toml = study / "study.toml"
+        line = 'plugin = "plugin.py"\n'
+        toml.write_text(
+            toml.read_text(encoding="utf-8").replace(line, f'{line}platforms = ["{MODULE}"]\n', 1), encoding="utf-8"
+        )
     writer(study)
     return study
 
@@ -250,3 +259,40 @@ def test_o35_a_study_pointing_at_the_other_backends_file_gets_that_backends_figu
         )
     assert "declares a deferral of" in str(refused.value)
     assert "shorter than the platform's" in str(refused.value)
+
+
+def test_o35_a_study_that_uses_the_platform_without_listing_its_module_is_refused_naming_it(tmp_path):
+    """O35: the platform's health check and run admission declare the deferral and name the module they are read
+    through (`expcore_onedata.sandbox.kinds`); a study whose list leaves that module out (the registry was never asked)
+    is refused when the scheduler is built, naming the module, whichever object declares it; listing the module starts
+    the campaign."""
+    unlisted = load_study(listing_the_platform(tmp_path / "unlisted", listed=False))
+    listed = load_study(listing_the_platform(tmp_path / "listed"))
+    assert (unlisted.platforms, listed.platforms) == ((), (MODULE,))
+    platform = unlisted.root / "platform.toml"
+    config = load_platform(platform, require_secrets=False)
+    bound = bound_of(platform)
+    assert bound is not None
+    assert bound.platform == MODULE
+    core = settings_for(poll_interval_s=1.0)
+    needed = (
+        bound.seconds + bound.rechecks * (core.recheck_s + core.poll_interval_s) + bound.checks * core.health_timeout_s
+    )
+    settings = settings_for(max_defer_s=needed, poll_interval_s=1.0)
+    by_health, by_admission = (
+        {"health": Carrying(bound)},
+        {"health": Carrying(None), "admission": run_admission(config)},
+    )
+    for name, options in (("health", by_health), ("admission", by_admission)):
+        with pytest.raises(ConfigError, match=MODULE) as refused:
+            build(tmp_path / name, listed_platforms=unlisted.platforms, settings=settings, plan=SMALL, **options)
+        assert "[study] platforms" in str(refused.value)
+    with build(
+        tmp_path / "listed-campaign",
+        platform_deferrals=platform_deferrals(listed),
+        listed_platforms=listed.platforms,
+        settings=settings,
+        plan=SMALL,
+        **by_health,
+    ):
+        pass

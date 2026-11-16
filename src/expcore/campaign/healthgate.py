@@ -131,12 +131,19 @@ class DeferralBound(NamedTuple):
     `seconds` is the platform's own time. A wait that only a later check can start (a repair that begins at a check)
     also holds waits whose lengths are the core's settings, which the platform cannot know: `rechecks` counts the waits
     between two of the core's checks (`recheck_s` and up to `poll_interval_s` each) and `checks` the checks' own time
-    (`health_timeout_s` each) the wait includes beyond `seconds`; the core adds them with its figures and names each."""
+    (`health_timeout_s` each) the wait includes beyond `seconds`; the core adds them with its figures and names each.
+
+    `platform` names the platform module the bound comes from, as `[study] platforms` lists it (the Onedata layer's is
+    `expcore_onedata.sandbox.kinds`; empty when the platform does not say). The core reads a platform's declared
+    deferral from its configuration through the modules a study lists, so when a bound that a health check or a run
+    admission declares names a module the study does not list, the campaign is refused at its start (`Scheduler(
+    listed_platforms=...)`): listing the module is required whenever a platform with a deferral is used."""
 
     seconds: float
     detail: str
     rechecks: int = 0
     checks: int = 0
+    platform: str = ""
 
 
 DEFERRAL_HOOK = "max_deferral_s"
@@ -187,12 +194,13 @@ def checked_bound(answer: Any, hook: str, owner: str) -> DeferralBound | None:
         or not math.isfinite(seconds)
         or seconds < 0
         or not isinstance(answer.detail, str)
-        or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:])
+        or not all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in answer[2:4])
+        or not isinstance(answer.platform, str)
     ):
         raise ConfigError(
             f"{owner} answered {hook}() with {answer!r:.120}, not None or a "
-            "DeferralBound of a finite, non-negative number of seconds, a detail and non-negative whole counts of "
-            "the core's own waits"
+            "DeferralBound of a finite, non-negative number of seconds, a detail, non-negative whole counts of "
+            "the core's own waits and the platform's module name as text"
         )
     return answer
 
