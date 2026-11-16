@@ -196,13 +196,27 @@ def builds_from(path: str) -> bool:
     return path.startswith(BUILD_DIRS) or path in BUILD_FILES
 
 
+def _linked_part(root: Path, relative: str) -> str | None:
+    """The first part of a path from the top of a checkout that is a link (`examples` of `examples/tiny_study`, or the
+    path itself), else None: what lies below a link is not what the commit holds there, whatever it matches."""
+    parts = Path(relative).parts
+    for number in range(1, len(parts) + 1):
+        if (root.joinpath(*parts[:number])).is_symlink():
+            return Path(*parts[:number]).as_posix()
+    return None
+
+
 def _input_files(root: Path) -> tuple[list[str], list[str]]:
     """What a build reads, as it lies on disk: every file below `BUILD_DIRS` (bytecode caches aside) and each of
-    `BUILD_FILES` that exists, by path from the top; and, apart, every link among them (never followed: a link is
-    dirt whatever it leads to)."""
+    `BUILD_FILES` that exists, by path from the top; and, apart, every link among them or on the way to them, a
+    directory of `BUILD_DIRS` or one above it included (never followed: a link is dirt whatever it leads to)."""
     files: list[str] = []
     links: list[str] = []
     for top in BUILD_DIRS:
+        linked = _linked_part(root, top.rstrip("/"))
+        if linked is not None:
+            links.append(linked)
+            continue
         for here, dirs, names in os.walk(root / top):
             for entry in [*dirs, *names]:
                 path = Path(here) / entry
@@ -211,11 +225,12 @@ def _input_files(root: Path) -> tuple[list[str], list[str]]:
             dirs[:] = [d for d in dirs if d not in _SKIPPED_DIRS and not (Path(here) / d).is_symlink()]
             files += [(Path(here) / n).relative_to(root).as_posix() for n in names if not (Path(here) / n).is_symlink()]
     for name in sorted(BUILD_FILES):
-        if (root / name).is_symlink():
-            links.append(name)
+        linked = _linked_part(root, name)
+        if linked is not None:
+            links.append(linked)
         elif (root / name).is_file():
             files.append(name)
-    return sorted(files), sorted(links)
+    return sorted(files), sorted(set(links))
 
 
 def _head_blobs(root: Path) -> dict[str, str] | None:
@@ -269,13 +284,16 @@ def _dirt(root: Path) -> str | None:
     head, disk = _head_blobs(root), _disk_blobs(root, files)
     if head is None or disk is None:
         return "git could not compare the files a build reads with HEAD's"
+    if _git(root, "config", "--bool", "core.fileMode") == "false":  # git itself does not trust the exec bit here
+        head = {name: blob.split()[-1] for name, blob in head.items()}
+        disk = {name: blob.split()[-1] for name, blob in disk.items()}
     changed = sorted(name for name in set(head) | set(disk) if head.get(name) != disk.get(name) and name not in links)
+    if links:  # first: what lies below a linked directory reads as missing, and the link is why
+        more = f" and {len(links) - 3} more" if len(links) > 3 else ""
+        return f"links in what a build reads, whose targets no commit holds: {', '.join(links[:3])}{more}"
     if changed:
         more = f" and {len(changed) - 3} more" if len(changed) > 3 else ""
         return f"uncommitted changes to what a build reads: {', '.join(changed[:3])}{more}"
-    if links:
-        more = f" and {len(links) - 3} more" if len(links) > 3 else ""
-        return f"links in what a build reads, whose targets no commit holds: {', '.join(links[:3])}{more}"
     return None
 
 

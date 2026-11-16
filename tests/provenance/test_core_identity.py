@@ -126,7 +126,31 @@ def test_p01_nothing_git_can_be_told_to_hide_takes_a_change_to_what_a_build_read
     repo.git("checkout", "--", "src/expcore/cli.py")
     (root / "src" / "expcore" / "cli.py").chmod(0o755)
     assert "src/expcore/cli.py" in str(from_checkout(root).why)
+    repo.git("config", "core.fileMode", "false")  # a filesystem git does not trust the exec bit on
+    assert from_checkout(root).dirty is False
+    repo.git("config", "core.fileMode", "true")
     (root / "src" / "expcore" / "cli.py").chmod(0o644)
+    assert from_checkout(root).dirty is False
+
+
+def test_p01_a_directory_a_build_reads_replaced_by_a_link_to_an_identical_copy_is_dirt(repo, tmp_path):
+    """P01: `src`, the example's directory or a directory above it, or a build file's directory, made a link to an
+    identical copy outside the tree, matches HEAD file for file and is still dirt: what lies below a link is not what
+    the commit holds there."""
+    root = core_project(repo)
+    repo.write("examples/tiny_study/plugin.py", "def build(context): ...\n")
+    repo.write("tests/data/study_tokens.sha256", "hashes\n")
+    repo.commit("the example and the hashes")
+    for moved in ("examples/tiny_study", "examples", "src", "tests/data"):
+        copy = tmp_path / "copies" / moved
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        (root / moved).rename(copy)
+        (root / moved).symlink_to(copy, target_is_directory=True)
+        found = from_checkout(root)
+        assert found.dirty, moved
+        assert f"whose targets no commit holds: {moved}" in str(found.why)
+        (root / moved).unlink()
+        copy.rename(root / moved)
     assert from_checkout(root).dirty is False
 
 
