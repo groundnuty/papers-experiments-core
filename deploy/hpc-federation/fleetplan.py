@@ -224,6 +224,12 @@ def load(path: Path) -> shards.Plan:
 def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None) -> List[str]:
     """The login node's srun line of one shard (`shards.step_argv`) on the federation the manifest gives it, which must
     be `root` when one is given (the federation the fleet's record gives it, and checked)."""
+    return target_of(plan, label, resume, root)[0]
+
+
+def target_of(plan: shards.Plan, label: str, resume: bool,
+              root: Optional[Path] = None) -> Tuple[List[str], Dict[str, Any]]:  # fmt: skip
+    """`line_of`'s line, and the job it lands in as the state names it (`shards.federation`: its id and name)."""
     (shard,) = [s for s in plan.shards if s.label == label]
     if root is not None and shard.root != root:
         raise FleetError(f"{MANIFEST} gives shard {label} another root than the fleet's record: run plan again")
@@ -231,38 +237,45 @@ def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = 
         fed = shards.federation(shard)
     except shards.ShardsError as error:
         raise FleetError(str(error)) from None
-    return shards.step_argv(plan, shard, fed, SCRIPT) + (["--resume"] if resume else [])
+    return shards.step_argv(plan, shard, fed, SCRIPT) + (["--resume"] if resume else []), fed
 
 
 @dataclass(frozen=True)
 class Launch:
-    """One shard's step to launch: on which federation, its line, and whether it resumes."""
+    """One shard's step to launch: on which federation, its line, the job it lands in (its id and the name its
+    federation's up gave it), and whether it resumes."""
 
     shard: str
     member: str
     argv: List[str]
     resume: bool
     note: str
+    job: str
+    name: str
 
 
 def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], resume: bool,
-             running: Callable[[Mapping[str, Any]], Optional[bool]]) -> Tuple[List[Launch], List[str]]:  # fmt: skip
-    """The steps `fleet.py step` launches, and what it refuses or skips, each checked again just before: the federation
-    still ready, still this fleet's, still of the fleet's fingerprint, and a moved shard's first reset there full. A
-    shard already launched on its federation is launched again only with `resume`, and never while its client runs
-    (`running`: True, False, or None when it cannot be told)."""
+             running: Callable[[Mapping[str, Any]], Optional[bool]]
+             ) -> Tuple[List[Launch], List[str], List[str]]:  # fmt: skip
+    """The steps `fleet.py step` launches, what it skips (said), and what it refuses, each checked again just before:
+    the federation still ready, still this fleet's, still of the fleet's fingerprint, and a moved shard's resets there
+    full reads. A shard already launched on its federation is launched again only with `resume`, and never while its
+    client runs (`running`: True, False, or None when it cannot be told). `fleet.py step` then asks Slurm of each
+    launch's job before it spawns."""
     plan = load(directory / MANIFEST)
     settings, written = record.get("template"), (directory / MANIFEST).read_text(encoding="utf-8")
     if settings is None or written != manifest_text(settings, entries(record, directory, {})):
         raise FleetError(f"the fleet's {MANIFEST} is not the one its record gives (edited, or a plan cut short): run "
                          "plan again; nothing was launched")  # fmt: skip
     reference = (record.get("reference") or {}).get("sha256")
-    found, said = [], []
+    found: List[Launch] = []
+    said: List[str] = []
+    refused: List[str] = []
     for shard in record["shards"]:
         label, holder = shard["label"], shard["member"]
         if (only is not None and label != only) or holder is None:
             if only == label:
-                said.append(f"{label}: unassigned: plan gives it a federation first")
+                refused.append(f"{label}: unassigned: plan gives it a federation first")
             continue
         started = [launch for launch in shard["launches"] if not launch.get("failed")]  # a spawn that failed: none
         here = [launch for launch in started if launch["member"] == holder]
@@ -279,12 +292,13 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
             reason = f"{holder}: its platform.toml turns [placement] reset_shortcut on, so the moved shard's resets "
             reason += "there are not all full reads"
         if reason is not None:
-            said.append(f"{label}: not launched: {reason}")
+            refused.append(f"{label}: not launched: {reason}")
             continue
         again = resume or bool(started)  # it ran before, here or elsewhere: its results go on
         note = ""
         if shard["moved"] and not here:
             note = (f"moved from {shard['last']}: {holder}'s platform.toml leaves [placement] reset_shortcut off, so "
                     "every reset there takes the full reads, its first included")  # fmt: skip
-        found.append(Launch(label, holder, line_of(plan, label, again, root_of(directory, holder)), again, note))
-    return found, said
+        argv, fed = target_of(plan, label, again, root_of(directory, holder))
+        found.append(Launch(label, holder, argv, again, note, str(fed["job"]), str(fed["name"])))
+    return found, said, refused

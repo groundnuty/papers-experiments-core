@@ -60,7 +60,9 @@ def test_o67_plan_gives_each_shard_its_own_federations_job_and_node(bench):
     assert assigned(bench) == {"shard-1": "fed-1", "shard-2": "fed-2", "shard-3": "fed-3"}
     for index, label in enumerate(("fed-1", "fed-2", "fed-3"), 1):
         argv = lines[f"shard-{index}"]["argv"]
-        assert argv[1:4] == [f"--jobid={job_ids(label)[0]}", "--het-group=1", "--exact"]
+        assert argv[1:3] == [f"--jobid={job_ids(label)[1]}", "--exact"]  # the agent's own job: no component
+        assert not [word for word in argv if word.startswith("--het-group")]
+        assert "--chdir=/" in argv[: argv.index("/usr/bin/env")]
         sandbox = json.loads((bench.root(label) / "hpc-federation.json").read_text(encoding="utf-8"))["sandbox"]
         assert argv[argv.index("-w") + 1] == sandbox["node"]
         assert argv[argv.index("--count") + 1] == "3"
@@ -111,7 +113,7 @@ def test_o67_an_unassigned_shard_goes_to_a_fresh_federation_of_the_fleets_finger
     code, printed, lines = plan(bench)
     assert code == 0, printed
     assert assigned(bench) == {"shard-1": "fed-1", "shard-2": "fed-4", "shard-3": "fed-3"}
-    assert lines["shard-2"]["argv"][1] == f"--jobid={job_ids('fed-4')[0]}"
+    assert lines["shard-2"]["argv"][1] == f"--jobid={job_ids('fed-4')[1]}"
 
 
 def test_o67_a_fresh_federation_of_another_fingerprint_is_never_given_a_shard(bench, tmp_path):
@@ -145,8 +147,8 @@ def test_o67_step_launches_each_shard_on_its_own_federation_once(bench):
     assert plan(bench)[0] == 0
     code, printed = bench.run("step")
     assert code == 0, printed
-    assert [(s.label, s.srun.job) for s in bench.spawned] == [("fed-1", job_ids("fed-1")[0]),
-                                                              ("fed-2", job_ids("fed-2")[0])]  # fmt: skip
+    assert [(s.label, s.srun.job) for s in bench.spawned] == [("fed-1", job_ids("fed-1")[1]),
+                                                              ("fed-2", job_ids("fed-2")[1])]  # fmt: skip
     assert all("--resume" not in s.argv for s in bench.spawned)
     code, printed = bench.run("step")
     assert len(bench.spawned) == 2
@@ -154,16 +156,38 @@ def test_o67_step_launches_each_shard_on_its_own_federation_once(bench):
 
 
 def test_o67_step_checks_the_federation_again_and_refuses_one_no_longer_the_fleets(bench):
-    """O67: fed-1's state replaced after the plan: shard-1 is not launched there; shard-2 is."""
+    """O67: fed-1's state replaced after the plan: shard-1 is not launched there; shard-2 is, and step exits 1, since
+    a shard it was asked to launch was refused."""
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
     path = bench.root("fed-1") / "hpc-federation.json"
     replaced = json.loads(path.read_text(encoding="utf-8"))
     replaced["allocation"]["name"] = "hpcop-another-federation-0000"
     path.write_text(json.dumps(replaced), encoding="utf-8")
-    printed = bench.run("step")[1]
+    code, printed = bench.run("step")
+    assert code == 1
     assert "shard-1: not launched: fed-1: its state file is of another federation" in printed
     assert [s.label for s in bench.spawned] == ["fed-2"]
+
+
+@pytest.mark.parametrize("now", ["another job", "gone", "pending"])
+def test_o67_step_never_launches_into_a_job_slurm_no_longer_holds_for_the_federation(bench, now):
+    """O67: everything on file still says fed-1, but Slurm now says otherwise of its agent's job: its id handed to
+    another job (Slurm reuses ids), the job gone, or not running. shard-1 is not launched; shard-2 is; step exits 1."""
+    assert bench.up(2)[0] == 0
+    assert plan(bench)[0] == 0
+    fake, agent = bench.fake("fed-1"), job_ids("fed-1")[1]
+    if now == "another job":
+        fake.submitted[agent][0]["--job-name"] = "someone-elses-job"
+    elif now == "gone":
+        fake.job_states[agent] = "GONE"
+    else:
+        fake.job_states[agent] = "PENDING"
+    code, printed = bench.run("step")
+    assert code == 1
+    assert "shard-1: not launched: " in printed
+    assert [s.label for s in bench.spawned] == ["fed-2"]
+    assert all(s.srun.job != agent for s in bench.spawned)
 
 
 def test_o67_step_launches_nothing_from_a_shard_manifest_the_record_does_not_give(bench):
@@ -244,7 +268,7 @@ def test_o67_status_says_each_federation_its_job_and_shard_and_runs_nothing(benc
     calls = {label: len(fake.calls) for label, fake in bench.fakes.items()}
     code, printed = bench.run("status")
     assert code == 0
-    assert f"fed-1: up, phase linked, job(s) {job_ids('fed-1')[0]}, shard shard-1" in printed
+    assert f"fed-1: up, phase linked, job(s) {', '.join(job_ids('fed-1'))}, shard shard-1" in printed
     assert "fed-2: failed, phase " in printed
     assert job_ids("fed-2")[0] in printed
     assert "shard-1: on fed-1, its step runs" in printed

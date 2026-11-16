@@ -61,13 +61,25 @@ def test_o67_up_brings_n_federations_up_each_its_own_root_state_file_and_held_jo
         assert member["root"] == str(bench.root(label))
         assert state(bench, label)["phase"] == "linked"
         assert (bench.root(label) / "platform.toml").is_file()
-        assert list(bench.fake(label).submitted) == [job_ids(label)[0]]
-        assert member["job"] == [job_ids(label)[0]]
+        job, agent = job_ids(label)
+        assert list(bench.fake(label).submitted) == [job, agent]  # the services' job, the agent's own
+        assert member["jobs"] == {"allocation": job, "sandbox": agent}
+        assert state(bench, label)["sandbox"]["name"] == f"{member['name']}-sandbox"
         assert member["name"] == state(bench, label)["allocation"]["name"]
         names.add(member["name"])
     assert len(names) == 3
     assert [s["label"] for s in found["shards"]] == ["shard-1", "shard-2", "shard-3"]
     assert all(s["member"] is None for s in found["shards"])
+
+
+def test_o67_up_refuses_a_layout_that_holds_the_agents_node_in_a_heterogeneous_job(bench):
+    """O67: a fleet's federations hold each agent's node as a job of its own: steps on a heterogeneous job's services
+    failed live on the site's Slurm, so the committed `het` layout is refused before anything is made."""
+    code, printed = bench.run("--layout", str(LAYOUT), "up", "2")
+    assert code == 2
+    assert 'sandbox_placement = "separate"' in printed
+    assert not bench.fleet.exists()
+    assert bench.fakes == {}
 
 
 @pytest.mark.parametrize(("maximum", "count"), [("2", 3), ("5", 6)])
@@ -125,8 +137,8 @@ def test_o67_one_failed_up_leaves_the_others_up_and_says_its_job_may_be_held(ben
     assert code == 1
     found = {m["label"]: m for m in record(bench)["members"]}
     assert (found["fed-1"]["status"], found["fed-2"]["status"], found["fed-3"]["status"]) == ("up", "failed", "up")
-    assert found["fed-2"]["job"] == [job_ids("fed-2")[0]]
-    assert f"its job(s) {job_ids('fed-2')[0]} may still be held: `fleet.py down --member fed-2`" in printed
+    assert found["fed-2"]["jobs"] == dict(zip(("allocation", "sandbox"), job_ids("fed-2"), strict=True))
+    assert f"its job(s) {', '.join(job_ids('fed-2'))} may still be held: `fleet.py down --member fed-2`" in printed
     assert bench.fake("fed-2").cancelled == []
     for label in ("fed-1", "fed-3"):
         assert state(bench, label)["phase"] == "linked"
@@ -203,7 +215,7 @@ def test_o67_down_tears_every_federation_down_each_verified(bench):
     code, printed = bench.run("down")
     assert code == 0, printed
     for label in ("fed-1", "fed-2", "fed-3"):
-        assert bench.fake(label).cancelled == [job_ids(label)[0]]
+        assert bench.fake(label).cancelled == list(job_ids(label))
         assert not bench.root(label).exists()
     assert [m["status"] for m in record(bench)["members"]] == ["down", "down", "down"]
     assert "3 of 3 federation(s) down" in printed
@@ -217,7 +229,7 @@ def test_o67_down_touches_no_federation_and_no_job_it_did_not_make(bench):
     assert bench.up(2)[0] == 0
     other_root = bench.fleet / "fed-9" / "root"
     other_root.parent.mkdir()
-    assert bench.federation("fed-9", "up", LAYOUT, other_root, bench.base / "other.log")[0] == 0
+    assert bench.federation("fed-9", "up", bench.layout, other_root, bench.base / "other.log")[0] == 0
     calls = len(bench.fake("fed-9").calls)
     assert bench.fake("fed-9").submitted  # it is up, on a cluster of its own
     bench.fake("fed-1").submitted["7777"] = [{"--job-name": "someone-elses-job", "--nodes": "1"}]
@@ -225,7 +237,7 @@ def test_o67_down_touches_no_federation_and_no_job_it_did_not_make(bench):
     assert len(bench.fake("fed-9").calls) == calls
     assert bench.fake("fed-9").cancelled == []
     assert (other_root / "hpc-federation.json").is_file()
-    assert bench.fake("fed-1").cancelled == [job_ids("fed-1")[0]]
+    assert bench.fake("fed-1").cancelled == list(job_ids("fed-1"))
     assert "7777" not in bench.fake("fed-1").cancelled
 
 
@@ -242,8 +254,27 @@ def test_o67_down_refuses_a_root_whose_state_is_another_federations(bench):
     assert "fed-2: NOT TOUCHED: fed-2: its state file is of another federation" in printed
     assert bench.fake("fed-2").cancelled == []
     assert bench.root("fed-2").is_dir()
-    assert bench.fake("fed-1").cancelled == [job_ids("fed-1")[0]]
+    assert bench.fake("fed-1").cancelled == list(job_ids("fed-1"))
     assert [m["status"] for m in record(bench)["members"]] == ["down", "down-failed"]
+
+
+@pytest.mark.parametrize("change", ["job", "name"])
+def test_o67_down_refuses_a_state_whose_agents_job_is_not_the_one_its_up_held(bench, change):
+    """O67: fed-2's state keeps its own allocation and command, but its agent's own job record is replaced by another
+    job's (another id, or another name): down would cancel that job by the record, so fed-2 is not touched at all."""
+    assert bench.up(2)[0] == 0
+    path = bench.root("fed-2") / "hpc-federation.json"
+    replaced = json.loads(path.read_text(encoding="utf-8"))
+    if change == "job":
+        replaced["sandbox"]["job"] = "7777"
+    else:
+        replaced["sandbox"]["name"] = "hpcop-another-federation-0000-sandbox"
+    path.write_text(json.dumps(replaced), encoding="utf-8")
+    code, printed = bench.run("down")
+    assert code == 1
+    assert "fed-2: NOT TOUCHED" in printed
+    assert bench.fake("fed-2").cancelled == []
+    assert bench.fake("fed-1").cancelled == list(job_ids("fed-1"))
 
 
 def test_o67_down_refuses_a_root_that_is_not_the_directory_the_fleet_made(bench):
@@ -312,7 +343,7 @@ def test_o67_an_unmarked_root_that_holds_anything_is_kept(bench):
 def test_o67_down_of_one_member_leaves_the_others_up(bench):
     assert bench.up(3)[0] == 0
     assert bench.run("down", "--member", "fed-2")[0] == 0
-    assert bench.fake("fed-2").cancelled == [job_ids("fed-2")[0]]
+    assert bench.fake("fed-2").cancelled == list(job_ids("fed-2"))
     assert bench.fake("fed-1").cancelled == bench.fake("fed-3").cancelled == []
     assert [m["status"] for m in record(bench)["members"]] == ["up", "down", "up"]
 

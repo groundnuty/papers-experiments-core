@@ -16,7 +16,7 @@ import os
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import hpcstate
 
@@ -71,7 +71,7 @@ def new_member(directory: Path, label: str) -> Dict[str, Any]:
         "status": "claimed",
         "made": None,  # (st_dev, st_ino) of the root this fleet made, once made
         "name": None,  # the held job's name, with up's random part: the federation's identity
-        "job": None,
+        "jobs": {},  # the ids its up's state recorded: "allocation", and "sandbox" (the agent's own held job)
         "phase": None,
         "shard": None,  # the shard it holds now
         "held": [],  # every shard it was ever given: a federation runs one shard in its life
@@ -93,6 +93,10 @@ def check(record: Any, directory: Path) -> Dict[str, Any]:
             raise FleetError(f"{RECORD}: a member's label is not fed-<n>")
         if member.get("root") != str(root_of(directory, label)) or member.get("status") not in STATUSES:
             raise FleetError(f"{RECORD}: member {label} is not a root this fleet makes (<fleet>/{label}/root)")
+        jobs = member.get("jobs")
+        if not isinstance(jobs, dict) or not all(k in ("allocation", "sandbox") and (v is None or (
+                isinstance(v, str) and hpcstate.JOB_ID.fullmatch(v))) for k, v in jobs.items()):  # fmt: skip
+            raise FleetError(f"{RECORD}: member {label}'s jobs are not Slurm job ids")
         made = member.get("made")
         if made is not None and not (isinstance(made, list) and len(made) == 2 and all(isinstance(v, int)
                                                                                          for v in made)):  # fmt: skip
@@ -194,11 +198,25 @@ class Record:
         return self._flock(LIFECYCLE, False, what)
 
 
+def jobs_of(state: Mapping[str, Any]) -> Dict[str, Optional[str]]:
+    """The held jobs a state names: its allocation's, and the agent's own job's under `separate` (a `het` agent's node
+    is the allocation's component, never a job of its own)."""
+    sandbox = state.get("sandbox") or {}
+    own = sandbox.get("job") if sandbox.get("placement") == "separate" else None
+    return {"allocation": (state.get("allocation") or {}).get("job"), "sandbox": own}
+
+
+def sandbox_name(name: str, placement: Optional[str]) -> str:
+    """The agent's node's job name as up derives it from the allocation's (`hpcdriver.sandbox_record`)."""
+    return name if placement == "het" else f"{name}-sandbox"
+
+
 def identity(directory: Path, member: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """Whether a member's root is the one this fleet made and holds the federation its up made: (why not, None), or
     (None, the held job's name its state file records, None when it has none). The root must be the directory this
-    fleet's mkdir made (its device and inode), never a link; a state file in it must be that federation's: the name up
-    recorded (with up's random part) or, when none was recorded yet, a state whose own command names this root."""
+    fleet's mkdir made (its device and inode), never a link; a state file in it must be that federation's: written by
+    an up of this root (its command names it), the name up recorded (with up's random part), the agent's node's record
+    named as up derives it from that name, and every job id the fleet recorded at its up the same."""
     label, root = member["label"], root_of(directory, member["label"])
     if member.get("made") is None:
         return f"{label}: its root was never made by this fleet", None
@@ -224,6 +242,12 @@ def identity(directory: Path, member: Dict[str, Any]) -> Tuple[Optional[str], Op
         return f"{label}: its state file was not written by an up of this root", None
     if member.get("name") is not None and name != member["name"]:
         return f"{label}: its state file is of another federation than the one this fleet's up made", None
+    sandbox = state.get("sandbox")
+    if sandbox is not None and sandbox.get("name") != sandbox_name(name, sandbox.get("placement")):
+        return f"{label}: its state file's agent's node is not the one its up held", None
+    found, recorded = jobs_of(state), member.get("jobs") or {}
+    if any(recorded.get(key) is not None and found.get(key) != recorded[key] for key in ("allocation", "sandbox")):
+        return f"{label}: its state file names other jobs than the ones this fleet's up recorded", None
     return None, name
 
 

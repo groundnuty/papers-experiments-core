@@ -329,8 +329,9 @@ def _job_id(job: Any) -> bool:
 
 
 def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) -> list[str]:
-    """The login node's `srun` of one shard's step (the module's docstring): `--exact`, never `--overlap`; an
-    environment of the allowlist alone, set on the node by `env -i`, with no secret in it."""
+    """The login node's `srun` of one shard's step (the module's docstring): `--exact`, never `--overlap`; `--chdir=/`,
+    so the step never starts in the directory srun was run from, which may be a shared one; an environment of the
+    allowlist alone, set on the node by `env -i`, with no secret in it."""
     env = [f"PATH={plan.step_path}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={shard.root.parent}",
            f"EXPCORE_FED_ROOT={shard.root}", *(f"{k}={v}" for k, v in home_env(NO_HOME).items())]  # fmt: skip
     step = [plan.python, "-I", str(script), "step", "--study", str(plan.study), "--index", str(shard.index),
@@ -340,7 +341,7 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
-        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH",
+        f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH", "--chdir=/",
         "/usr/bin/env", "-i", *env, *step,
     ]  # fmt: skip
 
@@ -469,7 +470,8 @@ def collect(plan: Plan, into: Path) -> list[Path]:
 
 
 def merge_argv(plan: Plan, outs: Sequence[Path]) -> list[str]:
-    return [plan.python, "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
+    """`python -I -m expcore merge`: isolated, so no module of the directory it is run from is imported."""
+    return [plan.python, "-I", "-m", "expcore", "merge", str(plan.study / "out"), *map(str, outs)]
 
 
 # ------------------------------------------------------------------------------------------------ the step

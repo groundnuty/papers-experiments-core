@@ -29,7 +29,8 @@ from expcore_onedata.config import load_platform
 
 
 def job_ids(label: str) -> tuple[str, str]:
-    """Each federation's held job's id (and a second sbatch's), distinct across the fleet: fed-k gets 4k00."""
+    """Each federation's held jobs' ids, distinct across the fleet: fed-k's allocation 4k00, its agent's own job
+    (`sandbox_placement = "separate"`, a second sbatch) 4k50."""
     k = int(label.split("-")[1])
     return str(4000 + 100 * k), str(4050 + 100 * k)
 
@@ -56,6 +57,10 @@ class StepRunner:
     def client_alive(self, client: Any) -> bool:
         return client.pid in self.bench.alive
 
+    def run(self, argv: list, timeout: float) -> Any:
+        """What Slurm answers on the login node (the fleet asks it of a step's job before the launch)."""
+        return self.bench.fake(self.label).run(argv, timeout)
+
 
 @dataclass
 class Bench:
@@ -81,6 +86,7 @@ class Bench:
         for name in ("onezone.tar", "oneprovider.tar"):
             (self.base / "images" / name).write_bytes(b"tar")
             (self.base / "images" / f"{name}.provenance").write_text("sha256\n", encoding="utf-8")
+        self.layout = separate_layout(self.base / "layout")
         agent = agent_site(self.base / "agent", work_root=self.node_tmp / "agent-work")
         self.environ = {**SITE, **agent, "SH": str(self.base / "images"), "L": str(self.base / "logs"),
                         "HPC_NODE_TMP": str(self.node_tmp), "HPC_FLEET_MAX": "5"}  # fmt: skip
@@ -149,7 +155,7 @@ class Bench:
         return code, printed.getvalue()
 
     def up(self, count: int, **given: Any) -> tuple[int, str]:
-        return self.run("--layout", str(LAYOUT), "up", str(count), **given)
+        return self.run("--layout", str(self.layout), "up", str(count), **given)
 
     def settings(self) -> Path:
         """The shard settings an operator gives plan: shards.py's keys, no [[shards]]."""
@@ -162,6 +168,22 @@ class Bench:
 
     def fingerprint(self, label: str) -> dict:
         return load_platform(self.root(label) / "platform.toml", require_secrets=False).fingerprint()
+
+
+PLACEMENT = 'sandbox_placement = "het"'
+
+
+def separate_layout(folder: Path) -> Path:
+    """The pilot's layout and template as committed, but for the agent's node held as a job of its own
+    (`sandbox_placement = "separate"`), as a fleet's federations hold it: the site's Slurm failed steps on a
+    heterogeneous job's services (live, 16 Nov 2026)."""
+    folder.mkdir(parents=True)
+    text = LAYOUT.read_text(encoding="utf-8")
+    assert text.count(PLACEMENT) == 1
+    (folder / LAYOUT.name).write_text(text.replace(PLACEMENT, 'sandbox_placement = "separate"'), encoding="utf-8")
+    template = LAYOUT.parent / "pilot-shape.platform.toml.template"
+    (folder / template.name).write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+    return folder / LAYOUT.name
 
 
 @contextlib.contextmanager
@@ -189,4 +211,4 @@ def another_ca(directory: Path) -> str:
     return make_ca(directory)
 
 
-__all__ = ["Bench", "StepRunner", "another_ca", "fleet_modules", "job_ids", "make_bench", "make_ca"]
+__all__ = ["Bench", "StepRunner", "another_ca", "fleet_modules", "job_ids", "make_bench", "make_ca", "separate_layout"]

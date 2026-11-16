@@ -52,6 +52,7 @@ from fleetrecord import (  # noqa: E402
     FleetError,
     Record,
     identity,
+    jobs_of,
     member_of,
     new_member,
     new_record,
@@ -60,8 +61,8 @@ from fleetrecord import (  # noqa: E402
     slot_of,
 )
 from hpcdriver import CORE_MISMATCH, CoreMismatch  # noqa: E402
-from hpcsettings import SettingsError, site_from_environment  # noqa: E402
-from hpcslurm import Client, Runner  # noqa: E402
+from hpcsettings import SettingsError, agent_limits, load_settings, site_from_environment  # noqa: E402
+from hpcslurm import Client, Runner, Slurm, SlurmError  # noqa: E402
 
 MAX_VAR, PARALLEL_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL"
 LINKED = "linked"  # a federation's phase once its up has finished (hpcstate.PHASES)
@@ -152,6 +153,17 @@ def setting(environ: Mapping[str, str], name: str, default: Optional[int] = None
     return int(value)
 
 
+def separate_only(spec: Any) -> None:
+    """A fleet's federations hold their agent's node as a job of its own (`[hpc] sandbox_placement = "separate"`): on
+    the site's Slurm, steps on a heterogeneous job's component 0 failed with an interconnect error after the services
+    had started (live, 16 Nov 2026), so a `het` layout is refused before anything is made."""
+    settings = load_settings(spec.hpc, agent_limits(spec.platform_template))
+    if settings.sandbox_node() is not None and settings.sandbox_placement != "separate":
+        raise FleetError("a fleet holds each agent's node as a job of its own: give the layout [hpc] "
+                         'sandbox_placement = "separate" (steps on a heterogeneous job\'s services failed live); '
+                         "nothing made")  # fmt: skip
+
+
 def fleet_directory(value: str) -> Path:
     if not os.path.isabs(value) or set(value) & UNSAFE:
         raise FleetError("--fleet must be an absolute path with no quote, backslash or control character")
@@ -167,6 +179,11 @@ def pooled(labels: Sequence[str], parallel: int, work: Callable[[str], bool]) ->
         return dict(zip(labels, pool.map(work, labels)))
 
 
+def held(jobs: Mapping[str, Optional[str]]) -> str:
+    """A federation's job ids, for a line: "4100, 4150"; empty when it holds none on record."""
+    return ", ".join(job for job in (jobs.get("allocation"), jobs.get("sandbox")) if job)
+
+
 def state_facts(root: Path) -> Dict[str, Any]:
     """What a root's state file says of its federation's identity and progress; nothing when it has none."""
     try:
@@ -175,9 +192,7 @@ def state_facts(root: Path) -> Dict[str, Any]:
         state = None
     if state is None:
         return {}
-    sandbox = state.get("sandbox") or {}
-    jobs = [state["allocation"].get("job"), sandbox.get("job") if sandbox.get("placement") == "separate" else None]
-    return {"name": state["allocation"].get("name"), "jobs": [j for j in jobs if j], "phase": state.get("phase")}
+    return {"name": state["allocation"].get("name"), "jobs": jobs_of(state), "phase": state.get("phase")}
 
 
 @dataclass
@@ -213,6 +228,7 @@ class Fleet:
             raise FleetError(f"{count} federations asked for, past the maximum of {maximum} ({MAX_VAR}); nothing made")
         layout = layout.resolve()
         spec, site = load_spec(layout), site_from_environment(self.environ)
+        separate_only(spec)
         self.hooks.self_check()
         self.say(self.hooks.inode_guard(count, self.scratch_layout(spec), site, self.environ))
         try:
@@ -233,6 +249,7 @@ class Fleet:
                                  f"maximum of {maximum} ({MAX_VAR}); nothing made")  # fmt: skip
             layout = Path(record["layout"]["path"])
             spec, site = load_spec(layout), site_from_environment(self.environ)
+            separate_only(spec)
             if spec.digest != record["layout"]["digest"]:
                 raise FleetError("the fleet's layout file changed since its up: its federations would differ")
             self.hooks.self_check()
@@ -273,14 +290,15 @@ class Fleet:
             def done(record: Dict[str, Any]) -> None:
                 member = member_of(record, label)
                 member.update(status="up" if ok else "failed", said=said, phase=facts.get("phase"))
-                member.update(name=facts.get("name") or member["name"], job=facts.get("jobs") or None)
+                member.update(name=facts.get("name") or member["name"], jobs=facts.get("jobs") or {})
 
             self.record.update(done)
             if ok:
-                self.say(f"{label}: up, job(s) {', '.join(facts['jobs'])}")
+                self.say(f"{label}: up, job(s) {held(facts['jobs'])}")
             else:
-                held = f"; its job(s) {', '.join(facts['jobs'])} may still be held" if facts.get("jobs") else ""
-                self.say(f"{label}: up FAILED ({said}){held}: `fleet.py down --member {label}`")
+                jobs = held(facts.get("jobs") or {})
+                kept = f"; its job(s) {jobs} may still be held" if jobs else ""
+                self.say(f"{label}: up FAILED ({said}){kept}: `fleet.py down --member {label}`")
             return ok
 
         results = pooled(made, parallel, one)
@@ -341,10 +359,14 @@ class Fleet:
                 shard_of(record, only)
             if not (self.directory / fleetplan.MANIFEST).is_file():
                 raise FleetError("the fleet has no shards.toml: run plan first")
-            found, said = fleetplan.launches(record, self.directory, only, resume, self.running)
+            found, said, refused = fleetplan.launches(record, self.directory, only, resume, self.running)
             logs = self.directory / "logs"
             logs.mkdir(mode=0o700, exist_ok=True)
             for launch in found:
+                reason = self.job_ours(launch)
+                if reason is not None:
+                    refused.append(f"{launch.shard}: not launched: {reason}")
+                    continue
                 shard = shard_of(self.record.read(), launch.shard)
                 log = logs / f"{launch.shard}.{launch.member}.{len(shard['launches']) + 1}.log"
                 entry = {"member": launch.member, "log": str(log), "resume": launch.resume, "pid": None,
@@ -360,9 +382,25 @@ class Fleet:
                 done = "FAILED to launch" if change.get("failed") else f"launched (client pid {change['pid']})"
                 self.say(f"{launch.shard} on {launch.member}: {done}{' with --resume' if launch.resume else ''}; "
                          f"its log {log}" + (f"; {launch.note}" if launch.note else ""))  # fmt: skip
-        for line in said:
+        for line in said + refused:
             self.say(line)
-        return 1 if failed or (only is not None and not found) else 0
+        return 1 if failed or refused or (only is not None and not found) else 0
+
+    def job_ours(self, launch: fleetplan.Launch) -> Optional[str]:
+        """Why a launch's job is not the one its federation's up holds, as Slurm records it now; None when it is: the
+        job its state names, still known to Slurm, by the name up gave it (Slurm reuses ids, and a job that ended long
+        ago may have handed its id to another), and running."""
+        try:
+            found = Slurm(self.hooks.runner(launch.member)).job(launch.job)
+        except (SlurmError, OSError, ValueError) as error:
+            return f"job {launch.job} could not be looked up ({type(error).__name__})"
+        if found is None:
+            return f"{launch.member}'s job {launch.job} is gone"
+        if found.get("JobName") != launch.name:
+            return f"job {launch.job} now names another job than {launch.member}'s: never stepped into"
+        if found.get("JobState") != "RUNNING":
+            return f"{launch.member}'s job {launch.job} is not running ({found.get('JobState')})"
+        return None
 
     # -- status and down --------------------------------------------------------------------------------------------
 
@@ -373,7 +411,7 @@ class Fleet:
               f"fingerprint {reference[:12] if reference else 'not yet planned'}")  # fmt: skip
         for member in record["members"]:
             facts = state_facts(root_of(self.directory, member["label"]))
-            jobs = ", ".join(facts.get("jobs") or member.get("job") or []) or "none"
+            jobs = held(facts.get("jobs") or member.get("jobs") or {}) or "none"
             line = f"{member['label']}: {member['status']}, phase {facts.get('phase')}, job(s) {jobs}"
             line += f", shard {member['shard']}" if member["shard"] else ""
             print(line + (f" ({member['said']})" if member["said"] else ""))

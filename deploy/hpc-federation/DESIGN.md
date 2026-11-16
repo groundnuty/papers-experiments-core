@@ -117,6 +117,10 @@ under one record. One federation's job failing ends one shard's step, never anot
 - **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
   under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
   its output in `<fleet>/logs/<label>.<command>.log`. One that fails is reported; the others go on.
+- **The agent's node is a job of its own** (`sandbox_placement = "separate"`). On the site's Slurm, new steps on a
+  heterogeneous job's component 0 failed with an interconnect error once the services had started (a live slot, 16
+  Nov 2026), so the fleet refuses a layout that holds the agent's node as a component. A shard's step then lands in a
+  job of one component and names no `--het-group`.
 - **Names and roots, derived.** Federations are `fed-1` ... `fed-N` and shards `shard-1` ... `shard-N`, from their
   places, never a site value; each federation's job name is its own `up`'s (`hpcop-<project>-<random>`). Its root is
   `<fleet>/fed-k/root`, made by an exclusive `mkdir` inside a slot made the same way, so the fleet never adopts a
@@ -127,8 +131,9 @@ under one record. One federation's job failing ends one shard's step, never anot
   so a federation another `up` made beside the fleet, in its directory or not, is never looked at.
 - **`down` takes down only what the fleet's `up` made.** Before each federation's `hpcfed.py down`, its root must be
   the directory the fleet's `mkdir` made (device and inode, no link) and its state file the one that federation's `up`
-  wrote (its `command` names this root, and its job name is the one recorded); otherwise it is refused, untouched,
-  and named. The driver's own `down` then cancels its jobs by id and never one whose id now names another job
+  wrote (its `command` names this root, its job name is the one recorded, its agent's job record is named as that
+  `up` names it, and every job id is the one the fleet recorded at its `up`); otherwise it is refused, untouched, and
+  named. The driver's own `down` then cancels its jobs by id and never one whose id now names another job
   (section 5). A root an `up` never marked (refused in its preflight) is the fleet's empty `mkdir`, which hpcfed's
   `down` refuses as unmarked: the fleet removes it with `rmdir`, which removes nothing else. Each is verified: the
   child's exit status and the root gone.
@@ -137,7 +142,9 @@ under one record. One federation's job failing ends one shard's step, never anot
   (`data_manifest`, C06) and whose `PlatformConfig.fingerprint()` is the fleet's. The first plan sets that reference,
   and refuses outright when the federations' fingerprints differ (naming each federation and the differing keys):
   their shards would never merge (C29). `step` checks all of it again, and that `shards.toml` is the one the record
-  gives, before each launch: a line is never built from a manifest the fleet did not write.
+  gives, before each launch: a line is never built from a manifest the fleet did not write. It then asks Slurm of the
+  job the line lands in: still known, running, and under the name its federation's `up` gave it, since Slurm reuses
+  ids and a job that ended may have handed its id to another. Each line runs with `--chdir=/`.
 - **Moving a shard (the coordinator's rule).** The shard count is fixed at the fleet's `up`. A shard whose federation
   is taken down (`down --member`) is released, and given only to a federation brought up after (`add`), never one that
   held a shard before, with the same checks and an equal fingerprint, its step started with `--resume` from its

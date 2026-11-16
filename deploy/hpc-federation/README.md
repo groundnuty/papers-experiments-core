@@ -487,16 +487,19 @@ each time: size `snapshot_every_s` to what the shared filesystem can take.
 
 A campaign's shards run in parallel, one shard per federation and one federation per held job (O67; DESIGN.md,
 section 1, "A fleet"). `fleet.py` brings N federations up from one layout, gives each a shard, launches each shard's
-step and takes them all down. Run it on the login node, from a private 0700 directory of yours, with `-I`:
+step and takes them all down. Run it on the login node, from a private 0700 directory of yours, with `-I`. Its
+layout holds each agent's node as a job of its own, `[hpc] sandbox_placement = "separate"`: on the site's Slurm, steps
+on a heterogeneous job's services failed with an interconnect error (a live slot), so `up` refuses a `het` layout.
+Copy `layouts/pilot-shape.toml` and its template beside each other and change that one line:
 
 ```bash
 set -a; . deploy/hpc-federation/site.env; set +a
 F=<an absolute path, not there yet, on the filesystem the login node and the nodes see>
-uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout deploy/hpc-federation/layouts/pilot-shape.toml up 4
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout <your copy of pilot-shape.toml> up 4
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <shard settings>
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
-uv run python deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
+uv run python -I deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
 uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
 ```
 
@@ -517,9 +520,13 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   (`data_manifest`) gets no shard; a shard whose federation failed stays unassigned. **The first plan refuses outright
   when the federations' platform fingerprints differ** (another zone image's CA, another SIF, another data manifest):
   their shards would never merge. It names each federation and the differing keys.
-- **`step`** launches each assigned shard's line detached on the login node, its client recorded and its output in
-  `<fleet>/logs/`, after checking the federation again and that `shards.toml` is the one the record gives. A shard is
-  not launched again while its client runs; one whose step ended is relaunched only with `--shard L --resume`.
+- **`step`** launches each assigned shard's line detached on the login node (`srun ... --chdir=/`, so the step never
+  starts in the directory you ran it from), its client recorded and its output in `<fleet>/logs/`, after checking the
+  federation again, that `shards.toml` is the one the record gives, and that Slurm still holds the job the line lands
+  in, running, under the name its federation's `up` gave it (Slurm reuses ids). A shard is not launched again while its
+  client runs; one whose step ended is relaunched only with `--shard L --resume`. A shard refused exits 1. A site that
+  needs `HPC_STEP_NETWORK` gives it to each federation's own steps (`hpcfed`); a shard's step, on the agent's own job of
+  one component, carries none.
 - **Moving a shard.** `down --member fed-k` takes one federation down and frees its shard (its step ends with the
   job); `add 1` brings a fresh federation up; `plan` gives it the shard only after its own `up` (data and links
   checked), with the fleet's fingerprint, and only when its `platform.toml` leaves `[placement] reset_shortcut` off, so
@@ -527,15 +534,17 @@ uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
   snapshots or archive. A federation that ran a shard is never given another.
 - **`down`** takes down every federation the fleet made (or `--member` one), each by `hpcfed.py down` (which cancels
   its jobs by id) and each verified: the exit status and its root gone. A root that is not the directory the fleet
-  made, or whose state file is another federation's, is refused, left untouched and named, and `down` exits 1;
+  made, or whose state file is another federation's (another job name, an agent's job record not the one its `up`
+  held, a job id other than the one the fleet recorded), is refused, left untouched and named, and `down` exits 1;
   nothing outside the record is ever looked at. The fleet's directory stays with its record, its logs and each root's
   lifecycle lock (hpcfed never removes one); remove it by hand once `status` shows every federation down.
 
 `tests/deploy/test_hpc_fleet.py` and `test_hpc_fleet_plan.py` run the fleet over a fake cluster per federation, the
 core's phase the real one over a bootstrap stand-in: several federations, one failing `up`, the maximum and the inode
-guard refusing before anything is made, the bound on ups at once, `down` of all and of one, a federation and a job the
-fleet did not make left untouched, the fingerprint check, each step on its own federation's job and node, and a shard
-moved to a fresh federation. Not run live.
+guard refusing before anything is made, a `het` layout refused, the bound on ups at once, `down` of all and of one, a
+federation and a job the fleet did not make left untouched (an agent's job record replaced included), the fingerprint
+check, each step on its own federation's agent's job and node and never into a job Slurm no longer holds for it, and a
+shard moved to a fresh federation. Not run live.
 
 ## What the repository's tests cover
 
