@@ -139,6 +139,7 @@ send() { # send <rc>: the results directory as one archive, base64 between a hea
 }
 
 cmd_run() {
+  cd "$dir" || fail "cannot enter the run directory"
   case "$HPCT_SHA" in "" | *[!0-9a-f]*) fail "the commit is not hex" ;; esac
   case "$HPCT_TIMEOUT_S$HPCT_CORES" in "" | *[!0-9]*) fail "the timeout and cores are whole numbers" ;; esac
   mkdir -m 0700 "$res" "$dir/home" "$dir/tmp"
@@ -182,6 +183,7 @@ cmd_run() {
 
 cmd_clean() {
   local mode=${1:-} d live=0 removed=0 kept=0
+  cd "$dir" || fail "cannot enter the run directory"
   case "$mode" in all) ;; "" | *[!0-9]*) fail "clean takes a number of minutes or all" ;; esac
   for d in "$root"/runs/*; do
     [ -d "$d" ] && [ "$d" != "$dir" ] || continue

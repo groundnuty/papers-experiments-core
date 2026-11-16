@@ -73,7 +73,7 @@ def slurm(bin_dir: Path, fake: Path) -> None:
 
 def remote(bin_dir: Path, fake: Path) -> None:
     """ssh runs the remote command with bash in $HOME; srun logs its options (up to /usr/bin/env) to fake/srun.argv,
-    the command after them (a multi-line word as <script>) to fake/srun.command, and
+    the command after them (a multi-line word as <script>) to fake/srun.command, moves to its --chdir, and
     runs the step's command, then sleeps on (an srun client that does not return) when fake/hang exists."""
     script(
         bin_dir / "ssh",
@@ -87,6 +87,7 @@ def remote(bin_dir: Path, fake: Path) -> None:
         f'printf \'%s\\n\' "${{args[@]:0:$i}}" -- >> "{fake}/srun.argv"\n'
         'for a in "${args[@]:$i}"; do case "$a" in *$\'\\n\'*) echo "<script>" ;; *) echo "$a" ;; esac; done'
         f' >> "{fake}/srun.command"\n'
+        'for a in "${args[@]:0:$i}"; do case "$a" in --chdir=*) cd "${a#--chdir=}" || exit 1 ;; esac; done\n'
         f'if [ -e "{fake}/hang" ]; then "${{args[@]:$i}}"; exec sleep 600; fi\n'
         'exec "${args[@]:$i}"\n',
     )
