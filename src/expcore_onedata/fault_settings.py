@@ -630,21 +630,53 @@ def heal_round_s(settings: FaultSettings) -> float:
 def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:
     """`[faults]`'s half of the platform's fingerprint (`PlatformConfig.fingerprint`); None when the file has none.
 
-    What a resume must not change about the fault injector: that it is configured at all (every run is then admitted
-    to the federation, an outage run exclusively), whether it is sanctioned, and which container each target takes
-    down, by the target's label and the SHA-256 of its Compose project and service names, never a name or a path
-    (O12). The bounds of its waits and where its journal lies are how it runs, not what the runs measure, so they are
-    left out.
+    What a resume must not change about the fault injector, and two shards must share (C06): that it is configured at
+    all (every run is then admitted to the federation, an outage run exclusively), whether it is sanctioned, which
+    service each target takes down, by the target's label and the SHA-256 of its backend and service name, never a
+    name (O12), and every bound of its waits, its restore and its heal after its default (`settings`, the derived
+    `heal_timeout_s` when the table leaves it out), each number of its field's type: they decide whether an outage
+    run's restore is verified in time or the run is set aside, and how long the federation stays held. Not here: the
+    journal and the Compose file (paths in the federation's root), the Compose project (each deployment's own name, so
+    two federations of one layout differ in it) and the commands that run Compose and Docker (the host's).
     """
     if "faults" not in load_toml(config.file):
         return None
     settings = load_faults(config.file, config)
-    where = "hpc:" if settings.backend == "hpc" else f"{settings.project}/"  # an HPC service has no project
     targets = {
-        config.provider_label(name): hashlib.sha256(f"{where}{service}".encode()).hexdigest()
+        config.provider_label(name): hashlib.sha256(f"{settings.backend}:{service}".encode()).hexdigest()
         for name, service in settings.services.items()
     }
-    return {"sanctioned": settings.sanctioned, "targets": dict(sorted(targets.items()))}
+    return {
+        "sanctioned": settings.sanctioned,
+        "targets": dict(sorted(targets.items())),
+        "settings": _bounds_record(settings),
+    }
+
+
+def _bounds_record(settings: FaultSettings) -> dict[str, Any]:
+    """The fault injector's bounds as the fingerprint holds them: every one after its default, a whole number of
+    attempts as an integer, every other number as a float, so `2` and `2.0` are one value."""
+    seconds = (
+        "poll_s",
+        "settle_timeout_s",
+        "command_timeout_s",
+        "ready_timeout_s",
+        "admission_timeout_s",
+        "health_wait_s",
+        "gate_timeout_s",
+        "heal_timeout_s",
+        "heal_settle_s",
+        "session_drain_s",
+        "stop_bound_s",
+        "relay_wait_s",
+    )
+    return {
+        "backend": settings.backend,
+        "heal": settings.heal,
+        "heal_container_fallback": settings.heal_container_fallback,
+        "clear_attempts": int(settings.clear_attempts),
+        **{key: float(getattr(settings, key)) for key in seconds},
+    }
 
 
 def compose_driver(

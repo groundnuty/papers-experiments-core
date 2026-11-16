@@ -280,36 +280,43 @@ class PlatformConfig:
         return ", ".join(self.provider_label(n) for n in sorted(set(names), key=order.index))
 
     def fingerprint(self) -> dict[str, Any]:
-        """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change.
+        """The platform's half of the campaign fingerprint (`StudyPlugin.platform`): what a resume must not change, and
+        what two shards must share to merge. It holds every declared setting that shapes a run, after its default and
+        in one canonical form, and nothing that is one federation's or one host's own (an address, an id, a port, a
+        name, a path) or a secret (O12): two renders of one template on two federations give one fingerprint, and a
+        changed setting that shapes a run gives another (`runsettings`, which says what is in and what is out).
 
-        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
-        whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
-        (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
-        An entry that declares its data (`data_manifest`) is there by its declared identity and its data's content hash,
-        without its Onezone id: a space is the same experimental condition across federations when its declared
-        identity and its data identity match (C06); one that does not is there with its id, as it always was. The
-        one-space form holds its space's data identity (`space_data`) only when `[space]` declares `data_manifest`.
-        The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
-        declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly` (and `shared`,
-        when true: O59).
+        It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value, and the
+        lifetime rule of the run's tokens (`tokens`). Whenever the `[[spaces]]` form is used (one entry or several), it
+        holds each entry's SHA-256 in the file's order (`StudySpace.digest`), so a resume under another set, order,
+        support, data provider or token planes is refused. An entry that declares its data (`data_manifest`) is there
+        by its declared identity and its data's content hash, without its Onezone id: a space is the same experimental
+        condition across federations when its declared identity and its data identity match (C06); one that does not is
+        there with its id, as it always was. The one-space form holds its support set, its local provider and its
+        prefixes (`support`), its data identity (`space_data`) when `[space]` declares `data_manifest`, and
+        `storage_import` with its `readonly` (and `shared`, when true: O59) when it declares an imported storage (O41).
 
-        With a `[sandbox]`, it also holds every level of the data path with its kind and a REST level's listing mode
-        (O21), so a resume after a level changed its data path or its listing is refused. A declared
-        `[sandbox.served_bytes]` puts the caps of the tables of the bytes served there too (O22), since they decide what
-        a run's evidence can show; without the table the fingerprint keeps the shape it had before the caps could be
-        declared, so a campaign that ran under the defaults still resumes. On the Apptainer backend it holds that
-        backend's pins too (`sandbox_backend`, O56); the Docker backend's fingerprint is unchanged.
+        With a `[sandbox]`, it also holds every level of the data path with its kind, a REST level's listing mode and a
+        mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is
+        declared (O22), on the Apptainer backend that backend's pins (`sandbox_backend`, O56), and the sandbox's other
+        settings that shape a run (`sandbox`: the backend, the images by id, the limits, the mount, the trust paths,
+        the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256). With a
+        `[toolserver]`, its pinned commit, its start's bound and each condition's allow-list, rights and manifest's
+        SHA-256 (`toolserver`); with a `[placement]`, its data provider by label and its range map by digest
+        (`placement`); with `[faults]`, the fault injector's sanction, targets and every bound of its waits and its heal
+        (`faults`, `fault_settings.faults_fingerprint`).
 
-        When the file has `[faults]`, it holds the fault injector's sanction and targets too
-        (`fault_settings.faults_fingerprint`), never a path, a name or a value (O12). A file without `[faults]` keeps
-        the fingerprint it had before the fault injector existed.
+        The fingerprint of a store recorded before these settings were in it differs: such a store is refused at its
+        resume, naming what changed, and a merge never joins it with a shard of this form (C06).
         """
-        from expcore_onedata.fault_settings import faults_fingerprint  # it reads this module's config: import when used
+        from expcore_onedata import runsettings  # it reads this module's settings: import when used
+        from expcore_onedata.fault_settings import faults_fingerprint
 
-        out: dict[str, Any] = {"tls": self.tls.record()}
+        out: dict[str, Any] = {"tls": self.tls.record(), "tokens": runsettings.tokens_record(self.tokens)}
         if self.spaces_table:
             out["spaces"] = [entry.digest() for entry in self.spaces]
-        else:  # the one-space form's: each only when declared, so the old one stands
+        else:  # the one-space form's
+            out["support"] = runsettings.support_record(self)
             if self.spaces[0].imported is not None:
                 out["storage_import"] = self.spaces[0].imported.record()
             if self.spaces[0].data is not None:  # its data identity (C06): two federations agree only on the same data
@@ -320,6 +327,12 @@ class PlatformConfig:
                 out["served_bytes"] = self.sandbox.served_caps.record()
             if self.sandbox.apptainer is not None:  # O56: a Docker and an Apptainer run are never one experiment
                 out["sandbox_backend"] = self.sandbox.apptainer.record()
+            out["sandbox"] = runsettings.sandbox_record(self.sandbox)
+        if self.toolserver is not None:
+            out["toolserver"] = runsettings.toolserver_record(self.toolserver, self.file)
+        placement = runsettings.placement_record(self)
+        if placement is not None:
+            out["placement"] = placement
         faults = faults_fingerprint(self)
         if faults is not None:
             out["faults"] = faults
