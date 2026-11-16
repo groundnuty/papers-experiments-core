@@ -79,7 +79,7 @@ class Rig:
         self.driver.poll_s = 0.0
         self.driver.slurm.sleep = lambda s: None
         self.driver.slurm.poll_s = 0.0
-        self.driver.core = lambda layout, owner, values: "core: the link check passed"
+        self.driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
         self.driver.relay_available = lambda: False
 
     def up(self):
