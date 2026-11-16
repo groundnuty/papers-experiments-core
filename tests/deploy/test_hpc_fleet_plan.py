@@ -1,4 +1,4 @@
-"""O66: the fleet's plan gives each shard of one campaign a federation of one platform fingerprint, its step lands on
+"""O67: the fleet's plan gives each shard of one campaign a federation of one platform fingerprint, its step lands on
 that federation's own job and node, and a shard moves only to a fresh federation of the fleet's fingerprint whose first
 reset is full (deploy/hpc-federation/fleetplan.py).
 
@@ -51,8 +51,8 @@ def assigned(bench) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ plan
-def test_o66_plan_gives_each_shard_its_own_federations_job_and_node(bench):
-    """O66: shard-k on fed-k: its line an exact step of fed-k's held job's component 1, on the agent's node fed-k's
+def test_o67_plan_gives_each_shard_its_own_federations_job_and_node(bench):
+    """O67: shard-k on fed-k: its line an exact step of fed-k's held job's component 1, on the agent's node fed-k's
     state names, labelled and counted as one shard of three; shards.toml written for collect."""
     assert bench.up(3)[0] == 0
     code, printed, lines = plan(bench)
@@ -73,8 +73,8 @@ def test_o66_plan_gives_each_shard_its_own_federations_job_and_node(bench):
     assert reference["fingerprint"] == bench.fingerprint("fed-1") == bench.fingerprint("fed-3")
 
 
-def test_o66_plan_refuses_a_fleet_whose_federations_platform_fingerprints_differ(bench, tmp_path):
-    """O66: fed-3's zone is of another image's build (another CA): the federations' platform fingerprints differ in
+def test_o67_plan_refuses_a_fleet_whose_federations_platform_fingerprints_differ(bench, tmp_path):
+    """O67: fed-3's zone is of another image's build (another CA): the federations' platform fingerprints differ in
     their TLS record, so their shards would never be one campaign; nothing is assigned, nothing is written."""
     bench.cas["fed-3"] = another_ca(tmp_path / "other-ca")
     assert bench.up(3)[0] == 0
@@ -88,8 +88,8 @@ def test_o66_plan_refuses_a_fleet_whose_federations_platform_fingerprints_differ
     assert not (bench.fleet / "shards.toml").exists()
 
 
-def test_o66_a_failed_federations_shard_is_left_unassigned_and_the_others_planned(bench):
-    """O66: fed-2's up failed: shard-1 and shard-3 are planned on their federations, shard-2 is unassigned."""
+def test_o67_a_failed_federations_shard_is_left_unassigned_and_the_others_planned(bench):
+    """O67: fed-2's up failed: shard-1 and shard-3 are planned on their federations, shard-2 is unassigned."""
     bench.data["fed-2"] = data_stand_in(differ="alpha-space")
     assert bench.up(3)[0] == 1
     code, printed, lines = plan(bench)
@@ -100,8 +100,8 @@ def test_o66_a_failed_federations_shard_is_left_unassigned_and_the_others_planne
     assert lines["shard-3"]["argv"][lines["shard-3"]["argv"].index("--count") + 1] == "3"
 
 
-def test_o66_an_unassigned_shard_goes_to_a_fresh_federation_of_the_fleets_fingerprint(bench):
-    """O66: fed-2 failed and was taken down; a fresh fed-4 (its own up, its data checked, the same fingerprint)
+def test_o67_an_unassigned_shard_goes_to_a_fresh_federation_of_the_fleets_fingerprint(bench):
+    """O67: fed-2 failed and was taken down; a fresh fed-4 (its own up, its data checked, the same fingerprint)
     takes shard-2; shard-1 and shard-3 stay where they are."""
     bench.data["fed-2"] = data_stand_in(differ="alpha-space")
     assert bench.up(3)[0] == 1
@@ -114,7 +114,7 @@ def test_o66_an_unassigned_shard_goes_to_a_fresh_federation_of_the_fleets_finger
     assert lines["shard-2"]["argv"][1] == f"--jobid={job_ids('fed-4')[0]}"
 
 
-def test_o66_a_fresh_federation_of_another_fingerprint_is_never_given_a_shard(bench, tmp_path):
+def test_o67_a_fresh_federation_of_another_fingerprint_is_never_given_a_shard(bench, tmp_path):
     bench.data["fed-2"] = data_stand_in(differ="alpha-space")
     bench.cas["fed-4"] = another_ca(tmp_path / "other-ca")
     assert bench.up(3)[0] == 1
@@ -127,7 +127,7 @@ def test_o66_a_fresh_federation_of_another_fingerprint_is_never_given_a_shard(be
     assert assigned(bench)["shard-2"] is None
 
 
-def test_o66_plan_refuses_settings_other_than_the_first_plans(bench):
+def test_o67_plan_refuses_settings_other_than_the_first_plans(bench):
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
     other = bench.base / "other-settings.toml"
@@ -138,8 +138,8 @@ def test_o66_plan_refuses_settings_other_than_the_first_plans(bench):
 
 
 # ------------------------------------------------------------------------------------------------ step
-def test_o66_step_launches_each_shard_on_its_own_federation_once(bench):
-    """O66: each assigned shard's line spawned detached, checked on its own federation's cluster; a second step
+def test_o67_step_launches_each_shard_on_its_own_federation_once(bench):
+    """O67: each assigned shard's line spawned detached, checked on its own federation's cluster; a second step
     launches nothing while the clients run."""
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
@@ -153,8 +153,8 @@ def test_o66_step_launches_each_shard_on_its_own_federation_once(bench):
     assert "shard-1: its step on fed-1 still runs" in printed
 
 
-def test_o66_step_checks_the_federation_again_and_refuses_one_no_longer_the_fleets(bench):
-    """O66: fed-1's state replaced after the plan: shard-1 is not launched there; shard-2 is."""
+def test_o67_step_checks_the_federation_again_and_refuses_one_no_longer_the_fleets(bench):
+    """O67: fed-1's state replaced after the plan: shard-1 is not launched there; shard-2 is."""
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
     path = bench.root("fed-1") / "hpc-federation.json"
@@ -166,8 +166,8 @@ def test_o66_step_checks_the_federation_again_and_refuses_one_no_longer_the_flee
     assert [s.label for s in bench.spawned] == ["fed-2"]
 
 
-def test_o66_a_moved_shard_resumes_on_a_fresh_federation_whose_first_reset_is_full(bench):
-    """O66: shard-1 ran on fed-1, which is taken down: it is released, given to the fresh fed-3 (the same
+def test_o67_a_moved_shard_resumes_on_a_fresh_federation_whose_first_reset_is_full(bench):
+    """O67: shard-1 ran on fed-1, which is taken down: it is released, given to the fresh fed-3 (the same
     fingerprint, [placement] reset_shortcut off), and its step there resumes; shard-2 runs on, untouched."""
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
@@ -189,8 +189,8 @@ def test_o66_a_moved_shard_resumes_on_a_fresh_federation_whose_first_reset_is_fu
     assert len(bench.spawned) == 3  # shard-2's step still runs on fed-2: not launched again
 
 
-def test_o66_a_shard_is_never_moved_to_a_federation_whose_reset_shortcut_is_on(bench):
-    """O66: a moved shard's first reset must be full; fed-3's platform.toml turns the shortcut on: refused."""
+def test_o67_a_shard_is_never_moved_to_a_federation_whose_reset_shortcut_is_on(bench):
+    """O67: a moved shard's first reset must be full; fed-3's platform.toml turns the shortcut on: refused."""
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
     assert bench.run("down", "--member", "fed-1")[0] == 0
@@ -204,7 +204,7 @@ def test_o66_a_shard_is_never_moved_to_a_federation_whose_reset_shortcut_is_on(b
     assert assigned(bench)["shard-1"] is None
 
 
-def test_o66_step_relaunches_an_ended_shard_only_with_resume(bench):
+def test_o67_step_relaunches_an_ended_shard_only_with_resume(bench):
     assert bench.up(2)[0] == 0
     assert plan(bench)[0] == 0
     assert bench.run("step")[0] == 0
@@ -219,7 +219,7 @@ def test_o66_step_relaunches_an_ended_shard_only_with_resume(bench):
 
 
 # ------------------------------------------------------------------------------------------------ status
-def test_o66_status_says_each_federation_its_job_and_shard_and_runs_nothing(bench):
+def test_o67_status_says_each_federation_its_job_and_shard_and_runs_nothing(bench):
     bench.data["fed-2"] = data_stand_in(differ="alpha-space")
     assert bench.up(3)[0] == 1
     assert plan(bench)[0] == 1

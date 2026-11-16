@@ -14,25 +14,27 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
   refuses), and past the quota by the inode guard (`hpcquota`, when this core has it: the account's usage plus N times
   one federation's estimate, read once, before anything is made); then the fleet's directory (new: never adopted),
   N federations `fed-1` ... `fed-N`, each its own root `<fleet>/fed-k/root` (an exclusive mkdir), state file and held
-  job, brought up by `hpcfed`'s own driver, `HPC_FLEET_PARALLEL` at a time (1 by default), and N shards. A federation
-  whose up fails is reported and the others stay up; it may hold a job until `down --member` releases it.
+  job, each brought up by `hpcfed.py up` in a process of its own, `HPC_FLEET_PARALLEL` at a time (1 by default), and N
+  shards. A federation whose up fails is reported and the others stay up; it may hold a job until `down --member`
+  releases it. Each federation's output is in `<fleet>/logs/<label>.<up|down>.log`.
 - add: K fresh federations into the fleet, by the same rules, the maximum counting every one that may hold a job.
 - plan: each shard on a federation (`fleetplan`), written to `<fleet>/shards.toml`, and each one's srun line printed
   as `shards.py plan` prints it.
 - step: each assigned shard's line launched detached on the login node, its client recorded.
 - status: what the record and each root's state file say; nothing is run.
-- down: every federation this fleet made, or one, taken down by its driver and verified gone; a root or state that is
-  not the one this fleet's up made is refused and left untouched, and nothing else is ever looked for.
+- down: every federation this fleet made, or one, taken down by `hpcfed.py down` and verified gone; a root or state
+  that is not the one this fleet's up made is refused and left untouched, and nothing else is ever looked for.
 """
 
 import argparse
 import json
 import os
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -72,12 +74,18 @@ def _say(line: str) -> None:
     print(f"fleet: {line}", file=sys.stderr, flush=True)
 
 
+# One federation's `hpcfed.py --layout L --root R <up|down>`: (label, command, layout, root, log) -> (its exit status,
+# what it printed). By default a process of its own (`hpcfed_process`): a federation's driver changes process-wide
+# state (the umask its secrets are written under), so two never share a process.
+Operate = Callable[[str, str, Path, Path, Path], Tuple[int, str]]
+
+
 @dataclass
 class Hooks:
-    """What a federation's up and down run on and a step is launched through: `hpcfed.make_driver` over the login
-    node's Runner by default, the tests' fake Slurm in their place."""
+    """What a federation's up and down run through and a step is launched through: `hpcfed.py` in a process of its own
+    and the login node's Runner by default, the tests' fake Slurm in their place."""
 
-    driver: Callable[[str, Path, Path, bool], Any]  # (label, layout, root, agent) -> hpcdriver.Driver
+    federation: Operate
     runner: Callable[[str], Any]  # label -> the Runner that spawns and watches its federation's shard step
     inode_guard: Callable[[int, Layout, Any, Mapping[str, str]], str]  # (count, layout, site, environ) -> its words
     self_check: Callable[[], Any] = hpcfed.self_check
@@ -97,13 +105,40 @@ def inode_guard(runner: Any, count: int, layout: Layout, site: Any, environ: Map
     return hpcquota.check_inodes(runner, site, count * each)
 
 
+def hpcfed_process(environ: Mapping[str, str], run: Callable[..., Any] = subprocess.run) -> Operate:
+    """Each federation's up or down as an operator runs it by hand: `hpcfed.py` under this interpreter with `-I` (no
+    module of the launch directory is ever imported), from the fleet's own 0700 directory (never a shared one), in a
+    process of its own with this environment (site.env's values), its output appended to the federation's log (0600)."""
+
+    def operate(label: str, command: str, layout: Path, root: Path, log: Path) -> Tuple[int, str]:
+        argv = [sys.executable, "-I", "-B", str(HERE / "hpcfed.py"), "--layout", str(layout), "--root", str(root),
+                command]  # fmt: skip
+        descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            done = run(argv, env=dict(environ), cwd=str(Path(root).parents[1]), stdin=subprocess.DEVNULL,
+                       stdout=descriptor, stderr=subprocess.STDOUT, check=False)  # fmt: skip
+        finally:
+            os.close(descriptor)
+        return done.returncode, log.read_text(encoding="utf-8", errors="replace")
+
+    return operate
+
+
 def default_hooks(environ: Mapping[str, str]) -> Hooks:
     runner = Runner()
     return Hooks(
-        driver=lambda label, layout, root, agent: hpcfed.make_driver(layout, str(root), runner, environ, agent=agent),
+        federation=hpcfed_process(environ),
         runner=lambda label: runner,
         inode_guard=lambda count, layout, site, env: inode_guard(runner, count, layout, site, env),
     )
+
+
+def last_error(printed: str) -> str:
+    """The line a failed command ended on, for the record: its last `error:` line, or its last line."""
+    lines = [line.strip() for line in printed.splitlines() if line.strip()]
+    errors = [line for line in lines if line.startswith("error:")]
+    said = (errors or lines or ["it printed nothing"])[-1]
+    return "".join(c if c.isprintable() else "?" for c in said)[-300:]
 
 
 def setting(environ: Mapping[str, str], name: str, default: Optional[int] = None) -> int:
@@ -158,8 +193,15 @@ class Fleet:
     def say(self, line: str) -> None:
         self.hooks.say(line)
 
-    def speaker(self, label: str) -> Callable[[str], None]:
-        return lambda line: print(f"hpcfed: {label}: {line}", file=sys.stderr, flush=True)
+    def operate(self, label: str, command: str, layout: Path) -> Tuple[int, str]:
+        """One federation's `hpcfed.py up` or `down`, its output in `<fleet>/logs/<label>.<command>.log`."""
+        logs = self.directory / "logs"
+        logs.mkdir(mode=0o700, exist_ok=True)
+        log = logs / f"{label}.{command}.log"
+        try:
+            return self.hooks.federation(label, command, layout, root_of(self.directory, label), log)
+        except (OSError, subprocess.SubprocessError) as error:
+            return 1, f"error: {command}: it could not be run ({type(error).__name__})"
 
     # -- up and add -----------------------------------------------------------------------------------------------
 
@@ -179,7 +221,7 @@ class Fleet:
             raise FleetError("the fleet's directory exists: a fleet's up makes its own and never adopts one") from None
         self.record.save(new_record(layout, spec.digest, count, maximum, parallel))
         with self.record.lifecycle("up"):
-            return self.bring_up([f"fed-{n}" for n in range(1, count + 1)], layout, site, parallel)
+            return self.bring_up([f"fed-{n}" for n in range(1, count + 1)], layout, parallel)
 
     def add(self, count: int) -> int:
         maximum, parallel = setting(self.environ, MAX_VAR), setting(self.environ, PARALLEL_VAR, 1)
@@ -196,7 +238,7 @@ class Fleet:
             self.hooks.self_check()
             self.say(self.hooks.inode_guard(count, self.scratch_layout(spec), site, self.environ))
             first = len(record["members"]) + 1
-            return self.bring_up([f"fed-{n}" for n in range(first, first + count)], layout, site, parallel)
+            return self.bring_up([f"fed-{n}" for n in range(first, first + count)], layout, parallel)
 
     def scratch_layout(self, spec: Any) -> Layout:
         """One federation's layout, for the inode estimate alone (nothing is made)."""
@@ -218,19 +260,15 @@ class Fleet:
         self.record.update(lambda r: member_of(r, label).update(status="made", made=[info.st_dev, info.st_ino]))
         return True
 
-    def bring_up(self, labels: List[str], layout: Path, site: Any, parallel: int) -> int:
+    def bring_up(self, labels: List[str], layout: Path, parallel: int) -> int:
         made = [label for label in labels if self.claim(label)]
 
         def one(label: str) -> bool:
-            root, said, out = root_of(self.directory, label), None, ""
-            try:
-                driver = self.hooks.driver(label, layout, root, True)
-                driver.say = self.speaker(label)
-                out = driver.up(site)
-            except Exception as error:  # one federation's failure, named, never another's
-                said = " ".join(f"{type(error).__name__}: {error}".split())
+            root = root_of(self.directory, label)
+            code, printed = self.operate(label, "up", layout)
             facts = state_facts(root)
-            ok = said is None and facts.get("phase") == LINKED
+            ok = code == 0 and facts.get("phase") == LINKED
+            said = None if ok else last_error(printed) if code != 0 else f"not linked (phase {facts.get('phase')})"
 
             def done(record: Dict[str, Any]) -> None:
                 member = member_of(record, label)
@@ -238,11 +276,11 @@ class Fleet:
                 member.update(name=facts.get("name") or member["name"], job=facts.get("jobs") or None)
 
             self.record.update(done)
-            for line in out.splitlines():
-                self.say(f"{label}: {line}")
-            if not ok:
+            if ok:
+                self.say(f"{label}: up, job(s) {', '.join(facts['jobs'])}")
+            else:
                 held = f"; its job(s) {', '.join(facts['jobs'])} may still be held" if facts.get("jobs") else ""
-                self.say(f"{label}: up FAILED ({said or 'not linked'}){held}: `fleet.py down --member {label}`")
+                self.say(f"{label}: up FAILED ({said}){held}: `fleet.py down --member {label}`")
             return ok
 
         results = pooled(made, parallel, one)
@@ -376,14 +414,10 @@ class Fleet:
             return False
         if name is not None and member["name"] is None:
             self.record.update(lambda r: member_of(r, label).update(name=name))
-        root, said = root_of(self.directory, label), None
-        try:
-            driver = self.hooks.driver(label, layout, root, False)
-            driver.say = self.speaker(label)
-            self.say(f"{label}: {driver.down()}")
-        except Exception as error:  # one federation's failure, named, never another's
-            said = " ".join(f"{type(error).__name__}: {error}".split())
-        ok = said is None and not root.exists()
+        root = root_of(self.directory, label)
+        code, printed = self.operate(label, "down", layout)
+        ok = code == 0 and not root.exists()
+        said = None if ok else last_error(printed) if code != 0 else "its root is still there"
 
         def done(record: Dict[str, Any]) -> None:
             member_of(record, label).update(status="down" if ok else "down-failed", said=said, shard=None)
@@ -392,8 +426,8 @@ class Fleet:
                     shard.update(member=None, last=label)
 
         self.record.update(done)
-        if not ok:
-            self.say(f"{label}: down FAILED ({said or 'its root is still there'}): run down again")
+        self.say(f"{label}: down, its job gone and its root removed" if ok else f"{label}: down FAILED ({said}): run "
+                 "down again")  # fmt: skip
         return ok
 
 

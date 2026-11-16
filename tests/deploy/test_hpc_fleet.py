@@ -1,4 +1,4 @@
-"""O66: the fleet launcher (deploy/hpc-federation/fleet.py) brings N federations up from one layout, each its own root,
+"""O67: the fleet launcher (deploy/hpc-federation/fleet.py) brings N federations up from one layout, each its own root,
 state file and held job, refuses past the operator's maximum and the inode guard before anything is made, keeps the
 others up when one fails, and takes down only what its own up made, each verified.
 
@@ -48,8 +48,8 @@ def submitted(bench) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ up
-def test_o66_up_brings_n_federations_up_each_its_own_root_state_file_and_held_job(bench):
-    """O66: three federations from one layout: each root `<fleet>/fed-k/root`, its state linked, one held job of its
+def test_o67_up_brings_n_federations_up_each_its_own_root_state_file_and_held_job(bench):
+    """O67: three federations from one layout: each root `<fleet>/fed-k/root`, its state linked, one held job of its
     own (its own fake cluster's), a job name with up's random part, all recorded by the fleet."""
     code, printed = bench.up(3)
     assert code == 0, printed
@@ -71,8 +71,8 @@ def test_o66_up_brings_n_federations_up_each_its_own_root_state_file_and_held_jo
 
 
 @pytest.mark.parametrize(("maximum", "count"), [("2", 3), ("5", 6)])
-def test_o66_up_past_the_maximum_is_refused_before_anything_is_made(bench, maximum, count):
-    """O66: N past the operator's maximum: refused, no fleet directory, no sbatch on any cluster."""
+def test_o67_up_past_the_maximum_is_refused_before_anything_is_made(bench, maximum, count):
+    """O67: N past the operator's maximum: refused, no fleet directory, no sbatch on any cluster."""
     code, printed = bench.up(count, environ={**bench.environ, "HPC_FLEET_MAX": maximum})
     assert code == 2
     assert f"past the maximum of {maximum} (HPC_FLEET_MAX)" in printed
@@ -81,7 +81,7 @@ def test_o66_up_past_the_maximum_is_refused_before_anything_is_made(bench, maxim
 
 
 @pytest.mark.parametrize("value", [None, "", "0", "five", "65"])
-def test_o66_up_without_a_maximum_the_operator_set_is_refused(bench, value):
+def test_o67_up_without_a_maximum_the_operator_set_is_refused(bench, value):
     environ = {k: v for k, v in bench.environ.items() if k != "HPC_FLEET_MAX"}
     if value is not None:
         environ["HPC_FLEET_MAX"] = value
@@ -91,8 +91,8 @@ def test_o66_up_without_a_maximum_the_operator_set_is_refused(bench, value):
     assert not bench.fleet.exists()
 
 
-def test_o66_up_refused_by_the_inode_guard_makes_nothing(bench):
-    """O66: the guard is asked once for all N federations, before the fleet's directory or any job."""
+def test_o67_up_refused_by_the_inode_guard_makes_nothing(bench):
+    """O67: the guard is asked once for all N federations, before the fleet's directory or any job."""
     asked = []
 
     def refuse(count, layout, site, environ):
@@ -108,7 +108,7 @@ def test_o66_up_refused_by_the_inode_guard_makes_nothing(bench):
     assert bench.fakes == {}
 
 
-def test_o66_up_never_adopts_an_existing_fleet_directory(bench):
+def test_o67_up_never_adopts_an_existing_fleet_directory(bench):
     bench.fleet.mkdir()
     code, printed = bench.up(2)
     assert code == 2
@@ -117,8 +117,8 @@ def test_o66_up_never_adopts_an_existing_fleet_directory(bench):
     assert bench.fakes == {}
 
 
-def test_o66_one_failed_up_leaves_the_others_up_and_says_its_job_may_be_held(bench):
-    """O66: fed-2's data is not its manifest's, so its up fails in the core's phase, after its sbatch: fed-1 and fed-3
+def test_o67_one_failed_up_leaves_the_others_up_and_says_its_job_may_be_held(bench):
+    """O67: fed-2's data is not its manifest's, so its up fails in the core's phase, after its sbatch: fed-1 and fed-3
     stay up, fed-2 is recorded as failed, and its held job is named, never cancelled by the fleet behind its back."""
     bench.data["fed-2"] = data_stand_in(differ="alpha-space")
     code, printed = bench.up(3)
@@ -133,29 +133,26 @@ def test_o66_one_failed_up_leaves_the_others_up_and_says_its_job_may_be_held(ben
         assert bench.fake(label).cancelled == []
 
 
-def test_o66_up_runs_at_most_the_parallel_setting_at_once(bench):
-    """O66: HPC_FLEET_PARALLEL=2 over four federations: two ups at once, never a third, every one run."""
+def test_o67_up_runs_at_most_the_parallel_setting_at_once(bench):
+    """O67: HPC_FLEET_PARALLEL=2 over four federations: two ups at once, never a third, every one run."""
     lock, entered, gate, full = threading.Lock(), [], threading.Event(), threading.Event()
     inflight = {"now": 0, "most": 0}
 
-    def up(site):
+    def operate(label, command, layout, root, log):
         with lock:
             inflight["now"] += 1
             inflight["most"] = max(inflight["most"], inflight["now"])
-            entered.append(1)
+            entered.append(label)
             if inflight["now"] == 2:
                 full.set()
         assert gate.wait(30), "the test never opened the gate"
         with lock:
             inflight["now"] -= 1
-        return "stub up"
-
-    def driver(label, layout, root, agent):
-        return SimpleNamespace(up=up, say=None)
+        return 1, "error: up: a stand-in"
 
     environ = {**bench.environ, "HPC_FLEET_PARALLEL": "2"}
     result = {}
-    runner = threading.Thread(target=lambda: result.update(code=bench.up(4, environ=environ, driver=driver)))
+    runner = threading.Thread(target=lambda: result.update(code=bench.up(4, environ=environ, federation=operate)))
     runner.start()
     assert full.wait(30)
     with lock:
@@ -165,12 +162,12 @@ def test_o66_up_runs_at_most_the_parallel_setting_at_once(bench):
     assert not runner.is_alive()
     assert inflight["most"] == 2
     assert len(entered) == 4
-    assert result["code"][0] == 1  # the stubs leave no linked state: each up counts as failed, which is not the test
+    assert result["code"][0] == 1  # the stand-ins fail every up: what is tested is how many ran at once
 
 
 # ------------------------------------------------------------------------------------------------ add
-def test_o66_add_counts_every_federation_that_may_hold_a_job_against_the_maximum(bench):
-    """O66: a failed federation may still hold its job, so it counts; one taken down does not."""
+def test_o67_add_counts_every_federation_that_may_hold_a_job_against_the_maximum(bench):
+    """O67: a failed federation may still hold its job, so it counts; one taken down does not."""
     bench.data["fed-2"] = data_stand_in(differ="alpha-space")
     environ = {**bench.environ, "HPC_FLEET_MAX": "3"}
     assert bench.up(2, environ=environ)[0] == 1
@@ -184,8 +181,8 @@ def test_o66_add_counts_every_federation_that_may_hold_a_job_against_the_maximum
     assert [m["status"] for m in record(bench)["members"]] == ["up", "down", "up", "up"]
 
 
-def test_o66_add_never_adopts_a_slot_someone_else_made(bench):
-    """O66: fed-3's slot made by hand before the add: never brought up, never taken down, left as it is."""
+def test_o67_add_never_adopts_a_slot_someone_else_made(bench):
+    """O67: fed-3's slot made by hand before the add: never brought up, never taken down, left as it is."""
     assert bench.up(2)[0] == 0
     (bench.fleet / "fed-3" / "root").mkdir(parents=True)
     (bench.fleet / "fed-3" / "root" / "theirs").write_text("not the fleet's\n", encoding="utf-8")
@@ -199,8 +196,8 @@ def test_o66_add_never_adopts_a_slot_someone_else_made(bench):
 
 
 # ------------------------------------------------------------------------------------------------ down
-def test_o66_down_tears_every_federation_down_each_verified(bench):
-    """O66: every federation's driver down: each cluster cancels its own job alone, each root is gone, and the fleet
+def test_o67_down_tears_every_federation_down_each_verified(bench):
+    """O67: every federation's driver down: each cluster cancels its own job alone, each root is gone, and the fleet
     records each as down."""
     assert bench.up(3)[0] == 0
     code, printed = bench.run("down")
@@ -213,15 +210,16 @@ def test_o66_down_tears_every_federation_down_each_verified(bench):
     assert bench.run("down")[0] == 0  # nothing left: every one is down already
 
 
-def test_o66_down_touches_no_federation_and_no_job_it_did_not_make(bench):
-    """O66: a federation brought up by hand beside the fleet (its own root, its own cluster) and another user's job on
-    a fleet federation's cluster: the fleet's down cancels neither and removes nothing of the first."""
+def test_o67_down_touches_no_federation_and_no_job_it_did_not_make(bench):
+    """O67: a federation brought up by hand in the fleet's directory, in a slot of the fleet's own form that its record
+    does not list (its own root, its own cluster), and another user's job on a fleet federation's cluster: the fleet's
+    down cancels neither and removes nothing of the first."""
     assert bench.up(2)[0] == 0
-    other_root = bench.base / "other" / "root"
+    other_root = bench.fleet / "fed-9" / "root"
     other_root.parent.mkdir()
-    other = bench.driver("fed-9", LAYOUT, other_root, True)
-    other.up(bench.deploy.hpc.settings.site_from_environment(bench.environ))
+    assert bench.federation("fed-9", "up", LAYOUT, other_root, bench.base / "other.log")[0] == 0
     calls = len(bench.fake("fed-9").calls)
+    assert bench.fake("fed-9").submitted  # it is up, on a cluster of its own
     bench.fake("fed-1").submitted["7777"] = [{"--job-name": "someone-elses-job", "--nodes": "1"}]
     assert bench.run("down")[0] == 0
     assert len(bench.fake("fed-9").calls) == calls
@@ -231,8 +229,8 @@ def test_o66_down_touches_no_federation_and_no_job_it_did_not_make(bench):
     assert "7777" not in bench.fake("fed-1").cancelled
 
 
-def test_o66_down_refuses_a_root_whose_state_is_another_federations(bench):
-    """O66: fed-2's state file replaced by one of another federation (another job name): fed-2 is not touched and is
+def test_o67_down_refuses_a_root_whose_state_is_another_federations(bench):
+    """O67: fed-2's state file replaced by one of another federation (another job name): fed-2 is not touched and is
     reported, fed-1 goes down, and down fails."""
     assert bench.up(2)[0] == 0
     path = bench.root("fed-2") / "hpc-federation.json"
@@ -248,8 +246,8 @@ def test_o66_down_refuses_a_root_whose_state_is_another_federations(bench):
     assert [m["status"] for m in record(bench)["members"]] == ["down", "down-failed"]
 
 
-def test_o66_down_refuses_a_root_that_is_not_the_directory_the_fleet_made(bench):
-    """O66: fed-2's root moved away and another directory put in its place, its state copied: not the fleet's mkdir
+def test_o67_down_refuses_a_root_that_is_not_the_directory_the_fleet_made(bench):
+    """O67: fed-2's root moved away and another directory put in its place, its state copied: not the fleet's mkdir
     (device and inode), so it is not touched."""
     assert bench.up(2)[0] == 0
     root = bench.root("fed-2")
@@ -262,8 +260,8 @@ def test_o66_down_refuses_a_root_that_is_not_the_directory_the_fleet_made(bench)
     assert bench.fake("fed-2").cancelled == []
 
 
-def test_o66_a_record_that_names_a_root_the_fleet_does_not_make_is_refused_whole(bench):
-    """O66: the record is the only list down acts on, and it accepts no root but `<fleet>/fed-k/root`."""
+def test_o67_a_record_that_names_a_root_the_fleet_does_not_make_is_refused_whole(bench):
+    """O67: the record is the only list down acts on, and it accepts no root but `<fleet>/fed-k/root`."""
     assert bench.up(2)[0] == 0
     path = bench.fleet / "fleet.json"
     edited = json.loads(path.read_text(encoding="utf-8"))
@@ -275,7 +273,7 @@ def test_o66_a_record_that_names_a_root_the_fleet_does_not_make_is_refused_whole
     assert all(fake.cancelled == [] for fake in bench.fakes.values())
 
 
-def test_o66_down_of_one_member_leaves_the_others_up(bench):
+def test_o67_down_of_one_member_leaves_the_others_up(bench):
     assert bench.up(3)[0] == 0
     assert bench.run("down", "--member", "fed-2")[0] == 0
     assert bench.fake("fed-2").cancelled == [job_ids("fed-2")[0]]
@@ -284,8 +282,8 @@ def test_o66_down_of_one_member_leaves_the_others_up(bench):
 
 
 # ------------------------------------------------------------------------------------------------ the inode guard
-def test_o66_the_inode_guard_reads_the_quota_once_for_n_times_one_federations_estimate(deploy, monkeypatch):
-    """O66: with the core's inode guard (hpcquota, stood in here), the fleet's check is the account's usage against N
+def test_o67_the_inode_guard_reads_the_quota_once_for_n_times_one_federations_estimate(deploy, monkeypatch):
+    """O67: with the core's inode guard (hpcquota, stood in here), the fleet's check is the account's usage against N
     times one federation's estimate, read once: N ups would each read the same usage."""
     asked = []
     stand_in = SimpleNamespace(
@@ -300,7 +298,34 @@ def test_o66_the_inode_guard_reads_the_quota_once_for_n_times_one_federations_es
     assert "HPC_STORAGE_ROOT is not set" in deploy.fleet.inode_guard(object(), 4, object(), SimpleNamespace(), {})
 
 
-def test_o66_without_the_inode_guard_the_fleet_says_none_was_made(deploy, monkeypatch):
+def test_o67_without_the_inode_guard_the_fleet_says_none_was_made(deploy, monkeypatch):
     monkeypatch.setitem(sys.modules, "hpcquota", None)  # an import of it fails, as in a core without it
     said = deploy.fleet.inode_guard(object(), 3, object(), SimpleNamespace(storage_root="/x"), {})
     assert said == "inode check: none: this core has no inode guard (hpcquota)"
+
+
+# ------------------------------------------------------------------------------------------------ one process each
+def test_o67_each_federations_up_and_down_is_hpcfed_in_a_process_of_its_own(deploy, tmp_path):
+    """O67: a federation's driver changes process-wide state (the umask its secrets are written under), so the fleet
+    runs each up and down as `hpcfed.py --layout L --root R <command>` in a child of its own, isolated (`-I`) and from
+    the fleet's own directory, with the site's environment, its output appended to the federation's log (0600)."""
+    seen = []
+
+    def run(argv, **options):
+        seen.append((argv, options))
+        os.write(options["stdout"], b"error: up: refused\n")
+        return SimpleNamespace(returncode=1)
+
+    operate = deploy.fleet.hpcfed_process({"HPC_ACCOUNT": "invented"}, run=run)
+    log = tmp_path / "fed-1.up.log"
+    code, printed = operate("fed-1", "up", LAYOUT, tmp_path / "fed-1" / "root", log)
+    ((argv, options),) = seen
+    assert argv[:3] == [sys.executable, "-I", "-B"]
+    assert options["cwd"] == str(tmp_path)
+    assert argv[3:] == [str(deploy.fleet.HERE / "hpcfed.py"), "--layout", str(LAYOUT), "--root",
+                        str(tmp_path / "fed-1" / "root"), "up"]  # fmt: skip
+    assert options["env"] == {"HPC_ACCOUNT": "invented"}
+    assert (code, printed) == (1, "error: up: refused\n")
+    assert log.stat().st_mode & 0o777 == 0o600
+    said = deploy.fleet.last_error("hpcfed: zone launched\nerror: up: the zone failed\n")
+    assert said == "error: up: the zone failed"

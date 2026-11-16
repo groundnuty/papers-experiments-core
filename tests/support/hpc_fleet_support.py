@@ -3,6 +3,10 @@ site.env for every federation (as on the login node), and each federation over a
 (`hpc_fed_support.FakeSlurm`, its own job ids), its core's phase the real one over the rehearsal's bootstrap stand-in,
 so every root holds the platform.toml its up rendered and its link check's record.
 
+The fleet runs each federation's `hpcfed.py up` and `down` in a process of its own; here they are `hpcfed.main` in
+this process (`Bench.federation`), with `hpcfed.make_driver` patched once for the bench's life to put each federation
+on its own fake cluster, chosen by its root (`<fleet>/<label>/root`).
+
 The fleet's step launches each shard's srun line detached on the login node; here `StepRunner` stands for that
 spawn, and checks each line against its own federation's fake cluster (`FakeSlurm._step`: the job and the node must
 be that federation's, the component its het group). Nothing reaches a cluster, a node or a container.
@@ -67,8 +71,10 @@ class Bench:
     spawned: list = field(default_factory=list)
     alive: set = field(default_factory=set)
     guard: Any = None  # the inode guard's stand-in: (count, layout, site, environ) -> its words
+    real: Any = None  # hpcfed.make_driver as the module has it, before the bench patches it
 
     def __post_init__(self) -> None:
+        self.real = self.deploy.hpc.cli.make_driver
         self.node_tmp = self.base / "node-tmpfs"
         for folder in ("images", "logs", "node-tmpfs"):
             (self.base / folder).mkdir()
@@ -96,7 +102,7 @@ class Bench:
     def driver(self, label: str, layout: Path, root: Path, agent: bool) -> Any:
         """`hpcfed.make_driver` over this federation's fake cluster, its waits not slept on, the core's phase the real
         one over the bootstrap's stand-in (as the rehearsal's `driver_maker`)."""
-        made = self.deploy.hpc.cli.make_driver(layout, str(root), self.fake(label), self.environ, agent=agent)
+        made = self.real(layout, str(root), self.fake(label), self.environ, agent=agent)
         made.sleep = made.slurm.sleep = lambda seconds: None
         made.poll_s = made.slurm.poll_s = 0.0
         made.core = functools.partial(
@@ -109,11 +115,30 @@ class Bench:
         )
         return made
 
+    def make_driver(
+        self, layout: Path, root: str, runner: Any = None, environ: Any = None, *, agent: bool = True
+    ) -> Any:
+        """`hpcfed.make_driver` as `hpcfed.main` calls it: the federation is the one whose slot holds the root, and the
+        runner `main` was given must be that federation's own fake cluster."""
+        label = Path(root).parent.name
+        assert runner is None or runner is self.fake(label), f"{root} driven over another federation's cluster"
+        return self.driver(label, layout, Path(root), agent)
+
+    def federation(self, label: str, command: str, layout: Path, root: Path, log: Path) -> tuple[int, str]:
+        """`hpcfed.py --layout L --root R <command>` through its own `main`, in this process, on the federation's own
+        fake cluster: what the fleet's process of its own would run."""
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
+            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command], self.environ,
+                                            runner=self.fake(label))  # fmt: skip
+        log.write_text(printed.getvalue(), encoding="utf-8")
+        return code, printed.getvalue()
+
     def hooks(self, **given: Any) -> Any:
         fleet = self.deploy.fleet
         guard = self.guard or (lambda count, layout, site, environ: f"inode check: stand-in for {count}")
-        return fleet.Hooks(driver=given.get("driver", self.driver), runner=lambda label: StepRunner(self, label),
-                           inode_guard=guard)  # fmt: skip
+        operate = given.get("federation", self.federation)
+        return fleet.Hooks(federation=operate, runner=lambda label: StepRunner(self, label), inode_guard=guard)
 
     def run(self, *argv: str, environ: dict | None = None, **given: Any) -> tuple[int, str]:
         """`fleet.py --fleet <fleet> ARGV`, through its own `main`: its exit status and all it printed."""
@@ -151,9 +176,12 @@ def fleet_modules():
 
 
 def make_bench(deploy: Any, base: Path, ca_pem: str, patch: Any) -> Bench:
-    """A bench in `base`, the link check's transfers stood in (`link_check_stand_in`) while `patch` lasts."""
+    """A bench in `base`; while `patch` lasts, the link check's transfers are stood in (`link_check_stand_in`) and
+    `hpcfed.make_driver` is the bench's."""
     patch.setattr(deploy.fedlinks, "check_links", link_check_stand_in([]))
-    return Bench(deploy, base, ca_pem)
+    bench = Bench(deploy, base, ca_pem)
+    patch.setattr(deploy.hpc.cli, "make_driver", bench.make_driver)
+    return bench
 
 
 def another_ca(directory: Path) -> str:
