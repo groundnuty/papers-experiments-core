@@ -10,7 +10,7 @@ than the work disk holds; what the agent made so is refused for the scorers, the
 writes its close lines) and the bytes it served counted once (O22), its log copied; the collector is stopped (it writes
 its end line) and its log read once, kept for the egress instrument and copied. Every file of evidence the collection
 writes is scanned for the data-path token: one that holds it is removed and the collection fails, since a secret is
-never evidence (O05).
+never evidence (O05). A mount run's guard closes its window here and its log is copied too (O60, `hostmount`).
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 EGRESS_COPY = "egress.jsonl"
+MOUNT_WATCH_COPY = "mount-watch.jsonl"
 GATE_COPY = "gate-requests.jsonl"
 
 
@@ -66,6 +67,9 @@ class Collection:
             result["gate_log"] = GATE_COPY
         written.append(self._egress(dest))
         result["egress_log"] = EGRESS_COPY if self.egress_bytes is not None else None
+        if box.spec.mode is DataPathMode.MOUNT:
+            written.append(self._mount_watch(dest))
+            result["mount_watch_log"] = MOUNT_WATCH_COPY if written[-1] is not None else None
         (dest / "metadata.json").write_text(json.dumps(box.metadata(), indent=1, default=str), encoding="utf-8")
         written.append(dest / "metadata.json")
         self._scan([path for path in written if path is not None])
@@ -168,6 +172,16 @@ class Collection:
             return None
         target = dest / EGRESS_COPY
         target.write_bytes(self.egress_bytes)
+        return target
+
+    def _mount_watch(self, dest: Path) -> Path | None:
+        """Close the mount guard's window, now that every process of the run is shown gone, and copy its log (O60): the
+        guard's verdict is then in the metadata this collection writes. A helper without a guard has none."""
+        found = self.box.mount_watch_log()
+        if found is None:
+            return None
+        target = dest / MOUNT_WATCH_COPY
+        target.write_bytes(found)
         return target
 
     def _scan(self, paths: Sequence[Path]) -> None:

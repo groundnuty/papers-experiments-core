@@ -305,6 +305,17 @@ class ApptainerSandbox:
         """Hook (c): the mount's helper, started before any cell; the node directory bound at the mount path."""
         self.register_creation()
         self._mount = self._mount_factory(self.node, self.s, self.spec, self.dir)
+        # before they exist: the record lists them, so a reaper removes them first, and every teardown too (O60); each
+        # must be a file of the run's directory, as the record names it relative to it and a reaper removes it there
+        paths = [Path(os.path.normpath(path)) for path in self._mount.token_paths()]
+        real = Path(os.path.realpath(self.dir))
+        outside = [p for p in paths if p == self.dir or not p.is_relative_to(self.dir)]
+        # through a link, even one that stays in the run: the reaper never follows one (`runs.remove_inside`)
+        linked = [p for p in paths if p not in outside and Path(os.path.realpath(p)) != real / p.relative_to(self.dir)]
+        if outside or linked:
+            raise SandboxError("the mount helper named a token file outside the run's directory or through a link")
+        self._token_files = [*self._token_files, *paths]
+        self.run_record()
         return self._mount.start()
 
     def _start_gate(self) -> None:
@@ -668,6 +679,18 @@ class ApptainerSandbox:
         """The collector's log as the collection read it once the collector had stopped; None before, or when it
         could not be read (`expcore.egress.EgressSource`)."""
         return self.collection.egress_bytes
+
+    def mount_watch_log(self) -> bytes | None:
+        """The mount guard's log (`expcore.mountguard.MountWatchSource`), its window closed first (O60); None without a
+        mount helper that keeps one. Read after the run's cells have ended: the collection does, and so may the
+        instrument."""
+        read = getattr(self._mount, "mount_watch_log", None)
+        return None if read is None else read()
+
+    @property
+    def mount_guard_nonce(self) -> str | None:
+        """The nonce of the mount guard's watcher (`expcore.mountguard.MountGuard`), once the helper exists."""
+        return getattr(self._mount, "nonce", None)
 
     def mount_io_mode(self) -> dict[str, Any]:
         if self.spec.mode is not DataPathMode.MOUNT or self._mount is None:

@@ -3,7 +3,8 @@ service verbs (`hpcfed_control.py`, M4) through the hook in `hpcfed.py` (DESIGN.
 
 - `StateStore`: `read()` the state file; `update(fn)` a locked, atomic read-modify-write of it (`fn` takes the state
   and returns the new one), under `hpc-federation.lock` in the root, so two commands never interleave their writes.
-- `Launcher`: steps of the held job the state names, on its own nodes only. `control(node, argv, *, name, timeout_s)`
+- `Launcher`: steps of the held job the state names, on its own nodes only (the agent's node's in its own component,
+  `--het-group`, or its own held job, as the state's `sandbox` says). `control(node, argv, *, name, timeout_s)`
   runs a bounded control step (`--exact`, the control reserve's size, the environment allowlist, stdin /dev/null)
   and raises `TimeoutError` at its bound after cancelling that step by its id; `service(node, argv, *, kind, name,
   log)` launches a detached service step of the kind's size; `listed(name)` is the step id `squeue -s` lists under a
@@ -92,22 +93,30 @@ class Launcher:
         self.store = store
         self.settings = settings
 
-    def _where(self, node: str, name: str) -> Tuple[str, Site]:
+    def _where(self, node: str, name: str) -> Tuple[str, Optional[int], Optional[str], Site]:
+        """The job a step on this node belongs to, the heterogeneous job's component it runs in (None: component 0,
+        or a job of one component) and that component's own id: a service node is the services' job's (component
+        0); the agent's node is the last component of the same job (`het`) or a held job of its own (`separate`)."""
         state = self.store.read()
         job = state["allocation"].get("job")
         if job is None:
             raise hpcstate.StateError("the state names no held job")
-        if node not in (state["allocation"].get("nodes") or []):
+        sandbox = state.get("sandbox") or {}
+        if node in (state["allocation"].get("nodes") or []):
+            where: Tuple[str, Optional[int], Optional[str]] = (job, None, None)
+        elif sandbox.get("node") is not None and node == sandbox["node"] and sandbox.get("job") is not None:
+            where = (sandbox["job"], sandbox.get("het_group"), sandbox.get("component_job"))
+        else:
             raise hpcstate.StateError("refusing a step on a node that is not one of the held job's")
         if not STEP_NAME.fullmatch(name):
             raise hpcstate.StateError("a step name must be letters, digits, '_', '.' and '-'")
-        return job, Site.from_json(state["site"])
+        return (*where, Site.from_json(state["site"]))
 
     def _step(self, node: str, argv: Sequence[str], name: str, kind: str, output: Optional[str] = None) -> Step:
-        job, site = self._where(node, name)
+        job, group, component, site = self._where(node, name)
         size = self.settings.control if kind == "control" else self.settings.size(kind)
         env = allowlist(site.step_path, site.node_tmp)
-        return Step(job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output)
+        return Step(job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output, group, component)
 
     def control(self, node: str, argv: Sequence[str], *, name: str, timeout_s: float) -> Completed:
         """A bounded control step, stdin /dev/null; `TimeoutError` (`StepTimeout`) at its bound, the step cancelled."""
@@ -140,7 +149,10 @@ class Launcher:
         return None if job is None else self.slurm.steps(job).get(name)
 
     def cancel(self, step_id: str) -> None:
+        """Cancel one step of the federation's own jobs: the held job, a component of it, or the agent's own job."""
         state = self.store.read()
-        if not step_id.startswith(f"{state['allocation'].get('job')}."):
+        sandbox = state.get("sandbox") or {}
+        ours = {state["allocation"].get("job"), sandbox.get("job"), sandbox.get("component_job")} - {None}
+        if "." not in step_id or step_id.split(".")[0].split("+")[0] not in ours:
             raise hpcstate.StateError("refusing to cancel a step of another job")
         self.slurm.cancel_step(step_id)

@@ -8,8 +8,10 @@ space so (`[space] import`, `spaces.py`) and checks the result here, through the
 (`ImportedSpace`):
 
 1. **`check_storage`**: the data provider's Onepanel shows the space supported by an imported storage, read-only as
-   declared, in the `auto` mode, with continuous scans off. A continuous scan would scan again on its own, during a
-   run, and with the detection of modifications on it claims a file changed on the storage whole on the data provider
+   declared (and, for a directory other federations import too, `[space] import` `shared`, O59, read-only with no
+   room for doubt: the flag must be the boolean `true`), in the `auto` mode, with continuous scans off. A continuous
+   scan would scan again on its own, during a run, and with the detection of modifications on it claims a file
+   changed on the storage whole on the data provider
    and takes its blocks from every other provider (op-worker f118ed9, `storage_import_engine.erl`,
    `maybe_update_file_location`; `fslogic_location.erl`, `update_imported_file_doc`), so it is refused. A manual
    import, file by file, is refused too: it has no scan to wait for.
@@ -90,6 +92,7 @@ class SpaceCheck:
             "space": provisioner.space.position,
             "ok": False,
             "readonly": provisioner.read_only,
+            **({"shared": True} if self._shared(provisioner) else {}),
             "manifest": {
                 "files": len(manifest.files),
                 "directories": len(manifest.directories),
@@ -104,6 +107,12 @@ class SpaceCheck:
             "seconds": {},
             "reads_retried": 0,
         }
+
+    @staticmethod
+    def _shared(provisioner: Provisioner) -> bool:
+        """Whether the space's imported directory is shared with other federations (`[space] import`, O59)."""
+        declared = provisioner.space.imported
+        return declared is not None and declared.shared
 
     @property
     def space(self) -> Space:
@@ -305,6 +314,11 @@ class ImportedSpace(SpaceCheck):
         self._record["storage"] = shown
         if shown["imported"] is not True:
             raise self._fail("the data provider's storage of the space is not an imported storage, as declared")
+        if self._shared(self._p) and shown["readonly"] is not True:
+            raise self._fail(
+                "the data provider's imported storage is not read-only, and the directory it holds is shared with "
+                "other federations: refused, since a federation that could write to it could change theirs"
+            )
         if shown["readonly"] is not self._p.read_only:
             raise self._fail("the data provider's imported storage's read-only is not as declared ([space] import)")
         if shown["mode"] == "manual":

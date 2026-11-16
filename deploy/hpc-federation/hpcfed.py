@@ -9,14 +9,16 @@ Run on the login node. `up` reads the site's values from the environment (`set -
 them in the state file in the root, so `down` and the service verbs need no environment: the login node's fault relay
 (M4), which `up` starts last, runs the verbs through this script's argv prefix, with `--layout` and `--root`.
 
-- up: one held job of `1 + providers` nodes (plus the agent's node when `[hpc]` declares `sandbox`), submitted and
-  read back; the zone and each provider a service step on its own node (the bundle's `zone.sbatch` and
-  `provider.sbatch`), each provider registered by a token minted on the zone and piped into its delivery step; the
-  zone's passphrase and CA into the root; then the bootstrap, the baseline, facts.json, platform.toml and the platform
-  layer's link check, which writes link-check.json in the root (`hpcboot.core_phase`). The layout's `[hpc] core` says
-  where that phase runs: "login" (in this process) or "step" (a control step on the zone's node, the core's Python).
+- up: one held job of `1 + providers` nodes, submitted and read back, with the agent's node when the layout declares
+  one (`[hpc] sandbox`, or the agent's limits in its template) as the job's component 1 of its own shape, or as a held
+  job of its own (`[hpc] sandbox_placement`); the zone and each provider a service step on its own node (the bundle's
+  `zone.sbatch` and `provider.sbatch`), each provider registered by a token minted on the zone and piped into its
+  delivery step; the zone's passphrase and CA into the root; then the bootstrap, the baseline, facts.json,
+  platform.toml and the platform layer's link check, which writes link-check.json in the root
+  (`hpcboot.core_phase`). The layout's `[hpc] core` says where that phase runs: "login" (in this process) or "step"
+  (a control step on the zone's node, the core's Python).
 - down: every service torn down (the providers, then the zone), every step gone, each node checked, the held job
-  cancelled by its id, then the root removed; on whatever up reached.
+  (and the agent's own job, when it has one) cancelled by its id, then the root removed; on whatever up reached.
 - describe: the plan: the nodes and their shape, every step's size, and what the job bills per hour.
 - stop, start, status, exec: the service verbs, `hpcfed_control.run` (M4), through the hook in `main`.
 - core: the core's phase alone, as the step of `[hpc] core = "step"` runs it.
@@ -40,7 +42,7 @@ from fedlayout import Layout, checked_root  # noqa: E402
 from fedspec import DEFAULT_LAYOUT, LayoutError, Spec, load_spec  # noqa: E402
 from hpcdriver import CORE_MISMATCH, CoreMismatch, Driver  # noqa: E402
 from hpclaunch import Launcher, StateStore  # noqa: E402
-from hpcsettings import SettingsError, load_settings, site_from_environment  # noqa: E402
+from hpcsettings import SettingsError, agent_limits, load_settings, site_from_environment  # noqa: E402
 from hpcslurm import Runner, Slurm  # noqa: E402
 
 CONTROL_VERBS = ("stop", "start", "status", "exec")  # hpcfed_control.VERBS (M4)
@@ -82,15 +84,27 @@ def root_layout(value: Optional[str], spec: Spec) -> Layout:
     return Layout(checked_root(value, parent, strict=True), parent, spec)
 
 
-def make_driver(layout_path: Path, root: Optional[str], runner: Optional[Runner] = None) -> Driver:
-    """The driver of one layout and one root; the runner is the tests' fake Slurm, or the real one."""
+def make_driver(
+    layout_path: Path,
+    root: Optional[str],
+    runner: Optional[Runner] = None,
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    agent: bool = True,
+) -> Driver:
+    """The driver of one layout and one root; the runner is the tests' fake Slurm, or the real one. `environ` is the
+    environment the driver reads a shared imported tree and its manifest from (O59), and gives the fault relay: this
+    process's own when it is None. `agent`: whether the agent's limits in the layout's template size the agent's node,
+    which only up and describe need; down and the verbs work from the state file, so a template edited since up never
+    stops them."""
     layout_path = layout_path.resolve()
     spec = load_spec(layout_path)
     layout = root_layout(root, spec)
-    settings = load_settings(spec.hpc)
+    settings = load_settings(spec.hpc, agent_limits(spec.platform_template) if agent else None)
     slurm = Slurm(runner or Runner())
     store = StateStore(layout.root)
     command = [sys.executable, "-B", str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root", str(layout.root)]
+    given = {} if environ is None else {"environ": dict(environ)}
     return Driver(
         layout_path=layout_path,
         layout=layout,
@@ -101,6 +115,7 @@ def make_driver(layout_path: Path, root: Optional[str], runner: Optional[Runner]
         user=pwd.getpwuid(os.getuid()).pw_name,
         command=command,
         core_paths=core_paths(),
+        **given,
     )
 
 
@@ -138,7 +153,8 @@ def main(
     args = parser.parse_args(words)
     environ = os.environ if environ is None else environ
     try:
-        driver = make_driver(args.layout, args.root or environ.get("EXPCORE_FED_ROOT"), runner)
+        root = args.root or environ.get("EXPCORE_FED_ROOT")
+        driver = make_driver(args.layout, root, runner, environ, agent=args.command in ("up", "describe"))
     except (LayoutError, SettingsError, ValueError) as error:
         print(f"error: {args.command}: {error}", file=sys.stderr)
         return 2
