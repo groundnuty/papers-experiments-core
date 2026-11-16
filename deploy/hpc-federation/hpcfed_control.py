@@ -36,7 +36,8 @@ or epoch seconds, is read as such), `site` (`node_tmp`, `logs`, `node_python`), 
 
 **Which services.** The service must be a key of `services` with kind `op` or `oz`, and its work directory one
 `hpcstate.checked_workdir` accepts for that kind (directly under the site's node tmpfs, `hpcop-<op|oz>.XXXXXX`).
-Anything else is exit 2 with a message that names neither a node nor a path.
+Anything else is exit 2 with a message that names neither a node nor a path: the agent's node among them (`sandbox`,
+kind `sandbox`), which no verb ever acts on.
 
 **One stop or start at a time.** A stop or a start holds `VERBS_LOCK` in the federation's root (the state store's
 `root`) from the state read that decides it to its last record, never waiting for it: a second one meanwhile is exit 1

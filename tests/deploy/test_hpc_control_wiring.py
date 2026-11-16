@@ -61,7 +61,7 @@ class Federation:
         driver = hpc.cli.make_driver(LAYOUT, str(self.root), runner=self.fake)
         driver.sleep, driver.poll_s = (lambda s: None), 0.0
         driver.slurm.sleep, driver.slurm.poll_s = (lambda s: None), 0.0
-        driver.core = lambda layout, owner, values: "core: the link check passed"
+        driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
         driver.relay_available = lambda: False
         driver.up(hpc.settings.site_from_environment(site))
         self.driver = driver
@@ -270,16 +270,176 @@ def test_o58_a_restarted_owner_through_hpcfed_is_ready_only_after_the_check_on_i
     assert fed.state()["services"]["aspen"]["mounts_proven"] is True
 
 
-def test_o58_the_shared_imports_calls_are_the_ones_the_hook_names_once_it_is_merged(hpc):
-    """O58: when #315's `hpcimport` is in this checkout, its three calls take what the hook passes them."""
-    path = Path(hpc.cli.__file__).parent / "hpcimport.py"
-    if not path.exists():
-        pytest.skip("the shared import (#315) is not merged into this checkout")
+def test_o58_the_shared_imports_calls_are_the_ones_the_hook_names(hpc):
+    """O58: #315's `hpcimport` is in this core, and its three calls take what the hook passes them."""
     with hpc_on_path():
         import hpcimport
     assert list(inspect.signature(hpcimport.shared_imports_of).parameters) == ["layout", "provider"]
     assert list(inspect.signature(hpcimport.mount_check_argv).parameters) == ["bundle", "workdir", "python"]
     assert list(inspect.signature(hpcimport.mount_check_problems).parameters) == ["report", "spaces"]
+
+
+# -- the read-only proof over this core's own hpcimport and the pilot-shape-import layout (O59) -----------------------
+
+
+class ImportFederation(Federation):
+    """`up` of the pilot-shape-import layout (each data space a shared tree its owner imports), the mount check on
+    each owner's node answered from `held`: the space and how many of its processes hold it writable."""
+
+    def __init__(self, hpc, tmp_path, site, monkeypatch):
+        from hpc_import_support import IMPORT_LAYOUT, SPACES, make_environ
+
+        self.spaces, self.writable, self.checks = SPACES, 0, []
+        self.environ = make_environ(tmp_path)
+        self.layout = IMPORT_LAYOUT
+        self.hpc, self.fake = hpc, FakeSlurm()
+        self.root = tmp_path / "fed" / "root"
+        self.fake.on_control = self.node
+        driver = hpc.cli.make_driver(IMPORT_LAYOUT, str(self.root), runner=self.fake, environ=self.environ)
+        driver.sleep, driver.poll_s = (lambda s: None), 0.0
+        driver.slurm.sleep, driver.slurm.poll_s = (lambda s: None), 0.0
+        driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
+        driver.relay_available = lambda: False
+        self.driver, self.upped = driver, False
+        self.exec_answer = (0, "pong\n", "")
+        self.teardowns = []
+        driver.up(hpc.settings.site_from_environment(site))
+        self.upped = True  # from here on the node side answers the verbs' steps too
+        monkeypatch.setattr(hpc.control, "_SLEEP", lambda s: None)
+
+    def node(self, srun):
+        from hpcslurm import Completed
+
+        if any(Path(word).name == "importstorage.py" for word in srun.command):
+            self.checks.append(srun)
+            owner = self.service_at(srun.command[srun.command.index("--workdir") + 1])
+            facts = [
+                {"space": space, "processes": 3, "read_only": 3 - self.writable, "writable": self.writable}
+                for space, (who, _) in self.spaces.items()
+                if who == owner
+            ]
+            return FakeProcess(Completed(0, json.dumps(facts) + "\n", ""))
+        return super().node(srun) if self.upped else None
+
+    def verb(self, *words):
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--layout", str(self.layout), "--root", str(self.root), *words]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sys, "stdout", out)
+            patch.setattr(sys, "stderr", err)
+            status = self.hpc.cli.main(argv, self.environ, runner=self.fake)
+        return status, out.getvalue(), err.getvalue()
+
+
+@pytest.fixture
+def imported(hpc, tmp_path, site, monkeypatch):
+    return ImportFederation(hpc, tmp_path, site, monkeypatch)
+
+
+def test_o59_with_this_cores_hpcimport_the_hook_is_on_for_an_owner_and_off_for_a_mirror(hpc, imported):
+    """O59: `hpcfed.mount_check` builds the proof from this core's `hpcimport`: an owner's shared spaces, none for
+    aspen, which owns no tree, and the check's argv on the bundle beside the driver with the node's Python."""
+    mounts = hpc.cli.mount_check(imported.driver)
+    assert mounts.spaces("larch") == ["alpha-space"]
+    assert mounts.spaces("aspen") == []
+    argv = mounts.argv("/tmp/hpcop-op.larxyz", "python3.11")
+    script = str(hpc.control.BUNDLE / "importstorage.py")
+    assert argv == ["python3.11", "-I", "-B", script, "mounts", "--workdir", "/tmp/hpcop-op.larxyz"]
+
+
+def test_o59_a_restarted_owner_is_ready_only_once_this_cores_check_reproves_its_tree_for_that_launch(imported):
+    """O59: up proved larch's tree read-only; a stop and a start clear the proof; the first status that finds larch
+    otherwise ready runs `importstorage.py mounts` on larch's own node, reads its report with `mount_check_problems`
+    against alpha-space, and only then records the proof and answers ready."""
+    assert imported.state()["services"]["larch"]["mounts_proven"] is True  # up's own check
+    up_checks = len(imported.checks)
+    assert imported.verb("stop", "larch")[0] == 0
+    assert imported.verb("start", "larch")[0] == 0
+    assert imported.state()["services"]["larch"]["mounts_proven"] is False
+    status, out, err = imported.verb("status", "larch")
+    assert (status, json.loads(out)["ready"]) == (0, True), err
+    [check] = imported.checks[up_checks:]
+    record = imported.state()["services"]["larch"]
+    assert check.node == record["node"]
+    assert check.command[-2:] == ["--workdir", record["workdir"]]
+    assert (record["mounts_proven"], record["launch"]) == (True, 2)
+    assert imported.verb("status", "larch")[0] == 0
+    assert len(imported.checks) == up_checks + 1  # proven for this launch: not checked again
+
+
+def test_o59_a_restarted_owner_whose_tree_is_writable_in_a_process_is_never_ready(imported):
+    """O59: the report says a process holds alpha-space writable: larch runs but is not ready, the proof stays
+    cleared, and the message names the space, never a path."""
+    assert imported.verb("stop", "larch")[0] == 0
+    assert imported.verb("start", "larch")[0] == 0
+    imported.writable = 1
+    status, out, err = imported.verb("status", "larch")
+    reading = json.loads(out)
+    assert (status, reading["running"], reading["ready"]) == (0, True, False)
+    assert imported.state()["services"]["larch"]["mounts_proven"] is False
+    assert "alpha-space" in err
+    assert str(imported.root) not in err
+
+
+def test_o59_a_mirror_that_owns_no_tree_is_ready_again_with_no_check(imported):
+    """O59: aspen owns no shared tree: its restart needs no proof, and no check runs on its node."""
+    before = len(imported.checks)
+    assert imported.verb("stop", "aspen")[0] == 0
+    assert imported.verb("start", "aspen")[0] == 0
+    assert json.loads(imported.verb("status", "aspen")[1])["ready"] is True
+    assert len(imported.checks) == before
+    assert "mounts_proven" not in imported.state()["services"]["aspen"]
+
+
+# -- the agent's node is never a fault verb's (O57's sandbox record) -------------------------------------------------
+
+
+def agent_layout(folder):
+    """The pilot-shape layout with the agent's node held as component 1 of the job, beside its platform template."""
+    folder.mkdir()
+    control = 'control = { cpus = 1, memory = "1g" }'
+    text = LAYOUT.read_text(encoding="utf-8")
+    assert control in text
+    agent = f'{control}\nsandbox = {{ cpus = 8, memory = "17g" }}'
+    (folder / LAYOUT.name).write_text(text.replace(control, agent), encoding="utf-8")
+    template = LAYOUT.parent / "pilot-shape.platform.toml.template"
+    (folder / template.name).write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+    return folder / LAYOUT.name
+
+
+@pytest.mark.parametrize(
+    "words",
+    [("stop", "sandbox"), ("start", "sandbox"), ("status", "sandbox"), ("exec", "sandbox", "--", "op_worker", "ping")],
+)
+def test_o58_no_fault_verb_acts_on_the_agents_node(hpc, tmp_path, site, monkeypatch, words):
+    """O58: the agent's node is a role of the held job (`services.sandbox`, kind `sandbox`) but no provider's: every
+    verb on it is exit 2, no step runs on any node, and the state file is unchanged; the relay never lists it."""
+    from expcore_onedata.fault_relay import services_of
+
+    layout = agent_layout(tmp_path / "layout")
+    fed = Federation.__new__(Federation)
+    fed.hpc, fed.fake, fed.root = hpc, FakeSlurm(), tmp_path / "fed" / "root"
+    driver = hpc.cli.make_driver(layout, str(fed.root), runner=fed.fake)
+    driver.sleep, driver.poll_s = (lambda s: None), 0.0
+    driver.slurm.sleep, driver.slurm.poll_s = (lambda s: None), 0.0
+    driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
+    driver.relay_available = lambda: False
+    driver.up(hpc.settings.site_from_environment(site))
+    state = driver.store.read()
+    assert state["services"]["sandbox"]["kind"] == "sandbox"
+    assert state["sandbox"]["node"] == state["services"]["sandbox"]["node"]
+    steps = len(fed.fake.sruns)
+    out, err = io.StringIO(), io.StringIO()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, "stdout", out)
+        patch.setattr(sys, "stderr", err)
+        status = hpc.cli.main(["--layout", str(layout), "--root", str(fed.root), *words], {}, runner=fed.fake)
+    assert status == 2
+    assert out.getvalue() == ""
+    assert "neither an Oneprovider nor an Onezone" in err.getvalue()
+    assert len(fed.fake.sruns) == steps
+    assert driver.store.read() == state
+    assert services_of(fed.root) == set(PROVIDERS)  # the relay's allowlist: the providers alone
 
 
 # -- the login node's fault relay, as up and down run it ----------------------------------------------------------
