@@ -51,7 +51,7 @@ standard library, so `python3 deploy/hpc-tests/hpctests.py` works too.
 ### pytest arguments
 
 A run's pytest arguments are an allowlist, since pytest also reads clustered short options (`-qo ...`) and argument
-files (`@file`): test paths and node ids relative to the clone (no `..`, nothing absolute), `-q`, `-v`, `-x`, `-s`,
+files (any argument that starts with `@`, an option's value included, which is refused everywhere): test paths and node ids relative to the clone (no `..`, nothing absolute), `-q`, `-v`, `-x`, `-s`,
 `-l`, `-r<chars>`, `--exitfirst`, `--showlocals`, `--strict-markers`, `--runxfail`, `--no-header`, `--no-summary`,
 `--disable-warnings`, `-p no:<plugin>` (disabling a plugin, never loading one), and `-k`, `-m`, `-W`, `--deselect`, `--ignore`, `--ignore-glob`, `--maxfail`, `--durations`,
 `--tb` with a value. Anything else is refused before a step starts (exit 64): an option that could write outside the
@@ -84,6 +84,11 @@ Ask for what the selection needs: most of the suite is single-threaded, so 2 to 
   killed outright (by its time limit, say) can leave its directory: `hpctests.py clean --stale 60` runs a small step
   that removes every run directory of ours that no live `node.sh` holds and that is older than 60 minutes;
   `clean --all` also removes the uv cache and the Python when no run is live.
+- **A launch srun reports failed** before anything of the boot came back (seen live: the login node's lookup of the
+  node's name failed for a minute) is tried again, up to three times 30 s apart, with the same run id. A lost launch
+  reply looks the same as a launch that never happened, so the boot's first act on the node is an atomic, durable mark
+  of the run id (`attempts/<run>`, kept after the run): a retry whose earlier attempt started there refuses (exit 72)
+  rather than run again or hide that attempt's result. `clean` removes the marks of runs gone longer than its bound.
 - **The srun client of a finished step can hang** while the step's results are already out (seen on a site). The run
   ends ssh 30 s after the end marker, and keeps the results. On the login node the step runs under `timeout` (the
   step's time limit plus an hour for waiting for cores), so a client left behind ends by then.

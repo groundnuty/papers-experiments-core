@@ -74,7 +74,8 @@ def slurm(bin_dir: Path, fake: Path) -> None:
 def remote(bin_dir: Path, fake: Path) -> None:
     """ssh runs the remote command with bash in $HOME; srun logs its options (up to /usr/bin/env) to fake/srun.argv,
     the command after them (a multi-line word as <script>) to fake/srun.command, moves to its --chdir, fails its
-    launch while fake/launch-fail exists (once when it is empty, always when it holds text), and runs the step's
+    launch while fake/launch-fail exists (once when it is empty, always when it holds text), runs the step but loses
+    its output and reports a failed launch once when fake/launch-lost exists, and runs the step's
     command, then sleeps on for 8 s (an srun client that does not return) when fake/hang exists."""
     script(
         bin_dir / "ssh",
@@ -89,6 +90,8 @@ def remote(bin_dir: Path, fake: Path) -> None:
         'for a in "${args[@]:$i}"; do case "$a" in *$\'\\n\'*) echo "<script>" ;; *) echo "$a" ;; esac; done'
         f' >> "{fake}/srun.command"\n'
         'for a in "${args[@]:0:$i}"; do case "$a" in --chdir=*) cd "${a#--chdir=}" || exit 1 ;; esac; done\n'
+        f'if [ -e "{fake}/launch-lost" ]; then rm -f "{fake}/launch-lost"; "${{args[@]:$i}}" > /dev/null\n'
+        '  echo "srun: error: Application launch failed: Socket timed out" >&2; exit 1; fi\n'
         f'if [ -e "{fake}/launch-fail" ]; then [ -s "{fake}/launch-fail" ] || rm -f "{fake}/launch-fail"\n'
         '  echo "srun: error: Application launch failed: Can\'t find an address, check slurm.conf" >&2; exit 1; fi\n'
         f'if [ -e "{fake}/hang" ]; then "${{args[@]:$i}}"; exec sleep 8; fi\n'

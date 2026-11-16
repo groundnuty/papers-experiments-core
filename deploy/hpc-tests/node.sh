@@ -193,12 +193,18 @@ cmd_clean() {
     if is_live "$d"; then
       live=$((live + 1))
     elif [ "$mode" = all ] || [ -n "$(find "$d" -maxdepth 0 -mmin +"$mode")" ]; then
-      force_rm "$d"
+      force_rm "$d" "$root/attempts/${d##*/}"
       removed=$((removed + 1))
     else
       kept=$((kept + 1))
     fi
   done
+  # The attempt marks of runs whose directories are gone (a mark outlives its run on purpose), as old as the bound.
+  local m age=()
+  [ "$mode" = all ] || age=(-mmin "+$mode")
+  while IFS= read -r m; do
+    [ "${m##*/}" = "$run" ] || [ -e "$root/runs/${m##*/}" ] || rmdir -- "$m" 2> /dev/null
+  done < <(find "$root/attempts" -mindepth 1 -maxdepth 1 -type d "${age[@]}" 2> /dev/null)
   if [ "$mode" = all ] && [ "$live" = 0 ]; then
     force_rm "$root/uv-cache" "$root/python" "$root/python-bin" "$root/uv-tools" "$root/python.lock"
     say "clean: the uv cache and Python removed"

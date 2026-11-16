@@ -295,7 +295,8 @@ def test_o64_a_run_s_remote_command_holds_the_use_lock_shared_and_is_bounded_on_
     "args",
     [["tests", "-q"], ["tests/x.py::test_a[1-2]", "-k", "a and not b", "-m", "not benchmark"],
      ["-x", "--tb=short", "-ra", "--maxfail=2", "-W", "error::DeprecationWarning"], ["--deselect", "tests/x.py::t"],
-     ["-q", "-p", "no:cacheprovider", "-pno:randomly", "tests"]],
+     ["-q", "-p", "no:cacheprovider", "-pno:randomly", "tests"], ["--ignore", "tests/slow", "--tb", "short"],
+     ["--maxfail", "2", "--ignore-glob=tests/*_live.py"]],
 )  # fmt: skip
 def test_the_pytest_arguments_a_run_takes(hpct, args):
     assert hpct.lib.check_pytest_args(args) == args
@@ -305,7 +306,9 @@ def test_the_pytest_arguments_a_run_takes(hpct, args):
     "args",
     [["-qo", "log_file=/x"], ["@args.txt"], ["--basetemp=/x"], ["--setup-only"], ["/abs/tests"], ["../x"],
      ["tests/../../x"], ["-k"], ["--co"], ["-o", "x=y"], ["-p", "myplugin"], ["-pmyplugin"], ["--junitxml=/x"],
-     ["-c", "x.ini"], ["-p"]],
+     ["-c", "x.ini"], ["-p"], ["--ignore", "@args.txt", "tests"], ["--deselect=@x"], ["-k", "@expr"],
+     ["--maxfail", "two"], ["--tb", "verbose"], ["--ignore", "/shared/x"], ["--ignore=../x"],
+     ["--ignore-glob", "/x/*"], ["--ignore-glob=../*"]],
 )  # fmt: skip
 def test_o64_any_other_pytest_argument_is_refused(hpct, args):
     """O64: pytest reads clustered short options (`-qo ...`) and argument files (`@file`), so a run's arguments are an

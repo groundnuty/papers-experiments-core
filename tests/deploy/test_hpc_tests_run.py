@@ -195,6 +195,7 @@ def test_clean_removes_a_dead_run_s_directory_and_keeps_young_ones(cli, world, c
     for path in (dead, young):
         (path / "repo").mkdir(parents=True)
         (path / "pid").write_text("999999999\n")
+        (world.node_root / "attempts" / path.name).mkdir(parents=True)
     (dead / "repo").chmod(0o500)  # a tree a test left read-only
     old = time.time() - 600
     os.utime(dead, (old, old))
@@ -202,6 +203,8 @@ def test_clean_removes_a_dead_run_s_directory_and_keeps_young_ones(cli, world, c
     assert "removed 1 run directories, kept 1 younger ones" in capsys.readouterr().out
     assert not dead.exists()
     assert young.exists()
+    marks = sorted(p.name for p in (world.node_root / "attempts").iterdir() if not p.name.startswith("clean-"))
+    assert marks == ["young-run"]  # the dead run's mark went with it; a mark outlives its own run on purpose
 
 
 def test_the_payload_must_arrive_intact(cli, world):
@@ -339,3 +342,13 @@ def test_a_launch_that_keeps_failing_ends_with_no_results(cli, world, monkeypatc
     assert (out / "transport-1.log").exists()
     assert (out / "transport-2.log").exists()
     assert "Application launch failed" in (out / "transport.log").read_text()
+
+
+def test_o64_a_retry_whose_earlier_attempt_ran_on_the_node_refuses_instead_of_running_again(cli, world, monkeypatch):
+    """O64: a launch reported failed can still have run (its reply lost): the boot's first act is a durable mark of
+    the run id, so the retry, which keeps the id, refuses (72) and never repeats the work or reports a pass."""
+    monkeypatch.setattr(cli.module, "LAUNCH_PAUSE_S", 0.0)
+    allocate(cli, world)
+    (world.fake / "launch-lost").write_text("")
+    assert run(cli, world, "tests") == 72
+    assert '"rc": 72' in (only_run(world) / "run.json").read_text()

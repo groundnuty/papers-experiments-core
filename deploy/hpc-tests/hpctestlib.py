@@ -287,9 +287,15 @@ mkdir -p -m 0700 "$root"
 chmod 0700 "$root"
 [ "$(readlink -f "$root")" = "$root" ] || fail "the node root goes through a link"
 [ "$(stat -f -c %T "$root")" = tmpfs ] || fail "the node root is not on a tmpfs"
-mkdir -p -m 0700 "$root/runs"
-[ -d "$root/runs" ] && [ ! -L "$root/runs" ] || fail "runs is not a directory"
-[ "$(stat -c %u "$root/runs")" = "$uid" ] || fail "runs is not ours"
+mkdir -p -m 0700 "$root/runs" "$root/attempts"
+for d in runs attempts; do
+  [ -d "$root/$d" ] && [ ! -L "$root/$d" ] || fail "$d is not a directory"
+  [ "$(stat -c %u "$root/$d")" = "$uid" ] || fail "$d is not ours"
+done
+# The run's durable mark, made atomically before anything else and kept after the run: a retry of a launch that failed
+# (the same run id) refuses when an earlier attempt started here, so a retry never repeats work or hides its result.
+mkdir -m 0700 "$root/attempts/$run" 2> /dev/null \
+  || fail "an earlier attempt of this run started on the node; its results were lost"
 dir=$root/runs/$run
 mkdir -m 0700 "$dir" || fail "the run directory exists already"
 mkdir -m 0700 "$dir/kit"
@@ -348,43 +354,67 @@ FLAGS = frozenset(
 WITH_VALUE = frozenset(
     {"-k", "-m", "-W", "--deselect", "--ignore", "--ignore-glob", "--maxfail", "--durations", "--tb"}
 )
+PATH_VALUED = frozenset({"--deselect", "--ignore", "--ignore-glob"})
+NUMBER_VALUED = frozenset({"--maxfail", "--durations"})
+TB_STYLES = frozenset({"auto", "long", "short", "line", "native", "no"})
+GLOB = re.compile(r"[A-Za-z0-9_*?\[\]][A-Za-z0-9_.*?/\[\]-]*")
 REPORT_CHARS = re.compile(r"-r[fEsxXpPaAN]+")
 PLUGIN_OFF = re.compile(r"no:[A-Za-z0-9_.-]+")
 TEST_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*(?:::[A-Za-z0-9_.\[\]\-:, ]+)?")
 
 
+def relative_test_path(value: str) -> bool:
+    return bool(TEST_PATH.fullmatch(value)) and ".." not in value.split("::", 1)[0].split("/")
+
+
+def check_value(option: str, value: str) -> None:
+    """A WITH_VALUE option's value, by kind: a path relative to the clone, a whole number, a traceback style, or
+    (for -k, -m, -W) an expression, which pytest never reads as a file."""
+    if value.startswith("@"):
+        raise HpcTestsError(f"{option}'s value {value!r} is an argument file, which a run does not take")
+    if option == "--ignore-glob" and not (GLOB.fullmatch(value) and ".." not in value.split("/")):
+        raise HpcTestsError(f"--ignore-glob takes a glob relative to the clone, not {value!r}")
+    if option in PATH_VALUED - {"--ignore-glob"} and not relative_test_path(value):
+        raise HpcTestsError(f"{option} takes a path relative to the clone, not {value!r}")
+    if option in NUMBER_VALUED and not value.isdigit():
+        raise HpcTestsError(f"{option} takes a whole number, not {value!r}")
+    if option == "--tb" and value not in TB_STYLES:
+        raise HpcTestsError(f"--tb takes one of {', '.join(sorted(TB_STYLES))}, not {value!r}")
+
+
 def check_pytest_args(args: Sequence[str]) -> list[str]:
     """The arguments, refused unless each is a FLAGS flag, a `-r<chars>` report option, `-p no:<plugin>`, a
-    WITH_VALUE option with its value (next, or after `=`), or a test path or node id relative to the clone (no `..`;
-    no leading `/`, `-`, `@`)."""
+    WITH_VALUE option with a value of its kind (next, or after `=`), or a test path or node id relative to the clone.
+    pytest expands any argument that starts with `@` as a file of further arguments, an option's value included, so
+    no argument may."""
     out, pending = list(args), None
     for arg in out:
+        if arg.startswith("@"):
+            raise HpcTestsError(f"the pytest argument {arg!r} is an argument file, which a run does not take")
         if pending == "-p":
             if not PLUGIN_OFF.fullmatch(arg):
                 raise HpcTestsError(
-                    f"-p takes only no:<plugin> in a run (a plugin is disabled, never loaded), not {arg!r}"
+                    f"-p takes only no:<plugin> in a run (a plugin disabled, never loaded), not {arg!r}"
                 )
-            pending = None
-            continue
+        elif pending is not None:
+            check_value(pending, arg)
         if pending is not None:
             pending = None
             continue
-        if arg == "-p":
-            pending = "-p"
+        name, has_value, value = arg.partition("=")
+        if arg in FLAGS or REPORT_CHARS.fullmatch(arg) or (arg.startswith("-p") and PLUGIN_OFF.fullmatch(arg[2:])):
             continue
-        if arg.startswith("-p") and PLUGIN_OFF.fullmatch(arg[2:]):
-            continue
-        name = arg.split("=", 1)[0]
-        if arg in FLAGS or REPORT_CHARS.fullmatch(arg):
+        if arg == "-p" or (name in WITH_VALUE and not has_value):
+            pending = arg
             continue
         if name in WITH_VALUE:
-            pending = None if "=" in arg else name
+            check_value(name, value)
             continue
-        if TEST_PATH.fullmatch(arg) and ".." not in arg.split("::", 1)[0].split("/"):
+        if relative_test_path(arg):
             continue
         raise HpcTestsError(
             f"the pytest argument {arg!r} is not one a run takes: test paths, {', '.join(sorted(FLAGS))}, -r<chars>,"
-            f" and {', '.join(sorted(WITH_VALUE))} with a value (README, 'pytest arguments')"
+            f" -p no:<plugin>, and {', '.join(sorted(WITH_VALUE))} with a value (README, 'pytest arguments')"
         )
     if pending is not None:
         raise HpcTestsError(f"the pytest option {pending} needs a value")
