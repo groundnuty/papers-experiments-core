@@ -25,8 +25,8 @@
  *   2. EXPCORE_GATE_PORT, when there is no such file: a decimal port, digits only, from 1 to 65535, no sign, space or
  *      suffix. Unset, the shim is inert and silent (a process that dropped its environment keeps its connections as
  *      they are); set to anything else, it is inert and says so on stderr once, by one line naming the variable.
- * A line on stderr is written only if stderr can take it at once, with SIGPIPE held back: a closed or full pipe loses
- * the line and never kills or blocks the process that loads the shim. The shim never guesses a port. A path other than /etc/expcore/gate.json is for the tests' build only
+ * A line on stderr is written without ever blocking, with SIGPIPE held back: a closed or full pipe loses the line and
+ * never kills or holds the process that loads the shim. The shim never guesses a port. A path other than /etc/expcore/gate.json is for the tests' build only
  * (-DEXPCORE_GATE_CONFIG_FILE="...").
  *
  * Only the port changes, never the address, and the result is the real connect()'s: the shim fabricates no success and
@@ -58,7 +58,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,30 +86,38 @@ typedef int (*connect_fn)(int, const struct sockaddr *, socklen_t);
 static unsigned short gate_port;   /* the port to send 443 to; 0: redirect nothing. Set once, by the constructor. */
 
 /* One line to the process's stderr, only to a pipe, a file or a terminal: a daemon that closed fd 2 may have reused it
- * for a socket, and a line must never go into a connection. (As in portshim.c and egresslog.c.) */
+ * for a socket, and a line must never go into a connection. (As in portshim.c and egresslog.c.)
+ *
+ * This runs in a constructor, before main() of every process that loads the shim, so it must neither kill nor hold one.
+ * A pipe or a terminal is written through a new, non-blocking description of the same file (/proc/self/fd/2 opened
+ * O_NONBLOCK): a full pipe then drops the line (EAGAIN) instead of blocking, whoever else fills it meanwhile, and a pipe
+ * whose reader has gone is not even opened (ENXIO). Fd 2's own description is shared with other processes, and its flags
+ * are left as they are. A regular file is written through fd 2 itself, whose offset and O_APPEND are the program's.
+ * SIGPIPE is held back for the write, and one this write raised is taken away; one that was already pending is not. */
 static void note(const char *line) {
     struct stat st;
     size_t n = strlen(line);
     int saved = errno;
     if (syscall(SYS_fstat, 2, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode) || S_ISCHR(st.st_mode))) {
-        /* This runs in a constructor, before main() of every process that loads the shim, so it must neither kill nor
-         * hold one: a pipe whose reader has gone raises SIGPIPE, and a full pipe blocks the write. The line is written
-         * only if stderr can take it at once (poll), with SIGPIPE held back for the write and, if it came, taken away. */
-        struct pollfd ready = {2, POLLOUT, 0};
         sigset_t pipe_signal, before, pending;
-        int was_pending;
+        int was_pending, out = 2, reopened = 0;
         sigemptyset(&pipe_signal);
         sigaddset(&pipe_signal, SIGPIPE);
         sigprocmask(SIG_BLOCK, &pipe_signal, &before);
         sigpending(&pending);
         was_pending = sigismember(&pending, SIGPIPE);
-        if (poll(&ready, 1, 0) == 1 && (ready.revents & POLLOUT) && !(ready.revents & (POLLERR | POLLHUP | POLLNVAL)))
+        if (!S_ISREG(st.st_mode)) {
+            out = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+            reopened = 1;
+        }
+        if (out >= 0)
             while (n > 0) {
-                long w = syscall(SYS_write, 2, line, n);
+                long w = syscall(SYS_write, out, line, n);
                 if (w < 0 && errno == EINTR) continue;
-                if (w <= 0) break;
+                if (w <= 0) break;   /* EAGAIN: a full pipe */
                 line += w; n -= (size_t)w;
             }
+        if (reopened && out >= 0) close(out);
         sigpending(&pending);
         if (!was_pending && sigismember(&pending, SIGPIPE)) {
             struct timespec none = {0, 0};

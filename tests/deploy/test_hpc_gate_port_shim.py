@@ -575,6 +575,22 @@ def test_a_stderr_pipe_that_is_full_does_not_hold_the_process_that_loads_the_shi
     assert results[0]["peer"] == 443
 
 
+def test_a_stderr_file_gets_the_line_appended_and_keeps_its_content(built, tmp_path):
+    """O61: a regular file is written through the program's own descriptor, with its O_APPEND and offset: what the
+    program had written there before is not overwritten."""
+    log = tmp_path / "stderr.log"
+    log.write_text("keep\n", encoding="utf-8")
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND)
+    try:
+        run_client([["udp", "127.0.0.1", 443]], [built["gateport"]], {ENV: "not-a-port"}, stderr=fd)
+    finally:
+        os.close(fd)
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2, lines
+    assert lines[0] == "keep"
+    assert ENV in lines[1]
+
+
 # ----------------------------------------------------------------------------- with the egress shim (O52, order)
 
 
