@@ -240,3 +240,22 @@ def test_a_mount_table_that_cannot_be_read_keeps_the_dead_run(node, settings):
     finally:
         node.mount_table_unreadable = False
         fresh.stop()
+
+
+def test_remove_inside_removes_a_file_of_the_run_and_nothing_through_a_link(tmp_path):
+    """O60: the reaper's removal of a recorded token file never follows a link, at any depth."""
+    run = tmp_path / "run"
+    (run / "a").mkdir(parents=True)
+    (run / "a" / "token").write_text("x")
+    assert runs.remove_inside(run, run / "a" / "token") is True
+    assert not (run / "a" / "token").exists()
+    assert runs.remove_inside(run, run / "a" / "gone") is True
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "token").write_text("kept")
+    (run / "b").symlink_to(outside)
+    assert runs.remove_inside(run, run / "b" / "token") is False
+    assert (outside / "token").read_text() == "kept"
+    (run / "c").symlink_to(outside / "token")
+    assert runs.remove_inside(run, run / "c") is True  # the link itself goes, never what it names
+    assert (outside / "token").read_text() == "kept"
