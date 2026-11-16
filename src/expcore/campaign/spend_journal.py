@@ -11,10 +11,13 @@ every change of what was spent, once the store has committed it and before the s
   model, the dispatcher's pid, when it began, its state, the bound it was reserved at (`reserved_capped`, C27), its
   counts and its top-ups;
 - `probe`: a charge of admission's probes (C26): the id of the event the store wrote with it, the model and the
-  dollars (a settlement is below 0).
+  dollars (a settlement is below 0);
+- `unheld`: a model taken off the reply maximum (C27), which raises the bound its attempts are charged.
 
-Every line carries the campaign's fingerprint hash (`campaign`) and the shard's label (`shard`, null for a campaign
-that is not sharded), so a journal of another campaign or shard is refused where it is read (`campaign.lost_spend`).
+Every line carries the campaign's fingerprint hash (`campaign`) and the shard's whole spec as the store pins it
+(`shard`: rule, index, count and label as canonical JSON, null for a campaign that is not sharded), so a journal of
+another campaign or shard, or of the same label in another partition, is refused where it is read
+(`campaign.lost_spend`).
 
 **Written after the commit, before the spend.** The store collects a transaction's lines and writes them only once it
 has committed (`Store.transact`): a transaction that rolls back leaves no line, so nothing that never happened is
@@ -36,7 +39,7 @@ from typing import Any
 
 FORMAT = "expcore-spend-journal/1"
 SUFFIX = ".jsonl"
-HEADER, ATTEMPT, PROBE = "header", "attempt", "probe"
+HEADER, ATTEMPT, PROBE, UNHELD = "header", "attempt", "probe", "unheld"
 ATTEMPT_FIELDS = (
     "id",
     "run_key",
@@ -127,11 +130,13 @@ def attempt_entry(row: Mapping[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class Journal:
-    """A journal as read: its name, each attempt's last line by id (in the order they first appear) and the probes'."""
+    """A journal as read: its name, each attempt's last line by id (in the order they first appear), the probes' lines
+    and the models it took off the reply maximum."""
 
     name: str
     attempts: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
     probes: Sequence[Mapping[str, Any]] = ()
+    unheld: frozenset[str] = frozenset()
 
 
 def journals_in(directory: Path, *, but: str | None = None) -> list[Path]:
@@ -160,7 +165,7 @@ def read_journal(path: Path, campaign: str, shard: str | None) -> Journal:
     elif lines:
         lines.pop()  # cut short by a kill: never whole, never spent
     attempts: dict[int, Mapping[str, Any]] = {}
-    probes = []
+    probes, unheld = [], set()
     if not lines:  # its header was cut short: the start that made it died before anything was spent
         return Journal(path.name)
     for number, line in enumerate(lines, 1):
@@ -185,9 +190,11 @@ def read_journal(path: Path, campaign: str, shard: str | None) -> Journal:
         elif kind == PROBE:
             _whole(path, number, entry, "event_id")
             probes.append(entry)
+        elif kind == UNHELD and isinstance(entry.get("model"), str):
+            unheld.add(entry["model"])
         else:
             raise SpendJournalError(f"{path.name}: line {number} has no kind this core writes ({kind!r})")
-    return Journal(path.name, attempts, tuple(probes))
+    return Journal(path.name, attempts, tuple(probes), frozenset(unheld))
 
 
 def _entry(path: Path, number: int, line: bytes) -> Mapping[str, Any]:

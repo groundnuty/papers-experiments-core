@@ -380,3 +380,34 @@ def test_o62_time_is_not_slept_on(shards):
     hook.start(Path("/nonexistent"))
     hook.stop(Path("/nonexistent"))
     assert time.monotonic() - began < 5.0
+
+
+def two_snapshots(store, out, counted, hook):
+    begin(store, out, KEYS[0])
+    hook.take_now(out)
+    begun, run_dir = begin(store, out, KEYS[1])
+    end(store, KEYS[1], begun, run_dir)
+    hook.take_now(out)
+    raise Killed
+
+
+@pytest.mark.parametrize("text", ["null", "[]"])
+def test_o62_a_newest_manifest_that_is_no_object_falls_back_too(shards, tmp_path, text):
+    """O62: a newest snapshot whose manifest is JSON but no object is passed over like any damaged one."""
+    killed_step(shards, tmp_path, two_snapshots)
+    (tmp_path / "results" / "fed-a" / "snapshots" / "snap-000002" / "snapshot.json").write_text(text)
+    found = {}
+    run, _ = dispatcher(None, lambda store, out, counted: found.update(n=len(store.q("SELECT 1 FROM attempts"))) or 0)
+    shards.step(step_args(tmp_path, resume=True), runner=run, core_found=lambda path: True)
+    assert found["n"] == 1  # snapshot 1: the one attempt that had begun
+
+
+def test_o62_a_shard_whose_every_snapshot_fails_and_that_has_no_archive_is_refused(shards, tmp_path):
+    """O62: dropping a killed shard's results for a fresh start is never a resume: it is refused, naming why."""
+    killed_step(shards, tmp_path, two_snapshots)
+    for snapshot in (tmp_path / "results" / "fed-a" / "snapshots").iterdir():
+        (snapshot / "snapshot.json").write_text("{")
+    run, seen = dispatcher(None, lambda store, out, counted: 0)
+    with pytest.raises(shards.ShardsError, match="no snapshot of its 2 verifies and it has no archive"):
+        shards.step(step_args(tmp_path, resume=True), runner=run, core_found=lambda path: True)
+    assert not seen

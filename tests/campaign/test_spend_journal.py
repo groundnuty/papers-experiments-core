@@ -7,6 +7,7 @@ from campaign_support import NOW, finished, planned_store
 
 from expcore.campaign.attempts import AttemptRefused
 from expcore.campaign.probe_spend import add as add_probe_charge
+from expcore.campaign.reply_cap import mark_unheld
 from expcore.campaign.spend_journal import SpendJournal, SpendJournalError, read_journal
 
 CAMPAIGN, LABEL = "c" * 64, "fed-a"
@@ -138,3 +139,11 @@ def test_o62_a_damaged_line_before_the_last_is_refused(tmp_path):
     store.begin_attempt(key, NOW, 4321, str(tmp_path / "try1"))
     with pytest.raises(SpendJournalError, match="line 2 is not a journal line"):
         read_journal(journal.path, CAMPAIGN, LABEL)
+
+
+def test_o62_a_model_taken_off_the_reply_maximum_is_a_line(tmp_path):
+    """O62: the mark raises what its attempts are charged, so it is journaled like a spend."""
+    store, journal, _ = journaled(tmp_path)
+    mark_unheld(store, MODEL, NOW, "reply_over_maximum", "a reply of 5000 output tokens")
+    assert [(entry["kind"], entry.get("model")) for entry in lines(journal)][1:] == [("unheld", MODEL)]
+    assert read_journal(journal.path, CAMPAIGN, LABEL).unheld == frozenset({MODEL})

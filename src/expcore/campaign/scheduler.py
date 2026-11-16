@@ -65,6 +65,7 @@ from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.shard import META_SHARD
 from expcore.campaign.shard_run import ShardStart
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.topup import Ledger
@@ -239,7 +240,7 @@ class Scheduler:
         )
         store = self.store
         if self.spend_journal is not None:  # before the probes, the first spend this start can make (O62)
-            label = None if self.shard is None else self.shard.spec.label
+            label = None if self.shard is None else self.shard.pinned()[META_SHARD]  # the whole spec, not its label
             campaign = stored_fingerprint_sha256(store) or fingerprint_sha256(self.fingerprint)
             pricing = Pricing({m: self.models.resolve(m) for m in self.plan_models}, self.agent_config.limits)
             self.lost_counted = open_journal(store, self.spend_journal, campaign, label, self.stamp(), pricing)

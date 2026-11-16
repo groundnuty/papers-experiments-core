@@ -14,6 +14,7 @@ from expcore.campaign.gate import Budget, BudgetGate
 from expcore.campaign.lost_ledger import KEY, LostSpendError, read
 from expcore.campaign.lost_spend import Pricing, costs, open_journal
 from expcore.campaign.probe_spend import add as add_probe_charge
+from expcore.campaign.reply_cap import is_unheld, mark_unheld, unheld
 from expcore.campaign.selection_ledger import Pricing as SpendPricing
 from expcore.campaign.selection_ledger import spend_of
 from expcore.campaign.spend_journal import SpendJournal, SpendJournalError
@@ -176,6 +177,39 @@ def test_o62_a_start_of_another_shard_on_this_store_is_refused(tmp_path):
     with pytest.raises(SpendJournalError, match=r"j1\.jsonl: line 1 is of shard 'fed-a', not 'fed-b'"):
         start(copy, tmp_path, "j2.jsonl", shard="fed-b")
     assert read(copy).journal == "j1.jsonl"
+
+
+def test_o62_the_same_label_in_another_partition_is_another_shard(tmp_path):
+    """O62: a journal is of a shard's whole spec (rule, index, count and label), so the same label in a partition of
+    another count is refused, and its spend never charged to the new partition's share."""
+    one_of_two = '{"count":2,"index":1,"label":"fed-a","rule":"expcore-shard/2"}'
+    one_of_three = '{"count":3,"index":1,"label":"fed-a","rule":"expcore-shard/2"}'
+    old, _, manifest = planned_store(tmp_path / "old")
+    start(old, tmp_path, "j1.jsonl", shard=one_of_two)
+    old.begin_attempt(manifest.rows[0].key.text, NOW, 4321, "try1")
+    new, _, _ = planned_store(tmp_path / "new")
+    with pytest.raises(SpendJournalError, match=r"j1\.jsonl: line 1 is of shard"):
+        start(new, tmp_path, "j2.jsonl", shard=one_of_three)
+
+
+def test_o62_a_model_a_lost_start_took_off_the_reply_maximum_is_off_it_in_the_copy(tmp_path):
+    """O62: a model taken off the reply maximum after the copy raises the bound its attempts are charged; the copy
+    put back takes the mark from the journal, so the attempt it holds and the one it lost are charged by the window."""
+    live, _, manifest = planned_store(tmp_path / "live")
+    keys = [row.key.text for row in manifest.rows]
+    start(live, tmp_path, "j1.jsonl")
+    live.begin_attempt(keys[0], NOW, 4321, "try1", reserved_capped=True)
+    copy = copy_of(live, tmp_path, "copy")
+    mark_unheld(live, MODEL, NOW, "reply_over_maximum", "a reply of 5000 output tokens")
+    live.begin_attempt(keys[1], NOW, 4321, "try1", reserved_capped=True)
+    start(copy, tmp_path, "j2.jsonl")
+    assert is_unheld(unheld(copy), MODEL)
+    (lost,) = read(copy).counted["j1.jsonl"]["attempts"]
+    window, capped = (bound_usd(SPEC, LIMITS, reply_capped=held) for held in (False, True))
+    assert window > capped
+    assert lost["usd"] == pytest.approx(window)
+    spent = BudgetGate(copy, {MODEL: SPEC}, Budget(max_usd=10.0), LIMITS).assess([], NOW, live=set()).spent_usd
+    assert spent == pytest.approx(2 * window)
 
 
 def test_o62_a_plan_that_grew_reads_its_earlier_journals_as_its_own(tmp_path):

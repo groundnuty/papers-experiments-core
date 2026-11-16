@@ -18,7 +18,9 @@ meta under `lost_in_kill` (`campaign.lost_ledger`), in one transaction with the 
 Each journal is counted once and the ledger says so (`counted`, by name), so a later start of this store, or of a copy
 taken after this start, counts nothing twice; a copy taken before it counts the same journals again, rightly, since
 that copy lacks them. One journal's probe charges are summed per model and never below 0 (a settlement whose charge the
-store holds leaves the store's figure an over-count, which stands).
+store holds leaves the store's figure an over-count, which stands). A model a counted journal took off the reply
+maximum is taken off it in the store as well, in the same transaction: the mark raises the bound its attempts are
+charged, those the store holds included, and the copy may predate it.
 
 **Refused**, naming what, before anything is changed: a ledger that cannot be read (what it holds would be lost); a
 journal of another campaign or shard, or one that is not a journal (`spend_journal.read_journal`); a store whose own
@@ -87,8 +89,9 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
     """Count every journal of `journal`'s directory that the store's ledger has not, and record this start's as the
     store's own, in one transaction; return `{"journals", "attempts", "charges_usd"}` of what was counted now.
     Each lost attempt keeps what it was charged when counted (`usd`, by `pricing`: the plan's models and the caps,
-    with the store's marks of models taken off the reply maximum), for the export. Raises LostSpendError, or
-    SpendJournalError for a journal that cannot be read, and changes nothing."""
+    with the models taken off the reply maximum), for the export. A model a counted journal took off the reply maximum
+    is taken off it in the store too (C27): the mark raises what its attempts are charged, the store's own included.
+    Raises LostSpendError, or SpendJournalError for a journal that cannot be read, and changes nothing."""
     ledger = read(store)
     if ledger is None:
         raise LostSpendError(f"the store's {KEY} cannot be read, so the spend a kill lost cannot be counted")
@@ -100,16 +103,16 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
             f"the store's own spend journal {ledger.journal} is not in the journal directory, so what its start "
             "spent after this store was copied is unknown; give the directory that holds it"
         )
+    uncounted = [read_journal(p, journal.campaign, journal.shard) for p in others if p.name not in ledger.counted]
+    unheld = sorted({model for journaled in uncounted for model in journaled.unheld})  # marks the copy may lack
     marks = reply_cap.unheld(store)
-    taken_off = frozenset(m for m in pricing.models if reply_cap.is_unheld(marks, m))
+    taken_off = frozenset(m for m in pricing.models if reply_cap.is_unheld(marks, m) or m in unheld)
     found: dict[str, dict[str, Any]] = {}
-    for path in others:
-        if path.name not in ledger.counted:
-            journaled = read_journal(path, journal.campaign, journal.shard)
-            lost = _lost(store, journaled, own=path.name == ledger.journal, now=now)
-            for attempt in lost["attempts"]:
-                attempt["usd"] = _attempt_cost(attempt, pricing.models, pricing.limits, (), taken_off)[0]
-            found[path.name] = lost
+    for journaled in uncounted:
+        lost = _lost(store, journaled, own=journaled.name == ledger.journal, now=now)
+        for attempt in lost["attempts"]:
+            attempt["usd"] = _attempt_cost(attempt, pricing.models, pricing.limits, (), taken_off)[0]
+        found[journaled.name] = lost
 
     def change(current: str | None) -> tuple[str, list[tuple[str, str | None, str]], None]:
         latest = parse(current)
@@ -119,7 +122,14 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
         events = [("lost_in_kill", None, _detail(name, lost)) for name, lost in found.items() if _any(lost)]
         return json.dumps(value, sort_keys=True), events, None
 
-    store.update_meta(KEY, change, now)
+    def record() -> None:  # the ledger and every mark the journals hold, in one transaction
+        store.update_meta(KEY, change, now)
+        for model in unheld:
+            if not reply_cap.is_unheld(reply_cap.unheld(store), model):
+                detail = f"{model}: taken off the reply maximum by a start whose store a kill lost (the spend journal)"
+                reply_cap.mark_unheld(store, model, now, "reply_cap_lost_in_kill", detail)
+
+    store.transact(record)
     charges: dict[str, float] = {}
     for lost in found.values():
         for charge in lost["charges"]:

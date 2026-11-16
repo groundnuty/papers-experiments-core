@@ -11,7 +11,9 @@ shared filesystem, and `restore` puts a snapshot back for the next start.
 record and marker are written in its directory when it ends, and only then does its row record the result (C04).
 `take` copies the store FIRST, by the online backup over a read-only connection (`snapshot.take_snapshot`: one
 committed state whatever the dispatcher is doing, its integrity checked, each attempt's directory named within the
-batch), and `runs/` AFTER it. Every attempt the store copy holds began before the backup, and one it holds as ended
+batch), and the rest of `out/` AFTER it: `runs/`, and the lease notes (`leases/`, the recovery state that keeps a key
+whose holder died from anyone until its resource is shown gone, C19), the logs and the lock file, everything but the
+live store's own files. Every attempt the store copy holds began before the backup, and one it holds as ended
 had written its record and marker before the backup, so the copy of `runs/` has them: the store never names a record
 `runs/` lacks, and `take` checks it (every ended attempt's marker is in the copy). Copied the other way, an attempt
 that ended between the two copies would be ended in the store and missing from `runs/`, and nothing would ever run it
@@ -22,7 +24,7 @@ attempt the same directory and, its sequence being the copy's, the same attempt 
 as the next attempt's.
 
 **Verified, then swapped in by rename.** A snapshot is written into a fresh directory, `.snap-<n>.part`, beside the
-others: the store's copy and each file of `runs/`, hashed as copied. It is then checked: every ended attempt's marker
+others: the store's copy and each file of the rest, hashed as copied. It is then checked: every ended attempt's marker
 present, every file read back against its hash. Its manifest is written last, and the directory renamed to
 `snap-<n>`. Only then are older snapshots removed, the newest `KEEP` kept, so the previous good one stays until the
 new one is in place. A kill at any point leaves every snapshot that was whole as it was: a `.part` directory is never
@@ -52,6 +54,7 @@ from expcore.campaign.snapshot import rebase_run_dirs, take_snapshot
 FORMAT = "expcore-out-snapshot/1"
 MANIFEST = "snapshot.json"
 STORE = "state.sqlite"  # the scheduler's STATE_FILE, under out/
+STORE_FILES = (STORE, f"{STORE}-wal", f"{STORE}-shm", f"{STORE}-journal")  # the live store: its backup stands for them
 RUNS = "runs"
 KEEP = 2  # the newest snapshots kept: a damaged newest one falls back to the one before
 ENDED = ("done", "infra_fail", "harness_error", "outage_discarded")  # states whose attempt wrote its marker (C04)
@@ -88,8 +91,8 @@ def take(
     `scratch` is a directory on the host's own filesystem for the store's backup (SQLite is never opened on the shared
     one); `facts` go into the manifest as they are (the caller's: which shard, from which archive); `live` says a
     dispatcher holds the store (read in place, over a read-only connection) or none does (read from a private copy,
-    so nothing is written beside it). `crash(point)` is called at `backup` (the store half copied), `runs` (one file
-    of runs/ copied), `verified` and `rename` (before the rename) and `renamed` (before older ones are removed)."""
+    so nothing is written beside it). `crash(point)` is called at `backup` (the store half copied), `files` (one file
+    of the rest copied), `verified` and `rename` (before the rename) and `renamed` (before older ones are removed)."""
     into.mkdir(parents=True, exist_ok=True)
     for leftover in _parts(into):  # a take killed before: never restored, removed now
         shutil.rmtree(leftover, ignore_errors=True)
@@ -102,17 +105,17 @@ def take(
         take_snapshot(out / STORE, backup, allow_running=True, in_place=live)
         store = _copy(backup, part / STORE, lambda: crash("backup"))
         ended, named, campaign = _attempts(backup)
-        files = _copy_runs(out / RUNS, part / RUNS, named, crash)
-        missing = sorted(d for d in ended if f"{d}/{MARKER_NAME}" not in files)
+        files = _copy_out(out, part, named, crash)
+        missing = sorted(d for d in ended if f"{RUNS}/{d}/{MARKER_NAME}" not in files)
         if missing:
             raise OutSnapshotError(
                 f"the store copy names {len(missing)} ended attempt(s) whose marker the runs/ copy lacks "
                 f"({missing[0]}): it would name a record runs/ does not hold"
             )
-        _read_back(part, {STORE: store, **{f"{RUNS}/{name}": digest for name, digest in files.items()}})
+        _read_back(part, {STORE: store, **files})
         crash("verified")
         manifest = {"format": FORMAT, "number": number, "taken_utc": now, "facts": dict(facts), "campaign": campaign,
-                    "store": store, "runs": files}  # fmt: skip
+                    "store": store, "files": files}  # fmt: skip
         _write_json(part / MANIFEST, manifest)
         _sync_dir(part)
         crash("rename")
@@ -163,23 +166,23 @@ def _attempts(store: Path) -> tuple[set[str], set[str], str | None]:
     return {d for state, d in rows if state in ENDED}, {d for _, d in rows}, campaign
 
 
-def _copy_runs(source: Path, target: Path, named: set[str], crash: Crash) -> dict[str, str]:
-    """Copy each regular file under `source` to `target`, hashed as copied, but those of a run directory no attempt of
-    the store copy names and every name that starts with a dot (a file being written in place); a file that goes
-    away while it is copied is left out. Returns `{relative path: sha256}`."""
+def _copy_out(source: Path, target: Path, named: set[str], crash: Crash) -> dict[str, str]:
+    """Copy each regular file under `source` (out/) to `target`, hashed as copied, but the live store's own files,
+    those of a directory `runs/<digest>/try<N>` no attempt of the store copy names, and every name that starts with a
+    dot (a file being written in place); a file that goes away while it is copied is left out. Returns `{path relative
+    to out/: sha256}`."""
     files: dict[str, str] = {}
-    target.mkdir()
     for base, dirs, names in os.walk(source):
         relative = PurePosixPath(Path(base).relative_to(source).as_posix())
         kept = []
         for d in sorted(dirs):
-            inside = relative / d
-            orphan = _TRY.fullmatch(d) and len(inside.parts) == 2 and inside.as_posix() not in named
+            inside = (relative / d).parts
+            orphan = len(inside) == 3 and inside[0] == RUNS and _TRY.fullmatch(d) and "/".join(inside[1:]) not in named
             if not d.startswith(".") and not orphan:
                 kept.append(d)
         dirs[:] = kept
         for name in sorted(names):
-            if name.startswith("."):
+            if name.startswith(".") or (not relative.parts and name in STORE_FILES):
                 continue
             path = Path(base) / name
             if not path.is_file() or path.is_symlink():
@@ -191,7 +194,7 @@ def _copy_runs(source: Path, target: Path, named: set[str], crash: Crash) -> dic
             except FileNotFoundError:
                 continue
             if len(files) == 1:
-                crash("runs")
+                crash("files")
     return files
 
 
@@ -251,10 +254,14 @@ def manifest_of(snapshot: Path) -> dict[str, Any]:
         manifest = json.loads((snapshot / MANIFEST).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raise OutSnapshotError(f"{snapshot.name}: no readable manifest") from None
-    store, runs = (manifest.get(k) if isinstance(manifest, dict) else None for k in ("store", "runs"))
-    if manifest.get("format") != FORMAT or not isinstance(store, dict) or not isinstance(runs, dict):
+    if not isinstance(manifest, dict) or manifest.get("format") != FORMAT:
         raise OutSnapshotError(f"{snapshot.name}: its manifest is not {FORMAT}")
-    if not isinstance(manifest.get("facts"), dict):
+    store, files, facts = manifest.get("store"), manifest.get("files"), manifest.get("facts")
+    if not isinstance(store, dict) or not isinstance(store.get("sha256"), str) or not isinstance(files, dict):
+        raise OutSnapshotError(f"{snapshot.name}: its manifest names no store or no files")
+    if not all(isinstance(name, str) and isinstance(digest, str) for name, digest in files.items()):
+        raise OutSnapshotError(f"{snapshot.name}: its manifest's files are not names and hashes")
+    if not isinstance(facts, dict):
         raise OutSnapshotError(f"{snapshot.name}: its manifest has no facts")
     return manifest
 
@@ -262,21 +269,28 @@ def manifest_of(snapshot: Path) -> dict[str, Any]:
 def restore(snapshot: Path, out: Path) -> dict[str, Any]:
     """Copy a snapshot into `out` (new) and return its manifest, every file hashed as copied and compared with it, the
     store copy's integrity checked and its attempts' directories pointed at `out/runs`; `OutSnapshotError` naming the
-    snapshot and what failed, with nothing left at `out`."""
+    snapshot and what failed, with nothing left at `out`; a file that cannot be read or written fails it the same way.
+    The files are exactly those the snapshot holds, so a manifest naming one outside it (`..`) never matches."""
     manifest = manifest_of(snapshot)
-    expected = {STORE: manifest["store"].get("sha256"), **{f"{RUNS}/{k}": v for k, v in manifest["runs"].items()}}
-    found = {
-        Path(base, name).relative_to(snapshot).as_posix()
-        for base, _, names in os.walk(snapshot)
-        for name in names
-        if Path(base, name) != snapshot / MANIFEST
-    }
+    expected = {STORE: manifest["store"]["sha256"], **manifest["files"]}
+    try:
+        found = {
+            Path(base, name).relative_to(snapshot).as_posix()
+            for base, _, names in os.walk(snapshot, onerror=_raise)
+            for name in names
+            if Path(base, name) != snapshot / MANIFEST
+        }
+    except OSError as error:
+        raise OutSnapshotError(f"{snapshot.name}: cannot be listed ({type(error).__name__})") from None
     if found != set(expected):
         extra, gone = sorted(found - set(expected)), sorted(set(expected) - found)
         raise OutSnapshotError(
             f"{snapshot.name}: its files are not its manifest's (added {extra[:1]}, gone {gone[:1]})"
         )
-    out.mkdir(parents=True)
+    try:
+        out.mkdir(parents=True)
+    except OSError as error:
+        raise OutSnapshotError(f"{snapshot.name}: cannot be restored to {out} ({type(error).__name__})") from None
     try:
         for name in sorted(expected):
             (out / name).parent.mkdir(parents=True, exist_ok=True)
@@ -284,10 +298,17 @@ def restore(snapshot: Path, out: Path) -> dict[str, Any]:
                 raise OutSnapshotError(f"{snapshot.name}: {name} is not the file its manifest names")
         _integrity(snapshot, out / STORE)
         rebase_run_dirs(out / STORE, out / RUNS)
+    except (OSError, sqlite3.Error) as error:
+        shutil.rmtree(out, ignore_errors=True)
+        raise OutSnapshotError(f"{snapshot.name}: cannot be restored ({type(error).__name__}: {error})") from None
     except BaseException:
         shutil.rmtree(out, ignore_errors=True)
         raise
     return manifest
+
+
+def _raise(error: OSError) -> None:
+    raise error
 
 
 def _integrity(snapshot: Path, store: Path) -> None:

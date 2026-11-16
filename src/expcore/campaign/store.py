@@ -52,7 +52,7 @@ from expcore.campaign.attempts import (
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
-from expcore.campaign.spend_journal import PROBE, SpendJournal, attempt_entry
+from expcore.campaign.spend_journal import PROBE, UNHELD, SpendJournal, attempt_entry
 
 _FIXED_SQL = """
 CREATE TABLE IF NOT EXISTS attempts(
@@ -282,6 +282,11 @@ class Store:
             return {"kind": PROBE, "event_id": event_id, "model": model, "usd": float(usd)}
 
         self._note_spend(line)
+
+    def note_unheld(self, model: str) -> None:
+        """Journal that the model is taken off the reply maximum (O62, C27), inside the transaction that marked it: the
+        mark raises what its attempts are charged, so a store copied back from before it takes it from the journal."""
+        self._note_spend(lambda: {"kind": UNHELD, "model": model})
 
     def _attempt_line(self, attempt_id: int) -> dict[str, Any]:
         """The journal's `attempt` line of an attempt's row as the open transaction holds it."""

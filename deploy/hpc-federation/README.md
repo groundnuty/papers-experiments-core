@@ -311,26 +311,30 @@ archive, and the tmpfs copy goes with the node. So while the dispatcher runs, th
 each run's end (the thread looks for a new attempt marker every 30 s), one at a time, and once more after the
 dispatcher exits, before the archive:
 
-- the store first, by the core's online backup of the live store, then `runs/`, so the snapshot's store never names
-  a record its `runs/` lacks. A run that ends between the two is `running` in the snapshot with its marker beside it,
-  which the resume's recovery commits. A run directory no row of the store copy names (an attempt begun after the
-  backup) is left out: after a restore that run's next attempt would get the same directory and the same attempt id;
+- the store first, by the core's online backup of the live store, then the rest of `out/` (`runs/`, the lease notes,
+  which keep a key whose holder died from anyone until its resource is shown gone, the logs and the lock file), so the
+  snapshot's store never names a record its `runs/` lacks. A run that ends between the two is `running` in the
+  snapshot with its marker beside it, which the resume's recovery commits. A run directory no row of the store copy
+  names (an attempt begun after the backup) is left out: after a restore that run's next attempt would get the same
+  directory and the same attempt id;
 - written into a fresh `.snap-<n>.part`, checked (the store's integrity, every ended attempt's marker present, every
   file read back against its hash), its manifest written last, then renamed to `snap-<n>`; the two newest are kept,
   so a kill at any point leaves the last good one and a damaged newest falls back to the one before;
 - the dispatcher journals its spend to `<results>/<label>/journals/<stamp>-<pid>-<hex>.jsonl`, a new file per step
-  (`expcore run --spend-journal`): one line per attempt begun, top-up, attempt ended and probe charge, written after
-  the store commits it and before the spend; a journal that cannot be written stops the dispatcher.
+  (`expcore run --spend-journal`): one line per attempt begun, top-up, attempt ended, probe charge and model taken off
+  the reply maximum, written after the store commits it and before the spend; a journal that cannot be written stops
+  the dispatcher.
 
 `shards.py step --resume` restores the newest snapshot that verifies, unless the archive is newer (each snapshot names
 the archive its step started from), else the archive, as before; either way the store's attempt directories are
-pointed at the new copy. The dispatcher's start then counts what the journals hold and the restored store lacks
-(attempts begun, top-ups and probe sends after the snapshot) as `lost_in_kill`, once, against the shard's share of the
-budget: an attempt whose end was journaled at its measured cost, one in flight at its reserved bound. The export and
-the report list it. A start without `--resume` of a shard with a snapshot is refused; a snapshot or a journal of
-another shard or campaign is refused, naming it. A snapshot holds the store and `runs/`, nothing else of `out/` (the
-harness-error log of a restored part and the lease directory are not kept), and copies them whole each time: size
-`snapshot_every_s` to what the shared filesystem can take.
+pointed at the new copy. A shard with snapshots none of which verifies, and no archive, is refused rather than started
+afresh. The dispatcher's start then counts what the journals hold and the restored store lacks (attempts begun,
+top-ups and probe sends after the snapshot, and a model taken off the reply maximum since) as `lost_in_kill`, once,
+against the shard's share of the budget: an attempt whose end was journaled at its measured cost, one in flight at its
+reserved bound. The export and the report list it. A start without `--resume` of a shard with a snapshot is refused; a
+snapshot or a journal of another shard (by its whole spec, so the same label in another partition too) or campaign is
+refused, naming it. A snapshot holds the whole of `out/` but the live store's own files, which its backup stands for,
+and copies it whole each time: size `snapshot_every_s` to what the shared filesystem can take.
 
 ## What the repository's tests cover
 

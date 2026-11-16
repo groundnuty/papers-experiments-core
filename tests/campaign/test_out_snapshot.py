@@ -83,13 +83,31 @@ def test_o62_a_snapshot_restores_the_store_and_runs_with_directories_under_the_n
     assert manifest["facts"] == FACTS
     assert manifest["campaign"] is None
     new = tmp_path / "new" / "out"
-    assert sorted(manifest["runs"]) == [
-        p.relative_to(new / "runs").as_posix() for p in sorted((new / "runs").rglob("*.json"))
-    ]
+    restored = [p.relative_to(new).as_posix() for p in sorted(new.rglob("*")) if p.is_file()]
+    assert sorted(manifest["files"]) == [name for name in restored if not name.startswith("state.sqlite")]
     with sqlite3.connect(new / "state.sqlite") as copy:
         (run_dir,) = copy.execute("SELECT run_dir FROM attempts").fetchone()
     assert run_dir.startswith(str(new / "runs"))
     assert (new / "runs").exists()
+
+
+def test_o62_the_lease_notes_the_logs_and_the_lock_come_back_and_the_live_store_files_do_not(live, tmp_path):
+    """O62: a lease's note is recovery state (a key whose holder died goes to nobody until its resource is shown gone,
+    C19), so it comes back with the rest of out/; the live store's -wal and -shm stand for nothing: its backup does."""
+    out, _store = live
+    (out / "leases").mkdir()
+    (out / "leases" / "slot-1.lock").write_text('{"holder": 4321, "unit": "unit-m1"}')
+    (out / "logs").mkdir()
+    (out / "logs" / "harness-errors.log").write_text("a traceback\n")
+    (out / "campaign.lock").write_text("")
+    made = snap(out, tmp_path / "snaps", tmp_path)
+    names = set(json.loads((made / "snapshot.json").read_text())["files"])
+    assert {"leases/slot-1.lock", "logs/harness-errors.log", "campaign.lock"} <= names
+    assert not [name for name in names if name.startswith("state.sqlite")]
+    new = tmp_path / "new" / "out"
+    restore(made, new)
+    assert (new / "leases" / "slot-1.lock").read_text() == '{"holder": 4321, "unit": "unit-m1"}'
+    assert (new / "campaign.lock").is_file()
 
 
 def test_o62_the_store_is_copied_first_so_a_run_that_ends_between_the_copies_is_recovered(live, tmp_path):
@@ -119,12 +137,14 @@ def test_o62_runs_copied_before_the_store_would_name_a_record_runs_lacks(live, t
     out, store = live
     key = keys_of(store)[0]
     begun, run_dir = begin(out, store, key)
-    files = out_snapshot._copy_runs(out / "runs", tmp_path / "runs-first", {"anything"}, out_snapshot._never)
+    every = {f"{d.parent.name}/{d.name}" for d in (out / "runs").glob("*/try*")}  # nothing left out
+    files = out_snapshot._copy_out(out, tmp_path / "runs-first", every, out_snapshot._never)
     end(store, key, begun, run_dir)
     take_snapshot(out / "state.sqlite", tmp_path / "store-after", allow_running=True, in_place=True)
     ended, _, _ = out_snapshot._attempts(tmp_path / "store-after")
     (done,) = ended
-    assert f"{done}/{MARKER_NAME}" not in files
+    assert done in every
+    assert f"runs/{done}/{MARKER_NAME}" not in files
 
 
 def test_o62_a_run_directory_no_row_of_the_copy_names_is_left_out(live, tmp_path):
@@ -141,7 +161,7 @@ def test_o62_a_run_directory_no_row_of_the_copy_names_is_left_out(live, tmp_path
             write_marker(later["dir"], key, later["begun"].id, finished())
 
     made = snap(out, tmp_path / "snaps", tmp_path, crash=begins_between)
-    assert not any("try1" in name for name in json.loads((made / "snapshot.json").read_text())["runs"])
+    assert not any("try1" in name for name in json.loads((made / "snapshot.json").read_text())["files"])
     new = tmp_path / "new" / "out"
     restore(made, new)
     resumed = Store(new / "state.sqlite", make_schema())
@@ -151,7 +171,7 @@ def test_o62_a_run_directory_no_row_of_the_copy_names_is_left_out(live, tmp_path
     resumed.close()
 
 
-@pytest.mark.parametrize("point", ["backup", "runs", "verified", "rename"])
+@pytest.mark.parametrize("point", ["backup", "files", "verified", "rename"])
 def test_o62_a_kill_while_a_snapshot_is_taken_leaves_the_last_good_one(live, tmp_path, point):
     """O62: killed mid-backup, mid-copy of runs/, after the check or as the rename is made, a snapshot never
     replaces the last good one: its `.part` directory is never restored, and the next take removes it."""
@@ -163,7 +183,7 @@ def test_o62_a_kill_while_a_snapshot_is_taken_leaves_the_last_good_one(live, tmp
     with pytest.raises(Killed):
         snap(out, tmp_path / "snaps", tmp_path, crash=kill_at(point))
     assert snapshots(tmp_path / "snaps") == [good]
-    assert len(restore(good, tmp_path / "new" / "out")["runs"]) == 2  # one run's record and marker
+    assert len(restore(good, tmp_path / "new" / "out")["files"]) == 2  # one run's record and marker
     after = snap(out, tmp_path / "snaps", tmp_path)
     assert not list((tmp_path / "snaps").glob(".*part"))
     assert snapshots(tmp_path / "snaps") == [after, good]
@@ -252,3 +272,14 @@ def test_o62_a_restored_snapshot_resumes_under_the_dispatcher_and_counts_a_lost_
         scheduler.run()
         statuses = {row["status"] for row in scheduler.store.q("SELECT status FROM runs")}
     assert statuses == {"done"}
+
+
+@pytest.mark.parametrize("text", ["null", "[]", '{"format": "expcore-out-snapshot/1"}', '"text"'])
+def test_o62_a_manifest_that_is_no_object_is_a_snapshot_error(live, tmp_path, text):
+    """O62: whatever a damaged manifest holds, it is refused as a snapshot that does not verify, so the caller goes on
+    to the one before."""
+    out, _store = live
+    made = snap(out, tmp_path / "snaps", tmp_path)
+    (made / "snapshot.json").write_text(text)
+    with pytest.raises(OutSnapshotError, match="snap-000001"):
+        restore(made, tmp_path / "new" / "out")

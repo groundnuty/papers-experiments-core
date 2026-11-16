@@ -522,12 +522,15 @@ def archive_named(results: Path, label: str) -> str | None:
 
 def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | None, work: Path, out: Path) -> None:
     """Put the shard's latest `out/` at `out`: the newest snapshot that verifies, unless the archive is newer (a
-    snapshot that does not name it was taken before it), else the archive, else nothing (a fresh start). Either way the
-    store's attempt directories are pointed at `out/runs`. A snapshot of another shard is `ShardsError`."""
+    snapshot that does not name it was taken before it), else the archive, else nothing (a fresh start, only when the
+    shard has neither). Either way the store's attempt directories are pointed at `out/runs`. A snapshot of another
+    shard, and a shard whose every snapshot fails its check and that has no archive, are `ShardsError`: its results
+    would otherwise be dropped for a fresh start."""
     from expcore.campaign import out_snapshot
     from expcore.campaign.snapshot import rebase_run_dirs
 
-    for snapshot in out_snapshot.snapshots(args.results / args.label / SNAPSHOTS):
+    found = out_snapshot.snapshots(args.results / args.label / SNAPSHOTS)
+    for snapshot in found:
         try:
             facts = out_snapshot.manifest_of(snapshot)["facts"]
         except out_snapshot.OutSnapshotError as error:
@@ -544,6 +547,11 @@ def resume_into(args: argparse.Namespace, spec: Mapping[str, Any], base: str | N
             continue
         print(f"shards: shard {args.label} resumes from snapshot {snapshot.name}", file=sys.stderr)
         return
+    if found and not (args.results / f"{args.label}.out.tar").exists():
+        raise ShardsError(
+            f"shard {args.label}: no snapshot of its {len(found)} verifies and it has no archive; a fresh start would "
+            "drop its results, so the resume is refused"
+        )
     if (args.results / f"{args.label}.out.tar").exists():
         shard = Shard(args.index, args.count, args.label, Path("/"))
         tar_path, _ = verified(args.results, shard, work)
