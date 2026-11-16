@@ -16,7 +16,7 @@ from expcore.campaign.lost_spend import Pricing, costs, open_journal
 from expcore.campaign.probe_spend import add as add_probe_charge
 from expcore.campaign.selection_ledger import Pricing as SpendPricing
 from expcore.campaign.selection_ledger import spend_of
-from expcore.campaign.spend_journal import SpendJournalError
+from expcore.campaign.spend_journal import SpendJournal, SpendJournalError
 from expcore.campaign.store import Store
 from expcore.config.models import Limits
 from expcore.config.prices import Price
@@ -162,12 +162,32 @@ def test_o62_a_journal_of_another_campaign_or_shard_is_refused_and_changes_nothi
     """O62: a start whose journal directory holds a journal of another campaign or shard is refused, naming it, and
     neither its journal nor its ledger is left changed."""
     _, copy, _ = killed_after_a_copy(tmp_path)
-    with pytest.raises(SpendJournalError, match=f"j1.jsonl: .*{named}"):
-        start(copy, tmp_path, "j2.jsonl", campaign=campaign, shard=shard)
-    assert read(copy) == read(copy_of(copy, tmp_path, "unchanged"))
+    SpendJournal(tmp_path / "journals" / "foreign.jsonl", campaign, shard, NOW).close()
+    with pytest.raises(SpendJournalError, match=f"foreign.jsonl: .*{named}"):
+        start(copy, tmp_path, "j2.jsonl")
     assert read(copy).journal == "j1.jsonl"
     assert read(copy).counted == {}
     assert not (tmp_path / "journals" / "j2.jsonl").exists()
+
+
+def test_o62_a_start_of_another_shard_on_this_store_is_refused(tmp_path):
+    """O62: the store's own journal is of shard fed-a: a start as fed-b reads it as another shard's and stops."""
+    _, copy, _ = killed_after_a_copy(tmp_path)
+    with pytest.raises(SpendJournalError, match=r"j1\.jsonl: line 1 is of shard 'fed-a', not 'fed-b'"):
+        start(copy, tmp_path, "j2.jsonl", shard="fed-b")
+    assert read(copy).journal == "j1.jsonl"
+
+
+def test_o62_a_plan_that_grew_reads_its_earlier_journals_as_its_own(tmp_path):
+    """O62: a grown plan records a new fingerprint (C06); the journals keep the campaign of the first start."""
+    store, _, manifest = planned_store(tmp_path / "store")
+    start(store, tmp_path, "j1.jsonl")
+    store.begin_attempt(manifest.rows[0].key.text, NOW, 4321, "try1")
+    store.spend_journal.close()
+    start(store, tmp_path, "j2.jsonl", campaign="e" * 64)  # the fingerprint the grown plan recorded
+    assert read(store).campaign == CAMPAIGN
+    header = json.loads((tmp_path / "journals" / "j2.jsonl").read_text().splitlines()[0])
+    assert header["campaign"] == CAMPAIGN
 
 
 def test_o62_a_store_whose_own_journal_is_gone_is_refused(tmp_path):
@@ -247,6 +267,6 @@ def test_o62_the_ledger_is_one_json_record(tmp_path):
     _, copy, _ = killed_after_a_copy(tmp_path)
     start(copy, tmp_path, "j2.jsonl")
     record = json.loads(copy.get_meta(KEY))
-    assert set(record) == {"journal", "counted"}
-    assert record["journal"] == "j2.jsonl"
+    assert set(record) == {"campaign", "journal", "counted"}
+    assert (record["campaign"], record["journal"]) == (CAMPAIGN, "j2.jsonl")
     assert [kind for (kind,) in copy.q("SELECT kind FROM events WHERE kind='lost_in_kill'")] == ["lost_in_kill"]

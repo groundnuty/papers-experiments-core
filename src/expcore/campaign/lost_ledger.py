@@ -4,13 +4,15 @@
 `campaign.lost_spend` counts the spend journals into it and charges it; this module only reads it, so the export can
 read it without the cost code. The record is one JSON object in the store's meta:
 
-    {"journal": <the journal of the start that last opened the store, or null>,
+    {"campaign": <the campaign's fingerprint hash when its first journal was opened: every journal's campaign>,
+     "journal": <the journal of the start that last opened the store, or null>,
      "counted": {<journal name>: {"counted_utc": ...,
                                   "attempts": [<an attempt's last journaled row, with "usd": its charge when counted>],
                                   "charges": [{"kind": "topup" | "probe", "model": ..., "usd": ..., "run_key"?}]}}}
 
-A record that is not that shape cannot be read: `read` answers None, which the budget gate takes as a total it
-cannot know (it holds every model), and the export refuses it.
+`campaign` is kept from the first start that journaled, so a plan that grows (which records a new fingerprint, C06)
+still reads its earlier journals as its own. A record that is not that shape cannot be read: `read` answers None,
+which the budget gate takes as a total it cannot know (it holds every model), and the export refuses it.
 """
 
 import json
@@ -51,6 +53,7 @@ class Ledger:
 
     journal: str | None
     counted: Mapping[str, Mapping[str, Any]]
+    campaign: str | None = None
 
 
 def read(store: Any) -> Ledger | None:
@@ -67,14 +70,14 @@ def parse(raw: str | None) -> Ledger | None:
         value = json.loads(raw)
     except ValueError:
         return None
-    if not isinstance(value, dict) or set(value) != {"journal", "counted"}:
+    if not isinstance(value, dict) or set(value) != {"campaign", "journal", "counted"}:
         return None
-    journal, counted = value["journal"], value["counted"]
-    if not (journal is None or isinstance(journal, str)) or not isinstance(counted, dict):
+    campaign, journal, counted = value["campaign"], value["journal"], value["counted"]
+    if not isinstance(campaign, str) or not (journal is None or isinstance(journal, str)):
         return None
-    if not all(_counted_ok(entry) for entry in counted.values()):
+    if not isinstance(counted, dict) or not all(_counted_ok(entry) for entry in counted.values()):
         return None
-    return Ledger(journal, counted)
+    return Ledger(journal, counted, campaign)
 
 
 def _counted_ok(entry: Any) -> bool:

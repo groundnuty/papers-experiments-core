@@ -41,6 +41,7 @@ from expcore.campaign import liveness, reply_cap
 from expcore.campaign.attempt import AttemptRunner, Parts, RunAdmission
 from expcore.campaign.defect_log import log_path
 from expcore.campaign.executor import BackendFactory, Endpoint, RunExecutor, default_backend_factory
+from expcore.campaign.export import stored_fingerprint_sha256
 from expcore.campaign.factors import EXCLUSIVE_KEY, FactorSchema
 from expcore.campaign.gate import BudgetGate
 from expcore.campaign.harness_stop import HarnessStops
@@ -239,7 +240,7 @@ class Scheduler:
         store = self.store
         if self.spend_journal is not None:  # before the probes, the first spend this start can make (O62)
             label = None if self.shard is None else self.shard.spec.label
-            campaign = fingerprint_sha256(self.fingerprint)
+            campaign = stored_fingerprint_sha256(store) or fingerprint_sha256(self.fingerprint)
             pricing = Pricing({m: self.models.resolve(m) for m in self.plan_models}, self.agent_config.limits)
             self.lost_counted = open_journal(store, self.spend_journal, campaign, label, self.stamp(), pricing)
         self.holds = HoldRegistry(store, self.stamp, None if self.on_hold is None else self._announce)

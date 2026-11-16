@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 from campaign_support import NOW, finished, make_manifest, make_schema
+from scheduler_support import build
 
 from expcore.campaign import out_snapshot
 from expcore.campaign.markers import MARKER_NAME, read_marker, write_marker
@@ -232,3 +233,22 @@ def test_o62_a_run_end_shows_in_the_count_of_ended_attempts(live, tmp_path):
     one_done(out, store, keys_of(store)[0])
     assert out_snapshot.ended_attempts(out) == 1
     assert out_snapshot.ended_attempts(tmp_path / "nowhere") is None
+
+
+def test_o62_a_restored_snapshot_resumes_under_the_dispatcher_and_counts_a_lost_start_once(tmp_path):
+    """O62: the real dispatcher opens a restored snapshot (its fingerprint checked, its recovery run), counts the
+    attempts of a start whose store never reached a snapshot as lost, and runs the campaign to its end."""
+    journals = tmp_path / "journals"
+    journals.mkdir()
+    root = tmp_path / "out"
+    with build(root, spend_journal=journals / "j1.jsonl") as scheduler:
+        scheduler.run(max_dispatch=2)
+    made = take(root, tmp_path / "snaps", scratch=tmp_path / "scratch", facts=FACTS, live=False, now=NOW)
+    with build(root, spend_journal=journals / "j2.jsonl") as scheduler:  # the start a kill will lose
+        scheduler.run(max_dispatch=2)
+    restore(made, tmp_path / "new" / "out")
+    with build(tmp_path / "new" / "out", spend_journal=journals / "j3.jsonl") as scheduler:
+        assert scheduler.lost_counted == {"journals": 2, "attempts": 2, "charges_usd": {}}
+        scheduler.run()
+        statuses = {row["status"] for row in scheduler.store.q("SELECT status FROM runs")}
+    assert statuses == {"done"}

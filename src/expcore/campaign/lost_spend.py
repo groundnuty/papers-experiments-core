@@ -66,8 +66,13 @@ def open_journal(
     store: Store, path: Path, campaign: str, shard: str | None, now: str, pricing: Pricing
 ) -> dict[str, Any]:
     """Create this start's journal at `path`, count every other journal of its directory (`reconcile`) and journal
-    the store's spend from here on; what was counted. A refused start leaves no journal of its own behind."""
-    journal = SpendJournal(path, campaign, shard, now)
+    the store's spend from here on; what was counted. `campaign` is the hash of the fingerprint the store records;
+    the campaign of every journal is the one the ledger kept from its first start, when it has one (a plan that grew
+    records a new fingerprint). A refused start leaves no journal of its own behind."""
+    ledger = read(store)
+    if ledger is None:
+        raise LostSpendError(f"the store's {KEY} cannot be read, so the spend a kill lost cannot be counted")
+    journal = SpendJournal(path, ledger.campaign or campaign, shard, now)
     try:
         counted = reconcile(store, journal, now, pricing)
     except BaseException:
@@ -87,6 +92,8 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
     ledger = read(store)
     if ledger is None:
         raise LostSpendError(f"the store's {KEY} cannot be read, so the spend a kill lost cannot be counted")
+    if ledger.campaign is not None and ledger.campaign != journal.campaign:
+        raise LostSpendError(f"the journal {journal.name} is of campaign {journal.campaign}, not the store's")
     others = journals_in(journal.path.parent, but=journal.name)
     if ledger.journal is not None and ledger.journal not in {path.name for path in others}:
         raise LostSpendError(
@@ -108,7 +115,7 @@ def reconcile(store: Store, journal: SpendJournal, now: str, pricing: Pricing) -
         latest = parse(current)
         if latest is None or latest != ledger:
             raise LostSpendError(f"the store's {KEY} changed while it was reconciled")
-        value = {"journal": journal.name, "counted": {**latest.counted, **found}}
+        value = {"campaign": journal.campaign, "journal": journal.name, "counted": {**latest.counted, **found}}
         events = [("lost_in_kill", None, _detail(name, lost)) for name, lost in found.items() if _any(lost)]
         return json.dumps(value, sort_keys=True), events, None
 
