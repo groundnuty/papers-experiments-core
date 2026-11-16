@@ -1067,6 +1067,48 @@ Implementer (the platform layer) guarantees:
 
 Not carried over from the earlier study: the gate's whole-file mode, the tracer and its checks, the capacity probes tied to two data layouts, and the replication branch of its fourth condition. Its merged-listing mode is the complete listing above, written anew against this gate with bounds and checks the earlier one lacked.
 
+### The Apptainer backend on an HPC batch node
+
+`expcore_onedata.sandbox.apptainer` (O56). `[sandbox] backend = "apptainer"` makes `SandboxPlatform` build `ApptainerSandbox` and prove a lease's sandbox gone with `apptainer.runs.ApptainerProbe`. The platform's `host` is then the node (`apptainer.node.NodeOps`; `LocalNode` on a real node). The class answers everything the platform and the code tool ask of a sandbox, as `DockerSandbox` does, and the egress instrument's source besides:
+
+```toml
+[sandbox]
+backend = "apptainer"
+work_root = "/node/tmpfs/dir"       # an existing 0700 directory of the driver's, not a link
+content_check_file = "dir/f"
+[sandbox.limits]                    # memory_bytes, tmp_bytes, shm_bytes, work_disk_bytes: the watch's bounds
+cpus = 2.0
+memory_bytes = 8589934592
+pids = 512
+nofile = 4096
+tmp_bytes = 1073741824
+shm_bytes = 1073741824
+work_disk_bytes = 4294967296
+[sandbox.data_paths]
+via-gate = "rest"
+[sandbox.apptainer]
+image = "agent.sif"
+image_sha256 = "<64 hex>"
+egress_shim = "egresslog.so"        # deploy/hpc-federation/bundle/egresslog.c, built for the image
+egress_shim_sha256 = "<64 hex>"
+egress_collector = "egress-collector.py"
+egress_collector_sha256 = "<64 hex>"
+```
+
+- **Its egress:** `EgressLog(sandbox, sandbox.egress_declaration(), sandbox.egress_nonce)`. The declaration names the gate at `127.0.0.1:<its port>`, the canary's listener, and the gate's names. `egress_log()` returns the collector's log once `collect` has stopped the collector, and None before that.
+- **Hook (a):** `[sandbox.apptainer.gate_options]` adds keys to the gate's configuration. A key the sandbox writes itself is refused.
+- **Hook (b):** `preload = [{ path, sha256 }]` lists libraries each cell preloads before the egress shim. A connect hook rewrites first and calls the next `connect`, so the shim logs the destination actually dialled. `binds = [{ path, sha256, target }]` adds read-only files. A REST cell also gets `/etc/expcore/gate.json` (`{"address", "port", "names"}`) and `EXPCORE_GATE_PORT`.
+- **Hook (c):** `ApptainerSandbox(..., mount_helper=factory)` with `apptainer.mounthook.MountHelper` (`start() -> Path` bound read-only at `[sandbox.mount] path`, then `stop()`, then `metadata()`). Without a factory a mount run raises `StartRefused(MOUNT_REFUSED)` before anything exists.
+- **Departures** from the Docker sandbox are listed by key in every run's `metadata()["infrastructure_facts"]` (`apptainer.facts.FACTS`):
+  - the network is shared;
+  - the gate is on the node's loopback;
+  - the cell runs as the driver's uid;
+  - memory and disks are kept by a watch;
+  - cpus, pids and nofile are not enforced;
+  - a cell's processes end with its exec;
+  - no freezer;
+  - the mount is refused.
+
 ## The platform layer's files in and out
 
 `expcore_onedata.provision.Provisioner` puts a study's data into its space and reads it back; every write and every range read goes through `expcore_onedata.client.OnezoneClient`'s mutation gate, bound to the provisioner's space (`space`): the target file's space is found by its parent links and its live name read right before each request, and a target in any other space is refused unsent (O09). `Digest` and `Upload` are in `expcore_onedata.streamed`.
