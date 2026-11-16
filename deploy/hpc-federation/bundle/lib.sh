@@ -179,13 +179,15 @@ mark_verified() {  # <workdir>
 
 # The identity of a deployment, recorded once its first start has passed every check and compared by a restart:
 # <workdir>/identity.json, 0600, no secret: {"kind": ..., "<key>": "<value>", ...}. Values are the service's own
-# names (an id, a domain, a user id), held to a safe character set so the file is always valid JSON.
+# names (an id, a domain, a user id): printable ASCII without a space, a quote or a backslash, so the file is always
+# valid JSON and no first start fails on an id format nobody has seen.
 write_identity() {  # <workdir> <kind> <key> <value> [<key> <value> ...]
   local W=$1 body k v
   body="{\"kind\": \"$2\""; shift 2
   while (( $# >= 2 )); do
     k=$1 v=$2; shift 2
-    [[ $k =~ ^[A-Za-z]{1,32}$ && $v =~ ^[A-Za-z0-9._:@-]{1,253}$ ]] || die "identity field '$k' is empty or outside the safe character set"
+    [[ $k =~ ^[A-Za-z]{1,32}$ && $v =~ ^[[:graph:]]{1,253}$ && $v != *\"* && $v != *\\* ]] \
+      || die "identity field '$k' is empty, too long, or holds a character that is not printable ASCII, or is a quote or a backslash"
     body+=", \"$k\": \"$v\""
   done
   put_secret "$W/identity.json" "$body}"$'\n'

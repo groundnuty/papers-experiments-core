@@ -257,13 +257,24 @@ def test_o56_the_identity_is_recorded_as_json_0600(holder, env):
     assert "identity changed" in other.stderr
 
 
-@pytest.mark.parametrize("value", ['a"b', "a b", "", "x\ny", "a/b"])
-def test_o56_an_identity_value_outside_the_safe_set_is_refused(value, holder, env):
-    """O56: the file is always valid JSON: a value that could break it is refused, and nothing is written."""
+@pytest.mark.parametrize("value", ['a"b', "a b", "", "x\ny", "a\\b", "caf\u00e9", "tab\there", "x" * 254])
+def test_o56_an_identity_value_that_could_break_the_json_is_refused(value, holder, env):
+    """O56: the file is always valid JSON: a quote, a backslash, a space or control character, anything but printable
+    ASCII, or a value too long, is refused, and nothing is written."""
     work = node.make_work(holder)
     done = node.lib('write_identity "$1" op providerId "$2" domain d', str(work), value, env=env)
     assert done.returncode != 0
     assert not (work / "identity.json").exists()
+
+
+@pytest.mark.parametrize("value", ["0a1b2c", "a/b+c=", "user@host:8443", "Zone-1_x.y", "%7B~!#$&*()[]{};,<>?|^`'"])
+def test_o56_an_identity_value_of_any_printable_ascii_is_recorded_as_valid_json(value, holder, env):
+    """O56: no first start fails on an id format nobody has seen: whatever is printable ASCII without a space, a quote
+    or a backslash is written, and the file reads back as the same value."""
+    work = node.make_work(holder)
+    done = node.lib('write_identity "$1" op providerId "$2" domain d', str(work), value, env=env)
+    assert done.returncode == 0, done.stderr
+    assert json.loads((work / "identity.json").read_text(encoding="utf-8"))["providerId"] == value
 
 
 # --- restart.sh: what it refuses ---
