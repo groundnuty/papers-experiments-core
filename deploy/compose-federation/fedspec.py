@@ -61,6 +61,7 @@ TOP_KEYS = {
     "providers",
     "spaces",
     "principals",
+    "hpc",  # read by deploy/hpc-federation (hpcsettings.py) only; kept here unread, and Compose ignores it
 }
 SERVICE_KEYS = {"port", "memory_limit"}
 SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline", "import"}
@@ -175,6 +176,7 @@ class Spec:
     principals: tuple[Principal, ...]
     platform_template: Path | None = None
     probe_space: str | None = None  # the link check's probe space (#221): agent_visible = false, never reset per run
+    hpc: Mapping[str, Any] | None = None  # the [hpc] table as written: the HPC driver checks it, Compose never reads it
 
     @property
     def services(self) -> tuple[Service, ...]:
@@ -442,7 +444,17 @@ def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:
         principals=tuple(principals),
         platform_template=template,
         probe_space=probe,
+        hpc=_hpc_table(read, top),
     )
+
+
+def _hpc_table(read: _Reader, top: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The `[hpc]` table, kept as written: `deploy/hpc-federation/hpcsettings.py` checks its keys and values."""
+    if "hpc" not in top:
+        return None
+    if not isinstance(top["hpc"], Mapping):
+        raise read.fail("hpc", "must be a table")
+    return top["hpc"]
 
 
 def checked_probe_space(read: _Reader, top: Mapping[str, Any], spaces: list[Space], template: Path | None) -> str:
