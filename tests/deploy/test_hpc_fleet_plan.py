@@ -166,6 +166,23 @@ def test_o67_step_checks_the_federation_again_and_refuses_one_no_longer_the_flee
     assert [s.label for s in bench.spawned] == ["fed-2"]
 
 
+def test_o67_step_launches_nothing_from_a_shard_manifest_the_record_does_not_give(bench):
+    """O67: shards.toml edited after the plan to give shard-1 fed-2's root (a linked federation of the fleet's): step
+    refuses whole and launches nothing, since a line built from it would land in a job the fleet never checked."""
+    assert bench.up(2)[0] == 0
+    assert plan(bench)[0] == 0
+    path = bench.fleet / "shards.toml"
+    text = path.read_text(encoding="utf-8")
+    assert text.count(f'root = "{bench.root("fed-1")}"') == 1
+    path.write_text(
+        text.replace(f'root = "{bench.root("fed-1")}"', f'root = "{bench.root("fed-2")}"'), encoding="utf-8"
+    )
+    code, printed = bench.run("step")
+    assert code == 2
+    assert "the fleet's shards.toml is not the one its record gives" in printed
+    assert bench.spawned == []
+
+
 def test_o67_a_moved_shard_resumes_on_a_fresh_federation_whose_first_reset_is_full(bench):
     """O67: shard-1 ran on fed-1, which is taken down: it is released, given to the fresh fed-3 (the same
     fingerprint, [placement] reset_shortcut off), and its step there resumes; shard-2 runs on, untouched."""
@@ -185,7 +202,7 @@ def test_o67_a_moved_shard_resumes_on_a_fresh_federation_whose_first_reset_is_fu
     assert code == 0, printed
     moved = bench.spawned[-1]
     assert (moved.label, moved.argv[-1]) == ("fed-3", "--resume")
-    assert "moved from fed-1: its first reset on fed-3 is a full one" in printed
+    assert "moved from fed-1: fed-3's platform.toml leaves [placement] reset_shortcut off" in printed
     assert len(bench.spawned) == 3  # shard-2's step still runs on fed-2: not launched again
 
 

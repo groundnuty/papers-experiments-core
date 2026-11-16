@@ -402,6 +402,24 @@ class Fleet:
         self.say(f"{sum(results.values())} of {len(targets)} federation(s) down")
         return 0 if all(results.values()) else 1
 
+    @staticmethod
+    def never_marked(root: Path) -> bool:
+        """A root this fleet made that its federation's up never marked: an up refused before it touched the root (its
+        preflight) leaves the fleet's mkdir as it was, no state file, no mark, nothing in it; hpcfed's down refuses a
+        root it did not mark, so the fleet removes this one itself. One holding anything is never this."""
+        from fedlayout import ROOT_MARKER
+
+        return root.is_dir() and not (root / ROOT_MARKER).exists() and not hpcstate.path(root).exists()
+
+    @staticmethod
+    def remove_empty(root: Path) -> Tuple[int, str]:
+        """The fleet's own mkdir, removed only while empty (`rmdir` removes nothing else)."""
+        try:
+            os.rmdir(root)
+        except OSError as error:
+            return 1, f"error: down: its root holds files no up of this fleet's marked ({type(error).__name__}): kept"
+        return 0, "down: its up never marked the root; the empty root removed"
+
     def down_one(self, label: str, layout: Path) -> bool:
         member = member_of(self.record.read(), label)
         if member["made"] is None:
@@ -415,7 +433,10 @@ class Fleet:
         if name is not None and member["name"] is None:
             self.record.update(lambda r: member_of(r, label).update(name=name))
         root = root_of(self.directory, label)
-        code, printed = self.operate(label, "down", layout)
+        if self.never_marked(root):  # its up stopped before it marked the root: hpcfed's down would refuse it
+            code, printed = self.remove_empty(root)
+        else:
+            code, printed = self.operate(label, "down", layout)
         ok = code == 0 and not root.exists()
         said = None if ok else last_error(printed) if code != 0 else "its root is still there"
 

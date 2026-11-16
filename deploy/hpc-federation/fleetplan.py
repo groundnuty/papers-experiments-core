@@ -11,8 +11,11 @@ never merge. A later federation of another fingerprint is never used.
 **A shard that moves.** The shard count is fixed at the fleet's `up`. A shard whose federation is taken down
 (`fleet.py down --member`) is released, and given to a federation only after its fresh `up`, never one that held a shard
 before, with the same checks and an equal fingerprint. Its first reset there must be a full one (the coordinator's rule
-for moving a shard): the fleet moves it only to a federation whose `platform.toml` leaves `[placement] reset_shortcut`
-off, under which every reset reads in full, the first included; one that turns it on is refused for the move.
+for moving a shard). What the fleet can check is the federation's platform file, which the shard's step carries into
+the study: it moves a shard only to a federation whose `platform.toml` leaves `[placement] reset_shortcut` off (the
+default), under which every reset's occupancy and quiet stages take the full reads, the first included; one that turns
+it on is refused for the move. It cannot see a study's own request for one full reset (O51), so a study that turns the
+shortcut on moves no shard.
 """
 
 import json
@@ -79,8 +82,13 @@ def sha256(fingerprint: Mapping[str, Any]) -> str:
 
 
 def differing(one: Mapping[str, Any], other: Mapping[str, Any]) -> List[str]:
-    """The fingerprint's keys whose values differ: named, never shown."""
-    return sorted(key for key in set(one) | set(other) if one.get(key) != other.get(key))
+    """The fingerprint's keys whose values differ, by their canonical JSON (a recorded one went through JSON): named,
+    never shown."""
+
+    def canonical(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    return sorted(key for key in set(one) | set(other) if canonical(one.get(key)) != canonical(other.get(key)))
 
 
 def shortcut_on(root: Path) -> bool:
@@ -137,7 +145,7 @@ def assignments(record: Mapping[str, Any], directory: Path) -> Tuple[Dict[str, s
         else:
             found[label] = fingerprint
     reference = (record.get("reference") or {}).get("fingerprint")
-    if reference is None:
+    if reference is None:  # the first plan: every federation ready must be of one fingerprint
         groups: Dict[str, List[str]] = {}
         for label, fingerprint in found.items():
             groups.setdefault(sha256(fingerprint), []).append(label)
@@ -154,7 +162,7 @@ def assignments(record: Mapping[str, Any], directory: Path) -> Tuple[Dict[str, s
         reference = next(iter(found.values()))
     free = []
     for label, fingerprint in found.items():
-        if fingerprint == reference:
+        if sha256(fingerprint) == sha256(reference):  # by its canonical JSON: the reference was recorded as JSON
             free += [] if label in holders else [label]
         elif label in holders:
             raise FleetError(f"{label}'s platform fingerprint is no longer the fleet's (differing: "
@@ -213,9 +221,12 @@ def load(path: Path) -> shards.Plan:
         raise FleetError(f"the fleet's shard manifest: {error}") from None
 
 
-def line_of(plan: shards.Plan, label: str, resume: bool) -> List[str]:
-    """The login node's srun line of one shard on the federation the manifest gives it (`shards.step_argv`)."""
+def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None) -> List[str]:
+    """The login node's srun line of one shard (`shards.step_argv`) on the federation the manifest gives it, which must
+    be `root` when one is given (the federation the fleet's record gives it, and checked)."""
     (shard,) = [s for s in plan.shards if s.label == label]
+    if root is not None and shard.root != root:
+        raise FleetError(f"{MANIFEST} gives shard {label} another root than the fleet's record: run plan again")
     try:
         fed = shards.federation(shard)
     except shards.ShardsError as error:
@@ -241,6 +252,10 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
     shard already launched on its federation is launched again only with `resume`, and never while its client runs
     (`running`: True, False, or None when it cannot be told)."""
     plan = load(directory / MANIFEST)
+    settings, written = record.get("template"), (directory / MANIFEST).read_text(encoding="utf-8")
+    if settings is None or written != manifest_text(settings, entries(record, directory, {})):
+        raise FleetError(f"the fleet's {MANIFEST} is not the one its record gives (edited, or a plan cut short): run "
+                         "plan again; nothing was launched")  # fmt: skip
     reference = (record.get("reference") or {}).get("sha256")
     found, said = [], []
     for shard in record["shards"]:
@@ -261,14 +276,15 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
         if reason is None and sha256(fingerprint) != reference:
             reason = f"{holder}: its platform fingerprint is no longer the fleet's"
         if reason is None and shard["moved"] and shortcut_on(root_of(directory, holder)):
-            reason = f"{holder}: its platform.toml turns [placement] reset_shortcut on: the moved shard's first reset"
+            reason = f"{holder}: its platform.toml turns [placement] reset_shortcut on, so the moved shard's resets "
+            reason += "there are not all full reads"
         if reason is not None:
             said.append(f"{label}: not launched: {reason}")
             continue
         again = resume or bool(started)  # it ran before, here or elsewhere: its results go on
         note = ""
         if shard["moved"] and not here:
-            note = (f"moved from {shard['last']}: its first reset on {holder} is a full one ([placement] "
-                    "reset_shortcut off)")  # fmt: skip
-        found.append(Launch(label, holder, line_of(plan, label, again), again, note))
+            note = (f"moved from {shard['last']}: {holder}'s platform.toml leaves [placement] reset_shortcut off, so "
+                    "every reset there takes the full reads, its first included")  # fmt: skip
+        found.append(Launch(label, holder, line_of(plan, label, again, root_of(directory, holder)), again, note))
     return found, said

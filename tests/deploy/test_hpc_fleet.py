@@ -273,6 +273,42 @@ def test_o67_a_record_that_names_a_root_the_fleet_does_not_make_is_refused_whole
     assert all(fake.cancelled == [] for fake in bench.fakes.values())
 
 
+def test_o67_a_federation_whose_up_stopped_before_it_marked_its_root_is_still_taken_down(bench):
+    """O67: fed-2's up refused in its preflight, before it touched the root: no state file, no mark, the fleet's empty
+    mkdir alone, which hpcfed's down refuses as unmarked; the fleet removes that empty root itself, runs no down for it,
+    and fed-2 no longer counts against the maximum."""
+    calls = []
+
+    def operate(label, command, layout, root, log):
+        calls.append((label, command))
+        if (label, command) == ("fed-2", "up"):
+            return 2, "error: up: the root lies inside another federation's root, or holds one; refused\n"
+        return bench.federation(label, command, layout, root, log)
+
+    assert bench.up(2, federation=operate)[0] == 1
+    assert {m["label"]: m["status"] for m in record(bench)["members"]} == {"fed-1": "up", "fed-2": "failed"}
+    assert bench.fake("fed-2").submitted == {}
+    code, printed = bench.run("down", "--member", "fed-2", federation=operate)
+    assert code == 0, printed
+    assert ("fed-2", "down") not in calls
+    assert not bench.root("fed-2").exists()
+    assert [m["status"] for m in record(bench)["members"]] == ["up", "down"]
+
+
+def test_o67_an_unmarked_root_that_holds_anything_is_kept(bench):
+    """O67: the fleet removes only its own empty mkdir: a root its up never marked that holds a file is kept."""
+
+    def operate(label, command, layout, root, log):
+        return (2, "error: up: refused\n") if label == "fed-1" else bench.federation(label, command, layout, root, log)
+
+    assert bench.up(2, federation=operate)[0] == 1
+    (bench.root("fed-1") / "someone-elses").write_text("kept\n", encoding="utf-8")
+    code, printed = bench.run("down", "--member", "fed-1")
+    assert code == 1
+    assert "its root holds files no up of this fleet's marked" in printed
+    assert (bench.root("fed-1") / "someone-elses").is_file()
+
+
 def test_o67_down_of_one_member_leaves_the_others_up(bench):
     assert bench.up(3)[0] == 0
     assert bench.run("down", "--member", "fed-2")[0] == 0
@@ -329,3 +365,18 @@ def test_o67_each_federations_up_and_down_is_hpcfed_in_a_process_of_its_own(depl
     assert log.stat().st_mode & 0o777 == 0o600
     said = deploy.fleet.last_error("hpcfed: zone launched\nerror: up: the zone failed\n")
     assert said == "error: up: the zone failed"
+
+
+def test_o67_hpcfed_runs_in_its_child_isolated_from_the_fleets_directory(deploy, tmp_path):
+    """O67: the child really runs: `hpcfed.py describe` (nothing of a cluster) under `-I`, so a PYTHONPATH that would
+    put another `expcore_onedata` first is ignored, from the fleet's directory, its output in the federation's log."""
+    fleet, planted = tmp_path / "fleet", tmp_path / "planted" / "expcore_onedata"
+    (fleet / "fed-1").mkdir(parents=True, mode=0o700)
+    planted.mkdir(parents=True)
+    (planted / "__init__.py").write_text("raise SystemExit('a planted module was imported')\n", encoding="utf-8")
+    environ = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "PYTHONPATH": str(planted.parent)}
+    operate = deploy.fleet.hpcfed_process(environ)
+    code, printed = operate("fed-1", "describe", LAYOUT, fleet / "fed-1" / "root", fleet / "fed-1.describe.log")
+    assert code == 0, printed
+    assert "held job: 6 node(s)" in printed
+    assert not (fleet / "fed-1" / "root").exists()
