@@ -116,7 +116,7 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
   control step's client is ended only when its step has been gone from `squeue -s` for three polls in a row; a step
   still listed at the bound is cancelled by its own id (`scancel <job>.<step>`), never more. Both ends of a token's
   pipe are finished whatever the first does. Ending a client is verified (SIGTERM, then SIGKILL, each only while the
-  pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the login node that
+  pid still has its recorded start tick), and `down` also ends any `srun --jobid=<job>` of ours on the same login node (run `down` where `up` ran) that
   no record names (one spawned just before a crash).
 - **No bytecode is written** by the driver or a step: `hpcfed.py` sets `sys.dont_write_bytecode`, and every Python a
   step runs takes `-I -B`.

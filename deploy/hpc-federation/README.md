@@ -217,7 +217,8 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
-  for the recorded work directory, cancels the held job by its id (never by user or name), ends the srun clients, and
+  for the recorded work directory, cancels the held job by its id (never by user or name), ends the srun clients (run it on the login node that ran
+  `up`: it finds them there), and
   removes the root. After a partial `up` it finds the job by its recorded id, or by its allocation's exact name.
 - **Every step** is `srun --jobid --exact` with a name, its size and `/usr/bin/env -i PATH=... LC_ALL=C TMPDIR=<node
   tmpfs>`; no step uses `--overlap`; a control step's srun client is ended only once its step is gone from `squeue
