@@ -133,6 +133,7 @@ from expcore.study.config import (
 from expcore.study.factory_version import check_factory_version
 from expcore.study.merged_times import timed_export, walls_of
 from expcore.study.platform_deferral import platform_deferrals
+from expcore.study.platform_legacy import legacy_fingerprint_of
 from expcore.study.plugin import StudyContext, StudyPlugin, import_plugin_module, load_plugin
 from expcore.study.selection_start import pricing_of, selection_start
 from expcore.study.verified import UNCOVERED, Unverified, VerifiedBatch, load_verified
@@ -328,6 +329,8 @@ def _run_campaign(
     leases = None if plugin.probe is None else LeasePool(out / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
+    if plugin.platform_legacy is not None and (out / STATE_FILE).is_file():  # C06: a store of the earlier form
+        fingerprint = legacy_fingerprint_of(read_fingerprint(out / STATE_FILE), fingerprint, plugin.platform_legacy)
     manifest, started = study.manifest, None
     if isinstance(shard, SelectionSpec):
         try:

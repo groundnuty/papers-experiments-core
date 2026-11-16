@@ -278,6 +278,9 @@ class PlatformConfig:
         It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value (O12), and,
         whenever the `[[spaces]]` form is used (one entry or several), each entry's SHA-256 in the file's order
         (`StudySpace.digest`), so a resume under another set, order, support, data provider or token planes is refused.
+        An entry that declares its data (`data_manifest`) is there by its declared identity and its data's content hash,
+        without its Onezone id: a space is the same experimental condition across federations when its declared
+        identity and its data identity match (C06); one that does not is there with its id, as it always was.
         The one-space form, `[space]` and `[support]`, adds nothing: its fingerprint is as it was, unless `[space]`
         declares an imported storage (`import`, O41), which adds `storage_import` with its `readonly` (and `shared`,
         when true: O59).
@@ -310,6 +313,14 @@ class PlatformConfig:
         if faults is not None:
             out["faults"] = faults
         return out
+
+    def legacy_fingerprint(self) -> dict[str, Any] | None:
+        """The platform's half of the fingerprint as a store started before its spaces declared their data recorded
+        it (`StudyPlugin.platform_legacy`): every `[[spaces]]` entry by its id-bearing digest (`legacy_digest`). None
+        when no entry declares its data, since then the two are one."""
+        if not any(entry.data is not None for entry in self.spaces) or not self.spaces_table:
+            return None
+        return {**self.fingerprint(), "spaces": [entry.legacy_digest() for entry in self.spaces]}
 
     def condition_label(self, name: str) -> str:
         """Name a declared condition for a message by its position in the file, `conditions[i]`, never by its name."""
