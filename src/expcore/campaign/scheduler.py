@@ -552,7 +552,7 @@ class Scheduler:
         with self._cv:
             others = [m for k, (m, _) in self._inflight.items() if k != key]
             live = frozenset(self._inflight)
-        stopped, stopped_all = self.stops.stopped()
+        stopped, stopped_all = self.stops.hold_reasons()
         budget = self._assessed(others, self.stamp(), live)
         hold = (
             self._all_hold(stopped_all)
@@ -578,10 +578,10 @@ class Scheduler:
         assert self.store
         return reply_cap.is_unheld(reply_cap.unheld(self.store), model)
 
-    def _all_hold(self, stopped_all: bool) -> Hold | None:
-        """The hold that applies to every run, if any: a stop on all dispatch, or a closed health gate."""
-        if stopped_all:
-            return Hold("harness_errors", "dispatch of every model is stopped by harness errors", temporary=False)
+    def _all_hold(self, stopped_all: str | None) -> Hold | None:
+        """The hold that applies to every run, if any: a stop on all dispatch (its sentence), or a closed health gate."""
+        if stopped_all is not None:
+            return Hold("harness_errors", stopped_all, temporary=False)
         reason = None if self.gate is None else self.gate.operator_reason  # what only an operator can end, said first
         said = "" if reason is None else f": {reason}"
         if self.gate is not None and self.gate.blocking:  # a deferral past its bound: it may never end by itself
@@ -592,10 +592,10 @@ class Scheduler:
             return Hold("health_gate", why, temporary=True)
         return None
 
-    def _model_hold(self, model: str, stopped: frozenset[str], budget: Any) -> Hold | None:
-        """The hold that applies to one model's runs, if any."""
+    def _model_hold(self, model: str, stopped: Mapping[str, str], budget: Any) -> Hold | None:
+        """The hold that applies to one model's runs, if any; `stopped` holds the sentence of each model's stop."""
         if model in stopped:
-            return Hold("harness_errors", f"dispatch of {model} is stopped by harness errors", temporary=False)
+            return Hold("harness_errors", stopped[model], temporary=False)
         if model in self.not_admitted:
             return Hold("not_admitted", self.not_admitted[model], temporary=False)
         reason = None if budget is None else budget.reason(model)
@@ -637,7 +637,7 @@ class Scheduler:
         self.stops.take_releases(now)
         if self.leases is not None:
             self.leases.settle_quarantines()
-        stopped, stopped_all = self.stops.stopped()
+        stopped, stopped_all = self.stops.hold_reasons()
         budget = self._assessed([m for m, _ in self._inflight.values()], now, frozenset(self._inflight))
         in_use = self._in_use()
         held_in_unit = self._live_per_unit()
