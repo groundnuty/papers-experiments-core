@@ -610,6 +610,8 @@ class Driver(Down):
         recorded = (state.get("data") or {}).get("ingested")
         if recorded is None:
             raise RuntimeError("the state holds no record of the ingested spaces (its up predates it): down, then up")
+        # a verification that fails, or dies mid-read, leaves no marker an earlier pass gave
+        self.set(lambda s: [record.update(verified=None) for record in s["data"]["ingested"].values()])
         values = hpcdata.study_values(Site.from_json(state["site"]).study_artifacts)
         now = hpcdata.ingested(self.layout)
         if set(now) != set(recorded):

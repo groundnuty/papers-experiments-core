@@ -285,6 +285,10 @@ def core_phase(
         filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env),
                   **hpcdata.values(manifests)}  # fmt: skip
         written = write_facts(layout, boot, filled)
+        if layout.spec.platform_template is not None:
+            hpcdata.check_rendered(
+                layout, manifests
+            )  # only a manifest up renders is checked: no path of the template's own
         # before the link check, so a platform file that leaves the sharing out fails up with no link record written
         verify(layout, env, timeout_s=VERIFY_TIMEOUT_S)
         held = hpcdata.check(layout, manifests, data(boot))  # no space is ready on a claim: its data is read back

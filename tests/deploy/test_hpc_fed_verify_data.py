@@ -133,6 +133,21 @@ def test_o57_a_verify_that_fails_after_one_that_passed_clears_the_marker(hpc, tm
     assert ingested_state(fed)["delta-space"]["verified"] is None
 
 
+def test_o57_a_verify_that_dies_mid_read_leaves_no_marker_from_an_earlier_pass(hpc, tmp_path, ca):
+    """O57: a REST error while reading a space raises before any verdict: the earlier pass's marker is already gone."""
+    fed = brought_up(hpc, tmp_path, ca)
+    verify_stand_in(hpc, fed, {"delta-space": ONE})
+    fed.driver.verify_data()
+
+    def dies(layout, owner, manifests):
+        raise OSError("the owner did not answer")
+
+    fed.driver.verify = dies
+    with pytest.raises(OSError, match="did not answer"):
+        fed.driver.verify_data()
+    assert ingested_state(fed)["delta-space"]["verified"] is None
+
+
 def test_o57_an_undeclared_ingested_space_is_verified_as_empty_so_ingested_bytes_fail_with_a_hint(hpc, tmp_path, ca):
     """O57, C06: a space that declares no manifest fingerprints as empty, so any byte the study ingested into it fails
     `verify-data`: the message says it declares nothing, and where to declare it."""

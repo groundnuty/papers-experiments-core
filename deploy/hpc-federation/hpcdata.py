@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
 
+import tomllib
 from fedlayout import BaselineFile, Layout, baseline_plan
 from fedspec import STUDY_ARTIFACTS, Space
 
@@ -156,6 +157,23 @@ def differences(tree: Tree, manifest: Manifest) -> str:
                                            (other, "file(s) of another size or other bytes"),
                                            (dirs, "director(ies) not as listed")) if n]  # fmt: skip
     return ", ".join(said)
+
+
+def check_rendered(layout: Layout, manifests: Mapping[str, Path]) -> None:
+    """Refuse a rendered platform.toml whose entry for a space names another `data_manifest` than the one `up` rendered
+    for it (`manifests`): a template that writes a path of its own would leave the data the campaign's fingerprint holds
+    unchecked, since only the manifests `up` renders are read back or verified. RuntimeError naming the space."""
+    data = tomllib.loads(layout.platform.read_text(encoding="utf-8"))
+    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+    for entry in entries:
+        if not (isinstance(entry, Mapping) and entry.get("data_manifest") and entry.get("name") in manifests):
+            continue
+        named = os.path.normpath(os.path.join(layout.root, str(entry["data_manifest"])))
+        if named != os.path.normpath(str(manifests[entry["name"]])):
+            raise RuntimeError(
+                f"{entry['name']}: the platform template names a data_manifest of its own, not the one up renders "
+                "(@data_manifest.<space>@, from the layout's data_manifest): its data would go unchecked"
+            )
 
 
 def check(layout: Layout, manifests: Mapping[str, Path], read: Callable[[str], Tree]) -> str:

@@ -259,8 +259,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   (`Manifest.digest()`: the declared file's, or the empty manifest's for a space that declares none), `declared` whether
   the layout declares it, and `verified` is `null` until `hpcfed.py verify-data` has read the space back and found
   exactly that manifest, then `{"manifest": <the digest it compared with>, "files": n, "bytes": n}`. **A state without
-  `data`** (an `up` of an earlier driver) cannot be shown verified, and `shards.py plan` refuses it. A re-run of
-  `verify-data` that fails sets `verified` back to `null`.
+  `data`** (an `up` of an earlier driver) cannot be shown verified, and `shards.py plan` refuses it. Every run of
+  `verify-data` sets `verified` back to `null` first, and a pass sets it again.
 - **Read and changed through one store** (`hpclaunch.StateStore`): `read()` the whole file; `update(fn)` a
   read-modify-write under `hpc-federation.lock` in the root (`flock`), `fn` taking the state and returning the new one,
   written atomically. Two commands never interleave their writes.
@@ -463,7 +463,9 @@ or an import, and a path that is neither absolute nor under `@study_artifacts@`,
 written into a quoted TOML string). `up` loads each declared manifest in the preflight, so a mistake fails before a job
 is held, naming the space and never the path. **The directory must be on a filesystem both the login node and the
 agent's node see**: `up`, `verify-data` and `plan` read the manifest on the login node, and the dispatcher's fingerprint
-reads it on the agent's node.
+reads it on the agent's node. `up` also refuses a rendered `platform.toml` whose entry for a space names another
+`data_manifest` than the one it rendered (a template that hard-codes a path of its own): only a manifest `up` renders
+is read back or verified.
 
 **`verify-data`** (`Driver.verify_data`, `hpcboot.verify_ingested`): refused unless the state's phase is `linked`, the
 layout's ingested spaces are the ones the state recorded, and each manifest's digest is the one `up` recorded. Each space
@@ -471,14 +473,16 @@ is read back through its owner (`hpcdata.content_reader`: every directory walked
 space ids come from `facts.json`, as the process is a fresh one) and compared with the manifest by `hpcdata.differences`,
 which counts, in counts alone (never a path): files missing, files not in the manifest, files of another size or other
 bytes, directories not as listed. On any difference it exits 1 naming the space and the counts, and, for a space that
-declares none, says where to declare it; it clears an earlier marker of that space. On a pass it records the marker in
+declares none, says where to declare it. Every earlier marker is cleared before anything is read, so a failure, or a
+read that dies half way, leaves none. On a pass it records the marker in
 `data.ingested.<space>.verified` (section 4).
 
 **`shards.py plan` and `lines`** (`federation()`, so a shard is never planned past it) refuse a federation whose
 ingested spaces lack a marker bound to the manifest `up` recorded, and to the manifest the platform file names now (a
 file edited after the verification changes the hash the fingerprint carries, which the pass was not for), naming the
 shard and the spaces. A later ingest needs another `verify-data`: nothing watches the space after the pass. Reading
-every file's bytes through the owner holds each whole in memory (16 workers): a very large ingested file is the limit.
+every file's bytes through the owner holds each whole in memory (16 workers): a very large ingested file is the limit. `verify-data` runs on the login node, as `[hpc] core = "login"`
+runs the core's phase: it reaches the services' 8443 from there, and has no `core = "step"` form yet.
 
 ## 7. Service verbs for faults and the heal (M4)
 
