@@ -64,6 +64,7 @@ RELAY_STALE_S = 30.0  # a heartbeat older than this, by the reader's wall clock,
 RELAY_NOTE = "fault_relay"  # the try's note key: what the fault gate's pre-run check saw of the relay
 POLL_S = 0.5  # between two looks for an answer, or for a request
 OUTPUT_CAP = 65536  # the most of a command's output an answer carries, per stream
+MIN_RUN_S = 1.0  # a request with less than this left before its deadline is refused, never started
 ENVIRONMENT = ("PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", "SLURM_CONF")
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSW|PASSPHRASE|CREDENTIAL|COOKIE|(^|_)KEY($|_)", re.IGNORECASE)
 _ID = re.compile(r"[0-9a-f]{32}")
@@ -235,6 +236,19 @@ def _answered(answer: Mapping[str, Any], key: str, nonce: str, timeout_s: float)
     return CommandResult(code, out, err)
 
 
+def _issued(paths: Iterator[Path]) -> list[Path]:
+    """Request files in the order they were written (each written once, atomically), drafts left out."""
+    found = []
+    for path in paths:
+        if path.name.startswith("."):
+            continue
+        try:
+            found.append((path.stat().st_mtime_ns, path.name, path))
+        except OSError:  # taken meanwhile
+            continue
+    return [path for _, _, path in sorted(found)]
+
+
 def clean_environment(environ: Mapping[str, str]) -> dict[str, str]:
     """The environment the relay runs a verb with: `ENVIRONMENT`'s names only, never one that looks like a secret."""
     return {name: environ[name] for name in ENVIRONMENT if name in environ and not SECRET_NAME.search(name)}
@@ -315,8 +329,7 @@ class Relay:
     def serve_once(self) -> int:
         """Answer every request waiting now, in the order they were issued; return how many were taken."""
         directory, taken = relay_dir(self.root), 0
-        waiting = sorted(p for p in (directory / "requests").glob("*.json") if not p.name.startswith("."))
-        for path in waiting:
+        for path in _issued((directory / "requests").glob("*.json")):
             claimed = directory / "taken" / path.name
             try:
                 os.rename(path, claimed)  # atomic: a request is taken once, by one relay
@@ -366,7 +379,9 @@ class Relay:
         except DriverError:
             return {"refused": "not_allowed"}
         left = record["deadline"] - self._wall() - POLL_S  # answered before the client's last look
-        bound = max(0.0, min(float(record["bound_s"]), left))
+        if left < MIN_RUN_S:  # too late to run and answer: refused, so nothing is started and killed at once
+            return {"refused": "expired"}
+        bound = min(float(record["bound_s"]), left)
         try:
             done = self._verbs(request, timeout_s=bound)
         except subprocess.TimeoutExpired:

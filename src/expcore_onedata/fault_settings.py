@@ -419,7 +419,9 @@ def _seconds(value: float) -> str:
 def command_bound_s(settings: FaultSettings) -> float:
     """The longest one driver command may take: `command_timeout_s`, and for the HPC backend the relay's wait too
     (`relay_wait_s`: a request's wait beyond its command's bound, `fault_relay`)."""
-    return settings.command_timeout_s + settings.relay_wait_s
+    if settings.backend == "hpc":
+        return settings.command_timeout_s + settings.relay_wait_s
+    return settings.command_timeout_s  # Compose: exactly as before
 
 
 def stop_command_s(settings: FaultSettings) -> float:
@@ -433,8 +435,9 @@ def stop_command_s(settings: FaultSettings) -> float:
 def link_command_s(settings: FaultSettings) -> float:
     """The longest a link restart's command may take: the RPC's bound and its margin, and for the HPC backend the
     exec's step (`fault_hpc.HPC_EXEC_MARGIN_S`) and the relay's wait."""
-    extra = HPC_EXEC_MARGIN_S + settings.relay_wait_s if settings.backend == "hpc" else 0.0
-    return RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + extra
+    if settings.backend == "hpc":
+        return RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + HPC_EXEC_MARGIN_S + settings.relay_wait_s
+    return RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S
 
 
 def _command_words(settings: FaultSettings) -> str:
