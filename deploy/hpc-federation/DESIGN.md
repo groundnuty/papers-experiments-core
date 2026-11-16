@@ -290,7 +290,27 @@ service steps through `zone.sbatch` and `provider.sbatch` unchanged):
 
 M3 replaces a provider's tmpfs posix storage for an imported space with a directory on the shared filesystem, bound
 read-only into that provider's container. It changes the service step's binds and the support's storage, not the
-process model: the step, the state file and the verbs stay as above.
+process model: the step, the state file and the verbs stay as above. It is declared in the layout the driver already
+reads (`layouts/shared-import.toml` is an example), as `import = { readonly = true, shared = true, source_env, manifest_env,
+direct_io }` on a space, and everything it needs from the driver is one call at each of six places, all in
+`hpcimport.py` or in the Compose federation's modules the driver imports (`docs/storage-import.md`, "A tree on the
+cluster's shared filesystem", says why each is there):
+
+| Where in `up` | The call | What it does |
+|---|---|---|
+| Preflight (section 5, step 1) | `Layout.import_source(space, os.environ)` and `Layout.import_manifest(space, os.environ)` for each of `layout.shared_imports()` | refuses a variable that is unset, relative, with a `..` step or a link on the way, a source that is not a directory, a manifest that is not a file or lies in a tree. The values are read from the environment `site.env` set on the login node; **the node's `env -i` allowlist never carries them**: the path travels as an argument |
+| A provider's service step (step 6) | append `hpcimport.provider_import_args(layout, provider, os.environ)` to the `provider.sbatch` argv, after the peers | `--import=SPACE=PATH` per tree the provider owns; none for a mirror. The bundle checks each tree again on the node, makes the mountpoint in the rootfs and binds it `:ro` at every start of the service, a restart (section 7) included, since the list is in the work directory |
+| The bootstrap (step 8) | override `Bootstrap.import_storage_extra(service)` to return `hpcimport.import_storage_extra(uid, gid)` | the imported storage is made with the job user's ids, the local LUMA feed and the canonical path type; `fedboot` names the storage by `import-<space>` and supports the space on it with the one-scan import configuration, as the Compose federation does |
+| The bootstrap's LUMA step (step 8) | for the storage `Bootstrap.storage_for(service, space)` returns, send `hpcimport.luma_requests(storage_id, space_id, member_ids, uid, gid)` | the space's default credentials and each member's mapping on **that storage**, not on "the provider's one posix storage": an owner of an imported space has two |
+| After `platform.toml` is rendered (step 9), before the link check | `fedimport.verify_imports(layout, os.environ, timeout_s=...)` | the core's `ImportedSpace.provision` over the rendered file: read-only imported storage on the owner's panel, scan completed, every provider's listing is the manifest, every file whole on the owner. A space the layout shares and the file does not is refused unsent |
+| After the providers' verdicts (step 6) and again after a start (section 7) | a control step on the owner's node: `hpcimport.mount_check_argv(bundle, workdir)` | exits 0 only when every listed tree is held with `ro` in the mount's own options by a process of the job's user |
+
+Two things the contract did not say, which M3 relies on and M1's code must keep: **the storage a support names is
+found by name** (`import-<space>` for the owner of an imported space, the provider's regular one for every other
+support; never the first the panel lists), and **`platform.toml`'s template repeats each `import` declaration** with
+`shared = true`, so the core, which reads the file and not the layout, can refuse a storage that is not read-only.
+`direct_io` is read by the sandbox milestone: `hpcimport.direct_storages(layout, storage_ids, os.environ)` is the
+`[sandbox.mount.storages]` it needs.
 
 ## 9. Assumptions a live slot verifies first
 

@@ -65,6 +65,7 @@ def workdir(base):
 
 
 def test_o56_an_import_argument_is_a_space_and_the_path_of_its_tree():
+    """O56: an import argument is a space and the path of its tree."""
     assert imp.parse_arg("--import=alpha=/srv/shared/alpha") == ("alpha", "/srv/shared/alpha")
 
 
@@ -89,7 +90,8 @@ def test_o56_an_import_argument_is_a_space_and_the_path_of_its_tree():
     ],
 )
 def test_o56_an_argument_outside_the_narrow_form_is_refused_without_echoing_the_path(arg):
-    """The path reaches a bind option and a file: a character that could end the option or add one never gets there."""
+    """O56: The path reaches a bind option and a file: a character that could end the option or add one never gets
+    there."""
     with pytest.raises(imp.ImportRefused) as caught:
         imp.parse_arg(arg)
     assert "/srv" not in str(caught.value)
@@ -106,10 +108,12 @@ def refused(path, workdir, mounts=NO_MOUNTS, space="alpha"):
 
 
 def test_o56_a_tree_that_is_a_plain_directory_is_taken(tree, workdir):
+    """O56: a tree that is a plain directory is taken."""
     imp.check_source("alpha", str(tree), workdir, NO_MOUNTS)
 
 
 def test_o56_a_path_that_is_not_in_its_plain_absolute_form_is_refused(tree, workdir):
+    """O56: a path that is not in its plain absolute form is refused."""
     assert "plain" in refused("relative/alpha", workdir)
     assert "plain" in refused(f"{tree}/../alpha", workdir)
     assert "plain" in refused(f"{tree}/", workdir)
@@ -119,7 +123,7 @@ def test_o56_a_path_that_is_not_in_its_plain_absolute_form_is_refused(tree, work
 
 
 def test_o56_a_link_on_the_way_to_the_tree_is_refused(tree, workdir, base):
-    """A link can be re-pointed between the check and the mount; the real path is what is named."""
+    """O56: A link can be re-pointed between the check and the mount; the real path is what is named."""
     (base / "link").symlink_to(tree)
     assert "symbolic link" in refused(base / "link", workdir)
     (base / "dirlink").symlink_to(tree.parent)
@@ -127,12 +131,14 @@ def test_o56_a_link_on_the_way_to_the_tree_is_refused(tree, workdir, base):
 
 
 def test_o56_a_tree_that_is_missing_or_not_a_directory_is_refused(tree, workdir, base):
+    """O56: a tree that is missing or not a directory is refused."""
     assert "does not exist" in refused(base / "absent", workdir)
     assert "not a directory" in refused(tree / "day-01.csv", workdir)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
 def test_o56_a_tree_this_user_cannot_read_is_refused(tree, workdir):
+    """O56: a tree this user cannot read is refused."""
     tree.chmod(0)
     try:
         assert "readable" in refused(tree, workdir)
@@ -148,7 +154,7 @@ MOUNTINFO = (
 
 
 def test_o56_a_tree_on_node_local_memory_is_refused_since_the_other_nodes_do_not_see_it(base, workdir):
-    """A tree on tmpfs belongs to one node: another federation's provider on another node would import something
+    """O56: A tree on tmpfs belongs to one node: another federation's provider on another node would import something
     else, or nothing."""
     local = base / "ram"
     (local / "alpha").mkdir(parents=True)
@@ -160,6 +166,7 @@ def test_o56_a_tree_on_node_local_memory_is_refused_since_the_other_nodes_do_not
 
 
 def test_o56_the_mount_table_is_read_for_the_longest_mount_that_holds_the_path(base, workdir):
+    """O56: the mount table is read for the longest mount that holds the path."""
     inner = base / "ram" / "inner"
     inner.mkdir(parents=True)
     table = f"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n30 22 0:25 / {base / 'ram'} rw - tmpfs tmpfs rw\n"
@@ -168,13 +175,14 @@ def test_o56_the_mount_table_is_read_for_the_longest_mount_that_holds_the_path(b
 
 
 def test_o56_a_mount_table_that_cannot_be_read_refuses_the_tree(tree, workdir, monkeypatch):
-    """Fail closed: not knowing that a tree is shared is not knowing that it is."""
+    """O56: Fail closed: not knowing that a tree is shared is not knowing that it is."""
     monkeypatch.setattr(imp, "MOUNTINFO", "/nonexistent/mountinfo")
     with pytest.raises(imp.ImportRefused, match="mount table cannot be read"):
         imp.prepare(workdir, [("alpha", str(tree))])
 
 
 def test_o56_a_tree_inside_or_holding_the_work_directory_is_refused(workdir, base):
+    """O56: a tree inside or holding the work directory is refused."""
     inside = workdir / "rootfs" / "volumes" / "x"
     inside.mkdir()
     assert "work directory" in refused(inside, workdir)
@@ -185,6 +193,7 @@ def test_o56_a_tree_inside_or_holding_the_work_directory_is_refused(workdir, bas
 
 
 def test_o56_prepare_makes_the_mountpoint_and_the_list_and_binds_name_the_tree_read_only(tree, workdir):
+    """O56: prepare makes the mountpoint and the list and binds name the tree read only."""
     imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
     mountpoint = workdir / "rootfs" / "volumes" / "import" / "alpha"
     assert mountpoint.is_dir()
@@ -199,6 +208,7 @@ def test_o56_prepare_makes_the_mountpoint_and_the_list_and_binds_name_the_tree_r
 
 
 def test_o56_every_bind_is_read_only_and_one_per_space_in_the_listed_order(base, workdir):
+    """O56: every bind is read only and one per space in the listed order."""
     trees = []
     for name in ("beta", "alpha"):
         trees.append((name, base / "shared" / name))
@@ -211,10 +221,12 @@ def test_o56_every_bind_is_read_only_and_one_per_space_in_the_listed_order(base,
 
 
 def test_o56_a_service_with_no_imports_binds_nothing(workdir):
+    """O56: a service with no imports binds nothing."""
     assert imp.binds(workdir) == []
 
 
 def test_o56_a_second_tree_that_is_refused_leaves_nothing_made_for_the_first(tree, workdir, base):
+    """O56: a second tree that is refused leaves nothing made for the first."""
     with pytest.raises(imp.ImportRefused):
         imp.prepare(workdir, [("alpha", str(tree)), ("beta", str(base / "absent"))], mountinfo=NO_MOUNTS)
     assert not (workdir / "imports").exists()
@@ -222,6 +234,7 @@ def test_o56_a_second_tree_that_is_refused_leaves_nothing_made_for_the_first(tre
 
 
 def test_o56_one_space_twice_or_one_tree_twice_is_refused(tree, workdir):
+    """O56: one space twice or one tree twice is refused."""
     with pytest.raises(imp.ImportRefused, match="twice"):
         imp.prepare(workdir, [("alpha", str(tree)), ("alpha", str(tree))], mountinfo=NO_MOUNTS)
     with pytest.raises(imp.ImportRefused, match="twice"):
@@ -229,7 +242,7 @@ def test_o56_one_space_twice_or_one_tree_twice_is_refused(tree, workdir):
 
 
 def test_o56_a_mountpoint_that_holds_something_or_is_a_link_is_refused(tree, workdir, base):
-    """A bind over a directory hides what it holds; a link would carry the bind outside the rootfs."""
+    """O56: A bind over a directory hides what it holds; a link would carry the bind outside the rootfs."""
     mountpoint = workdir / "rootfs" / "volumes" / "import" / "alpha"
     mountpoint.mkdir(parents=True)
     (mountpoint / "stray").touch()
@@ -244,6 +257,7 @@ def test_o56_a_mountpoint_that_holds_something_or_is_a_link_is_refused(tree, wor
 
 
 def test_o56_a_work_directory_that_is_not_a_providers_private_one_is_refused(tree, base):
+    """O56: a work directory that is not a providers private one is refused."""
     zone = base / "tmp" / "hpcop-oz.abc123"
     (zone / "rootfs").mkdir(parents=True)
     zone.chmod(0o700)
@@ -258,13 +272,14 @@ def test_o56_a_work_directory_that_is_not_a_providers_private_one_is_refused(tre
 
 
 def test_o56_a_work_directory_without_its_unpacked_rootfs_is_refused(tree, workdir):
+    """O56: a work directory without its unpacked rootfs is refused."""
     (workdir / "rootfs.complete").unlink()
     with pytest.raises(imp.ImportRefused, match="no complete rootfs"):
         imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
 
 
 def test_o56_a_tree_that_became_a_link_after_prepare_is_refused_when_the_service_starts(tree, workdir, base):
-    """`binds` checks again: the start, or a restart, may come long after prepare."""
+    """O56: `binds` checks again: the start, or a restart, may come long after prepare."""
     imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
     moved = base / "elsewhere"
     tree.rename(moved)
@@ -274,6 +289,7 @@ def test_o56_a_tree_that_became_a_link_after_prepare_is_refused_when_the_service
 
 
 def test_o56_a_list_that_was_edited_into_something_else_is_refused_at_the_start(tree, workdir):
+    """O56: a list that was edited into something else is refused at the start."""
     imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
     (workdir / "imports").write_text("alpha\t/srv/x:/etc\n", encoding="utf-8")
     with pytest.raises(imp.ImportRefused):
@@ -281,6 +297,7 @@ def test_o56_a_list_that_was_edited_into_something_else_is_refused_at_the_start(
 
 
 def test_o56_the_command_line_refuses_what_the_functions_refuse_and_says_so_on_stderr(workdir, base):
+    """O56: the command line refuses what the functions refuse and says so on stderr."""
     done = cli("prepare", "--workdir", str(workdir), f"--import=alpha={base}/absent")
     assert done.returncode == 1
     assert "importstorage: ERROR" in done.stderr
@@ -319,6 +336,7 @@ def listed(workdir, tree, *more):
 
 
 def test_o56_a_read_only_mount_in_every_process_that_holds_it_passes(tree, workdir, proc):
+    """O56: a read only mount in every process that holds it passes."""
     listed(workdir, tree)
     proc(11, mountinfo())
     proc(12, mountinfo())
@@ -328,6 +346,7 @@ def test_o56_a_read_only_mount_in_every_process_that_holds_it_passes(tree, workd
 
 
 def test_o56_a_writable_mount_in_one_process_fails_whatever_the_others_hold(tree, workdir, proc):
+    """O56: a writable mount in one process fails whatever the others hold."""
     listed(workdir, tree)
     proc(11, mountinfo())
     proc(12, mountinfo(options="rw,relatime"))
@@ -337,7 +356,8 @@ def test_o56_a_writable_mount_in_one_process_fails_whatever_the_others_hold(tree
 
 
 def test_o56_the_flag_of_the_mount_counts_never_the_flag_of_the_filesystem(tree, workdir, proc):
-    """A read-only bind of a writable filesystem is `ro` in the mount's options and `rw` after the hyphen; the reverse
+    """O56: A read-only bind of a writable filesystem is `ro` in the mount's options and `rw` after the hyphen; the
+    reverse
     is a writable mount of a read-only filesystem, which this check also reads as writable."""
     listed(workdir, tree)
     proc(11, mountinfo(options="ro,relatime"))  # superblock rw: the shape of a read-only bind
@@ -347,6 +367,7 @@ def test_o56_the_flag_of_the_mount_counts_never_the_flag_of_the_filesystem(tree,
 
 
 def test_o56_a_tree_no_process_holds_fails_since_nothing_is_proven(tree, workdir, proc):
+    """O56: a tree no process holds fails since nothing is proven."""
     listed(workdir, tree)
     proc(11, "100 99 0:50 / / rw,relatime - overlay overlay rw\n")
     facts, ok = imp.check_mounts(workdir, proc.root)
@@ -355,6 +376,7 @@ def test_o56_a_tree_no_process_holds_fails_since_nothing_is_proven(tree, workdir
 
 
 def test_o56_every_space_the_service_lists_is_checked_and_another_mountpoint_is_ignored(tree, workdir, proc, base):
+    """O56: every space the service lists is checked and another mountpoint is ignored."""
     second = base / "shared" / "beta"
     second.mkdir(parents=True)
     listed(workdir, tree, ("beta", str(second)))
@@ -367,6 +389,7 @@ def test_o56_every_space_the_service_lists_is_checked_and_another_mountpoint_is_
 
 
 def test_o56_a_process_that_is_gone_or_not_a_process_is_skipped(tree, workdir, proc):
+    """O56: a process that is gone or not a process is skipped."""
     listed(workdir, tree)
     proc(11, mountinfo())
     (proc.root / "self").mkdir()
@@ -375,6 +398,7 @@ def test_o56_a_process_that_is_gone_or_not_a_process_is_skipped(tree, workdir, p
 
 
 def test_o56_the_processes_of_another_user_are_not_counted(tree, workdir, proc):
+    """O56: the processes of another user are not counted."""
     listed(workdir, tree)
     proc(11, mountinfo())
     facts, ok = imp.check_mounts(workdir, proc.root, uid=os.getuid() + 1)
@@ -382,12 +406,14 @@ def test_o56_the_processes_of_another_user_are_not_counted(tree, workdir, proc):
 
 
 def test_o56_the_mount_table_decodes_the_escapes_the_kernel_writes(tree, workdir, proc):
+    """O56: the mount table decodes the escapes the kernel writes."""
     listed(workdir, tree)
     proc(11, mountinfo().replace("/volumes/import/alpha", "/volumes/import/alpha", 1))
     assert imp.parse_mountinfo("1 0 0:1 / /a\\040b ro - ext4 x rw\n") == [("/a b", {"ro"}, "ext4")]
 
 
 def test_o56_the_mounts_command_prints_counts_and_never_a_path(tree, workdir, proc):
+    """O56: the mounts command prints counts and never a path."""
     listed(workdir, tree)
     proc(11, mountinfo())
     done = cli("mounts", "--workdir", str(workdir), "--proc", str(proc.root))
@@ -413,6 +439,7 @@ def lib(command: str, *args: str):
 
 
 def test_o56_the_arguments_are_split_into_the_imports_and_the_peers():
+    """O56: the arguments are split into the imports and the peers."""
     script = (
         f'source "{BUNDLE}/lib.sh"; split_imports IMPORTS PEERS "$@"; '
         'printf "I=%s\\n" "${IMPORTS[@]}"; printf "P=%s\\n" "${PEERS[@]}"'
@@ -428,6 +455,7 @@ def test_o56_the_arguments_are_split_into_the_imports_and_the_peers():
 
 
 def test_o56_the_service_binds_what_the_list_names_and_a_service_with_none_binds_nothing(tree, workdir):
+    """O56: the service binds what the list names and a service with none binds nothing."""
     assert lib("import_binds", str(workdir)).stdout == ""
     imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
     done = lib("import_binds", str(workdir))
@@ -436,6 +464,7 @@ def test_o56_the_service_binds_what_the_list_names_and_a_service_with_none_binds
 
 
 def test_o56_a_list_that_cannot_be_bound_stops_the_start(tree, workdir):
+    """O56: a list that cannot be bound stops the start."""
     imp.prepare(workdir, [("alpha", str(tree))], mountinfo=NO_MOUNTS)
     tree.rename(tree.parent / "moved")
     done = lib("import_binds", str(workdir))
@@ -448,7 +477,7 @@ def read(name: str) -> str:
 
 
 def test_o56_the_run_binds_the_trees_read_only_before_the_image_and_through_the_function_alone():
-    """The bind arguments come from `import_binds` and nowhere else, are placed before the rootfs argument, and the
+    """O56: The bind arguments come from `import_binds` and nowhere else, are placed before the rootfs argument, and the
     exec keeps its flags."""
     run = read("lib.sh")
     body = run[run.index("run_service() {") :]
@@ -461,6 +490,7 @@ def test_o56_the_run_binds_the_trees_read_only_before_the_image_and_through_the_
 
 
 def test_o56_the_provider_job_and_its_configuration_pass_the_imports_through_and_the_zone_takes_none():
+    """O56: the provider job and its configuration pass the imports through and the zone takes none."""
     batch, configure = read("provider.sbatch"), read("configure.sh")
     assert 'configure.sh" op --workdir "$W" "$NAME" "$ZONE" "$MAIL" "$@"' in batch
     assert "split_imports" in configure
@@ -469,7 +499,8 @@ def test_o56_the_provider_job_and_its_configuration_pass_the_imports_through_and
 
 
 def test_o56_the_script_never_removes_renames_links_or_truncates_and_writes_only_in_the_work_directory():
-    """The shared tree is read, and named as a read-only bind source: nothing in the script can remove, rename, link or
+    """O56: The shared tree is read, and named as a read-only bind source: nothing in the script can remove, rename,
+    link or
     truncate a path, and the calls that make or write one are in the two functions that build the work directory's
     mountpoints and list from `workdir` alone."""
     import ast
@@ -556,6 +587,7 @@ def federation(fed, base):
 
 
 def test_o56_a_provider_is_given_the_trees_it_owns_and_a_mirror_none(federation):
+    """O56: a provider is given the trees it owns and a mirror none."""
     layout, environ, trees = federation
     assert hpcimport.provider_import_args(layout, "oak", environ) == [f"--import=alpha-space={trees['alpha']}"]
     assert hpcimport.provider_import_args(layout, "elm", environ) == [f"--import=beta-space={trees['beta']}"]
@@ -563,12 +595,14 @@ def test_o56_a_provider_is_given_the_trees_it_owns_and_a_mirror_none(federation)
 
 
 def test_o56_an_argument_made_for_a_provider_is_one_the_node_accepts(federation):
+    """O56: an argument made for a provider is one the node accepts."""
     layout, environ, _ = federation
     for arg in hpcimport.provider_import_args(layout, "oak", environ):
         assert imp.parse_arg(arg)
 
 
 def test_o56_a_tree_variable_that_is_not_set_is_refused_naming_the_variable_and_not_a_value(federation):
+    """O56: a tree variable that is not set is refused naming the variable and not a value."""
     layout, environ, _ = federation
     del environ["EXPCORE_FED_IMPORT_ALPHA"]
     with pytest.raises(ValueError, match="EXPCORE_FED_IMPORT_ALPHA is not set"):
@@ -576,6 +610,7 @@ def test_o56_a_tree_variable_that_is_not_set_is_refused_naming_the_variable_and_
 
 
 def test_o56_an_import_that_is_not_shared_is_refused_on_hpc(fed, base):
+    """O56: an import that is not shared is refused on hpc."""
     from federation_support import import_layout
 
     text = LAYOUT.replace("shared = true, ", "", 1).replace("direct_io = true, ", "", 1)
@@ -585,6 +620,7 @@ def test_o56_an_import_that_is_not_shared_is_refused_on_hpc(fed, base):
 
 
 def test_o56_the_creation_of_an_imported_storage_for_a_provider_that_runs_as_the_job_user():
+    """O56: the creation of an imported storage for a provider that runs as the job user."""
     assert hpcimport.import_storage_extra(1234, 4321) == {
         "rootUid": 1234,
         "rootGid": 4321,
@@ -600,7 +636,8 @@ def test_o56_the_creation_of_an_imported_storage_for_a_provider_that_runs_as_the
 
 
 def test_o56_the_user_mappings_are_those_the_onboarding_step_sends_for_the_regular_storage():
-    """The same three calls as bundle/onboard.py: the space's default credentials, then each member, to the job user."""
+    """O56: The same three calls as bundle/onboard.py: the space's default credentials, then each member, to the job
+    user."""
     calls = hpcimport.luma_requests("st1", "sp1", ["u-a", "u-b"], 1234, 4321)
     base = "/provider/storages/st1/luma/local_feed/storage_access"
     assert calls[0] == ("PUT", f"{base}/posix_compatible/default_credentials/sp1", {"uid": 1234, "gid": 4321})
@@ -619,6 +656,7 @@ def test_o56_the_user_mappings_are_those_the_onboarding_step_sends_for_the_regul
 
 
 def test_o56_the_mount_check_is_a_control_step_on_the_owners_node(base):
+    """O56: the mount check is a control step on the owners node."""
     argv = hpcimport.mount_check_argv(str(base / "bundle"), str(base / "hpcop-op.abc123"))
     assert argv == [
         "python3.11",
@@ -631,6 +669,7 @@ def test_o56_the_mount_check_is_a_control_step_on_the_owners_node(base):
 
 
 def test_o56_a_direct_mount_reads_the_tree_of_each_space_that_declares_it_and_no_other(federation):
+    """O56: a direct mount reads the tree of each space that declares it and no other."""
     layout, environ, trees = federation
     ids = {("oak", "alpha-space"): "st-alpha", ("elm", "beta-space"): "st-beta"}
     assert hpcimport.direct_storages(layout, ids, environ) == {"st-alpha": str(trees["alpha"])}
@@ -639,7 +678,7 @@ def test_o56_a_direct_mount_reads_the_tree_of_each_space_that_declares_it_and_no
 
 
 def test_o56_the_storage_of_a_provider_that_is_not_the_owner_is_its_own_regular_one(federation, fed):
-    """The mirrors mount nothing and keep node-local storage: the storage the bootstrap picks for them is not the
+    """O56: The mirrors mount nothing and keep node-local storage: the storage the bootstrap picks for them is not the
     imported one, which only the owner's support names."""
     layout, _, _ = federation
     space = layout.spec.space("alpha-space")
@@ -675,6 +714,7 @@ def rendered(fed, tmp_path) -> str:
 
 
 def test_o56_the_example_layout_declares_two_shared_read_only_imports_with_a_manifest_each(fed):
+    """O56: the example layout declares two shared read only imports with a manifest each."""
     spec = fed.spec.load_spec(LAYOUT_FILE)
     declared = {s.name: s.imported for s in spec.spaces if s.imported}
     assert set(declared) == {"alpha-data", "beta-data"}
@@ -685,6 +725,7 @@ def test_o56_the_example_layout_declares_two_shared_read_only_imports_with_a_man
 
 
 def test_o56_the_example_layout_and_its_template_hold_no_path_and_no_site_name():
+    """O56: the example layout and its template hold no path and no site name."""
     for path in (LAYOUT_FILE, TEMPLATE):
         text = path.read_text(encoding="utf-8")
         for host_path in ("/srv", "/mnt", "/home", "/scratch", "/net", "/lustre"):
@@ -693,7 +734,8 @@ def test_o56_the_example_layout_and_its_template_hold_no_path_and_no_site_name()
 
 
 def test_o56_the_template_repeats_each_shared_declaration_so_the_core_refuses_a_writable_one(fed, tmp_path):
-    """The platform file is what the core reads: a template that left `shared` out of an import the layout shares would
+    """O56: The platform file is what the core reads: a template that left `shared` out of an import the layout
+    shares would
     leave the core unable to refuse a storage that is not read-only, so every declaration is repeated."""
     import tomllib
 
@@ -711,6 +753,7 @@ def test_o56_the_template_repeats_each_shared_declaration_so_the_core_refuses_a_
 
 
 def test_o56_the_rendered_template_is_a_platform_file_the_core_loads_with_both_imports_shared(fed, tmp_path):
+    """O56: the rendered template is a platform file the core loads with both imports shared."""
     from expcore_onedata.config import load_platform
     from expcore_onedata.spaces import ImportedStorage
 
@@ -725,7 +768,7 @@ def test_o56_the_rendered_template_is_a_platform_file_the_core_loads_with_both_i
 
 
 def test_o56_only_the_owner_of_each_import_binds_its_tree_and_only_read_only_when_composed(fed):
-    """The same layout under Compose binds each tree into its owner's service alone, read-only."""
+    """O56: The same layout under Compose binds each tree into its owner's service alone, read-only."""
     model = fed.compose.model(fed.spec.load_spec(LAYOUT_FILE))["services"]
     binds = {name: [v for v in s["volumes"] if v["target"].startswith("/volumes/import/")] for name, s in model.items()}
     assert [(v["target"], v["read_only"]) for v in binds["pine"]] == [("/volumes/import/alpha-data", True)]

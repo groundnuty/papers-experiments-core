@@ -373,7 +373,8 @@ def test_the_scan_and_storage_steps_are_taken_for_a_layout_with_no_import_too(fe
 
 
 def test_o56_a_deployments_extra_settings_are_sent_with_the_creation_and_never_compared_after(fed, tmp_path):
-    """The HPC providers run as the job's user: their bootstrap adds the user's ids and the LUMA feed to the storage
+    """O56: The HPC providers run as the job's user: their bootstrap adds the user's ids and the LUMA feed to the
+    storage
     it creates. The panel need not echo them, so a storage found afterwards is checked on the declared keys alone."""
     fake = federation(fed, tmp_path)
     extra = {"rootUid": 1234, "rootGid": 4321, "lumaFeed": "local", "storagePathType": "canonical"}
@@ -385,7 +386,7 @@ def test_o56_a_deployments_extra_settings_are_sent_with_the_creation_and_never_c
 
 
 def test_o56_a_deployments_extra_settings_may_not_override_what_the_layout_declares(fed, tmp_path):
-    """A shared tree is read-only because the layout says so: no hook turns that off."""
+    """O56: A shared tree is read-only because the layout says so: no hook turns that off."""
     fake = federation(fed, tmp_path)
     fake.boot.import_storage_extra = lambda service: {"readonly": False}
     with pytest.raises(RuntimeError, match="may not override readonly"):
@@ -394,6 +395,7 @@ def test_o56_a_deployments_extra_settings_may_not_override_what_the_layout_decla
 
 
 def test_o56_without_a_deployments_hook_the_creation_is_what_it_was(fed, tmp_path):
+    """O56: without a deployments hook the creation is what it was."""
     fake = federation(fed, tmp_path)
     fake.boot.ensure_import_storages()
     assert fake.posts() == [("elm", "/provider/storages", {"import-fern-space": FERN})]

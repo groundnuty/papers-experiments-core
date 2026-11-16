@@ -145,6 +145,46 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository.
 
+## A shared imported tree
+
+A space can be held on a directory of the cluster's shared filesystem that other federations import too, so several
+federations serve one dataset with no copy of it and each run's data is the same bytes. The tree is **read-only in every
+federation**; this section is what the bundle does for that, and `../../docs/storage-import.md`, "A tree on the
+cluster's shared filesystem", is why. `layouts/shared-import.toml` declares it (invented names), `DESIGN.md` section 8
+says where the driver calls each step, and `site.env.example` names the two variables of each import.
+
+- **Declared** in the layout: `import = { readonly = true, shared = true, source_env, manifest_env }` on the space, and
+  `direct_io = true` if the agent's mount reads the storage directly (a mode of the mount: the sandbox node must see the
+  same directory, and the run's record shows the mode in effect). The path and the manifest's file are the variables'
+  values in `site.env`, never the layout's. The owner of the space is the one provider that mounts the tree; its mirrors
+  keep node-local storage.
+- **Checked on the node** (`bundle/importstorage.py`, called by `configure.sh` and at every start): `--import=SPACE=PATH`
+  must be a plain absolute path of `A-Z a-z 0-9 . _ + / -`, with no symbolic link on the way, an existing directory the
+  job's user can read, on no tmpfs (a tree on a node's memory is one the other nodes do not see), outside the work
+  directory. Nothing is created unless every tree passes. Then the service starts with `--bind PATH:/volumes/import/SPACE:ro`
+  over an empty mountpoint of the rootfs, which is the one thing of the node's filesystems the container sees. A refusal
+  names the space, never the path.
+- **Proven read-only by the kernel**: `python3.11 -I importstorage.py mounts --workdir <W>`, in a control step on the owner's
+  node once the service is up, prints per space how many processes hold the mount read-only and how many writable, and
+  exits 0 only when each space is held and none writable. It attempts no write: a write probe is the first thing that
+  could change the tree if a declaration were wrong.
+- **What the platform layer adds**: the Onedata storage is made `readonly` and imported by the bootstrap; the core
+  refuses a shared import that is not read-only (at load, and on the owner's panel), the provisioner refuses every write
+  and every eviction from the owner, and `fedimport.verify_imports` shows after up that the space holds exactly its
+  manifest.
+- **A reset** of the space evicts the mirrors and removes the run's own QoS requirements; it writes no file. To start
+  again: down, then up. `teardown.sh` removes the work directory with `rm -rf --one-file-system`, which never enters the
+  bind (it exists only in the container's own mount namespace).
+- **Not for the first run's helpers**: `bundle/onboard.py` and `run/fed_provider.py` support a space on the provider's
+  *first* storage, which is arbitrary once a provider has an imported one beside its own. The driver's bootstrap names
+  the storage; do not use those two helpers for a provider that owns an import.
+
+Written, not run. A live slot must show: Onepanel accepting the imported storage made with the job user's ids, the local
+LUMA feed and the canonical path type; the bind read-only by the mount table on this site's filesystem; the files'
+owner and mode as the scan gives them for another account's files (the tree must be readable by the job's group); the
+scan's time and its load on the shared filesystem for a tree of 15,000 files, which the site's file quota (pending) may
+bound; the sandbox node seeing the same directory for a direct mount; and two federations importing one tree at once.
+
 ## Steps
 
 The steps below start one zone and one provider by hand. A whole run (a zone, three providers, the agent's cell with
