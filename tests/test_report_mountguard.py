@@ -215,3 +215,9 @@ def test_the_terminal_summary_says_the_runs_either_guard_leaves_out_and_each_con
         in lines
     )
     assert lines[-1].startswith("both-guards sensitivity a-vs-b: estimate 0.17, p 0.0120, Holm p 0.0200, difference")
+
+
+def test_the_terminal_summary_gives_the_runs_either_guard_leaves_out_per_condition():
+    lines = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, combined())
+    assert "both guards, cond-a: 1 of 2 left out (1 by egress alone, 0 by the mount guard alone, 0 by both)" in lines
+    assert "both guards, cond-b: 2 of 2 left out (0 by egress alone, 1 by the mount guard alone, 1 by both)" in lines

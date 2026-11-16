@@ -802,6 +802,11 @@ def _guards_summary(guards: GuardsAnalysis) -> list[str]:
         f"both guards: {n['left_out']} of {n['analysed']} analysed run(s) left out ({n['egress_only']} by egress "
         f"alone, {n['mount_only']} by the mount guard alone, {n['both']} by both)"
     ]
+    for condition, c in guards.by_condition().items():
+        lines.append(
+            f"both guards, {condition}: {c['left_out']} of {c['analysed']} left out ({c['egress_only']} by egress "
+            f"alone, {c['mount_only']} by the mount guard alone, {c['both']} by both)"
+        )
     if guards.refused is not None:
         return [*lines, f"both-guards sensitivity: not computed ({guards.refused})"]
     if guards.sensitivity is None:

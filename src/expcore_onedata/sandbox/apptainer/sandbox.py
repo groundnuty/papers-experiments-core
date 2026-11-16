@@ -306,8 +306,12 @@ class ApptainerSandbox:
         """Hook (c): the mount's helper, started before any cell; the node directory bound at the mount path."""
         self.register_creation()
         self._mount = self._mount_factory(self.node, self.s, self.spec, self.dir)
-        # before they exist: the record lists them, so a reaper removes them first, and every teardown too (O60)
-        self._token_files = [*self._token_files, *self._mount.token_paths()]
+        # before they exist: the record lists them, so a reaper removes them first, and every teardown too (O60); each
+        # must be a file of the run's directory, as the record names it relative to it and a reaper removes it there
+        paths = [Path(os.path.normpath(path)) for path in self._mount.token_paths()]
+        if any(path == self.dir or not path.is_relative_to(self.dir) for path in paths):
+            raise SandboxError("the mount helper named a token file outside the run's directory")
+        self._token_files = [*self._token_files, *paths]
         self.run_record()
         return self._mount.start()
 

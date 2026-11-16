@@ -353,3 +353,72 @@ def start_box(node, settings):
     from apptainer_support import start
 
     return start(node, settings)
+
+
+def _dead_mount_run(node, settings, binary):
+    """A mount run whose driver was killed outright while the token file was on disk."""
+    factory = HM.host_mount_factory(binary, mountinfo=node.mountinfo)
+    old = ApptainerSandbox.start(
+        node, settings, make_spec("mounted", lease_key="slot-a"), **options(mount_helper=factory)
+    )
+    token = old._mount.where.token_file
+    token.write_text(TOKEN)
+    node.procs[node.owner.pid].alive = False
+    return old, token
+
+
+def test_the_reaper_removes_the_token_file_even_when_it_cannot_list_the_processes(node, settings, binary):
+    """O60 (Codex, delta round 1): the token files are removed before any step of the reap that can fail."""
+    from expcore_onedata.sandbox.apptainer import runs
+
+    old, token = _dead_mount_run(node, settings, binary)
+    node.proc_unreadable = True
+    done = runs.reap(node, settings.work_root, own="another-run")
+    assert done["left"] == 1  # the run itself waits for a later reap
+    assert not os.path.lexists(token)
+    assert runs.record_path(settings.work_root, old.sid).exists()
+
+
+def test_the_reaper_never_removes_a_path_a_record_names_outside_the_run(node, settings, binary, tmp_path):
+    from expcore_onedata.sandbox.apptainer import runs
+
+    old, _ = _dead_mount_run(node, settings, binary)
+    outside = settings.work_root / "not-the-runs"
+    outside.write_text("kept")
+    record = runs.record_path(settings.work_root, old.sid)
+    document = json.loads(record.read_text())
+    document["token_files"] += ["../not-the-runs", str(outside)]
+    record.write_text(json.dumps(document))
+    node.proc_unreadable = True
+    runs.reap(node, settings.work_root, own="another-run")
+    assert outside.read_text() == "kept"
+
+
+def test_a_mount_helper_that_names_a_token_file_outside_the_run_is_refused_before_it_starts(node, settings):
+    """O60 (Codex, delta round 1): the record names a token file relative to the run, and a reaper removes it there."""
+
+    class Escaping:
+        started = False
+
+        def __init__(self, run_dir):
+            self.run_dir = run_dir
+
+        def token_paths(self):
+            return [self.run_dir / ".." / "outside-token"]
+
+        def start(self):
+            Escaping.started = True
+            return self.run_dir / "mount"
+
+        def stop(self):
+            pass
+
+        def metadata(self):
+            return {}
+
+    def factory(node, settings, spec, run_dir):
+        return Escaping(run_dir)
+
+    with pytest.raises(SandboxError, match="outside the run's directory"):
+        ApptainerSandbox.start(node, settings, make_spec("mounted"), **options(mount_helper=factory))
+    assert not Escaping.started
