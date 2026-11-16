@@ -7,6 +7,7 @@ state, `check` must pass what the study did not break and must not pass a wrong 
 """
 
 import dataclasses
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from replay_scenarios import SCENARIOS
 from tree_support import read_only, tree_of
 
 from expcore.records.record import RunRecord
+from expcore.replay import side_file_placement as placement_module
 from expcore.replay import side_files as side_module
 from expcore.replay.check import verify_batch
 from expcore.replay.side_file_placement import (
@@ -476,6 +478,23 @@ def test_r15_a_removal_in_a_directory_nothing_can_be_written_in_is_left_too(requ
     assert (redundant.action, redundant.left) == ("removed", True)
     assert temporary(request_of.run_dir).is_file()
     assert failures(batch) == []  # a redundant copy refuses nothing: the check passes with it there
+
+
+def test_r15_a_failed_sync_after_the_rename_is_raised_and_never_reported_as_left(request_of, batch, monkeypatch):
+    """R15 (#304): `left` says nothing was changed. A sync of the directory that is refused after the rename has been
+    made is raised, as it always was, and the file lies at its declared name: it is never read as an unmade rename."""
+    _, staged = stage(request_of)
+    assert staged is not None
+    write_record(request_of, staged.sha256)
+
+    def refuse(directory):
+        raise PermissionError(errno.EACCES, "the directory cannot be opened")
+
+    monkeypatch.setattr(placement_module, "_fsync_directory", refuse)
+    with pytest.raises(PermissionError):
+        settle_side_files(batch, DECLARED)
+    assert (request_of.run_dir / LOGGED.pattern).read_bytes() == CONTENT
+    assert not temporary(request_of.run_dir).exists()
 
 
 def test_r15_the_recovery_touches_only_the_temporary_names_of_declared_side_files(batch, run_dir):

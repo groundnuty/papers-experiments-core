@@ -4,8 +4,8 @@
 The study is the one above `OUT` (or `--study`), and `OUT` is normally its `out/`. The merge loads the study for the
 whole plan, so that "every run belongs to its shard" and "no run is missing" are checked against it, and replays each
 shard's records the way `check` does (`verify_batch`, under the code and environment in use), then writes the batch
-(`campaign.merge`). Nothing is written to `OUT` unless every check passes. A shard's `out/` is only read: its store is
-copied with the online backup, and its records are copied into the batch.
+(`campaign.merge`). Nothing is written to `OUT` unless every check passes. A shard's `out/` is read, not written, but
+for one case below: its store is copied with the online backup, and its records are copied into the batch.
 
 The one thing the merge may write into a shard is the finish of a kill, the way `check` settles it (R15, #304): a side
 file left under its temporary name, which a record beside it names by its SHA-256, is renamed to its declared name

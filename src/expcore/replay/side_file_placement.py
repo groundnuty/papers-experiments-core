@@ -378,6 +378,8 @@ def _settle_one(
             if error.errno not in _UNWRITABLE:
                 raise
             return action, why, True  # a directory nobody may write in: reported by the caller, never changed
+        if action == FINISHED:  # after the rename, so that a failure of the sync is raised, never read as "left"
+            _fsync_directory(directory)
         return action, why, False
     except FileNotFoundError:
         return None  # the attempt's own commit, or another check, settled it meanwhile
@@ -386,15 +388,12 @@ def _settle_one(
 def _finish(temporary: Path, final: Path, sha256: str) -> tuple[str, str, Callable[[], None]] | None:
     """What to do with the file a record names: put it into place, or drop it when the same file is there already.
 
-    Returns (action, why, the write that does it), or None when another file is in place: the check's pairing refuses
-    that one, and nothing here overwrites it. Nothing is written here; the caller makes the write."""
+    Returns (action, why, the one write that does it: a rename or a removal), or None when another file is in place: the
+    check's pairing refuses that one, and nothing here overwrites it. Nothing is written here; the caller makes the
+    write, and syncs the directory after a rename."""
     if not os.path.lexists(final):
-
-        def rename() -> None:
-            os.replace(temporary, final)
-            _fsync_directory(final.parent)
-
-        return FINISHED, f"the record beside it names its SHA-256, so it is renamed to {final.name}", rename
+        why = f"the record beside it names its SHA-256, so it is renamed to {final.name}"
+        return FINISHED, why, lambda: os.replace(temporary, final)
     if _holds(final, sha256):
         return REMOVED, f"{final.name} lies in place with the same SHA-256", temporary.unlink
     return None
