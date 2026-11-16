@@ -10,7 +10,9 @@
 A shard's snapshot is made from its store with the online backup (`take_snapshot`), so a shard with attempts still
 running is refused, and everything the checks read is read from the copy the batch keeps. A shard's `out/` is only
 read: its store is backed up from a private copy of its files, under a reader's hold of its lock, so nothing is
-written beside it, a read-only `out/` is merged as it is, and a shard a dispatcher still holds is refused (R16).
+written beside it, a read-only `out/` is merged as it is, and a shard a dispatcher still holds is refused (R16). The
+one write the merge may make into a shard is in its `runs/`: the finish of a kill's rename of a declared side file
+(`study.merge`, R15, #304).
 
 **What a merge refuses, naming the shard and the reason (C29).** The checks run in the order that costs least, the
 replay check (`study.merge`) last:

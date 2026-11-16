@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from record_support import CODE
 from replay_scenarios import SCENARIOS
+from tree_support import read_only, tree_of
 
 from expcore.records.record import RunRecord
 from expcore.replay import side_files as side_module
@@ -438,6 +439,43 @@ def test_r15_a_record_that_does_not_load_names_nothing(request_of, batch):
     (request_of.run_dir / record_for("run-killed").filename).write_text("not json", encoding="utf-8")
     [settled] = settle_side_files(batch, DECLARED, remove_unnamed=True)
     assert settled.action == "removed"
+
+
+def test_r15_a_rename_in_a_directory_nothing_can_be_written_in_is_left_and_reported_not_raised(request_of, batch):
+    """R15 (#304): a directory that cannot be written (a shard fetched read-only) keeps the file under its temporary
+    name; `settle_side_files` returns the rename it could not make, as left, and changes nothing. It never raises
+    for it, and once the directory is writable the same call makes the rename."""
+    _, staged = stage(request_of)
+    assert staged is not None
+    write_record(request_of, staged.sha256)
+    before = tree_of(batch)
+    with read_only(request_of.run_dir):
+        [left] = settle_side_files(batch, DECLARED)
+        assert tree_of(batch) == before
+    assert (left.action, left.left) == ("finished", True)
+    assert left.path == temporary(request_of.run_dir).relative_to(batch).as_posix()
+    assert str(left).startswith(f"left {left.path}: its directory is read-only, so it was not finished")
+    [done] = settle_side_files(batch, DECLARED)
+    assert (done.action, done.left, done.path) == ("finished", False, left.path)
+    assert (request_of.run_dir / LOGGED.pattern).read_bytes() == CONTENT
+
+
+def test_r15_a_removal_in_a_directory_nothing_can_be_written_in_is_left_too(request_of, batch):
+    """R15 (#304): the removal of a file no record names (with the lock held) and that of a copy of a file already in
+    place are left as they are in a read-only directory, each reported as left and none raised."""
+    _, staged = stage(request_of)
+    assert staged is not None
+    with read_only(request_of.run_dir):
+        [unnamed] = settle_side_files(batch, DECLARED, remove_unnamed=True)
+    assert (unnamed.action, unnamed.left) == ("removed", True)
+    assert temporary(request_of.run_dir).is_file()
+    write_record(request_of, staged.sha256)
+    (request_of.run_dir / LOGGED.pattern).write_bytes(CONTENT)  # the file is in place, and its copy is redundant
+    with read_only(request_of.run_dir):
+        [redundant] = settle_side_files(batch, DECLARED)
+    assert (redundant.action, redundant.left) == ("removed", True)
+    assert temporary(request_of.run_dir).is_file()
+    assert failures(batch) == []  # a redundant copy refuses nothing: the check passes with it there
 
 
 def test_r15_the_recovery_touches_only_the_temporary_names_of_declared_side_files(batch, run_dir):

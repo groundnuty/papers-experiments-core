@@ -33,14 +33,21 @@ the declared name (which the pairing refuses as changed, and which `commit` neve
 is, and the check's pairing still verifies every file that is in place against the record. A check of a running
 campaign is a snapshot of a batch that is changing: an attempt it finds between its record and its rename is
 settled when the check lists it, and one that reaches that point after is the next check's to settle.
+
+`merge` runs `settle_side_files` over each shard's `runs/` before it replays the shard, and `check` of a merged batch
+runs it over the batch (#304), both without `remove_unnamed`: neither holds the campaign's lock, so a file that no
+record names may be an attempt's own, and only a rename that a record names, which is safe whenever it is made, is
+finished. A directory that cannot be written is never written to: what would have been done there is returned with
+`Settled.left` set, for the caller to report.
 """
 
+import errno
 import hashlib
 import os
 import re
 import stat
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -275,14 +282,28 @@ def _named_in(record: Path, field: str) -> Any:
 
 @dataclass(frozen=True)
 class Settled:
-    """What `settle_side_files` did to one temporary file: its path in the batch, `action` and why."""
+    """What `settle_side_files` did to one temporary file: its path in the batch, `action` and why.
+
+    `left` is set for what it would have done and could not, because the file's directory cannot be written (a copy
+    fetched read-only, #304): `action` is then what is still to do, and nothing was changed.
+    """
 
     path: str
     action: str
     why: str
+    left: bool = False
 
     def __str__(self) -> str:
+        if self.left:
+            return (
+                f"left {self.path}: its directory is read-only, so it was not {self.action} ({self.why}); make the "
+                "directory writable and run the command again"
+            )
         return f"{self.action} {self.path}: {self.why}"
+
+
+# What a refused write says of a directory nobody may write in: no permission, or a read-only mount.
+_UNWRITABLE = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 
 
 def settle_side_files(
@@ -299,6 +320,10 @@ def settle_side_files(
     file that no record names yet, and its partial hash is not a record's. A file in a directory of several records
     that one of them names, and anything that is not a regular file, is left alone. Nothing outside the declared
     temporary names is touched, and a second call finds nothing to do.
+
+    A directory that cannot be written (the write is refused for permission, or the file system is read-only) is never
+    written to: what would be done there is returned with `left` set, and the caller says so. Every other kind of
+    failure is raised.
     """
     settled: list[Settled] = []
     if not side_files:
@@ -324,8 +349,10 @@ def _declaration_of(name: str, side_files: Sequence[SideFile]) -> SideFile | Non
     return None
 
 
-def _settle_one(directory: Path, name: str, declaration: SideFile, remove_unnamed: bool) -> tuple[str, str] | None:
-    """Settle one temporary file; return (action, why), or None when it is left as it is."""
+def _settle_one(
+    directory: Path, name: str, declaration: SideFile, remove_unnamed: bool
+) -> tuple[str, str, bool] | None:
+    """Settle one temporary file; return (action, why, left), or None when it is left as it is (nothing to do)."""
     temporary = directory / name
     try:
         if not _is_regular(temporary):
@@ -334,22 +361,40 @@ def _settle_one(directory: Path, name: str, declaration: SideFile, remove_unname
         records = [p for p in directory.iterdir() if is_record_name(p.name) and _is_regular(p)]
         names_it = [p for p in records if _named_in(p, declaration.hash_field) == sha256]
         if names_it:
-            return _finish(temporary, directory / declaration.pattern, sha256) if len(records) == 1 else None
-        if not remove_unnamed:
+            if len(records) != 1:
+                return None
+            decided = _finish(temporary, directory / declaration.pattern, sha256)
+        elif remove_unnamed:
+            why = "no record beside it names its SHA-256" if records else "no record lies beside it to name it"
+            decided = REMOVED, why, temporary.unlink
+        else:
             return None
-        temporary.unlink()
-        return REMOVED, "no record beside it names its SHA-256" if records else "no record lies beside it to name it"
+        if decided is None:
+            return None
+        action, why, write = decided
+        try:
+            write()
+        except OSError as error:
+            if error.errno not in _UNWRITABLE:
+                raise
+            return action, why, True  # a directory nobody may write in: reported by the caller, never changed
+        return action, why, False
     except FileNotFoundError:
         return None  # the attempt's own commit, or another check, settled it meanwhile
 
 
-def _finish(temporary: Path, final: Path, sha256: str) -> tuple[str, str] | None:
-    """Put the file a record names into place, or drop it when the same file is there already; else leave it."""
+def _finish(temporary: Path, final: Path, sha256: str) -> tuple[str, str, Callable[[], None]] | None:
+    """What to do with the file a record names: put it into place, or drop it when the same file is there already.
+
+    Returns (action, why, the write that does it), or None when another file is in place: the check's pairing refuses
+    that one, and nothing here overwrites it. Nothing is written here; the caller makes the write."""
     if not os.path.lexists(final):
-        os.replace(temporary, final)
-        _fsync_directory(final.parent)
-        return FINISHED, f"the record beside it names its SHA-256, so it is renamed to {final.name}"
+
+        def rename() -> None:
+            os.replace(temporary, final)
+            _fsync_directory(final.parent)
+
+        return FINISHED, f"the record beside it names its SHA-256, so it is renamed to {final.name}", rename
     if _holds(final, sha256):
-        temporary.unlink()
-        return REMOVED, f"{final.name} lies in place with the same SHA-256"
-    return None  # another file is in place: the check's pairing refuses it, and nothing here overwrites it
+        return REMOVED, f"{final.name} lies in place with the same SHA-256", temporary.unlink
+    return None
