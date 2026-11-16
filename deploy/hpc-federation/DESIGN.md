@@ -322,9 +322,12 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 
 A failed `up` leaves its state file: what it placed is recorded, and `down` releases it.
 
-**`up` and `down` each hold the root's lifecycle lock** (`hpc-federation.lifecycle.lock`, `flock`, never waited
-for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job and
-remove the root); the service verbs do not take it.
+**`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
+waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
+and remove the root); the service verbs do not take it. **It lies outside the root and is never removed.** On the
+site's shared filesystem (NFS) a file held open while it is removed becomes a silly-rename file (`.nfsXXXX`) until its
+last close: the first live `down` held the lock inside the root it removed, which was then not empty. A lock file
+removed while held would let the next `up` or `down` lock another file of the same name, so it stays.
 
 **`down`** (login node), whatever `up` reached:
 
@@ -350,8 +353,12 @@ remove the root); the service verbs do not take it.
    fails in 0 to 3 (a relay that will not stop, a failed `squeue`, a work directory the driver refuses), the job is
    still cancelled and every client ended; the failure is reported as unverified.** A cancel that fails is raised once
    every job was tried, the clients left (their steps may still run) and the root kept for a second `down`.
-5. Remove the root, as Compose's `down` does. The service logs stay in the log directory (no secret: the bundle
-   redacts them), named in the run's output.
+5. Remove the root, as Compose's `down` does, **its marker last**. A file another process holds open becomes a
+   silly-rename file, which only its holder's close removes: the removal never removes one, and waits up to 30 s in
+   all for them to go. At the bound it fails, saying the job is gone, with the marker kept, so a second `down` finishes
+   the removal. A root a removal left unmarked (empty, or of nothing but silly files, with its lifecycle lock beside
+   it) is finished by a second `down` too, by `rmdir` alone; any other unmarked root is refused. The service logs stay
+   in the log directory (no secret: the bundle redacts them), named in the run's output.
 
 A job already ended (its `--time`, a failure) skips 2 and 3: Slurm stopped its steps, the bundle's cleanup removed
 what its time allowed, and the next job of ours on a node sweeps what is left (`sweep_leftovers`). `down` says which

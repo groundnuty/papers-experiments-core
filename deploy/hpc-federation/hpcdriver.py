@@ -85,6 +85,7 @@ class Driver(Down):
     relay_available: Callable[[], bool] = hpcrelay.available
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     timeouts: Dict[str, float] = field(default_factory=lambda: dict(TIMEOUTS))
+    removal: Dict[str, Any] = field(default_factory=dict)  # the root's removal's file calls (hpcdown), for a stand-in
 
     @property
     def spec(self) -> Spec:

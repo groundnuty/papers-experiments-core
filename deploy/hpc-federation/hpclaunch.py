@@ -26,7 +26,7 @@ from hpcsettings import HpcSettings, Site
 from hpcslurm import Completed, Slurm, Step, allowlist
 
 LOCK = "hpc-federation.lock"  # held around each change of the state file
-LIFECYCLE = "hpc-federation.lifecycle.lock"  # held for a whole up or down
+LIFECYCLE = ".lifecycle.lock"  # held for a whole up or down: `<root>.lifecycle.lock`, BESIDE the root (lifecycle)
 STEP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
 
@@ -54,12 +54,21 @@ class StateStore:
         finally:
             os.close(descriptor)
 
+    @property
+    def lifecycle_path(self) -> Path:
+        """`<root>.lifecycle.lock`, beside the root: never inside the directory `down` removes. On the site's shared
+        filesystem (NFS) a file held open while it is removed becomes a silly-rename file (`.nfsXXXX`), so a lock held
+        in the root left the root not empty and `down` failed (seen live). It is never removed either: a lock file
+        unlinked while held lets the next `up` or `down` lock a new file of the same name beside it. The root's path
+        has no link on its last step (`fedlayout.checked_root`), so every path to the root names this one file."""
+        return self.root.with_name(self.root.name + LIFECYCLE)
+
     @contextlib.contextmanager
     def lifecycle(self, what: str) -> Iterator[None]:
         """Hold the root's lifecycle lock for a whole `up` or `down`, never waiting for it: an `up` between its state
         and its `sbatch` must not meet a `down` that finds no job yet and removes the root. The kernel lets it go with a
         process that dies. The service verbs do not take it."""
-        descriptor = os.open(self.root / LIFECYCLE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        descriptor = os.open(self.lifecycle_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
