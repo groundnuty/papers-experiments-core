@@ -88,6 +88,14 @@ sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --
   its gate reaches the providers over the network, as it does in a component. Its steps take its own job id. The two
   jobs are scheduled apart, so the first can run, and bill, while the second waits (bounded as the first), and a
   partition that allows one submitted job per user (reason 5 above) refuses the second.
+- **On a site whose switch plugin gives each job a virtual network identifier, `separate` is the placement to start
+  from** (the second live slot, 16 Nov 2026). There a heterogeneous job's steps on component 0 failed from a point on
+  (`srun: error: task 0 launch failed: Error configuring interconnect`: after the zone and five providers had started,
+  every further step on a service node, so `up` failed at the first provider's registration); a step on component 1
+  ran, and so did the same steps in a job of one component in two earlier runs. With `separate` the services' job has
+  one component. The cause is not established (a count of steps per component, or exhausted identifiers), and the
+  placement was not run live on such a site. The other way round it is a site setting, section 3: `HPC_STEP_NETWORK`.
+  Neither changes a default.
 - **The last resort, a uniform shape sized for S, is not built:** it bills every node at S's shape (below).
 - **S never shares a node with a service:** a component, or a job, placed on a node another holds fails `up`, that
   job cancelled before any step.
@@ -146,8 +154,20 @@ sandbox_placement = "het"                # S as component 1 of a heterogeneous j
 
 ```
 srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name> --export=PATH \
-     [--output=<log>] /usr/bin/env -i <allowlist> <argv>        # stdin </dev/null unless it is the payload
+     [--network=<HPC_STEP_NETWORK>] [--output=<log>] /usr/bin/env -i <allowlist> <argv>  # stdin </dev/null unless the payload
 ```
+
+- **`--network=<value>` is on every step the driver launches when the site sets `HPC_STEP_NETWORK`** (empty by default:
+  no option, and the line is what it was). A control step, a service step, a teardown and a step in either component
+  of a heterogeneous job alike, since the site's switch plugin refused steps of component 0 while a step of component 1
+  ran.
+  The value is one option string of letters, digits and `_ . , = : + -` (at most 128, led by a letter or digit), checked
+  when `site.env` is read, again when the state file's `site` record is read, and again when the argv is made, so it
+  never carries a space or a shell character; a refusal names `HPC_STEP_NETWORK` and not the value. It is recorded in
+  the state file with the rest of the site, so `down` and the service verbs use it with no environment. The services
+  talk over TCP and need no virtual network identifier, which `no_vni` withholds; it is the value that ran live on
+  component 0 (section 9, item 6), and its effect on a whole `up` and on component 1 was not seen. The step line that
+  `shards.py lines` prints for a shard is the manifest's own and does not carry the option.
 
 - **The environment is an allowlist**, set on the node by `env -i`, so neither the login environment (srun passes it
   otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`, by default
@@ -205,7 +225,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null},
+           "billing_weight": null, "step_network": ""},
   "allocation": {
     "name": "hpcop-<project>-<8 hex>",
     "job": "<id>",
@@ -600,7 +620,14 @@ federation whose step is gone), then releases it.
    `scancel` ends component 1. **Found by it:** a step that names no `--het-group` is refused, component 0 included
    (section 1). Not seen yet: how `squeue -s -j <leader>` lists a step of component 0 (read as `<leader>.<n>` or
    `<leader>+0.<n>`), `scancel <component id>.<n>`, and `sacct -j <component id>` for a step's status. **The fallback
-   is a setting:** `sandbox_placement = "separate"`.
+   is a setting:** `sandbox_placement = "separate"`. **Found by the second live slot (16 Nov 2026), on a site whose switch
+   plugin gives each job a virtual network identifier:** in a heterogeneous job, every new step on component 0 failed
+   with `srun: error: task 0 launch failed: Error configuring interconnect` after the zone and five providers had
+   started, the first provider's token mint and delivery were cancelled in 0 s, and `up` failed at that provider's
+   registration; `--network=single_node_vni` failed the same way, `--network=no_vni` ran, and a step on component 1 ran.
+   The same steps ran in a job of one component in two earlier runs. Whether a count of steps per component or exhausted
+   identifiers is the cause is not established. Two settings go round it, neither the default: `HPC_STEP_NETWORK`
+   (section 3) and `sandbox_placement = "separate"` (section 1). Not seen: a whole `up` with either.
 
 ## 10. Who builds what
 

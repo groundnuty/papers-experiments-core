@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
 import tomllib
+from hpcslurm import NETWORK
 
 SIZE = re.compile(r"([1-9][0-9]{0,6})([mg])")
 TIME = re.compile(r"(?:([0-9]{1,2})-)?([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
@@ -327,6 +328,11 @@ class Site:
     oneclient_bundle: str = ""
     oneclient_bundle_sha256: str = ""
     agent_work_root: str = ""
+    # srun's `--network=<value>` on every step the driver launches, when not empty (HPC_STEP_NETWORK). On a site whose
+    # switch plugin gives each job a virtual network identifier, a heterogeneous job's steps on component 0 were refused
+    # ("Error configuring interconnect") from a point on while the same steps with `no_vni` ran; the services talk over
+    # TCP and need none. Empty: no option, as before.
+    step_network: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -340,6 +346,7 @@ class Site:
             "core_python": self.core_python,
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
+            "step_network": self.step_network,
             **{attribute: getattr(self, attribute) for attribute in AGENT_VARIABLES.values()},
         }
 
@@ -379,6 +386,11 @@ def checked_site(site: Site) -> Site:
     weight = site.billing_weight
     if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0):
         raise SettingsError("HPC_BILLING_MEM_WEIGHT: must be a positive number")
+    if site.step_network and not NETWORK.fullmatch(site.step_network):
+        raise SettingsError(
+            "HPC_STEP_NETWORK: must be an option of srun's --network (for example 'no_vni'): up to 128 letters, "
+            "digits and _ . , = : + -, with no space"
+        )
     for variable, attribute in AGENT_PATHS.items():
         if getattr(site, attribute):
             _absolute(getattr(site, attribute), variable)
@@ -413,6 +425,7 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             core_python=environ.get("HPC_CORE_PYTHON") or "",
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
+            step_network=environ.get("HPC_STEP_NETWORK") or "",
             **{attribute: environ.get(variable) or "" for variable, attribute in AGENT_VARIABLES.items()},
         )
     )
