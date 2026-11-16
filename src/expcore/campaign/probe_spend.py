@@ -67,7 +67,11 @@ def add(store: Store, model: str, usd: float, now: str, event: tuple[str, str | 
         value[model] = value.get(model, 0.0) + usd
         return json.dumps(value, sort_keys=True), [event], None
 
-    store.update_meta(PROBES_KEY, change, now)
+    def go() -> None:
+        store.update_meta(PROBES_KEY, change, now)  # joins this transaction
+        store.note_probe_charge(model, usd)  # with the event just written, journaled once it commits (O62)
+
+    store.transact(go)
 
 
 class ProbeSpend:

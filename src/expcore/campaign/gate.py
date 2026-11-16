@@ -39,7 +39,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from expcore.campaign import probe_spend, release, reply_cap
+from expcore.campaign import lost_spend, probe_spend, release, reply_cap
 from expcore.campaign.attempt_bounds import (
     AttemptCost,
     attempt_costs,
@@ -207,7 +207,7 @@ class BudgetGate:
         """
         holds, released = self._apply_releases(self._json(HOLDS_KEY), self._json(RELEASED_KEY), now)
         costs, capped = self._costs(live)
-        probes = probe_spend.charged(self.store)
+        probes = self._charged_outside()
         spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
         estimate = {m: self._estimate(m, costs, capped) for m in self.models}
@@ -247,7 +247,7 @@ class BudgetGate:
         """
         released = self._json(RELEASED_KEY)
         costs, capped = self._costs(live)
-        probes = probe_spend.charged(self.store)
+        probes = self._charged_outside()
         spent = _with_probes(spent_usd(costs), probes)
         reserve = {m: self._reserve(m, capped) for m in self.models}
         flying = {m: sum(1 for x in in_flight if x == m) for m in self.models}
@@ -271,7 +271,16 @@ class BudgetGate:
         taken_off = self._taken_off(reply_cap.unheld(self.store))
         capped = self.shown_capped - taken_off
         costs = attempt_costs(self.store, self.models, self.limits, reply_capped=capped, taken_off=taken_off, live=live)
+        ledger = lost_spend.read(self.store)  # what a kill took out of the store, counted from the journal (O62)
+        if ledger is not None:
+            costs += lost_spend.costs(ledger, self.models, self.limits, reply_capped=capped, taken_off=taken_off)
         return costs, capped
+
+    def _charged_outside(self) -> Mapping[str, float] | None:
+        """What admission's probes were charged, per model; None when that record, or the record of what a kill lost
+        (whose costs `_costs` adds), cannot be read: the total spent is then unknown."""
+        probes = probe_spend.charged(self.store)
+        return None if probes is None or lost_spend.read(self.store) is None else probes
 
     def request_bound(self, model: str) -> float | None:
         """What one request of the model can cost now: the bound of a top-up (C26); None when unpriced."""
@@ -309,7 +318,10 @@ class BudgetGate:
         if not spec.priced:
             return [Hold(model, f"model {model} has no price and is not marked free: its cost is unknown", False)]
         if probes is None:
-            why = f"the store's {probe_spend.PROBES_KEY}, what admission's probes were charged, cannot be read"
+            why = (
+                f"the store's {probe_spend.PROBES_KEY}, what admission's probes were charged, or its "
+                f"{lost_spend.KEY}, what a kill took out of it, cannot be read"
+            )
             return [Hold(ALL, f"the total spent is unknown: {why}", False)]
         if spent is None:
             return [Hold(ALL, "the total spent is unknown: an attempt of a model without a price was charged", False)]

@@ -236,6 +236,7 @@ def run_study(
     crash_hook: Callable[[str, str], None] | None = None,
     shard: Spec | None = None,
     after: Sequence[str | os.PathLike[str]] = (),
+    spend_journal: str | os.PathLike[str] | None = None,
 ) -> RunSummary:
     """Load the study at `path` and run its campaign: `run_built_study` of what `load_study` returned.
 
@@ -243,7 +244,13 @@ def run_study(
     fewer conditions or a selection, has no directory to name and calls `run_built_study` with it.
     """
     return run_built_study(
-        load_study(path), allow_dirty=allow_dirty, code_root=code_root, crash_hook=crash_hook, shard=shard, after=after
+        load_study(path),
+        allow_dirty=allow_dirty,
+        code_root=code_root,
+        crash_hook=crash_hook,
+        shard=shard,
+        after=after,
+        spend_journal=spend_journal,
     )
 
 
@@ -255,6 +262,7 @@ def run_built_study(
     crash_hook: Callable[[str, str], None] | None = None,
     shard: Spec | None = None,
     after: Sequence[str | os.PathLike[str]] = (),
+    spend_journal: str | os.PathLike[str] | None = None,
 ) -> RunSummary:
     """Open or resume the campaign of a `StudyConfig` and run the scheduler until nothing more can start.
 
@@ -274,7 +282,9 @@ def run_built_study(
     no run, or whose share of a total is nothing, is refused before the store is touched. A `SelectionSpec` runs the
     selected runs instead (C38, `study.selection_start`), after the earlier selections `after` names when sequential:
     the same entry for a selection of a study read from disk and of one built in code, so either keeps the study's
-    kinds in scope.
+    kinds in scope. With `spend_journal`, a new file, the dispatcher journals what it spends there, and first counts
+    what the other journals beside it hold that the store lacks (a store copied back after a kill, O62:
+    `campaign.lost_spend`).
 
     The store is `<study.root>/out`, and the campaign fingerprint covers the plan (the schema, tasks, models and
     seeds), so a cut config refuses to resume the store of the whole study (C06): run a smoke from a copy of the study
@@ -286,8 +296,9 @@ def run_built_study(
             "directory"
         )
     check_study(study)
+    journal = None if spend_journal is None else Path(spend_journal)
     with study_kinds(study.kinds):  # the attempts of the run end in these kinds, and its threads see them
-        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard, [Path(p) for p in after])
+        return _run_campaign(study, allow_dirty, code_root, crash_hook, shard, [Path(p) for p in after], journal)
 
 
 def _run_campaign(
@@ -297,6 +308,7 @@ def _run_campaign(
     crash_hook: Callable[[str, str], None] | None,
     shard: Spec | None = None,
     after: Sequence[Path] = (),
+    spend_journal: Path | None = None,
 ) -> RunSummary:
     """Internal: the body of `run_built_study`, which is the one to call.
 
@@ -322,7 +334,9 @@ def _run_campaign(
     elif shard is not None:
         manifest, settings, started = _shard_of(study, plugin, settings, shard)
         print(environment_block(started.spec, fingerprint["environment"]), file=sys.stderr)  # before a store refuses
-    options = {} if crash_hook is None else {"crash_hook": crash_hook}
+    options: dict[str, Any] = {} if crash_hook is None else {"crash_hook": crash_hook}
+    if spend_journal is not None:
+        options["spend_journal"] = spend_journal
     try:
         with Scheduler(
             out,
@@ -344,12 +358,25 @@ def _run_campaign(
             reset_settings=plugin.reset_settings,
             **options,
         ) as scheduler:
+            _say_lost(scheduler.lost_counted)
             return scheduler.run()
     except FingerprintMismatch as refused:
         hint = _counted_key_locations(study, read_fingerprint(out / STATE_FILE))
         if not hint:
             raise
         raise FingerprintMismatch(refused.differences, hint=hint) from None
+
+
+def _say_lost(counted: Mapping[str, Any] | None) -> None:
+    """Say what this start counted of the spend journals beside its own (O62), when it counted anything lost."""
+    if not counted or not (counted["attempts"] or counted["charges_usd"]):
+        return
+    charges = ", ".join(f"{model} {usd:.6f} USD" for model, usd in counted["charges_usd"].items()) or "none"
+    print(
+        f"run: the store lacked spend that the spend journals hold ({counted['journals']} journal(s)): "
+        f"{counted['attempts']} attempt(s), and top-ups and probe sends of {charges}; counted as lost_in_kill",
+        file=sys.stderr,
+    )
 
 
 def _counted_key_locations(study: StudyConfig, recorded: Mapping[str, Any] | None) -> str:

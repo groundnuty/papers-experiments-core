@@ -71,6 +71,8 @@ from expcore.config.prices import TOKENS_PER_PRICE_UNIT, TieredPrice
 
 # Attempts that spent tokens: every state but `running`, whose cost is not known yet.
 BILLED_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
+# The state of a cost the store's rows do not hold: what a kill lost of the store, counted from the spend journal (O62).
+LOST_STATE = "lost_in_kill"
 
 
 @dataclass(frozen=True)
@@ -294,6 +296,23 @@ def attempt_costs(
     return costs
 
 
+def row_cost(
+    spec: ModelSpec | None,
+    row: Mapping[str, Any],
+    limits: Limits,
+    *,
+    running: bool,
+    reply_capped: Collection[str] = (),
+    taken_off: Collection[str] = (),
+) -> tuple[float | None, bool]:
+    """One attempt's cost without its top-ups, and whether it is its bound, as `attempt_costs` charges a row: one
+    `running` with no worker left its bound, any other measured when its counts are known and complete, else its
+    bound, by the reply maximum or the window as the row records it was reserved (C27). `row` has the model, the
+    counts, `turn_usage`, `complete`, `replies_checked` and `reserved_capped`."""
+    capped = _reserved_capped(row, reply_capped, taken_off)
+    return _bound_cost(spec, limits, capped) if running else _base_cost(spec, row, limits, capped)
+
+
 def _reserved_capped(row: Mapping[str, Any], reply_capped: Collection[str], taken_off: Collection[str]) -> bool:
     """Tell whether an attempt is bounded by the reply maximum: as its row records it was reserved at dispatch, else as
     the caller holds its model now, and never once the store has taken its model off the maximum (C27)."""
@@ -343,7 +362,7 @@ def mean_run_usd(store: Store, costs: list[AttemptCost], model: str) -> float | 
         for r in store.q(f"SELECT run_key FROM runs WHERE status='done' AND {column_for('model')}=?", (model,))
     }
     per_run: dict[str, float] = {}
-    for c in costs:
-        if c.model == model and c.run_key in done and not c.bounded and c.usd is not None:
+    for c in costs:  # what a kill lost is no attempt of a run the store holds: never a sample
+        if c.model == model and c.run_key in done and not c.bounded and c.usd is not None and c.state != LOST_STATE:
             per_run[c.run_key] = per_run.get(c.run_key, 0.0) + c.usd
     return sum(per_run.values()) / len(per_run) if per_run else None
