@@ -242,7 +242,8 @@ says where `hpcfed.py up` calls each step, and `site.env.example` names the two 
 - **Declared** in the layout: `import = { readonly = true, shared = true, source_env, manifest_env }` on the space, and
   `direct_io = true` if the agent's mount reads the storage directly (a mode of the mount, which reads the storage of the
   agent's own provider, so only on a space that provider owns; the sandbox node must see the same directory, and the
-  run's record shows the mode in effect). The path and the manifest's file are the variables'
+  run's record shows the mode in effect; HPC mounts are proxy-only until the direct-I/O comparison passes, since the
+  Apptainer backend's mount helper refuses a direct mount). The path and the manifest's file are the variables'
   values in `site.env`, never the layout's. The owner of the space is the one provider that mounts the tree; its mirrors
   keep node-local storage.
 - **Checked on the node** (`bundle/importstorage.py`, called by `configure.sh` and at every start): `--import=SPACE=PATH`
