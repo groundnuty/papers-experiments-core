@@ -266,6 +266,41 @@ def test_r15_merge_refuses_what_its_own_staging_directory_cannot_settle(
     assert "staging directory" in errors
 
 
+def test_r15_merge_replays_a_directory_named_like_a_shard_s_own_check_file(
+    clean_environment, shard1, shard2, target, tmp_path
+):
+    """R15 (#304): only a shard's own `replay-check.json` and snapshot files are left out of the copy the merge
+    replays. A directory of one of those names is replayed, so a malformed record in it still refuses the shard, as it
+    did when the shard was replayed in place."""
+    trap = copy_campaign(shard1, tmp_path, "trap")
+    hidden = trap.runs / "replay-check.json"
+    hidden.mkdir()
+    (hidden / f"{'0' * 64}.1.json").write_text("not a record", encoding="utf-8")
+    before = state_of(trap.root / "out")
+    errors = merge_error(clean_environment, target, trap, shard2)
+    assert "shard 1 (shard-1)" in errors
+    assert "fail the replay check" in errors
+    assert state_of(trap.root / "out") == before
+
+
+def test_r15_merge_refuses_an_out_inside_a_shard_whatever_the_path_to_it(
+    clean_environment, shard1, shard2, target, tmp_path
+):
+    """R15 (#304): the merge writes a staging directory and the batch beside OUT, so an OUT that lies in a shard's
+    out/, by its own path or through a link, is refused before anything is made: no directory is added to the shard."""
+    inside = copy_campaign(shard1, tmp_path, "inside")
+    link = tmp_path / "link-to-out"
+    link.symlink_to(inside.root / "out", target_is_directory=True)
+    before = state_of(inside.root / "out")
+    for out in (inside.root / "out" / "merged", inside.root / "out" / "new" / "merged", link / "merged"):
+        shards = [str(inside.root / "out"), str(shard2.root / "out")]
+        code, errors = cli(clean_environment, "merge", str(out), *shards, "--study", str(target.root))
+        assert code == 1, errors
+        assert errors.splitlines()[-1].startswith("merge refused: "), errors
+        assert "the out/ of a shard" in errors
+        assert state_of(inside.root / "out") == before
+
+
 # --- the merged batch ------------------------------------------------------------------------------------------------
 
 

@@ -395,14 +395,18 @@ def merge_text(document: Mapping[str, Any]) -> str:
 def copy_runs(source: Path, target: Path) -> None:
     """Copy the batch of a shard (its `runs/`) into `target`, a private copy that the merge may write in (#304).
 
-    A shard's own `replay-check.json` and snapshot (`_SKIPPED`) are left behind, as `lay_out` leaves them: they are not
-    part of the union. Every directory of the copy is writable whatever the shard's modes are, so a shard fetched
-    read-only gives a copy that can be settled and removed. Raises OSError (`shutil.Error` included) for a file that
-    cannot be read; a copy that failed halfway is the caller's to remove (`make_writable`, then `shutil.rmtree`).
+    A shard's own `replay-check.json` and snapshot (`_SKIPPED`, the files of those names directly in `runs/`) are left
+    behind: they are not part of the union. A directory of one of those names is copied and replayed like any other
+    (`lay_out` then leaves it out of the batch). Every directory of the copy is writable whatever the shard's modes
+    are, so a shard fetched read-only gives a copy that can be settled and removed. Raises OSError (`shutil.Error`
+    included) for a file that cannot be read; a copy that failed halfway is the caller's to remove (`make_writable`,
+    then `shutil.rmtree`).
     """
 
     def left_behind(directory: str, names: list[str]) -> list[str]:
-        return [name for name in names if name in _SKIPPED] if Path(directory) == source else []
+        if Path(directory) != source:
+            return []
+        return [name for name in names if name in _SKIPPED and os.path.isfile(os.path.join(directory, name))]
 
     shutil.copytree(source, target, ignore=left_behind)
     make_writable(target)

@@ -81,7 +81,20 @@ def merge_shards(
         return _merge(study, out, [Path(path) for path in shard_outs], allow_dirty, code_root)
 
 
+def _refuse_inside_a_shard(out: Path, shard_outs: Sequence[Path]) -> None:
+    """The merge writes its staging directory and the batch beside `OUT`, so `OUT` may not be a shard's `out/` or lie
+    below one (#304): compared as resolved paths, symlinked parents included, before anything is made."""
+    target = out.resolve()
+    for shard_out in shard_outs:
+        held = shard_out.resolve()
+        if target == held or held in target.parents:
+            raise MergeRefused(
+                f"{out}: lies in {shard_out}, the out/ of a shard: a merge writes beside OUT, and never into a shard"
+            )
+
+
 def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: bool, code_root: Any) -> Merged:
+    _refuse_inside_a_shard(out, shard_outs)
     refuse_non_empty(out)
     code = require_known("merge", code_root or study.root, study.scope, allow_dirty=allow_dirty)
     env = study_environment(study)
