@@ -47,9 +47,7 @@ def platform_deferrals(study: StudyConfig) -> tuple[PlatformDeferral, ...]:
     found = []
     study_file = study.root / STUDY_FILE
     for name in study.platforms:
-        import_platforms(
-            study_file, [name]
-        )  # the process has imported it already; this names the study's key on failure
+        import_platforms(study_file, [name])  # imported already by the load; this names the study's key if it fails
         hook = getattr(importlib.import_module(name), PLATFORM_HOOK, None)
         if hook is None:
             continue
@@ -62,6 +60,11 @@ def platform_deferrals(study: StudyConfig) -> tuple[PlatformDeferral, ...]:
                 f"{study_file}: [study] {PLATFORMS_KEY}: platform {name!r} declares its longest deferral from its "
                 f"configuration, and this study points at none: name the file in [study] {PLATFORM_CONFIG_KEY}, or "
                 f"keep it as {PLATFORM_FILE} beside {STUDY_FILE}"
+            )
+        if not study.platform_config.is_file():
+            raise ConfigError(
+                f"{study_file}: [study] {PLATFORM_CONFIG_KEY}: names {study.platform_config.name!r}, which is not a "
+                f"file, and platform {name!r} declares its longest deferral from it"
             )
         try:
             answer = hook(study.platform_config)

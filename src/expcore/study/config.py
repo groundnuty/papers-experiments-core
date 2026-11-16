@@ -196,16 +196,18 @@ def _platforms(top: Section) -> tuple[str, ...]:
 
 
 def _platform_config(top: Section, root: Path) -> Path | None:
-    """The platform's own configuration, resolved: the file `[study] platform_config` names (a file inside the study
+    """The platform's own configuration, resolved: the file `[study] platform_config` names (a path inside the study
     directory, as the plugin is), or without the key the `platform.toml` beside study.toml when there is one, else None.
-    The core never reads it: it hands the path to each platform module that declares its deferral from it."""
+    The core never reads it: it hands the path to each platform module that declares its deferral from it, and that
+    file's being there is checked only then (`platform_deferral`), since a replication package ships the study without
+    its platform.toml and still loads it."""
     section = Section(top.section("study").data, top.file, "[study]")
     named = section.optional_string(PLATFORM_CONFIG_KEY)
     if named is None:
         default = root / PLATFORM_FILE
         return default.resolve() if default.is_file() else None
     file = (root / named).resolve()
-    if not file.is_file() or root.resolve() not in file.parents:
+    if root.resolve() not in file.parents:
         raise section.fail(PLATFORM_CONFIG_KEY, f"must name a file inside the study directory; {named!r} is not one")
     return file
 

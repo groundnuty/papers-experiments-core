@@ -123,15 +123,15 @@ def test_c11_the_key_wins_over_the_default_beside_study_toml(tmp_path):
 @pytest.mark.parametrize(
     ("value", "words"),
     [
-        ('"missing.toml"', "must name a file inside the study directory; 'missing.toml' is not one"),
         ('"../outside.toml"', "must name a file inside the study directory; '../outside.toml' is not one"),
         ('"/etc/hostname"', "must name a file inside the study directory; '/etc/hostname' is not one"),
         ("3", "must be a non-empty string, got"),
     ],
-    ids=["missing", "outside", "absolute", "number"],
+    ids=["outside", "absolute", "number"],
 )
-def test_c11_a_platform_configuration_that_is_not_a_file_of_the_study_is_refused_naming_the_key(tmp_path, value, words):
-    """C11: the pointer is checked when the study is loaded, naming study.toml and `platform_config`."""
+def test_c11_a_platform_configuration_outside_the_study_directory_is_refused_naming_the_key(tmp_path, value, words):
+    """C11: the pointer is checked when the study is loaded, naming study.toml and `platform_config`: a path outside the
+    study directory, absolute or through `..`, and a value that is no text."""
     (tmp_path / "outside.toml").write_text("deferral_s = 7\n", encoding="utf-8")
     study = study_with(tmp_path / "s", key=f"platform_config = {value}\n")
     text = refused(study)
@@ -159,6 +159,22 @@ def test_c11_a_platform_without_the_hook_and_one_the_study_does_not_list_declare
     assert platform_deferrals(study) == ()
     assert unlisted not in study.platforms
     assert platform_deferrals(load_study(study_with(tmp_path / "t"))) == ()  # no platform at all
+
+
+def test_c11_a_named_file_that_is_not_there_loads_and_is_refused_only_where_a_platform_reads_it(tmp_path, monkeypatch):
+    """C11: a replication package ships the study without its platform.toml and still loads, so the pointer is a path
+    inside the study directory and the file's being there is checked when a listed platform declares from it: the
+    refusal names the key and the platform; a platform with no hook reads nothing and asks for nothing."""
+    hooked = platform_module(tmp_path / "a", monkeypatch, HOOKED)
+    plain = platform_module(tmp_path / "b", monkeypatch, UNHOOKED)
+    key = 'platform_config = "missing.toml"\n'
+    study = load_study(study_with(tmp_path / "s", hooked, platform=None, key=key))
+    assert study.platform_config == (study.root / "missing.toml").resolve()
+    with pytest.raises(ConfigError) as caught:
+        platform_deferrals(study)
+    for part in ("[study] platform_config", "'missing.toml'", "not a file", hooked):
+        assert part in str(caught.value), caught.value
+    assert platform_deferrals(load_study(study_with(tmp_path / "t", plain, platform=None, key=key))) == ()
 
 
 def test_c11_a_platform_that_declares_none_is_kept_in_the_answer_as_none(tmp_path, monkeypatch):
