@@ -285,6 +285,7 @@ class FakeSlurm:
     node_tmp: str = "/tmp"  # the nodes' tmpfs, where a service's work directory is (the site's HPC_NODE_TMP)
     sweep_here: bool = False  # run down's sweep of the agent's node on this host (its tmpfs is here), else answer it
     sweeps: list = field(default_factory=list)  # each sweep step down launched
+    leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -473,6 +474,8 @@ class FakeSlurm:
             return self.teardown_rc, "", "ok: service stopped\n"
         if command[0] == "test":
             return 0, "", ""
+        if any(Path(word).name == "leftovers.py" for word in command):  # down's count of a node's work directories
+            return 0, json.dumps({"kind": command[-2], "count": self.leftovers.get(srun.node, 0)}) + "\n", ""
         if any(Path(word).name == "shards.py" for word in command) and "sweep" in command:
             self.sweeps.append(srun)
             if not self.sweep_here:

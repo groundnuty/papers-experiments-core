@@ -4,6 +4,7 @@ the root removed. Mixed into `hpcdriver.Driver`, whose state store, launcher and
 """
 
 import errno
+import json
 import os
 import re
 import stat
@@ -302,7 +303,8 @@ class Down:
 
     def teardown(self, service: str) -> bool:
         """teardown.sh in a control step on the service's node; a service whose work directory never reached the state
-        or its log has its step cancelled (its batch script's trap stops it and removes the directory), unverified."""
+        or its log has its step cancelled, if it is still listed (its batch script's trap stops it and removes the
+        directory), and its node is checked once every step has left (`node_clean`)."""
         state = self.store.read()
         record, prefix = state["services"][service], state["allocation"]["name"]
         if record["workdir"] is None and record["log"] and Path(record["log"]).is_file():
@@ -315,9 +317,10 @@ class Down:
                 record = self.store.read()["services"][service]
         if record["workdir"] is None:
             listed = self.launcher.listed(record["step"]["name"]) if record["step"] else None
-            if listed is not None:
+            if listed is not None:  # seen, so its end can be shown once it leaves
+                self.set(lambda s: s["services"][service]["step"].update(id=listed))
                 self.launcher.cancel(listed)
-            return record["step"] is None
+            return True
         argv = ["bash", str(BUNDLE / "teardown.sh"), record["kind"], "--workdir", record["workdir"]]
         argv += ["--timeout", str(self.settings.stop_seconds)]
         name = f"{prefix}-{service}-teardown-{record['launch']}"
@@ -340,11 +343,12 @@ class Down:
                 self.slurm.cancel_step(step_id)
 
     def node_clean(self, service: str) -> bool:
-        """A read-only control step: the service's work directory is gone from its node."""
+        """A read-only control step: the service's work directory is gone from its node. A service never launched is
+        clean; one launched whose log never named a work directory is checked by `no_workdir_left`."""
         state = self.store.read()
         record = state["services"][service]
         if record["workdir"] is None:
-            return True
+            return record["step"] is None or self.no_workdir_left(service)
         name = f"{state['allocation']['name']}-{service}-check"
         try:
             done = self.launcher.control(
@@ -353,6 +357,42 @@ class Down:
         except TimeoutError:
             return False
         return done.returncode == 0
+
+    def no_workdir_left(self, service: str) -> bool:
+        """A service whose step was launched but whose log never named a work directory (seen live: a zone that failed
+        in node-init before making one) is clean only when both are shown: its step has ended (listed no more, once
+        it was seen listed or its srun client of this host has ended: a step never listed whose client still runs may
+        yet start), and a read-only check on its node (`bundle/leftovers.py`) counts no work directory of ours of its
+        kind there. A check that fails, or prints anything but such a count, is no proof."""
+        state = self.store.read()
+        record, site = state["services"][service], Site.from_json(state["site"])
+        name = record["step"]["name"]
+        client = state.get("clients", {}).get(name)
+        seen = record["step"].get("id") is not None
+        recorded = Client(int(client["pid"]), int(client["start"])) if client is not None else None
+        ended = recorded is not None and not self.slurm.runner.client_alive(recorded)
+        if self.launcher.listed(name) is not None or not (seen or ended):
+            self.say(f"{service}: its step named no work directory and its end cannot be shown")
+            return False
+        argv = [site.node_python, "-I", "-B", str(BUNDLE / "leftovers.py"), record["kind"], site.node_tmp]
+        try:
+            done = self.launcher.control(
+                record["node"], argv, name=f"{state['allocation']['name']}-{service}-leftovers",
+                timeout_s=self.timeouts["step"],
+            )  # fmt: skip
+        except TimeoutError:
+            return False
+        try:
+            found = json.loads(done.stdout) if done.returncode == 0 else None
+        except ValueError:
+            found = None
+        count = found.get("count") if isinstance(found, dict) and found.get("kind") == record["kind"] else None
+        if isinstance(count, bool) or count != 0:
+            self.say(f"{service}: its node's check found {count if isinstance(count, int) else 'no count of'} "
+                     "work directories of ours")  # fmt: skip
+            return False
+        self.say(f"{service}: its step ended before naming a work directory, and its node holds none of ours")
+        return True
 
     def wait_gone(self, job: str) -> None:
         deadline = self.clock() + self.timeouts["cancel"]

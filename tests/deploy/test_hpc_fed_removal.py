@@ -156,7 +156,8 @@ def test_a_lock_held_inside_the_root_is_what_failed_live_and_a_second_down_finis
     store = type(rig.driver.store)
     beside = store.lifecycle_path
     monkeypatch.setattr(store, "lifecycle_path", property(lambda s: s.root / "hpc-federation.lifecycle.lock"))
-    with pytest.raises(RuntimeError, match=r"the held job 4242 is gone, but the root could not be removed") as raised:
+    cut_short = r"^the held job 4242 is gone \(shards: sweep: .*\), but the root could not be removed"
+    with pytest.raises(RuntimeError, match=cut_short) as raised:
         rig.driver.down()
     assert "1 NFS silly-rename file(s)" in str(raised.value)
     assert rig.fake.cancelled == ["4242"]

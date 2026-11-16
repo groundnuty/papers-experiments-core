@@ -272,6 +272,110 @@ def test_down_after_a_zone_that_failed_finds_its_work_directory_in_its_log(hpc, 
     assert not rig.root.exists()
 
 
+NODE_INIT_FAILED = "ok: /proc hides other users' processes\nhpcop: ERROR: ss failed: cannot list the listeners\n"
+
+
+def zone_died_in_node_init(fake, *, client_ends=True, listed=False):
+    """The fake's zone step as the live one ran: its log holds node-init's error and no work directory, and its step
+    ends at once (listed no more), its srun client too unless `client_ends` is False; `listed` keeps it listed."""
+    real = fake.spawn
+
+    def failing(argv, client_log):
+        client = real(argv, client_log)
+        srun = fake.sruns[-1]
+        if srun.name.endswith("-zone-run-1"):
+            Path(srun.output).write_text(NODE_INIT_FAILED, encoding="utf-8")
+            if not listed:
+                fake.steps.pop(srun.name, None)
+            if client_ends:
+                fake.dead_clients.append(client)
+        return client
+
+    fake.spawn = failing
+    return fake
+
+
+def leftover_checks(fake):
+    return [s for s in fake.sruns if any(Path(word).name == "leftovers.py" for word in s.command)]
+
+
+def test_down_after_a_zone_that_died_before_naming_its_work_directory_checks_its_node_and_removes_the_root(
+    hpc, tmp_path, site
+):
+    """O57: a zone whose step ended before its log named a work directory (live: node-init failed before making
+    one) is clean once its step is shown ended and a read-only check on its node counts no work directory of ours of
+    its kind; down then removes the root instead of refusing it."""
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm()))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    assert rig.state()["services"]["zone"]["workdir"] is None
+    rig.fake.sruns.clear()
+    assert "is gone, and so is the root" in rig.driver.down()
+    (check,) = leftover_checks(rig.fake)
+    assert (check.node, check.command[-2:]) == ("node01", ["oz", "/tmp"])
+    assert check.command[:3] == ["python3.11", "-I", "-B"]
+    assert rig.fake.cancelled == ["4242"]
+    assert not rig.root.exists()
+
+
+def test_down_keeps_the_root_when_the_nodes_check_finds_a_work_directory_of_ours(hpc, tmp_path, site):
+    """O57: a work directory of ours of the zone's kind on its node keeps the zone unverified and the root kept; the
+    held job is cancelled all the same."""
+    fake = zone_died_in_node_init(FakeSlurm(leftovers={"node01": 1}))
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert rig.fake.cancelled == ["4242"]
+    assert rig.root.exists()
+
+
+def test_a_step_whose_end_cannot_be_shown_stays_unverified_without_a_check(hpc, tmp_path, site):
+    """O57: a step never seen listed whose srun client still runs may yet start: its end cannot be shown, so the zone
+    stays unverified and no check of its node is taken as proof."""
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm(), client_ends=False))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    rig.fake.sruns.clear()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert leftover_checks(rig.fake) == []
+    assert rig.root.exists()
+
+
+def test_a_nodes_check_that_fails_is_no_proof_that_it_is_clean(hpc, tmp_path, site):
+    """O57: the node's check ending with a traceback, or printing no count, keeps the zone unverified: a check that
+    could not read the tmpfs is never a count of 0."""
+    from hpcslurm import Completed
+
+    def broken(srun):
+        if any(Path(word).name == "leftovers.py" for word in srun.command):
+            return FakeProcess(Completed(1, "", "Traceback (most recent call last):\nPermissionError\n"))
+        return None
+
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm(on_control=broken)))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert rig.root.exists()
+
+
+def test_a_step_still_listed_is_cancelled_by_its_id_and_its_node_checked_once_it_left(hpc, tmp_path, site):
+    """O57: a zone step still listed whose log names no work directory is cancelled by its own id, recorded as seen;
+    once every step has left, its node's check counts none and the root goes."""
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm(), client_ends=False, listed=True))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    step = rig.fake.steps[f"{rig.state()['allocation']['name']}-zone-run-1"]
+    rig.fake.sruns.clear()
+    rig.driver.down()
+    assert rig.fake.cancelled.index(step) < rig.fake.cancelled.index("4242")
+    assert len(leftover_checks(rig.fake)) == 1
+    assert not rig.root.exists()
+
+
 def test_a_teardown_that_fails_keeps_the_root_and_its_state_and_still_cancels_the_job(hpc, tmp_path, site):
     """O57: what down cannot verify it says, keeping the root and its state for a second down; the job is cancelled
     all the same, so nothing keeps billing."""
