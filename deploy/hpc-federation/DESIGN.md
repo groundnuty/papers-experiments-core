@@ -150,7 +150,9 @@ srun --jobid=<job> --exact -N1 -n1 -w <node> -c <cpus> --mem=<mem> -J <step name
 ```
 
 - **The environment is an allowlist**, set on the node by `env -i`, so neither the login environment (srun passes it
-  otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`), `LC_ALL=C`, and
+  otherwise) nor a site task prolog decides it: `PATH` (`HPC_STEP_PATH` from `site.env`, by default
+  `/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin`: the site's nodes keep `ss` in `/usr/sbin`, and the first
+  live zone step, without it, failed in its first second), `LC_ALL=C`, and
   `TMPDIR=<node tmpfs>` (`HPC_NODE_TMP`, default `/tmp`). Nothing else, and never a secret. The bundle's helpers
   then run on the first `python3.11` on that `PATH` (`lib.sh`'s default `HPCOP_PY`), which must be the node's own:
   `supervise.py`, which holds every service, needs `os.pidfd_open`, which uv's standalone Python lacks. Only the core's

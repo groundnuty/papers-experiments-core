@@ -28,6 +28,7 @@ SANDBOX_PLACEMENTS = ("het", "separate")
 KILL_TAIL_S = 30  # supervise.py's SIGKILL tail after the graceful stop's bound (lib.sh, stop_service)
 STEP_END_S = 60  # the longest the driver polls for a stopped service's step to leave squeue -s
 SETTLE_SLACK_S = 60  # what settle_timeout_s keeps beyond the stop's bound
+STEP_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"  # HPC_STEP_PATH's default
 SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
 SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
@@ -298,7 +299,9 @@ class Site:
     partition: str
     images: str  # SH: the rootfs tarballs and their .provenance
     logs: str  # L: the service steps' logs, on a filesystem the login node and the nodes see
-    step_path: str = "/usr/local/bin:/usr/bin:/bin"  # PATH inside every step
+    # PATH inside every step. The sbin directories hold ss (the bundle's port checks) on the site's nodes: without them
+    # the zone's step failed in its first second (the first live slot).
+    step_path: str = STEP_PATH
     node_tmp: str = "/tmp"  # the node's tmpfs: TMPDIR inside every step, never Slurm's per-job TMPDIR
     node_python: str = "python3.11"  # the nodes' Python for the stdlib helpers (the bundle's HPCOP_PY)
     core_python: str = ""  # the core's Python on the nodes (a venv's), for [hpc] core = "step"

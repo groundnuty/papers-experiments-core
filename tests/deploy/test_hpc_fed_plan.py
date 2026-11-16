@@ -99,12 +99,22 @@ def test_the_site_comes_from_the_environment_and_a_missing_value_is_named(hpc):
         "L": "/site/logs",
     }
     site = hpc.settings.site_from_environment(environ)
-    assert (site.node_tmp, site.step_path) == ("/tmp", "/usr/local/bin:/usr/bin:/bin")
+    assert (site.node_tmp, site.step_path) == ("/tmp", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin")
     assert hpc.settings.Site.from_json(site.to_json()) == site
     with pytest.raises(hpc.settings.SettingsError, match="HPC_PARTITION is not set"):
         hpc.settings.site_from_environment({**environ, "HPC_PARTITION": "<partition>"})
     with pytest.raises(hpc.settings.SettingsError, match="HPC_NODE_TMP"):
         hpc.settings.site_from_environment({**environ, "HPC_NODE_TMP": "tmp"})
+
+
+def test_the_default_step_path_holds_the_sbin_directories_where_the_sites_nodes_keep_ss(hpc):
+    """O57: under env -i a step finds its tools on the allowlist's PATH alone; the site's nodes keep ss (the bundle's
+    port checks) in /usr/sbin, and the first live zone step failed in its first second without it."""
+    path = hpc.settings.Site("a", "p", "/i", "/l").step_path.split(":")
+    assert path[:3] == ["/usr/local/bin", "/usr/bin", "/bin"]  # the bins first, as before
+    assert {"/usr/local/sbin", "/usr/sbin"} <= set(path)
+    env = dict(word.split("=", 1) for word in hpc.slurm.allowlist(":".join(path), "/tmp"))
+    assert env["PATH"] == ":".join(path)
 
 
 # -- the pilot's shape: ten pairs -----------------------------------------------------------------------------------
