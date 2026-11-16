@@ -8,14 +8,12 @@ The core is 0.1.0 at many commits with identical dependencies, so its version na
 same way however one commit is installed, and the campaign's environment records it (`provenance.environment`):
 
 - **From a checkout** (an editable install, or `src/` on the path): when the imported `expcore` package is the
-  `src/expcore` of a project named `papers-experiments-core` whose directory is the top of a git work tree, the entry
-  is read live from git there: `HEAD`, `HEAD^{tree}`, and dirty when a file a build reads (`builds_from`: `src/`,
-  the example, the project and build files, the ignore rules, the token hashes) differs from `HEAD` or is new, a file
-  git ignores lies under `BUILD_DIRS` (bytecode caches aside: hatchling reads only the top's ignore files, so a file
-  another rule hides can still be shipped, and a Python file there is imported though no commit holds it), or the
-  packages hold a link. A change elsewhere in the repository (a note, a test, the session log this project's hooks keep
-  writing, the marker uv leaves at the top of its git checkouts) reaches no build and no import, and is not dirt. A
-  checkout git cannot read is dirty.
+  `src/expcore` of a project named `papers-experiments-core` whose directory is the top of a git work tree, the entry is
+  read live from git there: `HEAD`, `HEAD^{tree}`, and dirty when a file a build reads (`builds_from`: `src/`, the
+  example, the project and build files, the ignore rules, the token hashes) is not HEAD's, by its content hashed as git
+  would and compared with HEAD's tree (changed, new whether git ignores it or not, removed), or is a link. A change
+  elsewhere in the repository (a note, a test, the session log this project's hooks keep writing, the marker uv leaves
+  at the top of its git checkouts) reaches no build and no import, and is not dirt. A checkout git cannot read is dirty.
 - **From a build** (a wheel, a git-URL or directory install, a wheel built from an sdist): the build hook
   (`hatch_build.py`) writes `expcore/_build_identity.json` (`BUILD_FILE`) into the wheel and the sdist, read the same
   way from the checkout it builds from, or taken from the sdist it builds from. The installed Python source is hashed
@@ -25,11 +23,11 @@ same way however one commit is installed, and the campaign's environment records
 
 `python_sha256` is over every `*.py` file of the packages `expcore` and `expcore_onedata`, by its path below the
 directory holding them (`expcore/cli.py`) and its content, without the example study the wheel carries under
-`expcore/examples/` (the study's own code once written out). A running core walks its directories, a checkout's
-`src/` as an installed core's site directory, following links (a cycle once): the digest is of what is imported. A build
-leaves out the files git ignores there, as the wheel does, so it records what its install will walk. The two agree on
-every checkout that is not dirty, and a link in a checkout's packages is dirt, since git holds where it points and not
-what it leads to. Two dirty trees at one commit therefore differ when their code does.
+`expcore/examples/` (the study's own code once written out). A running core walks its directories, a checkout's `src/`
+as an installed core's site directory, following links (a cycle once): the digest is of what is imported. A build leaves
+out the files git ignores there, as the wheel does, so it records what its install will walk. The two agree on every
+checkout that is not dirty, and a link in a checkout's packages is dirt, since git holds where it points and not what it
+leads to. Two dirty trees at one commit therefore differ when their code does.
 
 This module imports nothing of the core, so the build hook loads it by its path, without installing anything.
 """
@@ -185,15 +183,6 @@ def checkout_digest(root: Path) -> str | None:
     return _digest([(name, path) for name, path in package_files(root / "src")[0] if f"src/{name}" not in ignored])
 
 
-def _tracked_links(root: Path) -> set[str] | None:
-    """The links git tracks in a checkout's packages (mode 120000), by path from its top; None when git cannot say."""
-    listing = _git(root, "ls-files", "-z", "-s", "--", *(f"src/{p}" for p in PACKAGES), raw=True)
-    if listing is None:
-        return None
-    rows = (item.split("\t", 1) for item in listing.split("\0") if "\t" in item)
-    return {path for stage, path in rows if stage.startswith("120000 ")}
-
-
 def _ignored(root: Path) -> set[str] | None:
     """The files git ignores under `BUILD_DIRS` of a checkout, by path from its top; None when git cannot list them."""
     listing = _git(root, "ls-files", "-z", "-oi", "--exclude-standard", "--", *BUILD_DIRS, raw=True)
@@ -207,42 +196,86 @@ def builds_from(path: str) -> bool:
     return path.startswith(BUILD_DIRS) or path in BUILD_FILES
 
 
+def _input_files(root: Path) -> tuple[list[str], list[str]]:
+    """What a build reads, as it lies on disk: every file below `BUILD_DIRS` (bytecode caches aside) and each of
+    `BUILD_FILES` that exists, by path from the top; and, apart, every link among them (never followed: a link is
+    dirt whatever it leads to)."""
+    files: list[str] = []
+    links: list[str] = []
+    for top in BUILD_DIRS:
+        for here, dirs, names in os.walk(root / top):
+            for entry in [*dirs, *names]:
+                path = Path(here) / entry
+                if path.is_symlink():
+                    links.append(path.relative_to(root).as_posix())
+            dirs[:] = [d for d in dirs if d not in _SKIPPED_DIRS and not (Path(here) / d).is_symlink()]
+            files += [(Path(here) / n).relative_to(root).as_posix() for n in names if not (Path(here) / n).is_symlink()]
+    for name in sorted(BUILD_FILES):
+        if (root / name).is_symlink():
+            links.append(name)
+        elif (root / name).is_file():
+            files.append(name)
+    return sorted(files), sorted(links)
+
+
+def _head_blobs(root: Path) -> dict[str, str] | None:
+    """HEAD's blob id of each file a build reads, by path from the top; None when git cannot list them."""
+    names = [top.rstrip("/") for top in BUILD_DIRS] + sorted(BUILD_FILES)
+    listing = _git(root, "ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", *names, raw=True)
+    if listing is None:
+        return None
+    blobs = {}
+    for item in listing.split("\0"):
+        meta, _, path = item.partition("\t")
+        fields = meta.split()
+        if len(fields) == 3 and path:
+            blobs[path] = f"{fields[0]} {fields[2]}"
+    return blobs
+
+
+def _disk_blobs(root: Path, files: list[str]) -> dict[str, str] | None:
+    """The blob id git would give each file as it lies now (`hash-object`, with the path's filters), in the form
+    `_head_blobs` gives HEAD's: mode and id; None when git cannot hash them or a name cannot be passed to it."""
+    if not files:
+        return {}
+    if any("\n" in name for name in files):
+        return None
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), "hash-object", "--stdin-paths"],
+            input="\n".join(files) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    ids = done.stdout.split()
+    if done.returncode != 0 or len(ids) != len(files):
+        return None
+    modes = {name: "100755" if os.access(root / name, os.X_OK) else "100644" for name in files}
+    return {name: f"{modes[name]} {blob}" for name, blob in zip(files, ids, strict=True)}
+
+
 def _dirt(root: Path) -> str | None:
-    """Why a checkout is dirty, else None: a file a build reads differs from HEAD, or is new; a file git ignores lies
-    under `BUILD_DIRS`, bytecode caches aside (no commit holds it, and a wheel may ship it); the packages hold a link
-    (git holds a link's target path, never what it leads to); or git cannot say."""
-    status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", raw=True)
-    ignored = _ignored(root)
-    if status is None or ignored is None:
-        return "git status could not be read"
-    entries = [item for item in status.split("\0") if item]
-    changed, untracked, index = [], [], 0
-    while index < len(entries):
-        code, paths = entries[index][:2], [entries[index][3:]]
-        if "R" in code or "C" in code:  # --porcelain -z writes a rename's or a copy's source path as the next field
-            index += 1
-            paths += entries[index : index + 1]
-        index += 1
-        if any(builds_from(path) for path in paths):
-            (untracked if code == "??" else changed).append(paths[0])
+    """Why a checkout is dirty, else None: a file a build reads is not HEAD's (changed, new, removed, or its mode
+    changed), or is a link (git holds a link's target path, never what it leads to), or git cannot say.
+
+    The files on disk are hashed and compared with HEAD's tree, so nothing git's index, its ignore rules (nested,
+    `info/exclude`, global) or an `assume-unchanged` flag hides escapes it: a file a build reads either is HEAD's, or
+    the checkout is dirty. A change elsewhere in the repository reaches no build and no import, and is not dirt.
+    """
+    files, links = _input_files(root)
+    head, disk = _head_blobs(root), _disk_blobs(root, files)
+    if head is None or disk is None:
+        return "git could not compare the files a build reads with HEAD's"
+    changed = sorted(name for name in set(head) | set(disk) if head.get(name) != disk.get(name) and name not in links)
     if changed:
         more = f" and {len(changed) - 3} more" if len(changed) > 3 else ""
         return f"uncommitted changes to what a build reads: {', '.join(changed[:3])}{more}"
-    if untracked:
-        more = f" and {len(untracked) - 3} more" if len(untracked) > 3 else ""
-        return f"files a build would ship that git does not track: {', '.join(untracked[:3])}{more}"
-    hidden = sorted(item for item in ignored if "__pycache__" not in item.split("/"))
-    if hidden:
-        more = f" and {len(hidden) - 3} more" if len(hidden) > 3 else ""
-        return f"files under what a build reads that git ignores: {', '.join(hidden[:3])}{more}"
-    links = sorted(
-        {f"src/{name}" for name in package_files(root / "src")[1]}  # walked: what the packages import through
-        | (_tracked_links(root) or set())  # held by git, under the example's place too
-        | {item for item in ignored if (root / item).is_symlink()}  # a link git ignores imports like any other
-    )
     if links:
         more = f" and {len(links) - 3} more" if len(links) > 3 else ""
-        return f"links in the packages, whose targets no commit holds: {', '.join(links[:3])}{more}"
+        return f"links in what a build reads, whose targets no commit holds: {', '.join(links[:3])}{more}"
     return None
 
 

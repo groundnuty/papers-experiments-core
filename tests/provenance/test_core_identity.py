@@ -92,7 +92,7 @@ def test_p01_a_change_to_what_a_build_reads_is_dirt_and_one_elsewhere_or_a_marke
     (root / "src" / "expcore" / "build" / "hidden.py").write_text("HIDDEN = 1\n", encoding="utf-8")
     ignored = from_checkout(root)  # imported, and in no commit: git ignores build/ here
     assert ignored.dirty
-    assert "files under what a build reads that git ignores: src/expcore/build/hidden.py" in str(ignored.why)
+    assert "uncommitted changes to what a build reads: src/expcore/build/hidden.py" in str(ignored.why)
     shutil.rmtree(root / "src" / "expcore" / "build")
     (root / "examples" / "tiny_study" / "out").mkdir(parents=True)
     (root / ".git" / "info" / "exclude").write_text("out/\n", encoding="utf-8")  # hidden from git, not from hatchling
@@ -101,7 +101,33 @@ def test_p01_a_change_to_what_a_build_reads_is_dirt_and_one_elsewhere_or_a_marke
     shutil.rmtree(root / "examples" / "tiny_study" / "out")
     assert from_checkout(root).dirty is False
     (root / ".hgignore").write_text("syntax: glob\nexamples/tiny_study/plugin.py\n", encoding="utf-8")
-    assert "files a build would ship that git does not track: .hgignore" in str(from_checkout(root).why)
+    assert "uncommitted changes to what a build reads: .hgignore" in str(from_checkout(root).why)
+
+
+def test_p01_nothing_git_can_be_told_to_hide_takes_a_change_to_what_a_build_reads_out_of_the_dirt(repo):
+    """P01: dirt is read from the files themselves against HEAD's tree, so a root `.hgignore` that `info/exclude`
+    hides from git (hatchling still reads it), an edit behind `assume-unchanged` or `skip-worktree`, and a file
+    removed from what a build reads are each dirt; an exec bit changed is too."""
+    root = core_project(repo)
+    (root / ".git" / "info" / "exclude").write_text("/.hgignore\n", encoding="utf-8")
+    (root / ".hgignore").write_text("syntax: glob\nexamples/tiny_study/plugin.py\n", encoding="utf-8")
+    assert repo.git("status", "--porcelain") == ""  # git sees nothing
+    assert "uncommitted changes to what a build reads: .hgignore" in str(from_checkout(root).why)
+    (root / ".hgignore").unlink()
+    for flag in ("--assume-unchanged", "--skip-worktree"):
+        repo.git("update-index", flag, "src/expcore/cli.py")
+        (root / "src" / "expcore" / "cli.py").write_text("WIRE = 'hidden'\n", encoding="utf-8")
+        assert repo.git("status", "--porcelain") == ""
+        assert "src/expcore/cli.py" in str(from_checkout(root).why)
+        repo.git("update-index", flag.replace("--", "--no-"), "src/expcore/cli.py")
+        repo.git("checkout", "--", "src/expcore/cli.py")
+    (root / "src" / "expcore" / "cli.py").unlink()
+    assert "src/expcore/cli.py" in str(from_checkout(root).why)
+    repo.git("checkout", "--", "src/expcore/cli.py")
+    (root / "src" / "expcore" / "cli.py").chmod(0o755)
+    assert "src/expcore/cli.py" in str(from_checkout(root).why)
+    (root / "src" / "expcore" / "cli.py").chmod(0o644)
+    assert from_checkout(root).dirty is False
 
 
 def test_c06_a_linked_subpackage_is_walked_and_its_link_is_dirt(repo, tmp_path):
@@ -150,7 +176,7 @@ def test_c06_a_link_to_a_package_directory_never_takes_it_out_of_the_digest(repo
     (root / "src" / "expcore" / "examples").mkdir()
     (root / "src" / "expcore" / "examples" / "alias").symlink_to(tmp_path / "anywhere", target_is_directory=True)
     repo.commit("a link under the example's place")
-    assert "links in the packages" in str(from_checkout(root).why)
+    assert "links in what a build reads" in str(from_checkout(root).why)
 
 
 def test_c06_two_dirty_trees_at_one_commit_are_told_apart_by_their_python_digest(repo):
