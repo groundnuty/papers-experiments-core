@@ -37,10 +37,11 @@ the run notes, not from the record; each says so below.
   directories for `space-1`, 1 file each for `space-2` and `space-3`, and none in the fourth data space and the probe
   space. The six entries read here (size and SHA-256) are equal across the halves: 6 of 6, from the two records.
 - **The same before-maps.** The Compose half refused to mount unless every provider's block map of every file, before
-  the read, equalled the HPC record's, the `unknown` strings included. The record's `before_equal_to_hpc` is true with
-  no difference, and the comparison in this file's record recomputes it from the two halves' own maps. A fresh `up` of
-  the layout gave them without any placement or eviction first (notes): `providers[0]` held `replicated.bin` whole (the
-  baseline's replica) and nothing of the other five files, and each owner held its files whole.
+  the read, equalled the HPC record's, the `unknown` strings included. Its own record said so (`before_equal_to_hpc`
+  true, no difference; `comparison.before_maps_equal_recorded_by_compose_half` in this file's record), and the
+  comparison there recomputes it from the two halves' own maps. A fresh `up` of the layout gave them without any
+  placement or eviction first (notes): `providers[0]` held `replicated.bin` whole (the baseline's replica) and nothing
+  of the other five files, and each owner held its files whole.
 - **Per file, what each half measured:** the bytes the script served, their SHA-256, equality with the manifest, and
   each provider's block map before and after the read, read through `providers[0]` with the admin credential and
   settled (two consecutive equal polls, both before and after). Gained and lost bytes are the maps' difference.
