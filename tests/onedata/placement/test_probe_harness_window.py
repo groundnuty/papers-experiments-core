@@ -5,8 +5,13 @@ eviction, which the harness schedules before every run, is never in the accepted
 the listing; a harness job that could lie in the window and is missing still does (the O08 test beside the split's).
 """
 
+from collections.abc import Callable
+
+import pytest
+
 from expcore_onedata.probes import PlatformProbes
-from expcore_onedata.testing import BETA_ID, DATA, tool_plane_replicates
+from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
+from expcore_onedata.transferorder import STOP_MARGIN_S
 
 PATH = "study/data.bin"  # the file the reset evicts; the study does not track it
 OLDER = 64  # ended jobs of the space's history from before the reset, none of them the harness's
@@ -29,9 +34,12 @@ def history(seeded, first: float) -> None:
         seeded.add_transfer("replication", PATH, BETA_ID, scheduled=first + i)
 
 
-def run_window(probes, seeded, client, ticker, files) -> dict:
-    """Start the run, replicate every tracked file into beta through the tool plane, and return the snapshot."""
+def run_window(probes, seeded, client, ticker, files, during: Callable[[float], None] | None = None) -> dict:
+    """Start the run, replicate every tracked file into beta through the tool plane, and return the snapshot.
+    `during` is called with the window's start as soon as the run has started."""
     probes.start({})
+    if during is not None:
+        during(ticker.now)
     ticker.sleep(INSIDE_S)
     for path in files.values():
         seeded.end_transfer(tool_plane_replicates(seeded, client, path, BETA_ID))
@@ -119,3 +127,119 @@ def test_o08_a_harness_job_whose_record_cannot_be_read_still_flags_every_bound(c
     for provider in ("providers[0]", "providers[1]"):
         assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
         assert "harness_transfer_not_listed" in snapshot["on_demand"][provider]["unknown"]
+
+
+def hidden_eviction(client, provisioner, seeded, ticker) -> tuple[dict[str, str], str, PlatformProbes]:
+    """The space's older history and the harness's eviction after it, before the run, which no listing answer ever
+    shows (as a listing that dropped it would leave it), and the probes. Return the files, the eviction's id and the
+    probes; what each provider's record of the eviction says is the test's to set."""
+    files = tracked(seeded)
+    history(seeded, first=100)
+    provisioner.evict(PATH, "beta")
+    (eviction,) = [tid for _, tid, kind in provisioner.transfers() if kind == "eviction"]
+    seeded.listing_lag[eviction] = 10**6
+    ticker.sleep(BEFORE_S)
+    probes = PlatformProbes(client, provisioner, files, ["alpha", "beta"], sleep=ticker.sleep, now=ticker.clock)
+    return files, eviction, probes
+
+
+Records = Callable[[float, int], dict[str, dict]]  # (cutoff, the job's finish) -> provider id -> its record's fields
+
+
+def with_records(client, provisioner, seeded, ticker, records: Records) -> dict:
+    """Run the window with the hidden eviction's record on each provider changed as `records` gives it, from the
+    cutoff (the window's start less the allowance and the walk's margin) and the job's own finish time, and return the
+    snapshot. The listing itself was read."""
+    files, eviction, probes = hidden_eviction(client, provisioner, seeded, ticker)
+    cutoffs = []
+
+    def during(start: float) -> None:
+        cutoff = start - provisioner.settings.clock_skew_allowance_s - STOP_MARGIN_S
+        cutoffs.append(cutoff)
+        for provider_id, fields in records(cutoff, seeded.transfers[eviction].finished).items():
+            seeded.provider_view[(eviction, provider_id)] = fields
+
+    snapshot = run_window(probes, seeded, client, ticker, files, during=during)
+    section = snapshot["space_transfers"]
+    assert section["probe_ok"] is True, section["error"]
+    assert section["ended_since"] == cutoffs[0]
+    return snapshot
+
+
+def assert_flagged(snapshot) -> None:
+    """The harness's eviction is missing and nothing vouches that it ended before the cutoff: every bound unknown."""
+    section = snapshot["space_transfers"]
+    assert section["harness_unlisted"] == 1
+    assert "harness_before_window" not in section
+    for provider in ("providers[0]", "providers[1]"):
+        assert snapshot["on_demand"][provider]["on_demand_lower_bound"] is None
+        assert "harness_transfer_not_listed" in snapshot["on_demand"][provider]["unknown"]
+
+
+def both(fields: dict) -> dict[str, dict]:
+    """The same record fields on both providers."""
+    return {ALPHA_ID: fields, BETA_ID: fields}
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        lambda cutoff, finished: both({"finishTime": 0}),
+        lambda cutoff, finished: both({"finishTime": None}),
+        lambda cutoff, finished: both({"finishTime": cutoff}),
+        lambda cutoff, finished: both({"state": "ongoing"}),
+    ],
+    ids=["finish-0", "finish-none", "finish-at-cutoff", "not-final"],
+)
+def test_o08_a_harness_record_that_shows_no_end_before_the_cutoff_still_flags(
+    client, provisioner, seeded, ticker, records
+):
+    """O08: the harness's eviction is missing from the listing, and every provider's record of it gives a finish time
+    of 0, none, one exactly at the cutoff (`ended_since`), or a state that is not final: none of them is a job the
+    ended walk never keeps, so its absence may show the listing incomplete and every bound is unknown."""
+    seeded.clock = ticker.clock
+    assert_flagged(with_records(client, provisioner, seeded, ticker, records))
+
+
+def test_o08_a_lagging_copy_that_has_not_ended_does_not_contradict_an_end_before_the_cutoff(
+    client, provisioner, seeded, ticker
+):
+    """O08 with O32: alpha's copy of the harness's eviction still says it is ongoing (a copy that lags), and beta's
+    says it ended before the cutoff: the lagging copy contradicts nothing, so the eviction flags nothing."""
+    seeded.clock = ticker.clock
+    snapshot = with_records(
+        client, provisioner, seeded, ticker, lambda cutoff, finished: {ALPHA_ID: {"state": "ongoing"}}
+    )
+    assert_split_known(snapshot)
+    assert snapshot["space_transfers"]["harness_before_window"] == 1
+
+
+@pytest.mark.parametrize(
+    "alpha",
+    [lambda cutoff, finished: {"finishTime": finished - 1}, lambda cutoff, finished: {"finishTime": cutoff + 1}],
+    ids=["another-finish", "ended-after-cutoff"],
+)
+def test_o08_a_final_record_that_contradicts_the_end_before_the_cutoff_flags(
+    client, provisioner, seeded, ticker, alpha
+):
+    """O08: beta's record of the harness's eviction says it ended before the cutoff, but alpha's, also final, gives
+    another finish time before it, or one after the cutoff: the records do not agree that the job ended before the
+    window, so its absence may show the listing incomplete and every bound is unknown."""
+    seeded.clock = ticker.clock
+    snapshot = with_records(
+        client, provisioner, seeded, ticker, lambda cutoff, finished: {ALPHA_ID: alpha(cutoff, finished)}
+    )
+    assert_flagged(snapshot)
+
+
+def test_o08_a_provider_whose_record_cannot_be_read_neither_confirms_nor_contradicts(
+    client, provisioner, seeded, ticker
+):
+    """O08 with O32: alpha's record of the harness's eviction cannot be read (its connection resets on every try),
+    and beta's, the next provider asked, says it ended before the cutoff: the eviction flags nothing."""
+    seeded.clock = ticker.clock
+    files, eviction, probes = hidden_eviction(client, provisioner, seeded, ticker)
+    seeded.resets.append([f"/transfers/{eviction}", 99, ALPHA_ID])
+    snapshot = run_window(probes, seeded, client, ticker, files)
+    assert_split_known(snapshot)
+    assert snapshot["space_transfers"]["harness_before_window"] == 1
