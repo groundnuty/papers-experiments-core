@@ -348,6 +348,29 @@ MOUNT_SENSITIVITY_NOTES = [
     "both guards also gets a rerun without the runs either leaves out.",
 ]
 
+VISIBILITY_NOTES = [
+    "This batch's sandbox kept the agent's memory limit with a watch of the harness's over the cell's processes in",
+    "`/proc` (an HPC batch node, with no cgroup per container), where `/proc` hides a process of the agent's that",
+    "makes itself non-dumpable. The watch checked from outside: at every poll it compared the anonymous memory the",
+    "driver's cgroup charged with what the processes `/proc` showed held, and looked for a child of a cell's process",
+    "that `/proc` did not show. A run is `flagged` for a `hidden_process` (such a child) or `hidden_memory` (a cell",
+    "killed for memory nothing visible explained, past the margin: memory the watch cannot see is taken as past the",
+    "limit); `unknown` for a `memory_unknown` (memory that could not be told the run's, a reading that failed, a",
+    "margin the start's own cells passed, or no readable snapshot); otherwise `clean`. A run whose memory reading is",
+    "unknown has an unknown limit condition, never one within its limit. Detection, not prevention: a process that",
+    "forks twice under the cell's hidden init is a child of no visible process, hidden memory under the margin is not",
+    "told from the node's own share, and a hidden process's shared memory is not compared; the step's limit bounds",
+    "them, and every hidden process ends with its cell.",
+]
+
+VISIBILITY_SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without the runs that are not clean (flagged and unknown): each one is left",
+    "out as an absent run (`excluded`), so its pairs count as `Unpaired or left out` and its arm's runs as `Left",
+    "out`. The analysis above stands; this says whether its conclusions hold without the runs whose code hid a",
+    "process or its memory from the harness, or whose memory could not be read. A run is left out for what was",
+    "detected about it, never for its outcome.",
+]
+
 GUARDS_NOTES = [
     "This batch was checked by both guards, the egress check and the mount guard, and each section above reruns the",
     "analysis without its own runs. This one reruns it without every run either leaves out: flagged or unknown to",

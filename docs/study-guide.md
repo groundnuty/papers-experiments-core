@@ -361,6 +361,8 @@ The export lists every interrupted attempt with its basis and its log's size (`i
 
 **When a batch is held on budget after a kill**, a hold whose figure the kill inflated is lifted by resuming the campaign: `run STUDY` (or the shard driver's `step --resume`). The budget gate assesses the ceilings afresh before every dispatch from the store as it stands, with each interrupted attempt charged by its basis; a hold that is no longer over its ceiling ends at the first assessment with a `budget_hold_over` event, and stderr says the hold ended. Nothing else lifts a hold, and nothing should: never edit the store's `budget_holds`, an attempt's log or its basis by hand, since the gate recomputes the figure every time and a hand-made change can only make it count less than was spent. If the resume still holds the model, the figure is over its ceiling with every attempt charged as well as the store can say; the `recovered_interrupted` event counts the interrupted attempts by basis, and the export's `interrupted_spend` names those at their bound. A study's `campaign.toml` has no release file and its budget is in the campaign's fingerprint, so the remaining runs stay pending (exit status 3) and the analysis counts them as unfinished; spending more means a new campaign with the budget it needs.
 
+**A release file in a campaign built in code.** `campaign.toml` sets none, but a campaign built in code may (`HarnessStopConfig.release_file` for stops on harness errors, `Budget.release_file` for budget holds). Each stop is ended by one line, `<name> <serial>`, which its hold prints: `dispatch of m1 is stopped by harness errors (stop 3.k7f2qd9a; to end it, write the line 'm1 3.k7f2qd9a' in the harness stop's release file)`. Copy that line into the file. A bare model name or `ALL`, the form before serials, ends nothing, nor does the line of an earlier stop, and the file's time does not matter; a refused line is named in a warning with the line to write. The format is in [Release files](interfaces.md#release-files).
+
 ### An abandoned request
 
 When a run gives up a request in flight, the record cannot say what it cost. Its `route.abandoned_request` holds the bound the adapter took when it built that request: `prompt_bound_tokens`, `prompt_bound_by` (`bytes`, or `window` where the byte assumption cannot be used: the first request, a reply that left a count out, a conversation in which a reply reported more than its bound), and the `reply_max_tokens` it carried. A cost scorer that charges an abandoned run for that request prices it with `abandoned_request_bound`, in place of the window and the reply maximum, and reports which basis it used. The budget gate does not read it, and the reservation above is unchanged. Pass `reply_capped` from the record's own totals, which say whether the attempt was held to its reply maximum; a record with neither field was not.
@@ -461,11 +463,15 @@ How a run works there:
 - Your agent's code runs as one `apptainer exec` per cell.
 - The data gate runs on the node's loopback and holds the token; the agent never sees it.
 - The harness keeps the memory limit and the sizes of `/work`, `/tmp` and `/dev/shm`. A cell past one of them is killed as `memory_limit` or `disk_limit`, the agent's own outcome.
+- A process your agent's code hides from the harness (one that makes itself non-dumpable, which the node's `/proc` then hides) is still caught from the cgroup that charges its memory. Its memory, past a margin, kills the cell as `memory_limit`; a hidden child is recorded. Declare the `process_visibility` instrument (below) so the report says so.
 
-Three things differ from Docker, and the record says so (`infrastructure_facts`):
+Four things differ from Docker, and the record says so (`infrastructure_facts`):
 - **Detached workers end with their cell.** A process a cell starts in the background is killed when that cell ends, where Docker's container keeps it until the next cap.
 - **The network is the node's.** The agent can reach the internet, so declare the `egress` instrument (below).
+- **The memory reading can be unknown** (`infrastructure_facts.memory`): `within` only when the harness could show it, `unknown` with its reasons when it could not, and never `within` for a run whose code hid memory from it.
 - **A mount data path is refused at its start** until its helper lands.
+
+Names resolve as on Docker (`dns: none` in the record): the federation's names resolve from `/etc/hosts` and no other name resolves. A Docker agent's network is `--internal` with `--add-host` entries and no `--dns`, and measured on engine 29.2.1 the engine's embedded resolver answers every outside name with SERVFAIL at once. So the name lookup is no departure; the connect to an outside address is, as the network bullet says (on Docker it fails at once with ENETUNREACH).
 
 Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
 
@@ -1288,6 +1294,32 @@ What you get, with nothing else to call: once one analysed record carries the `m
 Report the primary analysis as it stands and the sensitivity analysis beside it. The guard detects, it does not prevent: inotify does not say which process touched the file, so every touch while cells can run counts as the agent's; a tracer is sampled, so a short one is missed; oneclient's environment and memory are covered only by the proof that no cell can see its process; and a process of your user outside the cells (an ssh login into the node) is outside every check.
 
 **Run nothing else of your account on a sandbox node while runs are live: no interactive login and no other job step.** A process of your user outside the cells is outside every check: the egress shim is loaded only in the cells, and the mount guard proves only the cells, so such a process could connect anywhere, or read oneclient's environment, which holds the token, without a line in either log.
+
+### Hidden processes on HPC: reported, never within the limit
+
+On an HPC batch node the harness keeps the memory limit by watching your agent's processes in `/proc`, and `/proc` hides a process that makes itself non-dumpable. The sandbox checks from outside: the memory the cgroup charges against what the visible processes hold, and a child of a cell's process that `/proc` does not show. Record what it found with `expcore.visibility.ProcessVisibility(sandbox)` beside the run's other instruments:
+
+```python
+from expcore.visibility import ProcessVisibility
+
+
+class Unwatched:
+    """A sandbox that kept no watch reading."""
+
+    def process_visibility(self):
+        return None
+
+
+seen = ProcessVisibility(Unwatched())
+assert seen.finish()["memory"] == "unknown"  # no reading: unknown, never within the limit
+```
+
+Once one analysed record carries it, `analyze` judges every analysed run:
+- `flagged` when its code hid a process or memory from the harness, a finding of its own;
+- `unknown` when its memory reading is unknown (memory not told its own, or a reading that failed), so its limit condition is unknown, never within its limit;
+- otherwise `clean`.
+
+The analysis then runs again without every run that is not clean. `report.md` gains `## Process visibility (detected, not prevented)`, `analysis.json` gains `process_visibility`, and `analyze` prints a line per contrast. The check detects, it does not prevent. Hidden memory under the margin (`hidden_memory_margin_bytes`, 128 MiB by default) and a hidden process's shared memory are not told apart from the node's own; the step's memory limit bounds them, and every hidden process ends with its cell. What each field means is in [`interfaces.md`](interfaces.md#processes-hidden-from-the-watch-the-process_visibility-instrument).
 
 ### The order instruments start and finish in
 

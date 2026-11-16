@@ -6,12 +6,17 @@ a setuid program's process of our own (Apptainer's starter), whose credentials a
 processes are ours and visible: the starter execs them with our uid. Each `apptainer exec --containall` gives its
 processes a PID namespace of their own, which `/proc/<pid>/ns/pid` names (`pid:[<inode>]`); that is how the harness
 finds a cell's processes, whatever they call themselves and whatever environment they cleared.
+
+A process of our own uid that makes itself non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`) is hidden by `hidepid=invisible`
+too, and its memory with it. Two outside readings still show it: the cgroup its memory is charged to counts it
+(`memory.stat`, `stat_value`), and its visible parent's `children` files list its pid while `/proc` has no entry for
+it (`hidden_children`).
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
 NAMESPACE = re.compile(r"pid:\[[0-9]{1,20}\]")
@@ -25,7 +30,8 @@ class Proc:
     `start` is its start time in clock ticks after boot (field 22 of `stat`), which with the pid names it uniquely;
     `pidns` its PID namespace (`pid:[<inode>]`), None when the link could not be read; `rss` its resident anonymous and
     shared-memory bytes (`RssAnon` + `RssShmem`), None when `status` could not be read; `tags` which of the strings the
-    caller asked for its environment or its command line holds."""
+    caller asked for its environment or its command line holds; `anon` its `RssAnon` alone (what a cgroup's `anon`
+    counts of it), None when there is none (a zombie); `cgroup` its cgroup v2 path, None when it could not be read."""
 
     pid: int
     start: str
@@ -35,6 +41,8 @@ class Proc:
     pidns: str | None
     rss: int | None
     tags: frozenset[str] = frozenset()
+    anon: int | None = None
+    cgroup: str | None = None
 
     def brief(self) -> dict[str, object]:
         """The process as a deadline's or a quiesce's record keeps it: pid, start, comm and state."""
@@ -67,6 +75,62 @@ def parse_rss(text: str) -> int | None:
     if set(found) != {"RssAnon", "RssShmem"}:
         return None
     return found["RssAnon"] + found["RssShmem"]
+
+
+def parse_anon(text: str) -> int | None:
+    """`RssAnon` of `/proc/<pid>/status` in bytes; None when the line is missing (a zombie has no memory) or not a
+    number of kB."""
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key == "RssAnon":
+            parts = value.split()
+            return int(parts[0]) * PAGE_KIB if len(parts) == 2 and parts[1] == "kB" and parts[0].isdigit() else None
+    return None
+
+
+def stat_value(text: str, key: str) -> int | None:
+    """The value of `key` in a cgroup v2 `memory.stat` (lines `<key> <bytes>`); None when it is absent or no number."""
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == key:
+            return int(parts[1]) if parts[1].isdigit() else None
+    return None
+
+
+def in_cgroup(path: str | None, root: str) -> bool:
+    """Whether a process's cgroup v2 path is `root` or below it: a v2 `memory.stat` counts its descendants too. A
+    path that could not be read is in none."""
+    if path is None or not path.startswith("/"):
+        return False
+    if root == "/":
+        return True
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def parse_children(text: str) -> set[int] | None:
+    """The pids of a `/proc/<pid>/task/<tid>/children` file (space-separated); None when it is not that."""
+    words = text.split()
+    return {int(word) for word in words} if all(word.isdigit() for word in words) else None
+
+
+def hidden_children(
+    children: Callable[[], set[int] | None], shown: Callable[[int], bool], exists: Callable[[int], bool | None]
+) -> list[int] | None:
+    """The children of one process that `/proc` does not show as this uid's while they exist: a non-dumpable process
+    under `hidepid`. A pid is one when the parent's `children` list it, its `/proc` entry is missing or another uid's
+    (`shown` is False), a process still holds the pid (`exists` is not False: None, unknown, is taken as one), and the
+    parent lists it again after those reads, so a child that ended (and was reaped) between them is never one.
+    `children()` reads the parent's children, None when they cannot be read; then so is the answer."""
+    first = children()
+    if first is None:
+        return None
+    candidates = [pid for pid in sorted(first) if not shown(pid) and exists(pid) is not False]
+    if not candidates:
+        return []
+    again = children()
+    if again is None:
+        return None
+    return [pid for pid in candidates if pid in again and not shown(pid) and exists(pid) is not False]
 
 
 def parse_uid(text: str) -> int | None:
@@ -102,4 +166,17 @@ def cgroup_path(text: str) -> str | None:
     return None
 
 
-__all__ = ["Proc", "cgroup_path", "namespace", "parse_rss", "parse_stat", "parse_uid", "tags_in"]
+__all__ = [
+    "Proc",
+    "cgroup_path",
+    "hidden_children",
+    "in_cgroup",
+    "namespace",
+    "parse_anon",
+    "parse_children",
+    "parse_rss",
+    "parse_stat",
+    "parse_uid",
+    "stat_value",
+    "tags_in",
+]
