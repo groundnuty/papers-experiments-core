@@ -63,7 +63,7 @@ def snapshot(environ):
 class Rig:
     """A driver over the fake Slurm, the core's phase recorded instead of run, and the mount check answered."""
 
-    def __init__(self, hpc, tmp_path, site, environ, layout=IMPORT_LAYOUT, mounts=None):
+    def __init__(self, hpc, tmp_path, site, environ, layout=IMPORT_LAYOUT, mounts=None, root=None):
         from hpcslurm import Completed
 
         self.fake = FakeSlurm()
@@ -71,7 +71,7 @@ class Rig:
         self.mounts = mounts or self.held_read_only
         self.mount_steps = []
         self.completed = Completed
-        self.root = tmp_path / "fed" / "root"
+        self.root = root or tmp_path / "fed" / "root"
         self.site = site
         self.hpc = hpc
         self.driver = hpc.cli.make_driver(layout, str(self.root), runner=self.fake, environ=environ)
@@ -375,6 +375,66 @@ def test_o59_a_variable_that_is_unset_is_refused_in_the_preflight_naming_it(hpc,
     assert not rig.driver.store.exists()
 
 
+def test_o59_a_root_reached_through_a_link_into_a_tree_is_refused_before_anything_is_written(
+    hpc, tmp_path, site, environ
+):
+    """O59: the layout compares the root with a tree by their names, and the driver checks the root against its parent
+    alone, so a root beneath a link that leads into a tree would have `up` write its state, and `down` remove it, inside
+    the tree. The real paths are compared: nothing is submitted, and no entry of any tree changes."""
+    tree = Path(tree_of(environ, "alpha-space"))
+    (tree / "runs").mkdir()
+    before = snapshot(environ)
+    (tmp_path / "alias").symlink_to(tree)
+    rig = Rig(hpc, tmp_path, site, environ, root=tmp_path / "alias" / "runs" / "fed")
+    with pytest.raises(
+        ValueError, match=r"the federation's root is, holds or lies inside.*EXPCORE_FED_IMPORT_ALPHA"
+    ) as caught:
+        rig.up()
+    assert str(tmp_path) not in str(caught.value)
+    assert rig.fake.calls == []
+    assert snapshot(environ) == before
+    assert not (tree / "runs" / "fed").exists()
+
+
+def test_o59_a_log_directory_inside_a_tree_is_refused_before_anything_is_written(hpc, tmp_path, site, environ):
+    """O59: the batch logs and the clients' logs are written beneath L by the driver, on the host, which a read-only
+    bind in a container does not reach: an L that is a tree, or lies inside one, is refused in the preflight."""
+    tree = Path(tree_of(environ, "beta-space"))
+    (tree / "logs").mkdir()
+    before = snapshot(environ)
+    for logs in (tree, tree / "logs"):
+        rig = Rig(hpc, tmp_path, {**site, "L": str(logs)}, environ)
+        with pytest.raises(
+            ValueError, match=r"the log directory \(L\) is, holds or lies inside.*EXPCORE_FED_IMPORT_BETA"
+        ):
+            rig.up()
+        assert rig.fake.calls == []
+    assert snapshot(environ) == before
+
+
+def test_o59_a_log_directory_that_holds_a_tree_is_refused_too(hpc, tmp_path, site, environ):
+    """O59: nor may L be a directory above a tree (the logs would sit beside the data; a clean-up of L reaches it)."""
+    rig = Rig(hpc, tmp_path, {**site, "L": str(Path(tree_of(environ, "alpha-space")).parent)}, environ)
+    with pytest.raises(ValueError, match="the log directory"):
+        rig.up()
+    assert rig.fake.calls == []
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["one directory", "one inside the other"])
+def test_o59_two_imports_may_not_name_one_tree_by_two_variables(hpc, tmp_path, site, environ, nested):
+    """O59: each import has a tree of its own: the layout compares the variables' names, and the driver compares what
+    they name, so a second variable for one directory (or for a directory inside it) is refused, naming both spaces."""
+    alpha = Path(tree_of(environ, "alpha-space"))
+    beta = alpha / "inner" if nested else alpha
+    beta.mkdir(exist_ok=True)
+    write_manifest(manifest_of_tree(beta), Path(environ["EXPCORE_FED_IMPORT_BETA_MANIFEST"]))
+    rig = Rig(hpc, tmp_path, site, {**environ, "EXPCORE_FED_IMPORT_BETA": str(beta)})
+    with pytest.raises(ValueError, match=r"spaces\.alpha-space and spaces\.beta-space") as caught:
+        rig.up()
+    assert str(tmp_path) not in str(caught.value)
+    assert rig.fake.calls == []
+
+
 def test_o59_a_tree_inside_the_federations_root_is_refused_in_the_preflight(hpc, tmp_path, site, environ):
     """O59: the layout's own check of a tree stands: one inside the root, which down empties, is never taken."""
     root = tmp_path / "fed" / "root"
@@ -384,6 +444,43 @@ def test_o59_a_tree_inside_the_federations_root_is_refused_in_the_preflight(hpc,
     with pytest.raises(ValueError, match="EXPCORE_FED_IMPORT_ALPHA"):
         rig.up()
     assert rig.fake.calls == []
+
+
+def test_o59_each_owner_that_passed_the_proof_is_recorded_and_a_mirror_that_owns_none_is_not(
+    hpc, tmp_path, site, environ
+):
+    """O59: the state records which providers' trees were proved read-only by this up."""
+    rig = Rig(hpc, tmp_path, site, environ)
+    rig.up()
+    services = rig.driver.store.read()["services"]
+    assert [name for name in PROVIDERS if services[name].get("mounts_proven")] == ["larch", "rowan", "alder", "hazel"]
+
+
+def test_o59_the_core_phase_run_by_hand_over_a_partial_up_does_not_start_without_every_proof(
+    hpc, tmp_path, site, environ
+):
+    """O59: `hpcfed.py core` runs the core's phase alone, which starts each tree's scan: over a partial up that failed
+    its proof for one owner (and never reached the others'), it refuses before the bootstrap, naming the first provider
+    with no proof, and the core is never called."""
+
+    def mounts(srun):
+        if srun.node == NODES["larch"]:
+            return rig.held_read_only(srun)
+        return (
+            1,
+            "[]\n",
+            "FAIL: shared import beta-space is mounted read-only (1 process(es), 0 read-only, 1 writable)\n",
+        )
+
+    rig = Rig(hpc, tmp_path, site, environ, mounts=mounts)
+    with pytest.raises(RuntimeError, match="not proven read-only"):
+        rig.up()
+    services = rig.driver.store.read()["services"]
+    assert services["larch"].get("mounts_proven")
+    assert not services["rowan"].get("mounts_proven")
+    with pytest.raises(RuntimeError, match=r"rowan's shared imported tree\(s\) have no read-only proof"):
+        rig.driver.core_here()
+    assert rig.core_calls == []
 
 
 # -- the environment is the driver's own ------------------------------------------------------------------------------

@@ -114,14 +114,15 @@ class Driver(Down):
 
     # -- up: what is checked and recorded before the cluster is touched -----------------------------------------------
 
-    def check_imports(self) -> None:
+    def check_imports(self, site: Site) -> None:
         """The shared imported trees (O59, DESIGN.md section 8), all checked before the cluster is touched.
 
         Every import a provider owns must be a shared one (`shared_imports_of` refuses the rest: a writable one copies
         its tree into the root, and one not marked shared would leave the sharing out of the platform file the core
         checks). Each shared import's tree and manifest are read from this driver's environment and checked, and no
-        manifest may hold more bytes than the support the layout gives its space. The core's step runs on a node whose
-        environment is an allowlist that carries none of the variables, so a shared import needs `[hpc] core =
+        manifest may hold more bytes than the support the layout gives its space, no tree may overlap another, and none
+        may be, hold or contain the root or the log directory, which this driver writes. The core's step runs on a node
+        whose environment is an allowlist that carries none of the variables, so a shared import needs `[hpc] core =
         "login"`. Every message names a space or a variable, never a path."""
         for provider in self.spec.providers:
             hpcimport.shared_imports_of(self.layout, provider.name)
@@ -137,9 +138,11 @@ class Driver(Down):
             self.layout.import_source(space.name, self.environ)
             self.layout.import_manifest(space.name, self.environ)
         hpcimport.check_support(self.layout, self.environ)
+        places = {"the federation's root": self.root, "the log directory (L)": Path(site.logs)}
+        hpcimport.check_separate(self.layout, self.environ, places)
 
     def preflight(self, site: Site) -> None:
-        self.check_imports()
+        self.check_imports(site)
         if self.layout.outer_roots or self.layout.inner_roots:
             raise RuntimeError("the root lies inside another federation's root, or holds one; refused")
         if self.root.exists() and not self.layout.owned and any(self.root.iterdir()):
@@ -391,7 +394,20 @@ class Driver(Down):
             raise RuntimeError(
                 f"{provider}'s shared imported tree(s) of {spaces} are not proven read-only: " + "; ".join(problems)
             )
+        self.set(lambda s: s["services"][provider].update(mounts_proven=True))
         self.say(f"{provider}: the shared imported tree(s) of {spaces} are held read-only")
+
+    def require_mount_proofs(self, state: Mapping[str, Any]) -> None:
+        """The core's phase starts a scan of every shared tree, so it never starts for an owner whose tree this up has
+        not proved read-only (`hpcfed.py core` run by hand over a partial up, for one)."""
+        for provider in self.spec.providers:
+            if hpcimport.shared_imports_of(self.layout, provider.name) and not state["services"][provider.name].get(
+                "mounts_proven"
+            ):
+                raise RuntimeError(
+                    f"{provider.name}'s shared imported tree(s) have no read-only proof recorded by this up: "
+                    "the core's phase does not start"
+                )
 
     def register(self, provider: str, workdir: str) -> None:
         """A one-hour single-use registration token, minted on the zone's node and piped into the provider's delivery
@@ -442,6 +458,7 @@ class Driver(Down):
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
             raise RuntimeError("the state names no owner of the providers' storage: the node facts did not run")
+        self.require_mount_proofs(state)
         s = self.settings
         values = hpc_values(state["command"], s.stop_bound_s, s.settle_timeout_s)
         out = self.core(self.placed_layout(state), owner, values, environ=self.environ)

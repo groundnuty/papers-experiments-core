@@ -9,7 +9,8 @@ platform file repeats and the core checks), and the mirrors keep node-local stor
 
 The hooks, in the order `up` meets them (DESIGN.md, section 8):
 
-0. `check_support`, in the preflight: the support the layout gives a space is no smaller than its tree's manifest.
+0. `check_support` and `check_separate`, in the preflight: the support the layout gives a space is no smaller than its
+   tree's manifest, and no tree overlaps another or a place the driver writes.
 1. `provider_import_args`: appended to a provider's `provider.sbatch` command, so its service mounts the trees it owns.
 2. `mount_check_argv`: the control step on each owner's node, once every provider is up, that proves from the mounts
    the service holds that each tree is read-only; before the bootstrap starts any scan. `mount_check_problems` reads
@@ -71,6 +72,35 @@ def check_support(layout, environ):
             )
         found[space.name] = wanted
     return found
+
+
+def overlap(first, second):
+    """Whether two real paths are one directory or one lies inside the other."""
+    return os.path.commonpath([first, second]) in (first, second)
+
+
+def check_separate(layout, environ, places):
+    """Refuse a federation that could write into a shared tree by a road the read-only bind does not close: a host-side
+    place the driver or its steps write (`places`, a label to a path: the root, which holds the state file and which
+    `down` empties, and the log directory) that is a shared tree, holds one or lies inside one, and two shared trees
+    that are one directory or one inside the other, each of which the layout means to have of its own. Real paths are
+    compared, since a root or log directory may be reached through a link above its parent that the layout's own
+    lexical check does not follow. A message names the space and its variable, never a path."""
+    trees = [(space, os.path.realpath(layout.import_source(space.name, environ))) for space in layout.shared_imports()]
+    for index, (space, tree) in enumerate(trees):
+        for other, found in trees[index + 1 :]:
+            if overlap(tree, found):
+                raise HpcImportRefused(
+                    f"spaces.{space.name} and spaces.{other.name}: the directories named by "
+                    f"{space.imported.source_env} and {other.imported.source_env} are one, or one is inside the "
+                    "other: each import needs a tree of its own"
+                )
+        for label, place in places.items():
+            if overlap(tree, os.path.realpath(place)):
+                raise HpcImportRefused(
+                    f"{label} is, holds or lies inside the directory named by {space.imported.source_env} "
+                    f"(spaces.{space.name}): the driver writes there, and nothing may be written to a shared tree"
+                )
 
 
 def import_storage_extra(uid, gid):
