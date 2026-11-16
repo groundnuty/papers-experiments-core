@@ -53,7 +53,7 @@ from expcore.package.spec import PackageError
 from expcore.provenance.codestamp import CodeVersionUnknown
 from expcore.provenance.redact import QuietParser, Redactor, stopped
 from expcore.provenance.redact import failure as shown_failure
-from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
+from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified, outcome_lines
 from expcore.report import summary_lines
 from expcore.study.example import ExampleError, write_example
 from expcore.study.merge import merge_shards
@@ -278,9 +278,8 @@ def _check(args: argparse.Namespace) -> int:
         code_root=args.code_root,
         partial=args.partial,
     )
-    for failure in check["failures"]:
-        print(f"FAIL {failure['file']} [{failure['stage']}] {failure['error']}")
-    print(f"{check['n_ok']} of {check['n_records']} records passed")
+    for line in outcome_lines(check):
+        print(line)
     return EXIT_REFUSED if check["failures"] else EXIT_OK
 
 

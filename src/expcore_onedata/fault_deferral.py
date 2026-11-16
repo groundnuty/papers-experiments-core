@@ -21,10 +21,8 @@ import os
 
 from expcore.campaign.healthgate import DeferralBound
 from expcore.config.loading import load_toml
-from expcore_onedata.config import load_platform
+from expcore_onedata.config import PLATFORM_MODULE, load_platform  # the module a study lists for this platform
 from expcore_onedata.fault_settings import FaultSettings, heal_deferral_s, load_faults
-
-PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
 
 
 def declared_from_file(path: str | os.PathLike[str]) -> DeferralBound | None:

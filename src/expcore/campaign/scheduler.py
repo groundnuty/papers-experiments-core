@@ -75,6 +75,7 @@ from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
 from expcore.config.loading import ConfigError, Section
 from expcore.config.models import ModelTable
+from expcore.config.platform_loads import PlatformLoad, check_loads_listed
 from expcore.loop.config import AgentConfig
 from expcore.models.admission import admit_reading, max_tokens_ignored, reply_cap_unshown
 
@@ -143,6 +144,7 @@ class Scheduler:
         spend_journal: Path | None = None,
         platform_deferrals: Sequence[PlatformDeferral] = (),
         listed_platforms: Collection[str] | None = None,
+        platform_loads: Collection[PlatformLoad] = (),
     ):
         self.root, self.schema, self.manifest, self.fingerprint = Path(root), schema, manifest, fingerprint
         self.shard = shard  # a shard's start: `manifest` is then its part of the plan, `settings` its shares (#154)
@@ -181,7 +183,13 @@ class Scheduler:
             speaks = {
                 p.bound.platform for p in platform_deferrals if p.platform in listed and p.bound and p.bound.platform
             }
+            # a listed module that ran a platform's loader to answer speaks for that platform too, even when it answers
+            # None (a heal that is off), which names no module
+            speaks |= {module for p in platform_deferrals if p.platform in listed for module in p.loaded}
             self._check_listed(declared, reported, listed | speaks)
+            # what the study's build loaded through the core's own loaders: the plugin may hide what its objects
+            # declare, but not that the platform's loader ran (`platform_loads`, C11)
+            check_loads_listed(platform_loads, listed | speaks)
         if health is not None:  # the platform's own wait must fit under max_defer_s
             self._check_deferral(health, declared, reported, tuple(platform_deferrals))
         exclusive = [name for name, value in schema.exclusive.items() if value]
