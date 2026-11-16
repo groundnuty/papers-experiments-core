@@ -5,11 +5,13 @@ fails: never an empty listing read as a node with no listener (live: a check who
 listener, a false pass). The scripts run in plain bash on this host, over a PATH of stand-ins that lacks `ss`, or
 whose `ss` fails, or prints listeners as the real one does."""
 
+import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -180,6 +182,38 @@ def test_o57_the_service_itself_starts_with_its_home_in_its_work_directory():
     body = text[text.index("run_service() {") :]
     body = body[: body.index("\n}\n")]
     assert body.index('home_in "$W"') < body.index("run -- apptainer exec")
+
+
+def leftovers(kind: str, tmpfs: Path) -> subprocess.CompletedProcess:
+    """bundle/leftovers.py as down runs it on a node, here on a directory of this host's."""
+    argv = [sys.executable, "-I", "-B", str(BUNDLE / "leftovers.py"), kind, str(tmpfs)]
+    return subprocess.run(argv, capture_output=True, text=True, timeout=60, check=False)
+
+
+def test_o57_leftovers_counts_the_work_directories_of_ours_of_one_kind_and_nothing_else(tmp_path):
+    """O57: down's node check counts the directories named as make_workdir names them, of the kind asked, directly in
+    the tmpfs: another kind, another name, a file or a directory deeper down is no work directory of that kind."""
+    tmpfs = tmp_path / "tmpfs"
+    tmpfs.mkdir()
+    assert json.loads(leftovers("oz", tmpfs).stdout) == {"count": 0, "kind": "oz"}
+    for name in ("hpcop-oz.abc123", "hpcop-oz.XYZ789", "hpcop-op.abc123", "hpcop-oz.short", "other"):
+        (tmpfs / name).mkdir()
+    (tmpfs / "other" / "hpcop-oz.deeper").mkdir()
+    assert json.loads(leftovers("oz", tmpfs).stdout) == {"count": 2, "kind": "oz"}
+    assert json.loads(leftovers("op", tmpfs).stdout) == {"count": 1, "kind": "op"}
+
+
+def test_o57_leftovers_gives_no_count_for_a_tmpfs_that_is_a_link_or_cannot_be_read(tmp_path):
+    """O57: a tmpfs that is a link is not where the bundle made its work directories (lib.sh replaces a TMPDIR that is
+    a link), and one that cannot be read shows nothing: no count is printed, so down keeps the service unverified."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "linked").symlink_to(real)
+    for tmpfs in (tmp_path / "linked", tmp_path / "missing"):
+        done = leftovers("oz", tmpfs)
+        assert done.returncode != 0, tmpfs
+        assert done.stdout == "", tmpfs
+    assert leftovers("xx", real).returncode == 2
 
 
 def test_node_init_names_a_missing_ss_before_it_makes_anything(tmp_path, no_ss):

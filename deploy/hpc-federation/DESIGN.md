@@ -358,8 +358,9 @@ removed while held would let the next `up` or `down` lock another file of the sa
    was launched but whose log never named a work directory (seen live: a zone that failed in node-init before making
    one) is clean only when both are shown: its step has ended (listed no more, once seen listed, or cancelled by its
    id in 2, or with its srun client ended), and a read-only step on its node (`bundle/leftovers.py`) counts no work
-   directory of ours of its kind in the tmpfs. A step whose end cannot be shown, or a check that fails or prints no
-   count, keeps it unverified.
+   directory of ours of its kind in the tmpfs. A step whose end cannot be shown, a log that names a work directory the
+   driver refused, a tmpfs that is a link (the bundle then makes its work directories elsewhere, `lib.sh`), or a check
+   that fails or prints no count, keeps it unverified.
 4. `scancel <job>`, by the recorded id only; wait until `squeue -j` lists it no more (nor any `<job>+<k>`: a
    heterogeneous job's leader's cancel ends every component, S's included). Under `separate`, the agent's own job too,
    by its own id: both are cancelled before either's failure is raised, and the srun clients of both are ended. **Whatever
