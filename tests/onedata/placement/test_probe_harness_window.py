@@ -239,7 +239,9 @@ def test_o08_a_provider_whose_record_cannot_be_read_neither_confirms_nor_contrad
     and beta's, the next provider asked, says it ended before the cutoff: the eviction flags nothing."""
     seeded.clock = ticker.clock
     files, eviction, probes = hidden_eviction(client, provisioner, seeded, ticker)
-    seeded.resets.append([f"/transfers/{eviction}", 99, ALPHA_ID])
+    fault = [f"/transfers/{eviction}", 99, ALPHA_ID]
+    seeded.resets.append(fault)
     snapshot = run_window(probes, seeded, client, ticker, files)
+    assert fault[1] < 99  # alpha's record was asked for, and its connection reset
     assert_split_known(snapshot)
     assert snapshot["space_transfers"]["harness_before_window"] == 1
