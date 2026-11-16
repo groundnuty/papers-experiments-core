@@ -237,8 +237,8 @@ run's context, so its admission), and the caller keeps that thread's future as `
   `inject` runs, never across the body, whose length the injector does not know; a share of the run's admission
   (`retain_admission`) is held for the whole block, so the federation stays held exclusively through the baseline
   whatever the run's task does. While a block is open, from any thread, `start` (so `session` and `running`), a second
-  `prepared` and `recover` are refused at once as a defect of the caller (`RuntimeError`), before they wait for the
-  lock, which the block's `inject` may hold; `start`'s own block is waited for, as a start always was. `check` and
+  `prepared` and `recover` are refused at once as a defect of the caller (`RuntimeError`, a `prepared` block when it is
+  entered), before they wait for the lock, which the block's `inject` may hold; `start`'s own block is waited for, as a start always was. `check` and
   `snapshot` answer as usual. A `clear` or `finish` from any thread during the body returns at once (True: nothing is
   down) and makes the block's `inject` refuse as `injector_failure`, with nothing locked, journalled or stopped; one
   that comes while `inject` runs waits for it, as for a start, and restores what it took down. Either way nothing is
@@ -247,15 +247,18 @@ run's context, so its admission), and the caller keeps that thread's future as `
   its last clear, as `running` does. `running`'s cancellation (its event, `cancel_wait_s`) knows no block: a block's
   caller cancels it with a `clear`, or leaves it without `inject`. `inject` is refused (`RuntimeError`) outside its
   block, after the block ended and a second time.
-- **The window is unbounded, so `inject` re-checks** what the preparation found, before it touches anything and with
-  no reading of the injector's clock and no step, so that `start`'s journal, steps and clock are unchanged: the
-  exclusive admission the block was prepared under is the one held where `inject` is called (a thread that does not
-  carry the run's context holds none; `injector_failure`); the journal still holds no open injection (the recovery
-  found none; one journalled since is `injector_failure`, naming its label); the drain record still has passed; and the
-  link epoch the preparation read has not moved, read once every link check under way has ended (`LinkEpoch.settled`,
-  within `admission_timeout_s`, as a run's admission reads it), so no target is stopped after a heal began or a link
-  check found a pair failing in the window (the hold `federation_busy`, for these two and for a link check that
-  outlasts the wait).
+- **The window is unbounded, so a caller's block's `inject` re-checks** what the preparation found, before it
+  touches anything, with no reading of the injector's clock and no step; `start`'s own block, with no body between its
+  halves, reads nothing again, so `start` is unchanged. The exclusive admission the block was prepared under must be
+  the one held where `inject` is called (a thread that does not carry the run's context holds none; `injector_failure`);
+  the journal must still hold no open injection (the recovery found none; one journalled since is `injector_failure`,
+  naming its label); the drain record must still have passed; and the link epoch must not have moved. The preparation
+  reads the epoch, making the record when there is none (`LinkEpoch.ensure`, as the fault gate's check does), and
+  `inject` reads it again once every link check under way has ended (`LinkEpoch.settled`, within
+  `admission_timeout_s`, as a run's admission reads it). Only the same `id` and count at both ends counts as unmoved:
+  a record raised, missing (a raise that could not be written spoils it), made anew or unreadable at either end
+  refuses, so no target is stopped after a heal began or a link check found a pair failing in the window (the hold
+  `federation_busy`, for the drain record, the epoch and a link check that outlasts the wait).
 - **Who can move them while the exclusive admission is held.** No other run, and no health check or heal of the gate
   holding the federation: the gate's link check needs a shared hold, and its heal and its recoveries an exclusive one of
   their own (`RECOVERY`). What remains: a health check in the run's own context, whose link check can raise the epoch;
@@ -383,7 +386,7 @@ class PreparedInjection:
         self._injector = injector
         self._own = own  # `start`'s own block, whose body is `inject` alone: waited for, never refused
         self._admission: Admission | None = None  # the exclusive admission the block was prepared under
-        self._epoch: Any = None  # the federation's link epoch as the preparation left it (`_epoch_note`)
+        self._epoch: tuple[str, int] | str | None = None  # a caller's block: the link epoch it was prepared at
         self._open = False  # the block's body runs: set once it is prepared, cleared as it ends
         self._used = False  # `inject` was called
         self._cleared = False  # a `clear` came while the body ran: `inject` takes nothing down
@@ -484,24 +487,27 @@ class FaultInjector:
         `identity` is the run's identity as a plain mapping with at least its `run_key` and `attempt`, which the snapshot
         names so the treatment rule counts the injection for this attempt only.
 
-        It is `prepared` with nothing in its body but `inject`, under the injector's lock for the whole of it, so a
-        clear waits for a start still running (see "A baseline before the stop").
+        It is its own `prepared` block with nothing in its body but `inject`, under the injector's lock for the whole
+        of it, so a clear waits for a start still running, and with no window between its halves it reads nothing again:
+        what a caller's block re-checks in `inject` guards a caller's body (see "A baseline before the stop").
         """
         self._refuse_inside_a_block("start")
         with self._mutex, self._block_for(identity, own=True) as block:
             block.inject()
 
-    def prepared(self, identity: Mapping[str, Any]) -> contextlib.AbstractContextManager[PreparedInjection]:
+    @contextlib.contextmanager
+    def prepared(self, identity: Mapping[str, Any]) -> Iterator[PreparedInjection]:
         """`start` in two halves, for a baseline between them (see "A baseline before the stop"): the entry admits,
         recovers what an earlier run left open and waits out the drain that recovery owes and the federation's drain
         record, raising as `start` does; the body runs with the federation held exclusively and nothing of the target
         touched; `inject()` on what it yields locks, journals and stops the target. The exit lets the admission go only
         when nothing is down, however the body ends, and never restores: after `inject` the caller's `finish` or `clear`
         does, as after `start`. While the block is open, `start`, `prepared` and `recover` are refused at once
-        (`RuntimeError`), and a `clear` makes `inject` refuse.
+        (`RuntimeError`), and a `clear` makes `inject` refuse. Entering the block, not building it, is what is refused.
         """
         self._refuse_inside_a_block("prepared")
-        return self._block_for(identity, own=False)
+        with self._block_for(identity, own=False) as block:
+            yield block
 
     def _refuse_inside_a_block(self, what: str) -> None:
         """Refuse `what` at once while a caller's block is open, without waiting for the injector's lock, which that
@@ -521,7 +527,9 @@ class FaultInjector:
         try:
             with self._mutex:
                 self._prepare(identity)
-                block._admission, block._epoch = self._exclusive_admission(), self._epoch_note()
+                block._admission = self._exclusive_admission()
+                if not own:  # made when there is none, so that a raise spoiled in the body reads as moved
+                    block._epoch = self._epoch_note(make=True)
                 block._open = True
             yield block
         finally:
@@ -551,8 +559,8 @@ class FaultInjector:
         self._await_drain()  # the record is read after the journal was: see `_await_drain`
 
     def _inject_prepared(self, block: PreparedInjection) -> None:
-        """`inject` of `block`: refuse a call outside it or a second one, and one that a clear came before, then
-        re-check what the preparation found (`_recheck`) and take the target down (`_inject`)."""
+        """`inject` of `block`: refuse a call outside it or a second one, and one that a clear came before, then, for a
+        caller's block, re-check what the preparation found (`_recheck`), and take the target down (`_inject`)."""
         with self._mutex:
             if self._block is not block or not block._open:
                 raise RuntimeError("inject() is called inside its own prepared block, before that block ends")
@@ -561,14 +569,17 @@ class FaultInjector:
             block._used = True
             if block._cleared:
                 raise self._fail(f"a clear of {self.target} came before its injection, so nothing is taken down")
-            self._recheck(block)
+            if not block._own:  # `start`'s own block has no body between its halves: it reads nothing again
+                self._recheck(block)
             self._inject()
 
-    def _epoch_note(self) -> Any:
+    def _epoch_note(self, *, make: bool = False) -> tuple[str, int] | str | None:
         """The federation's link epoch as it stands (`fault_epoch`): its `id` and count, None when there is no record,
-        or a word for a record that cannot be read. Compared, never raised: `start` never read it before `inject` did."""
+        or a word for a record that cannot be read or made. With `make`, a record is made when there is none
+        (`LinkEpoch.ensure`, as the fault gate's check makes it). Never raised: `inject` refuses on what it says."""
+        epochs = LinkEpoch(self._settings.journal)
         try:
-            record = LinkEpoch(self._settings.journal).read()
+            record = epochs.ensure() if make else epochs.read()
         except (OSError, ValueError) as error:
             return f"unreadable ({type(error).__name__})"
         return None if record is None else (record["id"], record["epoch"])
@@ -579,7 +590,8 @@ class FaultInjector:
         held exclusively by the block's admission, where `inject` is called; the journal must still hold no open
         injection; the drain record must still have passed, and the link epoch must not have moved, read once every
         link check under way has ended (`LinkEpoch.settled`, as a run's admission reads it), else the hold
-        `federation_busy`."""
+        `federation_busy`. The epoch counts as unmoved only when both readings are the same `id` and count: a record
+        missing (a raise spoiled it), made anew or unreadable at either end is no proof that nothing was raised."""
         admission = block._admission
         if admission is None or self._exclusive_admission() is not admission:
             raise self._fail(
@@ -596,8 +608,11 @@ class FaultInjector:
         with epochs.settled(self._settings.admission_timeout_s, self._cancel) as settled:
             if not settled:
                 raise FederationBusy("a link check of the federation outlasted the wait for it: no injection")
-            moved = self._epoch_note() != block._epoch
-        if moved:
+            now = self._epoch_note()
+        if not isinstance(block._epoch, tuple):
+            noted = block._epoch or "missing"
+            raise FederationBusy(f"the federation's link epoch was {noted} when this block was prepared: no injection")
+        if now != block._epoch:
             raise FederationBusy(
                 "the federation's link epoch moved since this start's preparation (a heal began, or a link check found "
                 "a pair failing): no injection"
