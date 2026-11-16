@@ -16,6 +16,13 @@ is published from the timer's thread under `meta_lock`, before the sandbox's sto
 that outcome, the cell's own included, lasts at most the margin and `SETTLE_SLACK_S`: an outcome not decided by then,
 like an escalation that raised and whose quiesce did not show the cell gone, is `survived_kill`, never a clean kill.
 The first end published stands: an outcome decided later is kept among the cell's deadlines, never made the run's end.
+
+A cell runs under the completion bootstrap (`completion.py`, O55): its program is checked whole in the container before
+it runs, and a record written after the interpreter's exit carries this exec's nonce and the exit status. The record's
+lines are taken out of the streams as they are read, so the output is the program's own; what it showed is the
+result's `exec_check`, kept on the cell's record. An exec not known to have completed (the program not delivered whole,
+no record, a record on one stream only, a status docker reports other than the recorded one) that no timeout and no
+kill explains raises `ExecIncomplete`, naming its cause: never a cell that ran and printed nothing.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox.api import NOT_STARTED, RAN, ExecResult
+from expcore_onedata.sandbox.completion import Completion, ExecIncomplete
 from expcore_onedata.sandbox.containers import Names
 from expcore_onedata.sandbox.hostops import TIMED_OUT, HostOps, describe_error
 from expcore_onedata.sandbox.observe import Observer
@@ -421,6 +429,7 @@ class CellRunner:
         remaining = timeout_s - (time.monotonic() - entered)
         limit_s = max(remaining, 1.0) + CAP_MARGIN_S  # the backstop; the harness's timer below comes first
         limit = f"{limit_s:.3f}"
+        completion = Completion.for_source(code)  # the program checked whole, and its exit recorded (O55)
         argv = [
             "exec",
             "-i",
@@ -433,8 +442,7 @@ class CellRunner:
             "-s",
             "KILL",
             limit,
-            self._s.python,
-            "-",
+            *completion.argv(self._s.python),
         ]
         if remaining < 1:  # too little left to start it: nothing runs, no timer was started, so none fired
             return self._not_started(record)
@@ -450,22 +458,39 @@ class CellRunner:
                     self._running = timer  # what `settle` enforces when the run's body ends while it runs
                 timer.start()
             done = self._host.docker(
-                *argv, input=code, timeout=remaining + HOST_CALL_MARGIN_S, check=False, output_cap=self._output_cap
+                *argv,
+                input=code,
+                timeout=remaining + HOST_CALL_MARGIN_S,
+                check=False,
+                output_cap=self._output_cap,
+                marker=completion.marker,
             )
             (fired, deadline), timer_ended = self._end(timer, cell), True  # its outcome waited for at most `decide_s`
             rc, out, err = done.returncode, done.stdout, done.stderr
             if rc == TIMED_OUT and err.startswith("timed out after"):
                 gave_up, err = True, "docker exec did not return"
             used = time.monotonic() - entered
+            check = completion.check(done)
             res = ExecResult(
-                out, err, rc, time.monotonic() - t0, timed_out=gave_up or fired, output_cut=_output_cut(done, gave_up)
+                out,
+                err,
+                rc,
+                time.monotonic() - t0,
+                timed_out=gave_up or fired,
+                output_cut=_output_cut(done, gave_up),
+                exec_check=check.facts,
             )
             bound = BD.named(fired=fired, gave_up=gave_up, exit_code=rc, ran_s=res.duration_s, limit_s=limit_s)
+            # incomplete, and no bound or kill of the harness's own to say how it ended: never a result (O55)
+            incomplete = check.cause if not gave_up and not fired else None
             if record:
-                self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, deadline, wall0)
+                self._record_cell(code, res, before, up0, used, timeout_s, gave_up, fired, deadline, wall0, incomplete)
                 res.bound = bound if res.timed_out else None
             else:  # no timer ran: only the container's own bound, or the host's giving up, can have ended it (O39)
                 res.timed_out, res.bound = bound is not None, bound
+            if incomplete is not None and not res.timed_out and res.kill is None:
+                log.error("a cell's exec did not complete: %s", incomplete)
+                raise ExecIncomplete(incomplete, res)
         finally:  # whatever was raised: a timer that has not fired must not kill the next cell's processes
             if not timer_ended:  # one wait for the outcome, bounded, whichever way the cell ended
                 self._end(timer, cell)
@@ -502,6 +527,7 @@ class CellRunner:
         fired: bool,
         deadline: dict[str, Any] | None,
         wall0: float,
+        incomplete: str | None = None,
     ) -> None:
         rc = res.exit_code
         entry: dict[str, Any] = {
@@ -509,6 +535,7 @@ class CellRunner:
             "status": RAN,
             "exit_code": rc,
             "duration_s": res.duration_s,
+            "exec_check": res.exec_check,
         }
         events = self._obs.memory_facts(self._names.agent)["events"]
         if events is None:  # not known whether anything of this cell was killed
@@ -540,6 +567,10 @@ class CellRunner:
                 self._meta.setdefault("cell_output_cuts", []).append({"cell": entry["cell"], **res.output_cut})
         if res.timed_out and not escalated:  # now, and not only from the timer: a worker that closed the pipes must
             self.quiesce("time cap")  # not run on (after an escalation the deadline has done all a kill can)
+        if incomplete is not None and not res.timed_out and not res.kill:  # it raises: its cause is on its record
+            entry["incomplete"] = incomplete
+            with self.meta_lock:
+                self._meta.setdefault("exec_incomplete", []).append({"cell": entry["cell"], "cause": incomplete})
         self.cells.append(entry)
 
     def _with_deadline(self, res: ExecResult, entry: dict[str, Any], record: dict[str, Any] | None) -> bool:
