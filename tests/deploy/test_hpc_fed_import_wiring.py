@@ -513,9 +513,9 @@ def test_o59_main_gives_the_driver_the_environment_it_was_called_with(hpc, tmp_p
     seen = []
     original = hpc.cli.make_driver
 
-    def make(layout, root, runner=None, environ=None):
+    def make(layout, root, runner=None, environ=None, *, agent=True):
         seen.append(environ)
-        return original(layout, root, runner, environ)
+        return original(layout, root, runner, environ, agent=agent)
 
     monkeypatch.setattr(hpc.cli, "make_driver", make)
     root = str(tmp_path / "fed" / "root")

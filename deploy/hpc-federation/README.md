@@ -284,6 +284,12 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   and memory, every node's control reserve, `stop_seconds`, and where the core's phase runs (`core = "login"` or
   `"step"`). `layouts/pilot-shape.toml` has the pilot's shape with invented names: a zone, five providers, four data
   spaces and the probe space; its link check covers ten ordered pairs.
+- **The agent's node** (M5), when `[hpc] sandbox` declares it or the layout's platform template declares the
+  Apptainer sandbox's limits, is held at its own shape: by default (`sandbox_placement = "het"`) as component 1 of a
+  heterogeneous job, every step there with `--het-group=1`; or (`"separate"`) as a held job of its own. Either is read
+  back as the services' job is, and `down` releases both. The state file's `sandbox` record names its node, its job
+  and its het group, which M5's shard step takes. With the pilot's shape and a memory weight of 0.5 this bills about
+  42 units per hour, against 63 for one uniform 18 GB shape (`DESIGN.md`, section 1).
 - **`up`** submits one held job of `1 + providers` nodes and reads back what Slurm recorded (it cancels that one job if
   any field differs); places the zone on the first node and each provider on the next; reads each node's FQDN and
   address in a control step (`bundle/nodefacts.py`); runs `zone.sbatch` and `provider.sbatch` as service steps, each
@@ -293,7 +299,7 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   `platform.toml`, and runs the platform layer's link check, which writes `link-check.json` in the root; last, when
   the core has it, it starts the login node's fault relay (M4) and waits for its heartbeat.
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, checks each node
-  for the recorded work directory, cancels the held job by its id (never by user or name), ends the srun clients (run it on the login node that ran
+  for the recorded work directory, cancels the held job (and the agent's own job, under `"separate"`) by its id (never by user or name), ends the srun clients (run it on the login node that ran
   `up`: it finds them there), and
   removes the root. After a partial `up` it finds the job by its recorded id, or by its allocation's exact name.
 - **Every step** is `srun --jobid --exact` with a name, its size and `/usr/bin/env -i PATH=... LC_ALL=C TMPDIR=<node
@@ -308,10 +314,11 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
 **What has not run, and what the first live slot checks first:** that the login node reaches the services' 8443 (or,
 with `[hpc] core = "step"`, that the core's Python from a venv on the shared filesystem runs on a node); the two
 batch scripts as `--exact` steps of a multi-node job; the bootstrap's panel calls through 8443 with the LUMA local
-feed's mappings; the submit read-back's fields as the site's Slurm prints them; and the ten pairs passing over the
-cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`), which also
-repeats the mount check after a `start`; the agent's node's step (M5) is not built here. A layout with a shared import
-is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
+feed's mappings; the submit read-back's fields as the site's Slurm prints them, for each component of a heterogeneous
+job too, and a step with `--het-group=1` from the login node (`DESIGN.md`, section 9); and the ten pairs passing over
+the cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`), which
+also repeats the mount check after a `start`; the agent's node's step (M5) is not built here. A layout with a shared
+import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
 ## The scripts
 

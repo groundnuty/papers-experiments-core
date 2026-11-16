@@ -10,18 +10,27 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
+
+import tomllib
 
 SIZE = re.compile(r"([1-9][0-9]{0,6})([mg])")
 TIME = re.compile(r"(?:([0-9]{1,2})-)?([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
 SLURM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")  # an account or a partition
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}")
-HPC_KEYS = ("time", "stop_seconds", "core", "zone", "provider", "control", "sandbox")
+HPC_KEYS = ("time", "stop_seconds", "core", "zone", "provider", "control", "sandbox", "sandbox_placement")
 SIZE_KEYS = ("cpus", "memory")
 CORE_PLACES = ("login", "step")  # where the bootstrap and the link check run (DESIGN.md, section 9)
+# Where the agent's node is held (DESIGN.md, section 1): "het", the last component of a heterogeneous job, sized on its
+# own; "separate", a held job of its own, the fallback should a site refuse the first.
+SANDBOX_PLACEMENTS = ("het", "separate")
 KILL_TAIL_S = 30  # supervise.py's SIGKILL tail after the graceful stop's bound (lib.sh, stop_service)
 STEP_END_S = 60  # the longest the driver polls for a stopped service's step to leave squeue -s
 SETTLE_SLACK_S = 60  # what settle_timeout_s keeps beyond the stop's bound
+SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
+SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF
+PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
 DEFAULTS = {
     # From the live peaks: the zone about 4.0 GB of RSS and its 1.9 GB rootfs on tmpfs; a provider about 4.8 GB and its
     # 2.5 GB rootfs, plus its posix storage on the same tmpfs; the largest control step (a token's delivery) about
@@ -32,6 +41,9 @@ DEFAULTS = {
     "zone": {"cpus": 4, "memory": "8g"},
     "provider": {"cpus": 4, "memory": "10g"},
     "control": {"cpus": 1, "memory": "1g"},
+    # The coordinator's decision (16 Nov 2026): the agent's node is its own component of a heterogeneous job, so only
+    # it bills the agent's size; a site that refuses one takes "separate"; a uniform larger shape is the last resort.
+    "sandbox_placement": "het",
 }
 
 
@@ -61,6 +73,23 @@ class Role:
 
 
 @dataclass(frozen=True)
+class AgentLimits:
+    """The agent's limits as the layout's platform template declares them for the Apptainer sandbox (M5): what its
+    node must hold beside the gate, the dispatcher, the collector, the store and the staged image."""
+
+    cpus: float
+    memory_bytes: int
+    work_disk_bytes: int
+    tmp_bytes: int
+
+    def least(self) -> Size:
+        """The least sandbox step for these limits: the agent's cores plus the spare ones, and its memory, work and tmp
+        bytes (the last two on the node's tmpfs, charged to the step) plus the overhead."""
+        mib = -(-(self.memory_bytes + self.work_disk_bytes + self.tmp_bytes) // (1 << 20))
+        return Size(math.ceil(self.cpus) + SANDBOX_SPARE_CPUS, mib + SANDBOX_OVERHEAD_MIB)
+
+
+@dataclass(frozen=True)
 class HpcSettings:
     """A layout's `[hpc]` table, checked, with its defaults."""
 
@@ -71,6 +100,7 @@ class HpcSettings:
     provider: Size
     control: Size
     sandbox: Optional[Size] = None
+    sandbox_placement: str = "het"
 
     @property
     def time(self) -> str:
@@ -89,22 +119,36 @@ class HpcSettings:
     def roles(self, providers: Tuple[str, ...]) -> Tuple[Role, ...]:
         """The held job's nodes in order: the zone, each provider in the layout's order, then the agent's node."""
         roles = [Role("zone", "oz"), *(Role(name, "op") for name in providers)]
+        if self.sandbox is not None and "sandbox" in providers:
+            raise SettingsError('a provider named "sandbox" would lose its node to the agent\'s: rename the provider')
         if self.sandbox is not None:
             roles.append(Role("sandbox", "sandbox"))
         return tuple(roles)
 
     def node(self) -> Size:
-        """Every node's shape: the largest step it may run, plus the control reserve."""
-        largest = [self.zone, self.provider, *([self.sandbox] if self.sandbox else [])]
+        """Every service node's shape (the zone's and each provider's): the larger step, plus the control reserve. The
+        agent's node has a shape of its own (`sandbox_node`), never this one."""
         return Size(
-            max(s.cpus for s in largest) + self.control.cpus,
-            max(s.memory_mib for s in largest) + self.control.memory_mib,
+            max(self.zone.cpus, self.provider.cpus) + self.control.cpus,
+            max(self.zone.memory_mib, self.provider.memory_mib) + self.control.memory_mib,
         )
 
+    def sandbox_node(self) -> Optional[Size]:
+        """The agent's node's shape: its step plus the control reserve; None when the layout declares no such node."""
+        if self.sandbox is None:
+            return None
+        return Size(self.sandbox.cpus + self.control.cpus, self.sandbox.memory_mib + self.control.memory_mib)
+
     def billing_per_hour(self, nodes: int, memory_weight: float) -> float:
-        """What the held job bills per hour where a job bills the larger of its cores and the weight times its GB."""
-        node = self.node()
-        return nodes * max(float(node.cpus), memory_weight * node.memory_mib / 1024)
+        """What the federation bills per hour where each node bills the larger of its cores and the weight times its GB:
+        `nodes` counts every node held, the agent's node included, which bills at its own shape."""
+
+        def bill(size: Size) -> float:
+            return max(float(size.cpus), memory_weight * size.memory_mib / 1024)
+
+        sandbox = self.sandbox_node()
+        services = nodes - (1 if sandbox is not None else 0)
+        return services * bill(self.node()) + (bill(sandbox) if sandbox is not None else 0.0)
 
     @property
     def stop_bound_s(self) -> int:
@@ -151,8 +195,27 @@ def _seconds(value: Any) -> int:
     return total
 
 
-def load_settings(table: Optional[Mapping[str, Any]]) -> HpcSettings:
-    """The `[hpc]` table of a layout (None: every default), checked; SettingsError names the key."""
+def _sandbox(table: Mapping[str, Any], agent: Optional[AgentLimits]) -> Optional[Size]:
+    """The agent's node's step: as declared, never below what the agent's limits need when the layout's template
+    declares them; derived from those limits when the table declares none; else no agent's node."""
+    declared = _size(table["sandbox"], "sandbox") if "sandbox" in table else None
+    if agent is None:
+        return declared
+    least = agent.least()
+    if declared is None:
+        return least
+    if declared.cpus < least.cpus or declared.memory_mib < least.memory_mib:
+        raise SettingsError(
+            f"hpc.sandbox: is below what the agent's limits in the platform template need: {least.cpus} cores (its "
+            f"cores + {SANDBOX_SPARE_CPUS}) and {least.memory_mib} MiB (its memory, work and tmp bytes + "
+            f"{SANDBOX_OVERHEAD_MIB} MiB)"
+        )
+    return declared
+
+
+def load_settings(table: Optional[Mapping[str, Any]], agent: Optional[AgentLimits] = None) -> HpcSettings:
+    """The `[hpc]` table of a layout (None: every default), checked, with the agent's limits when its platform template
+    declares them (`agent_limits`); SettingsError names the key."""
     table = {} if table is None else table
     if not isinstance(table, Mapping):
         raise SettingsError("hpc: must be a table")
@@ -166,6 +229,8 @@ def load_settings(table: Optional[Mapping[str, Any]]) -> HpcSettings:
     core = merged["core"]
     if core not in CORE_PLACES:
         raise SettingsError("hpc.core: must be " + " or ".join(f'"{place}"' for place in CORE_PLACES))
+    if merged["sandbox_placement"] not in SANDBOX_PLACEMENTS:
+        raise SettingsError("hpc.sandbox_placement: must be " + " or ".join(f'"{p}"' for p in SANDBOX_PLACEMENTS))
     settings = HpcSettings(
         time_s=_seconds(merged["time"]),
         stop_seconds=stop,
@@ -173,11 +238,47 @@ def load_settings(table: Optional[Mapping[str, Any]]) -> HpcSettings:
         zone=_size(merged["zone"], "zone"),
         provider=_size(merged["provider"], "provider"),
         control=_size(merged["control"], "control"),
-        sandbox=_size(merged["sandbox"], "sandbox") if "sandbox" in merged else None,
+        sandbox=_sandbox(merged, agent),
+        sandbox_placement=merged["sandbox_placement"],
     )
     if settings.time_s <= 2 * settings.stop_bound_s:
         raise SettingsError("hpc.time: must exceed twice the stop's bound (stop_seconds + 90 s), or down cannot finish")
     return settings
+
+
+def _whole(limits: Mapping[str, Any], key: str) -> int:
+    value = limits.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SettingsError(f"the platform template's sandbox.limits.{key}: must be a whole number of bytes")
+    return value
+
+
+def agent_limits(template: Optional[Path]) -> Optional[AgentLimits]:
+    """The agent's limits from the layout's platform template, when it declares the Apptainer sandbox (`[sandbox]
+    backend = "apptainer"`, M5) and its `[sandbox.limits]`; None for any other template. Each `@...@` placeholder is
+    read as 0, as up has not filled it yet; a template that is not TOML even so is refused, naming the file."""
+    if template is None:
+        return None
+    try:
+        document = tomllib.loads(PLACEHOLDER.sub("0", template.read_text(encoding="utf-8")))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        why = type(error).__name__
+        raise SettingsError(f"{template.name}: the platform template could not be read ({why})") from None
+    sandbox = document.get("sandbox")
+    if not isinstance(sandbox, Mapping) or sandbox.get("backend") != "apptainer":
+        return None
+    limits = sandbox.get("limits")
+    if not isinstance(limits, Mapping):
+        raise SettingsError("the platform template's [sandbox.limits]: is required for the Apptainer sandbox")
+    cpus = limits.get("cpus")
+    if isinstance(cpus, bool) or not isinstance(cpus, (int, float)) or not 0 < cpus <= 256:
+        raise SettingsError("the platform template's sandbox.limits.cpus: must be a number of cores up to 256")
+    return AgentLimits(
+        cpus=float(cpus),
+        memory_bytes=_whole(limits, "memory_bytes"),
+        work_disk_bytes=_whole(limits, "work_disk_bytes"),
+        tmp_bytes=_whole(limits, "tmp_bytes"),
+    )
 
 
 # -- the site -----------------------------------------------------------------------------------------------------

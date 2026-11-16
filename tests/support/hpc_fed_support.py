@@ -6,6 +6,14 @@ changes it), `squeue -s` lists the steps still running, `scancel` ends a job or 
 (behind `srun ... /usr/bin/env -i <allowlist>`) is answered by what it runs: the node facts, the zone's exports, a
 teardown, the node check, the core's step. A service step writes its log as the bundle's batch scripts do: the work
 directory, then the zone's verdict, or the provider's wait for its token and, once its token is delivered, its verdict.
+
+A heterogeneous job (`sbatch <component 0> : <component 1>`) is kept as Slurm 24.11 documents one
+(heterogeneous_jobs.html): its leader's id is component 0's, component k's own id is the leader's plus k, `scontrol show
+job` answers one record per component (`HetJobId`, `HetJobOffset`), `squeue` lists `<leader>+<k>`, a scancel of the
+leader ends every component, and an option of Slurm's propagated list (`PROPAGATED`) passes from component 0 to the
+next while `--partition`, `--nodes`, `--ntasks-per-node` and `--cpus-per-task` fall back to Slurm's defaults. A second
+`sbatch` gets `second_id` (`[hpc] sandbox_placement = "separate"`). Every step must land on a node of the job and the
+component (`--het-group`) it names, or the fake fails the test.
 """
 
 import json
@@ -26,6 +34,9 @@ SITE = {
     "HPC_NODE_TMP": "/tmp",
 }
 PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+# Options Slurm passes from one component of a heterogeneous job to the next (heterogeneous_jobs.html, those sbatch
+# takes that the driver uses); every other option of a later component falls back to Slurm's default.
+PROPAGATED = ("--job-name", "--account", "--time", "--mem", "--no-requeue", "--export", "--output", "--chdir")
 
 
 @contextmanager
@@ -99,6 +110,7 @@ class Srun:
     output: str | None
     exact: bool
     overlap: bool
+    het_group: int | None = None
 
 
 def parse_srun(argv: list) -> Srun:
@@ -110,6 +122,8 @@ def parse_srun(argv: list) -> Srun:
             break
         if word.startswith("--jobid="):
             found["job"] = word.split("=", 1)[1]
+        elif word.startswith("--het-group="):
+            found["het_group"] = int(word.split("=", 1)[1])
         elif word == "--exact":
             found["exact"] = True
         elif word == "--overlap":
@@ -159,6 +173,11 @@ class FakeSlurm:
     unkillable: list = field(default_factory=list)  # clients that survive their end
     running_recorded: dict = field(default_factory=dict)  # fields scontrol reports once the job has been read twice
     reads: int = 0
+    second_id: str = "4343"  # the id a second sbatch prints (the agent's own held job)
+    submitted: dict = field(default_factory=dict)  # job id -> each component's options, as Slurm took them
+    component_recorded: dict = field(default_factory=dict)  # (job id, component) -> fields reported otherwise
+    job_states: dict = field(default_factory=dict)  # a job id other than job_id -> its state (else RUNNING)
+    node_lists: dict = field(default_factory=dict)  # (job id, component) -> the nodes it got, when a test says
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -169,35 +188,40 @@ class FakeSlurm:
         self.calls.append(argv)
         tool = argv[0]
         if tool == "sbatch":
-            self.asked = {w.split("=", 1)[0]: w.split("=", 1)[1] for w in argv[1:] if "=" in w}
-            return Completed(0, f"{self.job_id}\n", "")
+            ident = self.second_id if self.job_id in self.submitted else self.job_id
+            self.submitted[ident] = self._components(argv[1:])
+            if ident == self.job_id:
+                self.asked = self.submitted[ident][0]
+            return Completed(0, f"{ident}\n", "")
         if argv[:3] == ["scontrol", "show", "job"]:
-            if self.state == "GONE" or self.job_id in self.cancelled:
+            ident = argv[4]
+            if self.gone_job(ident):
                 return Completed(1, "", "slurm_load_jobs error: Invalid job id specified\n")
-            self.reads += 1
-            return Completed(0, self.scontrol_line(), "")
+            if ident == self.job_id:
+                self.reads += 1
+            return Completed(0, self.scontrol_lines(ident), "")
         if argv[:3] == ["scontrol", "show", "hostnames"]:
-            count = int(self.asked.get("--nodes", "0"))
-            return Completed(0, "\n".join(self.nodes[:count]) + "\n", "")
+            return Completed(0, "\n".join(n for n in argv[3].split(",") if n) + "\n", "")
         if tool == "squeue" and "-s" in argv:
-            if self.job_id in self.cancelled:
+            if self.job_id in self.cancelled or self.job_id not in argv[argv.index("-j") + 1].split(","):
                 return Completed(0, "", "")
             lines = [f"{self.job_id}.batch batch", f"{self.job_id}.extern extern"]
             lines += [f"{step} {name}" for name, step in self.steps.items()]
             return Completed(0, "\n".join(lines) + "\n", "")
         if tool == "squeue" and "-n" in argv:
             name = argv[argv.index("-n") + 1]
-            listed = self.queued and self.asked.get("--job-name") == name and self.job_id not in self.cancelled
-            return Completed(0, f"{self.job_id} {name}\n" if listed else "", "")
+            named = [i for i in self.listed_ids() if self._options(i.split("+")[0])[0].get("--job-name") == name]
+            lines = [f"{ident} {name}" for ident in named]
+            return Completed(0, "".join(f"{line}\n" for line in lines) if self.queued else "", "")
         if tool == "squeue":
-            gone = self.job_id in self.cancelled or self.state == "GONE"
-            return Completed(0, "" if gone else f"{self.job_id}\n", "")
+            ident = argv[argv.index("-j") + 1]
+            return Completed(0, "".join(f"{i}\n" for i in self.listed_ids() if i.split("+")[0] == ident), "")
         if tool == "scancel":
             target = argv[1]
             self.cancelled.append(target)
             if "." in target:
                 self.steps = {n: s for n, s in self.steps.items() if s != target}
-            else:
+            elif target == self.job_id:
                 self.steps = {}
             return Completed(0, "", "")
         if tool == "sacct":
@@ -207,32 +231,89 @@ class FakeSlurm:
             return Completed(self.relay_rc.get(argv[4], 0), "", "")
         raise AssertionError(f"an unexpected command: {argv}")
 
-    def scontrol_line(self) -> str:
-        count = int(self.asked.get("--nodes", "0"))
-        cpus = int(self.asked.get("--cpus-per-task", "0"))
-        fields = {
-            "JobId": self.job_id,
-            "JobName": self.asked.get("--job-name"),
-            "JobState": self.state,
-            "TimeLimit": self.asked.get("--time"),
-            "Requeue": "0",
-            "Account": self.asked.get("--account"),
-            "Partition": self.asked.get("--partition"),
-            "NumNodes": str(count),
-            "NumCPUs": str(count * cpus),
-            "MinMemoryNode": self.asked.get("--mem"),
-            "NodeList": f"node[01-{count:02d}]",
-            "StartTime": "2026-11-16T10:00:00",
-            "EndTime": "2026-11-16T12:00:00",
-            **self.recorded,
-            **(self.running_recorded if self.reads > 2 else {}),
-        }
-        return " ".join(f"{key}={value}" for key, value in fields.items()) + "\n"
+    @staticmethod
+    def _components(words) -> list:
+        """sbatch's words, one options dict per component, each later one with what Slurm propagates to it."""
+        groups, current = [], {}
+        for word in words:
+            if word == ":":
+                groups.append(current)
+                current = {}
+            else:
+                key, _, value = word.partition("=")
+                current[key] = value
+        groups.append(current)
+        first = groups[0]
+        return [first] + [{**{k: first[k] for k in PROPAGATED if k in first}, **group} for group in groups[1:]]
+
+    def _options(self, ident) -> list:
+        return self.submitted.get(ident) or [self.asked]
+
+    def gone_job(self, ident) -> bool:
+        if ident in self.cancelled:
+            return True
+        return (self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING")) == "GONE"
+
+    def listed_ids(self) -> list:
+        """What squeue's %i lists of every job still known: a job's id, or `<leader>+<k>` per component."""
+        found = []
+        for ident in self.submitted or {self.job_id: None}:
+            if not self.gone_job(ident):
+                count = len(self._options(ident))
+                found += [ident] if count == 1 else [f"{ident}+{k}" for k in range(count)]
+        return found
+
+    def placed(self, ident, component) -> list:
+        """The nodes a component got: the first free ones, in submit order, unless a test names them."""
+        if (ident, component) in self.node_lists:
+            return list(self.node_lists[(ident, component)])
+        start = 0
+        for job in self.submitted or {self.job_id: None}:
+            for index, options in enumerate(self._options(job)):
+                count = int(options.get("--nodes", "1"))
+                if (job, index) == (ident, component):
+                    return self.nodes[start : start + count]
+                start += count
+        return []
+
+    def scontrol_lines(self, ident) -> str:
+        components = self._options(ident)
+        lines = []
+        for index, options in enumerate(components):
+            count = int(options.get("--nodes", "1"))
+            cpus = int(options.get("--cpus-per-task", "1"))
+            het = {"HetJobId": ident, "HetJobOffset": str(index)} if len(components) > 1 else {}
+            fields = {
+                "JobId": str(int(ident) + index),
+                **het,
+                "JobName": options.get("--job-name"),
+                "JobState": self.state if ident == self.job_id else self.job_states.get(ident, "RUNNING"),
+                "TimeLimit": options.get("--time"),
+                "Requeue": "0" if "--no-requeue" in options else "1",
+                "Account": options.get("--account"),
+                "Partition": options.get("--partition", "default-partition"),
+                "NumNodes": str(count),
+                "NumCPUs": str(count * cpus),
+                "MinMemoryNode": options.get("--mem"),
+                "NodeList": ",".join(self.placed(ident, index)),
+                "StartTime": "2026-11-16T10:00:00",
+                "EndTime": "2026-11-16T12:00:00",
+            }
+            if (ident, index) == (self.job_id, 0):
+                fields.update({**self.recorded, **(self.running_recorded if self.reads > 2 else {})})
+            fields.update(self.component_recorded.get((ident, index), {}))
+            lines.append(" ".join(f"{key}={value}" for key, value in fields.items()))
+        return "\n".join(lines) + "\n"
 
     def _step(self, argv) -> Srun:
         srun = parse_srun(list(argv))
         self.calls.append(list(argv))
         self.sruns.append(srun)
+        if self.submitted:  # Slurm places a step only on a node of the job and the component it names
+            assert srun.job in self.submitted, f"a step of a job never submitted: {srun.job}"
+            assert srun.node in self.placed(srun.job, srun.het_group or 0), (
+                f"a step on {srun.node}, outside component {srun.het_group or 0} of job {srun.job}"
+            )
         return srun
 
     def start(self, argv, data=None):

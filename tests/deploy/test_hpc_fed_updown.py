@@ -291,14 +291,14 @@ def step_layout(tmp_path):
 
 
 def test_the_agents_node_is_held_and_placed_last_and_nothing_runs_or_is_torn_down_there(hpc, tmp_path, site):
-    """O57: [hpc] sandbox makes the agent's node one more role, the held job's last node; it enters the uniform shape,
-    gets no service step and no teardown, and has no ports of a service."""
+    """O57: [hpc] sandbox makes the agent's node one more role, placed last, as the held job's own component (its
+    shape never enters the service nodes'); it gets no service step and no teardown, and has no ports of a service."""
     control = 'control = { cpus = 1, memory = "1g" }'
     layout = edited_layout(tmp_path / "layout", control, control + '\nsandbox = { cpus = 8, memory = "17g" }')
     rig = Rig(hpc, tmp_path, site, layout=layout)
     rig.up()
-    assert (rig.fake.asked["--nodes"], rig.fake.asked["--cpus-per-task"]) == ("7", "9")
-    assert rig.fake.asked["--mem"] == "18432M"
+    assert (rig.fake.asked["--nodes"], rig.fake.asked["--cpus-per-task"]) == ("6", "5")
+    assert rig.fake.asked["--mem"] == "11264M"
     sandbox = rig.state()["services"]["sandbox"]
     assert sandbox["node"] == "node07"
     assert sandbox["ports"] == {}

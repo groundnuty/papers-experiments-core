@@ -24,7 +24,7 @@ from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore
 from hpcsettings import HpcSettings, Site
-from hpcslurm import Allocation, Client, Slurm, SlurmError
+from hpcslurm import READBACK, Allocation, Client, Shape, Slurm, SlurmError
 
 HERE = Path(__file__).resolve().parent
 CORE_MISMATCH = 97  # the exit status of a core step whose interpreter imports another core
@@ -95,12 +95,19 @@ class Driver(Down):
 
     def describe(self, weight: Optional[float] = None) -> str:
         roles = self.settings.roles(tuple(p.name for p in self.spec.providers))
-        node, s = self.settings.node(), self.settings
+        node, agent, s = self.settings.node(), self.settings.sandbox_node(), self.settings
+        services = len(roles) - (1 if agent is not None else 0)
         lines = [
             f"layout: {self.spec.source} (project {self.spec.project}); root {self.root}",
-            f"held job: {len(roles)} node(s) of {node.cpus} cores and {node.memory_mib} MiB, --time {s.time}, "
-            f"--no-requeue; {len(roles) * node.cpus} cores and {len(roles) * node.memory_mib} MiB in all",
+            f"held job: {services} node(s) of {node.cpus} cores and {node.memory_mib} MiB, --time {s.time}, "
+            f"--no-requeue; {services * node.cpus} cores and {services * node.memory_mib} MiB in all",
         ]
+        if agent is not None:
+            where = {
+                "het": 'component 1 of the held job (a heterogeneous job: sandbox_placement "het")',
+                "separate": 'a held job of its own (sandbox_placement "separate")',
+            }[s.sandbox_placement]
+            lines.append(f"the agent's node: 1 node of {agent.cpus} cores and {agent.memory_mib} MiB, {where}")
         for index, role in enumerate(roles):
             size = s.size(role.kind)
             lines.append(f"node {index}: {role.name} ({role.kind}), its step {size.cpus} cores, {size.memory_mib} MiB")
@@ -142,6 +149,7 @@ class Driver(Down):
         hpcimport.check_separate(self.layout, self.environ, places)
 
     def preflight(self, site: Site) -> None:
+        self.settings.roles(tuple(p.name for p in self.spec.providers))  # a provider named like the agent's role
         self.check_imports(site)
         if self.layout.outer_roots or self.layout.inner_roots:
             raise RuntimeError("the root lies inside another federation's root, or holds one; refused")
@@ -158,7 +166,10 @@ class Driver(Down):
         if self.settings.core == "step" and not site.core_python:
             raise RuntimeError('[hpc] core = "step" needs HPC_CORE_PYTHON, the core\'s Python on the nodes')
         if self.settings.sandbox is not None:
-            self.say("the layout declares the agent's node: it is held and placed, and nothing runs on it yet (M5)")
+            self.say(
+                f"the layout declares the agent's node ({self.settings.sandbox_placement}): it is held and placed, and "
+                "only its node facts step runs on it here (M5's shard step runs the agent)"
+            )
 
     def prepare_root(self) -> None:
         private_directory(self.root)
@@ -172,6 +183,7 @@ class Driver(Down):
     def initial_state(self, site: Site) -> Dict[str, Any]:
         roles = self.settings.roles(tuple(p.name for p in self.spec.providers))
         node = self.settings.node()
+        name = f"hpcop-{self.spec.project[:40]}-{secrets.token_hex(4)}"
         return {
             "format": hpcstate.FORMAT,
             "project": self.spec.project,
@@ -180,7 +192,7 @@ class Driver(Down):
             "command": list(self.command),
             "site": site.to_json(),
             "allocation": {
-                "name": f"hpcop-{self.spec.project[:40]}-{secrets.token_hex(4)}",
+                "name": name,
                 "job": None,
                 "nodes": [],
                 "cpus_per_node": node.cpus,
@@ -190,6 +202,7 @@ class Driver(Down):
                 "started": None,
                 "ends": None,
             },
+            "sandbox": self.sandbox_record(name),
             "roles": [role.name for role in roles],
             "services": {role.name: hpcstate.new_service(role.kind) for role in roles},
             "clients": {},
@@ -197,15 +210,57 @@ class Driver(Down):
             "phase": "preflight",
         }
 
+    def sandbox_record(self, name: str) -> Optional[Dict[str, Any]]:
+        """Where the agent's node is held (DESIGN.md, section 4), None without one: M5's shard driver reads `node`, and
+        launches its step with `--jobid=<job>`, plus `--het-group=<het_group>` when that is not None. Its own job, under
+        `separate`, is named apart (`<name>-sandbox`), so each job is found by its own exact name."""
+        shape = self.settings.sandbox_node()
+        if shape is None:
+            return None
+        het = self.settings.sandbox_placement == "het"
+        return {
+            "placement": self.settings.sandbox_placement,
+            "name": name if het else f"{name}-sandbox",
+            "job": None,
+            "het_group": 1 if het else None,
+            "component_job": None,  # het: the component's own id, under which squeue -s and sacct list its steps
+            "node": None,
+            "cpus_per_node": shape.cpus,
+            "memory_mib_per_node": shape.memory_mib,
+            "time": self.settings.time,
+            "readback": None,
+            "started": None,
+            "ends": None,
+        }
+
     def allocation(self, state: Mapping[str, Any], site: Site) -> Allocation:
-        node = self.settings.node()
+        """The held job: the service nodes, and the agent's node as its component 1 under `het`."""
+        node, agent = self.settings.node(), self.settings.sandbox_node()
+        het = agent is not None and self.settings.sandbox_placement == "het"
         return Allocation(
             name=state["allocation"]["name"],
             account=site.account,
             partition=site.partition,
-            nodes=len(state["roles"]),
+            nodes=sum(1 for role in state["roles"] if state["services"][role]["kind"] != "sandbox"),
             cpus_per_node=node.cpus,
             memory_mib=node.memory_mib,
+            time=self.settings.time,
+            time_s=self.settings.time_s,
+            het=(Shape(1, agent.cpus, agent.memory_mib),) if het and agent is not None else (),
+        )
+
+    def sandbox_allocation(self, state: Mapping[str, Any], site: Site) -> Optional[Allocation]:
+        """The agent's own held job under `separate` (one node of its own shape), else None."""
+        record, agent = state.get("sandbox"), self.settings.sandbox_node()
+        if record is None or agent is None or record["placement"] != "separate":
+            return None
+        return Allocation(
+            name=record["name"],
+            account=site.account,
+            partition=site.partition,
+            nodes=1,
+            cpus_per_node=agent.cpus,
+            memory_mib=agent.memory_mib,
             time=self.settings.time,
             time_s=self.settings.time_s,
         )
@@ -220,20 +275,17 @@ class Driver(Down):
 
     def bring_up(self, site: Site) -> str:
         state = self.store.create(self.initial_state(site))
-        asked = self.allocation(state, site)
-        job = self.slurm.submit(asked)
-        self.set(lambda s: (s["allocation"].update(job=job), s.update(phase="submitted")))
-        self.say(f"held job {job} submitted ({asked.nodes} nodes); reading back what Slurm recorded")
-        readback = self.slurm.readback(job, asked)
-        self.set(lambda s: s["allocation"].update(readback=readback))
-        self.slurm.wait_running(job, self.timeouts["queue"])
-        # Once more on the running job: the scheduler may allocate more than a pending request showed.
-        readback = self.slurm.readback(job, asked)
-        info = self.slurm.job(job) or {}
-        nodes = self.slurm.hostnames(info.get("NodeList", ""))
-        if len(nodes) != asked.nodes:
-            raise SlurmError(f"the held job runs on {len(nodes)} node(s), not the {asked.nodes} asked for")
-        self.set(lambda s: (self.place(s, nodes, info), s["allocation"].update(readback=readback)))
+        asked, alone = self.allocation(state, site), self.sandbox_allocation(state, site)
+        held = [(self.submit(asked, "allocation"), asked)]
+        if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
+            held.append((self.submit(alone, "sandbox"), alone))
+        for job, wanted in held:
+            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name)
+        # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
+        records = [(job, shape, record) for job, wanted in held for shape, record in zip(
+            wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
+        placed = self.placed_nodes(records)
+        self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
         self.node_facts()
         self.zone_up()
         self.providers_up()
@@ -258,10 +310,64 @@ class Driver(Down):
         )  # fmt: skip
         return "fault relay: serving"
 
-    def place(self, state: Dict[str, Any], nodes: List[str], info: Mapping[str, str]) -> None:
-        state["allocation"].update(nodes=nodes, started=info.get("StartTime"), ends=info.get("EndTime"))
-        for role, node in zip(state["roles"], nodes):
+    def submit(self, asked: Allocation, key: str) -> str:
+        """Submit one held job (`key`: "allocation", the services' job, or "sandbox", the agent's own); its id is
+        recorded as soon as sbatch prints it, before the read-back, which cancels that one job unless Slurm recorded
+        every component as asked."""
+        job = self.slurm.submit(asked)
+
+        def submitted(state: Dict[str, Any]) -> None:
+            state[key]["job"] = job
+            if asked.het:  # the agent's node is this job's component 1
+                state["sandbox"]["job"] = job
+            state["phase"] = "submitted"
+
+        self.set(submitted)
+        self.say(f"held job {job} submitted ({sum(s.nodes for s in asked.shapes())} nodes); reading back what Slurm "
+                 "recorded")  # fmt: skip
+        records = self.slurm.checked(job, asked)
+        self.set(lambda s: self.record_readback(s, key, records))
+        return job
+
+    @staticmethod
+    def record_readback(state: Dict[str, Any], key: str, records: Sequence[Mapping[str, str]]) -> None:
+        state[key]["readback"] = {field: records[0][field] for field in READBACK}
+        if len(records) > 1:  # the heterogeneous job's component 1: the agent's node, with its own job id
+            readback = {field: records[1][field] for field in READBACK}
+            state["sandbox"].update(readback=readback, component_job=records[1]["JobId"])
+
+    def placed_nodes(self, records: Sequence[Any]) -> List[List[str]]:
+        """Each component's nodes, the services' first and the agent's last, as Slurm placed them. A component on
+        another count of nodes than asked, or on a node another holds (no node runs two services, nor the agent beside
+        one), fails up, its job cancelled by its id before any step."""
+        found: List[List[str]] = []
+        seen: set = set()
+        for job, shape, record in records:
+            nodes = self.slurm.hostnames(record.get("NodeList", ""))
+            twice = sorted((set(nodes) & seen) | {n for n in nodes if nodes.count(n) > 1})
+            if len(nodes) != shape.nodes or twice:
+                self.slurm.cancel(job)
+                why = f"on {', '.join(twice)}, held twice" if twice else f"on {len(nodes)} node(s)"
+                raise SlurmError(f"job {job} was placed {why}, not on the {shape.nodes} asked for; it was cancelled")
+            seen.update(nodes)
+            found.append(nodes)
+        return found
+
+    def place(self, state: Dict[str, Any], placed: List[List[str]], records: Sequence[Mapping[str, str]]) -> None:
+        """Each role on its node: the services on the held job's (component 0's) in the layout's order, the agent's
+        node on its own component's or job's; the read-back of each, taken on the running jobs."""
+        roles = [role for role in state["roles"] if state["services"][role]["kind"] != "sandbox"]
+        first = records[0]
+        state["allocation"].update(nodes=placed[0], started=first.get("StartTime"), ends=first.get("EndTime"))
+        state["allocation"]["readback"] = {field: first[field] for field in READBACK}
+        for role, node in zip(roles, placed[0]):
             state["services"][role]["node"] = node
+        if state.get("sandbox") is not None:
+            node, agent = placed[1][0], records[1]
+            readback = {field: agent[field] for field in READBACK}
+            state["sandbox"].update(node=node, readback=readback, started=agent.get("StartTime"))
+            state["sandbox"]["ends"] = agent.get("EndTime")
+            state["services"]["sandbox"]["node"] = node
         state["phase"] = "placed"
 
     def node_facts(self) -> None:

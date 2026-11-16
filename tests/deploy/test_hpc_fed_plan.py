@@ -41,7 +41,8 @@ def test_the_held_job_holds_one_node_per_service_and_one_for_the_agent_when_decl
     with_agent = hpc.settings.load_settings({"sandbox": {"cpus": 8, "memory": "17g"}})
     roles = with_agent.roles(("a", "b"))
     assert [(r.name, r.kind) for r in roles] == [("zone", "oz"), ("a", "op"), ("b", "op"), ("sandbox", "sandbox")]
-    assert with_agent.node() == hpc.settings.Size(9, 18432)  # the largest step sets the uniform shape
+    assert with_agent.node() == hpc.settings.Size(5, 11264)  # the agent's node never sets the service nodes' shape
+    assert with_agent.sandbox_node() == hpc.settings.Size(9, 18432)
 
 
 def test_billing_is_the_larger_of_cores_and_the_weight_times_the_memory_per_node(hpc):

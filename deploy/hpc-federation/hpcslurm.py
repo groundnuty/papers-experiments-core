@@ -2,7 +2,9 @@
 
 - **The held job**: one `sbatch` holding the federation's nodes with `exec sleep`, `--no-requeue` and a `--time`; what
   Slurm recorded is read back (`scontrol show job -o`) and the job is cancelled, by its own id only, unless it is what
-  was asked for.
+  was asked for. A heterogeneous job (`sbatch <component 0> : <component 1>`, the agent's node as component 1) is read
+  back component by component: one record each, by `HetJobOffset`; squeue lists it as `<leader>+<k>`, and a cancel of
+  its leader's id ends every component.
 - **Every step** is `srun --jobid --exact` with a name, its cores and memory, and `/usr/bin/env -i` with an explicit
   allowlist in front of its command, so neither the login environment nor a site prolog decides what it sees. No step
   uses `--overlap`.
@@ -29,7 +31,12 @@ GONE_POLLS = 3  # a step absent from squeue -s this many polls in a row has ende
 READBACK = ("JobName", "TimeLimit", "Requeue", "Account", "Partition", "NumNodes", "NumCPUs", "MinMemoryNode")
 WAITING_STATES = ("PENDING", "CONFIGURING", "REQUEUED", "RESIZING")
 JOB_LINE = re.compile(r"([0-9]{1,12})(?:;[A-Za-z0-9_.-]+)?")
-STEP_LINE = re.compile(r"([0-9]{1,12}\.(?:[0-9]{1,9}|batch|extern))\s+(\S+)")
+JOB_LISTED = re.compile(r"([0-9]{1,12})(?:\+[0-9]{1,6})?")  # squeue's %i: a job, or a component <leader>+<k>
+# A step as squeue -s lists it: of a job, or of a heterogeneous job's component (<leader>+<k>.<n>, or the
+# component's own id); the batch and extern steps included.
+STEP_LINE = re.compile(r"([0-9]{1,12}(?:\+[0-9]{1,6})?\.(?:[0-9]{1,9}|batch|extern))\s+(\S+)")
+STEP_ID = re.compile(r"[0-9]{1,12}(?:\+[0-9]{1,6})?\.[0-9]{1,9}")
+OFFSET = re.compile(r"[0-9]{1,6}")
 
 
 class SlurmError(RuntimeError):
@@ -180,8 +187,17 @@ class Runner:
 
 
 @dataclass(frozen=True)
+class Shape:
+    """One component of a held job: its nodes, and each node's cores and memory."""
+
+    nodes: int
+    cpus_per_node: int
+    memory_mib: int
+
+
+@dataclass(frozen=True)
 class Allocation:
-    """The held job, as asked for."""
+    """The held job, as asked for: one component, or more for a heterogeneous job (`het`, components 1 and on)."""
 
     name: str
     account: str
@@ -191,9 +207,17 @@ class Allocation:
     memory_mib: int
     time: str
     time_s: int
+    het: Tuple[Shape, ...] = ()
+
+    def shapes(self) -> Tuple[Shape, ...]:
+        """Every component's shape, component 0 first."""
+        return (Shape(self.nodes, self.cpus_per_node, self.memory_mib), *self.het)
 
     def argv(self) -> List[str]:
-        return [
+        """sbatch's argv. A further component follows a `:` and names its account, partition and time again (Slurm
+        propagates no partition, nodes or cores to it, and the read-back checks what it recorded) with its own nodes,
+        cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once."""
+        argv = [
             "sbatch",
             "--parsable",
             f"--job-name={self.name}",
@@ -210,11 +234,25 @@ class Allocation:
             "--export=NONE",
             f"--wrap=exec sleep {self.time_s}",
         ]
+        for shape in self.het:
+            argv += [
+                ":",
+                f"--account={self.account}",
+                f"--partition={self.partition}",
+                f"--time={self.time}",
+                f"--nodes={shape.nodes}",
+                "--ntasks-per-node=1",
+                f"--cpus-per-task={shape.cpus_per_node}",
+                f"--mem={shape.memory_mib}M",
+            ]
+        return argv
 
 
 @dataclass(frozen=True)
 class Step:
-    """One job step: where it runs, its size, its name, and its command behind the environment allowlist."""
+    """One job step: where it runs, its size, its name, and its command behind the environment allowlist. A step in a
+    heterogeneous job's further component names it (`het_group`, srun's `--het-group`; a step without one runs in
+    component 0) and that component's own job id (`component`), by which squeue -s and sacct list its steps."""
 
     job: str
     node: str
@@ -224,12 +262,21 @@ class Step:
     env: Tuple[str, ...]
     command: Tuple[str, ...]
     output: Optional[str] = None
+    het_group: Optional[int] = None
+    component: Optional[str] = None
+
+    @property
+    def listed_as(self) -> str:
+        """The job id squeue -s and sacct list this step under."""
+        return self.component or self.job
 
     def argv(self) -> List[str]:
         out = [f"--output={self.output}"] if self.output else []
+        group = [] if self.het_group is None else [f"--het-group={self.het_group}"]
         return [
             "srun",
             f"--jobid={self.job}",
+            *group,
             "--exact",
             "-N1",
             "-n1",
@@ -295,19 +342,40 @@ def _count(value: str) -> Optional[int]:
     return int(match.group(1))
 
 
-def mismatches(recorded: Mapping[str, str], asked: Allocation) -> List[str]:
-    """The fields of the held job Slurm recorded otherwise than asked, by name; empty when it is what was asked."""
+def mismatches(recorded: Mapping[str, str], asked: Allocation, shape: Optional[Shape] = None) -> List[str]:
+    """The fields of the held job (or of one of its components, `shape`) Slurm recorded otherwise than asked, by name;
+    empty when it is what was asked."""
+    shape = shape or asked.shapes()[0]
     wanted = {
         "JobName": (recorded.get("JobName"), asked.name),
         "TimeLimit": (limit_seconds(recorded.get("TimeLimit", "")), asked.time_s),
         "Requeue": (recorded.get("Requeue"), "0"),
         "Account": ((recorded.get("Account") or "").lower(), asked.account.lower()),
         "Partition": (recorded.get("Partition"), asked.partition),
-        "NumNodes": (_count(recorded.get("NumNodes", "")), asked.nodes),
-        "NumCPUs": (_count(recorded.get("NumCPUs", "")), asked.nodes * asked.cpus_per_node),
-        "MinMemoryNode": (memory_mib(recorded.get("MinMemoryNode", "")), asked.memory_mib),
+        "NumNodes": (_count(recorded.get("NumNodes", "")), shape.nodes),
+        "NumCPUs": (_count(recorded.get("NumCPUs", "")), shape.nodes * shape.cpus_per_node),
+        "MinMemoryNode": (memory_mib(recorded.get("MinMemoryNode", "")), shape.memory_mib),
     }
     return [field for field in READBACK if wanted[field][0] != wanted[field][1]]
+
+
+def component_mismatches(records: Sequence[Mapping[str, str]], asked: Allocation, job: str) -> List[str]:
+    """What a job's records (one per component, `Slurm.components`) hold otherwise than asked: a missing or extra
+    component, or a field of one, named with its component in a heterogeneous job."""
+    shapes = asked.shapes()
+    if len(records) != len(shapes):
+        return [f"its components ({len(records)} recorded, {len(shapes)} asked)"]
+    wrong: List[str] = []
+    for index, (record, shape) in enumerate(zip(records, shapes)):
+        named = mismatches(record, asked, shape)
+        if asked.het:
+            own = record.get("JobId", "")
+            if record.get("HetJobId") != job or record.get("HetJobOffset") != str(index):
+                named.append("HetJobOffset")
+            if not JOB_LINE.fullmatch(own) or ";" in own or (index == 0) != (own == job):
+                named.append("JobId")
+        wrong += [f"component {index}'s {field}" if asked.het else field for field in named]
+    return wrong
 
 
 class Slurm:
@@ -345,41 +413,74 @@ class Slurm:
             raise SlurmError("sbatch printed no job id")
         return match.group(1)
 
-    def job(self, job: str) -> Optional[Dict[str, str]]:
-        """What Slurm records of a job, or None when it no longer knows it."""
+    def records(self, job: str) -> Optional[List[Dict[str, str]]]:
+        """Every record `scontrol show job -o` answers for a job id, one per line: the job's, or each component's of a
+        heterogeneous job asked by its leader's id; None when Slurm no longer knows the id."""
         done = self.runner.run(["scontrol", "show", "job", "-o", job], self.command_timeout_s)
         if done.returncode != 0:
             if "Invalid job id" in done.stderr:
                 return None
             raise SlurmError(f"scontrol show job failed with status {done.returncode}: {done.stderr.strip()[:300]}")
-        fields = _fields(done.stdout)
-        if fields.get("JobId") != job:
+        found = [_fields(line) for line in done.stdout.splitlines() if line.strip()]
+        if not any(record.get("JobId") == job for record in found):
             raise SlurmError("scontrol show job answered for another job")
-        return fields
+        return found
 
-    def readback(self, job: str, asked: Allocation) -> Dict[str, str]:
-        """What Slurm recorded of the job just submitted; unless it is what was asked, cancel that one job and fail,
-        naming the fields."""
-        recorded = self.job(job)
-        wrong = ["the job itself"] if recorded is None else mismatches(recorded, asked)
+    def job(self, job: str) -> Optional[Dict[str, str]]:
+        """What Slurm records of a job (of a heterogeneous job, its component 0), or None when it no longer knows it."""
+        found = self.records(job)
+        return None if found is None else next(r for r in found if r.get("JobId") == job)
+
+    def components(self, job: str) -> Optional[List[Dict[str, str]]]:
+        """The job's records in component order: its own alone, or a heterogeneous job's (its leader's id) by
+        `HetJobOffset`; None when Slurm no longer knows the id."""
+        found = self.records(job)
+        if found is None:
+            return None
+        het = [record for record in found if record.get("HetJobId") == job]
+        if not het:
+            return [record for record in found if record.get("JobId") == job]
+        if not all(OFFSET.fullmatch(record.get("HetJobOffset", "")) for record in het):
+            raise SlurmError("a component of the heterogeneous job has no offset")
+        return sorted(het, key=lambda record: int(record["HetJobOffset"]))
+
+    def checked(self, job: str, asked: Allocation) -> List[Dict[str, str]]:
+        """Every component's record of the job just submitted, read back; unless each is what was asked, cancel that
+        one job (a heterogeneous job by its leader's id, which ends every component) and fail, naming the fields."""
+        records = self.components(job)
+        self._ours(job, records, asked.name)
+        wrong = ["the job itself"] if records is None else component_mismatches(records, asked, job)
         if wrong:
             self.cancel(job)
             raise SlurmError(f"the held job was recorded otherwise than asked ({', '.join(wrong)}); it was cancelled")
-        assert recorded is not None
-        return {field: recorded[field] for field in READBACK}
+        assert records is not None
+        return records
 
-    def wait_running(self, job: str, timeout_s: float) -> Dict[str, str]:
-        """Wait for the held job to run; at the bound, or if it ends first, cancel it by its id and fail."""
+    def readback(self, job: str, asked: Allocation) -> Dict[str, str]:
+        """`checked`, reduced to the read-back's fields of component 0."""
+        return {field: self.checked(job, asked)[0][field] for field in READBACK}
+
+    @staticmethod
+    def _ours(job: str, records: Optional[Sequence[Mapping[str, str]]], name: Optional[str]) -> None:
+        """Slurm reuses ids: a job id whose job (component 0) carries another name than the one submitted is not ours,
+        and is never cancelled; fail instead, naming it."""
+        if records and name is not None and records[0].get("JobName") != name:
+            raise SlurmError(f"job {job} carries another job's name: not the job submitted, and not cancelled")
+
+    def wait_running(self, job: str, timeout_s: float, name: Optional[str] = None) -> Dict[str, str]:
+        """Wait for the held job (every component of it) to run; at the bound, or if it ends first, cancel it by its
+        id and fail. With `name`, a job that carries another is never cancelled (`_ours`)."""
         deadline = self.clock() + timeout_s
         while True:
-            fields = self.job(job)
-            state = None if fields is None else fields.get("JobState")
-            if state == "RUNNING":
-                assert fields is not None
-                return fields
-            if state not in WAITING_STATES:
+            records = self.components(job) or []
+            self._ours(job, records, name)
+            states = [record.get("JobState") for record in records]
+            if states and all(state == "RUNNING" for state in states):
+                return records[0]
+            ended = [state for state in states if state not in (*WAITING_STATES, "RUNNING")]
+            if not states or ended:
                 self.cancel(job)
-                raise SlurmError(f"the held job is {state or 'gone'} before it ran")
+                raise SlurmError(f"the held job is {(ended or ['gone'])[0]} before it ran")
             if self.clock() >= deadline:
                 self.cancel(job)
                 raise SlurmError(f"the held job did not start within {timeout_s:.0f} s; it was cancelled")
@@ -393,18 +494,22 @@ class Slurm:
         return nodes
 
     def jobs_named(self, user: str, name: str) -> List[str]:
-        """The ids of this user's jobs with exactly this name (the allocation's, which holds up's random part)."""
+        """The ids of this user's jobs with exactly this name (the allocation's, which holds up's random part); a
+        heterogeneous job, listed once per component (`<leader>+<k>`), counts once, by its leader's id."""
         done = self._call(["squeue", "-u", user, "-h", "-n", name, "-o", "%i %j"])
-        found = []
+        found: List[str] = []
         for line in done.stdout.splitlines():
             words = line.split()
-            if len(words) == 2 and words[1] == name and JOB_LINE.fullmatch(words[0]):
-                found.append(words[0])
+            match = JOB_LISTED.fullmatch(words[0]) if len(words) == 2 and words[1] == name else None
+            if match and match.group(1) not in found:
+                found.append(match.group(1))
         return found
 
     def gone(self, job: str) -> bool:
+        """Whether squeue lists the job no more: neither its id nor any component of it (`<job>+<k>`)."""
         done = self._call(["squeue", "-h", "-j", job, "-o", "%i"])
-        return job not in done.stdout.split()
+        listed = (JOB_LISTED.fullmatch(word) for word in done.stdout.split())
+        return not any(match and match.group(1) == job for match in listed)
 
     def cancel(self, job: str) -> None:
         """Cancel one job by its id: never by user, never by name."""
@@ -429,7 +534,8 @@ class Slurm:
         return found
 
     def cancel_step(self, step_id: str) -> None:
-        if not re.fullmatch(r"[0-9]{1,12}\.[0-9]{1,9}", step_id):
+        """Cancel one step by the id squeue -s lists it under: `<job>.<n>`, or a component's `<leader>+<k>.<n>`."""
+        if not STEP_ID.fullmatch(step_id):
             raise SlurmError("refusing to cancel something that is not one step id")
         self._call(["scancel", step_id])
 
@@ -453,15 +559,15 @@ class Slurm:
         absent = 0
         deadline = self.clock() + max(self.poll_s * (GONE_POLLS + 2), 30.0)
         while self.clock() < deadline:
-            listed = self.steps(step.job)
+            listed = self.steps(step.listed_as)
             absent = 0 if step.name in listed else absent + 1
             if absent >= GONE_POLLS:
                 process.kill()
                 done = process.result()
-                return Completed(self.step_status(step.job, step.name), done.stdout, done.stderr)
+                return Completed(self.step_status(step.listed_as, step.name), done.stdout, done.stderr)
             if process.wait(self.poll_s):
                 return process.result()
-        listed = self.steps(step.job)
+        listed = self.steps(step.listed_as)
         if step.name in listed:
             self.cancel_step(listed[step.name])
         process.kill()
