@@ -224,6 +224,17 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository.
 
+**Who owns what.** The federation operator owns the `site.env` every `up` reads and fills every pin in it. A study
+supplies its agent image; the operator supplies what is built for that image or for the nodes. Each file is declared
+with its SHA-256, which `up` checks (below, "The agent's sandbox").
+
+| Keys | Supplied by | What |
+|---|---|---|
+| `HPC_AGENT_SIF`, `HPC_AGENT_SIF_SHA256` | the study | the agent's SIF and its SHA-256, in an owner-only (0700) directory under the images path `site.env.example` defines (`<shared_root>/images`), not in `SH`, which holds the rootfs tarballs alone |
+| `HPC_EGRESS_SHIM`, `HPC_EGRESS_SHIM_SHA256` | the operator | the egress shim (`bundle/egresslog.c`) built for that image, and its SHA-256 |
+| `HPC_ONECLIENT_BUNDLE`, `HPC_ONECLIENT_BUNDLE_SHA256` | the operator | the tar `oneclient_bundle.py` builds, and its SHA-256 |
+| `HPC_AGENT_WORK_ROOT` | the operator | the agent's work root on its node's tmpfs |
+
 ## A shared imported tree
 
 A space can be held on a directory of the cluster's shared filesystem that other federations import too, so several
