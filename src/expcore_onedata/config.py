@@ -76,6 +76,11 @@ pre-campaign link check, never a study space, and its bounds; `linksettings.load
 file is loaded, into `link_check`, and kept out of the fingerprint: it says what is checked before a campaign, not what
 a run measures.
 
+**Loading is recorded for the study's build** (C11, O35). `load_platform` and `fault_settings.load_faults` record that
+they ran, with `PLATFORM_MODULE` and the file (`expcore.config.platform_loads`), while a study's build is open, and the
+scheduler refuses a study whose build loaded this platform without listing the module in `[study] platforms`, whatever
+its plugin wraps. The record is the module and the path only, and no value or fingerprint depends on it.
+
 **Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and its
 fingerprint is unchanged. With several spaces, `space` and `support` refuse (there is no one space to give), and each
 consumer names the space it acts on by its label: provisioning, placement, eviction and the probes are bound to one
@@ -96,6 +101,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from expcore.config.loading import ConfigError, Section, load_toml
+from expcore.config.platform_loads import record_platform_load
 from expcore_onedata.credentials import DEFAULT_PATTERN, PLAIN_ID, Principal, SecretSource, UserCredentials
 from expcore_onedata.linksettings import LinkCheckSettings, load_link_check
 from expcore_onedata.rights import declares_qos, declares_write, rights_problem
@@ -103,6 +109,7 @@ from expcore_onedata.sandbox.settings import SandboxSettings, load_sandbox
 from expcore_onedata.spaces import PLANES, Space, StudySpace, Support, load_spaces
 from expcore_onedata.tls import TlsSettings, load_tls, moved
 
+PLATFORM_MODULE = "expcore_onedata.sandbox.kinds"  # the module a study lists in `[study] platforms` for this platform
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 HOSTNAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
@@ -548,8 +555,11 @@ def load_platform(
     With `require_secrets` (the default, for a run) the admin credential's source must exist and hold something, and
     each fixed principal must have a credential file that others cannot read, so a missing variable or file fails here
     and not at the first request. Only the presence and mode of a user's file are checked, never its contents.
+
+    While a study's build is open it records that it ran, with `PLATFORM_MODULE` and the file (`platform_loads`).
     """
     file = Path(path).resolve()
+    record_platform_load(PLATFORM_MODULE, file)  # at the entry: a load that then refuses its file still ran
     try:  # the same errors load_toml gives, so a missing file is a configuration error, not a crash
         digest = hashlib.sha256(file.read_bytes()).hexdigest()
     except FileNotFoundError:

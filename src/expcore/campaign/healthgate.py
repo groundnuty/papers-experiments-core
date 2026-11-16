@@ -175,10 +175,16 @@ class PlatformDeferral(NamedTuple):
     platform's configuration through the platform's module (`expcore.study.platform_deferral`, with no object of the
     study's plugin between): the module's name and its `DeferralBound`, None for a platform whose configuration declares
     none. The scheduler holds the health check to each (`Scheduler(platform_deferrals=...)`,
-    `SchedulerConfig.check_declared_deferral`)."""
+    `SchedulerConfig.check_declared_deferral`).
+
+    `loaded` names the platform modules whose loader the module's function ran to answer (`expcore.config.platform_loads`):
+    a module of the study's own that re-exports a platform's function loads that platform's configuration, so it speaks
+    for the platform even when it answers None, and what the study's build loaded of that platform is covered by listing
+    the study's module (`Scheduler(platform_loads=...)`)."""
 
     platform: str
     bound: DeferralBound | None
+    loaded: tuple[str, ...] = ()
 
 
 def checked_bound(answer: Any, hook: str, owner: str) -> DeferralBound | None:

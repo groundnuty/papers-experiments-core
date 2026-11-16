@@ -57,7 +57,10 @@ waits piled up behind a long heal never exhaust a run (O11).
 
 The module also declares the platform's longest deferral for the core (`declared_deferral_from_config`, O35): the core
 calls it with the study's platform.toml when a campaign starts and holds the health check to the answer, so a study's
-own wrapper around the platform's check or its run admission cannot hide it.
+own wrapper around the platform's check or its run admission cannot hide it. The platform's loaders (`load_platform`,
+`load_faults`) also record this module, with the file they read, while a study's build is open
+(`expcore.config.platform_loads`), and a study whose build loaded the platform without listing the module is refused at
+its start, so a plugin that hides both declarations cannot leave the platform out of `[study] platforms`.
 """
 
 import os
