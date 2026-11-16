@@ -15,10 +15,21 @@ in argv[1]:
 
   {"run_key": "...", "verify_ssl": true, "log": "/var/gate/requests.jsonl",
    "upstream_ca_file": "/etc/gate/federation-ca.pem", "tls_dir": "/etc/gate/tls",
-   "listing": "paged|complete",
+   "listing": "paged|complete", "peer_uid_check": false,
    "hosts": {"<name>": {"role": "onezone|oneprovider", "addr": "<upstream host>",
                         "port": 443, "tls": true}},
    "tcp_forwards": [{"listen": 8000, "host": "...", "port": 8000}]}
+
+`peer_uid_check` (true or false, false when absent; anything else refuses the start) is for a node whose loopback other
+users share, where the gate has no network of its own (the HPC batch nodes). On, the gate attributes every connection it
+accepts, on its HTTPS listener and on every `tcp_forwards` listener, to the uid of its peer's socket (`gatepeer.py`,
+which it loads by its path from beside this file: read from `/proc/net/tcp` and `tcp6`), and serves only a peer of its own
+uid. It refuses any other, a peer it cannot attribute, and everything when it cannot read the tables, closing the
+connection with a reset before one byte is read or written and logging one `peer_refused` line with the reason
+(`other_uid`, `no_owner_shown`, `not_found`, `table_unreadable`, `no_address`, `check_error`) and the uid the table showed.
+The gate stops at its start if it could not run the check (it runs as uid 0, which the tables also print for a socket
+nobody owns, or it cannot read the table, or `gatepeer.py` is not beside it). Off, nothing of this runs and `gatepeer.py`
+is not needed beside it: Docker's gate, on its own network, is as it was.
 
 `listing` is the data path's listing mode (gatepolicy, O21), `paged` when absent; a gate given another refuses to
 start. In `complete` the gate answers a listing with all of the directory's entries as one page, which it merges from
@@ -116,6 +127,11 @@ gatepolicy = _load_sibling("gatepolicy")
 gateboundary = _load_sibling("gateboundary")  # every answer passes it before it reaches the agent (O05)
 
 CFG: dict = {}
+# The owner check (`peer_uid_check`, `_start_peer_check`): None while it is off, which is the whole of Docker's gate. The
+# sibling that makes it is loaded by path only when the check is on, so a gate directory copied before it existed (the HPC
+# steps copy gate.py, gatepolicy.py and gateboundary.py by name) keeps working.
+gatepeer = None
+_PEER_CHECK = None
 _LOCK = threading.Lock()
 _HOP = {
     "connection",
@@ -1343,6 +1359,14 @@ class GateServer(ThreadingHTTPServer):
         finally:
             super().server_close()
 
+    def verify_request(self, request, client_address) -> bool:
+        """With the owner check off, the base server's answer and nothing else. With it on, the accepted connection is
+        attributed to its peer's uid before a thread is made for it: the TLS handshake is the handler's first act, so a
+        refused connection has had no byte read and none written (`_admit_peer`)."""
+        if _PEER_CHECK is None:
+            return super().verify_request(request, client_address)
+        return _admit_peer(request, self.server_address[1])
+
     def handle_error(self, request, client_address) -> None:
         """A connection that failed outside a request (a TLS handshake, a thread that could not start): logged, never
         silent. Its origin is the gate unless the client broke off its own handshake."""
@@ -1359,6 +1383,64 @@ class GateServer(ThreadingHTTPServer):
                 "trace": traceback.format_exc(limit=3)[-600:],
             }
         )
+
+
+def _peer_module():
+    """`gatepeer`, loaded by its path on first use. A gate that is asked to check its peers and has no sibling to do it
+    stops, rather than serving them unchecked."""
+    global gatepeer
+    if gatepeer is None:
+        try:
+            gatepeer = _load_sibling("gatepeer")
+        except OSError:
+            sys.modules.pop("gatepeer", None)
+            raise SystemExit("the gate's peer_uid_check is on, but gatepeer.py is not beside gate.py") from None
+    return gatepeer
+
+
+def _start_peer_check() -> None:
+    """Set the owner check from the configuration: `peer_uid_check`, true or false (false when absent). Nothing else is
+    accepted, for a string "false" is truthy. With it on, a gate that could not run the check stops here (a uid the
+    tables also print for a socket nobody owns, or tables it cannot read) instead of refusing every connection while it
+    says ready."""
+    global _PEER_CHECK
+    flag = CFG.get("peer_uid_check", False)
+    if not isinstance(flag, bool):
+        raise SystemExit("the gate's peer_uid_check is neither true nor false")
+    _PEER_CHECK = None
+    if not flag:
+        return
+    try:
+        check = _peer_module().OwnerCheck()
+        check.require_readable()
+    except ValueError as e:
+        raise SystemExit(f"the gate's owner check cannot run: {e}") from None
+    _PEER_CHECK = check
+
+
+def _admit_peer(conn, listen: int) -> bool:
+    """True if `conn`, just accepted, is from a socket of the gate's own uid. Otherwise one `peer_refused` line says why
+    (it carries no `error_origin`, so no summary counts it as an error: a refusal is the check working) and the
+    connection is reset, unread and unwritten. A fault in the check refuses too. This runs in the accept loop and never
+    raises: an exception out of it would end the loop."""
+    detail = None
+    try:
+        verdict = _PEER_CHECK.decide(conn)
+    except Exception as e:  # a fault here must refuse, never serve
+        verdict = _peer_module().Verdict(False, "check_error")
+        detail = repr(e)[:300]
+    if verdict.served:
+        return True
+    rec = {"event": "peer_refused", "listen": listen, "reason": verdict.reason, "peer_uid": verdict.peer_uid}
+    rec["peer"] = verdict.peer
+    if detail:
+        rec["error"] = detail
+    _log(rec)
+    with contextlib.suppress(OSError):
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # close() is then a reset
+    with contextlib.suppress(OSError):
+        conn.close()
+    return False
 
 
 def _tls_context() -> ssl.SSLContext:
@@ -1439,6 +1521,8 @@ def _tcp_forward(listen: int, host: str, port: int) -> None:
                 )
                 time.sleep(0.1)
                 continue
+            if _PEER_CHECK is not None and not _admit_peer(c, listen):
+                continue  # refused, logged and closed: this accept is judged as the HTTPS listener's is
             u = None
             try:
                 u = socket.create_connection(
@@ -1502,6 +1586,7 @@ def main() -> None:
         raise SystemExit("the gate has no token to add to the requests it forwards")
     if CFG.get("listing", gatepolicy.PAGED) not in gatepolicy.LISTINGS:  # O21: never a mode it would guess at
         raise SystemExit("the gate's listing mode is not one it knows")
+    _start_peer_check()  # before any listener: the HTTPS one and every forward judge their peers by it
     for f in CFG.get("tcp_forwards", []):
         _tcp_forward(f["listen"], f["host"], f["port"])
     GateServer.request_queue_size = int(CFG.get("listen_backlog", GateServer.request_queue_size))
