@@ -64,11 +64,11 @@ def bound_of(platform: Path) -> DeferralBound | None:
     return heal_deferral_bound(load_faults(platform, load_platform(platform, require_secrets=False)))
 
 
-def test_o35_the_module_a_study_lists_exposes_the_hook_under_the_cores_name_and_imports_nothing_heavy():
-    """O35: the core reads the hook by a name it defines; the module a study imports for its kinds stays cheap, since
-    the platform layer's own modules are imported only when the hook is called."""
-    assert callable(getattr(kinds, PLATFORM_HOOK))
+def test_o35_the_module_a_study_lists_exposes_the_hook_under_the_cores_name():
+    """O35: the core reads the hook by a name it defines, from the module the study lists for its kinds."""
     assert PLATFORM_HOOK == "declared_deferral_from_config"
+    assert callable(getattr(kinds, PLATFORM_HOOK))
+    assert PLATFORM_HOOK in kinds.__all__
 
 
 def test_o35_the_hook_answers_what_the_health_check_and_the_admission_declare_of_the_same_file(tmp_path, fake):
