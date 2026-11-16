@@ -18,9 +18,10 @@ adds one). The start's own cells (the egress canary and the read-only probe, the
 harness's code) calibrate it: one that grew past the margin means this node's own share is too large to tell an agent's
 from, and the run's memory reading is then unknown (`margin_exceeded_at_start`), never a kill.
 
-A poll whose growth passes the margin lists `/proc` again after the cgroup's second reading and counts each visible
-process at the larger of its two readings, so a process that freed memory just as it was read and took it again
-before the cgroup was must do so around both readings to look hidden. A growth that passes so for `HIDDEN_CONFIRM`
+A poll whose growth passes the margin lists `/proc` again after the cgroup's second reading and takes the larger of
+the two listings' totals, so a process that freed memory just as it was read and took it again before the cgroup was
+must do so around both readings to look hidden; each total is one listing's own, so two processes that hold memory in
+turn are never counted twice. A growth that passes so for `HIDDEN_CONFIRM`
 polls in a row is the running cell's when no other cell's namespace is in the cgroup. Memory the watch
 cannot see is taken as past the limit, as a directory the disk walk cannot read is taken as past its size: the watch
 kills the run's processes as `memory_limit`, of `memory_hidden` (`watch.Watch`), once per cell. With another run's
@@ -135,19 +136,16 @@ class HiddenCheck:
             self._cell_reasons.add(PROC_UNREADABLE)
 
     def _visible(self, listings: Sequence[Sequence[P.Proc]]) -> tuple[int, set[str]]:
-        """The RssAnon of every process of the uid the listings show in the cgroup, each at the larger of its readings,
-        and the PID namespaces of the cells among them."""
-        held: dict[tuple[int, str], int] = {}
+        """The RssAnon the visible processes of the uid in the cgroup hold, at the larger of the listings' totals, and
+        the PID namespaces of the cells among them. Each total is one listing's: a sum of each process's largest
+        reading across listings would count memory two processes held in turn twice, and hide as much."""
+        totals: list[int] = []
         cells: set[str] = set()
         for found in listings:
-            for proc in found:
-                if not P.in_cgroup(proc.cgroup, str(self.cgroup)):
-                    continue
-                key = (proc.pid, proc.start)
-                held[key] = max(held.get(key, 0), proc.anon or 0)
-                if proc.pidns is not None and proc.pidns != self._own:
-                    cells.add(proc.pidns)
-        return sum(held.values()), cells
+            inside = [proc for proc in found if P.in_cgroup(proc.cgroup, str(self.cgroup))]
+            totals.append(sum(proc.anon or 0 for proc in inside))
+            cells |= {proc.pidns for proc in inside if proc.pidns is not None and proc.pidns != self._own}
+        return max(totals, default=0), cells
 
     def suspect(self, found: Sequence[P.Proc], before: int | None, after: int | None, run_namespaces: set[str]) -> bool:
         """Whether the poll's one listing leaves the running cell's growth past its allowance. The watch then lists

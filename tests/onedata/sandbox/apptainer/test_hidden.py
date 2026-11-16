@@ -384,3 +384,31 @@ def test_o56_a_visible_memory_kill_that_signals_no_process_is_unknown_never_over
     found = watch.end_cell()
     assert found["kills"][0]["signalled"] == 0
     assert (found["memory"]["reading"], found["memory"]["unknown"]) == ("unknown", ["kill_reached_none"])
+
+
+def test_o56_two_visible_processes_holding_memory_in_turn_never_hide_a_hidden_one(node, tmp_path):
+    """O56: Codex's case: a hidden process holds 768 MiB while two visible ones take turns holding another 768 MiB, so
+    the poll's own listing sees the first and the second listing the other. The visible memory is the larger of the
+    two listings' totals, never each process's larger reading summed, so the hidden 768 MiB stays unexplained."""
+    watch = _watch(node, tmp_path)
+    watch.poll()
+    watch.begin_cell(1, "n")
+    ns, top, first = _cell(node, rss=768 * MIB)
+    second = node._new_proc(ns, "python3", rss=0)
+    node._new_proc(ns, "python3", hidden=True, anon=768 * MIB)
+    listed, real = [0], node.processes
+
+    def in_turn(tags=()):
+        listed[0] += 1
+        found = real(tags)
+        if listed[0] % 2 == 0:  # the second listing finds the memory moved from the first process to the second
+            moved = {first.pid: 0, second.pid: 768 * MIB}
+            found = [
+                dataclasses.replace(p, rss=moved[p.pid], anon=moved[p.pid]) if p.pid in moved else p for p in found
+            ]
+        return found
+
+    node.processes = in_turn
+    _polls(watch, 3)
+    assert not top.alive
+    assert watch.end_cell()["kills"][0]["what"] == "memory_hidden"
