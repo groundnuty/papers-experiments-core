@@ -77,6 +77,22 @@ def serial_of(stop: object) -> str | None:
     return serial if isinstance(serial, str) and _SERIAL.fullmatch(serial) else None
 
 
+def numbered(store: Store, stops: Mapping[str, object], now: str) -> tuple[dict[str, dict], list[str]]:
+    """Give each stop that has no serial (one recorded before serials) its serial, in the caller's transaction.
+
+    Return the stops by name, each with its serial, and the names given one now, in order.
+    """
+    out: dict[str, dict] = {}
+    given: list[str] = []
+    for name, stop in sorted(stops.items()):
+        record = dict(stop) if isinstance(stop, Mapping) else {}
+        if serial_of(record) is None:
+            record["serial"] = next_serial(store, now)
+            given.append(name)
+        out[name] = record
+    return out, given
+
+
 def line_for(name: str, serial: str) -> str:
     """Return the line of a release file that ends the stop on `name` with this serial."""
     return f"{name} {serial}"

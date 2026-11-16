@@ -179,19 +179,17 @@ class BudgetGate:
 
         def change(current: str | None) -> tuple[str | None, list[tuple[str, str | None, str]], dict]:
             try:
-                fresh = json.loads(current) if current else {}
+                stored = json.loads(current) if current else {}
             except ValueError:
                 return None, [], holds
-            if not isinstance(fresh, dict):
+            if not isinstance(stored, dict):
                 return None, [], holds
-            events = []
-            for scope, hold in sorted(fresh.items()):
-                if release.serial_of(hold) is None:
-                    serial = release.next_serial(self.store, now)
-                    fresh[scope] = {**(hold if isinstance(hold, dict) else {}), "serial": serial}
-                    said = f"{scope}: the hold, recorded without a serial, is stop {serial}"
-                    events.append(("budget_hold_numbered", None if scope == ALL else scope, said))
-            return (json.dumps(fresh, sort_keys=True) if events else None), events, fresh
+            fresh, given = release.numbered(self.store, stored, now)
+            said = "the hold, recorded without a serial, is stop"
+            events = [
+                ("budget_hold_numbered", None if s == ALL else s, f"{s}: {said} {fresh[s]['serial']}") for s in given
+            ]
+            return (json.dumps(fresh, sort_keys=True) if given else None), events, fresh
 
         return self.store.update_meta(HOLDS_KEY, change, now)
 

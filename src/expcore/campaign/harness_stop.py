@@ -55,6 +55,7 @@ ALL = "ALL"
 UNKNOWN_KIND = "unknown"
 WHERE = "the harness stop's release file"  # how a hold names the file: the store, which may be published, has no path
 WHAT = "harness-error stop"
+NUMBERED = "harness_error_stop_numbered"  # the event of a stop recorded before serials, given its serial
 
 
 @dataclass(frozen=True)
@@ -230,18 +231,18 @@ class HarnessStops:
 
     def _number(self, state: dict[str, Any], now: str) -> list[tuple[str, str | None, str]]:
         """Give each stop in force that has no serial its serial, in the caller's transaction; return their events."""
-        events: list[tuple[str, str | None, str]] = []
-        for model, stop in sorted(state["models"].items()):
-            if release.serial_of(stop) is None:
-                serial = release.next_serial(self.store, now)
-                state["models"][model] = {**(stop if isinstance(stop, dict) else {}), "serial": serial}
-                said = f"the stop on {model}, recorded without a serial, is stop {serial}"
-                events.append(("harness_error_stop_numbered", model, said))
-        if state["all"] is not None and release.serial_of(state["all"]) is None:
-            serial = release.next_serial(self.store, now)
-            state["all"] = {**state["all"], "serial": serial}
-            said = f"the all-stop, recorded without a serial, is stop {serial}"
-            events.append(("harness_error_stop_numbered", None, said))
+        state["models"], given = release.numbered(self.store, state["models"], now)
+        events: list[tuple[str, str | None, str]] = [
+            (NUMBERED, m, f"the stop on {m}, recorded without a serial, is stop {state['models'][m]['serial']}")
+            for m in given
+        ]
+        if state["all"] is not None:
+            every, given = release.numbered(self.store, {ALL: state["all"]}, now)
+            state["all"] = every[ALL]
+            if given:
+                events.append(
+                    (NUMBERED, None, f"the all-stop, recorded without a serial, is stop {every[ALL]['serial']}")
+                )
         return events
 
     def note(self, model: str, kind: str, now: str, exact: str | None = None) -> list[str]:
