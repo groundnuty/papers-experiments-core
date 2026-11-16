@@ -54,14 +54,22 @@ as the outage (O10, O11, C01). The federation's lock has one more (`expcore_oned
 run's bounded wait for the federation that ran out while another run held it, an outage run through its restore and
 heal say, or while an outage run's sessions drain. A hold like `ingest_held`: never treatable, it costs no attempt, so
 waits piled up behind a long heal never exhaust a run (O11).
+
+The module also declares the platform's longest deferral for the core (`declared_deferral_from_config`, O35): the core
+calls it with the study's platform.toml when a campaign starts and holds the health check to the answer, so a study's
+own wrapper around the platform's check or its run admission cannot hide it.
 """
 
+import os
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from expcore.errors import PROVIDER_OUTAGE, InfraError, register_infra_kind
 from expcore.records.injections import INJECTOR_FAILURE  # the core names it: it sets an attempt aside as this kind
 from expcore_onedata.sandbox import infradeath, killcause
+
+if TYPE_CHECKING:
+    from expcore.campaign.healthgate import DeferralBound
 
 DATA_GATE_INTEGRITY = "data_gate_integrity"
 register_infra_kind(
@@ -211,6 +219,17 @@ def collection_error(what: str, reason: str) -> InfraError:
     return InfraError(OUTPUT_COLLECTION, f"collecting {what} failed: {reason}"[:600])
 
 
+def declared_deferral_from_config(path: "str | os.PathLike[str]") -> "DeferralBound | None":
+    """The longest the platform's health check may stay deferred under the platform.toml at `path`
+    (`fault_deferral.declared_from_file`): what the core reads through `[study] platforms`
+    (`expcore.study.platform_deferral`), from the study's own file, to hold the campaign's `max_defer_s` and its health
+    check to. None with the heal off or no `[faults]`. The platform layer is imported when this is called, so
+    importing this module for its kinds stays cheap."""
+    from expcore_onedata.fault_deferral import declared_from_file
+
+    return declared_from_file(path)
+
+
 __all__ = [
     "CELL_UNKILLABLE",
     "DATA_GATE_INTEGRITY",
@@ -224,6 +243,7 @@ __all__ = [
     "collection_error",
     "deadline_error",
     "death_error",
+    "declared_deferral_from_config",
     "gate_error",
     "kill_error",
     "kind_of",
