@@ -72,9 +72,11 @@ def plan(site: Site, allocation: str, providers: Sequence[str]) -> Optional[Dict
 
 
 def check_root(site: Site, federation_root: Path) -> None:
-    """The scratch root, in the preflight: a directory this user can write, and neither the federation's root nor inside
-    it, which `down` empties. A shared tree is the driver's (`hpcimport.check_separate`, with this root among its
-    places). Names the variable, never its value."""
+    """The scratch root, in the preflight: a directory this user can write, neither the federation's root nor inside
+    it, which `down` empties, and its own real path, since each provider's node binds its storage only through a path
+    with no link on the way (`bundle/posixstorage.py`): one given through a link is refused here, before anything is
+    submitted, not on the node once the job is held. A shared tree is the driver's (`hpcimport.check_separate`, with
+    this root among its places). Names the variable, never its value."""
     if not site.storage_root:
         return
     where = Path(site.storage_root)
@@ -91,6 +93,11 @@ def check_root(site: Site, federation_root: Path) -> None:
     real, root = Path(os.path.realpath(where)), Path(os.path.realpath(federation_root))
     if real == root or root in real.parents:
         raise StorageRefused("HPC_STORAGE_ROOT is, or lies inside, the federation's root, which down empties")
+    if str(real) != os.path.normpath(site.storage_root):
+        raise StorageRefused(
+            "HPC_STORAGE_ROOT must be its real path, with no symbolic link on the way: each provider's node binds its "
+            "storage only through a path with none"
+        )
 
 
 def _marker(record: Mapping[str, Any], provider: Optional[str] = None) -> bytes:

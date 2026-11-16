@@ -240,7 +240,7 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
 
 | Key | What |
 |---|---|
-| `HPC_STORAGE_ROOT` | an existing directory on the scratch filesystem that only you can write (`<scratch_root>/hpcop-storage`, `mkdir -m 700`: owned by you, no group or other write bit, which `up` and `down` both check), neither inside the federation's root nor a shared tree. With none, nothing below runs |
+| `HPC_STORAGE_ROOT` | an existing directory on the scratch filesystem that only you can write (`<scratch_root>/hpcop-storage`, `mkdir -m 700`: owned by you, no group or other write bit, which `up` and `down` both check), neither inside the federation's root nor a shared tree, and named by its real path (no symbolic link on the way, which `up` refuses: the nodes bind through none). With none, nothing below runs |
 | `HPC_QUOTA_CMD` | the site's command that prints the account's inode usage and quota (`<quota tool> --inodes <scratch_root>`), split as a shell would split it and **run without a shell** on the login node |
 | `HPC_QUOTA_PATTERN` | a regular expression with the named groups `used` and `quota` that reads its output and matches **exactly once** (`inodes used (?P<used>[0-9,]+) of (?P<quota>[0-9,]+)` reads an invented line); you write it for the real output, which this repository never holds |
 | `HPC_QUOTA_CHECK` | **refused with `HPC_STORAGE_ROOT`**: the check is mandatory for a federation bound onto scratch, so the site is not loaded with both. Without a scratch root there is no check, and `off` (its only value) changes nothing |
@@ -261,7 +261,8 @@ contract; in short, with `HPC_STORAGE_ROOT` set in `site.env`:
   empty directory it stores in (`posix`, 0700).
 - **Each provider stores there:** its job is given that directory (`--storage=PATH`, from the state's record checked
   whole), `configure.sh` has `bundle/posixstorage.py` check it (the form `up` makes for this provider, no link on the
-  way, 0700 and yours, the marker naming the provider and the allocation, empty and not on the node's memory) and
+  way, 0700 and yours (a setgid bit the scratch passes down is allowed), the marker naming the provider and the
+  allocation, empty and not on the node's memory) and
   record it in the work directory, and the service binds it writable onto `/volumes/posix` at every start, `hpcfed.py
   start` included. A refusal stops the start: a provider never falls back to tmpfs. The provider runs as you in its
   cell, so 0700 is all it needs, and it never sees the marker, which stays beside the bound directory. Its storage is at

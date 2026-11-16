@@ -94,12 +94,13 @@ def _no_link_on_the_way(path):
 
 
 def _private(path, what):
-    """A directory of this user, mode 0700, that this user can write."""
+    """A directory of this user, mode 0700, that this user can write. The permission bits alone are compared: a setgid
+    bit, which a project's scratch passes down to every directory made in it, is no access for anyone."""
     info = os.lstat(path)
     if (
         not stat.S_ISDIR(info.st_mode)
         or info.st_uid != os.getuid()
-        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_mode & 0o777 != 0o700
         or not os.access(path, os.R_OK | os.W_OK | os.X_OK)
     ):
         raise StorageRefused(f"{what} is not a directory of this user with mode 0700 that this user can write")

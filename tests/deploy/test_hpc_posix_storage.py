@@ -168,6 +168,17 @@ def test_o57_each_of_the_three_directories_must_be_this_users_alone_0700(workdir
     refused("mode 0700", workdir, storage)
 
 
+def test_o57_a_setgid_bit_that_a_projects_scratch_passes_down_is_accepted(workdir, storage):
+    """O57: a project's scratch often has its setgid bit set, and every directory made in it inherits it: no access for
+    anyone, so the permission bits alone are compared and 02700 is taken as 0700."""
+    for path in (storage, storage.parent, storage.parents[1]):
+        path.chmod(0o2700)
+        if not path.stat().st_mode & 0o2000:
+            pytest.skip("this filesystem keeps no setgid bit on a directory")
+    prepare(workdir, storage)
+    assert ps.binds(str(workdir)) == ["--bind", f"{storage}:/volumes/posix:rw"]
+
+
 def test_o57_a_storage_this_user_does_not_own_is_refused(workdir, storage, monkeypatch):
     """O57: a directory of another uid is refused, whatever its mode."""
     monkeypatch.setattr(ps.os, "getuid", lambda: os.stat(storage).st_uid + 1)

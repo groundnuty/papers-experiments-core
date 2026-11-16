@@ -8,6 +8,7 @@ hpc_fed_support and temporary directories for scratch; nothing reaches a cluster
 
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import os
 import stat
@@ -167,6 +168,61 @@ def test_o57_a_storage_argument_is_given_only_for_a_record_of_the_form_up_writes
         args(lost, "larch")
     plain = {**state, "storage": None, "site": {**state["site"], "storage_root": ""}}
     assert args(plain, "larch") == []
+
+
+def node_script(hpc):
+    """The bundle's node-side script (`posixstorage.py`), loaded by its path as the node runs it."""
+    spec = importlib.util.spec_from_file_location("hpcop_posixstorage_of_driver", hpc.driver.BUNDLE / "posixstorage.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def provider_workdir(base: Path) -> Path:
+    """A provider's private work directory with an unpacked rootfs, as node-init.sh leaves it on its node."""
+    path = base / "hpcop-op.abc123"
+    (path / "rootfs" / "volumes" / "posix").mkdir(parents=True)
+    path.chmod(0o700)
+    (path / "rootfs.complete").touch()
+    return path
+
+
+@pytest.mark.parametrize("setgid", [False, True], ids=["plain", "setgid-scratch"])
+def test_o57_the_directory_up_names_in_a_providers_step_is_the_one_its_node_takes_and_binds(hpc, tmp_path, setgid):
+    """O57: end to end, the driver and the node agree: each provider's `--storage=` argument, as up made and named the
+    directory, passes the node's checks (posixstorage.py prepare) and is bound onto /volumes/posix, also on a scratch
+    root whose setgid bit every directory made in it inherits; another provider's argument is refused on that node."""
+    site = make_site(tmp_path, scratch=True)
+    if setgid:
+        Path(site["HPC_STORAGE_ROOT"]).chmod(0o2755)
+        if not Path(site["HPC_STORAGE_ROOT"]).stat().st_mode & stat.S_ISGID:
+            pytest.skip("this filesystem keeps no setgid bit on a directory")
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    script, steps = node_script(hpc), rig.provider_steps()
+    for name, command in steps.items():
+        if setgid:
+            assert rig.bound()[name].stat().st_mode & stat.S_ISGID
+        work = provider_workdir(tmp_path / "nodes" / name)
+        script.prepare(str(work), name, command[-1], mountinfo="")
+        assert script.binds(str(work)) == ["--bind", f"{rig.bound()[name]}:/volumes/posix:rw"]
+    elsewhere = provider_workdir(tmp_path / "nodes" / "elsewhere")
+    with pytest.raises(script.StorageRefused, match="not of the form up makes"):
+        script.prepare(str(elsewhere), "aspen", steps["larch"][-1], mountinfo="")
+
+
+def test_o57_a_scratch_root_given_through_a_link_is_refused_before_anything_is_submitted(hpc, tmp_path):
+    """O57: each node binds its storage only through a path with no link on the way, so up refuses a scratch root that
+    is not its own real path, naming the variable, before the root, the storage or a job exists."""
+    site = make_site(tmp_path, scratch=True)
+    (tmp_path / "scratch-link").symlink_to(site["HPC_STORAGE_ROOT"])
+    rig = Rig(hpc, tmp_path, {**site, "HPC_STORAGE_ROOT": str(tmp_path / "scratch-link")})
+    with pytest.raises(RuntimeError, match=r"HPC_STORAGE_ROOT must be its real path") as refused:
+        rig.up()
+    assert str(tmp_path) not in str(refused.value)
+    assert not any(call[0] == "sbatch" for call in rig.fake.calls)
+    assert listing(Path(site["HPC_STORAGE_ROOT"])) == set()
+    assert not rig.root.exists()
 
 
 # -- what up makes, and down removes ---------------------------------------------------------------------------------

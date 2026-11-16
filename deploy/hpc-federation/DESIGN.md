@@ -664,7 +664,7 @@ root nothing lands on scratch, there is no check, and `off` changes nothing. A s
 names no command cannot `up`.
 
 **The directories** (`hpcstorage.py`): below `HPC_STORAGE_ROOT` (a directory only this user can write, owned by this user
-with no group or other write bit, which is neither the
+with no group or other write bit, named by its real path since the nodes bind through no link, which is neither the
 federation's root nor inside it, and is no shared tree and holds or lies inside none, since `down` removes below it and
 nothing may be written to a shared tree) `up` makes `<root>/<allocation name>` (0700; the name's random part is the
 allocation's) and in it one directory per provider (0700), each by an exclusive `mkdir`: anything already there refuses
@@ -684,8 +684,9 @@ directories are made after the state exists and before the job is submitted, so 
   tmpfs). The zone takes none. Without a scratch root the argument is absent and every step is what it was.
 - `configure.sh` takes it out of the peers and has `posixstorage.py prepare` check it: a plain absolute path of
   characters that cannot end a bind option; of `up`'s form for this provider, `<…>/<allocation>/<provider>/posix`; no
-  link at any step of the path; the bound directory, the provider's and the allocation's each a directory of this user,
-  mode 0700, that this user can write; the provider's directory holding `up`'s marker that names this provider and this
+  link at any step of the path (so `up` refuses a scratch root that is not its own real path, before anything is
+  submitted); the bound directory, the provider's and the allocation's each a directory of this user, permission bits
+  0700 (a setgid bit, which a project's scratch passes down, is allowed), that this user can write; the provider's directory holding `up`'s marker that names this provider and this
   allocation (a regular file of this user, never read through a link); neither inside nor holding the work directory;
   empty; and not on node-local memory (the mount table: tmpfs or ramfs is refused, since the bind is there to keep the
   data off the node). The rootfs's `/volumes/posix`, which the bind covers, must be a real directory holding nothing.
