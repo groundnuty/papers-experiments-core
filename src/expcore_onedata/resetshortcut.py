@@ -35,15 +35,19 @@ during the reset) fails the stage that finds it: those reads certify nothing.
 `ResetPlan.full_reason`) asks for it inside its exclusive section, so the section still keeps every reader out for
 the reset: leaving the section out gives the full reads too, without that guard. The record says `full`, keeps the
 core's own why where the core gives the full reads anyway and says `requested` where it would have given the shortcut,
-and holds the caller's text beside it (`full_reason`). With no `full_reason` the record is what it always was.
+and holds the caller's reason beside it (`full_reason`). With no `full_reason` the record is what it always was. The
+record is published, so the reason is a short code (`checked_reason`): no path, host, address or sentence, and none of
+the names the platform's configuration gives (O12).
 """
 
+import re
 from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
 from expcore_onedata import consistency
 from expcore_onedata.admission import Federation
 from expcore_onedata.client import PlatformError
+from expcore_onedata.config import PlatformConfig
 from expcore_onedata.occupancy import Listing
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.rangemap import PlacementSettings
@@ -58,6 +62,40 @@ OFF, NOT_PLANNED, OUTSIDE_GRANT, OTHER_FEDERATION = "off", "not_planned", "outsi
 REQUESTED = "requested"  # the caller asked for the full reads (`full_reason`) where the shortcut would have been given
 GRANT_LAPSED, NOT_ON_A_FILE, TRANSFERS_UNREAD = "grant_lapsed", "transfer_not_on_a_file", "transfers_unread"
 UNREAD = (Unreadable, PlatformError, consistency.WaitTimeout)  # a walk that cannot be read: the full reads
+REASON_FORM = re.compile(r"[a-z][a-z0-9_]{0,63}")  # a caller's reason for the full reads: a short code
+
+
+def checked_reason(reason: object, config: PlatformConfig) -> str:
+    """A caller's reason for the full reads, as it goes into the published record: a short code (a lower-case letter,
+    then up to 63 lower-case letters, digits or underscores), so no path, host, address or sentence, that holds none of
+    the names `config` gives (`_configured`), compared with the underscores dropped (O12). Raise ValueError otherwise.
+    A name the study chose and the configuration does not hold is the study's to keep out, as in any field it writes."""
+    if not isinstance(reason, str) or not REASON_FORM.fullmatch(reason):
+        raise ValueError(
+            "full_reason is a short code that says why the reset reads in full: a lower-case letter, then up to 63 "
+            "lower-case letters, digits or underscores; never empty, a path, a host or a sentence (the record is "
+            "published, O12)"
+        )
+    flat = reason.replace("_", "")
+    if any(name in flat for name in _configured(config)):
+        raise ValueError("full_reason holds a name the platform's configuration gives; the record is published (O12)")
+    return reason
+
+
+def _configured(config: PlatformConfig) -> frozenset[str]:
+    """Every name the configuration gives, lower-cased with all but its letters and digits dropped: the zone's name
+    and host, each provider's name, id and host, and each space's label, name, id and prefixes."""
+    names = [config.zone.name, _host(config.zone.url)]
+    for provider in config.providers.values():
+        names += [provider.name, provider.id or "", _host(provider.url)]
+    for entry in config.spaces:
+        names += [entry.label, entry.space.name, entry.space.id, *entry.space.prefixes]
+    return frozenset(flat for flat in (re.sub(r"[^a-z0-9]", "", name.lower()) for name in names) if flat)
+
+
+def _host(url: str) -> str:
+    """The host of an address, without its scheme, port or path."""
+    return url.split("://", 1)[-1].split("/", 1)[0].split("@")[-1].split(":", 1)[0]
 
 
 def initial(

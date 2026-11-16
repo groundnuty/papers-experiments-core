@@ -87,7 +87,7 @@ class ResetPlan:
     qos_rights: bool | None = None
     never_holds: Collection[str] = ()
     planned: Holdings | None = None  # a planner's reading (`resetplan.plan_scan`): its scan is the qos stage's first
-    full_reason: str | None = None  # the caller's reason for the full reads, inside its exclusive section as ever
+    full_reason: str | None = None  # the caller's short code for the full reads (`resetshortcut.checked_reason`)
 
 
 class _Space:
@@ -106,8 +106,8 @@ class _Space:
         if isinstance(never_holds, str) or not all(isinstance(q, str) for q in never_holds):
             raise ValueError("never_holds is a collection of provider names")
         reason = plan.full_reason
-        if reason is not None and (not isinstance(reason, str) or not reason.strip()):
-            raise ValueError("full_reason is a text that says why the reset reads in full, never empty or blank")
+        if reason is not None:
+            reason = resetshortcut.checked_reason(reason, reset.provisioner.config)
         self.reset, self.p = reset, reset.provisioner
         self.since = float(reset.now() if since is None else since)
         self.baseline = baseline

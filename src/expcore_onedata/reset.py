@@ -296,11 +296,12 @@ class SpaceReset:
         its scan the qos stage's first, so the space is listed once (`resetplan.py`); by default the stage scans. With
         `[placement] reset_shortcut` on and the reading made inside a live exclusive section (`exclusive`), the
         occupancy and quiet stages re-read only what may have changed since it (`resetshortcut.py`); the record's
-        `occupancy_reads` says which reads were made, and why. `full_reason`, a text that says why, asks for the full
+        `occupancy_reads` says which reads were made, and why. `full_reason`, a short code that says why
+        (`resetshortcut.checked_reason`: a lower-case letter, then up to 63 lower-case letters, digits or
+        underscores, holding no name the configuration gives, since the record is published, O12), asks for the full
         reads all the same, inside the section, which holds its grant as without it: the record says `full`, the
-        core's own why (`requested` where it would have given the shortcut) and the text beside it (`full_reason`,
-        published with the record, so it names no provider, space or path, O12); an empty or blank one is refused
-        before anything is sent."""
+        core's own why (`requested` where it would have given the shortcut) and the code beside it (`full_reason`).
+        Any other reason is refused before anything is sent."""
         from expcore_onedata.resetspaces import ResetPlan, SpacesReset  # the driver builds on this module
 
         plan = ResetPlan(
