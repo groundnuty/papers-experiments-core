@@ -200,14 +200,33 @@ def test_the_token_margin_is_the_least_the_loader_of_this_core_accepts(hpc, tmp_
     assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(loaded))
 
 
+def test_with_this_cores_loader_the_pilot_shapes_least_margin_is_the_hpc_restores_rule(hpc, tmp_path, make_ca):
+    """O58: with this core's [faults] loader (backend "hpc", M4), up's [tokens] margin_s is the loader's own rule over
+    the file as written, `restore_token_margin_s` of what `load_faults` reads, with nothing stubbed: 5,340 s for the
+    pilot shape's defaults (stop_seconds 600), the restore's bound, the slack, the drain and the start's own stop."""
+    import tomllib
+
+    from expcore_onedata.fault_settings import load_faults
+
+    assert hpc.boot.has_hpc_backend() is True
+    path = rendered_pilot(hpc, tmp_path, make_ca)
+    settings = load_faults(path, load_platform(path))
+    assert (settings.backend, settings.stop_bound_s, settings.settle_timeout_s) == ("hpc", 690.0, 750.0)
+    margin = tomllib.loads(path.read_text(encoding="utf-8"))["tokens"]["margin_s"]
+    assert margin == math.ceil(restore_token_margin_s(settings)) == 5340
+
+
 def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_settle_and_poll(
     hpc, tmp_path, make_ca, monkeypatch
 ):
     """O57: a core whose loader cannot read the HPC [faults] (no backend "hpc" yet) still gets a margin: the restore's
-    rule over the keys it knows, with the HPC settle time (stop bound + 60 s) and poll (10 s)."""
+    rule over the keys it knows, with the HPC settle time (stop bound + 60 s) and poll (10 s). Such a core's settings
+    know none of the HPC backend's keys (O58's `backend`, `stop_bound_s` and `relay_wait_s`), so they are left out
+    here as that core leaves them out."""
     import tomllib
 
     monkeypatch.setattr(hpc.boot, "has_hpc_backend", lambda: False)
+    monkeypatch.setattr(hpc.boot, "NOT_A_BOUND", hpc.boot.NOT_A_BOUND | {"backend", "stop_bound_s", "relay_wait_s"})
     document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
     rule = FaultSettings(
         file=Path("p"), sanctioned=False, journal=Path("j"), compose_file=Path("c"), services={},
