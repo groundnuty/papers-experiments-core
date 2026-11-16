@@ -110,8 +110,13 @@ def test_a_cell_with_no_completion_record_raises_the_exit_not_recorded(node, set
         box.stop()
 
 
-def test_o56_a_completion_cause_names_apptainer_exec_never_docker_exec(node, settings):
-    """O56: the shared completion check names the backend's own exec (the HPC probe's C5 read "docker exec")."""
+def test_o56_guard_a_completion_cause_through_the_sandbox_names_apptainer_exec(node, settings):
+    """O56 (a guard, not the fix's test): through the sandbox, the cause of an exec with no record names `apptainer
+    exec`, never `docker exec`. This held before the fix, when the cell runner rewrote the shared check's words with a
+    `.replace`, and it must keep holding now the check names the runner itself; it pins the end-to-end text. The fix
+    is tested in `test_exec_completion.py` (`Completion.runner`), which fails without it. The fake node's
+    `Unrecorded(137)` does not reproduce the text the HPC probe's C5 read as `docker exec`: that text's source is not
+    reproduced here."""
     box = start(node, settings)
     try:
         node.cell_handler = lambda cell: Unrecorded(137, "", "")
