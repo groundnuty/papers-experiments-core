@@ -199,8 +199,11 @@ class Image:
                 done = done[:-1]
                 continue
             member = self.members.get("/".join([*done, part]))
-            if member is None:
+            if member is None and not parts:
                 return None
+            if member is None:  # a directory a tar may leave implicit: only its members are listed
+                done.append(part)
+                continue
             if member.issym():
                 hops += 1
                 if hops > MAX_LINKS:
