@@ -122,49 +122,53 @@ submits cannot both pass it.
 
 ## Renewal
 
-Renewal is a deliberate step, taken only while lanes need the allocation: billing runs idle or busy. The standard
-partition queues a job behind a running one, so the next allocation is requested before the current one ends, with
-`--begin` so that it cannot start (and bill) early, and only while the login directory's marker says lanes need it:
+The standard partition queues a job behind a running one, so the next allocation is requested before the current one
+ends, with `--begin` so that it cannot start (and bill) early. Billing runs idle or busy, so **renewal follows use**:
+by default the loop renews while a test step of ours ran in the last 3 h (as `sacct` records it, on an allocation
+of ours or on one of the last three the ledger holds), and lets an idle allocation end. An operator can force either
+way:
 
 ```
-uv run python deploy/hpc-tests/hpctests.py renew want --until 2026-11-18T18:00Z   # lanes need it until then
-uv run python deploy/hpc-tests/hpctests.py renew unwant                          # they don't: no successor
-uv run python deploy/hpc-tests/hpctests.py renew start --until 2026-11-20T18:00Z  # the loop, detached on the login node
-uv run python deploy/hpc-tests/hpctests.py renew stop                             # it stops at its next poll
-uv run python deploy/hpc-tests/hpctests.py renew once --until ...                 # one decision, now
+uv run python deploy/hpc-tests/hpctests.py renew want --until 2026-11-18T18:00Z  # renew even when idle, until then
+uv run python deploy/hpc-tests/hpctests.py renew never                          # never renew, even when busy
+uv run python deploy/hpc-tests/hpctests.py renew auto                           # no override: follow use (default)
+uv run python deploy/hpc-tests/hpctests.py renew start --until 2026-11-20T18:00Z # the loop, detached on the login node
+uv run python deploy/hpc-tests/hpctests.py renew stop                            # it stops at its next poll
+uv run python deploy/hpc-tests/hpctests.py renew once --until ...                # one decision, now
 ```
 
-Without the marker (`renew.wanted`), or once its time has passed, the loop submits nothing and the running
-allocation ends at its time limit; `release` ends it sooner.
+`never` (`renew.never`) wins over `want` (`renew.wanted`, until its time), and either replaces the other; `auto`
+removes both and `unwant` the want alone. `jobs` shows the mode (`renewal auto|want|never`).
 
 **The idle release:** every poll, the loop also releases a RUNNING allocation of ours that has run no test step for
-`--idle-hours` (3; from its start when it never ran one), by its id through `release`'s own ledger and name checks.
-It reads the job's steps from `sacct`, so a step shorter than a poll still counts; a record it cannot read, or one
-that does not list the job's batch step yet, counts as busy; and right before releasing it asks the controller for
-the job's live steps (`squeue -s`), once and while holding the use lock exclusively, so no run can start a step
-between that check and the release. It clears `renew.wanted` with it, so the next poll does not submit another, and releases a successor of
-ours still queued.
+`--idle-hours` (3; from its start when it never ran one), by its id through `release`'s own ledger and name checks,
+except while a `want` lasts. It reads the job's steps from `sacct`, so a step shorter than a poll still counts; a
+record it cannot read, or one that does not list the job's batch step yet, counts as busy; and right before
+releasing it asks the controller for the job's live steps (`squeue -s`), once and while holding the use lock
+exclusively, so no run can start a step between that check and the release. A successor of ours still queued is
+released with it.
 
 `renew start` runs `alloc.sh renew` with `setsid nohup` on the login node, from a frozen copy of `alloc.sh` (bash reads a
 script as it runs, so a later `install` never changes a running loop), so it outlives the ssh session and any agent
 session. Every `--poll` (300 s) it reads the clock (`date +%s`) and squeue, never trusting a timer, and:
 
-- does nothing unless `renew.wanted` names a time still ahead, or while a successor of ours is queued;
-- when our running allocation ends within `--lead` (3 h), submits its successor to begin `--overlap` (15 min) before
-  that end, or now if that is past;
-- when no allocation of ours is alive (the loop was down, or the queue was slow), submits one to begin now, so a gap
-  lasts one poll;
-- submits nothing that would begin at or after `--until` or the marker's time, nothing beyond `--max` (4) submits, nothing past
+- does nothing while a successor of ours is queued, or while our running allocation ends later than `--lead` (3 h);
+- then, when renewal is on (busy, or a `want` whose time is after the successor's begin; not `never`), submits the
+  successor to begin `--overlap` (15 min) before that end, or now if that is past; when `sacct` cannot be read it
+  decides nothing that round;
+- when no allocation of ours is alive and renewal is on (the last allocation was busy, or a `want` lasts), submits
+  one to begin now, so a gap lasts one poll;
+- submits nothing that would begin at or after `--until`, nothing beyond `--max` (4) submits, nothing past
   `HPCT_MAX_ALIVE`; it stops at `--until`, on `renew.stop`, after a submit that was not as asked (that job cancelled), or
   after three failed submits in a row.
 
-It writes `renew.state` (heartbeat, until, submits) every poll and logs to `renew.log`; `jobs` shows its state and
-warns when the allocation ends within 2 h with no successor queued and no renewer running. A second loop is refused
-while the first one's heartbeat is fresh. A successor once queued is Slurm's, so the loop dying after a submit still
-leaves the next allocation in place.
+It writes `renew.state` (heartbeat, until, submits) every poll and logs to `renew.log` (a decision not to submit
+once, when it changes); `jobs` shows its state and mode and warns when the allocation ends within 2 h with no
+successor queued and no renewer that would submit one. A second loop is refused while the first one's heartbeat is
+fresh. A successor once queued is Slurm's, so the loop dying after a submit still leaves the next allocation in place.
 
-**By hand** (no loop), the same rule: `jobs`, then within 3 h of the end `submit --begin <end less 15 min>`; release
-the old one early only when it is idle.
+**By hand** (no loop), the same rule: `jobs`, then within 3 h of the end, if lanes ran tests in the last 3 h,
+`submit --begin <end less 15 min>`; release the old one early only when it is idle.
 
 ## Files
 

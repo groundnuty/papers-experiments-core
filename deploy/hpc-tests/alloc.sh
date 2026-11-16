@@ -11,8 +11,10 @@
 #                                        renew while lanes want it, release when idle (the loop; README, "Renewal")
 #   alloc.sh renew-start <renew options> start that loop detached (setsid nohup), from a frozen copy of this script
 #   alloc.sh renew-stop                  ask the loop to stop at its next poll
-#   alloc.sh want --until <epoch>        lanes need the allocation until <epoch>: the loop may submit successors
-#   alloc.sh unwant                      lanes no longer need it: the loop submits nothing (the running job ends)
+#   alloc.sh want --until <epoch>        override: renew until <epoch> even when idle (and no idle release)
+#   alloc.sh never                       override: no renewal even when busy (the running job ends; idle release on)
+#   alloc.sh auto                        no override: renew while a test step ran in the last 3 h (the default)
+#   alloc.sh unwant                      remove the want override only
 #
 # "Ours" is the ledger AND the name: a job of the account that this ledger does not list (another study's, another
 # lane's) is never listed, renewed or cancelled, and no command here cancels by user. The clock is read (date +%s) at
@@ -24,6 +26,8 @@ STATE=$DIR/renew.state
 LOCK=$DIR/renew.lock
 STOP=$DIR/renew.stop
 WANTED=$DIR/renew.wanted
+NEVER=$DIR/renew.never
+BUSY=10800  # a test step of ours within this many seconds makes the allocation busy: renewal is on by default then
 
 die() { echo "alloc.sh: $1" >&2; exit "${2:-2}"; }
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -174,7 +178,9 @@ renewer_status() {
   elif [ -n "$words" ]; then
     status=ended
   fi
-  echo "status=$status wanted=$(wanted_until || echo -) $(printf '%s\n' "$words" | tr ' ' '\n' | grep -v -E '^(pid|status)=' | tr '\n' ' ')"
+  local mode=auto
+  if [ -e "$NEVER" ]; then mode=never; elif [ -n "$(wanted_until)" ]; then mode=want; fi
+  echo "status=$status mode=$mode wanted=$(wanted_until || echo -) $(printf '%s\n' "$words" | tr ' ' '\n' | grep -v -E '^(pid|status)=' | tr '\n' ' ')"
 }
 
 cmd_release() {
@@ -238,28 +244,75 @@ wanted_until() { # the epoch renew.wanted names, when it exists and holds one; n
   is_count "$value" && echo "$value"
 }
 
-renew_once() {
-  local now rows pending end begin out rc want
-  now=$(date +%s)
-  # A deliberate step: billing runs idle or busy, so a successor is submitted only while the marker says lanes need it.
+ran_step_since() { # ran_step_since <id> <epoch> <alive>: whether sacct shows a test step of the job that runs or ended at
+  # or after <epoch>: 0 yes, 1 no, 2 its record cannot be read. A test step is a numbered one (never batch or extern).
+  # For an alive job, accounting that does not list its batch step has not caught up: unreadable, not "no step".
+  local id=$1 since=$2 alive_job=$3 rows step start end state
+  rows=$(sacct -n -P -j "$id" -o JobID,Start,End,State) || return 2
+  if ! printf '%s\n' "$rows" | grep -q "^$id\.batch|"; then [ "$alive_job" = 1 ] && return 2; return 1; fi
+  while IFS='|' read -r step start end state; do
+    case "$step" in "$id".[0-9]*) ;; *) continue ;; esac
+    case "${step#"$id".}" in *[!0-9]*) continue ;; esac
+    if [ "$state" = RUNNING ] || [ "$end" = Unknown ]; then return 0; fi
+    end=$(to_epoch "$end")
+    if is_count "$end" && [ "$end" -ge "$since" ]; then return 0; fi
+  done <<< "$rows"
+  return 1
+}
+
+# Whether a successor may be submitted now, and why (one line on stdout): 0 yes, 1 no, 2 no decision this round.
+# `never` wins, then an unexpired `want`; otherwise renewal is on exactly while a test step of ours ran within BUSY
+# seconds, on an alive allocation of ours or on one of the last three the ledger holds.
+renewal_wanted() { # renewal_wanted <now> <alive rows>
+  local now=$1 rows=$2 want id unread=0
+  if [ -e "$NEVER" ]; then echo "renew never is set"; return 1; fi
   want=$(wanted_until)
-  if [ -z "$want" ] || [ "$now" -ge "$want" ]; then return 0; fi
+  if [ -n "$want" ] && [ "$now" -lt "$want" ]; then echo "want $want"; return 0; fi
+  for id in $(printf '%s\n' "$rows" | awk -F'|' '$3 == "RUNNING" {print $1}'); do
+    ran_step_since "$id" $((now - BUSY)) 1
+    case $? in 0) echo "busy: job $id ran a test step within $BUSY s"; return 0 ;; 2) unread=1 ;; esac
+  done
+  for id in $( [ -f "$LEDGER" ] && awk '$1 ~ /^[0-9]+$/ {print $1}' "$LEDGER" | tail -n 3); do
+    printf '%s\n' "$rows" | grep -q "^$id|" && continue
+    ran_step_since "$id" $((now - BUSY)) 0
+    case $? in 0) echo "busy: job $id ran a test step within $BUSY s"; return 0 ;; 2) unread=1 ;; esac
+  done
+  if [ "$unread" = 1 ]; then echo "accounting could not be read"; return 2; fi
+  echo "idle: no test step of ours within $BUSY s"
+  return 1
+}
+
+renew_once() {
+  local now rows pending end begin out rc reason situation
+  now=$(date +%s)
   rows=$(alive) || { log "squeue failed: no decision this round"; return 0; }
   pending=$(printf '%s\n' "$rows" | awk -F'|' '$3 == "PENDING" || $3 == "CONFIGURING" {n++} END {print n + 0}')
   if [ "$pending" -gt 0 ]; then return 0; fi
   end=$(printf '%s\n' "$rows" | awk -F'|' '$3 == "RUNNING" {print $5}' | while read -r t; do to_epoch "$t"; done | grep -E '^[0-9]+$' | sort -n | tail -n 1)
   if [ -z "$end" ]; then
     begin=$now
-    log "no allocation of ours is alive: submitting one now"
+    situation="no allocation of ours is alive"
   elif [ $((end - now)) -gt "$LEAD" ]; then
     return 0
   else
     begin=$((end - OVERLAP))
     [ "$begin" -gt "$now" ] || begin=$now
-    log "the allocation of ours ends in $((end - now)) s: submitting its successor to begin at $(date -u -d "@$begin" +%FT%TZ)"
+    situation="the allocation of ours ends in $((end - now)) s"
   fi
-  [ "$begin" -lt "$UNTIL" ] || { log "a successor would begin at or after --until: none submitted"; return 0; }
-  [ "$begin" -lt "$want" ] || { log "a successor would begin after renew.wanted's time: none submitted"; return 0; }
+  reason=$(renewal_wanted "$now" "$rows")
+  case $? in
+    0) ;;
+    1) echo "NOTE $situation; no successor: $reason"; return 0 ;;
+    *) echo "NOTE $situation; no decision this round: $reason"; return 0 ;;
+  esac
+  case "$reason" in
+    want\ *)
+      [ "$begin" -lt "${reason#want }" ] || { echo "NOTE a successor would begin after renew want's time: none"; return 0; }
+      reason="renew want until $(date -u -d "@${reason#want }" +%FT%TZ)"
+      ;;
+  esac
+  [ "$begin" -lt "$UNTIL" ] || { echo "NOTE a successor would begin at or after --until: none submitted"; return 0; }
+  log "$situation ($reason): submitting a successor to begin at $(date -u -d "@$begin" +%FT%TZ)"
   out=$(cmd_submit --begin "$begin" 2>&1)
   rc=$?
   printf '%s\n' "$out" | sed 's/^/  /'
@@ -294,9 +347,12 @@ last_activity() { # last_activity <id> <start>: when a step of the job last ran 
 # never ran one) is released, by its id, through release's own ledger and name checks; renew.wanted is cleared with it,
 # so the loop does not submit another at once, and a successor of ours still queued is released too (nobody needs it).
 idle_release() {
-  local now rows id name state start end cpus mem began last live released=0
+  local now rows id name state start end cpus mem began last live want released=0
   [ "$IDLE" -gt 0 ] || return 0
   now=$(date +%s)
+  # `renew want` keeps the allocation even when idle, so no idle release while it lasts.
+  want=$(wanted_until)
+  if [ -n "$want" ] && [ "$now" -lt "$want" ]; then return 0; fi
   rows=$(alive) || { log "squeue failed: no idle decision this round"; return 0; }
   while IFS='|' read -r id name state start end cpus mem; do
     [ "$state" = RUNNING ] || continue
@@ -344,7 +400,7 @@ on_signal() {
 cmd_renew() {
   parse_renew "$@"
   load_env
-  local submitted=0 failures=0 decision reason=""
+  local submitted=0 failures=0 decision reason="" note last_note=""
   if [ "$ONCE" = 0 ]; then
     take_lock
     trap 'drop_lock' EXIT
@@ -357,7 +413,11 @@ cmd_renew() {
     if [ "$(date +%s)" -ge "$UNTIL" ]; then reason=until; break; fi
     idle_release
     decision=$(renew_once)
-    printf '%s\n' "$decision" | grep -v -E '^(SUBMITTED|SUBMIT-FAILED|STOP)$' | sed '/^$/d'
+    printf '%s\n' "$decision" | grep -v -E '^(SUBMITTED|SUBMIT-FAILED|STOP|NOTE .*)$' | sed '/^$/d'
+    # A decision not to submit is logged once, when it changes, not at every poll of an idle day.
+    note=$(printf '%s\n' "$decision" | sed -n 's/^NOTE //p' | tail -n 1)
+    if [ -n "$note" ] && { [ "$note" != "$last_note" ] || [ "$ONCE" = 1 ]; }; then log "$note"; fi
+    last_note=$note
     case "$decision" in
       *SUBMITTED) submitted=$((submitted + 1)); failures=0 ;;
       *SUBMIT-FAILED) failures=$((failures + 1)) ;;
@@ -396,12 +456,24 @@ cmd_want() {
   [ "${1:-}" = --until ] && is_count "${2:-}" || die "want takes --until <seconds since the epoch>"
   [ "$2" -gt "$(date +%s)" ] || die "want: that time has passed"
   printf '%s\n' "$2" > "$WANTED.new" && mv -f "$WANTED.new" "$WANTED"
+  rm -f "$NEVER"
   echo "WANTED until $2"
 }
 
 cmd_unwant() {
   rm -f "$WANTED"
-  echo "UNWANTED: no successor is submitted; the running allocation ends at its time limit (release ends it now)"
+  echo "UNWANTED: the want override is gone; renewal follows the default (renew while a test step ran within 3 h)"
+}
+
+cmd_never() {
+  : > "$NEVER"
+  rm -f "$WANTED"
+  echo "NEVER: no successor is submitted, even when busy; the running allocation ends at its time limit"
+}
+
+cmd_auto() {
+  rm -f "$WANTED" "$NEVER"
+  echo "AUTO: no override; renewal is on while a test step of ours ran within 3 h"
 }
 
 cmd_renew_stop() {
@@ -409,7 +481,7 @@ cmd_renew_stop() {
   echo "the renewer stops at its next poll (renew.stop written)"
 }
 
-[ $# -ge 1 ] || die "usage: alloc.sh submit|list|release|renew|renew-start|renew-stop|want|unwant ..."
+[ $# -ge 1 ] || die "usage: alloc.sh submit|list|release|renew|renew-start|renew-stop|want|unwant|never|auto ..."
 umask 077
 sub=$1
 shift
@@ -422,5 +494,7 @@ case "$sub" in
   renew-stop) cmd_renew_stop ;;
   want) cmd_want "$@" ;;
   unwant) cmd_unwant ;;
+  never) cmd_never ;;
+  auto) cmd_auto ;;
   *) die "unknown subcommand $sub" ;;
 esac

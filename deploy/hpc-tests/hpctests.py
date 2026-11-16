@@ -7,7 +7,8 @@ and bring its results back (README.md).
     hpctests.py jobs                            our allocations, their ends in UTC, and the renewer's state
     hpctests.py release JOB                     cancel one allocation of ours (the ledger's, under our name)
     hpctests.py renew start --until ISO | stop  the login node's renewal loop (README, "Renewal")
-    hpctests.py renew want --until ISO | unwant whether lanes need the allocation: the loop renews only while wanted
+    hpctests.py renew want --until ISO | never | auto | unwant   override the default (renew while a test step
+                                                ran in the last 3 h): renew even if idle, never renew, or no override
     hpctests.py run [--rev REV] [--cores N] [--mem SIZE] [--time MIN] [--job JOB] -- <pytest arguments>
     hpctests.py clean [--stale MIN | --all]     remove what killed steps left on the allocation's node
 
@@ -383,13 +384,14 @@ def cmd_jobs(remote: Remote) -> int:
     beat_text = utc(int(beat)) if beat.isdigit() else "-"
     until = renewer.get("until", "")
     print(
-        f"renewer: {renewer.get('status', 'none')}, heartbeat {beat_text},"
+        f"renewer: {renewer.get('status', 'none')} (renewal {renewer.get('mode', 'auto')}), heartbeat {beat_text},"
         f" until {utc(int(until)) if until.isdigit() else '-'}"
     )
     running = [j for j in jobs if j.state == "RUNNING" and j.end is not None]
     queued = [j for j in jobs if j.state != "RUNNING"]
-    if running and not queued and max(j.end or 0 for j in running) - now < 7200 and renewer.get("status") != "running":
-        print("WARNING: the allocation ends within 2 h, no successor is queued and no renewer runs (README, Renewal)")
+    ending = running and not queued and max(j.end or 0 for j in running) - now < 7200
+    if ending and (renewer.get("status") != "running" or renewer.get("mode") == "never"):
+        print("WARNING: the allocation ends within 2 h, no successor is queued, and no renewer will submit one")
     return 0
 
 
@@ -410,7 +412,7 @@ def parser() -> argparse.ArgumentParser:
     release = sub.add_parser("release")
     release.add_argument("job")
     renew = sub.add_parser("renew")
-    renew.add_argument("action", choices=["start", "stop", "once", "want", "unwant"])
+    renew.add_argument("action", choices=["start", "stop", "once", "want", "unwant", "never", "auto"])
     renew.add_argument(
         "--until", help="ISO time (UTC): the loop's end (start, once), or until when lanes need it (want)"
     )
@@ -448,8 +450,8 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "renew":
         if args.action == "stop":
             return passthrough(remote.alloc("renew-stop"))
-        if args.action == "unwant":
-            return passthrough(remote.alloc("unwant"))
+        if args.action in ("unwant", "never", "auto"):
+            return passthrough(remote.alloc(args.action))
         if not args.until:
             raise lib.HpcTestsError("renew start, once and want need --until")
         if args.action == "want":

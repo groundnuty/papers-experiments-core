@@ -202,23 +202,89 @@ def test_o64_with_no_allocation_of_ours_alive_one_is_submitted_now(login):
     assert f"--begin={slurm_time(NOW)}" in call["argv"]
 
 
+IDLE_STEPS = (("500.batch", "x", "Unknown", "RUNNING"), ("500.0", "x", slurm_time(NOW - 4 * 3600), "COMPLETED"))
+BUSY_STEPS = (("500.batch", "x", "Unknown", "RUNNING"), ("500.4", "x", slurm_time(NOW - 3600), "COMPLETED"))
+
+
 @pytest.mark.parametrize("wanted", [None, NOW, NOW + 60])
-def test_o64_no_successor_is_submitted_unless_lanes_said_they_need_it_until_after_it_begins(login, wanted):
-    """O64: renewal is a deliberate step: billing runs idle or busy, so the loop submits a successor only while
-    renew.wanted names a time still ahead and after the successor's begin; without it (or after it) the running
-    allocation simply ends."""
+def test_o64_an_idle_allocation_gets_no_successor_unless_a_want_covers_its_begin(login, wanted):
+    """O64: billing runs idle or busy, so an allocation whose last test step ended more than 3 h ago gets no successor
+    and simply ends; a want override that has passed, or ends before the successor would begin, changes nothing."""
     login.ledger(500)
     login.queue(running(500, NOW + 3600))
-    renew_once(login, wanted=wanted)
+    steps(login, 500, *IDLE_STEPS)
+    out = renew_once(login, wanted=wanted)
     assert fakes.calls(login.fake / "sbatch.jsonl") == []
+    assert "no successor: idle" in out.stdout or "renew want's time" in out.stdout
 
 
-def test_want_and_unwant_set_and_clear_the_marker_the_listing_shows(login):
+def test_o64_a_busy_allocation_is_renewed_by_default(login):
+    """O64: renewal is on by default while a test step of ours ran within 3 h: the successor is queued with --begin
+    at the end less the overlap, with no marker at all."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 3600))
+    steps(login, 500, *BUSY_STEPS)
+    out = renew_once(login, wanted=None)
+    (call,) = fakes.calls(login.fake / "sbatch.jsonl")
+    assert f"--begin={slurm_time(NOW + 3600 - 900)}" in call["argv"]
+    assert "busy: job 500 ran a test step" in out.stdout
+
+
+def test_o64_renew_never_stops_the_renewal_of_a_busy_allocation(login):
+    """O64: `never` overrides the default: a busy allocation gets no successor (and still the idle release)."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 3600))
+    steps(login, 500, *BUSY_STEPS)
+    login.alloc("never", check=0)
+    assert "mode=never" in login.alloc("list", check=0).stdout
+    out = renew_once(login, wanted=None)
+    assert fakes.calls(login.fake / "sbatch.jsonl") == []
+    assert "renew never is set" in out.stdout
+
+
+def test_o64_renew_want_renews_an_idle_allocation_and_holds_off_the_idle_release(login):
+    """O64: `want --until` overrides the default the other way: an idle allocation is renewed, and it is not released
+    for idleness while the want lasts."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 3600))
+    steps(login, 500, *IDLE_STEPS)
+    out = renew_once(login, wanted=NOW + 86400, idle="10800")
+    assert fakes.calls(login.fake / "scancel.jsonl") == []
+    (call,) = fakes.calls(login.fake / "sbatch.jsonl")
+    assert f"--begin={slurm_time(NOW + 3600 - 900)}" in call["argv"]
+    assert "renew want until" in out.stdout
+
+
+def test_no_renewal_decision_on_unreadable_accounting(login):
+    login.ledger(500)
+    login.queue(running(500, NOW + 3600))
+    (login.fake / "sacct-fail").write_text("")
+    out = renew_once(login, wanted=None)
+    assert fakes.calls(login.fake / "sbatch.jsonl") == []
+    assert "no decision this round" in out.stdout
+
+
+@pytest.mark.parametrize(("rows", "submits"), [(BUSY_STEPS, 1), (IDLE_STEPS, 0), ((), 0)])
+def test_with_none_alive_the_last_ledger_jobs_steps_decide(login, rows, submits):
+    login.ledger(500)  # ended: not in the queue
+    steps(login, 500, *rows)
+    renew_once(login, wanted=None)
+    assert len(fakes.calls(login.fake / "sbatch.jsonl")) == submits
+
+
+def test_want_never_auto_and_unwant_set_and_clear_the_overrides_the_listing_shows(login):
     login.alloc("want", "--until", str(NOW - 1), check=2)
     assert login.alloc("want", "--until", str(NOW + 7200), check=0).stdout.strip() == f"WANTED until {NOW + 7200}"
-    assert f"wanted={NOW + 7200}" in login.alloc("list", check=0).stdout
+    assert f"mode=want wanted={NOW + 7200}" in login.alloc("list", check=0).stdout
     login.alloc("unwant", check=0)
-    assert "wanted=-" in login.alloc("list", check=0).stdout
+    assert "mode=auto wanted=-" in login.alloc("list", check=0).stdout
+    login.alloc("never", check=0)
+    login.alloc("want", "--until", str(NOW + 60), check=0)  # a want replaces a never
+    assert "mode=want" in login.alloc("list", check=0).stdout
+    login.alloc("never", check=0)  # and a never a want
+    assert "mode=never wanted=-" in login.alloc("list", check=0).stdout
+    login.alloc("auto", check=0)
+    assert "mode=auto wanted=-" in login.alloc("list", check=0).stdout
 
 
 def test_the_renewer_stops_after_a_submit_that_was_not_as_asked(login):
@@ -256,17 +322,16 @@ def steps(login, job, *rows):
     (login.fake / f"sacct-{job}").write_text("".join("|".join(map(str, row)) + "\n" for row in rows))
 
 
-def test_o64_an_allocation_of_ours_idle_for_three_hours_is_released_by_its_id_and_the_marker_cleared(login):
+def test_o64_an_allocation_of_ours_idle_for_three_hours_is_released_by_its_id_and_not_renewed(login):
     """O64: a RUNNING allocation of ours that has run no test step for 3 h (from its start, when it never ran one) is
-    released by its own id; renew.wanted is cleared so the loop does not submit another at once; an idle job of the
-    account outside the ledger is never touched."""
+    released by its own id, and, being idle, gets no successor; an idle job of the account outside the ledger is
+    never touched."""
     login.ledger(500)
     login.queue(running(500, NOW + 8 * 3600), running(600, NOW + 60))  # 500 started 4 h ago and ran nothing
     steps(login, 500, ("500.batch", slurm_time(NOW - 4 * 3600), "Unknown", "RUNNING"))
-    out = renew_once(login, wanted=NOW + 86400, idle="10800")
+    out = renew_once(login, wanted=None, idle="10800")
     assert fakes.calls(login.fake / "scancel.jsonl") == [["500"]]
     assert "RELEASED 500" in out.stdout
-    assert not (login.dir / "renew.wanted").exists()
     assert fakes.calls(login.fake / "sbatch.jsonl") == []
 
 
