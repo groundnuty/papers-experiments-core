@@ -142,6 +142,14 @@ the restore, the step is `deferred` and the admission closes the federation for 
 labelled with the seconds on the injector's clock since `start`, so replay serves it and no scorer asks the platform.
 The injection's own entry holds `target`, `injected`, `cleared`, `verified` and, once its provider served, `ready_after_s`.
 
+**A link check whose record was not written says so (O35, `linkrecord`).** The restore's link check and each read of the
+pairs a heal makes write `link-check.json` (`fault_serves.recorded`), and one that could not be serialized or whose
+record could not be written leaves no record. The snapshot then holds `link_record: "not_written"` and
+`link_record_reason` (`lock_not_taken` or `write_failed`) at its top level, a `link_record` step with the same two keys,
+and the heal's matrices (`first`, `before`, `after`) say it of their own check; a `recovered` step holds them for a
+recovery's. All of it is absent when every record was written, so a reading is what it was. The restore is verified or
+not as ever: the record is advisory.
+
 **Use.** The study's plugin passes the platform's run admission to the campaign (`admission=run_admission(config,
 schema)`, with the study's factor schema), which admits each run to the federation before anything starts (exclusive
 when its condition declares `provider_outage` or `exclusive = true`) and keeps it until after the post-run check, and
@@ -330,6 +338,7 @@ from expcore_onedata.fault_recovery import RESTORED, FaultDriver, Recovery, Rest
 from expcore_onedata.fault_restore import stop_record
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, heal_token_margin_s, hpc_driver, load_faults
+from expcore_onedata.linkrecord import NOT_WRITTEN, fact
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 __all__ = [
@@ -811,6 +820,8 @@ class FaultInjector:
         heal = record.get("heal")
         if isinstance(heal, Mapping):
             self._step("heal", heal.get("ok") is True, **{k: v for k, v in heal.items() if k != "ok"})
+        if record.get("link_record") == NOT_WRITTEN:  # a check's record was not written: the run's record says so
+            self._step("link_record", False, **fact(str(record["link_record_reason"])))
 
     @contextlib.asynccontextmanager
     async def running(
@@ -953,7 +964,16 @@ class FaultInjector:
             "injections": [] if injection is None else [injection],
             "steps": [dict(step) for step in self._steps],
             **self._restore_reading(injection),
+            **self._link_record_reading(),
         }
+
+    def _link_record_reading(self) -> dict[str, Any]:
+        """The optional fact that a link check's record was not written (`linkrecord.fact`), from the latest step that
+        holds it, a `link_record` step or a `recovered` one; nothing when every record was written."""
+        for step in reversed(self._steps):
+            if step.get("link_record") == NOT_WRITTEN:
+                return fact(str(step["link_record_reason"]))
+        return {}
 
     def _restore_reading(self, injection: Mapping[str, Any] | None) -> dict[str, Any]:
         """What the snapshot says of the restore, so that the record carries a failure itself (O11): `restore_verified`
