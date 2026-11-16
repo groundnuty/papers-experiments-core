@@ -308,7 +308,9 @@ def test_s15_the_sensitivity_analysis_shows_the_flat_equivalence_family_with_its
     primary analysis uses, under the sensitivity analysis's own heading level."""
     section = sensitivity_section(flat_equivalence(four(), {"gain-x": 0.002, "loss-x": 0.04}))
     claims = table_of(section, "#### Equivalence family (Holm over two one-sided tests)")
-    assert claims["Contrast"] == ["Contrast", *claims["Contrast"][1:]]
+    assert claims["Contrast"] == [
+        "Contrast", "Margin", "TOST p", "Holm TOST p", "Interval level", "Adjusted interval", "Equivalent"
+    ]  # fmt: skip
     assert claims["gain-x"][2:4] == ["0.0020", "0.0040"]
     assert claims["loss-x"][2:4] == ["0.0400", "0.0400"]
     assert "Holm family |" not in section  # one flat Holm family: no family column
