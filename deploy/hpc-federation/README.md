@@ -483,6 +483,60 @@ another shard (by its whole spec, so the same label in another partition too) or
 snapshot holds the whole of `out/` but the live store's own files, which its backup stands for, and copies it whole
 each time: size `snapshot_every_s` to what the shared filesystem can take.
 
+## A fleet of federations (`fleet.py`)
+
+A campaign's shards run in parallel, one shard per federation and one federation per held job (O67; DESIGN.md,
+section 1, "A fleet"). `fleet.py` brings N federations up from one layout, gives each a shard, launches each shard's
+step and takes them all down. Run it on the login node, from a private 0700 directory of yours, with `-I`:
+
+```bash
+set -a; . deploy/hpc-federation/site.env; set +a
+F=<an absolute path, not there yet, on the filesystem the login node and the nodes see>
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" --layout deploy/hpc-federation/layouts/pilot-shape.toml up 4
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" plan --manifest <shard settings>
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" step
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" status
+uv run python deploy/hpc-federation/shards.py collect --manifest "$F/shards.toml" --into <a new directory> --run
+uv run python -I deploy/hpc-federation/fleet.py --fleet "$F" down
+```
+
+- **How many.** `HPC_FLEET_MAX` (in `site.env`) is your maximum of federations at once in one fleet, which the grant
+  and the scratch inode quota set; with none set, `up` refuses. `up N` past it is refused before anything is made, and
+  `add K` counts every federation that may still hold a job (a failed one may, until its `down`). With the inode guard
+  in the core, the fleet asks it once for all N (the account's usage against N times one federation's estimate).
+  `HPC_FLEET_PARALLEL` (1 by default) is how many ups or downs run at once. The maximum is one fleet's: two fleets of
+  one account share the grant by hand.
+- **What `up` makes.** The fleet's directory (new: never adopted), and federations `fed-1` ... `fed-N`, each its own
+  root `<fleet>/fed-k/root`, state file and held job, each brought up by `hpcfed.py up` in a process of its own (its
+  output in `<fleet>/logs/fed-k.up.log`). The fleet's record, `<fleet>/fleet.json`, holds each one's root, its job's
+  name and its shard, and is the only list the other commands act on. **A failed `up` leaves the others up:** it is
+  reported with any job it may still hold, and `down --member fed-k` releases it.
+- **`plan`** takes the shard settings, `shards.py`'s manifest keys without `[[shards]]` (its docstring has them), gives
+  `shard-k` to `fed-k`, writes `<fleet>/shards.toml` for `collect` and prints each shard's line as `shards.py plan`
+  does. A federation that is not linked, is not the one the fleet made, or leaves a space's data undeclared
+  (`data_manifest`) gets no shard; a shard whose federation failed stays unassigned. **The first plan refuses outright
+  when the federations' platform fingerprints differ** (another zone image's CA, another SIF, another data manifest):
+  their shards would never merge. It names each federation and the differing keys.
+- **`step`** launches each assigned shard's line detached on the login node, its client recorded and its output in
+  `<fleet>/logs/`, after checking the federation again and that `shards.toml` is the one the record gives. A shard is
+  not launched again while its client runs; one whose step ended is relaunched only with `--shard L --resume`.
+- **Moving a shard.** `down --member fed-k` takes one federation down and frees its shard (its step ends with the
+  job); `add 1` brings a fresh federation up; `plan` gives it the shard only after its own `up` (data and links
+  checked), with the fleet's fingerprint, and only when its `platform.toml` leaves `[placement] reset_shortcut` off, so
+  every reset there, the shard's first included, takes the full reads; `step` then starts it with `--resume` from its
+  snapshots or archive. A federation that ran a shard is never given another.
+- **`down`** takes down every federation the fleet made (or `--member` one), each by `hpcfed.py down` (which cancels
+  its jobs by id) and each verified: the exit status and its root gone. A root that is not the directory the fleet
+  made, or whose state file is another federation's, is refused, left untouched and named, and `down` exits 1;
+  nothing outside the record is ever looked at. The fleet's directory stays with its record, its logs and each root's
+  lifecycle lock (hpcfed never removes one); remove it by hand once `status` shows every federation down.
+
+`tests/deploy/test_hpc_fleet.py` and `test_hpc_fleet_plan.py` run the fleet over a fake cluster per federation, the
+core's phase the real one over a bootstrap stand-in: several federations, one failing `up`, the maximum and the inode
+guard refusing before anything is made, the bound on ups at once, `down` of all and of one, a federation and a job the
+fleet did not make left untouched, the fingerprint check, each step on its own federation's job and node, and a shard
+moved to a fresh federation. Not run live.
+
 ## What the repository's tests cover
 
 `tests/deploy/test_hpc_*.py` run the Couchbase guard against the stand-in, the password rules, a 3.8 parse of every

@@ -101,6 +101,54 @@ What it bills, with the pilot shape (six service nodes of 5 cores and 11 GB) and
 | uniform at 9 cores, 18 GB | 7 × 9 = 63 | (one of the 7) | 63 |
 | uniform at 11 cores, 18 GB | 7 × 11 = 77 | (one of the 7) | 77 |
 
+### A fleet: N federations, one shard on each
+
+A campaign's #154 shards run in parallel, **one shard per federation and one federation per held job**, as many at
+once as the operator allows (`fleet.py`, `fleetrecord.py`, `fleetplan.py`; README, "A fleet of federations"). A
+federation stays what it is above: the fleet is `hpcfed.py up` and `down` run N times, plus `shards.py`'s lines,
+under one record. One federation's job failing ends one shard's step, never another's.
+
+- **How many.** `HPC_FLEET_MAX` in `site.env` is the operator's maximum of federations at once in one fleet, set by
+  the grant and the scratch inode quota; unset refuses. `up N` past it is refused before anything is made; `add K`
+  counts every federation that may still hold a job (a failed `up` may, until its `down`). The inode guard
+  (`hpcquota`, when the core has it) is asked once for N: N concurrent ups would each read the same usage and pass
+  alone, so the fleet reads it against N times one federation's estimate. `HPC_FLEET_PARALLEL` (1 by default) is how
+  many ups or downs run at once.
+- **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
+  under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
+  its output in `<fleet>/logs/<label>.<command>.log`. One that fails is reported; the others go on.
+- **Names and roots, derived.** Federations are `fed-1` ... `fed-N` and shards `shard-1` ... `shard-N`, from their
+  places, never a site value; each federation's job name is its own `up`'s (`hpcop-<project>-<random>`). Its root is
+  `<fleet>/fed-k/root`, made by an exclusive `mkdir` inside a slot made the same way, so the fleet never adopts a
+  directory; the fleet's own directory is made the same way.
+- **The record (`fleet.json`) is the only list.** Each change is written whole, under its lock, before the action it
+  enables: a federation is recorded before its slot is made, and its root's device and inode once made, so `down`
+  finds whatever `up` reached. The record accepts no root but `<fleet>/fed-k/root`. Nothing is ever found by a search,
+  so a federation another `up` made beside the fleet, in its directory or not, is never looked at.
+- **`down` takes down only what the fleet's `up` made.** Before each federation's `hpcfed.py down`, its root must be
+  the directory the fleet's `mkdir` made (device and inode, no link) and its state file the one that federation's `up`
+  wrote (its `command` names this root, and its job name is the one recorded); otherwise it is refused, untouched,
+  and named. The driver's own `down` then cancels its jobs by id and never one whose id now names another job
+  (section 5). A root an `up` never marked (refused in its preflight) is the fleet's empty `mkdir`, which hpcfed's
+  `down` refuses as unmarked: the fleet removes it with `rmdir`, which removes nothing else. Each is verified: the
+  child's exit status and the root gone.
+- **One campaign.** `plan` gives a shard only to a federation whose `up` finished (`linked`: each space's data read
+  back against its manifest, every link checked), whose identity is the fleet's, whose every space declares its data
+  (`data_manifest`, C06) and whose `PlatformConfig.fingerprint()` is the fleet's. The first plan sets that reference,
+  and refuses outright when the federations' fingerprints differ (naming each federation and the differing keys):
+  their shards would never merge (C29). `step` checks all of it again, and that `shards.toml` is the one the record
+  gives, before each launch: a line is never built from a manifest the fleet did not write.
+- **Moving a shard (the coordinator's rule).** The shard count is fixed at the fleet's `up`. A shard whose federation
+  is taken down (`down --member`) is released, and given only to a federation brought up after (`add`), never one that
+  held a shard before, with the same checks and an equal fingerprint, its step started with `--resume` from its
+  snapshots or archive (O62). Its first reset there must be full. What the fleet can check is the platform file the
+  step carries into the study: it moves a shard only to a federation whose `platform.toml` leaves `[placement]
+  reset_shortcut` off (the default), under which every reset takes the full reads; one that turns it on is refused.
+  It cannot see a study's own request for one full reset (O51), so a study that turns the shortcut on moves no shard.
+- **Not built:** a fleet's `down` of a failed federation on its own (the operator decides when a failed `up`'s job
+  goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
+  two fleets of one account must share it by hand).
+
 ## 2. Sizing: service steps, control steps, and the node
 
 The sizes are layout settings, in an `[hpc]` table of the same layout file. `fedspec.py` accepts the table and keeps
