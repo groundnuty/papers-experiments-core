@@ -146,14 +146,17 @@ def one_outage_run(directory, inject):
         "clock_reads": clock.reads,
         "wall_reads": clock.wall_reads,
         "sleeps": clock.sleeps,
+        "epoch_record": LinkEpoch(settings_of(platform).journal).path.exists(),
     }
 
 
 def test_o11_start_is_prepared_then_inject_with_the_same_journal_steps_calls_and_clock_reads(tmp_path):
     """O11: `start` and a block whose body only calls `inject` journal the same lines, record the same snapshot (every
-    step, with its time), make the same driver calls, and read the clock, the wall clock and sleep the same number of
-    times with the same sleeps, over a start that recovers an earlier run's injection, waits out the drain that
-    recovery owes and then a drain record that outlasts it, before it takes the target down and is restored."""
+    step, with its time), make the same driver calls, and read the injector's clock and sleep the same number of times
+    with the same sleeps, over a start that recovers an earlier run's injection, waits out the drain that recovery owes
+    and then a drain record that outlasts it, before it takes the target down and is restored. What the caller's block
+    alone re-reads before its stop adds one reading of the wall clock (the drain record's) and the link epoch's record,
+    which it makes when there is none; `start`'s own block reads neither."""
 
     def by_start(injector):
         injector.start(RUN)
@@ -164,7 +167,12 @@ def test_o11_start_is_prepared_then_inject_with_the_same_journal_steps_calls_and
 
     started = one_outage_run(tmp_path / "start", by_start)
     blocked = one_outage_run(tmp_path / "block", by_block)
-    assert blocked == started
+    apart = ("wall_reads", "epoch_record")
+    assert {key: value for key, value in blocked.items() if key not in apart} == {
+        key: value for key, value in started.items() if key not in apart
+    }
+    assert blocked["wall_reads"] == started["wall_reads"] + 1
+    assert (blocked["epoch_record"], started["epoch_record"]) == (True, False)
     steps = [step["step"] for step in started["snapshot"]["steps"]]
     assert {"recovered", "recovery_drain", "injected", "cleared", "verified"} <= set(steps)
     injected = next(step for step in started["snapshot"]["steps"] if step["step"] == "injected")
@@ -189,17 +197,14 @@ def legacy_start(injector, identity):
             give_up()
 
 
-def test_o11_start_differs_from_the_start_before_the_block_only_by_the_wall_clock_read_of_its_re_check(tmp_path):
-    """O11: against `start` as it was before the block, the new one journals the same lines, records the same
-    snapshot, makes the same driver calls and reads the injector's clock and sleeps alike; what `inject` reads again
-    (the admission, the journal, the drain record, the link epoch) adds one reading of the wall clock, the drain
-    record's, and nothing else."""
+def test_o11_start_is_the_start_before_the_block_down_to_every_clock_read_and_the_files_it_makes(tmp_path):
+    """O11: against `start` as it was before the block, rebuilt from its two unchanged halves, the new one journals
+    the same lines, records the same snapshot, makes the same driver calls, reads the injector's clock and the wall
+    clock and sleeps alike, and makes no link-epoch record: its own block reads nothing again."""
     before = one_outage_run(tmp_path / "legacy", lambda injector: legacy_start(injector, RUN))
     now = one_outage_run(tmp_path / "start", lambda injector: injector.start(RUN))
-    assert {key: value for key, value in now.items() if key != "wall_reads"} == {
-        key: value for key, value in before.items() if key != "wall_reads"
-    }
-    assert now["wall_reads"] == before["wall_reads"] + 1
+    assert now == before
+    assert now["epoch_record"] is False
 
 
 # --- the pilot's shape: a probe's start inside the block --------------------------------------------------------------
@@ -522,11 +527,13 @@ def at_once(call):
 
 
 def test_o11_a_start_a_block_and_a_recovery_are_refused_at_once_while_the_blocks_inject_holds_the_lock(tmp_path):
-    """O11: a block's `inject` holds the injector's lock through its stop; a `start`, a second block and a recovery
-    from another thread meanwhile are refused at once (`RuntimeError`), before they wait for that lock, so none of them
-    can run on once the block has ended; the block's injection goes on and is restored as usual."""
+    """O11: a block's `inject` holds the injector's lock through its stop; a `start`, a second block, a block built
+    before the first one opened and entered only now, and a recovery, from another thread meanwhile, are refused at
+    once (`RuntimeError`), before they wait for that lock, so none of them can run on once the block has ended; the
+    block's injection goes on and is restored as usual."""
     platform, services = write_faults(tmp_path), SlowStop()
     injector = injector_for(platform, services)
+    built_early = injector.prepared({**RUN, "attempt": 4})  # entering, not building, is what is refused
     worker = injecting_slowly(services, injector)
     try:
 
@@ -534,12 +541,16 @@ def test_o11_a_start_a_block_and_a_recovery_are_refused_at_once_while_the_blocks
             with injector.prepared({**RUN, "attempt": 3}):
                 pass
 
-        refused = [at_once(call) for call in (lambda: injector.start({**RUN, "attempt": 3}), second_block)]
-        refused.append(at_once(injector.recover))
+        def enter_built_early():
+            with built_early:
+                pass
+
+        calls = (lambda: injector.start({**RUN, "attempt": 3}), second_block, enter_built_early, injector.recover)
+        refused = [at_once(call) for call in calls]
     finally:
         services.release.set()
         worker.join(10)
-    assert [type(error) for error in refused] == [RuntimeError] * 3
+    assert [type(error) for error in refused] == [RuntimeError] * 4
     assert all("prepared" in str(error) for error in refused)
     assert stops(services) == [("stop", OUTAGE_SERVICE)]
     assert injector.finish()["ok"] is True
@@ -586,22 +597,31 @@ def test_o11_a_drain_record_raised_during_the_baseline_holds_the_injection_back_
     assert services.running(OUTAGE_SERVICE) is True
 
 
-@pytest.mark.parametrize("how", ["raised", "made_anew"])
-def test_o11_a_link_epoch_moved_during_the_baseline_holds_the_injection_back_as_federation_busy(tmp_path, how):
-    """O11: the link epoch the preparation read (`fault_epoch`) moved during the baseline: a link check, in the run's
-    own context, found a pair failing and raised it, or the record was made anew (a raise that could not be written
-    spoiled it). `inject` refuses as the hold `federation_busy` before it locks, journals or stops anything, so no
-    target is stopped on a federation whose links a check found failing after the run was admitted."""
+@pytest.mark.parametrize("how", ["raised", "spoiled_with_none_before", "made_anew", "unreadable", "unreadable_before"])
+def test_o11_a_link_epoch_not_proven_unmoved_holds_the_injection_back_as_federation_busy(tmp_path, how):
+    """O11: only the same link epoch (`fault_epoch`: its `id` and count) at the preparation and at `inject` lets the
+    target be stopped. A link check in the run's own context that found a pair failing and raised it; a raise that could
+    not be written and spoiled the record, even when there was none before the block (the preparation made one, so the
+    spoiling shows); a record made anew; and a record unreadable at `inject` or already at the preparation: each makes
+    `inject` refuse as the hold `federation_busy` before it locks, journals or stops anything."""
     platform, services = write_faults(tmp_path), FakeServices()
     injector = injector_for(platform, services)
     epochs = LinkEpoch(settings_of(platform).journal)
-    if how == "raised":
+    if how != "spoiled_with_none_before":
         epochs.ensure()
+    if how == "unreadable_before":
+        epochs.path.write_text("not json", encoding="utf-8")
     with injector.prepared(RUN) as prepared:
         if how == "raised":
             epochs.raise_for(LINKS_FAILED)
-        else:
+        elif how == "spoiled_with_none_before":
+            assert epochs.path.exists()  # made by the preparation
+            epochs.path.unlink()
+        elif how == "made_anew":
+            epochs.path.unlink()
             epochs.ensure()
+        elif how == "unreadable":
+            epochs.path.write_text("not json", encoding="utf-8")
         with pytest.raises(InfraError) as caught:
             prepared.inject()
     assert caught.value.kind == FEDERATION_BUSY
@@ -682,6 +702,33 @@ def test_o11_a_link_check_that_outlasts_the_wait_holds_the_injection_back_as_fed
     assert "outlasted" in caught.value.detail
     assert stops(services) == []
     assert journal_lines(platform) == []
+
+
+def test_o11_a_plain_start_neither_waits_for_a_link_check_under_way_nor_reads_the_epoch(tmp_path):
+    """O11: `start`'s own block has no body between its halves and reads nothing again, so a link check under way past
+    `admission_timeout_s` holds a plain `start` back no more than before the block existed: it takes the target down at
+    once and makes no link-epoch record."""
+    platform, services = write_faults(tmp_path, admission_timeout_s=0.3), FakeServices()
+    injector = injector_for(platform, services)
+    epochs = LinkEpoch(settings_of(platform).journal)
+    checking, done = threading.Event(), threading.Event()
+
+    def link_check():
+        with epochs.checking():
+            checking.set()
+            done.wait(10)
+
+    check = threading.Thread(target=link_check)
+    check.start()
+    try:
+        assert checking.wait(10)
+        assert at_once(lambda: injector.start(RUN)) is None
+    finally:
+        done.set()
+        check.join(10)
+    assert stops(services) == [("stop", OUTAGE_SERVICE)]
+    assert epochs.path.exists() is False
+    assert injector.finish()["ok"] is True
 
 
 def test_o11_an_injection_journalled_during_the_baseline_refuses_the_injection(tmp_path):
