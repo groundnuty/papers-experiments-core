@@ -35,7 +35,9 @@ FACTS: dict[str, str] = {
         "no cgroup per container: the agent's memory limit is the harness's watch, which sums the RssAnon and "
         "RssShmem of the run's processes every memory_poll_s and kills them all over the limit (Docker's kernel "
         "kills the largest process alone); a spike shorter than the period is missed, and the kernel's limit is "
-        "the step's, shared with the driver and the gate, so its OOM kill is infrastructure"
+        "the step's, shared with the driver and the gate, so its OOM kill is infrastructure. A process that makes "
+        "itself non-dumpable is hidden by /proc's hidepid, so the watch neither counts nor kills it; the end of its "
+        "cell's PID namespace when the exec returns ends it"
     ),
     "disk_watch": (
         "/work, /tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch "
