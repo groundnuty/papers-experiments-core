@@ -1632,11 +1632,15 @@ The platform layer guarantees:
 
 ```toml
 import = { readonly = true }    # the data provider holds the space on an imported storage; read-only or not (required)
+import = { readonly = true, shared = true }   # a directory other federations import too (O59): read-only is required
 ```
 
 ```python
 @dataclass(frozen=True)
-class ImportedStorage: readonly: bool          # spaces.py: StudySpace.imported, None for a regular space
+class ImportedStorage:                          # spaces.py: StudySpace.imported, None for a regular space
+    readonly: bool
+    shared: bool = False                        # O59: refused at load beside readonly = false; in the fingerprint when true
+    def record(self) -> dict[str, bool]         # {"readonly"} and {"shared": True} only when shared
 
 class Manifest:                                 # importmanifest.py: what the space must hold
     files: tuple[ManifestFile, ...]             # path, size, sha256, sorted by path
@@ -1668,6 +1672,7 @@ The platform layer guarantees:
 - **The declaration is checked against the federation before anything is waited for.** `check_storage` reads the data provider's Onepanel (`GET /provider/spaces/{space}` and `GET /provider/storages/{id}`, with the admin credential, which must be a member of that provider's cluster): the support's storage must be imported, read-only as declared, in the `auto` mode, with `continuousScan` false; anything else is `ImportFailed`, a manual import included.
 - **The scan's state is a report, the listing and the block maps the evidence (O01).** `await_scan` reads `GET .../storage-import/auto/info` every `poll_s` until a scan later than the `after`-th has `completed` with no failed file, within `timeout_s`; `failed` or `aborted` fails at once. `verify` then requires, on each provider named (the data provider always, first), that the listing holds exactly the manifest's paths, kinds and sizes and nothing more on `consecutive_polls` reads in a row, all providers within one `timeout_s`; then that every file is whole on the data provider by its block map, read under `[placement] concurrency`; and with `hashes`, every file read back through the data provider with the manifest's SHA-256.
 - **The record** (version 1): `space` (its position), `ok`, `readonly`, `manifest` (counts, bytes, its SHA-256), `storage` (the flags `check_storage` read), `scan` (the last state read, with `polls` and `waited_s`), `listing` per provider position (`files`, `directories`, `bytes`, `missing`, `wrong_size` and `wrong_kind` as manifest positions, `missing_directories` and `extra` as counts, `converged`, `seconds` from the verification's start to the first of the matching reads, `polls`), `blocks` (`files`, `whole`, `not_whole`), `hashes` (`files`, `equal`, `differ`), `seconds` per phase and `reads_retried` (O29). `ImportFailed.record` is the record so far. Nothing in it or in a message is a path, a name or a label (O12).
+- **A shared tree is read-only in every layer (O59).** `shared = true` beside `readonly = false` is a `ConfigError` at load naming the key; a shared import's `check_storage` refuses a storage whose `readonly` is not the boolean `true` (`1`, `"true"`, null and a missing key are none of them), before the scan is read; and the record carries `shared: true`, only for such a space. The deployment's side (the layout's `shared`, `manifest_env` and `direct_io`, `fedimport.verify_imports`, the HPC provider's read-only bind and its mount check) is in [`storage-import.md`](storage-import.md), "A tree on the cluster's shared filesystem".
 - **A read-only imported space is never written by the core.** `Provisioner.mutate` refuses, before anything is sent, every request under `/data/` (a creation, a write, a delete, through any provider), and `schedule_transfer` refuses a replication onto the data provider: `Refused`. `ProgressiveIngest` refuses such a space when built (`Refused`), and the day-0 round trip is unknown there. Reads, replications onto the other providers, their evictions, the reset and QoS requirements are unchanged.
 
 ## The platform layer's testing module
