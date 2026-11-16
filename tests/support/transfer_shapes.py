@@ -1,5 +1,6 @@
-"""Transfer records for the tests of the state rule (O32): two live ones, and the eviction and migration shapes derived
-from op-worker's source, since no live eviction or migration record has been saved.
+"""Transfer records for the tests of the state rule (O32): three live ones (an ended and an enqueued replication, an
+ended eviction), and the other eviction and migration shapes derived from op-worker's source, since no live record of
+them has been saved.
 
 Every record op-worker answers carries its summary `transferStatus` beside both halves, `replicationStatus` and
 `evictionStatus` (op-worker f118ed9, the federation's build, `transfer_rest_translator.erl:119-123`), and the half a job
@@ -31,7 +32,8 @@ LIVE_REPLICATION_ENQUEUED = {
     "evictingProviderId": None,
 }
 
-# DERIVED FROM OP-WORKER f118ed9, not live: an eviction's replication half is `skipped` from its creation
+# LIVE since 15 Nov: a reset's eviction record, read once after that study's Day-0 fact 3, verbatim but for the provider
+# id. It equals what op-worker f118ed9 gives: an eviction's replication half is `skipped` from its creation
 # (`transfer.erl:157-166`) and its summary is its eviction half's, `active` read as `evicting` (`transfer.erl:486-490`).
 EVICTION_ENDED = {
     "type": "eviction",

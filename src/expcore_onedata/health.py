@@ -59,6 +59,14 @@ transfers the check made. `monotonic` and `sleep` are its clock and its pauses, 
 probes and evicts them, so a caller that must change nothing, day-0's read-only `health` check alone, builds this with
 `links=False`; a campaign's health gate never does.
 
+**With `[faults]` every link check this makes also writes the federation's record (O35).** The report is written as
+`link-check.json` in the federation's root, atomically and in the format `up` writes, whichever platform file the
+check ran through (the root is the `[faults] journal`'s parent), by the same rules as a restore's and a heal's checks
+(`fault_serves.recorded`: the latest check's verdict, a check that raises or whose record cannot be written leaving no
+older record standing, one check at a time under the record's lock), so the record is the check's, not the one `up`
+wrote before an outage. Without `[faults]` no root is declared and nothing is written. The record is advisory: it
+never changes a verdict and takes no federation lock.
+
 **So is every preallocated ingest's baseline (O44, `ingesthealth.py`), when the study names the ingests' journals**
 (`ingest_journals`): before anything else, with no request to the federation, the check fails while a space's baseline
 is marked unhealthy, or open by a run that is gone, so no run is admitted until `ProgressiveIngest.recover` verifies it
@@ -82,11 +90,12 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_recovery import FaultDriver
-from expcore_onedata.fault_serves import provider_serves
-from expcore_onedata.fault_settings import compose_driver
+from expcore_onedata.fault_serves import provider_serves, recorded
+from expcore_onedata.fault_settings import FaultSettings, compose_driver, hpc_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.ingesthealth import baseline_health
 from expcore_onedata.linkcheck import LinkReport, check_links
+from expcore_onedata.linkrecord import record_path
 from expcore_onedata.linksettings import LinkCheckSettings
 from expcore_onedata.precampaign import ContentTypeVerdict, PreCampaignHealth, measure_content_type
 from expcore_onedata.tls import WARNING
@@ -156,6 +165,7 @@ def compare(view: SpaceView, config: PlatformConfig, entry: StudySpace | None = 
 
 
 def _fault_gate(
+    settings: FaultSettings | None,
     config: PlatformConfig,
     client: OnezoneClient,
     driver: FaultDriver | None,
@@ -163,16 +173,17 @@ def _fault_gate(
     links: Callable[[], LinkReport | None],
     relink: Callable[[], None],
 ) -> FaultGate | None:
-    """The fault gate around `inner` when platform.toml has a `[faults]` table, None when it has none; a table that is
-    not valid raises ConfigError here, so a platform with an injector never runs without the gate. The Compose driver
-    it recovers through finds a restored provider serving by reading through the check's own client. `links` takes the
-    link report the check made in the calling thread, `relink` makes its next call check the links again, and the
-    providers' services are those of `[faults.services]`, by label, so the gate heals the stuck pairs its own link
-    check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
-    settings = fault_settings_of(config)
+    """The fault gate around `inner` for a platform.toml's `[faults]` table (`settings`: `fault_settings_of`, which
+    raises ConfigError for a table that is not valid, so a platform with an injector never runs without the gate), None
+    when it has none. The Compose driver it recovers through finds a restored provider serving by reading through the
+    check's own client. `links` takes the link report the check made in the calling thread, `relink` makes its next call
+    check the links again, and the providers' services are those of `[faults.services]`, by label, so the gate heals the
+    stuck pairs its own link check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
     if settings is None:
         return None
-    if driver is None:
+    if driver is None and settings.backend == "hpc":  # its requests go through the federation's fault relay
+        driver = hpc_driver(settings, probe=provider_serves(config, settings, client))
+    elif driver is None:
         driver = compose_driver(settings, probe=provider_serves(config, settings, client))
     labels = {config.provider_label(name): service for name, service in settings.services.items()}
     return FaultGate(settings, driver, inner, labels=labels, links=links, relink=relink)
@@ -211,12 +222,18 @@ class PlatformHealth:
         self._fresh_for = 0  # the expiries the last link report postdates: older than `_expiries`, it is no answer
         self._made = threading.local()  # the link report each thread's call made, which only that thread takes
         self._with_links = links
+        settings = fault_settings_of(config)  # a table that is not valid raises ConfigError here
+        # the federation's record (O35): in its root, which `[faults] journal` names; a platform with no `[faults]`
+        # declares no root, so its checks write none
+        self._record = None if settings is None else record_path(settings.journal)
         self._ingest_journals = tuple(Path(journal) for journal in ingest_journals)  # read at every call (O44)
         # The link check is not a kept pre-campaign check: a stuck link is remedied while the campaign waits, and the
         # gate's re-checks must see it pass (O35). It runs in `_regular`, after the space, at the first call and later.
         self._gate = PreCampaignHealth(self._regular, self._measure)
         # outermost: it holds the federation, and heals the stuck pairs the link check finds (`fault_gate_heal`)
-        self._faults = _fault_gate(config, client, fault_driver, self._gate, self._take_links, self._expire_links)
+        self._faults = _fault_gate(
+            settings, config, client, fault_driver, self._gate, self._take_links, self._expire_links
+        )
 
     @property
     def gate_heal(self) -> dict | None:
@@ -254,7 +271,11 @@ class PlatformHealth:
         return self._content_type.health
 
     def _check_links(self) -> None:
-        self._links = check_links(self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock)
+        def check() -> LinkReport:
+            return check_links(self._config, self._client, clock=self._monotonic, sleep=self._sleep, now=self._clock)
+
+        # with `[faults]`, the routine check writes the federation's record as the restore's and the heal's do (O35)
+        self._links = check() if self._record is None else recorded(self._record, check)
         self._links_at = self._monotonic()
         self._links_passed = self._links_passed or self._links.ok
         self._made.report = self._links  # this thread's own: another thread's call never takes it

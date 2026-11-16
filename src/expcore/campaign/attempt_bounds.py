@@ -4,12 +4,14 @@
 #   changes: see git history of this file from its import commit
 """What an attempt cost, and the bound charged for one that left no count (C05, C25, C26, C27).
 
-An attempt killed before its outcome was recorded is `interrupted`: no counts, no transcript. It may have spent anything
-up to what its caps allow, so it is **charged its bound**, never 0. The same goes for an attempt whose usage is known to
-be short (an abandoned request) or was never reported. A bounded attempt is part of what has been spent, and no part of
-what a run costs: **the mean cost of a run leaves bounded attempts out**, so a kill does not make a model look dear to
-the projection, and its bound does not make it look cheap. The budget gate reserves the same bound for every run it
-starts or has in flight.
+An attempt killed before its outcome was recorded is `interrupted`: no counts, no transcript, never 0. With a budget it
+kept a **call log** as it ran, and it is charged what that log recorded: the replies' counts at the model's price, plus
+one request's bound for a request sent and not answered (`campaign.interrupted_spend`). Without a log it can trust, it
+may have spent anything up to what its caps allow, so it is **charged its bound**. The same bound goes for an attempt
+whose usage is known to be short (an abandoned request) or was never reported. An interrupted or bounded attempt is
+part of what has been spent, and no part of what a run costs: **the mean cost of a run leaves them out**, so a kill
+does not make a model look dear to the projection, and its bound does not make it look cheap. The budget gate reserves
+the same bound for every run it starts or has in flight.
 
 **The bound is the most the caps let one attempt cost** (C25), from the limits it ran under (`Limits`, the campaign's):
 - The token cap counts each reply's input and output tokens, the whole prompt with its cached part, summed over the
@@ -65,17 +67,22 @@ from dataclasses import dataclass
 from typing import Any
 
 from expcore.campaign.export import RunState
+from expcore.campaign.interrupted_spend import BOUND, MEASURED, logged_cost, read_log, trusted_log
 from expcore.campaign.store import Store, column_for
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import TOKENS_PER_PRICE_UNIT, TieredPrice
 
 # Attempts that spent tokens: every state but `running`, whose cost is not known yet.
 BILLED_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
+# The state of a cost the store's rows do not hold: what a kill lost of the store, counted from the spend journal (O62).
+LOST_STATE = "lost_in_kill"
 
 
 @dataclass(frozen=True)
 class AttemptCost:
-    """The cost of one attempt in dollars: `None` when the model's price is unknown; `bounded` when it is the bound."""
+    """The cost of one attempt in dollars: `None` when the model's price is unknown; `bounded` when it is the bound, or
+    holds one (a request in flight); `basis`, for an interrupted attempt with a call log or a lost one the journal never
+    saw end, how it was charged (`interrupted_spend.BASES`), else None."""
 
     attempt_id: int
     run_key: str
@@ -83,6 +90,7 @@ class AttemptCost:
     state: str
     usd: float | None
     bounded: bool
+    basis: str | None = None
 
 
 def _check_limits(limits: Limits) -> None:
@@ -266,10 +274,11 @@ def attempt_costs(
     topup_usd = "a.topup_usd" if "topup_usd" in columns else "0 AS topup_usd"
     reserved = "a.reserved_capped" if "reserved_capped" in columns else "NULL AS reserved_capped"
     checked = "a.replies_checked" if "replies_checked" in columns else "NULL AS replies_checked"
+    log = ", ".join(f"a.{c}" if c in columns else f"NULL AS {c}" for c in ("calls_sent", "calls_usage", "spend_basis"))
     rows = store.q(
         "SELECT a.id, a.run_key, a.state, r." + column_for("model") + " AS model, a.input_tokens, a.output_tokens, "
         f"a.cache_creation_tokens, a.cache_read_tokens, {turn_usage}, COALESCE(a.usage_complete,1) AS complete, "
-        f"{topup_usd}, {reserved}, {checked} FROM attempts a JOIN runs r USING(run_key) "
+        f"{topup_usd}, {reserved}, {checked}, {log} FROM attempts a JOIN runs r USING(run_key) "
         f"WHERE a.state IN ({marks}) ORDER BY a.id",
         states,
     )
@@ -283,15 +292,71 @@ def attempt_costs(
                     costs.append(AttemptCost(row["id"], row["run_key"], row["model"], "running", topped, True))
                 continue
             usd, bounded = _bound_cost(spec, limits, capped)  # no worker settles it: its usage is unknown
+            basis = None
+        elif row["state"] == "interrupted" and row["spend_basis"] is not None:
+            usd, bounded, basis = _interrupted_cost(spec, row, limits, capped)
         else:
-            usd, bounded = _base_cost(spec, row, limits, capped)
+            (usd, bounded), basis = _base_cost(spec, row, limits, capped), None
         costs.append(
             AttemptCost(
                 row["id"], row["run_key"], row["model"], row["state"],
-                None if usd is None else usd + topped, bounded or topped > 0,
+                None if usd is None else usd + topped, bounded or topped > 0, basis,
             )
         )  # fmt: skip
     return costs
+
+
+def row_cost(
+    spec: ModelSpec | None,
+    row: Mapping[str, Any],
+    limits: Limits,
+    *,
+    running: bool,
+    reply_capped: Collection[str] = (),
+    taken_off: Collection[str] = (),
+) -> tuple[float | None, bool]:
+    """One attempt's cost without its top-ups, and whether it is its bound, as `attempt_costs` charges a row: one
+    `running` with no worker left its bound, any other measured when its counts are known and complete, else its
+    bound, by the reply maximum or the window as the row records it was reserved (C27). `row` has the model, the
+    counts, `turn_usage`, `complete`, `replies_checked` and `reserved_capped`."""
+    capped = _reserved_capped(row, reply_capped, taken_off)
+    return _bound_cost(spec, limits, capped) if running else _base_cost(spec, row, limits, capped)
+
+
+def journaled_cost(
+    spec: ModelSpec | None,
+    row: Mapping[str, Any],
+    limits: Limits,
+    *,
+    reply_capped: Collection[str] = (),
+    taken_off: Collection[str] = (),
+) -> tuple[float | None, bool, str]:
+    """A lost attempt the spend journal never saw end, without its top-ups: by the call log its `call` lines sum to,
+    complete up to the kill (each line precedes the send it allows), else its bound (C05, O62); whether that holds a
+    bound, and the basis. `row` is the lost attempt as the ledger keeps it, `calls_sent` and `calls_usage` absent when
+    its journal kept no consistent log."""
+    capped = _reserved_capped(row, reply_capped, taken_off)
+    if spec is None:
+        return None, False, BOUND
+    log = read_log(row.get("calls_sent"), row.get("calls_usage"))
+    return _priced_log(spec, limits, log, capped)
+
+
+def _interrupted_cost(
+    spec: ModelSpec | None, row: Mapping[str, Any], limits: Limits, reply_capped: bool
+) -> tuple[float | None, bool, str]:
+    """An interrupted attempt whose row records a basis (C05): by its call log when the basis is measured and the log
+    still says so, else its bound; whether that holds a bound, and the basis it was charged on."""
+    if spec is None:
+        return None, False, BOUND
+    return _priced_log(spec, limits, trusted_log(row), reply_capped)
+
+
+def _priced_log(spec: ModelSpec, limits: Limits, log: Any, reply_capped: bool) -> tuple[float | None, bool, str]:
+    bound = bound_usd(spec, limits, reply_capped=reply_capped)
+    per_request = request_bound_usd(spec, limits, reply_capped=reply_capped)
+    usd, basis = logged_cost(spec, log, bound=bound, per_request=per_request)
+    return usd, basis != MEASURED and usd is not None and not spec.free, basis
 
 
 def _reserved_capped(row: Mapping[str, Any], reply_capped: Collection[str], taken_off: Collection[str]) -> bool:
@@ -336,14 +401,17 @@ def mean_run_usd(store: Store, costs: list[AttemptCost], model: str) -> float | 
     """Return what a finished run of the model costs on average, from measured attempts only; None without a sample.
 
     A sample is a run with status `done` and at least one measured attempt. Bounded attempts, whose cost is a ceiling and
-    not a measurement, are no part of the mean (C05).
+    not a measurement, are no part of the mean, and neither is an interrupted one, measured from its call log or not:
+    a kill cut it short (C05).
     """
     done = {
         r["run_key"]
         for r in store.q(f"SELECT run_key FROM runs WHERE status='done' AND {column_for('model')}=?", (model,))
     }
     per_run: dict[str, float] = {}
-    for c in costs:
+    for c in costs:  # what a kill cut short or lost is no sample of what a run costs
+        if c.state in ("interrupted", LOST_STATE):
+            continue
         if c.model == model and c.run_key in done and not c.bounded and c.usd is not None:
             per_run[c.run_key] = per_run.get(c.run_key, 0.0) + c.usd
     return sum(per_run.values()) / len(per_run) if per_run else None

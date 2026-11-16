@@ -17,8 +17,9 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from expcore.records.record import is_record_name
 from expcore.records.schema import SCHEMAS, SchemaVersion
-from expcore.replay.check import CHECK_FILE, BatchNotVerified, input_files, require_current_check
+from expcore.replay.check import CHECK_FILE, BatchNotVerified, batch_files, require_current_check
 
 ARCHIVE_GLOB = "records*.tar.gz"
 
@@ -29,20 +30,15 @@ def archives_under(root: str | os.PathLike[str]) -> list[Path]:
 
 
 def archived_records(root: str | os.PathLike[str]) -> Iterator[tuple[str, bytes]]:
-    """Yield (`<archive name>:<member>`, bytes) for every JSON record in every record archive under a directory.
+    """Yield (`<archive name>:<member>`, bytes) for every run record in every record archive under a directory.
 
-    The check file inside an archive is not a record and is not yielded.
+    A record is known by its name (`is_record_name`, R04), as the check knows it: the check file, an outcome marker, a
+    side file or a manifest inside an archive is not a record and is not yielded.
     """
     for archive in archives_under(root):
         with tarfile.open(archive, "r:gz") as tar:
             for member in tar:
-                name = Path(member.name)
-                if (
-                    not member.isfile()
-                    or name.suffix != ".json"
-                    or member.name == CHECK_FILE
-                    or name.name.startswith(".")
-                ):
+                if not member.isfile() or not is_record_name(Path(member.name).name):
                     continue
                 handle = tar.extractfile(member)
                 if handle is not None:
@@ -70,10 +66,10 @@ def archive_batch(
     check = require_current_check(
         root, code=code, allow_dirty=allow_dirty, required_recompute=required_recompute, schemas=schemas
     )
-    records, hashed = input_files(root, check.get("hashed_only_patterns") or ())
+    records, hashed, unexpected = batch_files(root, check.get("hashed_only_patterns") or ())
     names = [*records, *hashed]
     held = check["inputs"]
-    if sorted(names) != sorted(held):
+    if sorted(names) != sorted(held) or unexpected:
         raise BatchNotVerified(f"{root}: the inputs changed between the check and the archive; check the batch again")
     contents: dict[str, bytes] = {}
     for rel in names:

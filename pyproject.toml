@@ -67,6 +67,9 @@ target-version = "py312"
 src = ["src", "tests"]
 # Template tooling under .claude/ is not this project's code.
 extend-exclude = [".claude"]
+# The HPC bundle's Python runs inside the Onedata images (Python 3.8) and on the batch nodes, not under the
+# distribution's interpreter: the linter must not rewrite it into syntax those cannot parse.
+per-file-target-version = { "deploy/hpc-federation/**" = "py38" }
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
@@ -130,6 +133,9 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "PT", "C4", "RUF"]
 "src/expcore_onedata/users.py" = ["E501"]
 "src/expcore_onedata/faults.py" = ["E501"]
 "src/expcore_onedata/testing/fake_onedata.py" = ["E501"]
+# The HPC bundle keeps the percent formatting of the revision that ran live on the batch nodes; it is a style rule,
+# and rewriting about thirty format strings in the Couchbase guard would change what was proven there.
+"deploy/hpc-federation/**" = ["UP031"]
 
 [tool.uv.sources]
 sparql-platform = { path = "examples/sparql_platform", editable = true }

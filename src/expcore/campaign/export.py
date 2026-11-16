@@ -70,6 +70,21 @@ changed (`at`, the start's time; `key`; `old` and `new`, each absent where that 
 unknown. Both lists are written out when empty, so the key says the settings were recorded. A campaign whose platform
 supplied none has no such key.
 
+A campaign whose store a kill took spend out of, counted back from the spend journal (O62, `campaign.lost_spend`),
+also exports `lost_in_kill`, after `reset_settings`: each lost attempt (`kind` `attempt`: its journal, attempt id, run
+key, model, start, its last journaled state and whether the journal saw it end, the bound it was reserved at, its
+counts and its top-ups) and each lost top-up or probe charge (`kind` `topup` or `probe`, its model and dollars),
+journal by journal. The budget gate charged each as it charges an attempt's row; none is an attempt in the run lists.
+A campaign that lost none has no such key, and its export is the one it had before. A lost attempt whose end its
+journal did not see also says the basis it was charged on (`basis`, C05: `measured`, `measured_plus_inflight` or
+`bound`, from its journaled call log).
+
+A campaign whose interrupted attempts kept a call log (C05, `campaign.interrupted_spend`) also exports
+`interrupted_spend`, after `lost_in_kill`: every interrupted attempt in attempt order (`attempt_id`, `run_key`,
+`model`), the basis the budget charges it on (`measured`, `measured_plus_inflight`, `bound`) and its log's
+`calls_sent` and `calls_answered` (None without a log). A campaign none of whose interrupted attempts records a basis
+(no budget, or attempts from before the log) has no such key, and its export is the one it had before.
+
 A shard of a sharded campaign (#154) has one more top-level key, `shard` (`campaign.shard.EXPORT_KEY`), last: the
 `spec` it ran as, `started_utc`, the `environment_identity` it ran against and its `shares` of the caps and the
 budget, read from the store's meta table. Its run entries are what they are in any export. An unsharded campaign's
@@ -104,6 +119,11 @@ from expcore.campaign.deployments import ACCEPTED_META, DeploymentsUnreadable, d
 from expcore.campaign.factors import FactorSchema, RunKey
 from expcore.campaign.healthgate import META as HEALTH_META
 from expcore.campaign.healthgate import parse as parse_outages
+from expcore.campaign.interrupted_spend import EXPORT_KEY as INTERRUPTED_KEY
+from expcore.campaign.interrupted_spend import exported as exported_interrupted
+from expcore.campaign.lost_ledger import KEY as LOST_KEY
+from expcore.campaign.lost_ledger import LostSpendError
+from expcore.campaign.lost_ledger import exported as exported_lost
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.reset_settings import exported as exported_settings
@@ -183,6 +203,11 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
             settings = exported_settings(store)
         except ValueError as error:
             raise ExportError(f"the store's {SETTINGS_KEY} cannot be exported: {error}") from None
+        try:
+            lost = exported_lost(store)
+        except LostSpendError as error:
+            raise ExportError(f"{error}, so it cannot be exported") from None
+        interrupted = exported_interrupted(store)
     left_out = dict(excluded or {})
     exhausted, unfinished, analysed, left = [], [], [], []
     scored: list[tuple[str, Any]] = []  # the model and the analysed attempt of each analysed run
@@ -255,6 +280,10 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
         data["operator_holds"] = holds
     if settings is not None:  # only a campaign whose platform supplied settings has the key (C35)
         data[SETTINGS_KEY] = settings
+    if lost is not None:  # only a campaign whose store a kill took spend out of has the key (O62)
+        data[LOST_KEY] = lost
+    if interrupted is not None:  # only a campaign whose interrupted attempts kept a call log has the key (C05)
+        data[INTERRUPTED_KEY] = interrupted
     if excluded is not None:
         running = sum(1 for tried in attempts.values() for a in tried if a["state"] == "running")
         data.update(partial=bool(left) or running > 0, running_attempts=running, excluded_attempts=left)

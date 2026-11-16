@@ -440,11 +440,23 @@ def test_c19_the_probe_asks_the_cores_check_whether_the_holder_is_gone(stage):
 
 
 def test_the_clock_of_the_token_follows_the_runs_ceiling(stage, tmp_path):
-    """O06: the token's expiry is derived from the whole-time ceiling the launch is given."""
+    """O06: the token's expiry is derived from the whole-time ceiling the launch is given, and the run's metadata
+    records the lifetime it was minted for and that ceiling, beside the expiry."""
     lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
     sandbox, _ = run_launch(stage, "via-gate", lease)
-    expires = sandbox.metadata()["data_path_token"]["expires_at"]
-    assert expires >= NOW + CEILING_S + stage.config.tokens.margin_s
+    recorded = sandbox.metadata()["data_path_token"]
+    tokens = stage.config.tokens
+    assert recorded["expires_at"] >= NOW + CEILING_S + tokens.margin_s
+    assert (recorded["ttl_s"], recorded["ceiling_s"]) == (CEILING_S + tokens.margin_s + tokens.mint_headroom_s, 600.0)
+
+
+def test_o06_a_run_without_a_lease_records_its_tokens_lifetime_too(stage):
+    """O06: a live check's run mints as the fixed data-path user, never journalled; its metadata still says how long
+    the token was minted for and from which ceiling."""
+    sandbox, _ = run_launch(stage, "via-gate")
+    recorded = sandbox.metadata()["data_path_token"]
+    assert (recorded["slot"], recorded["ttl_s"], recorded["ceiling_s"]) == ("principals.data_path", 1800, 600.0)
+    assert recorded["expires_at"] == int(NOW) + 1800
 
 
 def block_the_agents_docker_run(stage):
@@ -637,7 +649,40 @@ def test_c19_one_lease_key_per_run_serves_both_planes(stage, tmp_path):
     assert seen["data"].expires_at == started.token.expires_at == lines[1]["expires_at"]
     assert [line["plane"] for line in lines[2:]] == ["revoking", "revoked"]  # the run's end revoked both users' (C19)
     assert stage.journal.latest_expiry("slot-b") is None
-    assert seen["metadata"]["tool_server_token"] == {"slot": 0, "expires_at": started.token.expires_at}
+    assert seen["metadata"]["tool_server_token"] == {
+        "slot": 0,
+        "expires_at": started.token.expires_at,
+        "ttl_s": 1800,
+        "ceiling_s": CEILING_S,
+    }
+    # the mint's two lines say it too (O06); the revocation's lines are not a mint's, and carry neither
+    assert [(line["ttl_s"], line["ceiling_s"]) for line in lines[:2]] == [(1800, CEILING_S)] * 2
+    assert not any("ttl_s" in line or "ceiling_s" in line for line in lines[2:])
+
+
+def test_o06_the_tool_server_is_checked_against_the_ceiling_its_token_was_minted_for(stage, tmp_path):
+    """O06: the server's checks of its token (its remaining life at the start) use the ceiling the launch minted it
+    for: without one the tool server takes that ceiling, and another one is refused before anything starts, since a
+    longer one would refuse a correct token and a shorter one would pass a token the run could outlive."""
+    launcher = with_tools(stage)
+    group = stage.platform.lease_group({"data_path": "via-gate", "tools": "read"})
+    lease = lease_pool(stage, tmp_path).acquire(group, run_key="run-1")
+    ctx, refused = RecordingContext(), []
+
+    async def body(sandbox):
+        async with stage.platform.tool_server(ctx, sandbox):
+            pass
+        for other in (CEILING_S * 3, CEILING_S / 2):
+            with pytest.raises(ValueError, match="minted for a whole-time ceiling of 600 s") as caught:
+                async with stage.platform.tool_server(ctx, sandbox, ceiling_s=other):
+                    pass
+            refused.append(caught.value)
+        async with stage.platform.tool_server(ctx, sandbox, ceiling_s=CEILING_S):  # the same one is accepted
+            pass
+
+    run_launch(stage, "via-gate", lease, body, ctx, condition="read")
+    assert [started.ceiling_s for started in launcher.started] == [CEILING_S, CEILING_S]
+    assert len(refused) == 2
 
 
 def test_c19_a_run_with_a_tool_server_and_no_data_path_leases_a_slot_and_mints_only_the_tool_servers_token(

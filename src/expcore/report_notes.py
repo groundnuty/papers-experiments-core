@@ -312,6 +312,65 @@ BUDGET_HOLD_NOTES = [
     "leaves out included. A model with more of them had its runs stopped by the budget more often than the others.",
 ]
 
+EGRESS_NOTES = [
+    "This batch's runs were checked for egress: their agents ran where the network could not be restricted (an HPC",
+    "batch node without network namespaces), so each run's outbound connections were logged through a shim in the",
+    "agent's cell and its code cells scanned. A run is flagged for an `outside` connection (an intact log lists a",
+    "destination that is neither the data gate nor a loopback address), a `log_unknown` (the log is missing, damaged,",
+    "of another run, without the launcher's canary, or the record has no readable egress snapshot: unknown is never",
+    "read as clean), or a `static_scan` hit (a URL off the platform, a download, or a network call in the agent's",
+    "code). Detection, not prevention: a statically linked program, raw system calls, io_uring or the C library's own",
+    "DNS queries pass the shim, which is why the scan is the second line, and neither stops a connection.",
+]
+
+MOUNT_GUARD_NOTES = [
+    "This batch's mount was guarded: its agents shared a uid with the oneclient that held the mount's token (an HPC",
+    "batch node, with no root and no user namespace), so the token could not be kept from them as a separate",
+    "container keeps it. oneclient ran on the node outside every cell, its token in a file no cell bound, removed",
+    "once the mount was up. A watcher outside the cells logged every event on that file and its directory, sampled",
+    "oneclient for a tracer, and proved from the node's `/proc` that each cell it caught ran in a PID namespace of",
+    "its own, with no host `/proc` and no private directory in its mounts. A run is `flagged` for a `token_access`",
+    "(an event on the token's file or directory while its cells could run) or a `process_access` (a tracer on",
+    "oneclient); `unknown` for a `log_unknown` (the log is missing, damaged, of another run or without its canary, or",
+    "the record has no readable snapshot) or an `isolation_unproven` (no cell was proved, or a proof failed);",
+    "otherwise `clean`. Unknown is never read as clean. Detection, not prevention: inotify names no process, so every",
+    "event counts as the agent's; a tracer is sampled, so one that comes and goes between samples is missed;",
+    "oneclient's environment and memory are covered only by the proof that no cell can see its process, never",
+    "watched; and a cell that starts and ends between two polls is not proved itself.",
+]
+
+MOUNT_SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without the runs that are not clean (flagged and unknown): each one is left",
+    "out as an absent run (`excluded`), so its pairs count as `Unpaired or left out` and its arm's runs as `Left",
+    "out`. The analysis above stands; this says whether its conclusions hold without the runs that touched the",
+    "mount's token or oneclient's process, or could not be shown not to. A run is left out for what was detected",
+    "about it, never for its outcome. The egress section, if any, leaves out its own runs, and a batch checked by",
+    "both guards also gets a rerun without the runs either leaves out.",
+]
+
+GUARDS_NOTES = [
+    "This batch was checked by both guards, the egress check and the mount guard, and each section above reruns the",
+    "analysis without its own runs. This one reruns it without every run either leaves out: flagged or unknown to",
+    "either, so a run unknown to one guard and clean to the other is left out. It is the rerun to read when the",
+    "question is whether the conclusions hold for the runs both guards show clean. A run's egress is `flagged` for an",
+    "outside connection or a static-scan hit and `unknown` for an unknown log alone; its mount is the mount guard's",
+    "verdict.",
+]
+
+GUARDS_SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without every run either guard leaves out: each one is left out as an absent",
+    "run (`excluded`), so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The analysis",
+    "above stands, and so do the two reruns of the single guards. A run is left out for what was detected about it,",
+    "never for its outcome.",
+]
+
+SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without the flagged runs: each one is left out as an absent run (`excluded`),",
+    "so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The analysis above stands; this",
+    "says whether its conclusions hold without the runs whose network use was detected or could not be checked. A run",
+    "is left out for what was detected about it, never for its outcome.",
+]
+
 HOLD_NOTES = [
     "Each row is a stretch in which the platform's health check said that only an operator could end what it found (a",
     "repair that failed and left its fault in place), so no run started. A held run has no attempt; the hold itself is",

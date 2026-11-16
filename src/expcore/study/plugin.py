@@ -83,11 +83,20 @@ class StudyPlugin:
       an attempt starts and left after its post-run check, so the check sees what the run left; None when it has none.
       It may also have a method `declared_deferral_s()` answering the longest the platform's health check may stay
       deferred (a `DeferralBound` or None, read from the platform's settings), which the core holds `health` to: a
-      health check that exposes no `max_deferral_s`, or a smaller bound, is refused when the campaign starts.
+      health check that exposes no `max_deferral_s`, or a smaller bound, is refused when the campaign starts. The core
+      also reads the declaration itself, from the platform's own configuration through the module `[study] platforms`
+      names (`study.platform_deferral`), so wrapping `admission` hides nothing, and it refuses a study whose build ran a
+      platform's loader for a module `[study] platforms` does not list (`config.platform_loads`), so hiding both
+      declarations and listing nothing hides nothing either.
     - `platform`: the platform's settings that make two starts one experiment, as plain data without a secret (the
       Onedata layer's `PlatformConfig.fingerprint()`: its TLS mode and CA bundle hash, each level's data path and
       listing mode, and with `[faults]` the fault injector's sanction and targets). They go into the campaign
       fingerprint, so a resume under another is refused. Leave it empty for a study without a platform.
+    - `platform_legacy`: an earlier form of `platform` that a store may have recorded for these same settings, or None
+      (the Onedata layer's `PlatformConfig.legacy_fingerprint()`: each space by its Onezone id, as before a space could
+      declare its data). A store whose recorded fingerprint is this campaign's with `platform` in that form resumes
+      under the fingerprint it recorded, unchanged; nothing else accepts it, and a merge compares the shards'
+      recorded fingerprints as they are, so a store of the earlier form never merges with one of the later (C06).
     - `reset_settings`: the platform's settings that change how it does its work and not what an agent sees, and so are
       in no fingerprint, after its defaults (the Onedata layer's `Placement.reset_settings()`): a flat mapping
       of names to text, numbers, booleans or None, without a secret or a name that identifies a machine, since it
@@ -122,6 +131,7 @@ class StudyPlugin:
     backend_factory: BackendFactory | None = None
     environment_identity: Callable[[], Mapping[str, str]] | None = None
     reset_settings: Mapping[str, Any] = field(default_factory=dict)  # last, so positional callers keep their order
+    platform_legacy: Mapping[str, Any] | None = None  # after it, for the same reason
 
     def scorer_digest(self) -> str:
         """The SHA-256 of the scorers' names and versions, for the campaign fingerprint."""
@@ -332,6 +342,9 @@ def _check(file: Any, study: StudyConfig, plugin: StudyPlugin) -> None:
     if not isinstance(plugin.platform, Mapping):
         kind = type(plugin.platform).__name__
         raise ConfigError(f"{file}: the plugin's platform must be a mapping of plain data, not a {kind}")
+    if plugin.platform_legacy is not None and not isinstance(plugin.platform_legacy, Mapping):
+        kind = type(plugin.platform_legacy).__name__
+        raise ConfigError(f"{file}: the plugin's platform_legacy must be a mapping of plain data or None, not a {kind}")
     if not isinstance(plugin.reset_settings, Mapping):
         kind = type(plugin.reset_settings).__name__
         raise ConfigError(f"{file}: the plugin's reset_settings must be a mapping of plain data, not a {kind}")

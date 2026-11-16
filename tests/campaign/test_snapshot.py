@@ -10,7 +10,14 @@ from tree_support import added, read_only, tree_of, without
 from expcore.campaign.export import export_run_state
 from expcore.campaign.markers import AttemptResult
 from expcore.campaign.scheduler import STATE_FILE
-from expcore.campaign.snapshot import SNAPSHOT_FILE, AttemptsRunning, SnapshotError, StoreSnapshot, take_snapshot
+from expcore.campaign.snapshot import (
+    SNAPSHOT_FILE,
+    AttemptsRunning,
+    SnapshotError,
+    StoreSnapshot,
+    rebase_run_dirs,
+    take_snapshot,
+)
 from expcore.loop.outcomes import Outcome
 from expcore.package.spec import never_selected
 
@@ -210,3 +217,21 @@ def test_r16_in_place_backs_the_store_itself_up_over_a_read_only_connection(fini
     new = added(without(before, "runs/"), without(tree_of(finished_out), "runs/"))
     assert new == [f"{STATE_FILE}-shm", f"{STATE_FILE}-wal"]
     assert all(never_selected(f"out/{name}") for name in new)
+
+
+def test_o62_a_store_copied_back_has_each_attempts_directory_under_its_new_runs(tmp_path):
+    """O62: a snapshot's `<digest>/try<N>` and an archive's absolute paths of another node both become the runs
+    directory the store now has, so a resume's recovery reads each running attempt's marker where it is."""
+    store, _, manifest = planned_store(tmp_path)
+    keys = [row.key.text for row in manifest.rows]
+    run_one(store, keys[0], finished(), run_dir=str(tmp_path / "old-node" / f"{0:064d}" / "try1"))
+    store.begin_attempt(keys[1], NOW, 4321, str(tmp_path / "old-node" / f"{1:064d}" / "try2"))
+    destination = tmp_path / SNAPSHOT_FILE
+    take_snapshot(store.path, destination, allow_running=True, in_place=True)
+    store.close()
+    for copy in (destination, store.path):
+        assert rebase_run_dirs(copy, tmp_path / "new" / "runs") == 2
+        with sqlite3.connect(copy) as connection:
+            named = sorted(r[0] for r in connection.execute("SELECT run_dir FROM attempts"))
+        new = tmp_path / "new" / "runs"
+        assert named == [str(new / f"{0:064d}" / "try1"), str(new / f"{1:064d}" / "try2")]

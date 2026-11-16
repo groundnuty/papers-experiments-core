@@ -1,5 +1,6 @@
 """A model backend of the study's own: named in models.toml, built by the plugin's factory, with no edit to the core."""
 
+import hashlib
 import importlib.machinery
 import json
 import shutil
@@ -494,28 +495,39 @@ def test_r03_a_batch_of_core_backend_records_checks_clean_without_importing_anyt
     assert check["n_ok"] == check["n_records"] > 0
 
 
+def record_named(label: str) -> str:
+    """A file name a run record is written under (a record is known by its name, R04), made from a label."""
+    return f"{hashlib.sha256(label.encode('utf-8')).hexdigest()}.1.json"
+
+
 def test_r03_only_what_this_process_cannot_read_asks_for_the_study_s_code(tmp_path):
     """R03: the scan reads the backend and the infrastructure kinds each replayable record names and nothing else, so a
-    file the check will report as broken, a field of the wrong type, a core name or a marker that is only hashed asks
-    for nothing; a kind may be named by the condition's treatment, the outcome or the failed request."""
+    file the check will report as broken, a field of the wrong type, a core name, a marker that is only hashed or a file
+    not named as a record (R04) asks for nothing; a kind may be named by the condition's treatment, the outcome or the
+    failed request."""
     batch = tmp_path / "batch"
     batch.mkdir()
-    files = {
-        "broken.json": "{not json",
-        "array.json": "[1]",
-        "no-route.json": '{"route": 3}',
-        "no-backend.json": '{"route": {}}',
-        "odd-backend.json": '{"route": {"backend": 3}}',
-        "core.json": '{"route": {"backend": "stub"}, "treatment_kinds": ["knowledge"], "outcome": {}}',
-        "unhashable.json": '{"route": {"backend": []}, "treatment_kinds": [[]], "outcome": {"infra_kind": {}}}',
-        "own.json": '{"route": {"backend": "toy_unread"}}',
-        "treated.json": '{"treatment_kinds": ["toy_treated", 3]}',
-        "ended.json": '{"outcome": {"infra_kind": "toy_ended"}, "failed_request": {"infra_kind": "toy_failed"}}',
-        "odd-kinds.json": '{"treatment_kinds": "toy_not_a_list", "outcome": 3}',
-        "x-attempt-marker.json": '{"route": {"backend": "toy_marker"}, "treatment_kinds": ["toy_marker"]}',
+    records = {
+        "broken": "{not json",
+        "array": "[1]",
+        "no-route": '{"route": 3}',
+        "no-backend": '{"route": {}}',
+        "odd-backend": '{"route": {"backend": 3}}',
+        "core": '{"route": {"backend": "stub"}, "treatment_kinds": ["knowledge"], "outcome": {}}',
+        "unhashable": '{"route": {"backend": []}, "treatment_kinds": [[]], "outcome": {"infra_kind": {}}}',
+        "own": '{"route": {"backend": "toy_unread"}}',
+        "treated": '{"treatment_kinds": ["toy_treated", 3]}',
+        "ended": '{"outcome": {"infra_kind": "toy_ended"}, "failed_request": {"infra_kind": "toy_failed"}}',
+        "odd-kinds": '{"treatment_kinds": "toy_not_a_list", "outcome": 3}',
     }
-    for name, body in files.items():
-        (batch / name).write_text(body, encoding="utf-8")
+    for label, body in records.items():
+        (batch / record_named(label)).write_text(body, encoding="utf-8")
+    (batch / "x-attempt-marker.json").write_text(
+        '{"route": {"backend": "toy_marker"}, "treatment_kinds": ["toy_marker"]}', encoding="utf-8"
+    )
+    (batch / "sandbox.json").write_text(
+        '{"route": {"backend": "toy_stray"}, "treatment_kinds": ["toy_stray"]}', "utf-8"
+    )
     assert what_records_need(batch, HASHED_ONLY) == (["toy_unread"], ["toy_ended", "toy_failed", "toy_treated"])
 
 
@@ -526,15 +538,15 @@ def test_r03_a_kind_only_an_instrument_refusal_names_asks_for_the_study_s_platfo
     batch = tmp_path / "batch"
     batch.mkdir()
     refusal = {"namespace": "manipulation", "infra_kind": "toy_refused", "detail": "not realised"}
-    files = {
-        "refused.json": json.dumps({"route": {"backend": "stub"}, "outcome": {}, "instrument_refusal": refusal}),
-        "core.json": json.dumps({"instrument_refusal": {**refusal, "infra_kind": "tool_plane_integrity"}}),
-        "no-kind.json": '{"instrument_refusal": {"namespace": "manipulation"}}',
-        "odd-kind.json": '{"instrument_refusal": {"infra_kind": 3}}',
-        "odd-refusal.json": '{"instrument_refusal": "toy_not_an_object"}',
+    records = {
+        "refused": json.dumps({"route": {"backend": "stub"}, "outcome": {}, "instrument_refusal": refusal}),
+        "core": json.dumps({"instrument_refusal": {**refusal, "infra_kind": "tool_plane_integrity"}}),
+        "no-kind": '{"instrument_refusal": {"namespace": "manipulation"}}',
+        "odd-kind": '{"instrument_refusal": {"infra_kind": 3}}',
+        "odd-refusal": '{"instrument_refusal": "toy_not_an_object"}',
     }
-    for name, body in files.items():
-        (batch / name).write_text(body, encoding="utf-8")
+    for label, body in records.items():
+        (batch / record_named(label)).write_text(body, encoding="utf-8")
     assert what_records_need(batch, HASHED_ONLY) == ([], ["toy_refused"])
 
 

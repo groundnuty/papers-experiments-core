@@ -15,6 +15,7 @@ local = "<name>"                # the agent's own provider, one of these; the sa
 holder = "<name>"               # this space's data provider, one of its providers: required, never [placement]'s (O09)
 tokens = ["data_path", "tool_server"]  # optional: the token planes whose caveats reach this space; both by default
 import = { readonly = true }    # optional: the data provider holds this space on an imported storage (below)
+data_manifest = "data.json"     # optional: the manifest of the data the space holds (below)
 ```
 
 Each entry is a `StudySpace`. The one-space form reads as the single space `spaces[0]` with the label `space`. A
@@ -30,6 +31,23 @@ to; `readonly` (required) says whether that storage is read-only, so that Onedat
 from it. A space without the key is a regular one, as every space was. The declaration is in the fingerprint: in an
 entry's digest with `[[spaces]]`, and as `storage_import` in the one-space form, whose fingerprint stays as it was
 without the key.
+
+`shared` (optional, false by default; O59) says the storage's directory is imported by other federations too, so
+nothing of this one may write to it: a shared import must be read-only, and `readonly = false` beside `shared = true`
+is refused at load. It enters the fingerprint only when true, so no earlier declaration's fingerprint changes.
+
+**The space's data identity** (`data_manifest`, in `[space]` or an entry of `[[spaces]]`; C06). A space is the same
+experimental condition across federations when its declared identity and its data identity match. `data_manifest` names
+the manifest of the data the space holds (`importmanifest`: every file with its size and SHA-256, every directory),
+relative to the platform file or absolute; the loader reads and checks it, and the entry keeps its content hash
+(`Manifest.digest()`), never the path. An entry that declares it has a digest of its declared identity (label, name,
+prefixes, support, holder, token planes, import) and that hash, without the space's Onezone id, a deployment's handle
+that every federation's `up` makes anew: two federations holding the same data give one digest, and one file different
+gives another. An entry without it keeps the digest it always had, which holds the Onezone id, so its data being
+unknown, two federations never give one digest, and a store started before the key existed resumes as it was. In the
+one-space form, whose fingerprint holds nothing of its space, a declared manifest adds its content hash (`space_data`),
+and without one that fingerprint is as it was. `legacy_digest()` is that id-bearing form of any entry, which a store
+started before the entry declared its data may have recorded (`PlatformConfig.legacy_fingerprint`).
 """
 
 import hashlib
@@ -37,14 +55,15 @@ import json
 import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from expcore.config.loading import Section
+from expcore.config.loading import ConfigError, Section
 
 PLANES = ("data_path", "tool_server")  # the token planes (`tokens.Plane`), by the values a space's `tokens` names
 ONE_SPACE_LABEL = "space"  # the label of the one-space form's space: its table's name
 LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
-SPACE_KEYS = ("name", "id", "prefixes", "import")
+SPACE_KEYS = ("name", "id", "prefixes", "import", "data_manifest")
 SUPPORT_KEYS = ("providers", "local")
 SPACES_KEYS = ("label", *SPACE_KEYS, *SUPPORT_KEYS, "holder", "tokens")
 
@@ -68,9 +87,16 @@ class Support:
 
 @dataclass(frozen=True)
 class ImportedStorage:
-    """How the data provider holds an imported space: on a storage Onedata imported the files from, read-only or not."""
+    """How the data provider holds an imported space: on a storage Onedata imported the files from, read-only or not,
+    and whether other federations import the same directory (`shared`, O59), in which case it is read-only."""
 
     readonly: bool
+    shared: bool = False
+
+    def record(self) -> dict[str, bool]:
+        """What the fingerprint holds of it: `readonly`, and `shared` only when true, so that the digest of every
+        declaration made before the key existed is what it was."""
+        return {"readonly": self.readonly, **({"shared": True} if self.shared else {})}
 
 
 @dataclass(frozen=True)
@@ -86,10 +112,25 @@ class StudySpace:
     holder: str | None = None
     tokens: tuple[str, ...] = PLANES
     imported: ImportedStorage | None = None  # None: a regular storage, the data written to it (O41)
+    data: str | None = None  # the content hash of the data manifest it declares (`data_manifest`), None without one
 
     def digest(self) -> str:
-        """The SHA-256 of everything that makes this the space it is, for the fingerprint: never a value itself. An
-        imported storage adds a key, so the digest of a space without one is what it always was."""
+        """The SHA-256 of everything that makes this the space it is, for the fingerprint: never a value itself. With a
+        data identity (`data_manifest`), its declared identity and that, without the Onezone id, so two federations
+        holding the same data agree; without one, the form it always had (`legacy_digest`), the id included."""
+        if self.data is None:
+            return self.legacy_digest()
+        facts = self._declared()
+        facts["space"] = [self.space.name, list(self.space.prefixes)]
+        facts["data"] = self.data
+        return hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()
+
+    def legacy_digest(self) -> str:
+        """The digest every entry had before a space could declare its data: the declared identity with the Onezone id.
+        An imported storage adds a key, so the digest of a space without one is what it always was."""
+        return hashlib.sha256(json.dumps(self._declared(), sort_keys=True).encode()).hexdigest()
+
+    def _declared(self) -> dict[str, Any]:
         facts: dict[str, Any] = {
             "label": self.label,
             "space": [self.space.name, self.space.id, list(self.space.prefixes)],
@@ -98,9 +139,8 @@ class StudySpace:
             "tokens": list(self.tokens),
         }
         if self.imported is not None:
-            facts["import"] = {"readonly": self.imported.readonly}
-        text = json.dumps(facts, sort_keys=True)
-        return hashlib.sha256(text.encode()).hexdigest()
+            facts["import"] = self.imported.record()
+        return facts
 
 
 def parse_space(section: Section) -> Space:
@@ -122,12 +162,21 @@ def parse_import(section: Section) -> ImportedStorage | None:
     if not isinstance(value, Mapping):
         raise section.fail("import", "must be a table, written import = { readonly = true }")
     table = Section(value, section.file, f"{section.where}.import")
-    table.reject_unknown(("readonly",))
+    table.reject_unknown(("readonly", "shared"))
     if "readonly" not in table.data:
         raise table.fail("readonly", "is required: say whether the imported storage is read-only")
     if not isinstance(table.data["readonly"], bool):
         raise table.fail("readonly", "must be true or false")
-    return ImportedStorage(readonly=table.data["readonly"])
+    shared = table.data.get("shared", False)
+    if not isinstance(shared, bool):
+        raise table.fail("shared", "must be true or false")
+    if shared and not table.data["readonly"]:
+        raise table.fail(
+            "readonly",
+            "must be true when 'shared' is true: other federations import this directory too, and nothing of this one "
+            "may write to it",
+        )
+    return ImportedStorage(readonly=table.data["readonly"], shared=shared)
 
 
 def parse_support(section: Section, providers: Collection[str]) -> Support:
@@ -152,7 +201,8 @@ def _one_space(root: Section, providers: Collection[str]) -> tuple[StudySpace, .
     support_table = root.section("support")
     support_table.reject_unknown(SUPPORT_KEYS)
     support = parse_support(support_table, providers)
-    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, support, imported=parse_import(space_table)),)
+    imported, data = parse_import(space_table), parse_data(space_table)
+    return (StudySpace(ONE_SPACE_LABEL, "spaces[0]", space, support, imported=imported, data=data),)
 
 
 def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySpace:
@@ -168,7 +218,26 @@ def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySp
     tokens = entry.strings("tokens") if "tokens" in entry.data else PLANES
     if len(set(tokens)) != len(tokens) or any(plane not in PLANES for plane in tokens):
         raise entry.fail("tokens", f"must list token planes, each once; known: {', '.join(PLANES)}")
-    return StudySpace(label, position, parse_space(entry), support, holder, tuple(tokens), parse_import(entry))
+    data = parse_data(entry)
+    return StudySpace(label, position, parse_space(entry), support, holder, tuple(tokens), parse_import(entry), data)
+
+
+def parse_data(section: Section) -> str | None:
+    """The content hash of the data manifest an entry declares (`data_manifest`), relative to the platform file or
+    absolute; None without the key. A manifest that cannot be read or checked is refused naming the key, never the
+    path (O12)."""
+    if "data_manifest" not in section.data:
+        return None
+    from expcore_onedata.importmanifest import load_manifest  # it reaches config, which reads this module
+
+    path = Path(section.file).parent / section.string("data_manifest")
+    try:
+        return load_manifest(path).digest()
+    except ConfigError as error:  # the loader names the file first: that prefix, and the path anywhere, never shown
+        said, prefix = str(error), f"{path}: "
+        problem = said[len(prefix) :] if said.startswith(prefix) else "it cannot be read or checked"
+        problem = problem.replace(str(path), "<data_manifest>")
+        raise section.fail("data_manifest", f"is no manifest of a space's data ({problem})") from None
 
 
 def _several(root: Section, providers: Collection[str]) -> tuple[StudySpace, ...]:

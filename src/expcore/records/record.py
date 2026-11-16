@@ -44,6 +44,8 @@ from expcore.records.schema import (
 from expcore.records.seal import mark_unverified, seal
 
 _LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")  # in a str only unpaired (a valid pair decodes to one character)
+# Every name `record_filename` has given, in every version of the core: the one form it has ever had.
+_RECORD_NAME = re.compile(r"[0-9a-f]{64}\.\d+\.json")
 
 
 def record_filename(run_key: str, attempt: int) -> str:
@@ -51,6 +53,15 @@ def record_filename(run_key: str, attempt: int) -> str:
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RecordError(f"the attempt is a non-negative integer, not {attempt!r}")
     return f"{hashlib.sha256(run_key.encode('utf-8')).hexdigest()}.{attempt}.json"
+
+
+def is_record_name(name: str) -> bool:
+    """Tell whether a file name is one a run record is written under (`record_filename`).
+
+    This is how every reader of a batch tells a record from the other files beside it (R04): by its name, never by its
+    suffix or its content, so a study's own `.json` file in a run's directory is never read as a record.
+    """
+    return _RECORD_NAME.fullmatch(name) is not None
 
 
 @dataclass(frozen=True)

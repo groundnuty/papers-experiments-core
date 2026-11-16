@@ -67,7 +67,11 @@ def add(store: Store, model: str, usd: float, now: str, event: tuple[str, str | 
         value[model] = value.get(model, 0.0) + usd
         return json.dumps(value, sort_keys=True), [event], None
 
-    store.update_meta(PROBES_KEY, change, now)
+    def go() -> None:
+        store.update_meta(PROBES_KEY, change, now)  # joins this transaction
+        store.note_probe_charge(model, usd)  # with the event just written, journaled once it commits (O62)
+
+    store.transact(go)
 
 
 class ProbeSpend:
@@ -96,7 +100,7 @@ class ProbeSpend:
     async def before_request(self) -> None:
         """Nothing: a probe is no request of a run, and no recording sees it."""
 
-    async def after_reply(self, input_tokens: int | None, output_tokens: int | None) -> None:
+    async def after_reply(self, input_tokens: int | None, output_tokens: int | None, **parts: Any) -> None:
         """Nothing: the probe's reply is settled by `settle`."""
 
     async def after_failed_send(self, kind: str, *, resend: bool) -> None:

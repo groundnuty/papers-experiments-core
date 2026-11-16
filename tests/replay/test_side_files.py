@@ -81,11 +81,13 @@ def test_r14_the_hashed_only_patterns_a_caller_gives_are_recorded_as_given_with_
 
 
 def test_r14_a_side_file_named_like_a_json_file_is_hashed_and_paired_never_taken_for_a_record(batch):
-    """R14: a declared name ending in `.json` is a side file, hashed and not replayed, and pairs with its record;
-    without the declaration the same file fails the check as a record that does not load."""
+    """R14 and R04: a declared name ending in `.json` is a side file, hashed and not replayed, and pairs with its
+    record; without the declaration the same file is no record either, but a file nothing accounts for, and fails the
+    check as unexpected."""
     name_side_file(lone_record(batch), b'{"ranges": [[0, 512]]}')
     without = verify_batch(batch, code=CODE)
-    assert [(f["file"], f["stage"]) for f in without["failures"]] == [(f"shard-2/{LOGGED.pattern}", "load")]
+    assert [(f["file"], f["stage"]) for f in without["failures"]] == [(f"shard-2/{LOGGED.pattern}", "unexpected")]
+    assert without["n_records"] == 4
     made = verify_batch(batch, code=CODE, side_files=[LOGGED])
     assert (made["n_records"], made["n_ok"], made["failures"]) == (4, 4, [])
     assert made["hashed_only"] == [f"shard-2/{LOGGED.pattern}"]
@@ -126,7 +128,7 @@ def test_r14_the_analysis_refuses_a_check_made_under_another_declaration_than_th
     for other in ([], [SideFile(LOGGED.pattern, "instruments.other.sha256")], [LOGGED, SideFile("more.gz", "a.b")]):
         with pytest.raises(BatchNotVerified, match="another declaration of side files"):
             require_current_check(batch, code=CODE, side_files=other)
-    (batch / "shard-2" / LOGGED.pattern).unlink()  # a check without the declaration would take it for a record
+    (batch / "shard-2" / LOGGED.pattern).unlink()  # a check without the declaration would fail it as unexpected
     write_check(batch, verify_batch(batch, code=CODE))
     with pytest.raises(BatchNotVerified, match="another declaration of side files"):
         require_current_check(batch, code=CODE, side_files=[LOGGED])

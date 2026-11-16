@@ -111,8 +111,8 @@ def test_o11_a_session_whose_start_breaks_after_the_stop_still_brings_the_provid
 
 
 def test_o11_every_directory_the_journal_creates_is_durable_in_its_parent_before_the_stop(tmp_path, monkeypatch):
-    """O11: the lock and the journal create their directories; the file, its directory and the parent of every new
-    directory are fsynced, and all of it before the stop command runs."""
+    """O11: the lock and the journal create their directory (which lies directly in the federation's root, O35); the
+    file, its directory and the parent of the new directory are fsynced, and all of it before the stop command runs."""
     synced: list[tuple[int, int]] = []
     real_fsync = os.fsync
 
@@ -125,7 +125,7 @@ def test_o11_every_directory_the_journal_creates_is_durable_in_its_parent_before
     services = FakeServices()
     at_stop: list[int] = []
     services.on_stop = lambda service: at_stop.append(len(synced))
-    injector = injector_for(write_faults(tmp_path, journal="faults/journal"), services)
+    injector = injector_for(write_faults(tmp_path), services)
     injector.start(RUN)
     before_stop = set(synced[: at_stop[0]])
 
@@ -134,10 +134,9 @@ def test_o11_every_directory_the_journal_creates_is_durable_in_its_parent_before
         return status.st_dev, status.st_ino
 
     expected = {
-        "the journal": key(tmp_path / "faults" / "journal" / JOURNAL),
-        "its directory": key(tmp_path / "faults" / "journal"),
-        "the parent of the journal's directory": key(tmp_path / "faults"),
-        "the parent of the first new directory": key(tmp_path),
+        "the journal": key(tmp_path / "fault-journal" / JOURNAL),
+        "its directory": key(tmp_path / "fault-journal"),
+        "the parent of the new directory, the federation's root": key(tmp_path),
     }
     assert [name for name, path in expected.items() if path not in before_stop] == []
     injector.finish()

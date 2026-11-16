@@ -25,6 +25,16 @@ otherwise let the run in onto a stuck link once the heal lets the federation go,
 
   The refusal's words say which, and the campaign puts them in the run's `run_unstarted` event. It then asks again,
   and the run's next pre-run check sees the federation as it is now.
+- **A failed heal leads the words** (C11, O35). When the heal record's current stuck episode holds a heal that ended
+  with a pair still failing (`GateHeals.failed`), a refusal that rests on the gate's state (the epoch moved, is missing
+  or is new, or a heal has begun since the link check last passed) leads with the reason every answer of the gate
+  leads with in that heal's aftermath (`fault_gate_heal.failed_heal_reason`): `a failed heal: operator action needed
+  (stuck pairs: providers[2] reading from providers[0])`, a semicolon, then the words above. So the refusal's detail,
+  and the `run_unstarted` event that keeps it after the run's key, say first that an operator is needed, not only that
+  the epoch moved. It is the same hold with the same charge (none), and no new reason. The words stay as they were for
+  a heal under way or cut short, one that mended every pair, a failed heal the gate's link check has since seen mended,
+  an `ended` line that names no pair by a label, and every refusal that is not about the gate's state (no note, a link
+  check under way, a record that cannot be read).
 - **A run with no note at all is admitted.** It is a caller that is no campaign (a tool outside one, a test): no
   pre-run check was asked, so no check vouched for anything an admission could find outdated. It is never a campaign
   with `[faults]`, which never runs without a health check, two ways:
@@ -55,7 +65,7 @@ from typing import Any
 
 from expcore.campaign import prerun
 from expcore_onedata.fault_epoch import GATE_NOTE, HEAL, LINKS_FAILED, LinkEpoch
-from expcore_onedata.fault_gate_heal import GateHeals
+from expcore_onedata.fault_gate_heal import GateHeals, failed_heal_reason
 
 # What the platform's run admission declares: why a campaign with `[faults]` needs a health check, and what to pass.
 HEALTH_REQUIRED = (
@@ -112,11 +122,20 @@ def refusal(
             return f"a link check of the fault gate was still under way when the admission's wait ran out: {_AGAIN}"
         try:
             record = epochs.read()
-            unpassed = GateHeals(directory).unpassed()
+            heals = GateHeals(directory)
+            unpassed, failed = heals.unpassed(), heals.failed()
         except (OSError, ValueError) as error:  # its type only (O12)
             unread = "the federation's link epoch or the fault gate's heal record cannot be read"
             return f"{unread} ({type(error).__name__}): {_AGAIN}"
-    return _outdated(noted, record, unpassed)
+    return _led(_outdated(noted, record, unpassed), failed)
+
+
+def _led(why: str | None, failed: Mapping[str, Any] | None) -> str | None:
+    """`why` (a refusal that rests on the gate's state, or None) led by the reason a failed heal needs an operator, the
+    gate's own (`failed_heal_reason`, from the `ended` line of the current stuck episode's failed heal, `failed`), when
+    there is one that names a pair by a label; `why` as it is otherwise."""
+    reason = None if why is None or failed is None else failed_heal_reason(failed)
+    return why if reason is None else f"{reason}; {why}"
 
 
 def _outdated(noted: tuple[str, int], record: Mapping[str, Any] | None, unpassed: bool) -> str | None:

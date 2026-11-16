@@ -6,7 +6,9 @@ A thin shell; the logic is in the packages.
     run STUDY       load the configuration, open or resume the campaign, run the scheduler; with `--shard i/N
                     [--shard-label L [--shard-label-wide]]` run shard i of N of the campaign on this host (one
                     campaign on several hosts); with `--select FACTOR=L1,L2 --shard-label L [--sequential [--after
-                    EARLIER_OUT...]]` run only the selected runs, one batch of the campaign (one campaign in batches)
+                    EARLIER_OUT...]]` run only the selected runs, one batch of the campaign (one campaign in batches);
+                    with `--spend-journal FILE` journal what it spends to FILE, new, and first count what the journals
+                    beside it hold that the store lacks (a store copied back after a kill)
     merge OUT SHARD_OUT...
                     merge the outputs of a campaign's shards into one batch under OUT (normally STUDY/out), refusing
                     shards that are not one campaign run against one environment; check, analyze and report then read
@@ -39,17 +41,19 @@ from pathlib import Path
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.export import ExportError
 from expcore.campaign.factors import PlanError
+from expcore.campaign.lost_spend import LostSpendError
 from expcore.campaign.merge import MergeRefused
 from expcore.campaign.scheduler import CampaignLocked
 from expcore.campaign.selection import Selection, SelectionSpec, Spec
 from expcore.campaign.shard import ShardError, ShardSpec
+from expcore.campaign.spend_journal import SpendJournalError
 from expcore.config.loading import ConfigError
 from expcore.package.build import build_package, default_hashes, private_hashes, verify_package
 from expcore.package.spec import PackageError
 from expcore.provenance.codestamp import CodeVersionUnknown
 from expcore.provenance.redact import QuietParser, Redactor, stopped
 from expcore.provenance.redact import failure as shown_failure
-from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified
+from expcore.replay.check import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, BatchNotVerified, outcome_lines
 from expcore.report import summary_lines
 from expcore.study.example import ExampleError, write_example
 from expcore.study.merge import merge_shards
@@ -78,6 +82,8 @@ _REFUSALS = (
     MergeRefused,
     ShardError,
     ExportError,
+    LostSpendError,
+    SpendJournalError,
 )
 _GUARDED = frozenset({"package", "package-check"})  # commands whose every message goes through the redactor
 
@@ -147,6 +153,13 @@ def build_parser() -> argparse.ArgumentParser:
                 metavar="EARLIER_OUT",
                 help="with --sequential: an earlier selection's out/ (or its store); give every earlier one",
             )
+            command.add_argument(
+                "--spend-journal",
+                type=Path,
+                metavar="FILE",
+                help="journal what this start spends to FILE (new, *.jsonl) on a filesystem that outlives the host, "
+                "after first counting what the other journals in its directory hold that the store lacks",
+            )
         else:
             command.add_argument(
                 "--partial",
@@ -206,6 +219,7 @@ def _run(args: argparse.Namespace, crash_hook: Callable[[str, str], None] | None
         crash_hook=crash_hook,
         shard=shard,
         after=args.after or (),
+        spend_journal=args.spend_journal,
     )
     runs = sum(summary.statuses.values())
     statuses = dict(sorted(summary.statuses.items()))
@@ -264,9 +278,8 @@ def _check(args: argparse.Namespace) -> int:
         code_root=args.code_root,
         partial=args.partial,
     )
-    for failure in check["failures"]:
-        print(f"FAIL {failure['file']} [{failure['stage']}] {failure['error']}")
-    print(f"{check['n_ok']} of {check['n_records']} records passed")
+    for line in outcome_lines(check):
+        print(line)
     return EXIT_REFUSED if check["failures"] else EXIT_OK
 
 
@@ -278,7 +291,7 @@ def _analyze(args: argparse.Namespace) -> int:
     analysis = _analysis(args)
     for path in write_analysis(analysis):
         print(f"wrote {path}")
-    print("\n".join(summary_lines(analysis.result)))
+    print("\n".join(summary_lines(analysis.result, analysis.egress, analysis.mount_guard, analysis.guards)))
     return EXIT_OK
 
 
