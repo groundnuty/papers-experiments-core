@@ -19,7 +19,8 @@ or removed; the live-run notes and the two drivers are kept privately, since the
 **Where each claim stands.** The per-file figures, the I/O mode, the oneclient build, the options, the token lifetime and
 the step timings are in the record, copied from the two halves' own records. The comparison in the record is computed
 from them. The code commits, the Python tags, the layout edits, the manifest counts and the teardown proofs come from
-the run notes, not from the record; each says so below.
+the run notes, not from the two halves' records; each says so below. The `code_commit` fields and the Python line of
+`differences_outside_the_comparison` in the published record were added from the notes.
 
 ## Method
 
@@ -65,7 +66,7 @@ the run notes, not from the record; each says so below.
 |---|---|---|
 | Core commit | `a50cd83802701814a67d88dfb637e5c221f47816` (main at #333; the site checkout was byte-identical to it, 1,196 of 1,196 files by SHA-256) | `655ea0a66e034390197c62c393209b879961ced0` (main at #336, a detached worktree) |
 | Mount code | `HostMount` (`sandbox/apptainer/hostmount.py`) | `DockerSandbox` mount mode, the sidecar |
-| oneclient | 25.0, FUSE 3.2, build id `a2f1d9345615360e465c1e43d24046df407c6254`, from the relocatable bundle, tar SHA-256 `e959d9aa63c2889e4c1839a60c1471696136da2ac86f935810b57e9b2014a6af` | 25.0, FUSE 3.2, the same build id, from the image `sha256:aff60c5ff78c99f4cb0c5d0acb5392b37a1fdd3cdd73b73bca9b640d067a51d8` (its id, pinned by digest and never pulled) |
+| oneclient | 25.0, FUSE 3.2, build id `a2f1d9345615360e465c1e43d24046df407c6254`, from the relocatable bundle, tar SHA-256 `e959d9aa63c2889e4c1839a60c1471696136da2ac86f935810b57e9b2014a6af` | 25.0, FUSE 3.2, the same build id, from the image `sha256:aff60c5ff78c99f4cb0c5d0acb5392b37a1fdd3cdd73b73bca9b640d067a51d8` (its id; this run pinned it by digest, notes) |
 | Agent | a SIF built from `python:3.11-slim` (notes) | `python:3.12-slim`, `sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf` |
 
 - **The same oneclient build.** The two records give version 25.0, FUSE 3.2 and one GNU build id. The HPC build id is
