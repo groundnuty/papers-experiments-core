@@ -224,7 +224,7 @@ def test_o51_a_reset_of_several_spaces_takes_one_exclusive_section_for_all(
     assert record["spaces"][0]["occupancy_reads"]["mode"] == "shortcut"
 
 
-FULL_REASON = "the owner ledger fell back"  # a study's reason for one full reset
+FULL_REASON = "owner_ledger_fell_back"  # a study's reason for one full reset: a short code
 
 
 def a_reader_could_share(platform_file, config) -> bool:
@@ -301,16 +301,17 @@ def test_o51_without_a_full_reason_the_reads_are_recorded_as_before(
     assert resetshortcut.initial(p.settings, None, None) == resetshortcut.initial(p.settings, None, None, None)
 
 
-@pytest.mark.parametrize("reason", ["", "   ", "\n\t", 7, b"why"], ids=["empty", "spaces", "blank", "number", "bytes"])
-def test_o51_an_empty_blank_or_non_text_full_reason_is_refused_before_anything_is_sent(
+@pytest.mark.parametrize("reason", ["", "the owner ledger fell back"], ids=["empty", "sentence"])
+def test_o51_a_full_reason_that_is_not_a_short_code_is_refused_before_anything_is_sent(
     client, config, platform_file, ticker, tmp_path, fake, lock, reason
 ):
-    """O51: a full reset's reason is a text with something in it: an empty or whitespace-only one, or one that is not
-    a text, is refused before any stage, and nothing is sent to the federation."""
+    """O51: a full reset's reason goes into the published record, so it is a short code (`resetshortcut
+    .checked_reason`, whose own tests hold every form): one that is not is refused before any stage, and nothing is
+    sent to the federation."""
     p = provisioner(client, config, platform_file, ticker, tmp_path)
     reset = SpaceReset(p, now=ticker.clock)
     calls = len(fake.provider_calls)
-    with pytest.raises(ValueError, match="full_reason"):
+    with pytest.raises(ValueError, match="full_reason is a short code"):
         reset.run(full_reason=reason)
     assert len(fake.provider_calls) == calls
 
