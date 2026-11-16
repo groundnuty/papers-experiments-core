@@ -110,7 +110,7 @@ def test_c06_the_legacy_fingerprint_is_every_entry_by_its_id_bearing_digest(tmp_
     }
 
 
-@pytest.mark.parametrize("case", ["missing", "not json", "not a manifest", "not a string"])
+@pytest.mark.parametrize("case", ["missing", "not json", "not a manifest", "not a string", "a colon in its path"])
 def test_c06_a_data_manifest_that_is_no_manifest_is_refused_naming_the_key_never_the_path(tmp_path, case):
     directory = tmp_path / "fed"
     directory.mkdir()
@@ -119,6 +119,8 @@ def test_c06_a_data_manifest_that_is_no_manifest_is_refused_naming_the_key_never
     elif case == "not a manifest":
         (directory / "data-manifest.json").write_text(json.dumps({"version": 1}))
     value = 7 if case == "not a string" else "data-manifest.json"
+    if case == "a colon in its path":  # the loader's message is split at nothing the path may hold
+        value = str(directory / "absent: private-dataset" / "manifest.json")
 
     def edit(document):
         with_spaces(document, 2)
@@ -127,6 +129,7 @@ def test_c06_a_data_manifest_that_is_no_manifest_is_refused_naming_the_key_never
     with pytest.raises(ConfigError, match=r"spaces\[0\]: key 'data_manifest'") as refused:
         load_platform(write_platform(directory, edit))
     assert "data-manifest.json" not in str(refused.value)
+    assert "private-dataset" not in str(refused.value)
     assert leaked_values(str(refused.value), directory) == []
 
 
