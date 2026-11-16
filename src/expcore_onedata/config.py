@@ -81,12 +81,12 @@ they ran, with `PLATFORM_MODULE` and the file (`expcore.config.platform_loads`),
 scheduler refuses a study whose build loaded this platform without listing the module in `[study] platforms`, whatever
 its plugin wraps. The record is the module and the path only, and no value or fingerprint depends on it.
 
-**Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and its
-fingerprint is unchanged. With several spaces, `space` and `support` refuse (there is no one space to give), and each
-consumer names the space it acts on by its label: provisioning, placement, eviction and the probes are bound to one
-(`provision.Provisioner`), a token plane's caveats and privilege checks reach every space it is scoped to
-(`space_ids`), a mutation passes the gate when its target lies under any declared prefix (`prefixes`), and the spaces
-enter the campaign fingerprint, so a resume under another set is refused.
+**Several spaces** (`spaces.py`). The one-space form's single space is `spaces[0]`, labelled `space`, and it is in
+the fingerprint by its support, name and prefixes (`support`). With several spaces, `space` and `support` refuse
+(there is no one space to give), and each consumer names the space it acts on by its label: provisioning, placement,
+eviction and the probes are bound to one (`provision.Provisioner`), a token plane's caveats and privilege checks
+reach every space it is scoped to (`space_ids`), a mutation passes the gate when its target lies under any declared
+prefix (`prefixes`), and the spaces enter the campaign fingerprint, so a resume under another set is refused.
 """
 
 import hashlib

@@ -111,9 +111,11 @@ class PlacementSettings:
     def reset_settings(self) -> dict[str, Any]:
         """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
 
-        Every field after its default, as `placement.<name>`: numbers and text only. They are in no fingerprint, since
-        they change how placement and the reset work and not what an agent sees, so a campaign resumed after one
-        changed (or after a default changed under a file that never declared it) says so. The data provider's name is
+        Every field after its default, as `placement.<name>`: numbers and text only. Those that change only how
+        placement and the reset work are in no fingerprint, so a campaign resumed after one changed (or after a default
+        changed under a file that never declared it) says so; those a run's own instruments read inside its attempt
+        (`runsettings.PLACEMENT_IN_RUN`) are in the fingerprint as well, so a resume under another of them is refused
+        before this comparison is made. The data provider's name is
         left out, since the record travels with the export and the replication package, which name no provider. The
         map is not here either: `Placement.reset_settings()` adds it, as its digest.
         """
