@@ -120,6 +120,10 @@ cmd_submit() {
     esac
   done
   load_env
+  # One submit at a time from this login directory, the count of alive allocations included, so two submits (a loop's
+  # and a hand's, or two --once) cannot both pass the guard.
+  exec 8> "$DIR/submit.lock"
+  flock -w 60 8 || die "another submit holds the lock: nothing submitted" 3
   rows=$(alive) || die "squeue failed: nothing submitted" 2
   count=$(printf '%s\n' "$rows" | grep -c '[0-9]')
   [ "$count" -lt "$MAX_ALIVE" ] || die "$count allocations of ours are alive already (the limit is $MAX_ALIVE): nothing submitted" 3
@@ -273,6 +277,9 @@ last_activity() { # last_activity <id> <start>: when a step of the job last ran 
   local id=$1 last=$2 now rows step start end state
   now=$(date +%s)
   rows=$(sacct -n -P -j "$id" -o JobID,Start,End,State) || { echo "$now"; return 0; }
+  # Accounting that does not list the job's batch step has not caught up with it (or failed): no "no steps" is read
+  # from it.
+  printf '%s\n' "$rows" | grep -q "^$id\.batch|" || { echo "$now"; return 0; }
   while IFS='|' read -r step start end state; do
     case "$step" in "$id".[0-9]*) ;; *) continue ;; esac
     case "${step#"$id".}" in *[!0-9]*) continue ;; esac
@@ -298,6 +305,10 @@ idle_release() {
     last=$(last_activity "$id" "$began")
     is_count "$last" || continue
     [ $((now - last)) -ge "$IDLE" ] || continue
+    # Right before the release, the controller's own list of the job's live steps: a step a lane has just started is
+    # there before accounting has it.
+    if squeue -h -s -j "$id" -o '%i' 2> /dev/null | grep -q "^$id\.[0-9]"; then continue; fi
+    squeue -h -s -j "$id" -o '%i' > /dev/null 2>&1 || continue
     log "job $id has run no test step for $((now - last)) s (since $(date -u -d "@$last" +%FT%TZ)): releasing it"
     (cmd_release "$id") 2>&1 | sed 's/^/  /'
     released=1

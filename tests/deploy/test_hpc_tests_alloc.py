@@ -300,5 +300,19 @@ def test_no_idle_release_on_an_unreadable_record_or_with_idle_off(login):
 def test_an_idle_release_also_releases_our_queued_successor(login):
     login.ledger(500, 501)
     login.queue(running(500, NOW + 8 * 3600), (501, "expcore-tests", "PENDING", "N/A", "N/A", 16, "30G"))
+    steps(login, 500, ("500.batch", slurm_time(NOW - 4 * 3600), "Unknown", "RUNNING"))
     renew_once(login, wanted=None, idle="10800")
     assert fakes.calls(login.fake / "scancel.jsonl") == [["500"], ["501"]]
+
+
+def test_o64_no_idle_release_while_accounting_lags_or_a_step_has_just_started(login):
+    """O64: "no steps" is read only from accounting that lists the job's batch step, and the controller's live list
+    of steps is asked right before the release: a step a lane has just started keeps the allocation."""
+    login.ledger(500)
+    login.queue(running(500, NOW + 8 * 3600))
+    steps(login, 500)  # accounting knows nothing of the job yet
+    renew_once(login, wanted=None, idle="10800")
+    steps(login, 500, ("500.batch", slurm_time(NOW - 4 * 3600), "Unknown", "RUNNING"))
+    (login.fake / "squeue-steps").write_text("500.batch\n500.7\n")
+    renew_once(login, wanted=None, idle="10800")
+    assert fakes.calls(login.fake / "scancel.jsonl") == []

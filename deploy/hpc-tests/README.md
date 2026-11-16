@@ -30,7 +30,12 @@ node's tmpfs root and the step's PATH is on a step's command line.
    and the summary, writes `run.json`, and exits with pytest's status. The run directory on the node is removed.
 
 A step writes only under the node's tmpfs root: never under the home directory or a shared filesystem, and never
-under Slurm's per-job `TMPDIR` (a link into a shared filesystem with an inode quota on some sites).
+under Slurm's per-job `TMPDIR` (a link into a shared filesystem with an inode quota on some sites). It reads nothing
+of the account's home either, which every agent of the account shares: with HOME unset, uv would fall back to the
+passwd entry's home (seen live), so every phase runs with HOME, TMPDIR and the XDG directories inside the run
+directory, uv's cache, Python, Python links and tools under the node root (`--no-bin`: no link in any `bin`), pip's
+config and git's global config at `/dev/null` (git's system config off), Python's user site off, and Apptainer's and
+Singularity's cache and config inside the run directory.
 
 ```
 uv run python deploy/hpc-tests/hpctests.py run --repo <your worktree> -- tests/test_changelog.py tests/onedata -q
@@ -90,7 +95,8 @@ cancels, each of one id: `submit` cancels the job sbatch has just printed when S
 (name, requeue, account, partition, cores, memory, time limit, state; an unreadable record counts as different), and
 `release` cancels a job of the ledger that is alive under our name. The account and partition reach sbatch through
 its own input variables (`SBATCH_ACCOUNT`, `SBATCH_PARTITION`), never its command line. `submit` refuses once
-`HPCT_MAX_ALIVE` (2) allocations of ours are alive.
+`HPCT_MAX_ALIVE` (2) allocations of ours are alive, under a lock held from that count to the ledger's entry, so two
+submits cannot both pass it.
 
 ## Renewal
 
@@ -111,8 +117,9 @@ allocation ends at its time limit; `release` ends it sooner.
 
 **The idle release:** every poll, the loop also releases a RUNNING allocation of ours that has run no test step for
 `--idle-hours` (3; from its start when it never ran one), by its id through `release`'s own ledger and name checks.
-It reads the job's steps from `sacct`, so a step shorter than a poll still counts, and a record it cannot read counts
-as busy. It clears `renew.wanted` with it, so the next poll does not submit another, and releases a successor of
+It reads the job's steps from `sacct`, so a step shorter than a poll still counts; a record it cannot read, or one
+that does not list the job's batch step yet, counts as busy; and right before releasing it asks the controller for
+the job's live steps (`squeue -s`), so a step a lane has just started keeps the allocation. It clears `renew.wanted` with it, so the next poll does not submit another, and releases a successor of
 ours still queued.
 
 `renew start` runs `alloc.sh renew` with `setsid nohup` on the login node, from a frozen copy of `alloc.sh` (bash reads a

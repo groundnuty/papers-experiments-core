@@ -27,14 +27,16 @@ def script(path: Path, text: str) -> Path:
 
 
 def slurm(bin_dir: Path, fake: Path) -> None:
-    """squeue prints fake/squeue (exit 1 when fake/squeue-fail exists); sbatch logs its argv and the two input
-    variables to fake/sbatch.jsonl and prints fake/next-id (700 at first, then one more each time); scontrol prints
-    fake/record (RECORD by default) for the id asked; scancel logs its argv to fake/scancel.jsonl; sacct prints
-    fake/sacct-<id> (exit 1 when fake/sacct-fail exists); date +%s prints fake/now."""
+    """squeue prints fake/squeue, or fake/squeue-steps for `-s` (exit 1 when fake/squeue-fail exists); sbatch logs
+    its argv and the two input variables to fake/sbatch.jsonl and prints fake/next-id (700 at first, then one more
+    each time); scontrol prints fake/record (RECORD by default) for the id asked; scancel logs its argv to
+    fake/scancel.jsonl; sacct prints fake/sacct-<id> (exit 1 when fake/sacct-fail exists); date +%s prints fake/now."""
     python = sys.executable
     script(
         bin_dir / "squeue",
-        f'#!/bin/bash\n[ ! -e "{fake}/squeue-fail" ] || exit 1\n[ ! -e "{fake}/squeue" ] || cat "{fake}/squeue"\n',
+        f'#!/bin/bash\n[ ! -e "{fake}/squeue-fail" ] || exit 1\n'
+        f'case " $* " in *" -s "*) [ ! -e "{fake}/squeue-steps" ] || cat "{fake}/squeue-steps"; exit 0 ;; esac\n'
+        f'[ ! -e "{fake}/squeue" ] || cat "{fake}/squeue"\n',
     )
     script(
         bin_dir / "sbatch",
@@ -101,6 +103,7 @@ if os.path.exists("fake-outcome-none"):  # a run that ran no test and still exit
     print("no tests ran in 0.01s")
     sys.exit(0)
 print("env-keys: " + ",".join(sorted(os.environ)))
+print("env-json: " + json.dumps(dict(os.environ)))
 print("args: " + json.dumps(args))
 with open(junit, "w") as out:
     out.write('<testsuites><testsuite name="pytest" errors="0" failures="%d" skipped="1" tests="3" time="0.5"/>'
@@ -117,10 +120,8 @@ print("================ 2 passed, 1 skipped in 0.50s ================")
 FAKE_UV = r"""
 import glob, json, os, subprocess, sys
 args = sys.argv[1:]
-KEYS = ("HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_DATA_HOME", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR",
-        "UV_PYTHON_BIN_DIR")
 with open(LOG, "a") as log:
-    log.write(json.dumps({"args": args, "env": {k: os.environ.get(k) for k in KEYS}}) + "\n")
+    log.write(json.dumps({"args": args, "env": dict(os.environ)}) + "\n")
 if args == ["--version"]:
     print("uv 0.11.19 (stand-in)")
     sys.exit(0)

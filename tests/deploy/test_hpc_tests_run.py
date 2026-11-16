@@ -4,6 +4,7 @@ files, and `uv` builds a small venv whose pytest is a stand-in. The boot, node.s
 SHA-256, the self-check, the clean and the local report are the real ones, on a real tmpfs (the node root).
 """
 
+import json
 import os
 import secrets
 import shutil
@@ -235,19 +236,43 @@ def test_o64_the_boot_refuses_a_root_whose_filesystem_is_not_a_tmpfs_and_creates
     assert not Path(f"{root}-{os.getuid()}").exists()
 
 
-def test_o64_uv_git_and_pytest_on_the_node_write_under_the_run_directory_never_the_account_home(cli, world):
-    """O64: with HOME unset, uv falls back to the passwd entry's home, a shared filesystem (found live): every uv call
-    of a step is told to keep its cache, its Python and that Python's links under the node root, with HOME inside the
-    run directory, and the Python is installed without a link in any bin directory."""
+# Every place a program of a step would otherwise read or write under the account's home, and where the step sends it.
+UNDER_ROOT = ("HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_BIN_HOME",
+              "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "UV_PYTHON_BIN_DIR", "UV_TOOL_DIR", "UV_TOOL_BIN_DIR",
+              "PIP_CACHE_DIR", "PYTHONUSERBASE", "APPTAINER_CACHEDIR", "APPTAINER_CONFIGDIR", "SINGULARITY_CACHEDIR",
+              "SINGULARITY_CONFIGDIR")  # fmt: skip
+TO_NULL = ("PIP_CONFIG_FILE", "GIT_CONFIG_GLOBAL")
+SET_ONE = ("GIT_CONFIG_NOSYSTEM", "PYTHONNOUSERSITE")
+
+
+def confined(env: dict, root: str, home: str) -> None:
+    for key in UNDER_ROOT:
+        assert env.get(key, "").startswith(root), (key, env.get(key))
+    for key in TO_NULL:
+        assert env.get(key) == "/dev/null", key
+    for key in SET_ONE:
+        assert env.get(key) == "1", key
+    assert not [k for k, v in env.items() if home in v], "a value names the account's home"
+
+
+def test_o64_a_step_reads_and_writes_nothing_of_the_account_s_home(cli, world):
+    """O64: the account's home is shared by every agent of the account, and with HOME unset uv falls back to it (found
+    live): in every uv call of a step and in pytest's environment, uv's cache, Python, Python links, tools and config,
+    pip's cache and config, git's global and system config, Python's user site and Apptainer's cache go inside the
+    run directory or the node root, or to /dev/null, no value names the account's home, and the Python is installed
+    without a link in any bin directory (so neither ~/.local/share/uv/python nor ~/.local/bin is ever written)."""
     allocate(cli, world)
     assert run(cli, world, "tests") == 0
+    root, home = f"{world.node_root}/", os.environ["HOME"]
     calls = fakes.calls(world.fake / "uv.jsonl")
-    install = next(c for c in calls if c["args"][:2] == ["python", "install"])
-    assert "--no-bin" in install["args"]
-    root = f"{world.node_root}/"
+    assert "--no-bin" in next(c for c in calls if c["args"][:2] == ["python", "install"])["args"]
     for call in calls:
-        assert all(value and value.startswith(root) for value in call["env"].values()), call["env"]
-        assert call["env"]["HOME"].startswith(f"{root}runs/")
+        confined(call["env"], root, home)
+        assert call["env"]["UV_NO_CONFIG"] == "1"
+    log = (only_run(world) / "results" / "pytest.log").read_text()
+    env = json.loads(log.split("env-json: ", 1)[1].split("\n", 1)[0])
+    confined(env, root, home)
+    assert env["HOME"].startswith(f"{root}runs/")
 
 
 def test_o64_the_site_s_step_path_reaches_the_tests_through_the_payload_not_the_command_line(cli, world):

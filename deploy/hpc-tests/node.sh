@@ -20,6 +20,7 @@ dir=$root/runs/$run
 kit=$dir/kit
 res=$dir/results
 child=""
+RUN_ENV=()
 
 say() { printf 'HPCT-LOG %s\n' "$*"; }
 fail() { printf 'HPCT-FAIL node: %s\n' "$*"; exit 72; }
@@ -98,7 +99,7 @@ do_env() {
 do_check() {
   local want line out
   want=$(readlink -f "$dir/repo/src")/
-  out=$(cd "$dir" && env -i PATH=/usr/bin:/bin "$dir/venv/bin/python" -I -c \
+  out=$(cd "$dir" && env -i PATH=/usr/bin:/bin HOME="$dir/home" "$dir/venv/bin/python" -I -c \
     'import os, expcore, expcore_onedata; print(os.path.realpath(expcore.__file__)); print(os.path.realpath(expcore_onedata.__file__))' 2>&1) \
     || { echo "$out"; return 1; }
   while IFS= read -r line; do
@@ -111,9 +112,9 @@ do_pytest() {
   [ ! -s "$kit/pytest-args" ] || mapfile -d '' -t args < "$kit/pytest-args"
   (
     cd "$dir/repo" || exit 72
-    exec env -i PATH="$dir/venv/bin:$PATH" HOME="$dir/home" TMPDIR="$dir/tmp" LC_ALL=C.UTF-8 LANG=C.UTF-8 \
+    exec env -i PATH="$dir/venv/bin:$PATH" LC_ALL=C.UTF-8 LANG=C.UTF-8 "${RUN_ENV[@]}" \
       PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS="$HPCT_CORES" OPENBLAS_NUM_THREADS="$HPCT_CORES" \
-      MKL_NUM_THREADS="$HPCT_CORES" GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=hpct GIT_AUTHOR_EMAIL=hpct@invalid \
+      MKL_NUM_THREADS="$HPCT_CORES" GIT_AUTHOR_NAME=hpct GIT_AUTHOR_EMAIL=hpct@invalid \
       GIT_COMMITTER_NAME=hpct GIT_COMMITTER_EMAIL=hpct@invalid \
       timeout --signal=TERM --kill-after=30 "$HPCT_TIMEOUT_S" \
       "$dir/venv/bin/python" -m pytest "${args[@]}" -p no:cacheprovider -ra "--junitxml=$res/junit.xml" \
@@ -142,13 +143,20 @@ cmd_run() {
   case "$HPCT_TIMEOUT_S$HPCT_CORES" in "" | *[!0-9]*) fail "the timeout and cores are whole numbers" ;; esac
   mkdir -m 0700 "$res" "$dir/home" "$dir/tmp"
   echo "$$" > "$dir/pid"
-  # Everything from here on writes under the run directory or the node root, never the account's home: uv, git and
-  # Python would otherwise fall back to the passwd entry's home (a shared filesystem) when HOME is unset.
-  export HOME=$dir/home TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/home/.cache XDG_CONFIG_HOME=$dir/home/.config
-  export XDG_DATA_HOME=$dir/home/.local/share XDG_STATE_HOME=$dir/home/.local/state XDG_BIN_HOME=$dir/home/.local/bin
-  export UV_CACHE_DIR=$root/uv-cache UV_PYTHON_INSTALL_DIR=$root/python UV_PYTHON_BIN_DIR=$root/python-bin
-  export UV_TOOL_DIR=$root/uv-tools UV_TOOL_BIN_DIR=$root/uv-tools/bin UV_NO_CONFIG=1 UV_NO_PROGRESS=1
-  export UV_PYTHON_PREFERENCE=only-managed
+  # From here on nothing reads or writes the account's home, which every agent of the account shares: uv, pip, git
+  # and Python would otherwise fall back to the passwd entry's home when HOME is unset. RUN_ENV is exported for the
+  # clone and uv, and is the core of pytest's own environment.
+  RUN_ENV=(
+    "HOME=$dir/home" "TMPDIR=$dir/tmp" "XDG_CACHE_HOME=$dir/home/.cache" "XDG_CONFIG_HOME=$dir/home/.config"
+    "XDG_DATA_HOME=$dir/home/.local/share" "XDG_STATE_HOME=$dir/home/.local/state" "XDG_BIN_HOME=$dir/home/.local/bin"
+    "UV_CACHE_DIR=$root/uv-cache" "UV_PYTHON_INSTALL_DIR=$root/python" "UV_PYTHON_BIN_DIR=$root/python-bin"
+    "UV_TOOL_DIR=$root/uv-tools" "UV_TOOL_BIN_DIR=$root/uv-tools/bin" "UV_NO_CONFIG=1" "UV_NO_PROGRESS=1"
+    "UV_PYTHON_PREFERENCE=only-managed" "PIP_CONFIG_FILE=/dev/null" "PIP_CACHE_DIR=$dir/home/.cache/pip"
+    "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_NOSYSTEM=1" "PYTHONNOUSERSITE=1" "PYTHONUSERBASE=$dir/home/.local"
+    "APPTAINER_CACHEDIR=$dir/home/.apptainer/cache" "APPTAINER_CONFIGDIR=$dir/home/.apptainer"
+    "SINGULARITY_CACHEDIR=$dir/home/.singularity/cache" "SINGULARITY_CONFIGDIR=$dir/home/.singularity"
+  )
+  export "${RUN_ENV[@]}"
   [ -z "$HPCT_STEP_PATH" ] || export PATH=$HPCT_STEP_PATH
   local t0 t1 t2 t3 t4 rc=0
   t0=$(date +%s)
