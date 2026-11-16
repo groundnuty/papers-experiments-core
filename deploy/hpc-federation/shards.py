@@ -306,19 +306,22 @@ def undeclared_data(plan: Plan) -> list[str]:
     such shards would never merge: refused before anything runs, never found at the merge after the spend."""
     if len({shard.root for shard in plan.shards}) < 2:
         return []
-    found = []
-    for shard in plan.shards:
-        try:
-            data = tomllib.loads((shard.root / PLATFORM).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-            found.append(f"{shard.label}: its federation's {PLATFORM} could not be read")
-            continue
-        entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
-        missing = [str(e.get("name")) if isinstance(e, Mapping) else "[space]" for e in entries
-                   if not (isinstance(e, Mapping) and e.get("data_manifest"))]  # fmt: skip
-        if missing:
-            found.append(f"{shard.label}: {', '.join(missing)}")
-    return found
+    found = [undeclared_spaces(shard.label, shard.root) for shard in plan.shards]
+    return [entry for entry in found if entry is not None]
+
+
+def undeclared_spaces(label: str, root: Path) -> str | None:
+    """One federation's part of `undeclared_data`: `<label>: <space>, ...` for each space its `platform.toml` leaves
+    without `data_manifest`, or that the file could not be read; None when every space declares its data. `fleet.py`
+    asks it of every federation it gives a shard, one at a time."""
+    try:
+        data = tomllib.loads((root / PLATFORM).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return f"{label}: its federation's {PLATFORM} could not be read"
+    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+    missing = [str(e.get("name")) if isinstance(e, Mapping) else "[space]" for e in entries
+               if not (isinstance(e, Mapping) and e.get("data_manifest"))]  # fmt: skip
+    return f"{label}: {', '.join(missing)}" if missing else None
 
 
 def _job_id(job: Any) -> bool:

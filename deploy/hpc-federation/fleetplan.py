@@ -1,0 +1,274 @@
+"""Which federation of a fleet runs which shard (`fleet.py plan`), and what `fleet.py step` checks again before each
+launch (DESIGN.md, section 1, "A fleet"). The lines are `shards.py`'s own (`load_plan`, `federation`, `step_argv`).
+
+**One campaign.** A federation is given a shard only when its own `up` finished (`linked`: every space's data read back
+against its manifest, every link checked), its root and state are the ones this fleet made (`fleetrecord.identity`),
+every space of its `platform.toml` declares its data (`data_manifest`, C06), and its platform fingerprint
+(`PlatformConfig.fingerprint()`) is the fleet's. The first plan sets that reference, and refuses outright when the
+federations' fingerprints differ, naming each federation and the keys that differ, never a value: their shards would
+never merge. A later federation of another fingerprint is never used.
+
+**A shard that moves.** The shard count is fixed at the fleet's `up`. A shard whose federation is taken down
+(`fleet.py down --member`) is released, and given to a federation only after its fresh `up`, never one that held a shard
+before, with the same checks and an equal fingerprint. Its first reset there must be a full one (the coordinator's rule
+for moving a shard): the fleet moves it only to a federation whose `platform.toml` leaves `[placement] reset_shortcut`
+off, under which every reset reads in full, the first included; one that turns it on is refused for the move.
+"""
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+import hpcstate
+import shards
+import tomllib
+from fleetrecord import FleetError, identity, member_of, root_of
+
+MANIFEST = "shards.toml"  # in the fleet's directory: what `shards.py collect --manifest` reads at the end
+SETTINGS = ("study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory")  # shards.py's keys
+OPTIONAL = ("snapshot_every_s",)
+SCRIPT = Path(__file__).resolve().parent / "shards.py"
+
+
+def read_settings(path: Path) -> Dict[str, Any]:
+    """The shard manifest's settings: `shards.py`'s keys but `[[shards]]`, which the fleet writes. shards.py checks the
+    values when the fleet's manifest is loaded; here each must be a string or a number."""
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise FleetError(f"the shard settings could not be read ({type(error).__name__})") from None
+    if not set(SETTINGS) <= set(data) <= set(SETTINGS) | set(OPTIONAL):
+        raise FleetError(f"the shard settings take exactly: {', '.join(SETTINGS)}, and perhaps snapshot_every_s; "
+                         "no [[shards]] (the fleet writes them)")  # fmt: skip
+    for key, value in data.items():
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise FleetError(f"the shard setting {key} must be a string or a number")
+    return data
+
+
+def _toml(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False) if isinstance(value, str) else repr(value)
+
+
+def manifest_text(settings: Mapping[str, Any], entries: List[Tuple[str, str]]) -> str:
+    """`shards.toml` for `shards.py`: the settings, then one `[[shards]]` per shard (its label, its federation's
+    root), in the campaign's order."""
+    lines = ["# written by fleet.py plan: one shard per federation of the fleet"]
+    lines += [f"{key} = {_toml(settings[key])}" for key in sorted(settings)]
+    for label, root in entries:
+        lines += ["", "[[shards]]", f"label = {_toml(label)}", f"root = {_toml(root)}"]
+    return "\n".join(lines) + "\n"
+
+
+def platform_fingerprint(root: Path) -> Dict[str, Any]:
+    """The platform's half of the campaign fingerprint, as a study's plugin takes it from this platform file."""
+    from expcore_onedata.config import ConfigError, load_platform
+
+    try:
+        return load_platform(root / shards.PLATFORM, require_secrets=False).fingerprint()
+    except (ConfigError, OSError, ValueError) as error:
+        raise FleetError(f"its {shards.PLATFORM} could not be loaded ({type(error).__name__})") from None
+
+
+def sha256(fingerprint: Mapping[str, Any]) -> str:
+    from expcore.campaign.manifest import fingerprint_sha256
+
+    return fingerprint_sha256(fingerprint)
+
+
+def differing(one: Mapping[str, Any], other: Mapping[str, Any]) -> List[str]:
+    """The fingerprint's keys whose values differ: named, never shown."""
+    return sorted(key for key in set(one) | set(other) if one.get(key) != other.get(key))
+
+
+def shortcut_on(root: Path) -> bool:
+    """Whether a federation's `platform.toml` turns `[placement] reset_shortcut` on (unreadable counts as on)."""
+    try:
+        data = tomllib.loads((root / shards.PLATFORM).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return True
+    placement = data.get("placement")
+    return isinstance(placement, Mapping) and placement.get("reset_shortcut", False) is not False
+
+
+def readiness(directory: Path, member: Mapping[str, Any]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """(why the federation cannot run a shard now, None), or (None, its platform fingerprint)."""
+    label = member["label"]
+    if member["status"] != "up":
+        return f"{label}: its up has not finished (it is {member['status']})", None
+    reason, _ = identity(directory, member)
+    if reason is not None:
+        return reason, None
+    root = root_of(directory, label)
+    try:
+        state = hpcstate.load(root)
+    except hpcstate.StateError as error:
+        return f"{label}: {error}", None
+    if state is None or state.get("phase") != shards.LINKED:
+        return f"{label}: its federation is not linked (phase {(state or {}).get('phase')})", None
+    missing = shards.undeclared_spaces(label, root)
+    if missing is not None:
+        return f"{label}: a space's data is not declared (data_manifest, C06): {missing}", None
+    try:
+        return None, platform_fingerprint(root)
+    except FleetError as error:
+        return f"{label}: {error}", None
+
+
+def assignments(record: Mapping[str, Any], directory: Path) -> Tuple[Dict[str, str], Dict[str, Any], List[str]]:
+    """The new assignments ({shard: federation}), the reference fingerprint and what is said; FleetError refuses the
+    whole plan: a federation holding a shard that is no longer ready or no longer of the fleet's fingerprint, the first
+    plan's federations of differing fingerprints, or none ready."""
+    said: List[str] = []
+    holders = {s["member"]: s["label"] for s in record["shards"] if s["member"] is not None}
+    found: Dict[str, Dict[str, Any]] = {}
+    for member in record["members"]:
+        label = member["label"]
+        if label not in holders and (member["status"] != "up" or member["held"]):
+            continue  # neither holding a shard nor fresh
+        reason, fingerprint = readiness(directory, member)
+        if reason is not None and label in holders:
+            raise FleetError(f"shard {holders[label]}'s federation is not ready: {reason}; `fleet.py down --member "
+                             f"{label}` frees the shard for a fresh federation")  # fmt: skip
+        if reason is not None:
+            said.append(f"not used: {reason}")
+        else:
+            found[label] = fingerprint
+    reference = (record.get("reference") or {}).get("fingerprint")
+    if reference is None:
+        groups: Dict[str, List[str]] = {}
+        for label, fingerprint in found.items():
+            groups.setdefault(sha256(fingerprint), []).append(label)
+        if len(groups) > 1:
+            first, *rest = groups.values()
+            keys = sorted({k for labels in rest for k in differing(found[first[0]], found[labels[0]])})
+            raise FleetError(
+                "the federations' platform fingerprints differ, so their shards would not be one campaign: "
+                + "; ".join(", ".join(labels) for labels in groups.values())
+                + f" (differing: {', '.join(keys)}); nothing was assigned"
+            )
+        if not found:
+            raise FleetError("no federation of the fleet is ready to run a shard; nothing was assigned")
+        reference = next(iter(found.values()))
+    free = []
+    for label, fingerprint in found.items():
+        if fingerprint == reference:
+            free += [] if label in holders else [label]
+        elif label in holders:
+            raise FleetError(f"{label}'s platform fingerprint is no longer the fleet's (differing: "
+                             f"{', '.join(differing(reference, fingerprint))}); nothing was assigned")  # fmt: skip
+        else:
+            said.append(f"not used: {label}: its platform fingerprint differs from the fleet's (differing: "
+                        f"{', '.join(differing(reference, fingerprint))})")  # fmt: skip
+    new: Dict[str, str] = {}
+    unassigned = [s for s in record["shards"] if s["member"] is None]
+    for shard in unassigned:  # shard-k on fed-k, the federation its fleet's up made for it, when that one is ready
+        mine = "fed-" + shard["label"].split("-", 1)[1]
+        if shard["last"] is None and mine in free:
+            new[shard["label"]] = mine
+            free.remove(mine)
+    for shard in unassigned:  # any other: the next fresh federation, a moved shard only where its first reset is full
+        if shard["label"] in new:
+            continue
+        for label in list(free):
+            if shard["last"] is not None and shortcut_on(root_of(directory, label)):
+                said.append(f"{shard['label']}: not moved to {label}: its platform.toml turns [placement] "
+                            "reset_shortcut on, so the moved shard's first reset there is not shown full")  # fmt: skip
+                continue
+            new[shard["label"]] = label
+            free.remove(label)
+            break
+        else:
+            said.append(f"{shard['label']}: unassigned: no fresh federation is ready for it (`fleet.py add 1`, then "
+                        "plan again)")  # fmt: skip
+    return new, reference, said
+
+
+def entries(record: Mapping[str, Any], directory: Path, new: Mapping[str, str]) -> List[Tuple[str, str]]:
+    """Each shard's label and root for `shards.toml`: its federation's; an unassigned one's the federation it last had,
+    or the one its fleet's up made for it (never launched: `shards.py` refuses a federation that is not linked)."""
+    found = []
+    for shard in record["shards"]:
+        label = new.get(shard["label"]) or shard["member"] or shard["last"] or "fed-" + shard["label"].split("-")[1]
+        found.append((shard["label"], str(root_of(directory, label))))
+    return found
+
+
+def write_whole(path: Path, text: str) -> None:
+    draft = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(draft, path)
+
+
+def load(path: Path) -> shards.Plan:
+    try:
+        return shards.load_plan(path)
+    except shards.ShardsError as error:
+        raise FleetError(f"the fleet's shard manifest: {error}") from None
+
+
+def line_of(plan: shards.Plan, label: str, resume: bool) -> List[str]:
+    """The login node's srun line of one shard on the federation the manifest gives it (`shards.step_argv`)."""
+    (shard,) = [s for s in plan.shards if s.label == label]
+    try:
+        fed = shards.federation(shard)
+    except shards.ShardsError as error:
+        raise FleetError(str(error)) from None
+    return shards.step_argv(plan, shard, fed, SCRIPT) + (["--resume"] if resume else [])
+
+
+@dataclass(frozen=True)
+class Launch:
+    """One shard's step to launch: on which federation, its line, and whether it resumes."""
+
+    shard: str
+    member: str
+    argv: List[str]
+    resume: bool
+    note: str
+
+
+def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], resume: bool,
+             running: Callable[[Mapping[str, Any]], Optional[bool]]) -> Tuple[List[Launch], List[str]]:  # fmt: skip
+    """The steps `fleet.py step` launches, and what it refuses or skips, each checked again just before: the federation
+    still ready, still this fleet's, still of the fleet's fingerprint, and a moved shard's first reset there full. A
+    shard already launched on its federation is launched again only with `resume`, and never while its client runs
+    (`running`: True, False, or None when it cannot be told)."""
+    plan = load(directory / MANIFEST)
+    reference = (record.get("reference") or {}).get("sha256")
+    found, said = [], []
+    for shard in record["shards"]:
+        label, holder = shard["label"], shard["member"]
+        if (only is not None and label != only) or holder is None:
+            if only == label:
+                said.append(f"{label}: unassigned: plan gives it a federation first")
+            continue
+        started = [launch for launch in shard["launches"] if not launch.get("failed")]  # a spawn that failed: none
+        here = [launch for launch in started if launch["member"] == holder]
+        if here and running(here[-1]) is not False:
+            said.append(f"{label}: its step on {holder} still runs, or cannot be shown gone: not launched again")
+            continue
+        if here and not resume:
+            said.append(f"{label}: its step on {holder} has ended; `fleet.py step --shard {label} --resume` relaunches")
+            continue
+        reason, fingerprint = readiness(directory, member_of(record, holder))
+        if reason is None and sha256(fingerprint) != reference:
+            reason = f"{holder}: its platform fingerprint is no longer the fleet's"
+        if reason is None and shard["moved"] and shortcut_on(root_of(directory, holder)):
+            reason = f"{holder}: its platform.toml turns [placement] reset_shortcut on: the moved shard's first reset"
+        if reason is not None:
+            said.append(f"{label}: not launched: {reason}")
+            continue
+        again = resume or bool(started)  # it ran before, here or elsewhere: its results go on
+        note = ""
+        if shard["moved"] and not here:
+            note = (f"moved from {shard['last']}: its first reset on {holder} is a full one ([placement] "
+                    "reset_shortcut off)")  # fmt: skip
+        found.append(Launch(label, holder, line_of(plan, label, again), again, note))
+    return found, said
