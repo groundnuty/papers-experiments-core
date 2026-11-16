@@ -344,8 +344,8 @@ removed while held would let the next `up` or `down` lock another file of the sa
    `<root>/fault-relay/` goes with the root. The stop signals the relay by the pid and start tick of its heartbeat,
    through a pidfd where the kernel has `pidfd_open` and, on a login node whose kernel has none (Linux before 5.3, which
    answers ENOSYS), by the same start tick read just before an `os.kill`, so a pid another process took is never
-   signalled. On either path it signals only a process whose command line is the relay's
-   (`-m expcore_onedata.fault_relay serve`), since the heartbeat is a file. A relay whose stop failed is ended as a
+   signalled. On either path it signals only a process whose command line holds
+   `-m expcore_onedata.fault_relay serve --root <root>` in order, since the heartbeat is a file. A relay whose stop failed is ended as a
    recorded client in step 4, and `down` checks it again only after that: it is reported unverified only if the second
    stop still shows a heartbeat.
 1. Read the state file. A recorded job id whose job now carries another name is not ours (Slurm reuses ids): nothing
