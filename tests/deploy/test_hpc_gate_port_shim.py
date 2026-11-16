@@ -1,14 +1,14 @@
-"""O61: the cell's connect-side 443 mapper (deploy/hpc-federation/bundle/gateport.c) sends a connect() to port 443 on
-loopback to the gate's port, and touches no other connection.
+"""O61: the cell's connect-side 443 mapper (deploy/hpc-federation/bundle/gateport.c) sends a connect() to 127.0.0.1:443
+to the gate's port, and touches no other connection.
 
 The published REST client dials port 443 only, and on a batch node the gate cannot bind below 1024, so the cell loads
-this shim: a TCP connect to 127.0.0.1:443 or [::1]:443 goes to the gate's port, which the shim reads from the cell's
-/etc/expcore/gate.json and, without that file, from EXPCORE_GATE_PORT. It is built with the host's gcc and every warning
-an error, as the run builds it inside the cell's image, and used by a small Python client (the published client's own
-path: `socket.connect`). Three witnesses tell what a connect really reached: a listener of the test's that takes it; a
-stand-in for the next `connect()` in the preload list (deploy/hpc-federation/tests/fake_next_connect.c), which records
-the destination the shim passes on and fails, so no packet leaves; and the egress shim (egresslog.c, loaded after this
-one), which logs what it is asked to connect to. Nothing leaves the machine.
+this shim: a TCP connect to 127.0.0.1:443, and to no IPv6 address, goes to the gate's port, which the shim reads from
+the cell's /etc/expcore/gate.json and, without that file, from EXPCORE_GATE_PORT. It is built with the host's gcc and
+every warning an error, as the run builds it inside the cell's image, and used by a small Python client (the published
+client's own path: `socket.connect`). Three witnesses tell what a connect really reached: a listener of the test's that
+takes it; a stand-in for the next `connect()` in the preload list (deploy/hpc-federation/tests/fake_next_connect.c),
+which records the destination the shim passes on and fails, so no packet leaves; and the egress shim (egresslog.c,
+loaded after this one), which logs what it is asked to connect to. Nothing leaves the machine.
 """
 
 import fcntl
@@ -262,11 +262,14 @@ def test_a_connect_to_loopback_443_lands_on_the_gates_port(built):
 
 
 @needs_ipv6
-def test_a_connect_to_ipv6_loopback_443_lands_on_the_gates_port(built):
-    gate = listener(socket.AF_INET6, "::1")
-    [result], _ = run_client([["send", "::1", 443]], [built["gateport"]], {ENV: str(port_of(gate))})
-    assert result["peer"] == port_of(gate)
-    assert taken(gate) == [b"hello"]
+def test_a_connect_to_ipv6_loopback_443_is_not_rewritten_and_reaches_no_listener_at_the_gates_port(built):
+    """O61: the gate listens on 127.0.0.1 only, so [::1]:443 rewritten to [::1]:<gate port> would reach whatever other
+    socket holds that address, another user's on a shared node. It goes through as asked: a listener at the gate's port
+    on [::1], standing for that stranger, is never reached."""
+    stranger = listener(socket.AF_INET6, "::1")
+    [result], _ = run_client([["send", "::1", 443]], [built["gateport"]], {ENV: str(port_of(stranger))})
+    assert result.get("peer") in (None, 443)  # refused, unless the host has a listener of its own on [::1]:443
+    assert taken(stranger) == []
 
 
 def test_every_connect_of_a_process_to_443_is_mapped_not_only_the_first(built):
@@ -313,12 +316,6 @@ def test_the_rewritten_connect_goes_to_the_next_connect_with_the_gates_port_and_
     results, _, seen = via_the_stand_in(built, tmp_path, steps, {ENV: "34567"})
     assert seen == [("tcp", "inet", "127.0.0.1", "34567")] * 2
     assert [r["errno"] for r in results] == [ENETDOWN, ENETDOWN]
-
-
-@needs_ipv6
-def test_the_ipv6_connect_goes_to_the_next_connect_with_the_gates_port(built, tmp_path):
-    _, _, seen = via_the_stand_in(built, tmp_path, [["tcp", "::1", 443]], {ENV: "34567"})
-    assert seen == [("tcp", "inet6", "::1", "34567")]
 
 
 # ---------------------------------------------------------------------------------------------------- left alone
@@ -378,15 +375,24 @@ def test_every_other_destination_reaches_the_next_connect_unchanged(built, tmp_p
 
 @needs_ipv6
 def test_every_other_ipv6_destination_reaches_the_next_connect_unchanged(built, tmp_path):
-    """[::ffff:127.0.0.1]:443 is left alone with the rest: the mapper rewrites 127.0.0.1 and ::1, no other spelling."""
-    steps = [["tcp", "::1", 80], ["tcp", "::2", 443], ["mapped", "::ffff:127.0.0.1", 443], ["udp", "::1", 443]]
-    _, _, seen = via_the_stand_in(built, tmp_path, steps, {ENV: "34567"})
+    """O61: no IPv6 destination is rewritten: [::1]:443 and [::ffff:127.0.0.1]:443 reach the next connect() as asked,
+    with the rest. The mapper rewrites 127.0.0.1:443 and nothing else."""
+    steps = [
+        ["tcp", "::1", 443],
+        ["tcp", "::1", 80],
+        ["tcp", "::2", 443],
+        ["mapped", "::ffff:127.0.0.1", 443],
+        ["udp", "::1", 443],
+    ]
+    results, _, seen = via_the_stand_in(built, tmp_path, steps, {ENV: "34567"})
     assert seen == [
+        ("tcp", "inet6", "::1", "443"),
         ("tcp", "inet6", "::1", "80"),
         ("tcp", "inet6", "::2", "443"),
         ("tcp", "inet6", "::ffff:127.0.0.1", "443"),
         ("udp", "inet6", "::1", "443"),
     ]
+    assert [r["errno"] for r in results] == [ENETDOWN] * len(steps)
 
 
 @pytest.mark.parametrize(("name", "protocol"), [("sctp", 132), ("mptcp", 262)])
@@ -414,20 +420,22 @@ def test_a_socket_address_shorter_than_its_family_needs_is_never_read_past_its_l
 
 
 @needs_ipv6
-def test_the_short_ipv6_address_the_kernel_accepts_is_mapped_and_read_no_further(built):
-    """O61: [::1]:443 as the 24-byte address (no scope id) is rewritten from those 24 bytes alone."""
-    gate = listener(socket.AF_INET6, "::1")
+def test_the_short_ipv6_address_the_kernel_accepts_goes_through_unchanged(built, tmp_path):
+    """O61: [::1]:443 as the 24-byte address (no scope id), at the end of the last readable page, is read for its family
+    only and reaches the next connect() as it was given."""
+    log = tmp_path / "connects.log"
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "LD_PRELOAD": str(built["gateport"]),
-        ENV: str(port_of(gate)),
+        "LD_PRELOAD": f"{built['gateport']}:{built['fake']}",
+        "FAKE_CONNECT_LOG": str(log),
+        ENV: "34567",
     }
     done = subprocess.run(
         [str(built["probe"]), "v6short"], capture_output=True, text=True, timeout=60, env=env, check=False
     )
     assert done.returncode == 0, (done.returncode, done.stderr)
-    assert done.stdout.split() == ["0", str(port_of(gate))]
-    assert len(taken(gate)) == 1
+    assert done.stdout.split() == ["-1", "0"]  # the stand-in's failure, no peer
+    assert [tuple(line.split()) for line in log.read_text().splitlines()] == [("tcp", "inet6", "::1", "443")]
 
 
 # --------------------------------------------------------------------------------------- a variable or file unusable

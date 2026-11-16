@@ -4,8 +4,8 @@
  *   gateport_probe short     connect() with every length from 0 to 15 for an AF_INET address and from 0 to 23 for an
  *                            AF_INET6 one (the kernel's shortest is 24): one line each, "<family> <length> <result>
  *                            <errno>"; every one must fail with EINVAL, and none reaches a peer
- *   gateport_probe v6short   connect() to [::1]:443 with the 24-byte IPv6 address the kernel also accepts (no scope id),
- *                            which a shim that maps ::1:443 must read whole and no further: prints "<result> <peer port>" */
+ *   gateport_probe v6short   connect() to [::1]:443 with the 24-byte IPv6 address the kernel also accepts (no scope id):
+ *                            the shim must read no more of it than that and pass it on as it is; prints "<result> <peer port>" */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>

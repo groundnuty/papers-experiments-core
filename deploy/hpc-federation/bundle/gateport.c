@@ -5,9 +5,10 @@
  * federation's names to 127.0.0.1: the client's connect to <name>:443 is a connect to 127.0.0.1:443. This shim sends that
  * one connect to the gate. Everything else the cell connects to is left exactly as it is.
  *
- *   connect()  of a TCP socket (SOCK_STREAM, protocol TCP: SCTP and MPTCP are not) to 127.0.0.1:443 or to [::1]:443
+ *   connect()  of an IPv4 TCP socket (SOCK_STREAM, protocol TCP: SCTP and MPTCP are not) to 127.0.0.1:443
  *                                                  -> the same address, on the gate's port
- *   connect()  anything else (any other address or port, [::ffff:127.0.0.1]:443 included, UDP, a Unix socket) -> untouched
+ *   connect()  anything else (any other address or port, every IPv6 destination, [::1]:443 and [::ffff:127.0.0.1]:443
+ *              included, UDP, a Unix socket) -> untouched
  *
  * The gate's port comes from two places, read once, when the shim loads (a constructor, before any thread of the
  * process exists), so the mapping never changes under a running process and no thread reads the environment while
@@ -32,10 +33,10 @@
  * Only the port changes, never the address, and the result is the real connect()'s: the shim fabricates no success and
  * no error. A client that is refused on the gate's port sees the refusal.
  *
- * The address ::1 is rewritten like 127.0.0.1, as asked, and it keeps ::1: the gate must listen on [::1] for it to be
- * served. The core's gate listens on 127.0.0.1 only, so a connect to [::1]:443 then reaches whatever else holds
- * [::1]:<gate port> on this node, if anything does, and is refused if nothing does. The federation's names map to
- * 127.0.0.1 and no AAAA record, so the cell does not dial ::1 for them.
+ * Only 127.0.0.1:443 is rewritten, and no IPv6 destination is: the core's gate listens on 127.0.0.1 only, so a connect
+ * to [::1]:443 rewritten to [::1]:<gate port> would reach whatever other socket holds that address, and on a node shared
+ * with other users that can be another user's listener. The federation's names map to 127.0.0.1 and no AAAA record, so
+ * nothing legitimate dials ::1. A connect to [::1]:443 or to [::ffff:127.0.0.1]:443 goes through as it is asked.
  *
  * Order in the preload list. The shim passes the rewritten call on to the next connect() in the lookup order
  * (dlsym(RTLD_NEXT)), not to the kernel, so it chains with the cell's egress shim: list it BEFORE egresslog.so
@@ -74,9 +75,6 @@
 #define ENV_GATE_PORT "EXPCORE_GATE_PORT"
 #define GATE_ADDRESS "127.0.0.1"
 #define FROM_PORT 443
-#ifndef SIN6_LEN_RFC2133
-#define SIN6_LEN_RFC2133 24   /* the shortest IPv6 address the kernel accepts (no sin6_scope_id) */
-#endif
 
 enum { CONFIG_MAX = 4096, JSON_DEPTH = 16, KEY_MAX = 16 };
 enum { FILE_ABSENT = 0, FILE_OK = 1, FILE_BAD = 2 };
@@ -395,8 +393,9 @@ static int is_tcp(int fd) {
            && syscall(SYS_getsockopt, fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &m) == 0 && protocol == IPPROTO_TCP;
 }
 
-/* 1 if a connect() of fd to addr is the one this shim redirects, with *to the destination to use instead: the same
- * address and the gate's port. Everything else, and anything that is not a well-formed address, is 0. */
+/* 1 if a connect() of fd to addr is the one this shim redirects (127.0.0.1:443 of a TCP socket), with *to the destination
+ * to use instead: the same address and the gate's port. Everything else, and anything that is not a well-formed address,
+ * is 0. */
 static int redirect(int fd, const struct sockaddr *addr, socklen_t len, struct sockaddr_storage *to) {
     memset(to, 0, sizeof *to);
     if (!addr || len < (socklen_t)sizeof(sa_family_t)) return 0;   /* nothing of addr may be read before its length is */
@@ -405,13 +404,8 @@ static int redirect(int fd, const struct sockaddr *addr, socklen_t len, struct s
         memcpy(s, addr, sizeof *s);
         if (s->sin_addr.s_addr != htonl(INADDR_LOOPBACK) || s->sin_port != htons(FROM_PORT)) return 0;
         s->sin_port = htons(gate_port);
-    } else if (addr->sa_family == AF_INET6 && len >= (socklen_t)SIN6_LEN_RFC2133) {
-        struct sockaddr_in6 *s = (struct sockaddr_in6 *)to;
-        memcpy(s, addr, len < (socklen_t)sizeof *s ? (size_t)len : sizeof *s);   /* the kernel takes the short length too */
-        if (s->sin6_port != htons(FROM_PORT) || !IN6_IS_ADDR_LOOPBACK(&s->sin6_addr)) return 0;
-        s->sin6_port = htons(gate_port);
     } else {
-        return 0;
+        return 0;   /* every other family, IPv6 included, is the caller's own */
     }
     return is_tcp(fd);
 }

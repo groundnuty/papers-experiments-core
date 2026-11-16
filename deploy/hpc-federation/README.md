@@ -119,7 +119,7 @@ shares, on a port above 1023. Two pieces, neither run live yet:
   `gateboundary.py` as before, and `gatepeer.py` beside them when it is on. The gate does not start with it on if it
   runs as uid 0 or cannot read the table.
 - **`gateport.c`**, the cell's connect-side mapper: an `LD_PRELOAD` shim that sends a TCP `connect()` to
-  `127.0.0.1:443` or `[::1]:443` to the gate's port, because the published REST client dials 443 only, and touches no
+  `127.0.0.1:443` to the gate's port, because the published REST client dials 443 only, and touches no
   other connection. The port is read once at load from the cell's `/etc/expcore/gate.json`
   (`{"address": "127.0.0.1", "port": P, ...}`), which decides whenever it exists, and otherwise from
   `EXPCORE_GATE_PORT`; a malformed file or variable makes the process redirect nothing and say so once on stderr. It
@@ -127,7 +127,7 @@ shares, on a port above 1023. Two pieces, neither run live yet:
   egress log records the gate's port; after it, it is never reached. Build: `gcc -shared -fPIC -O2
   -fno-stack-protector -Wall -Wextra -Werror -o gateport.so gateport.c -ldl`, in the cell's image. The bundle hashes
   tarballs (`.provenance`), not shims: whoever loads the built shim into a cell pins it by the hash of the file it
-  built. `[::1]:443` keeps `::1`, which the core's gate does not serve (see the header of the file).
+  built. No IPv6 destination is rewritten, `[::1]:443` included: the core's gate listens on 127.0.0.1 only, and a rewrite to `[::1]:<gate port>` could reach another user's listener (see the header of the file).
 
 `tests/deploy/test_hpc_gate_port_shim.py` builds the shim with the host's gcc and drives it with a Python client
 against listeners of its own, a stand-in for the next `connect()` (`tests/fake_next_connect.c`) and the egress shim;
@@ -236,7 +236,7 @@ the whole node for the job.
 | `baked.py` | node | finds the Couchbase cookies and memcached password the images ship, by the SHA-256 that `lib.sh` lists (never the values) |
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
-| `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 or [::1]:443 goes to the gate's port; nothing else is touched |
+| `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
 
 ## What the repository's tests cover
 
