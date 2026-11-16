@@ -7,10 +7,15 @@ and with it what was spent since: the attempts that began, their top-ups, admiss
 then count less than was billed. With `expcore run --spend-journal FILE`, the dispatcher appends a line to FILE for
 every change of what was spent, once the store has committed it and before the spend it allows:
 
-- `attempt`: an attempt's row as it stands once it began, once it took a top-up, before each request it sends, after
-  each reply and once it ended: its id, run key, model, the dispatcher's pid, when it began, its state, the bound it
-  was reserved at (`reserved_capped`, C27), its counts, its top-ups and its call log (`calls_sent`, `calls_usage`,
-  C05: what an attempt the kill interrupted is charged by, `campaign.interrupted_spend`);
+- `attempt`: an attempt's row as it stands once it began, once it took a top-up and once it ended: its id, run key,
+  model, the dispatcher's pid, when it began, its state, the bound it was reserved at (`reserved_capped`, C27), its
+  counts, its top-ups, and how many `call` lines of it the journal holds so far (`calls_sent`, `calls_closed`; None
+  for an attempt that keeps no call log), which the reader checks the call lines against;
+- `call` (C05, `campaign.interrupted_spend`): one line per request an attempt sends, before it goes out
+  (`phase` `sent`), and one per request it closes (`phase` `closed`, its `entry`: the reply's counts `[input, output,
+  cache writes, cache reads]`, null for a reply billed and not read, or `"failed"` for a request whose last send
+  failed, after the line of that send's top-up), each with the attempt's `id` and `run_key`. Each is a line of its
+  own, so the journal grows linearly in the calls; the reader sums them by attempt id into the attempt's call log;
 - `probe`: a charge of admission's probes (C26): the id of the event the store wrote with it, the model and the
   dollars (a settlement is below 0);
 - `unheld`: a model taken off the reply maximum (C27), which raises the bound its attempts are charged.
@@ -40,8 +45,9 @@ from typing import Any
 
 FORMAT = "expcore-spend-journal/1"
 SUFFIX = ".jsonl"
-HEADER, ATTEMPT, PROBE, UNHELD = "header", "attempt", "probe", "unheld"
-ATTEMPT_FIELDS = (
+HEADER, ATTEMPT, PROBE, UNHELD, CALL = "header", "attempt", "probe", "unheld", "call"
+SENT, CLOSED = "sent", "closed"  # a call line's phase
+ROW_FIELDS = (
     "id",
     "run_key",
     "model",
@@ -59,8 +65,8 @@ ATTEMPT_FIELDS = (
     "topups",
     "topup_usd",
     "calls_sent",
-    "calls_usage",
 )
+ATTEMPT_FIELDS = (*ROW_FIELDS, "calls_closed")  # calls_closed: the closed requests of the row's call log
 PROBE_FIELDS = ("event_id", "model", "usd")
 
 
@@ -127,19 +133,46 @@ class SpendJournal:
 
 
 def attempt_entry(row: Mapping[str, Any]) -> dict[str, Any]:
-    """The `attempt` line of an attempt's row as the store holds it (the model joined from its run)."""
-    return {"kind": ATTEMPT, **{name: row[name] for name in ATTEMPT_FIELDS}}
+    """The `attempt` line of an attempt's row as the store holds it (the model joined from its run), with the closed
+    requests of its call log in place of the log (`calls_closed`; None without a log or with one that cannot be
+    read, which no call line then matches)."""
+    return {"kind": ATTEMPT, **{name: row[name] for name in ROW_FIELDS}, "calls_closed": _closed(row["calls_usage"])}
+
+
+def _closed(usage: Any) -> int | None:
+    try:
+        entries = json.loads(usage) if isinstance(usage, str) else None
+    except ValueError:
+        return None
+    return len(entries) if isinstance(entries, list) else None
+
+
+def call_entry(attempt_id: int, run_key: str, phase: str, entry: Any = None) -> dict[str, Any]:
+    """A `call` line: a request of the attempt before it goes out (`SENT`), or how one closed (`CLOSED`, `entry`)."""
+    line = {"kind": CALL, "id": attempt_id, "run_key": run_key, "phase": phase}
+    return line if phase == SENT else {**line, "entry": entry}
+
+
+@dataclass(frozen=True)
+class CallLines:
+    """An attempt's call lines as read: the requests sent and how each closed one ended, in order; `consistent`
+    False when its attempt lines name other counts than its call lines, or it keeps no log and has call lines."""
+
+    sent: int = 0
+    closed: tuple[Any, ...] = ()
+    consistent: bool = True
 
 
 @dataclass(frozen=True)
 class Journal:
-    """A journal as read: its name, each attempt's last line by id (in the order they first appear), the probes' lines
-    and the models it took off the reply maximum."""
+    """A journal as read: its name, each attempt's last line by id (in the order they first appear), the probes' lines,
+    the models it took off the reply maximum, and each logged attempt's call lines by id (C05)."""
 
     name: str
     attempts: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
     probes: Sequence[Mapping[str, Any]] = ()
     unheld: frozenset[str] = frozenset()
+    calls: Mapping[int, CallLines] = field(default_factory=dict)
 
 
 def journals_in(directory: Path, *, but: str | None = None) -> list[Path]:
@@ -168,6 +201,7 @@ def read_journal(path: Path, campaign: str, shard: str | None) -> Journal:
     elif lines:
         lines.pop()  # cut short by a kill: never whole, never spent
     attempts: dict[int, Mapping[str, Any]] = {}
+    calls: dict[int, CallLines] = {}
     probes, unheld = [], set()
     if not lines:  # its header was cut short: the start that made it died before anything was spent
         return Journal(path.name)
@@ -189,7 +223,20 @@ def read_journal(path: Path, campaign: str, shard: str | None) -> Journal:
             continue
         kind = entry.get("kind")
         if kind == ATTEMPT:
-            attempts[_whole(path, number, entry, "id")] = entry
+            attempt_id = _whole(path, number, entry, "id")
+            if attempt_id not in attempts and entry.get("calls_sent") is not None:
+                calls[attempt_id] = CallLines()  # the attempt keeps a call log
+            attempts[attempt_id] = entry
+            if attempt_id in calls:
+                calls[attempt_id] = _referenced(calls[attempt_id], entry)
+        elif kind == CALL:
+            attempt_id = _whole(path, number, entry, "id")
+            begun = attempts.get(attempt_id)
+            if begun is None:
+                raise SpendJournalError(f"{path.name}: line {number} is a call line of an attempt it never began")
+            if entry.get("run_key") != begun["run_key"]:
+                raise SpendJournalError(f"{path.name}: line {number} is a call line of another run than its attempt")
+            calls[attempt_id] = _called(path, number, calls.get(attempt_id), entry)
         elif kind == PROBE:
             _whole(path, number, entry, "event_id")
             probes.append(entry)
@@ -197,7 +244,27 @@ def read_journal(path: Path, campaign: str, shard: str | None) -> Journal:
             unheld.add(entry["model"])
         else:
             raise SpendJournalError(f"{path.name}: line {number} has no kind this core writes ({kind!r})")
-    return Journal(path.name, attempts, tuple(probes), frozenset(unheld))
+    return Journal(path.name, attempts, tuple(probes), frozenset(unheld), calls)
+
+
+def _referenced(lines: CallLines, entry: Mapping[str, Any]) -> CallLines:
+    """The call lines checked against the counts an attempt line names: any difference makes them inconsistent."""
+    named = (entry.get("calls_sent"), entry.get("calls_closed"))
+    agree = named == (lines.sent, len(lines.closed))
+    return lines if agree else CallLines(lines.sent, lines.closed, False)
+
+
+def _called(path: Path, number: int, lines: CallLines | None, entry: Mapping[str, Any]) -> CallLines:
+    """The call lines with one more: a request sent, or one closed; a call line of an attempt that keeps no log, or
+    a reply before its request, makes them inconsistent."""
+    phase = entry.get("phase")
+    if phase not in (SENT, CLOSED) or (phase == CLOSED and "entry" not in entry):
+        raise SpendJournalError(f"{path.name}: line {number} is a call line with no phase this core writes")
+    base = CallLines(consistent=False) if lines is None else lines
+    if phase == SENT:
+        return CallLines(base.sent + 1, base.closed, base.consistent)
+    closed = (*base.closed, entry["entry"])
+    return CallLines(base.sent, closed, base.consistent and len(closed) <= base.sent)
 
 
 def _entry(path: Path, number: int, line: bytes) -> Mapping[str, Any]:

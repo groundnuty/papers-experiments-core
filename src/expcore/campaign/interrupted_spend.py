@@ -10,8 +10,10 @@ runs (`Store.note_call_sent`, `Store.note_call_answered`, written by the attempt
 endpoint billed and the backend could not read), or `"failed"` for a request whose last send failed after it may have
 been billed, with nothing sent after it: that send is charged a top-up of one request's bound (C26) in the same
 transaction that closes the request here (`Store.add_topup(close_call=True)`), so it is never charged again as a
-request in flight. The spend journal carries both on every `attempt` line (O62), so the log outlives a host whose
-store a kill took.
+request in flight. The spend journal has a `call` line for each request sent and each request closed, with the
+attempt's id (O62), and its `attempt` lines name how many of each it holds so far; a reader sums the call lines by
+attempt id (`lost_spend`), and a set that disagrees with its attempt lines is no log. So the log outlives a host
+whose store a kill took, and the journal grows linearly in the calls.
 
 An interrupted attempt is charged on one of three **bases**:
 
@@ -88,16 +90,22 @@ class CallLog:
 
 
 def read_log(sent: Any, usage: Any) -> CallLog | None:
-    """The call log in the store's columns (or a journal line's fields); None when none was kept, or it cannot be
-    read or is not consistent: a count that is no whole number, a cache count above its prompt, more replies than
+    """The call log in the store's columns (or a lost attempt's in the ledger); None when none was kept, or it cannot
+    be read or is not consistent: a count that is no whole number, a cache count above its prompt, more replies than
     requests, or more than one request unanswered."""
-    if isinstance(sent, bool) or not isinstance(sent, int) or sent < 0 or not isinstance(usage, str):
+    if not isinstance(usage, str):
         return None
     try:
         entries = json.loads(usage)
     except ValueError:
         return None
-    if not isinstance(entries, list):
+    return log_of(sent, entries)
+
+
+def log_of(sent: Any, entries: Any) -> CallLog | None:
+    """The call log of a count of requests sent and how each closed one ended, in order (the store's columns read,
+    or a journal's call lines summed by attempt); None as `read_log` says."""
+    if isinstance(sent, bool) or not isinstance(sent, int) or sent < 0 or not isinstance(entries, list | tuple):
         return None
     answered: list[Entry] = []
     for entry in entries:

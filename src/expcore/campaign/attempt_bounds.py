@@ -331,10 +331,10 @@ def journaled_cost(
     reply_capped: Collection[str] = (),
     taken_off: Collection[str] = (),
 ) -> tuple[float | None, bool, str]:
-    """A lost attempt the spend journal never saw end, without its top-ups: by the call log its last journaled line
-    holds, which is complete up to the kill (each line precedes the send it allows), else its bound (C05, O62); whether
-    that holds a bound, and the basis. `row` is the journaled attempt, `calls_sent` and `calls_usage` absent from a
-    journal written before the log."""
+    """A lost attempt the spend journal never saw end, without its top-ups: by the call log its `call` lines sum to,
+    complete up to the kill (each line precedes the send it allows), else its bound (C05, O62); whether that holds a
+    bound, and the basis. `row` is the lost attempt as the ledger keeps it, `calls_sent` and `calls_usage` absent when
+    its journal kept no consistent log."""
     capped = _reserved_capped(row, reply_capped, taken_off)
     if spec is None:
         return None, False, BOUND

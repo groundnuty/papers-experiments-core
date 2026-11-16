@@ -52,7 +52,15 @@ from expcore.campaign.attempts import (
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
 from expcore.campaign.markers import AttemptResult
-from expcore.campaign.spend_journal import PROBE, UNHELD, SpendJournal, attempt_entry
+from expcore.campaign.spend_journal import (
+    CLOSED,
+    PROBE,
+    SENT,
+    UNHELD,
+    SpendJournal,
+    attempt_entry,
+    call_entry,
+)
 
 FAILED = "failed"  # `interrupted_spend.FAILED`: a request closed by its last failed send, which its top-up paid for
 
@@ -548,11 +556,17 @@ class Store:
             if cursor.rowcount != 1:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
             self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
-            if close_call:
-                self._close_call(attempt_id, FAILED)
             self._note_spend(lambda: self._attempt_line(attempt_id))  # written before the send it pays for (O62)
+            # the close after the top-up's line: a write cut between them leaves the request in flight, never unpaid
+            if close_call and self._close_call(attempt_id, FAILED):
+                self._note_spend(lambda: self._call_line(attempt_id, CLOSED, FAILED))
 
         self.transact(go)
+
+    def _call_line(self, attempt_id: int, phase: str, entry: Any = None) -> dict[str, Any]:
+        """The journal's `call` line of a request of an attempt, inside the open transaction (C05)."""
+        row = self.db.execute("SELECT run_key FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        return call_entry(attempt_id, row["run_key"], phase, entry)
 
     def _close_call(self, attempt_id: int, entry: Any) -> bool:
         """Append how a request of a running attempt closed to its call log, inside the open transaction; False when
@@ -586,7 +600,7 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise AttemptRefused(f"attempt {attempt_id} is not running with a call log, so no request is noted")
-            self._note_spend(lambda: self._attempt_line(attempt_id))
+            self._note_spend(lambda: self._call_line(attempt_id, SENT))
 
         self.transact(go)
 
@@ -605,7 +619,7 @@ class Store:
             if running is None:
                 raise AttemptRefused(f"attempt {attempt_id} is not running with a call log, so no reply is noted")
             if self._close_call(attempt_id, entry):  # a log that cannot be read stays so, and charges the bound
-                self._note_spend(lambda: self._attempt_line(attempt_id))
+                self._note_spend(lambda: self._call_line(attempt_id, CLOSED, entry))
 
         self.transact(go)
 

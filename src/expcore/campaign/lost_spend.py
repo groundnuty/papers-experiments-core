@@ -28,7 +28,7 @@ journal is not in the directory, since what its start spent after the copy would
 leaves no journal of its own behind.
 
 **What is charged** (`costs`): a lost attempt as `attempt_bounds.attempt_costs` charges a row, at the budget gate's
-every assessment: one whose end the journal did not see by the call log its last line holds, complete up to the
+every assessment: one whose end the journal did not see by the call log its `call` lines sum to, complete up to the
 kill, measured plus one request's bound for a request in flight (C05, `attempt_bounds.journaled_cost`), or at its
 reserved bound when it has none that can be read (R, C27, by the window once its model is taken off the reply
 maximum); one that ended at its measured cost (the provider's counts) or, when they are not complete, its bound; its
@@ -49,7 +49,7 @@ from typing import Any
 
 from expcore.campaign import reply_cap
 from expcore.campaign.attempt_bounds import LOST_STATE, AttemptCost, journaled_cost, row_cost
-from expcore.campaign.interrupted_spend import BOUND, basis_of, merged, read_log
+from expcore.campaign.interrupted_spend import BOUND, CallLog, basis_of, log_of, merged, read_log
 from expcore.campaign.lost_ledger import ATTEMPT_KEYS, CALL_KEYS, KEY, Ledger, LostSpendError, dollars, parse, read
 from expcore.campaign.spend_journal import Journal, SpendJournal, SpendJournalError, journals_in, read_journal
 from expcore.campaign.store import Store
@@ -192,12 +192,13 @@ def _lost(store: Store, journal: Journal, *, own: bool, now: str) -> dict[str, A
             entry["started_utc"],
             entry["pid"],
         )
+        journaled = _journaled_log(journal, attempt_id)
         if not same:
-            calls = {name: entry[name] for name in CALL_KEYS if name in entry}  # absent from a journal before the log
+            calls = dict(zip(CALL_KEYS, journaled.as_columns(), strict=True)) if journaled is not None else {}
             attempts.append({**{name: entry[name] for name in ATTEMPT_KEYS}, **calls})
             continue
         if row["state"] == "interrupted" and row["calls_sent"] is not None:
-            confirmed.append(_confirmed(attempt_id, row, entry))
+            confirmed.append(_confirmed(attempt_id, row, journaled))
         if entry["topups"] > row["topups"] and entry["topup_usd"] > row["topup_usd"]:
             usd = float(entry["topup_usd"]) - float(row["topup_usd"])
             charges.append({"kind": "topup", "model": entry["model"], "run_key": entry["run_key"], "usd": usd})
@@ -213,13 +214,22 @@ def _lost(store: Store, journal: Journal, *, own: bool, now: str) -> dict[str, A
     return {"counted_utc": now, "attempts": attempts, "charges": charges, "confirmed": confirmed}
 
 
-def _confirmed(attempt_id: int, row: Mapping[str, Any], entry: Mapping[str, Any]) -> tuple[int, int | None, Any, str]:
+def _journaled_log(journal: Journal, attempt_id: int) -> CallLog | None:
+    """The attempt's call log from its call lines, summed in the journal's order (C05); None when it keeps none, or
+    its lines are not consistent with its attempt lines or cannot be read as a log: then it is charged its bound."""
+    lines = journal.calls.get(attempt_id)
+    if lines is None or not lines.consistent:
+        return None
+    return log_of(lines.sent, list(lines.closed))
+
+
+def _confirmed(attempt_id: int, row: Mapping[str, Any], journaled: CallLog | None) -> tuple[int, int | None, Any, str]:
     """The call log and basis of an interrupted attempt the store holds, as its own journal confirms them (C05): the
     store may be a snapshot whose log the attempt outgrew, and the journal holds every request and reply up to the
     kill. The longer log stands when one extends the other; a log either side cannot read, or two that disagree,
     leave the row's log as it is and charge its bound. Top-ups are not touched: those past the row's are charges."""
     stored = read_log(row["calls_sent"], row["calls_usage"])
-    log = merged(stored, read_log(entry.get("calls_sent"), entry.get("calls_usage")))
+    log = merged(stored, journaled)
     if log is None:
         return attempt_id, row["calls_sent"], row["calls_usage"], BOUND
     sent, usage = log.as_columns()

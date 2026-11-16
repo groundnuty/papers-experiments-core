@@ -16,6 +16,7 @@ from expcore.campaign.lost_ledger import KEY, read
 from expcore.campaign.lost_spend import Pricing, costs, open_journal
 from expcore.campaign.recovery import recover
 from expcore.campaign.snapshot import rebase_run_dirs
+from expcore.campaign.spend_journal import SpendJournalError
 from expcore.campaign.store import Store
 from expcore.config.models import Limits
 from expcore.config.prices import Price
@@ -74,15 +75,94 @@ def killed_mid_run_after_a_snapshot(tmp_path):
     return live, snapshot, begun
 
 
-def test_c05_the_journal_carries_the_call_log_on_a_line_before_each_request_and_after_each_reply(tmp_path):
-    """C05, O62: every note of the log is an `attempt` line, fsynced after its commit and before the send it allows,
-    so the journal's last line of an attempt holds every request it sent and every reply it read."""
+def journal_lines(tmp_path, name="j1.jsonl"):
+    return [json.loads(line) for line in (tmp_path / "journals" / name).read_text().splitlines()[1:]]
+
+
+def test_c05_the_journal_has_a_line_per_request_before_it_goes_out_and_per_reply_with_its_counts(tmp_path):
+    """C05, O62: each request is a `call` line, fsynced after its commit and before the send it allows, and each
+    reply a `call` line with its counts and cache parts; each carries the attempt's id and run, and the campaign and
+    shard as every line does. The attempt line holds no log: it names how many call lines it follows."""
     _, _, begun = killed_mid_run_after_a_snapshot(tmp_path)
-    lines = [json.loads(line) for line in (tmp_path / "journals" / "j1.jsonl").read_text().splitlines()[1:]]
-    mine = [line for line in lines if line["id"] == begun.id]
-    assert [(line["calls_sent"], len(json.loads(line["calls_usage"]))) for line in mine] == [
-        (0, 0), (1, 0), (1, 1), (2, 1), (2, 2), (3, 2), (3, 3), (4, 3),
+    mine = [line for line in journal_lines(tmp_path) if line["id"] == begun.id]
+    assert [(line["kind"], line.get("phase"), line.get("entry")) for line in mine] == [
+        ("attempt", None, None),
+        ("call", "sent", None), ("call", "closed", list(REPLY)),
+        ("call", "sent", None), ("call", "closed", list(REPLY)),
+        ("call", "sent", None), ("call", "closed", list(REPLY)),
+        ("call", "sent", None),
     ]  # fmt: skip
+    assert all((line["campaign"], line["shard"]) == (CAMPAIGN, LABEL) for line in mine)
+    assert all(line["run_key"] == mine[0]["run_key"] for line in mine)
+    assert (mine[0]["calls_sent"], mine[0]["calls_closed"]) == (0, 0)
+    assert "calls_usage" not in mine[0]
+
+
+def test_c05_the_journal_grows_linearly_in_the_calls(tmp_path):
+    """C05: each request and each reply adds one line of a size that does not grow with the calls before it, so an
+    attempt of N requests adds about N times what one request adds, never N squared."""
+    store, _, manifest = planned_store(tmp_path / "live")
+    start(store, tmp_path, "j1.jsonl")
+    begun = store.begin_attempt(manifest.rows[0].key.text, NOW, 4321, "try1", calls_logged=True)
+    path = tmp_path / "journals" / "j1.jsonl"
+    sizes = []
+    for done in range(1, 121):
+        calls(store, begun.id, "sent", (100_000 + done, 4_000, 1_000, 2_000))
+        if done in (30, 60, 120):
+            sizes.append(path.stat().st_size)
+    first, second = sizes[1] - sizes[0], sizes[2] - sizes[1]  # 30 calls, then 60 calls
+    assert second == pytest.approx(2 * first, rel=0.05)
+    call_lines = [line for line in path.read_text().splitlines() if '"kind": "call"' in line]
+    assert len(call_lines) == 2 * 120
+    assert max(len(line) for line in call_lines) < 250
+
+
+def test_c05_a_journal_line_of_a_call_whose_attempt_the_journal_never_began_or_of_another_run_is_refused(tmp_path):
+    """C05, O62: a call line belongs to the attempt line of its id before it in the same journal, and to its run: one
+    that names an attempt the journal never began, or another run, is a damaged journal, and the start is refused."""
+    snapshot = None
+    for case in ("unbegun", "another run"):
+        root = tmp_path / case.replace(" ", "-")
+        _, snapshot, begun = killed_mid_run_after_a_snapshot(root)
+        path = root / "journals" / "j1.jsonl"
+        lines = path.read_text().splitlines()
+        forged = json.loads(lines[-1])
+        forged.update(id=begun.id + 7) if case == "unbegun" else forged.update(run_key="another")
+        path.write_text("\n".join([*lines[:-1], json.dumps(forged, sort_keys=True), lines[-1]]) + "\n")
+        with pytest.raises(SpendJournalError, match="call line"):
+            start(snapshot, root, "j2.jsonl")
+    assert snapshot is not None
+
+
+def test_c05_an_attempt_line_that_disagrees_with_its_call_lines_charges_the_bound(tmp_path):
+    """C05: the attempt line names how many requests and replies the journal holds of it; a journal whose call lines
+    say otherwise (a line the store committed and the journal lacks) is not trusted: the bound."""
+    live, _, manifest = planned_store(tmp_path / "live")
+    keys = [row.key.text for row in manifest.rows]
+    start(live, tmp_path, "j1.jsonl")
+    snapshot = copy_of(live, tmp_path, "snapshot")
+    begun = live.begin_attempt(keys[1], NOW, 4321, "try1", calls_logged=True)
+    calls(live, begun.id, "sent")
+    journal, live.spend_journal = live.spend_journal, None  # a reply the store commits and the journal never gets
+    calls(live, begun.id, REPLY)
+    live.spend_journal = journal
+    live.add_topup(begun.id, 0.24, NOW, ("topup", MODEL, "a request after a reply that left a count out"))
+    start(snapshot, tmp_path, "j2.jsonl")
+    [lost] = read(snapshot).counted["j1.jsonl"]["attempts"]
+    assert (lost["basis"], lost["usd"]) == (BOUND, pytest.approx(BOUND_USD + 0.24))
+
+
+def test_c05_a_failed_last_sends_close_follows_its_top_up_in_the_journal(tmp_path):
+    """C05, C26: the top-up of a request's last failed send is journaled before the line that closes the request, so
+    a write cut between them leaves the request in flight (charged once more, never less), never closed and unpaid."""
+    live, _, manifest = planned_store(tmp_path / "live")
+    start(live, tmp_path, "j1.jsonl")
+    begun = live.begin_attempt(manifest.rows[0].key.text, NOW, 4321, "try1", calls_logged=True)
+    calls(live, begun.id, "sent")
+    live.add_topup(begun.id, REQUEST_USD, NOW, ("topup", MODEL, "the last failed send"), close_call=True)
+    mine = [line for line in journal_lines(tmp_path) if line["id"] == begun.id]
+    assert [(line["kind"], line.get("entry")) for line in mine[-2:]] == [("attempt", None), ("call", "failed")]
+    assert (mine[-2]["topups"], mine[-2]["calls_closed"]) == (1, 0)
 
 
 def test_c05_a_restored_snapshots_attempt_is_charged_by_its_own_journals_log_not_the_snapshots(tmp_path):
