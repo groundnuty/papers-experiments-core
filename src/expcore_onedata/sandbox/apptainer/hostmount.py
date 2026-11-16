@@ -166,6 +166,12 @@ def clean_env(where: Layout) -> list[str]:
     return [*(word for name in UNSET_ENV for word in ("-u", name)), f"HOME={where.home_dir}"]
 
 
+def probe_env(where: Layout) -> list[str]:
+    """`env -i`'s variables for the bundle's `--version`: those a spawned helper gets (`NodeOps.spawn`: the node's
+    `PATH`, `LC_ALL=C`) with oneclient's own `HOME`, and nothing of the driver's environment besides."""
+    return [f"PATH={os.environ.get('PATH', '/usr/bin:/bin')}", "LC_ALL=C", f"HOME={where.home_dir}"]
+
+
 def oneclient_argv(settings: Any, provider: Any, where: Layout, launcher: Sequence[str], ca: Path | None) -> list[str]:
     """The wrapper's command line (the module's docstring, step 1); `launcher` runs the bundle's oneclient."""
     trust = [f"SSL_CERT_FILE={ca}"] if ca is not None else []
@@ -300,8 +306,11 @@ class HostMount:
         return where.mountpoint
 
     def _read_build(self, bundle: OB.Bundle) -> dict[str, Any]:
-        """What the run records of its oneclient: its own `--version`, run here, the binary's build id, and the pin."""
-        ran = self.node.run(["env", *clean_env(self.where), *bundle.launcher(), "--version"], STEP_S)
+        """What the run records of its oneclient: its own `--version`, run here, the binary's build id, and the pin.
+
+        The probe runs in the environment the mount's oneclient gets (`probe_env`), never the driver's: a site's
+        `LD_PRELOAD` or `LD_AUDIT` there would load the node's code into the probe alone."""
+        ran = self.node.run(["env", "-i", *probe_env(self.where), *bundle.launcher(), "--version"], STEP_S)
         return {
             **OB.version_of(ran.returncode, ran.stdout),
             "build_id": OB.build_id(bundle.binary),

@@ -148,6 +148,20 @@ def test_a_needed_name_found_nowhere_in_the_image_fails_the_build(ob):
         closure_of(ob, oneclient_image(**{"opt/oneclient/lib/libb.so.2": None}))
 
 
+def test_a_library_without_paths_of_its_own_is_found_through_the_rpath_of_the_object_that_loaded_it(ob):
+    """O65: glibc searches the RPATH of the whole loading chain for an object without a RUNPATH; the build does so too,
+    and neither refuses the name nor takes another copy from a default directory."""
+    entries = oneclient_image(**{
+        "opt/oneclient/bin/oneclient": elf(interp=f"/opt/oneclient/lib/{LOADER}", needed=("libc1.so.1",),
+                                           rpath="/opt/oneclient/lib"),
+        "opt/oneclient/lib/libc1.so.1": elf(needed=("libc2.so.1",)),
+        "opt/oneclient/lib/libc2.so.1": elf(),
+        "usr/lib/x86_64-linux-gnu/libc2.so.1": elf(),
+    })  # fmt: skip
+    sources = {entry.name: entry.source for entry in closure_of(ob, entries).libraries}
+    assert sources["lib/libc2.so.1"] == "/opt/oneclient/lib/libc2.so.1"
+
+
 def test_a_candidate_of_another_machine_is_skipped_for_the_next_directory(ob):
     """As the loader does: a file it cannot load is passed over, and the search goes on."""
     entries = oneclient_image(**{"opt/oneclient/lib/libb.so.2": elf(machine=AARCH64),

@@ -181,6 +181,23 @@ def test_the_run_records_the_oneclient_that_served_it(node, settings, bundle):
         mount.stop()
 
 
+def test_the_version_probe_runs_in_the_mounts_own_environment_never_the_drivers(node, settings, monkeypatch):
+    """O65: a site's LD_PRELOAD or LD_AUDIT in the driver's environment never reaches the bundle's --version, which
+    runs with what the mount's oneclient gets: the node's PATH, LC_ALL=C and oneclient's own HOME."""
+    monkeypatch.setenv("LD_PRELOAD", "/invented/site/preload.so")
+    mount = helper(node, settings)
+    try:
+        mount.start()
+        probe = node.version_runs[-1]
+        at = probe.index(mount.bundle.launcher()[0])
+        assert probe[:2] == ["env", "-i"]
+        assert probe[2:at] == HM.probe_env(mount.where)
+        assert [word.split("=")[0] for word in probe[2:at]] == ["PATH", "LC_ALL", "HOME"]
+        assert not any("LD_PRELOAD" in word for word in probe)
+    finally:
+        mount.stop()
+
+
 def test_a_bundle_whose_oneclient_does_not_name_its_version_fails_the_start_before_the_token_is_written(node, settings):
     node.oneclient_version = "Segmentation fault\n"
     mount = helper(node, settings)

@@ -281,12 +281,27 @@ def _expand(directory: str, origin: str) -> str:
     return expanded
 
 
-def _lookup(image: Image, name: str, needer: str, elf: Elf, defaults: Sequence[str]) -> str:
-    """Where the image's loader finds `name` for the object at `needer` (a path in the image)."""
+def _own_dirs(needer: str, elves: dict[str, Elf], parents: dict[str, str | None]) -> list[str]:
+    """The directories searched before the image's defaults for a name `needer` needs, as glibc searches them: its
+    RUNPATH when it has one; otherwise the RPATH of itself and of every object up the chain that loaded it (an object
+    with a RUNPATH has no RPATH for the loader), each `$ORIGIN` its own."""
+    origin = "/" + str(PurePosixPath(needer).parent)
+    if elves[needer].runpath:
+        return [_expand(d, origin) for d in elves[needer].runpath]
+    found: list[str] = []
+    at: str | None = needer
+    while at is not None and at in elves:
+        if not elves[at].runpath:
+            found += [_expand(d, "/" + str(PurePosixPath(at).parent)) for d in elves[at].rpath]
+        at = parents.get(at)
+    return found
+
+
+def _lookup(image: Image, name: str, needer: str, own: Sequence[str], defaults: Sequence[str]) -> str:
+    """Where the image's loader finds `name` for the object at `needer` (a path in the image), `own` the directories
+    searched first (`_own_dirs`)."""
     if not NAME.fullmatch(name):
         raise BuildError(f"/{needer} needs {name!r}, which is no plain library name")
-    origin = "/" + str(PurePosixPath(needer).parent)
-    own = [_expand(d, origin) for d in (elf.runpath or elf.rpath)]
     for directory in [*own, *defaults]:
         found = image.resolve(f"{directory}/{name}")
         if found is None or image.regular(found) is None:
@@ -313,17 +328,21 @@ def closure(image: Image, binary: str = BINARY) -> Closure:
     defaults = [*image.search_dirs(), *TRUSTED]
     first, _ = _entry(image, f"lib/{LOADER}", loader, EXECUTABLE)
     found: dict[str, Entry] = {LOADER: first}
+    elves: dict[str, Elf] = {resolved: elf}
+    parents: dict[str, str | None] = {resolved: None}  # each object by the one that loaded it first: RPATH's chain
     # the start's loads first, breadth first as the loader goes; then what glibc opens later, with its own closure
     for phase in (elf.needed, DLOPENED):
-        queue: list[tuple[str, Elf, tuple[str, ...]]] = [(resolved, elf, phase)]
+        queue: list[tuple[str, tuple[str, ...]]] = [(resolved, phase)]
         while queue:
-            needer, needer_elf, names = queue.pop(0)
+            needer, names = queue.pop(0)
             for name in names:
                 if name in found:
                     continue
-                source = _lookup(image, name, needer, needer_elf, defaults)
+                source = _lookup(image, name, needer, _own_dirs(needer, elves, parents), defaults)
                 found[name], library = _entry(image, f"lib/{name}", source, READABLE)
-                queue.append((source, library, library.needed))
+                elves.setdefault(source, library)
+                parents.setdefault(source, needer)
+                queue.append((source, library.needed))
     return Closure(main, elf.build_id, tuple(found.values()))
 
 

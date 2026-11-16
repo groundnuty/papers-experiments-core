@@ -10,8 +10,9 @@ The bundle (`deploy/hpc-federation/oneclient_bundle.py` builds it from the Compo
 **`unpack`** reads the tar once, hashing every byte as it goes, and writes only what a bundle may hold into an empty
 private directory of the run: the directories `bin` and `lib`, and the regular files `bin/oneclient`, `lib/<plain
 name>` and `PROVENANCE.json`, each of at most `MAX_FILE_BYTES` and all together at most `MAX_TOTAL_BYTES`. Any other
-member (a link, a device, a path that climbs or goes a level deeper, a name twice) refuses the start, and so does a tar
-whose SHA-256, once the whole file is read, is not the pin; the unpacked copy is then removed. Only that copy runs.
+member (a link, a device, a path that climbs or goes a level deeper) and any name twice, a directory's too, refuses
+the start, and so does a tar whose SHA-256, once the whole file is read, is not the pin; the unpacked copy is then
+removed. Only that copy runs.
 
 **`Bundle.launcher`** runs the image's loader on the binary: `lib/LOADER --inhibit-cache --inhibit-rpath <every file
 of the bundle> --library-path lib bin/oneclient`. `--library-path` alone would not keep the node's libraries out: the
@@ -118,11 +119,15 @@ def _write(source: BinaryIO, target: Path, mode: int) -> int:
 
 def _extract(tar: tarfile.TarFile, root: Path) -> list[str]:
     files: list[str] = []
+    seen: set[str] = set()
     total = 0
     for count, member in enumerate(tar, start=1):
         problem = "more members than a bundle's" if count > MAX_MEMBERS else _allowed(member)
         if problem is not None:
             raise StartRefused(f"oneclient's bundle holds {problem}")
+        if member.name in seen:
+            raise StartRefused("oneclient's bundle names a member twice")
+        seen.add(member.name)
         if member.isdir():
             (root / member.name).mkdir(mode=0o700, exist_ok=True)
             continue

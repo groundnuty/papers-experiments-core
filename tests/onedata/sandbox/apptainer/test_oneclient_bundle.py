@@ -91,6 +91,14 @@ def test_a_name_twice_is_refused(tmp_path, root):
         OB.unpack(pinned_tar(tmp_path, extra=[twice]), root)
 
 
+def test_a_directory_named_twice_is_refused_too(tmp_path, root):
+    again = tarfile.TarInfo("lib")
+    again.type = tarfile.DIRTYPE
+    with pytest.raises(StartRefused, match="twice"):
+        OB.unpack(pinned_tar(tmp_path, extra=[again]), root)
+    assert os.listdir(root) == []
+
+
 def test_a_bundle_without_the_binary_is_refused(tmp_path, root):
     members = {name: data for name, data in bundle_members().items() if name != "bin/oneclient"}
     with pytest.raises(StartRefused, match="no bin/oneclient"):
