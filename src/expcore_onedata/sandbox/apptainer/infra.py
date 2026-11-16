@@ -16,7 +16,9 @@ infrastructure is processes of the driver's, read by role: the egress collector 
 
 A process the harness stops itself (the collection stops the gate and the collector, the guard's window closes with its
 watcher, and the teardown stops everything) is judged by its state just before that stop, which `stopped_by_harness`
-marks, as Docker's check does: so the check reads the same before the collection, after it and after the stop.
+marks, as Docker's check does: so the check reads the same before the collection, after it and after the stop. The
+harness notes that state before it stops anything, and the check reads a component's live state first and looks for
+the note after, so a stop that lands while the check reads is found by its note, never taken for a death.
 
 No per-process limit, OOM counter or kernel line is kept for a process of the driver's, so every death's cause is
 `undetermined` and its category `infrastructure`, as the collection always recorded it (`kinds.death_error` then makes
@@ -99,9 +101,10 @@ class InfraCheck:
             helper = box._helpers.get(role)
             if helper is None:
                 continue
+            now = process_state(box.node, helper.process)  # first: a note taken after it is found below
             with self._lock:
                 before = self._before.get(role)
-            entry = {"start": helper.process.record(), "end": before or process_state(box.node, helper.process)}
+            entry = {"start": helper.process.record(), "end": before or now}
             if before is not None:
                 entry["stopped_by_harness"] = True
             found[role] = entry

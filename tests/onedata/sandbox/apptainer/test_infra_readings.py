@@ -230,3 +230,54 @@ def test_o18_a_run_without_a_mount_has_no_mount_reading(node, settings, level):
         assert (box.mount_errors(), box.mount_log()) == (None, None)
     finally:
         box.stop()
+
+
+def test_o17_a_harness_stop_that_lands_during_the_checks_own_read_is_no_death(node, settings):
+    """O17: the harness notes a helper's state and then stops it, possibly while a check reads it: a check whose live
+    read already sees the stop finds the note, and judges by it, never calling the harness's own stop a death."""
+    box = start(node, settings)
+    try:
+        pid = _process(box, "gate")[0]
+        alive, landed = node.alive, []
+
+        def racing(p, s):
+            if p == pid and not landed:  # the check's live read of the gate: the collection stops it right then
+                landed.append(True)
+                box.infra.stopping("gate")
+                node.procs[pid].alive, node.procs[pid].exit_status = False, 0
+                return False
+            return alive(p, s)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(node, "alive", racing)
+            check = box.infra_check()
+        assert landed
+        assert check["deaths"] == []
+        assert check["containers"]["gate"]["stopped_by_harness"] is True
+    finally:
+        box.stop()
+
+
+def test_o17_a_window_close_that_lands_during_the_checks_own_read_is_no_death(mount_node, settings):
+    """O17: the same for the guard's watcher, whose stop is the window's close."""
+    box = mounted(mount_node, settings)
+    try:
+        watcher = mount_node.watch().proc
+        alive, landed = mount_node.alive, []
+
+        def racing(p, s):
+            if p == watcher.pid and not landed:
+                landed.append(True)
+                box._mount.close_watch()
+                return alive(p, s)
+            return alive(p, s)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(mount_node, "alive", racing)
+            check = box.infra_check()
+        assert landed
+        assert watcher.alive is False
+        assert check["deaths"] == []
+        assert check["containers"]["mount_watch"]["stopped_by_harness"] is True
+    finally:
+        box.stop()

@@ -410,16 +410,18 @@ class HostMount:
     def infra_state(self) -> dict[str, dict[str, Any]]:
         """oneclient with its mount (`mount`) and the guard's watcher (`mount_watch`), by role, for the sandbox's
         `infra_check` (`apptainer.infra`, O17): each one's process (`start`) and its state (`end`), now, or just before
-        the harness stopped it (`stopped_by_harness`). Only what has started is listed."""
+        the harness stopped it (`stopped_by_harness`). Only what has started is listed. The live state is read before
+        the note is looked for, and the note is taken before every stop, so a stop that lands meanwhile is found by its
+        note, never taken for a death."""
         found: dict[str, dict[str, Any]] = {}
         for role, helper, now in (("mount", self.oneclient, self._mount_state),
                                   ("mount_watch", self.watch, None)):  # fmt: skip
             if helper is None:
                 continue
+            live = now() if now is not None else process_state(self.node, helper.process)  # first, then the note
             with self._lock:
                 before = self._before.get(role)
-            end = before or (now() if now is not None else process_state(self.node, helper.process))
-            found[role] = {"start": helper.process.record(), "end": end}
+            found[role] = {"start": helper.process.record(), "end": before or live}
             if before is not None:
                 found[role]["stopped_by_harness"] = True
         return found

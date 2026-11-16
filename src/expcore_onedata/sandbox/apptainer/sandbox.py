@@ -98,7 +98,6 @@ from expcore_onedata.sandbox.settings import SandboxSettings
 log = logging.getLogger(__name__)
 
 COLLECTOR_READY = "egress collector ready"
-TOOL_SERVER_DIR = "toolserver"  # in the run's directory, 0700, while the run's tool server runs: its HOME (O56)
 LOG_UNREAD = "the oneclient log could not be read"
 GATE_ATTEMPTS = 3  # a free port another process took before the gate bound it: tried again with another
 PROBE_S = 60.0
@@ -785,12 +784,14 @@ class ApptainerSandbox:
         """Where the run's tool server runs on the node (O56): a process of the driver's, as Docker's is one on the
         host, outside every cell and in the node's PID namespace, which no cell can address. Its `HOME` and working
         directory are `toolserver/` of the run's directory (0700, refused if it is there already, and removed once the
-        server has stopped), and it carries the run's tag, so the reaper of a dead driver kills it and the lease's
-        probe holds the key while it lives, as for the gate. The launcher names its whole environment
-        (`toolserver.ToolServerLauncher.launch`); the metadata records how it ran, by name, never a value."""
+        server has stopped, or by a teardown that keeps the run as evidence, before it keeps it: what the server wrote
+        there is no evidence, and may hold its token), its `TMPDIR` a directory in it, and it carries the run's tag,
+        so the reaper of a dead driver kills it and the lease's probe holds the key while it lives, as for the gate.
+        The launcher names its whole environment (`toolserver.ToolServerLauncher.launch`); the metadata records how
+        it ran, by name, never a value."""
         if self._stopped:
             raise SandboxError("the sandbox has stopped: its run has no tool server")
-        home = self.dir / TOOL_SERVER_DIR
+        home = self.dir / layout.TOOL_SERVER_DIR
         try:
             home.mkdir(mode=0o700)
         except FileExistsError:
@@ -798,10 +799,11 @@ class ApptainerSandbox:
                 "the directory of the run's tool server is there already: its last one is not gone"
             ) from None
         home.chmod(0o700)  # whatever the driver's umask
-        self.record(tool_server_process={"on": "node", "home": "run_directory", "run_tag": True,
+        (home / "tmp").mkdir(mode=0o700)  # its TMPDIR: never the node's shared /tmp
+        self.record(tool_server_process={"on": "node", "home": "run_directory", "tmpdir": "home", "run_tag": True,
                                          "inherited": ["PATH"]})  # fmt: skip
         try:
-            yield ServerProcess(home=home, env={AV.RUN_TAG: self.sid})
+            yield ServerProcess(home=home, env={AV.RUN_TAG: self.sid, "TMPDIR": str(home / "tmp")})
         finally:
             try:
                 runs.remove_tree(home)

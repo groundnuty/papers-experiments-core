@@ -137,7 +137,7 @@ def test_o56_the_tool_server_runs_on_the_node_in_an_environment_named_whole_with
     environ = seen["environ"]
     assert during["echo"] == {"result": "hi"}
     assert not set(DRIVER_ONLY) & set(environ)
-    expected = {"HOME", "PATH", RUN_TAG, "FASTMCP_LOG_LEVEL", RECORD}
+    expected = {"HOME", "TMPDIR", "PATH", RUN_TAG, "FASTMCP_LOG_LEVEL", RECORD}
     # Python sets LC_CTYPE itself when it starts with no locale at all (PEP 538's coercion): the server's own, never
     # the driver's, which never sets one of these values
     assert environ.pop("LC_CTYPE", "C.UTF-8") in ("C.UTF-8", "C.utf8", "UTF-8")
@@ -158,7 +158,7 @@ def test_o56_the_tool_servers_home_is_gone_once_it_has_stopped_and_the_sandbox_r
 
     left, meta = run(stage, body)
     assert left is False
-    assert meta["tool_server_process"] == {"on": "node", "home": "run_directory", "run_tag": True,
+    assert meta["tool_server_process"] == {"on": "node", "home": "run_directory", "tmpdir": "home", "run_tag": True,
                                            "inherited": ["PATH"]}  # fmt: skip
 
 
@@ -215,3 +215,34 @@ def test_o56_the_backends_settings_cannot_be_set_by_the_studys_extra_environment
         return stage.spawns.seen
 
     assert run(stage, body) == []
+
+
+def test_o56_a_run_kept_as_evidence_while_its_tool_server_runs_keeps_no_file_of_the_servers_home(tmp_path):
+    """O56, O05: a teardown that keeps the run's directory as evidence (a cell's deadline ended the run, say) while the
+    tool server's home is still there removes that home first: what the server wrote there, its token among it maybe,
+    is never evidence, and the server's own end then finds nothing left to remove."""
+    from apptainer_support import make_spec, start
+
+    from expcore_onedata.sandbox.apptainer.teardown import KEPT
+
+    settings = make_settings(tmp_path)
+    box = start(FakeNode(), settings, make_spec("via-gate"))
+    with box.tool_server_process() as process:
+        (process.home / "cache.json").write_text('{"token": "the tool-server token"}', encoding="utf-8")
+        assert process.env == {RUN_TAG: box.sid, "TMPDIR": str(process.home / "tmp")}
+        box.keep_evidence = True
+        box.stop()
+        kept = settings.work_root / KEPT / box.sid
+        assert kept.is_dir()
+        assert not (kept / "toolserver").exists()
+    assert not (kept / "toolserver").exists()
+    assert not os.path.lexists(box.dir)
+
+
+def test_o56_the_tool_servers_home_holds_its_temporary_files_too(stage):
+    """O56: the server's `TMPDIR` is a directory of its home, so its temporary files stay in the run's private
+    directory and go with it, never on the node's shared `/tmp`."""
+    record = stage.tmp / "environ.json"
+    run(stage, serve(stage, record))
+    environ = json.loads(record.read_text(encoding="utf-8"))["environ"]
+    assert environ["TMPDIR"] == os.path.join(environ["HOME"], "tmp")
