@@ -53,16 +53,16 @@ def test_o56_all_links_execs_restart_link_into_every_providers_service_and_fetch
     tmp_path,
 ):
     """O56: the all-links sequence on HPC: every provider's node pinged, then its link restarted, each by an exec into
-    its Apptainer service (the ping within the command bound, the restart within the RPC's 150 s), in label order and
-    one after another; then the settle, with no read through any provider (no serving probe, no session gate, no link
-    check) from the first restart to its end, and only then the gate and every pair, which pass: the restore is
-    verified, the stuck pair healed by one round, no service restarted."""
+    its Apptainer service (the ping within the command bound, the restart within the RPC's 150 s and 60 s for its
+    step), in label order and one after another; then the settle, with no read through any provider (no serving probe,
+    no session gate, no link check) from the first restart to its end, and only then the gate and every pair, which
+    pass: the restore is verified, the stuck pair healed by one round, no service restarted."""
     injector, federation = healing(tmp_path, heal="all_links")
     injector.start(RUN)
     assert injector.clear() is True
     order = [SERVICE[label] for label in sorted(LABEL.values())]
     assert execs(federation, PING) == [(service, 10.0) for service in order]
-    assert execs(federation, RESTART_LINK) == [(service, 150.0) for service in order]
+    assert execs(federation, RESTART_LINK) == [(service, 210.0) for service in order]
     heal = step(injector, "heal")
     assert (heal["outcome"], heal["shared_source"]) == ("healed", CRASHED)
     restarts = [a for a in heal["actions"] if a["action"] == "restart_link"]

@@ -15,7 +15,7 @@ from expcore_onedata.day0.registry import REGISTRY, Context, Result, failed
 from expcore_onedata.day0.report import Entry, build_report, stamp, write_report
 from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_serves import provider_serves
-from expcore_onedata.fault_settings import compose_driver
+from expcore_onedata.fault_settings import compose_driver, hpc_driver
 from expcore_onedata.provision import resolve_provider_ids
 from expcore_onedata.rangemap import load_placement
 from expcore_onedata.sandbox.hostops import DockerHost, HostOps
@@ -79,7 +79,9 @@ def build_context(
     placement = load_placement(path, config) if "placement" in load_toml(path) else None
     client = client or OnezoneClient(config, environ=environ)
     settings = fault_settings_of(config)
-    if driver is None and settings is not None:
+    if driver is None and settings is not None and settings.backend == "hpc":  # through the federation's fault relay
+        driver = hpc_driver(settings, probe=provider_serves(config, settings, client))
+    elif driver is None and settings is not None:
         driver = compose_driver(settings, probe=provider_serves(config, settings, client))
     ctx = Context(
         config=config,

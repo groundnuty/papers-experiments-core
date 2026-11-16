@@ -215,6 +215,11 @@ runs it is handed to recovery, see "The token's window"): call it inside the blo
 **Names (O12).** Outside the driver and the journal the provider is known only by its label: in the snapshot, in every
 message and in every failure. Identities are recorded as SHA-256 digests. The settings are `[faults]` of
 platform.toml (`expcore_onedata.fault_settings`).
+
+**An HPC federation (O56).** With `[faults] backend = "hpc"` the driver is `hpc_driver(settings, probe=...)`
+(`expcore_onedata.fault_hpc`): the same injector, journal, restore, settle, recovery and heal, its requests run by the
+federation's fault relay on the login node (`expcore_onedata.fault_relay`), and its stop's evidence journalled with the
+injection (`injected`: how the stop ended and its seconds).
 """
 
 import asyncio
@@ -243,8 +248,9 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.fault_drain import SessionDrain
 from expcore_onedata.fault_journal import HeldLock, SettledInjections, holder
 from expcore_onedata.fault_recovery import RESTORED, FaultDriver, Recovery, RestoreNotVerified, digest
+from expcore_onedata.fault_restore import stop_record
 from expcore_onedata.fault_serves import provider_serves
-from expcore_onedata.fault_settings import FaultSettings, compose_driver, heal_token_margin_s, load_faults
+from expcore_onedata.fault_settings import FaultSettings, compose_driver, heal_token_margin_s, hpc_driver, load_faults
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 __all__ = [
@@ -258,6 +264,7 @@ __all__ = [
     "SettledInjections",
     "Unsanctioned",
     "compose_driver",
+    "hpc_driver",
     "load_faults",
     "provider_outage",
     "provider_serves",
@@ -428,7 +435,7 @@ class FaultInjector:
             self._went_down = self._recovery.wait(lambda seen: not seen.running, self._service) is not None
             if not self._went_down:
                 raise _NotSeenDown()
-            self._journal.append({"event": "injected", "id": entry})
+            self._journal.append({"event": "injected", "id": entry, **stop_record(self._driver)})
         except BaseException as error:  # whatever broke after the stop, the target is brought back before it is raised
             why = type(error).__name__
             self._step("injected", False, identity_before_sha256=digest, seen_down=self._went_down, error=why)
@@ -439,7 +446,7 @@ class FaultInjector:
                 raise
             raise self._fail(f"{self.target} could not be taken down, seen down and journalled ({why})") from None
         self._injection["injected"] = True
-        self._step("injected", True, identity_before_sha256=digest)
+        self._step("injected", True, identity_before_sha256=digest, **stop_record(self._driver))
 
     def _wait_owed(self) -> None:
         """When this start's recovery restored a provider an earlier run left down, wait out the drain it owes before

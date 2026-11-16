@@ -59,7 +59,8 @@ def test_o56_an_outage_on_hpc_journals_restores_and_settles_exactly_as_on_compos
     """O56: the same outage, its provider slow to serve after the restore, run once over the Compose driver and once
     over the HPC driver, with the same REST side: the journal holds the same lines in the same order, the snapshot
     the same steps with the same words, and both restores are verified once the provider served, the session gate
-    passed and every pair transferred."""
+    passed and every pair transferred. The HPC journal's `injected` line adds the stop's evidence: how it ended and
+    its seconds, the figure a live slot sets `stop_seconds` from."""
     runs = {}
     for backend in ("compose", "hpc"):
         root = tmp_path / backend
@@ -81,8 +82,9 @@ def test_o56_an_outage_on_hpc_journals_restores_and_settles_exactly_as_on_compos
         assert injector.clear() is True
         runs[backend] = (journal(root), injector.snapshot())
     (compose_lines, compose_shot), (hpc_lines, hpc_shot) = runs["compose"], runs["hpc"]
-    shape = [(line["event"], line.get("how"), sorted(line)) for line in hpc_lines]
+    shape = [(line["event"], line.get("how"), sorted(set(line) - {"stop"})) for line in hpc_lines]
     assert shape == [(line["event"], line.get("how"), sorted(line)) for line in compose_lines]
+    assert [line.get("stop") for line in hpc_lines] == [None, None, {"ended": "exit", "seconds": 0.0}, None]
     assert [event for event, _, _ in shape] == ["injecting", "stopping", "injected", "cleared"]
     assert hpc_lines[0]["gate_probe"] == "gate-probe-1"
     words = [(s["step"], s["ok"], s.get("how")) for s in hpc_shot["steps"]]
@@ -104,7 +106,7 @@ def test_o56_the_stop_and_the_start_reach_the_target_service_alone_and_the_ident
     assert federation.acted("stop", "start") == [("stop", OUTAGE_TARGET), ("start", OUTAGE_TARGET)]
     assert (federation.launches(SERVICE), federation.launches(SERVICES["alpha"])) == (2, 1)
     verified = [step for step in injector.snapshot()["steps"] if step["step"] == "verified"][-1]
-    assert verified["identity_after_sha256"] == digest(f"{SERVICE}@launch-2")
+    assert verified["identity_after_sha256"] == digest("2:4002:902")
     assert SERVICE not in json.dumps(injector.snapshot())
 
 

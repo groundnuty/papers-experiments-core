@@ -91,7 +91,7 @@ from expcore_onedata.config import PlatformConfig, StudySpace
 from expcore_onedata.fault_gate import FaultGate
 from expcore_onedata.fault_recovery import FaultDriver
 from expcore_onedata.fault_serves import provider_serves, recorded
-from expcore_onedata.fault_settings import FaultSettings, compose_driver
+from expcore_onedata.fault_settings import FaultSettings, compose_driver, hpc_driver
 from expcore_onedata.federation import ReportedProvider, SpaceView, declared_names, parse_scope
 from expcore_onedata.ingesthealth import baseline_health
 from expcore_onedata.linkcheck import LinkReport, check_links
@@ -181,7 +181,9 @@ def _fault_gate(
     stuck pairs its own link check finds (`fault_gate_heal`, when `[faults] heal` is declared)."""
     if settings is None:
         return None
-    if driver is None:
+    if driver is None and settings.backend == "hpc":  # its requests go through the federation's fault relay
+        driver = hpc_driver(settings, probe=provider_serves(config, settings, client))
+    elif driver is None:
         driver = compose_driver(settings, probe=provider_serves(config, settings, client))
     labels = {config.provider_label(name): service for name, service in settings.services.items()}
     return FaultGate(settings, driver, inner, labels=labels, links=links, relink=relink)

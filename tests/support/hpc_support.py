@@ -1,8 +1,8 @@
 """Fakes for the fault injector's HPC backend (`expcore_onedata.fault_hpc`): providers' Apptainer services behind the
-command runner, on the injector's fake clock, and the four verbs' commands that address them.
+command runner, on the injector's fake clock, reached through the driver's `VerbCommand` transport.
 
-`FakeCommands` builds each verb's argv as the federation's process model would (`hpc-service <verb> <service>`, an
-exec followed by `--` and the argv to run inside the service). `FakeHpc` is the runner that answers them: each
+The verbs are run as `hpc-service <verb> <service>`, an exec followed by `--` and the allowed command to run inside the
+service, as the relay runs the federation's `hpcfed.py`. `FakeHpc` is the runner that answers them: each
 service runs or not under a launch counter, which its identity carries, so a start changes it; a stop is asked of the
 service, which exits `exit_after_s` seconds later (never, when None), and with `stop_hangs` the command does not return
 and is killed at the runner's timeout while the service goes on stopping. Inside a running service, `op_worker ping`
@@ -14,46 +14,20 @@ read noted with the clock's time, so a test can tell a fetch from a listing and 
 import json
 import subprocess
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
-from fault_support import FakeClock
+from fault_support import SERVICES, FakeClock
 
-from expcore_onedata.compose import OP_WORKER, RESTART_LINK_SCRIPT, CommandResult, DriverError
-from expcore_onedata.fault_hpc import HpcDriver
+from expcore_onedata.compose import OP_WORKER, RESTART_LINK_SCRIPT, CommandResult
+from expcore_onedata.fault_hpc import HpcDriver, VerbCommand
 from expcore_onedata.fault_matrix import LinkMatrix, PairState
+from expcore_onedata.testing import write_platform
 
 TOOL = "hpc-service"
 PING = [OP_WORKER, "ping"]
 RESTART_LINK = ["bash", "-c", RESTART_LINK_SCRIPT]
 GATE_PROBE = "gate-probe-1"
-
-
-class FakeCommands:
-    """The argv of the four verbs on a provider's service; a service the federation does not hold is refused, as a
-    state file that does not list it is, before anything runs."""
-
-    def __init__(self, services: Sequence[str]) -> None:
-        self.services = set(services)
-
-    def _known(self, service: str) -> None:
-        if service not in self.services:
-            raise DriverError("the federation holds no such service")
-
-    def status(self, service: str) -> list[str]:
-        self._known(service)
-        return [TOOL, "status", service]
-
-    def stop(self, service: str) -> list[str]:
-        self._known(service)
-        return [TOOL, "stop", service]
-
-    def start(self, service: str) -> list[str]:
-        self._known(service)
-        return [TOOL, "start", service]
-
-    def exec(self, service: str, argv: Sequence[str]) -> list[str]:
-        self._known(service)
-        return [TOOL, "exec", service, "--", *argv]
 
 
 class FakeProbe:
@@ -108,6 +82,7 @@ class FakeHpc:
         self.never_serving: set[str] = set()
         self.serves_after = 0
         self.unreadable: set[str] = set()
+        self.not_ready: set[str] = set()  # services that run but whose own checks have not passed
         self.stuck: set[tuple[str, str]] = set()
         self.link_fixes: dict[str, tuple[tuple[str, str], ...]] = {}
         self.container_fixes: set[str] = set()
@@ -168,8 +143,10 @@ class FakeHpc:
         if service in self.unreadable:
             return CommandResult(1, "", "srun: error: the step could not be created\n")
         entry = self._service(service)
-        identity = f"{service}@launch-{entry['launch']}"
-        return CommandResult(0, json.dumps({"running": entry["running"], "identity": identity}) + "\n")
+        identity = f"{entry['launch']}:{4000 + entry['launch']}:{900 + entry['launch']}"
+        ready = entry["running"] and service not in self.not_ready
+        record = {"service": service, "running": entry["running"], "identity": identity, "ready": ready}
+        return CommandResult(0, json.dumps(record) + "\n")
 
     def _stop(self, service: str, argv: Sequence[str], timeout_s: float) -> CommandResult:
         self.note("stop", service)
@@ -179,7 +156,9 @@ class FakeHpc:
         if self.stop_hangs:
             self.clock.sleep(timeout_s)  # the command is killed here; the service goes on stopping
             raise subprocess.TimeoutExpired(list(argv), timeout_s)
-        return CommandResult(0, "")
+        ended = "exit" if entry["exit_at"] is not None else "none"
+        record = {"service": service, "stopped": True, "ended": ended, "seconds": self.exit_after_s or 0.0}
+        return CommandResult(0, json.dumps(record) + "\n")
 
     def _start(self, service: str) -> CommandResult:
         self.note("start", service)
@@ -234,7 +213,54 @@ class FakeHpc:
         return LinkMatrix(not self.stuck, "stuck: " + ", ".join(shown) if shown else "every pair passed", pairs)
 
 
-def hpc_driver(federation: FakeHpc, *, timeout_s: float = 10.0) -> HpcDriver:
-    """The real HPC driver over the fake federation: its commands, its runner and its probe."""
-    commands = FakeCommands(tuple(federation.label))
-    return HpcDriver(commands, runner=federation, timeout_s=timeout_s, probe=federation.probe)
+def hpc_driver(federation: FakeHpc, *, timeout_s: float = 10.0, stop_timeout_s: float | None = None) -> HpcDriver:
+    """The real HPC driver over the fake federation: the verbs run as commands through it, and its probe."""
+    transport = VerbCommand([TOOL], federation)
+    return HpcDriver(transport, timeout_s=timeout_s, stop_timeout_s=stop_timeout_s, probe=federation.probe)
+
+
+FEDERATION = "hpcop-study-0a1b2c3d"  # an allocation's name, as `up` makes it (DESIGN.md section 4)
+
+
+def write_state(root: Path, services: Sequence[str]) -> Path:
+    """The federation's state file in `root`, as `up` writes it: the allocation's name and each service."""
+    state = {
+        "format": "expcore-hpc-federation/1",
+        "allocation": {"name": FEDERATION},
+        "services": {name: {"kind": "op", "launch": 1, "state": "running"} for name in services},
+    }
+    path = root / "hpc-federation.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+    return path
+
+
+def hpc_table(**changes: Any) -> dict[str, Any]:
+    """`[faults]` of an HPC federation's platform.toml: the relay's backend, short waits, both providers' services."""
+    table = {
+        "sanctioned": True,
+        "journal": "fault-journal",
+        "backend": "hpc",
+        "stop_bound_s": 4,
+        "settle_timeout_s": 5,
+        "relay_wait_s": 1,
+        "poll_s": 1,
+        "ready_timeout_s": 5,
+        "clear_attempts": 2,
+        "admission_timeout_s": 1,
+        "session_drain_s": 0,
+        "services": dict(SERVICES),
+    }
+    table.update(changes)
+    return {key: value for key, value in table.items() if value is not None}
+
+
+def write_hpc_platform(root: Path, *, margin_s: int | None = 100_000, **changes: Any) -> Path:
+    """platform.toml of an HPC federation in `root`, with its state file; `margin_s` sets `[tokens] margin_s`."""
+
+    def edit(data: dict[str, Any]) -> None:
+        data["faults"] = hpc_table(**changes)
+        if margin_s is not None:
+            data["tokens"] = {**data.get("tokens", {}), "margin_s": margin_s}
+
+    write_state(root, tuple(SERVICES.values()))
+    return write_platform(root, edit)

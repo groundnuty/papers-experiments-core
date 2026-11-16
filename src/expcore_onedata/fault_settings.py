@@ -186,9 +186,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from expcore.config.loading import Section, load_toml
+from expcore.config.loading import ConfigError, Section, load_toml
 from expcore_onedata.compose import RESTART_LINK_MARGIN_S, RPC_TIMEOUT_S, CommandRunner, ComposeDriver, run_command
 from expcore_onedata.config import PlatformConfig
+from expcore_onedata.fault_hpc import HPC_EXEC_MARGIN_S, HPC_POLL_S, HPC_STOP_BOUND_S, HpcDriver
+from expcore_onedata.fault_relay import RelayClient
 from expcore_onedata.linkrecord import ROOT_FILE, federation_root
 
 SERVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -206,6 +208,10 @@ DEFAULT_HEAL_SETTLE_S = 180.0  # provisional, until the other study's measuremen
 DEFAULT_SESSION_DRAIN_S = 320.0  # op-worker's 300 s mount-session grace, 15 s for a removal that retries, a margin
 TOKEN_SLACK_S = 300.0  # what the token margin keeps beyond the restore's bound: the start, the link check, the teardown
 HEAL_MODES = ("off", "all_links", "link_then_container", "link")
+BACKENDS = ("compose", "hpc")
+DEFAULT_RELAY_WAIT_S = 30.0  # what a request through the fault relay may wait beyond its command's own bound
+_COMPOSE_KEYS = ("compose_file", "project", "command", "docker")  # an HPC backend reads none of them
+_HPC_KEYS = ("stop_bound_s", "relay_wait_s")  # a Compose backend reads neither
 _KEYS = (
     "sanctioned",
     "journal",
@@ -227,6 +233,8 @@ _KEYS = (
     "session_drain_s",
     "heal_container_fallback",
     "services",
+    "backend",
+    *_HPC_KEYS,
 )
 
 
@@ -237,7 +245,7 @@ class FaultSettings:
     file: Path
     sanctioned: bool
     journal: Path
-    compose_file: Path
+    compose_file: Path | None  # None for the HPC backend, which has no Compose file
     services: Mapping[str, str]
     project: str = ""
     command: tuple[str, ...] = ("docker", "compose")
@@ -256,6 +264,9 @@ class FaultSettings:
     session_drain_s: float = DEFAULT_SESSION_DRAIN_S
     heal_container_fallback: bool = True
     config_sha256: str = ""  # the digest of the platform.toml it was read from: part of the federation's identity
+    backend: str = "compose"  # "hpc": the providers are Apptainer services on batch nodes (`fault_hpc`)
+    stop_bound_s: float = 0.0  # the HPC backend's: the longest a service's stop takes (0 for Compose: not read)
+    relay_wait_s: float = 0.0  # the HPC backend's: a relayed request's wait beyond its command's bound (`fault_relay`)
 
 
 def _number(table: Section, key: str, default: float, minimum: float, *, integer: bool = False) -> float:
@@ -281,8 +292,16 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
     services = Section(table.table("services"), file, "[faults.services]")
     if not services.data:
         raise services.fail(None, "must name the service of at least one provider")
-    project = table.string("project")
-    if not PROJECT.fullmatch(project):
+    backend = table.data.get("backend", "compose")
+    if backend not in BACKENDS:
+        raise table.fail("backend", "must be one of " + ", ".join(f'"{name}"' for name in BACKENDS))
+    hpc = backend == "hpc"
+    for key in _COMPOSE_KEYS if hpc else _HPC_KEYS:
+        if key in table.data:
+            other = "compose" if hpc else "hpc"
+            raise table.fail(key, f'is read only with backend = "{other}", and this table declares "{backend}"')
+    project = "" if hpc else table.string("project")
+    if not hpc and not PROJECT.fullmatch(project):
         raise table.fail("project", "must be a Compose project name: lower-case letters, digits, '_' and '-'")
     named: dict[str, int] = {}  # each service by the position of the entry that names it
     for index, (name, service) in enumerate(services.data.items()):
@@ -309,17 +328,20 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
             f"must lie directly in the federation's root, the directory that holds its {ROOT_FILE} (`up` makes it as "
             f"<root>/fault-journal), where the link-check record is written; its parent holds no {ROOT_FILE}",
         )
+    stop_bound_s = _number(table, "stop_bound_s", HPC_STOP_BOUND_S, 1) if hpc else 0.0
     settings = FaultSettings(
         file=file,
         sanctioned=sanctioned,
         journal=journal,
-        compose_file=(file.parent / table.string("compose_file")).resolve(),
+        compose_file=None if hpc else (file.parent / table.string("compose_file")).resolve(),
         services=dict(services.data),
         project=project,
         command=words["command"],
         docker=words["docker"],
-        poll_s=_number(table, "poll_s", 2.0, 0.001),
-        settle_timeout_s=_number(table, "settle_timeout_s", DEFAULT_SETTLE_TIMEOUT_S, 0),
+        poll_s=_number(table, "poll_s", HPC_POLL_S if hpc else 2.0, 0.001),
+        settle_timeout_s=_number(
+            table, "settle_timeout_s", stop_bound_s + SETTLE_MARGIN_S if hpc else DEFAULT_SETTLE_TIMEOUT_S, 0
+        ),
         command_timeout_s=_number(table, "command_timeout_s", 120.0, 1),
         ready_timeout_s=_number(table, "ready_timeout_s", DEFAULT_READY_TIMEOUT_S, 0),
         clear_attempts=_number(table, "clear_attempts", 3, 1, integer=True),
@@ -332,7 +354,18 @@ def load_faults(path: str | os.PathLike[str], config: PlatformConfig) -> FaultSe
         session_drain_s=_number(table, "session_drain_s", DEFAULT_SESSION_DRAIN_S, 0),
         heal_container_fallback=fallback,
         config_sha256=config.sha256,
+        backend=backend,
+        stop_bound_s=stop_bound_s,
+        relay_wait_s=_number(table, "relay_wait_s", DEFAULT_RELAY_WAIT_S, 0) if hpc else 0.0,
     )
+    if hpc and settings.settle_timeout_s <= stop_bound_s:  # a stop's waits must outlast the stop itself
+        raise table.fail(
+            "settle_timeout_s",
+            f"must exceed stop_bound_s, {stop_bound_s:g} s, the longest a service's stop takes on an HPC federation "
+            f"(by default the layout's stop_seconds 600, supervise.py's kill 30 s and the step's end 60 s), not "
+            f"{settings.settle_timeout_s:g}: a stop waited for less is never seen to end; leave it out for "
+            f"{stop_bound_s + SETTLE_MARGIN_S:g}",
+        )
     declared = "heal_timeout_s" in table.data
     if not declared:  # never a fixed number: one the loader's own check would refuse for some size is wrong
         settings = replace(settings, heal_timeout_s=default_heal_timeout_s(settings))
@@ -383,6 +416,34 @@ def _seconds(value: float) -> str:
     return str(int(number)) if number.is_integer() else repr(number)
 
 
+def command_bound_s(settings: FaultSettings) -> float:
+    """The longest one driver command may take: `command_timeout_s`, and for the HPC backend the relay's wait too
+    (`relay_wait_s`: a request's wait beyond its command's bound, `fault_relay`)."""
+    return settings.command_timeout_s + settings.relay_wait_s
+
+
+def stop_command_s(settings: FaultSettings) -> float:
+    """The longest a stop command may take: a command's on Compose; for the HPC backend its own bound,
+    `settle_timeout_s`, which outlasts a service's stop (`fault_hpc.HpcDriver`), and the relay's wait."""
+    if settings.backend == "hpc":
+        return settings.settle_timeout_s + settings.relay_wait_s
+    return command_bound_s(settings)
+
+
+def link_command_s(settings: FaultSettings) -> float:
+    """The longest a link restart's command may take: the RPC's bound and its margin, and for the HPC backend the
+    exec's step (`fault_hpc.HPC_EXEC_MARGIN_S`) and the relay's wait."""
+    extra = HPC_EXEC_MARGIN_S + settings.relay_wait_s if settings.backend == "hpc" else 0.0
+    return RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + extra
+
+
+def _command_words(settings: FaultSettings) -> str:
+    """`command_timeout_s` in words, with the relay's wait for the HPC backend."""
+    n = _seconds
+    words = f"command_timeout_s {n(settings.command_timeout_s)} s"
+    return f"{words} + relay_wait_s {n(settings.relay_wait_s)} s" if settings.backend == "hpc" else words
+
+
 def _bound_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
     """The terms of `restore_bound_s`, each with its declared values in words."""
     s, attempts, n = settings, settings.clear_attempts, _seconds
@@ -390,9 +451,9 @@ def _bound_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
     return (
         (f"a stop of unknown outcome waited out (settle_timeout_s {n(s.settle_timeout_s)} s + poll_s {n(s.poll_s)} s)",
          identity_wait),
-        (f"{attempts} starts each with its wait ({attempts} x (command_timeout_s {n(s.command_timeout_s)} s + "
+        (f"{attempts} starts each with its wait ({attempts} x ({_command_words(s)} + "
          f"settle_timeout_s {n(s.settle_timeout_s)} s + poll_s {n(s.poll_s)} s))",
-         attempts * (s.command_timeout_s + identity_wait)),
+         attempts * (command_bound_s(s) + identity_wait)),
         (f"{attempts - 1} pause(s) between them ({attempts - 1} x poll_s {n(s.poll_s)} s)", (attempts - 1) * s.poll_s),
         (f"the wait to serve (ready_timeout_s {n(s.ready_timeout_s)} s + poll_s {n(s.poll_s)} s)",
          s.ready_timeout_s + s.poll_s),
@@ -416,12 +477,26 @@ def _drain_terms(settings: FaultSettings, bound: float) -> tuple[tuple[str, floa
     return tuple(terms)
 
 
+def _start_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
+    """The HPC backend's term of `restore_token_margin_s` for the injector's start after the run's mint: its stop, which
+    may run to its own bound (`stop_command_s`), past what the slack holds; none on Compose, whose stop the slack
+    holds."""
+    if settings.backend != "hpc":
+        return ()
+    n = _seconds
+    words = (
+        f"the injector's start's stop (settle_timeout_s {n(settings.settle_timeout_s)} s + relay_wait_s "
+        f"{n(settings.relay_wait_s)} s)"
+    )
+    return ((words, stop_command_s(settings)),)
+
+
 def _restore_terms(settings: FaultSettings) -> tuple[tuple[str, float], ...]:
-    """The terms of `restore_token_margin_s`, each with its declared values in words: the restore's bound, the slack and
-    the session drain."""
+    """The terms of `restore_token_margin_s`, each with its declared values in words: the restore's bound, the slack,
+    the session drain and, for the HPC backend, the start's stop."""
     bound = _bound_terms(settings)
     drain = _drain_terms(settings, sum(value for _, value in bound))
-    return (*bound, (f"slack {_seconds(TOKEN_SLACK_S)} s", TOKEN_SLACK_S), *drain)
+    return (*bound, (f"slack {_seconds(TOKEN_SLACK_S)} s", TOKEN_SLACK_S), *drain, *_start_terms(settings))
 
 
 def restore_margin_derivation(settings: FaultSettings) -> str:
@@ -457,8 +532,9 @@ def restore_drain_s(settings: FaultSettings) -> float:
 def restore_token_margin_s(settings: FaultSettings) -> float:
     """The least `[tokens] margin_s` of a platform with `[faults]`, which must declare it and is refused at load below
     it: the restore's bound, `TOKEN_SLACK_S` and the session drain a clear may wait (`restore_drain_s`; see the module
-    docstring). 2,134 s with the defaults."""
-    return restore_bound_s(settings) + TOKEN_SLACK_S + restore_drain_s(settings)
+    docstring), and for the HPC backend the start's stop (`_start_terms`). 2,134 s with the defaults on Compose."""
+    started = sum(value for _, value in _start_terms(settings))
+    return restore_bound_s(settings) + TOKEN_SLACK_S + restore_drain_s(settings) + started
 
 
 def heal_token_margin_s(settings: FaultSettings) -> float:
@@ -491,7 +567,7 @@ def heal_deferral_s(settings: FaultSettings) -> float:
 def heal_link_reserve(settings: FaultSettings) -> float:
     """The declared bounds of a ping and a link restart: two container lookups and the ping, the RPC and its margin,
     and one settle."""
-    return 3 * settings.command_timeout_s + RPC_TIMEOUT_S + RESTART_LINK_MARGIN_S + settings.heal_settle_s
+    return 3 * command_bound_s(settings) + link_command_s(settings) + settings.heal_settle_s
 
 
 def heal_container_reserve(settings: FaultSettings) -> float:
@@ -499,7 +575,8 @@ def heal_container_reserve(settings: FaultSettings) -> float:
     waits for it to go down and to come back, the wait for it to serve, a margin of three commands (a start in flight
     and one reading past the restart's own deadline, `Recovery.restart_container`), and one settle."""
     return (
-        7 * settings.command_timeout_s
+        6 * command_bound_s(settings)
+        + stop_command_s(settings)
         + 2 * settings.settle_timeout_s
         + settings.ready_timeout_s
         + (settings.heal_settle_s)
@@ -556,8 +633,9 @@ def faults_fingerprint(config: PlatformConfig) -> dict[str, Any] | None:
     if "faults" not in load_toml(config.file):
         return None
     settings = load_faults(config.file, config)
+    where = "hpc:" if settings.backend == "hpc" else f"{settings.project}/"  # an HPC service has no project
     targets = {
-        config.provider_label(name): hashlib.sha256(f"{settings.project}/{service}".encode()).hexdigest()
+        config.provider_label(name): hashlib.sha256(f"{where}{service}".encode()).hexdigest()
         for name, service in settings.services.items()
     }
     return {"sanctioned": settings.sanctioned, "targets": dict(sorted(targets.items()))}
@@ -569,6 +647,8 @@ def compose_driver(
     """The Compose driver `[faults]` describes, running its commands through `runner`; `probe(service)` says whether
     the provider behind a service answers its REST API (`expcore_onedata.fault_serves.provider_serves`), which a
     restore is not verified without."""
+    if settings.backend != "compose" or settings.compose_file is None:
+        raise ConfigError(f'{settings.file}: [faults]: backend = "{settings.backend}" has no Compose driver')
     return ComposeDriver(
         settings.compose_file,
         project=settings.project,
@@ -578,3 +658,13 @@ def compose_driver(
         timeout_s=settings.command_timeout_s,
         probe=probe,
     )
+
+
+def hpc_driver(settings: FaultSettings, *, probe: Callable[[str], bool], transport: Any = None) -> HpcDriver:
+    """The HPC driver `[faults]` describes (`backend = "hpc"`): its requests go through the federation's fault relay
+    (`fault_relay.RelayClient`, in the federation's root), or `transport` (a test's), each command within
+    `command_timeout_s` and a stop within `settle_timeout_s`; `probe(service)` as for `compose_driver`."""
+    if settings.backend != "hpc":
+        raise ConfigError(f'{settings.file}: [faults]: backend = "{settings.backend}" has no HPC driver')
+    sent = transport or RelayClient(federation_root(settings.journal), wait_s=settings.relay_wait_s)
+    return HpcDriver(sent, timeout_s=settings.command_timeout_s, stop_timeout_s=settings.settle_timeout_s, probe=probe)

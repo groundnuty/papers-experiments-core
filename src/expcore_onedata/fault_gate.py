@@ -106,12 +106,14 @@ from expcore_onedata.fault_gate_heal import GateHeal, GateHeals, failed_heal_rea
 from expcore_onedata.fault_journal import HeldLock, holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
+from expcore_onedata.fault_relay import RELAY_NOTE, beat
 from expcore_onedata.fault_settings import (
     FaultSettings,
     heal_all_links_reserve,
     heal_container_reserve,
     heal_wait_s,
 )
+from expcore_onedata.linkrecord import federation_root
 
 _PURPOSES = {
     OUTAGE_RUN: "an outage run",
@@ -196,6 +198,7 @@ class FaultGate:
         whatever its last verdict; `labels` maps each provider's label to its service. With all three, a declared and
         sanctioned heal, the gate heals the stuck pairs its own check finds (see the module docstring)."""
         self._clock, self._sleep, self._drain_s = clock, sleep, settings.session_drain_s
+        self._wall = wall  # the clock the fault relay's heartbeat is read on (HPC, `fault_relay`)
         self._lock = FederationLock(settings, clock=clock, sleep=sleep, wall=wall)
         self._recovery = Recovery(
             settings, driver, clock=clock, sleep=sleep, labels=labels, wall=wall, hold_for=self._lock.hold_for
@@ -416,6 +419,9 @@ class FaultGate:
         if stale and self._relink is not None:
             self._relink()
         prerun.note(GATE_NOTE, noted)
+        if self._settings.backend == "hpc":  # an outage run's admission refuses unless this check saw the relay live
+            live = beat(federation_root(self._settings.journal), self._wall)
+            prerun.note(RELAY_NOTE, {"alive": live is not None, "nonce": None if live is None else live["nonce"]})
         return noted
 
     def _judged(self, noted: dict[str, Any] | None = None) -> tuple[Health, LinkMatrix | None]:
