@@ -7,9 +7,10 @@ start time) and the run's token files by their place in its directory. Its stop 
 everything it names is shown gone. So a driver killed outright leaves a record, and:
 
 * the next start on the same work root **reaps** every record whose owner is shown gone (`reap`): it SIGKILLs the
-  helpers it names and every process that carries the run's tag, removes the token files first and then the run's
-  directory, and drops the record once all of it is gone. A record whose owner lives, or whose owner cannot be told
-  gone, is never touched;
+  helpers it names and every process that carries the run's tag (a mount's oneclient included), removes the token
+  files first, unmounts whatever is still mounted in the run's directory (`fusermount3 -u`, then `-uz`), then removes
+  the directory, and drops the record once all of it is gone. A record whose owner lives, or whose owner cannot be
+  told gone, is never touched;
 * the lease's **probe** (`ApptainerProbe.resource_gone`) says a key's sandbox is gone only when no record names the
   key, no run directory of the key is under the work root and no process carries a run tag of the key; anything it
   cannot read is not gone.
@@ -38,6 +39,8 @@ log = logging.getLogger(__name__)
 RUNS = "_runs"
 FORMAT = "expcore-apptainer-run/1"
 SID = re.compile(r"[A-Za-z0-9_.-]{1,64}-[0-9a-f]{8}")
+UNMOUNT, LAZY_UNMOUNT = ("fusermount3", "-u"), ("fusermount3", "-uz")  # an unprivileged user's own FUSE mounts
+UNMOUNT_S = 30.0
 
 
 def record_path(work_root: Path, sid: str) -> Path:
@@ -101,6 +104,23 @@ def _tagged(node: NodeOps, sid: str) -> list[Any] | None:
     return None if found is None else [p for p in found if tag in p.tags]
 
 
+def _unmount_all(node: NodeOps, run_dir: Path) -> None:
+    """Unmount every mount left inside a dead run's directory, deepest first: `fusermount3 -u`, then `-uz` (lazy) as a
+    last resort, once its daemon is gone; `SandboxError` unless the table then shows none (unknown is never none)."""
+    found = node.mounts_under(run_dir)
+    if found is None:
+        raise SandboxError("the mount table could not be read")
+    for mountpoint in found:
+        for argv in (UNMOUNT, LAZY_UNMOUNT):
+            node.run([*argv, mountpoint], UNMOUNT_S)
+            still = node.mounts_under(run_dir)
+            if still is not None and mountpoint not in still:
+                break
+    left = node.mounts_under(run_dir)
+    if left is None or left:
+        raise SandboxError("a dead driver's run still has a mount in its directory")
+
+
 def reap(node: NodeOps, work_root: Path, *, own: str) -> dict[str, Any]:
     """Reap the runs whose driver is shown gone (the module's docstring); `own` is the starting sandbox's id. Counts
     and errors, never a name. It never raises."""
@@ -139,6 +159,7 @@ def _reap_one(node: NodeOps, work_root: Path, document: Mapping[str, Any]) -> in
     left = _tagged(node, sid)
     if any(state is not False for state in states) or left is None or left:  # unknown is never gone
         raise SandboxError("a dead driver's helper or cell is not shown gone")
+    _unmount_all(node, run_dir)  # a dead oneclient's FUSE mount, say (hook c): never removed from under a mount
     remove_tree(run_dir)
     drop(work_root, sid)
     return killed

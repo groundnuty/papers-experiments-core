@@ -155,6 +155,10 @@ class FakeNode:
         self.owner = Spawned(999, "4242")
         self.procs[999] = FakeProc(999, "4242", OWN_NS, "driver", role="driver")
         self.signals: list[tuple[int, int]] = []
+        self.mounts: set[str] = set()  # mount points in the driver's mount table (a mount's oneclient, say)
+        self.busy_mounts: set[str] = set()  # those only a lazy unmount takes
+        self.unmounts: list[list[str]] = []
+        self.mount_table_unreadable = False
 
     # ------------------------------------------------------------------------------------------------ processes
     def _new_proc(self, pidns: str, comm: str, **kw: Any) -> FakeProc:
@@ -229,10 +233,27 @@ class FakeNode:
         return {"kernel": "invented", "apptainer": "apptainer version invented"}
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
+        if argv and argv[0] == "fusermount3":
+            return self._fusermount(list(argv))
         return run_bounded(argv, timeout_s, input=input)
 
     def exists(self, path: str | Path) -> bool:
         return Path(path).exists()
+
+    def mounts_under(self, root: Path) -> list[str] | None:
+        if self.mount_table_unreadable:
+            return None
+        base = str(root).rstrip("/") + "/"
+        return sorted((m for m in self.mounts if m.startswith(base)), key=lambda m: (-m.count("/"), m))
+
+    def _fusermount(self, argv: list[str]) -> CmdResult:
+        """`fusermount3 -u` unmounts a mount whose daemon is gone; one in `busy_mounts` goes only with `-uz`."""
+        self.unmounts.append(list(argv))
+        mountpoint = argv[-1]
+        if mountpoint in self.mounts and (argv[1] == "-uz" or mountpoint not in self.busy_mounts):
+            self.mounts.discard(mountpoint)
+            return CmdResult(0)
+        return CmdResult(1, "", "fusermount3: failed to unmount: Device or resource busy\n")
 
     # ------------------------------------------------------------------------------------------------ helpers
     def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path, env: dict[str, str] | None = None) -> Spawned:
