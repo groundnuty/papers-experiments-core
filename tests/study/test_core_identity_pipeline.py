@@ -1,6 +1,6 @@
 """The core's identity across a study's commands (C06, C29, P01): a dirty core is refused for a scored or merged result
 unless dirt is allowed, two commits of one version are two cores that never merge, and a store an earlier core recorded
-keeps resuming, checking and analysing in its own form, while a merge never mixes the two forms.
+keeps resuming, checking and analysing in its own form, while a new merge takes no shard of that form.
 
 The core's identity is replaced, for one command at a time, by one read from a throwaway repository (`make_repo`) or by
 one at an invented commit: what is under test is what the commands do with it. The example study runs for real.
@@ -21,6 +21,7 @@ from expcore.provenance import core_identity
 from expcore.provenance import environment as environment_module
 from expcore.provenance.core_identity import from_checkout
 from expcore.provenance.environment import CORE_DISTRIBUTION, environment
+from expcore.study import merge as study_merge
 from expcore.study import pipeline
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
@@ -176,11 +177,13 @@ def test_c06_an_earlier_store_whose_install_differs_from_the_cores_now_is_refuse
     assert f"sources.{CORE_DISTRIBUTION}" in errors
 
 
-def test_c29_a_merge_never_mixes_the_two_forms_and_merges_shards_that_all_hold_the_earlier_one(
+def test_c29_a_merge_refuses_the_earlier_form_mixed_or_not_and_a_batch_an_earlier_core_merged_still_checks(
     tmp_path, clean_environment, monkeypatch
 ):
-    """C29: a shard an earlier core recorded beside one recorded by the core's identity is refused, naming both; shards
-    that all hold the earlier form merge under it, said on stderr, and the merged batch is checked in it."""
+    """C29: a shard an earlier core recorded beside one recorded by the core's identity is refused, naming both, and
+    shards that all hold the earlier form are refused too, since that form does not say which core ran them; a batch
+    an earlier core merged from such shards (its merge stood in for by this one without the refusal) is checked,
+    analysed and reported in that form."""
     with monkeypatch.context() as patch:
         earlier_form(patch)
         old_one = run_shard(tmp_path, "old-one", clean_environment, 1)
@@ -195,7 +198,12 @@ def test_c29_a_merge_never_mixes_the_two_forms_and_merges_shards_that_all_hold_t
     merged = Campaign(make_study(tmp_path, "merged"))
     outs = (str(old_one.root / "out"), str(old_two.root / "out"))
     code, errors = cli(clean_environment, "merge", str(merged.root / "out"), *outs)
+    assert code == 1
+    assert "which does not say which core code ran it; merge its shards with the core that ran them" in errors
+    assert not (merged.root / "out" / "runs").exists()
+    with monkeypatch.context() as patch:
+        patch.setattr(study_merge, "refuse_earlier_form", lambda shards: None)  # as the earlier core merged them
+        code, errors = cli(clean_environment, "merge", str(merged.root / "out"), *outs)
     assert code == 0, errors
-    assert "every shard recorded the core in its earlier form" in errors
     finish(clean_environment, merged)
     assert merged.codes == {"check": 0, "analyze": 0, "report": 0}

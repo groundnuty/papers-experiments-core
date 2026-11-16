@@ -8,7 +8,8 @@
    study.toml declares) with the check itself, and the four outputs (`export.json`, `scores.json`, `analysis.json`,
    `report.md`);
 3. refuse a check made under code that is not a clean commit, outputs made by another core version, and a check that
-   records no environment or another one than the build's (`provenance.environment`); warn about every other included
+   records no environment, one whose core was dirty or unknown (`provenance.core_check`), or another one than the
+   build's (`provenance.environment`, in the form the check holds the core in); warn about every other included
    file no commit holds and list it, and refuse one in an anonymised build unless the author allows it (`tracking`);
 4. in every build, write each key location of models.toml (`key_file`, `key_env`) as its fixed placeholder: where a key
    lives is outside the code identity and the campaign fingerprint, so the file still verifies (`config.key_locations`,

@@ -1,4 +1,5 @@
-"""Shared fixtures: a throwaway git repository that ignores the developer's own git configuration."""
+"""Shared fixtures: the core's identity pinned as committed, and a throwaway git repository that ignores the
+developer's own git configuration."""
 
 import os
 import stat

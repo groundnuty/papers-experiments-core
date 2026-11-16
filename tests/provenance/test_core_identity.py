@@ -32,7 +32,7 @@ PROJECT = '[project]\nname = "papers-experiments-core"\nversion = "0.1.0"\n'
 def core_project(repo) -> Path:
     """A committed checkout shaped like the core's: its project file, both packages and a cache git ignores."""
     repo.write("pyproject.toml", PROJECT)
-    repo.write(".gitignore", "__pycache__/\n")
+    repo.write(".gitignore", "__pycache__/\nbuild/\n")
     repo.write("src/expcore/__init__.py", "")
     repo.write("src/expcore/provenance/__init__.py", "")
     repo.write("src/expcore/cli.py", "WIRE = 'blue'\n")
@@ -61,8 +61,8 @@ def test_c06_a_clean_checkout_is_named_by_its_commit_and_tree(repo):
 
 def test_p01_a_tracked_change_anywhere_or_an_untracked_file_a_wheel_ships_is_dirt_and_a_marker_at_the_top_is_not(repo):
     """P01: a tracked file edited anywhere (a note) is dirt, and so is a file git does not track under what a wheel
-    ships; an untracked file elsewhere, like the `.ok` uv leaves at the top of its git checkouts, ships nothing and is
-    not, and neither is an ignored cache."""
+    ships, and a Python file git ignores in the packages; an untracked file elsewhere, like the `.ok` uv leaves at the
+    top of its git checkouts, ships nothing and is not, and neither is an ignored cache."""
     root = core_project(repo)
     (root / ".ok").write_text("", encoding="utf-8")
     (root / "src" / "expcore" / "__pycache__").mkdir()
@@ -77,6 +77,12 @@ def test_p01_a_tracked_change_anywhere_or_an_untracked_file_a_wheel_ships_is_dir
     untracked = from_checkout(root)
     assert untracked.dirty
     assert "src/expcore/new.py" in str(untracked.why)
+    (root / "src" / "expcore" / "new.py").unlink()
+    (root / "src" / "expcore" / "build").mkdir()
+    (root / "src" / "expcore" / "build" / "hidden.py").write_text("HIDDEN = 1\n", encoding="utf-8")
+    ignored = from_checkout(root)  # imported, and in no commit or wheel: git ignores build/ here
+    assert ignored.dirty
+    assert "Python files in the packages that git ignores: src/expcore/build/hidden.py" in str(ignored.why)
 
 
 def test_c06_two_dirty_trees_at_one_commit_are_told_apart_by_their_python_digest(repo):

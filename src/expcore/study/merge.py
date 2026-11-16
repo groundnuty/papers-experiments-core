@@ -127,16 +127,27 @@ def _merge(study: StudyConfig, out: Path, shard_outs: list[Path], allow_dirty: b
 
 
 def _environment_of(study: StudyConfig, shards: Sequence[ShardFacts]) -> dict[str, Any]:
-    """The environment the shards are replayed under: the one in use, in the form the shards record the core in, which
-    `check_core` made one form for all of them; shards an earlier core recorded merge under its form, said on stderr."""
-    recorded = campaign_environment(shards[0].fingerprint)
-    if is_earlier_form(recorded):
-        print(
-            "merge: every shard recorded the core in its earlier form, by how it was installed; they merge under "
-            "that form",
-            file=sys.stderr,
-        )
-    return environment_like(study, recorded)
+    """The environment the shards are replayed under: the one in use, which names the core by its identity, once no
+    shard holds the earlier form (`refuse_earlier_form`)."""
+    refuse_earlier_form(shards)
+    return environment_like(study, campaign_environment(shards[0].fingerprint))
+
+
+def refuse_earlier_form(shards: Sequence[ShardFacts]) -> None:
+    """Refuse a shard whose environment an earlier core recorded, by how the core was installed (C06, C29).
+
+    That form says nothing of which code a wheel or a directory install was, so two such shards may have run two cores
+    and still compare equal: the very merge the core's identity exists to refuse. A store of that form still resumes,
+    and is checked and analysed, in its own form (`study.core_legacy`), and a batch an earlier core merged is checked
+    and analysed in it too; only a new merge is refused. `check_core` has refused a mix of the forms already.
+    """
+    for shard in shards:
+        if is_earlier_form(campaign_environment(shard.fingerprint)):
+            raise MergeRefused(
+                f"{shard.name}: its environment records the core by how it was installed, as a core before its "
+                "commit was recorded, which does not say which core code ran it; merge its shards with the core that "
+                "ran them, or run the campaign again with this one"
+            )
 
 
 def _replay(study: StudyConfig, shard: ShardFacts, code: Any, env: Any, copy: Path) -> ShardFacts:

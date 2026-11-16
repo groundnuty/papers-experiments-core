@@ -9,9 +9,10 @@ that form (`environment.is_earlier_form`), and comparing it with the current for
 So the earlier form is accepted for that campaign's own continuation and nothing else: its resume, its check, its
 analysis and its package compare it with the environment in use computed in the same earlier form, exactly as the
 earlier core did, so nothing is weaker than it was, and the start says so on stderr. A new campaign always records the
-current form, the core in use is still held to its own identity (`core_check.require_core`), and a merge refuses
-shards that record the core in two forms (`campaign.merge.check_core`); shards that all record the earlier form are
-merged under it, as the earlier core merged them.
+current form, and the core in use is still held to its own identity (`core_check.require_core`). A new merge takes
+no shard of the earlier form (`study.merge.refuse_earlier_form`, and `campaign.merge.check_core` for a mix of the
+two): for a wheel or a directory install that form names no code, so two such shards may have run two cores and still
+compare equal. A batch an earlier core merged is checked and analysed in the earlier form, like a store.
 """
 
 import sys
