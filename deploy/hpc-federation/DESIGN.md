@@ -197,8 +197,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 **`up`** (login node), each phase recorded in `phase`:
 
 1. **Preflight**, touching nothing on the cluster: the layout and its `[hpc]` table; `site.env`'s keys; the root's
-   rules and mark (as Compose); the two rootfs tarballs and their `.provenance`; the core's self-check. A root that
-   holds a state file is refused: `down` first.
+   rules and mark (as Compose); the two rootfs tarballs and their `.provenance`; the core's self-check; a shared
+   imported tree's variables and manifest (section 8). A root that holds a state file is refused: `down` first.
 2. **Submit** the held job: `sbatch --parsable --job-name=<allocation name> --account --partition --no-requeue
    --time --nodes --ntasks-per-node=1 --cpus-per-task --mem --chdir=/ --output=/dev/null --export=NONE --wrap 'exec sleep
    <seconds of --time>'`. **The read-back:** `scontrol show job -o <id>` must report what was asked (TimeLimit,
@@ -215,7 +215,9 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 6. **The providers**: one detached service step each, `provider.sbatch <bundle> <provider tar> <name> <zone FQDN>
    <admin mail> <zone address> <every other provider's address>`; for each, a registration token minted in a control
    step on the zone's node piped into a delivery step on the provider's (`mint-registration-token.sh |
-   deliver-token.sh`, the bundle's, with `--workdir`); then each log's verdict (`hpcop: OK provider`).
+   deliver-token.sh`, the bundle's, with `--workdir`); then each log's verdict (`hpcop: OK provider`). A provider that
+   owns a shared imported tree is also given `--import=SPACE=PATH`, and once every provider is up a control step on
+   its node proves the tree read-only (section 8).
 7. **The root's secrets and CA**: the zone's admin passphrase through a control step's stdout into
    `secrets/zone.passphrase` (0600), as the registration tokens travel; the Onedata test CA of the zone's rootfs (public)
    into `ca/federation-ca.pem`.
@@ -223,8 +225,11 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    core` says (section 9). **The bootstrap** is the Compose federation's own `fedboot.Bootstrap` over a layout whose
    services' URLs are `https://<node FQDN>:8443`: the admin's token, the users, the spaces, the support (on each
    provider's one posix storage, owned by the job's uid, and that storage's LUMA local feed mapping the space and every
-   user to that uid, as `onboard.py` does), the members, the baseline content (`fedcontent.Content`).
-9. **`facts.json` and `platform.toml`** (section 6), then **the link check**: `fedlinks.check_after_up`, the platform
+   user to that uid, as `onboard.py` does), the members, the baseline content (`fedcontent.Content`). An owner of a
+   shared imported space also has its `import-<space>` storage made before any support, and the scan awaited after
+   the members (section 8).
+9. **`facts.json` and `platform.toml`** (section 6), then each shared import verified against its manifest (section 8),
+   then **the link check**: `fedlinks.check_after_up`, the platform
    layer's own check through the rendered `platform.toml`, which writes `link-check.json` in the root through
    `expcore_onedata.linkrecord`. `up` fails unless every pair passes.
 10. **The fault relay** (M4's `expcore_onedata.fault_relay`), when the core has it: started detached on the login node
@@ -295,7 +300,9 @@ provided it reaches the services' 8443 and reads the root. A layout's link check
 (a zone, five providers, four data spaces each owned by one provider and mirrored by another, and the probe space on
 all five) with invented names, and its template declares the four spaces as `[[spaces]]`, which gives the ten ordered
 pairs the pilot's check reports. Its `delta-space` stands for the pilot's largest space (15,340 files); `up` writes
-none into it, and its synthetic tree of that count is M3's, on an imported storage.
+none into it. `layouts/pilot-shape-import.toml` is the same shape with the four data spaces imported from trees on the
+shared filesystem (section 8), whose template adds `import = { readonly = true, shared = true }` to each of them and
+leaves the ten pairs as they were.
 
 ## 7. Service verbs for faults and the heal (M4)
 
@@ -386,27 +393,37 @@ service steps through `zone.sbatch` and `provider.sbatch` unchanged):
 
 M3 replaces a provider's tmpfs posix storage for an imported space with a directory on the shared filesystem, bound
 read-only into that provider's container. It changes the service step's binds and the support's storage, not the
-process model: the step, the state file and the verbs stay as above. It is declared in the layout the driver already
-reads (`layouts/shared-import.toml` is an example), as `import = { readonly = true, shared = true, source_env, manifest_env,
-direct_io }` on a space, and everything it needs from the driver is one call at each of six places, all in
-`hpcimport.py` or in the Compose federation's modules the driver imports (`docs/storage-import.md`, "A tree on the
-cluster's shared filesystem", says why each is there):
+process model: the step, the state file and the verbs stay as above, and `down` is unchanged (the bind exists only in
+the container's own mount namespace, so a teardown never enters the tree). It is declared in the layout the driver
+already reads (`layouts/shared-import.toml` is an example, and `layouts/pilot-shape-import.toml` is the pilot's shape
+with its four data spaces imported; `layouts/pilot-shape.toml` stays ingest-based until a live slot shows the two
+equivalent), as `import = { readonly = true, shared = true, source_env, manifest_env, direct_io }` on a space. The driver
+makes one call at each of seven places, all in `hpcimport.py` or in the Compose federation's modules it imports
+(`docs/storage-import.md`, "A tree on the cluster's shared filesystem", says why each is there). **Every variable is
+read from the driver's own environment** (`Driver.environ`, which `hpcfed.py main` fills from the login node's, as
+`set -a; . site.env; set +a` left it), never `os.environ` directly:
 
 | Where in `up` | The call | What it does |
 |---|---|---|
-| Preflight (section 5, step 1) | `Layout.import_source(space, os.environ)` and `Layout.import_manifest(space, os.environ)` for each of `layout.shared_imports()`, then `hpcimport.check_support(layout, os.environ)` | refuses a variable that is unset, relative, with a `..` step or a link on the way, a source that is not a directory, a manifest that is not a file or lies in a tree, and a manifest of more bytes than the space's `support_bytes`. The values are read from the environment `site.env` set on the login node; **the node's `env -i` allowlist never carries them**: the path travels as an argument |
-| A provider's service step (step 6) | append `hpcimport.provider_import_args(layout, provider, os.environ)` to the `provider.sbatch` argv, after the peers | `--import=SPACE=PATH` per tree the provider owns; none for a mirror. The bundle checks each tree again on the node, makes the mountpoint in the rootfs and binds it `:ro` at every start of the service, a restart (section 7) included, since the list is in the work directory |
-| The bootstrap (step 8) | override `Bootstrap.import_storage_extra(service)` to return `hpcimport.import_storage_extra(uid, gid)` | the imported storage is made with the job user's ids, the local LUMA feed and the canonical path type; `fedboot` names the storage by `import-<space>` and supports the space on it with the one-scan import configuration, as the Compose federation does |
-| The bootstrap's LUMA step (step 8) | for the storage `Bootstrap.storage_for(service, space)` returns, send `hpcimport.luma_requests(storage_id, space_id, member_ids, uid, gid)` | the space's default credentials and each member's mapping on **that storage**, not on "the provider's one posix storage": an owner of an imported space has two |
-| After `platform.toml` is rendered (step 9), before the link check | `fedimport.verify_imports(layout, os.environ, timeout_s=...)` | the core's `ImportedSpace.provision` over the rendered file: read-only imported storage on the owner's panel, scan completed, every provider's listing is the manifest, every file whole on the owner. A space the layout shares and the file does not is refused unsent |
-| After the providers' verdicts (step 6) and again after a start (section 7) | a control step on the owner's node: `hpcimport.mount_check_argv(bundle, workdir)` | exits 0 only when every listed tree, and every mount below it, is held with `ro` in the mount's own options by the service's container processes (the children of the starter `service.pid`'s supervisor started; nothing else of the account's on the node counts) |
+| Preflight (section 5, step 1) | `Driver.check_imports`: `hpcimport.shared_imports_of(layout, provider)` for every provider, then for each of `layout.shared_imports()` `Layout.import_source(space, environ)` and `Layout.import_manifest(space, environ)`, then `hpcimport.check_support(layout, environ)` | refuses an import a provider owns that is not shared (a writable one copies its tree into the root, and one not marked shared would leave the sharing out of the platform file the core checks), a variable that is unset, relative, with a `..` step or a link on the way, a source that is not a directory, a manifest that is not a file or lies in a tree, and a manifest of more bytes than the space's `support_bytes`; **and `[hpc] core = "step"`**: the node's `env -i` allowlist carries none of the variables, so the core's phase there cannot read a manifest. Nothing is submitted: no sbatch, no state file, no root |
+| A provider's service step (step 6) | `hpcimport.provider_import_args(layout, provider, environ)` appended to the `provider.sbatch` argv, after the peers | `--import=SPACE=PATH` per tree the provider owns; none for a mirror. The path travels as an argument and never in a step's environment (every step's `env -i` list is the same three names). The bundle checks each tree again on the node, makes the mountpoint in the rootfs and binds it `:ro` at every start of the service, a restart (section 7) included, since the list is in the work directory |
+| After every provider's verdict (step 6) | `Driver.check_mounts(provider)`, for each owner: a control step named `<allocation>-<provider>-mounts` on its node, `hpcimport.mount_check_argv(bundle, workdir, python=site.node_python)` | exits 0 only when every listed tree, and every mount below it, is held with `ro` in the mount's own options by the service's container processes (the children of the starter `service.pid`'s supervisor started; nothing else of the account's on the node counts). A failure fails `up` before the bootstrap starts any scan, naming the provider and the spaces and repeating only the check's own `FAIL: shared import <space>` lines. M4's `start` runs the same check after a start (section 7) |
+| The bootstrap (step 8) | `HpcBootstrap.import_storage_extra(service)` returns `hpcimport.import_storage_extra(uid, gid)`; `hpcboot.bring_up` calls `boot.ensure_import_storages()` between `ensure_spaces` and `ensure_support`, and `boot.wait_import(1800)` after the members | the imported storage is made with the job user's ids, the local LUMA feed and the canonical path type, and `fedboot` names it `import-<space>` and supports the space on it with the one-scan import configuration, as the Compose federation does; the scan is awaited, and one that failed or did not complete fails `up`. Both calls are the bootstrap's own no-ops for a layout with no import |
+| The bootstrap's LUMA step (step 8) | `HpcBootstrap.support` sends `hpcimport.luma_requests(storage_id, space_id, member_ids, uid, gid)` for the storage `storage_for(service, space)` returns | the space's default credentials on **that storage**, and each member's mapping on it once per (provider, storage): an owner of an imported space has two storages. A user mapping that is already there is read back and must name the job's uid |
+| After `platform.toml` is rendered (step 9), before the link check | `fedimport.verify_imports(layout, environ, timeout_s=1800)`, inside `hpcboot.core_phase` | the core's `ImportedSpace.provision` over the rendered file: read-only imported storage on the owner's panel, scan completed, every provider's listing is the manifest, every file whole on the owner. A space the layout shares and the file does not is refused unsent, so a template that leaves `shared = true` out fails `up` before the link check runs |
+| With the rendered file (step 9) | `hpcimport.direct_storages(layout, boot.ids.storages, environ)` fills `@hpc_direct_storages@` | an inline TOML table of each `direct_io` import's storage id to its tree's directory, `{}` when none declares one, for a template's `[sandbox.mount] storages` (M5 is its consumer; no template names it yet). The file that holds the host's paths is the root's own, never committed |
 
-Two things the contract did not say, which M3 relies on and M1's code must keep: **the storage a support names is
+Two things the contract did not say, which the driver keeps and the tests pin: **the storage a support names is
 found by name** (`import-<space>` for the owner of an imported space, the provider's regular one for every other
 support; never the first the panel lists), and **`platform.toml`'s template repeats each `import` declaration** with
 `shared = true`, so the core, which reads the file and not the layout, can refuse a storage that is not read-only.
-`direct_io` is read by the sandbox milestone: `hpcimport.direct_storages(layout, storage_ids, os.environ)` is the
-`[sandbox.mount.storages]` it needs.
+`direct_io` is read by the sandbox milestone.
+
+**Not built, and what would build it.** `[hpc] core = "step"` with a shared import: the variables would travel to the
+core's step as arguments (`hpcfed.py core --import-env NAME=VALUE`, the way `--import=SPACE=PATH` reaches a provider)
+rather than in the allowlist; a first live slot that finds the login node cannot reach the services' 8443 (section 9,
+assumption 1) is what would need it. The scan is also awaited inside the core's phase, so on `core = "step"` the
+core's bound (5,400 s) would have to cover it.
 
 **The agent's node S (M5).** The campaign's dispatcher runs as one step on S, launched from the login node like any
 step here; the gate is on S's loopback and every cell a local `apptainer exec` on S, so S hosts no Onedata service.

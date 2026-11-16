@@ -151,8 +151,10 @@ repository.
 A space can be held on a directory of the cluster's shared filesystem that other federations import too, so several
 federations serve one dataset with no copy of it and each run's data is the same bytes. The tree is **read-only in every
 federation**; this section is what the bundle does for that, and `../../docs/storage-import.md`, "A tree on the
-cluster's shared filesystem", is why. `layouts/shared-import.toml` declares it (invented names), `DESIGN.md` section 8
-says where the driver calls each step, and `site.env.example` names the two variables of each import.
+cluster's shared filesystem", is why. `layouts/shared-import.toml` declares it (invented names),
+`layouts/pilot-shape-import.toml` is the pilot's shape with its four data spaces imported this way (the ingest-based
+`layouts/pilot-shape.toml` stays the primary layout until a live slot shows the two equivalent), `DESIGN.md` section 8
+says where `hpcfed.py up` calls each step, and `site.env.example` names the two variables of each import.
 
 - **Declared** in the layout: `import = { readonly = true, shared = true, source_env, manifest_env }` on the space, and
   `direct_io = true` if the agent's mount reads the storage directly (a mode of the mount, which reads the storage of the
@@ -166,8 +168,9 @@ says where the driver calls each step, and `site.env.example` names the two vari
   directory. Nothing is created unless every tree passes. Then the service starts with `--bind PATH:/volumes/import/SPACE:ro`
   over an empty mountpoint of the rootfs, which is the one thing of the node's filesystems the container sees. A refusal
   names the space, never the path.
-- **Proven read-only by the kernel**: `python3.11 -I importstorage.py mounts --workdir <W>`, in a control step on the owner's
-  node once the service is up, reads the mount table of this service's container processes (the children of the starter
+- **Proven read-only by the kernel**: `python3.11 -I -B importstorage.py mounts --workdir <W>`, which `hpcfed.py up` runs
+  in a control step on each owner's node once every provider is up (the node's Python is `HPCOP_PY`; a failure fails
+  `up` before the bootstrap starts any scan), reads the mount table of this service's container processes (the children of the starter
   its supervisor, named by `service.pid`, started, so another service of the account on the node is not counted),
   prints per space how many hold the mount, or one below it, read-only and how many writable, and exits 0 only when each
   space is held and none writable. It attempts no write: a write probe is the first thing that
@@ -278,8 +281,9 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
 with `[hpc] core = "step"`, that the core's Python from a venv on the shared filesystem runs on a node); the two
 batch scripts as `--exact` steps of a multi-node job; the bootstrap's panel calls through 8443 with the LUMA local
 feed's mappings; the submit read-back's fields as the site's Slurm prints them; and the ten pairs passing over the
-cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`); an imported
-space (M3) and the agent's node's step (M5) are not built here.
+cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`), which also
+repeats the mount check after a `start`; the agent's node's step (M5) is not built here. A layout with a shared import
+is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
 ## The scripts
 

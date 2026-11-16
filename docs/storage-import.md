@@ -53,7 +53,7 @@ An HPC federation can hold a space on a directory of the cluster's shared filesy
 so several of them serve one dataset with no copy of it. The directory is declared in the layout and in `platform.toml`
 as **shared**, which means read-only everywhere, for every federation, always:
 
-- **The layout** (`deploy/hpc-federation/layouts/shared-import.toml`): `import = { readonly = true, shared = true,
+- **The layout** (`deploy/hpc-federation/layouts/shared-import.toml`, and `pilot-shape-import.toml` for the pilot's shape): `import = { readonly = true, shared = true,
   source_env = "EXPCORE_FED_IMPORT_...", manifest_env = "EXPCORE_FED_IMPORT_..._MANIFEST" }`, and optionally
   `direct_io = true`. The path and the manifest's file come from the two variables (`site.env`), never from the layout.
   `shared` with `readonly = false` is refused at load; a shared import without a manifest is refused; so are two spaces on
@@ -90,7 +90,7 @@ is one `stat` per entry per federation, and it is a live measurement, not a figu
 
 **Direct I/O** is a mode of the agent's mount, not of the storage: `[sandbox.mount] io_mode = "direct"` with the
 storage's id mapped to the tree's directory in `[sandbox.mount.storages]`. `direct_io = true` in the layout declares that
-this import is read that way, and `hpcimport.direct_storages` gives the mapping from the storage ids the bootstrap made;
+this import is read that way, and `hpcimport.direct_storages` gives the mapping from the storage ids the bootstrap made, which the HPC driver puts in the platform file as `@hpc_direct_storages@`;
 the mode in effect is shown per run by the record (O49), never by the layout. A direct mount reads the storage of the
 agent's own provider (`local` in the platform file; O40's start check reads a file that provider holds in full), so
 `direct_io` belongs on a space that provider owns: the layout has no `local`, and the platform template carries it. The
