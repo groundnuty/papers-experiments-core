@@ -2,9 +2,10 @@
 """Hook (c): the slot a mount data path plugs into on the Apptainer backend (O56).
 
 A mount run needs a host-side helper (oneclient, holding the mount's token) that the sandbox starts before the run's
-first cell and stops after its last. The mount's own lane builds it, with the detector of a cell's access to its
-process and its token file (`hostmount.host_mount_factory`); without one, a mount run is refused at its start
-(`MOUNT_REFUSED`).
+first cell and stops after its last. `hostmount.host_mount_factory` builds it, with the detector of a cell's access to
+its process and its token file (O60); without one, or without `[sandbox.mount]` in the platform's file, a mount run is
+refused at its start (`MOUNT_REFUSED`), and that refusal is what the run's `mount_refused` fact reports (`facts.py`).
+The shipped helper accepts proxy I/O only, and refuses a direct mount.
 
 The sandbox calls, in this order: the factory `(node, settings, spec, run_dir)` once the run's directory exists and
 before the gate, the collector's canary or any cell; `token_paths()`, the files of the run's directory that will hold
@@ -24,8 +25,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 MOUNT_REFUSED = (
-    "a mount data path is not available on the Apptainer backend yet: a cell would share the uid of the oneclient "
-    "that holds the mount's token, and the mount's helper and its detector are still to land (hook c)"
+    "a mount data path on the Apptainer backend needs the mount's helper (given as mount_helper=, "
+    "host_mount_factory()) and [sandbox.mount] in the platform's file: this sandbox lacks one of them"
 )
 
 
