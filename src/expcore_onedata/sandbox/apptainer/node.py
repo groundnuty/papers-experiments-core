@@ -17,7 +17,6 @@ import ctypes
 import os
 import platform
 import signal
-import socket
 import subprocess
 import threading
 from collections.abc import Collection, Mapping, Sequence
@@ -27,6 +26,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.apptainer import loopback
 from expcore_onedata.sandbox.apptainer import procs as P
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, mounts_under, run_bounded
 
@@ -339,9 +339,7 @@ class LocalNode:
             return None
 
     def free_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            return int(probe.getsockname()[1])
+        return loopback.free_port()
 
     def make_ca(self, directory: Path, names: Sequence[str]) -> None:
         DockerHost(sudo_command=()).make_ca(directory, names)  # openssl only, as this uid
