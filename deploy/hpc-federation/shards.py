@@ -6,6 +6,7 @@
         --results DIR --core-src DIR                    # inside the step on the sandbox node; `lines` writes it
     uv run python deploy/hpc-federation/shards.py collect --manifest shards.toml --into DIR [--run]
     <python> -I deploy/hpc-federation/shards.py step ... --archive-left  # an out/ a step could not archive
+    # a step's line may end in: --pre-step REL --pre-step-sha256 HEX --pre-step-timeout S  (`lines` writes them)
     <node python> -I deploy/hpc-federation/shards.py sweep --tmpfs DIR --root ROOT  # hpcfed.py down runs it
 
 **Where the dispatcher runs.** One shard runs per federation, as one job step on that federation's sandbox node: the
@@ -37,6 +38,25 @@ its federation's `platform.toml` declares it (`data_manifest`, which `up` render
 space's Onezone id, which every federation's `up` makes anew, and the shards never merge. So `plan` and `lines` refuse
 a manifest of more than one federation whose platform files leave a space's data undeclared, naming each shard and
 space, before anything runs.
+
+**The study's own refusals: a pre-step guard.** A study that refuses a campaign it must not run (one worker, each
+model's cap exactly 1, a federation of its own) can have every step assert that again at its start, before anything is
+made. The manifest's `pre_step` names a script of the study, a path relative to the study's root: refused when it is
+absolute, has an empty, `.` or `..` part, or leads through a link (a part, or the file itself), is not a regular file or
+is over 1 MiB. `plan` and `lines` read it and record its SHA-256 (`plan` prints it with the guard's path and bound) and
+each line carries `--pre-step REL --pre-step-sha256 HEX --pre-step-timeout S`; no line is made from a plan that has not
+pinned it, and with no `pre_step` the line and the `plan` output are what they were. `step` does this before anything
+else, before the core check, before a `--resume` removes a killed step's directory, and before it makes the sandbox's
+work root, its own directory, the journals or an archive: it opens the guard part by part below `--study` (no link
+followed), refuses a file whose SHA-256 is not the one on its line, and runs those same bytes, never the file read
+again, as `<python> -I - <label> <study>/campaign.toml` (the script on the interpreter's stdin) with the study's root,
+`--study` (the stamped copy, since its tmpfs copy does not exist yet), as its working directory, in an environment of
+`ALLOWLIST` and the step's home below a path nobody can make, and in a session of its own, killed with everything it
+started when it does not end within `pre_step_timeout_s` (60 s by default, above 0 and at most 600). A non-zero exit, a
+signal, a timeout, a hash mismatch or a guard that cannot be read refuses the step with `PRE_STEP_REFUSED` (73), naming
+the guard and why, and nothing is made. A step that passes records `{path, sha256, exit_status}` as `pre_step` in
+its `step.json` and in its archive's manifest. The line carries the guard, so a line run as it was printed runs it; a
+hand-edited line that drops the three words runs without it, and `--archive-left`, which starts no work, ignores them.
 
 **The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
 records its step (`step.json`: its pid and start time, its shard, its federation's root, its results directory, the
@@ -98,6 +118,8 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     cpus = 6
     memory = "18g"
     snapshot_every_s = 900            # optional: seconds between snapshots of a running shard's out/ (also at run ends)
+    pre_step = "guards/pre_step.py"   # optional: a script of the study that each step runs first (see above)
+    pre_step_timeout_s = 60           # optional, with pre_step: its bound in seconds (above 0, at most 600)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
     root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml
@@ -107,9 +129,12 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -122,7 +147,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -137,6 +162,11 @@ LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuse
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
+PRE_STEP_REFUSED = 73  # the study's pre-step guard refused the step, or could not be run as declared: nothing made
+PRE_STEP_TIMEOUT_S = 60.0  # a guard's bound when the manifest names none
+PRE_STEP_MAX_S = 600.0  # the longest bound a manifest may give a guard
+PRE_STEP_MAX_BYTES = 1 << 20  # a guard script is at most this long
+CAMPAIGN = "campaign.toml"  # the study's stamped campaign file: the guard's second argument
 CHUNK = 1 << 20
 SNAPSHOT_EVERY_S = 900.0  # a running shard's out/ is snapshotted this often, and after each run's end
 POLL_S = 30.0  # how often the snapshot thread looks for a run's end in the store
@@ -201,6 +231,9 @@ class Plan:
     memory: str
     shards: tuple[Shard, ...]
     snapshot_every_s: float = SNAPSHOT_EVERY_S
+    pre_step: str | None = None  # the study's pre-step guard: a path relative to its root
+    pre_step_sha256: str | None = None  # its SHA-256, recorded by `pinned` when `plan` and `lines` read it
+    pre_step_timeout_s: float = PRE_STEP_TIMEOUT_S
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -221,11 +254,21 @@ def load_plan(path: Path) -> Plan:
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
-    if not keys <= set(data) <= keys | {"snapshot_every_s"}:
-        raise ShardsError(f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps snapshot_every_s")
+    optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s"}
+    if not keys <= set(data) <= keys | optional:
+        raise ShardsError(
+            f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps {', '.join(sorted(optional))}"
+        )
     every = data.get("snapshot_every_s", SNAPSHOT_EVERY_S)
     if isinstance(every, bool) or not isinstance(every, int | float) or not 60 <= every < float("inf"):
         raise ShardsError("snapshot_every_s must be a number of seconds, at least 60")
+    if "pre_step" in data and (problem := guard_path_problem(data["pre_step"])):
+        raise ShardsError(f"pre_step {problem}")
+    if "pre_step_timeout_s" in data and "pre_step" not in data:
+        raise ShardsError("pre_step_timeout_s is the bound of a pre_step, which the manifest does not declare")
+    bound = data.get("pre_step_timeout_s", PRE_STEP_TIMEOUT_S)
+    if problem := bound_problem(bound):
+        raise ShardsError(f"pre_step_timeout_s {problem}")
     for key in ("study", "core_src", "results", "tmpfs"):
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
@@ -249,7 +292,7 @@ def load_plan(path: Path) -> Plan:
         raise ShardsError("a label is given to two shards")
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
-                float(every))  # fmt: skip
+                float(every), data.get("pre_step"), None, float(bound))  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -334,12 +377,81 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
             "--count", str(shard.count), "--label", shard.label, "--tmpfs", str(plan.tmpfs),
             "--results", str(plan.results), "--core-src", str(plan.core_src),
             "--snapshot-every", f"{plan.snapshot_every_s:g}"]  # fmt: skip
+    if plan.pre_step is not None:  # the study's guard rides on the line: `step` runs it first (`run_pre_step`)
+        if plan.pre_step_sha256 is None:
+            raise ShardsError(
+                "the pre-step guard is not pinned: no line is made from a plan that has not recorded its hash"
+            )
+        step += ["--pre-step", plan.pre_step, "--pre-step-sha256", plan.pre_step_sha256,
+                 "--pre-step-timeout", f"{plan.pre_step_timeout_s:g}"]  # fmt: skip
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
         f"--mem={plan.memory}", "-J", f"{fed['name']}-shard-{shard.index}", "--export=PATH",
         "/usr/bin/env", "-i", *env, *step,
     ]  # fmt: skip
+
+
+# ------------------------------------------------------------------------------------------------ the pre-step guard
+def guard_path_problem(path: Any) -> str | None:
+    """Why `path` cannot name a file of the study (a plain relative path: no empty, `.` or `..` part), or None."""
+    if isinstance(path, bool) or not isinstance(path, str) or not path or "\0" in path:
+        return "must be a path, a string, relative to the study's root"
+    if path.startswith("/"):
+        return "must be relative to the study's root, never absolute"
+    if any(part in ("", ".", "..") for part in path.split("/")):
+        return "must name a file inside the study: no empty, `.` or `..` part"
+    return None
+
+
+def bound_problem(bound: Any) -> str | None:
+    """Why `bound` is not a guard's bound (seconds above 0 and at most `PRE_STEP_MAX_S`), or None."""
+    if isinstance(bound, bool) or not isinstance(bound, int | float) or not 0 < bound <= PRE_STEP_MAX_S:
+        return f"must be a number of seconds above 0 and at most {PRE_STEP_MAX_S:g}"
+    return None
+
+
+def read_guard(study: Path, path: str) -> bytes:
+    """The bytes of the study's guard `path`: each part opened with `O_NOFOLLOW` from the directory before it, so that a
+    link anywhere on the way, or a part swapped for one after a check, never leads out of the study; a regular file of
+    at most `PRE_STEP_MAX_BYTES`. `ShardsError` naming the guard otherwise, never the study's own path."""
+    name = f"pre-step guard {path}"
+    if problem := guard_path_problem(path):
+        raise ShardsError(f"{name} {problem}")
+    parts, fd = path.split("/"), -1
+    try:
+        fd = os.open(study, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        for n, part in enumerate(parts):
+            last = n == len(parts) - 1  # the file itself may be a FIFO that blocks: never waited on, and refused below
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_NONBLOCK if last else os.O_DIRECTORY)
+            below = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = below
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ShardsError(f"{name} is not a regular file")
+        chunks, size = [], 0
+        while chunk := os.read(fd, CHUNK):
+            size += len(chunk)
+            if size > PRE_STEP_MAX_BYTES:
+                raise ShardsError(f"{name} is over {PRE_STEP_MAX_BYTES} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as error:
+        why = {errno.ENOENT: "it does not exist", errno.ELOOP: "it is, or lies behind, a link",
+               errno.ENOTDIR: "a part of its path is a link or not a directory"}  # fmt: skip
+        raise ShardsError(f"{name} cannot be read: {why.get(error.errno, type(error).__name__)}") from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def pinned(plan: Plan) -> Plan:
+    """The plan with its pre-step guard's SHA-256 recorded, from the study as it is now (`plan` and `lines` call it, so
+    that a guard that leaves the study, is a link or is missing refuses them before a line is printed; `collect` never
+    reads it). The same plan when none is declared."""
+    if plan.pre_step is None:
+        return plan
+    return replace(plan, pre_step_sha256=hashlib.sha256(read_guard(plan.study, plan.pre_step)).hexdigest())
 
 
 # ------------------------------------------------------------------------------------------------ archives
@@ -361,8 +473,11 @@ def _write_whole(path: Path, write: Callable[[Path], None]) -> None:
     os.replace(draft, path)
 
 
-def archive(out: Path, results: Path, spec: Mapping[str, Any], exit_status: int) -> dict[str, Any]:
-    """Write `out/` whole to `<results>/<label>.out.tar` and its manifest; the manifest, as written."""
+def archive(
+    out: Path, results: Path, spec: Mapping[str, Any], exit_status: int, pre_step: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Write `out/` whole to `<results>/<label>.out.tar` and its manifest; the manifest, as written. `pre_step`, the
+    record of the guard the step ran (`run_pre_step`), is in it only when there is one."""
     label = str(spec["label"])
     tar_path = results / f"{label}.out.tar"
     files = sum(1 for p in out.rglob("*") if p.is_file() and not p.is_symlink())
@@ -381,6 +496,7 @@ def archive(out: Path, results: Path, spec: Mapping[str, Any], exit_status: int)
         "files": files,
         "lock": (out / LOCK_NAME).is_file(),
         "exit_status": exit_status,
+        **({"pre_step": dict(pre_step)} if pre_step is not None else {}),
     }
     _write_whole(results / f"{label}.out.json", lambda d: d.write_text(json.dumps(manifest, sort_keys=True) + "\n"))
     return manifest
@@ -876,7 +992,8 @@ def archive_left(args: argparse.Namespace) -> int:
         raise ShardsError(f"shard {args.label}: {left.path.name} holds no out/")
     settle_store(out)
     status = left.owner.get("exit_status", (left.failed or {}).get("exit_status", 1))
-    manifest = archive(out, args.results, spec, int(status))
+    guard = left.owner.get("pre_step")  # the guard that step ran; this one starts no work and runs none
+    manifest = archive(out, args.results, spec, int(status), guard if isinstance(guard, Mapping) else None)
     remove_tree(left.path)
     print(f"shards: shard {args.label}'s kept out/ archived: {manifest['files']} files, sha256 {manifest['sha256']}")
     return 0
@@ -927,6 +1044,81 @@ def _ended(work: Path, status: int) -> bool:
     return True
 
 
+class PreStepRefused(Exception):
+    """The study's pre-step guard refused the step, or could not be run as declared; the message names the guard."""
+
+
+def pre_step_env() -> dict[str, str]:
+    """The guard's environment: the step's allowlist as this step was given it, and the home its line gives (below a
+    path nobody can make: its own directory does not exist yet), nothing else."""
+    return {k: os.environ[k] for k in ALLOWLIST if k in os.environ} | home_env(NO_HOME)
+
+
+def run_guard(source: bytes, args: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float) -> int | None:
+    """Run a guard's `source` as this interpreter's `-I -` (its script on its stdin) with `args`, in `cwd`, in a session
+    of its own, and return its exit status (negative for a signal). None when it did not end within `timeout`
+    seconds: it and everything it started are killed. Its stdout and stderr are this step's."""
+    child = subprocess.Popen([sys.executable, "-I", "-", *args], stdin=subprocess.PIPE, env=dict(env), cwd=cwd,
+                             start_new_session=True)  # fmt: skip
+    try:
+        child.communicate(source, timeout=timeout)
+        return child.returncode
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        if child.poll() is None:  # overrun, or this step is ending: nothing the guard started outlives it
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+
+
+def run_pre_step(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The step's first act (the module's docstring): None when its line declares no guard, else the record
+    `{path, sha256, exit_status: 0}` of the guard that passed. `PreStepRefused`, naming the guard and why, for a
+    declaration that is incomplete or not a plain path of the study, a file that cannot be read or is not the one the
+    plan hashed, a study with no campaign.toml of its own, a guard that cannot start, does not end in its bound or does
+    not exit 0. It runs the bytes it hashed, in the study's root, given the shard's label and campaign.toml's path."""
+    path, wanted, bound = (getattr(args, key, None) for key in ("pre_step", "pre_step_sha256", "pre_step_timeout"))
+    if path is None:
+        if wanted is not None or bound is not None:
+            raise PreStepRefused("--pre-step-sha256 and --pre-step-timeout belong to a --pre-step, not given")
+        return None
+    name = f"pre-step guard {path}"
+    if problem := guard_path_problem(path):
+        raise PreStepRefused(f"{name} {problem}")
+    if not isinstance(wanted, str) or not re.fullmatch(r"[0-9a-f]{64}", wanted):
+        raise PreStepRefused(f"{name} has no SHA-256 from the plan: --pre-step-sha256 is 64 hex digits")
+    bound = PRE_STEP_TIMEOUT_S if bound is None else bound
+    if problem := bound_problem(bound):
+        raise PreStepRefused(f"{name}: --pre-step-timeout {problem}")
+    study = Path(os.path.abspath(args.study))
+    try:
+        source = read_guard(study, path)
+    except ShardsError as error:
+        raise PreStepRefused(str(error)) from None
+    digest = hashlib.sha256(source).hexdigest()
+    if digest != wanted:
+        raise PreStepRefused(f"{name} is not the file the plan hashed: its sha256 is {digest}, the plan's {wanted}")
+    campaign = study / CAMPAIGN
+    try:
+        found = stat.S_ISREG(os.lstat(campaign).st_mode)
+    except OSError:
+        found = False
+    if not found:
+        raise PreStepRefused(f"{name} cannot run: the study's {CAMPAIGN} is missing, a link or not a file")
+    try:
+        status = run_guard(source, [args.label, str(campaign)], study, pre_step_env(), bound)
+    except OSError as error:
+        raise PreStepRefused(f"{name} could not be started ({type(error).__name__})") from None
+    if status is None:
+        raise PreStepRefused(f"{name} did not end within {bound:g} s: it was killed")
+    if status < 0:
+        raise PreStepRefused(f"{name} refused the step: it was killed by signal {-status}")
+    if status != 0:
+        raise PreStepRefused(f"{name} refused the step: exit status {status}")
+    return {"path": path, "sha256": digest, "exit_status": status}
+
+
 def step(
     args: argparse.Namespace,
     *,
@@ -936,7 +1128,16 @@ def step(
 ) -> int:
     """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
     status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
-    end, into `<results>/<label>/snapshots/`."""
+    end, into `<results>/<label>/snapshots/`. Its first act is the study's pre-step guard, when its line declares one
+    (`run_pre_step`): nothing is made, removed or read before it, and `PRE_STEP_REFUSED` ends a step it refuses."""
+    try:
+        guard = run_pre_step(args)
+    except PreStepRefused as error:
+        print(f"shards: ERROR: {error}; the step is refused, with nothing made", file=sys.stderr)
+        return PRE_STEP_REFUSED
+    if guard is not None:
+        print(f"shards: pre-step guard {guard['path']} (sha256 {guard['sha256']}) passed for shard {args.label}",
+              file=sys.stderr)  # fmt: skip
     if not core_found(args.core_src):
         print("shards: ERROR: this interpreter does not import the core from --core-src", file=sys.stderr)
         return CORE_MISMATCH
@@ -970,7 +1171,7 @@ def step(
         work.chmod(0o700)
         owner = {"format": OWNER_FORMAT, "shard": spec, "pid": os.getpid(), "start": _start_of(os.getpid()),
                  "root": os.environ.get("EXPCORE_FED_ROOT"), "results": str(args.results), "base": base,
-                 "phase": RUNNING}  # fmt: skip
+                 "phase": RUNNING, **({"pre_step": guard} if guard is not None else {})}  # fmt: skip
         (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
         (work / OWNER_ENDING).write_text(json.dumps({**owner, "phase": ARCHIVING}, sort_keys=True) + "\n", "utf-8")
         copy = work / "study"
@@ -1012,7 +1213,7 @@ def step(
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
             return status
         try:
-            manifest = archive(out, args.results, spec, status)
+            manifest = archive(out, args.results, spec, status, guard)
         except (OSError, tarfile.TarError) as error:  # the only whole out/ is the tmpfs copy: kept, never removed
             keep = True
             mark = {"shard": spec, "exit_status": status, "error": type(error).__name__}
@@ -1046,6 +1247,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--resume", action="store_true")
     one.add_argument("--archive-left", dest="archive_left", action="store_true")
     one.add_argument("--snapshot-every", dest="snapshot_every", type=float, default=SNAPSHOT_EVERY_S)
+    one.add_argument("--pre-step", dest="pre_step", default=None)  # the study's guard: `lines` writes all three
+    one.add_argument("--pre-step-sha256", dest="pre_step_sha256", default=None)
+    one.add_argument("--pre-step-timeout", dest="pre_step_timeout", type=float, default=None)
     left = sub.add_parser("sweep")
     left.add_argument("--tmpfs", type=Path, required=True)
     left.add_argument("--root", required=True)
@@ -1066,11 +1270,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"a campaign on {len(plan.shards)} federations is one only where each declares every space's data "
                 f"(data_manifest in its platform.toml, C06); undeclared: {'; '.join(missing)}"
             )
+        plan = pinned(plan)  # the guard read and hashed before any line is printed
         script = Path(__file__).resolve()
         for shard in plan.shards:
             fed = federation(shard)
             line = step_argv(plan, shard, fed, script)
-            print(json.dumps({"shard": shard.label, "argv": line}) if args.command == "plan" else shlex.join(line))
+            record = {"shard": shard.label, "argv": line}
+            if plan.pre_step is not None:
+                record["pre_step"] = {"path": plan.pre_step, "sha256": plan.pre_step_sha256,
+                                      "timeout_s": plan.pre_step_timeout_s}  # fmt: skip
+            print(json.dumps(record) if args.command == "plan" else shlex.join(line))
         return 0
     except ShardsError as error:
         print(f"shards: ERROR: {error}", file=sys.stderr)

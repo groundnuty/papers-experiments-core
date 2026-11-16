@@ -574,6 +574,17 @@ the root's `platform.toml` beside the study's `study.toml`. The driver holds, re
 facts step there, and in `down` the sweep of its tmpfs (`shards.py sweep`: each shard step's directory of this
 federation whose step is gone), then releases it.
 
+**The study's pre-step guard (a script of the study, run first by the step).** A study's own refusals (one worker,
+every planned model's cap 1, a federation root of its own) must hold at every shard's start, and `step` makes the work
+root and its tmpfs directory itself, so they cannot be checked from the study's plugin, which runs later, nor from a
+wrapper, which a line run directly skips. The manifest's `pre_step` (a path relative to the study's root, with its
+bound `pre_step_timeout_s`) is hashed by `plan` and `lines` and rides on every line as `--pre-step`,
+`--pre-step-sha256` and `--pre-step-timeout`. `step` runs it before anything else: the bytes it hashed, as
+`<python> -I - <label> <study>/campaign.toml`, from the stamped study's root (the tmpfs copy is not made yet), under
+the step's allowlist and no-home variables, in a session of its own with a bound. A refusal ends the step with 73 and
+nothing made; a pass is recorded in `step.json` and the archive's manifest. `--archive-left` runs none: it starts no
+work.
+
 ## 9. Assumptions a live slot verifies first
 
 1. **The login node reaches every service's 8443** on the nodes' FQDNs. The bootstrap, the link check and the core's

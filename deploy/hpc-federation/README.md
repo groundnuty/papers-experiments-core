@@ -450,6 +450,38 @@ dispatcher ended and whose `out/` was not archived (exit 75, or killed before th
 `--resume` refuses while it is there, and `shards.py step ... --archive-left` archives it with the same manifest and that
 step's exit status, then removes it, unless an archive was published after that step started.
 
+**The study's own refusals: a pre-step guard.** A study that refuses a campaign it must not run (one worker, each
+planned model's cap exactly 1, a federation root of its own) can have every shard step assert that again, from its
+stamped `campaign.toml`, before the step makes anything. The manifest declares one script of the study:
+
+    pre_step = "guards/pre_step.py"   # a path relative to the study's root
+    pre_step_timeout_s = 60           # optional, with pre_step: above 0, at most 600 (60 by default)
+
+`shards.py plan` and `lines` read the file and record its SHA-256 (`plan` prints `{path, sha256, timeout_s}` as
+`pre_step` beside each line), and each line then ends in `--pre-step REL --pre-step-sha256 HEX --pre-step-timeout S`.
+They refuse a path that is absolute, has an empty, `.` or `..` part, or goes through a link, a file that is a link, is
+not a regular file, is missing or is over 1 MiB, printing nothing; a plan that has not pinned the guard makes no line.
+`collect` never reads it. With no `pre_step` the lines and the plan are what they were, word for word.
+
+`step` runs the guard first, before the core check, before a `--resume` removes a killed step's directory, and before
+it makes the sandbox's work root, its own directory on the tmpfs, the journals or an archive. It opens the guard part
+by part below `--study` with no link followed, refuses a file whose SHA-256 is not the one on the line, and runs those
+bytes, never the file read a second time: `<python> -I - <label> <study>/campaign.toml`, the script on the
+interpreter's stdin, so the guard's `sys.argv[1:]` is the shard's label and the path of the stamped `campaign.toml`.
+It runs with `-I`, the same interpreter as the step, in the study's root (`--study`, the stamped copy: the step's tmpfs
+copy does not exist yet), in an environment of the step's allowlist (`PATH`, `LC_ALL`, `EXPCORE_FED_ROOT_PARENT`,
+`EXPCORE_FED_ROOT`) and the step's no-home variables and nothing else, and in a session of its own, killed with
+everything it started when it does not end within its bound. Its stdout and stderr are the step's. A non-zero exit, a
+signal, a timeout, a hash that is not the plan's or a guard that cannot be read refuses the step with exit status 73
+(`PRE_STEP_REFUSED`), naming the guard and why, and leaves nothing made. A step that passes records
+`pre_step: {path, sha256, exit_status}` in its `step.json` and in its archive's manifest (`<label>.out.json`).
+
+The guard rides on the generated line, so running a line directly runs it; nothing in `lines` skips it. What it does
+not cover: a line edited by hand to drop the three `--pre-step` words runs without it, and `step --archive-left`, which
+starts no work and makes no directory, ignores them, so a refusing guard cannot strand the only whole `out/` of a step
+(the archive carries the record of the guard that step ran). The guard is the study's own code, hashed as it was when
+the plan was made; it is not a sandbox, and it asserts only what its own file reads.
+
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into
 `<results>/<label>/snapshots/` every `snapshot_every_s` seconds (a manifest key, 900 by default, at least 60) and after
