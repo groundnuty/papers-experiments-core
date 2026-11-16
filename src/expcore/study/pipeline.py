@@ -864,7 +864,8 @@ def _holm_entries(result: AnalysisResult) -> dict[str, Any]:
     only for several named families (S17), `holm_families`, each family's name, members, steps and equivalence
     decisions. One flat family gets no such key, so its analysis.json is the one it was before families were named.
     Only for declared equivalence families (S18), `equivalence_families`: each one's name, members and steps over
-    their TOST p-values; a study that declares none keeps its analysis.json byte for byte."""
+    their TOST p-values; a study that declares none keeps its analysis.json byte for byte. A sensitivity analysis
+    (egress, the mount guard, both) holds the same entries of its own result beside its `left_out` and `contrasts`."""
     entries: dict[str, Any] = {"holm": result.holm}
     if result.holm_families:
         entries["holm_families"] = result.holm_families
@@ -903,7 +904,8 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
 def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch checked for egress (#179): each analysed run's verdict (its flags, its
     log's state and reasons, its outside destinations by address and port, its static-scan hits) and the sensitivity
-    analysis without the flagged runs, or why there is none."""
+    analysis without the flagged runs (its Holm decisions and, as the primary analysis's, its named and equivalence
+    families, S17 and S18), or why there is none."""
     sensitivity = egress.sensitivity
     return {
         "counts": egress.counts(),
@@ -925,7 +927,7 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in egress.flagged], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": egress.refused,
     }  # fmt: skip
 
@@ -948,7 +950,7 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guard.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guard.refused,
     }  # fmt: skip
 
@@ -968,7 +970,7 @@ def _guards_summary(guards: GuardsAnalysis) -> dict[str, Any]:
         "sensitivity": None
         if sensitivity is None
         else {"left_out": [run.run_key for run in guards.left_out], "contrasts": sensitivity.contrasts,
-              "holm": sensitivity.holm},
+              **_holm_entries(sensitivity)},
         "sensitivity_refused": guards.refused,
     }  # fmt: skip
 
