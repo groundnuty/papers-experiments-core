@@ -102,6 +102,32 @@ def test_c11_a_declaration_from_a_listed_module_is_read_as_before(tmp_path):
         pass
 
 
+def test_c11_a_listed_module_that_answers_for_another_platform_covers_that_platforms_bounds(tmp_path):
+    """C11: a study may list a module of its own that re-exports a platform's function, so the bounds name the
+    platform's module and not the listed one's. What a listed module answers names the module it speaks for, and
+    that module is covered: the campaign starts. A listed module that answers nothing covers nothing."""
+    registry = [PlatformDeferral("study_platform", BOUND)]
+    with build(
+        tmp_path / "covered",
+        health=Declaring(BOUND),
+        admission=Platform(BOUND),
+        platform_deferrals=registry,
+        listed_platforms=("study_platform",),
+        settings=ENOUGH,
+        plan=SMALL,
+    ):
+        pass
+    with pytest.raises(ConfigError, match=PLATFORM):
+        build(
+            tmp_path / "silent",
+            health=Declaring(BOUND),
+            platform_deferrals=[PlatformDeferral("study_platform", None)],
+            listed_platforms=("study_platform",),
+            settings=ENOUGH,
+            plan=SMALL,
+        )
+
+
 @pytest.mark.parametrize(
     "bound",
     [None, DeferralBound(4700.0, "a heal"), DeferralBound(0.0, "nothing to wait for", platform=PLATFORM)],

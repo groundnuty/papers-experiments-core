@@ -175,7 +175,10 @@ class Scheduler:
         declared = deferral_bound(admission, DECLARED_HOOK, ADMISSION_OWNER) if asked else None
         reported = deferral_bound(health) if health is not None else None
         if listed_platforms is not None:  # the study's own list: a platform used with a deferral must be listed (C11)
-            self._check_listed(declared, reported, frozenset(listed_platforms))
+            # a listed module speaks for the platforms its answers name (one of the study's own may re-export a platform's
+            # function, so its bounds name the platform's module and not its own)
+            speaks = {p.bound.platform for p in platform_deferrals if p.bound is not None and p.bound.platform}
+            self._check_listed(declared, reported, frozenset(listed_platforms) | speaks)
         if health is not None:  # the platform's own wait must fit under max_defer_s
             self._check_deferral(health, declared, reported, tuple(platform_deferrals))
         exclusive = [name for name, value in schema.exclusive.items() if value]

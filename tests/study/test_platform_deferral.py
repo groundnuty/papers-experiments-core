@@ -35,6 +35,9 @@ def {PLATFORM_HOOK}(path):
     return DeferralBound(float(seconds), "the toy platform's heal: lower heal_timeout_s", rechecks=0, checks=0)
 '''
 UNHOOKED = "# a platform that registers nothing and declares nothing\n"
+ORIGINAL = "toy_original_platform.kinds"  # the module a re-exporting platform module of the study speaks for
+REEXPORTING = HOOKED.replace("rechecks=0, checks=0)", f"rechecks=0, checks=0, platform={ORIGINAL!r})")
+SILENT = f"def {PLATFORM_HOOK}(path):\n    return None\n"
 # What a study's plugin adds to wrap the platform's health check, and its run admission, in objects of its own.
 WRAPPING = '''
 
@@ -433,3 +436,25 @@ def test_c11_a_study_whose_platform_declares_no_deferral_from_a_module_is_unaffe
     the study left out: it runs without listing any."""
     study = stamped(study_with(tmp_path / "s", platform=None), carrying(WRAPPING, True), MAX_DEFER)
     assert set(run_study(study).statuses) == {"done"}
+
+
+def test_c11_a_study_listing_a_module_that_speaks_for_the_platform_its_check_declares_from_runs(tmp_path, monkeypatch):
+    """C11: the study lists a module of its own that re-exports the platform's function, so the bounds name the
+    platform's module and not the listed one; what the listed module answers names the module it speaks for, which is
+    covered, and the campaign runs. A listed module that answers nothing covers nothing: the study is refused."""
+    speaks = platform_module(tmp_path / "a", monkeypatch, REEXPORTING)
+    silent = platform_module(tmp_path / "b", monkeypatch, SILENT)
+    covered = stamped(
+        study_with(tmp_path / "covered", speaks, platform="deferral_s = 4000\n"),
+        carrying(WRAPPING, True, platform=ORIGINAL),
+        MAX_DEFER,
+    )
+    assert set(run_study(covered).statuses) == {"done"}
+    uncovered = stamped(
+        study_with(tmp_path / "uncovered", silent, platform="deferral_s = 4000\n"),
+        carrying(WRAPPING, True, platform=ORIGINAL),
+        MAX_DEFER,
+    )
+    with pytest.raises(ConfigError, match=ORIGINAL):
+        run_study(uncovered)
+    assert not (uncovered / "out" / "state.sqlite").exists()
