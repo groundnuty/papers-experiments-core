@@ -411,8 +411,9 @@ serves both:
 - **storages are found by name**, never by place in a list: finish.sh's `posix-local` for a provider's support, and
   `import-<space>` for an owner's support of an imported space (M3: such an owner has two); the LUMA mappings are
   made on the storage the support names;
-- `[faults] journal = "fault-journal"`, when the template declares faults, so the link-check record lands in the root
-  (`linkrecord.record_path`);
+- `[faults] journal = "<root>/fault-journal"` in full (`@hpc_root@/fault-journal` in the template), when the template
+  declares faults, so the link-check record lands in the root (`linkrecord.record_path`) and a copy of the file beside a
+  study names the root's journal (`load_faults` refuses a relative one in a study directory);
 - `[faults]` for the HPC backend (M4's loader): `backend = "hpc"`, `stop_bound_s`, `journal`, `[faults.services]`
   naming every provider, and none of `compose_file`, `project`, `command` or `docker`, which that backend refuses;
   its defaults are `settle_timeout_s = stop_bound_s + 60`, `poll_s` 10 and `relay_wait_s` 30;
