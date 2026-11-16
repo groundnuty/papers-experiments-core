@@ -193,6 +193,24 @@ def test_r15_merge_still_refuses_a_temporary_file_that_is_not_the_one_the_record
     assert temporary.read_bytes() == wrong
 
 
+def test_r15_a_refused_merge_leaves_the_renames_it_finished_in_an_earlier_shard(
+    clean_environment, shard1, shard2, target, tmp_path
+):
+    """R15 (#304): a merge refused on shard 2 has already settled shard 1, which it replays first. The rename is what
+    `check` would have made, so it stays, and it is the only change: nothing is written to OUT."""
+    killed = copy_campaign(shard1, tmp_path, "killed")
+    placed, temporary = leave_under_temporary_name(killed)
+    bad = copy_campaign(shard2, tmp_path, "bad")
+    _, wrong = leave_under_temporary_name(bad)
+    changed_log(wrong)
+    errors = merge_error(clean_environment, target, killed, bad)
+    assert "shard 2 (shard-2)" in errors
+    assert "fail the replay check" in errors
+    assert placed.is_file()
+    assert not temporary.exists()
+    assert wrong.is_file()
+
+
 def test_r15_merge_removes_nothing_from_a_shard_it_cannot_prove_has_no_writer(
     clean_environment, shard1, shard2, target, tmp_path
 ):

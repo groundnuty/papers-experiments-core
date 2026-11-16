@@ -155,5 +155,5 @@ def _unsettled(left: Sequence[Settled]) -> str:
     return (
         f"; the merge did not settle {len(renames)} side file(s) that a kill left under a temporary name a record "
         f"names ({listed}), because the shard's out/ is read-only: make the shard's out/ writable (chmod -R u+w on "
-        "it) and merge again"
+        "it), or copy it to a disk that is, and merge again"
     )
