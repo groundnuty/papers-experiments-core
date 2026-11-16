@@ -330,9 +330,19 @@ class ApptainerSandbox:
         self.run_record()
         return self._mount.start()
 
+    def _served(self) -> dict[str, dict[str, Any]]:
+        """The names the gate serves, each with the URL's host and port it dials (`gaterun.hosts`):
+        `[sandbox.federation]`'s when the platform declares them (O69), else the URLs' own hosts. The cell sees these
+        names and no other."""
+        names = self.s.federation
+        declared = (names.zone, names.local_provider) if names is not None and names.zone is not None else None
+        if names is not None and declared is None:
+            raise SandboxError("[sandbox.federation] names no zone, which the REST data path's gate serves")
+        return gaterun.hosts(self.spec.zone, self.spec.provider, declared)
+
     def _start_gate(self) -> None:
         sp = self.spec
-        served = gaterun.hosts(sp.zone, sp.provider)
+        served = self._served()
         tls_dir, gate_dir = self.dir / "tls", self.dir / "gate"
         tls_dir.mkdir(mode=0o700)
         gate_dir.mkdir(mode=0o700)
@@ -369,6 +379,7 @@ class ApptainerSandbox:
         asked = json.loads(config.read_text(encoding="utf-8")).get(gaterun.PEER_CHECK_KEY) is True
         # in effect only when asked of a gate that has it, which refuses to start when it cannot make it (#317)
         self._meta["gate"] = {"port": self._gate_port, "hosts": len(served),
+                              "names": "declared" if self.s.federation is not None else "urls",  # whose, not which
                               "peer_uid_check": asked and gaterun.PEER_CHECK.is_file()}  # fmt: skip
 
     def _retire_gate(self) -> None:
@@ -422,7 +433,8 @@ class ApptainerSandbox:
         """The cell's files, its binds and its environment (`argv.py`)."""
         cell, sp = self.dir / "cell", self.spec
         rest = sp.mode is DataPathMode.REST
-        names = list(gaterun.hosts(sp.zone, sp.provider)) if rest else []
+        served = self._served() if rest else {}
+        names = list(served)
         preloads = [f"{AV.PRELOAD_DIR}/{n}.so" for n in range(len(self.app.preload))]
         layout.write_text(cell / "hosts", AV.hosts_text(names))
         layout.write_text(cell / "resolv.conf", AV.RESOLV_TEXT)
@@ -443,7 +455,8 @@ class ApptainerSandbox:
             layout.write_text(cell / "gate.json", AV.gate_info(self._gate_port, names))
             binds += [AV.Bind(cell / "ca.pem", CA_PATH), AV.Bind(cell / "gate.json", AV.GATE_INFO)]
             binds += [AV.Bind(bundle, path) for path, bundle in self._trust_bundles().items()]
-            env |= dict.fromkeys(ENV_CA_BUNDLES, CA_PATH) | {ENV_ZONE_HOST: sp.zone.host, ENV_VERIFY_SSL: "true"}
+            zone_name = next(name for name, host in served.items() if host["role"] == "onezone")  # the name it serves
+            env |= dict.fromkeys(ENV_CA_BUNDLES, CA_PATH) | {ENV_ZONE_HOST: zone_name, ENV_VERIFY_SSL: "true"}
             env |= {ENV_TOKEN: self.s.placeholder_token, AV.GATE_PORT_ENV: str(self._gate_port)}
         if share is not None:
             binds.append(AV.Bind(share, self.s.mount.path))
@@ -688,7 +701,7 @@ class ApptainerSandbox:
         whether the data path is the agent's own HTTP to the gate."""
         rest = self.spec.mode is DataPathMode.REST
         gate = [(AV.LOOPBACK, self._gate_port)] if rest and self._gate_port else []
-        names = list(gaterun.hosts(self.spec.zone, self.spec.provider)) if rest else []
+        names = list(self._served()) if rest else []  # the names the agent's code was given, never the URLs' (O69)
         return declaration(gate, (AV.LOOPBACK, self._canary_port or 1), hosts=names, network_calls=rest)
 
     def egress_log(self) -> bytes | None:

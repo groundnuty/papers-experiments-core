@@ -473,6 +473,16 @@ Four things differ from Docker, and the record says so (`infrastructure_facts`):
 
 Names resolve as on Docker (`dns: none` in the record): the federation's names resolve from `/etc/hosts` and no other name resolves. A Docker agent's network is `--internal` with `--add-host` entries and no `--dns`, and measured on engine 29.2.1 the engine's embedded resolver answers every outside name with SERVFAIL at once. So the name lookup is no departure; the connect to an outside address is, as the network bullet says (on Docker it fails at once with ENETUNREACH).
 
+**Give a REST level on HPC the layout's names (O69).** Without more, a REST cell is given the hosts of the URLs of `[zone]` and the local provider, which on an HPC federation are the nodes' FQDNs on port 8443: site details that would reach the agent's environment, its `/etc/hosts`, the gate's certificates and any error text its client prints, and that differ from what a Compose agent sees. Declare the names in `[sandbox.federation]`, as on Docker but without `network`:
+
+```toml
+[sandbox.federation]                 # Apptainer: the names the gate serves the agent, on 443; a rest level is required
+zone = "zone.<layout domain>"
+providers.<local> = "<local>.<layout domain>"
+```
+
+The gate then serves and certifies those names on the cell's loopback, where the cell dials them on 443, and dials the URLs behind them. The record says `gate.names: declared`. The zone's scope answer still carries each provider's registered domain, which is the layout's name only where the provider registered it.
+
 Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
 
 On an HPC federation of `deploy/hpc-federation`, its shard driver does both for you (O63). The federation's `up` renders `[sandbox]` from the pilot's template with the SIF, the shim and their SHA-256s from `site.env`, checked before anything is held, and `shards.py step` runs your campaign on the agent's node with the federation's `platform.toml` copied beside your `study.toml` and the sandbox's work root made. So your plugin loads `platform.toml` from your study's own directory (beside `study.toml`), never from a path of the federation's, and only where it runs a campaign: `check`, `analyze` and `report` build your plugin on the login node, where your study has no such file. Never put a federation's path in `study.toml`: its hash is in the campaign fingerprint, and every shard's must be the same.
