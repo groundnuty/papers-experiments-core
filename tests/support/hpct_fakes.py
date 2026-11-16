@@ -70,7 +70,8 @@ def slurm(bin_dir: Path, fake: Path) -> None:
 
 
 def remote(bin_dir: Path, fake: Path) -> None:
-    """ssh runs the remote command with bash in $HOME; srun logs its options (up to /usr/bin/env) to fake/srun.argv and
+    """ssh runs the remote command with bash in $HOME; srun logs its options (up to /usr/bin/env) to fake/srun.argv,
+    the command after them (a multi-line word as <script>) to fake/srun.command, and
     runs the step's command, then sleeps on (an srun client that does not return) when fake/hang exists."""
     script(
         bin_dir / "ssh",
@@ -82,6 +83,8 @@ def remote(bin_dir: Path, fake: Path) -> None:
         '#!/bin/bash\nargs=("$@"); i=0\n'
         'while [ "$i" -lt "${#args[@]}" ] && [ "${args[$i]}" != /usr/bin/env ]; do i=$((i + 1)); done\n'
         f'printf \'%s\\n\' "${{args[@]:0:$i}}" -- >> "{fake}/srun.argv"\n'
+        'for a in "${args[@]:$i}"; do case "$a" in *$\'\\n\'*) echo "<script>" ;; *) echo "$a" ;; esac; done'
+        f' >> "{fake}/srun.command"\n'
         f'if [ -e "{fake}/hang" ]; then "${{args[@]:$i}}"; exec sleep 600; fi\n'
         'exec "${args[@]:$i}"\n',
     )
@@ -92,6 +95,11 @@ import json, os, sys
 args = sys.argv[1:]
 junit = next(a.split("=", 1)[1] for a in args if a.startswith("--junitxml="))
 fail = os.path.exists("fake-outcome-fail")
+if os.path.exists("fake-outcome-none"):  # a run that ran no test and still exits 0
+    with open(junit, "w") as out:
+        out.write('<testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0"/></testsuites>')
+    print("no tests ran in 0.01s")
+    sys.exit(0)
 print("env-keys: " + ",".join(sorted(os.environ)))
 print("args: " + json.dumps(args))
 with open(junit, "w") as out:
@@ -107,8 +115,12 @@ print("================ 2 passed, 1 skipped in 0.50s ================")
 """
 
 FAKE_UV = r"""
-import glob, os, subprocess, sys
+import glob, json, os, subprocess, sys
 args = sys.argv[1:]
+KEYS = ("HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_DATA_HOME", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR",
+        "UV_PYTHON_BIN_DIR")
+with open(LOG, "a") as log:
+    log.write(json.dumps({"args": args, "env": {k: os.environ.get(k) for k in KEYS}}) + "\n")
 if args == ["--version"]:
     print("uv 0.11.19 (stand-in)")
     sys.exit(0)
@@ -130,8 +142,9 @@ sys.exit(2)
 """
 
 
-def uv(path: Path) -> Path:
-    body = f"PYTHON = {sys.executable!r}\nFAKE_PYTEST = {FAKE_PYTEST!r}\n" + FAKE_UV
+def uv(path: Path, log: Path) -> Path:
+    """The stand-in uv; every call's arguments and the directories it was told to write in go to `log`."""
+    body = f"PYTHON = {sys.executable!r}\nFAKE_PYTEST = {FAKE_PYTEST!r}\nLOG = {str(log)!r}\n" + FAKE_UV
     return script(path, f"#!{sys.executable}\n{body}")
 
 

@@ -61,13 +61,13 @@ def world(tmp_path, monkeypatch):
         path.mkdir()
     fakes.slurm(bin_dir, fake)
     fakes.remote(bin_dir, fake)
-    uv = fakes.uv(tmp_path / "uv")
+    uv = fakes.uv(tmp_path / "uv", fake / "uv.jsonl")
     root = f"{BASE}/hpct-test-{secrets.token_hex(4)}"
     site = tmp_path / "site.env"
     site.write_text(
         f"HPCT_HOST=fake-login\nHPCT_NODE_ROOT={root}\nHPCT_UV={uv}\nHPCT_UV_VERSION=0.11.19\n"
         f"HPCT_OUT={tmp_path / 'out'}\n"
-        f"HPCT_WORK={tmp_path}\nHPCT_STEP_PATH=/usr/bin:/bin\nHPCT_ACCOUNT=acct-x\nHPCT_PARTITION=std-part\n"
+        f"HPCT_WORK={tmp_path}\nHPCT_STEP_PATH=/usr/bin:/bin:/opt/site-only/bin\nHPCT_ACCOUNT=acct-x\nHPCT_PARTITION=std-part\n"
     )
     site.chmod(0o600)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -233,3 +233,61 @@ def test_o64_the_boot_refuses_a_root_whose_filesystem_is_not_a_tmpfs_and_creates
     )
     assert b"HPCT-FAIL boot: the node root is not on a tmpfs" in out.stdout
     assert not Path(f"{root}-{os.getuid()}").exists()
+
+
+def test_o64_uv_git_and_pytest_on_the_node_write_under_the_run_directory_never_the_account_home(cli, world):
+    """O64: with HOME unset, uv falls back to the passwd entry's home, a shared filesystem (found live): every uv call
+    of a step is told to keep its cache, its Python and that Python's links under the node root, with HOME inside the
+    run directory, and the Python is installed without a link in any bin directory."""
+    allocate(cli, world)
+    assert run(cli, world, "tests") == 0
+    calls = fakes.calls(world.fake / "uv.jsonl")
+    install = next(c for c in calls if c["args"][:2] == ["python", "install"])
+    assert "--no-bin" in install["args"]
+    root = f"{world.node_root}/"
+    for call in calls:
+        assert all(value and value.startswith(root) for value in call["env"].values()), call["env"]
+        assert call["env"]["HOME"].startswith(f"{root}runs/")
+
+
+def test_o64_the_site_s_step_path_reaches_the_tests_through_the_payload_not_the_command_line(cli, world):
+    """O64: HPCT_STEP_PATH is the tests' PATH on the node, carried in the payload; the step's command line has the
+    boot's fixed PATH only."""
+    allocate(cli, world)
+    assert run(cli, world, "tests") == 0
+    command = (world.fake / "srun.command").read_text().splitlines()
+    assert command[:3] == ["/usr/bin/env", "-i", "PATH=/usr/local/bin:/usr/bin:/bin"]
+    assert "site-only" not in (world.fake / "srun.argv").read_text() + "\n".join(command)
+    log = (only_run(world) / "results" / "pytest.log").read_text()
+    assert "args: " in log
+
+
+def test_o64_a_run_whose_pytest_exits_0_without_running_a_test_is_no_pass(cli, world, capsys):
+    """O64: a zero from pytest counts as a pass only when its JUnit XML records a test; otherwise the run exits 5."""
+    allocate(cli, world)
+    commit(world.repo, {"fake-outcome-none": ""})
+    assert run(cli, world, "tests") == 5
+    assert "no test ran, which is not a pass" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--basetemp=/shared/x"], ["--junitxml", "/shared/j.xml"], ["-o", "cache_dir=/x"], ["-ocache_dir=/x"],
+     ["--collect-only"], ["--co"], ["--version"], ["--log-file=/x"], ["-c", "/x.ini"]],
+)  # fmt: skip
+def test_o64_a_pytest_option_that_writes_elsewhere_or_runs_nothing_is_refused_before_any_step(cli, world, args):
+    """O64: options that write outside the run (basetemp, JUnit, logs, ini overrides) or run no test are refused
+    locally, before a step starts."""
+    allocate(cli, world)
+    assert run(cli, world, "tests", *args) == 64
+    assert not (world.fake / "srun.argv").exists()
+
+
+def test_the_boot_refuses_a_runs_directory_that_is_a_link(cli, world, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    world.node_root.mkdir(mode=0o700)
+    (world.node_root / "runs").symlink_to(elsewhere)
+    allocate(cli, world)
+    assert run(cli, world, "tests") == 72
+    assert list(elsewhere.iterdir()) == []

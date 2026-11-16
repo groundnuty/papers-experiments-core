@@ -191,6 +191,10 @@ def report(streamed: parse.Streamed, out: Path, meta: dict[str, object]) -> int:
         )
         if (res / "junit.xml").exists():
             meta["junit"] = parse.junit_counts((res / "junit.xml").read_bytes())
+        ran = meta.get("junit", {}).get("tests", 0) if isinstance(meta.get("junit"), dict) else 0
+        if rc == 0 and not ran:
+            print("pytest exited 0 but its JUnit XML records no test: no test ran, which is not a pass (exit 5)")
+            rc = 5
         meta["summary"] = parse.summary_line(log)
         meta["times"] = dict(x.split("=", 1) for x in tail(res / "times").splitlines() if "=" in x)
         for line in parse.short_summary(log):
@@ -237,8 +241,9 @@ def cmd_run(site: lib.Site, remote: Remote, args: argparse.Namespace) -> int:
         timeout_s=args.time * 60 - 60,
         cores=args.cores,
         keep=args.keep,
+        step_path=site.step_path,
     )
-    pytest_args = "\0".join(args.pytest).encode() + (b"\0" if args.pytest else b"")
+    pytest_args = "\0".join(lib.check_pytest_args(args.pytest)).encode() + (b"\0" if args.pytest else b"")
     print(f"run {run_id}: commit {sha[:12]} on job {job.id} ({args.cores} cores, {args.mem}, {args.time} min)")
     work = Path(tempfile.mkdtemp(prefix="hpct-", dir=site.work or None))
     try:
@@ -289,6 +294,9 @@ def cmd_clean(site: lib.Site, remote: Remote, args: argparse.Namespace) -> int:
     if streamed.failure:
         print(f"the clean step refused: {streamed.failure}")
         return 72
+    if not any(line.startswith("clean: removed") for line in streamed.logs):
+        print("the clean step did not report its end (the step failed, or ssh dropped)")
+        return 70
     return 0
 
 

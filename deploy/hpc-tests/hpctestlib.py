@@ -5,7 +5,7 @@ command or touches the network; `hpctests.py` does, and the tests drive these fu
 The rules every step obeys are here, in one place each:
 - a step is `srun --jobid=<ours> --exact` with its own cores, memory and time limit, never `--overlap`;
 - its environment is the allowlist (`step_environment`) behind `/usr/bin/env -i`: nothing of the login shell reaches it;
-- nothing from `site.env` but the job id, the node's tmpfs root and the step's PATH is on its command line;
+- nothing from `site.env` but the job id and the node's tmpfs root is on its command line;
 - it writes only under the node's tmpfs root (`/tmp/<name>` or `/dev/shm/<name>`, checked again on the node).
 
 What a step sends back, and the login node's listing of our allocations, are read by `hpctestparse.py`.
@@ -194,11 +194,14 @@ def allowlist(pairs: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(f"{key}={value}" for key, value in pairs.items())
 
 
+BOOT_PATH = "/usr/local/bin:/usr/bin:/bin"  # the boot's PATH; the site's own (HPCT_STEP_PATH) travels in the payload
+
+
 def step_environment(site: Site) -> dict[str, str]:
-    """PATH, the locale and TMPDIR on the node's tmpfs (never Slurm's per-job TMPDIR, a link into a shared filesystem
-    on some sites). Nothing else of the login node's environment reaches a step."""
+    """A fixed PATH, the locale and TMPDIR on the node's tmpfs (never Slurm's per-job TMPDIR, a link into a shared
+    filesystem on some sites). Nothing else of the login node's environment, and no site value, reaches a step."""
     return {
-        "PATH": site.step_path,
+        "PATH": BOOT_PATH,
         "LC_ALL": "C.UTF-8",
         "LANG": "C.UTF-8",
         "TMPDIR": site.node_root.rsplit("/", 1)[0],
@@ -272,6 +275,8 @@ chmod 0700 "$root"
 [ "$(readlink -f "$root")" = "$root" ] || fail "the node root goes through a link"
 [ "$(stat -f -c %T "$root")" = tmpfs ] || fail "the node root is not on a tmpfs"
 mkdir -p -m 0700 "$root/runs"
+[ -d "$root/runs" ] && [ ! -L "$root/runs" ] || fail "runs is not a directory"
+[ "$(stat -c %u "$root/runs")" = "$uid" ] || fail "runs is not ours"
 dir=$root/runs/$run
 mkdir -m 0700 "$dir" || fail "the run directory exists already"
 mkdir -m 0700 "$dir/kit"
@@ -294,13 +299,19 @@ def boot_command(node_root: str, run_id: str, payload_sha256: str, *node_args: s
     return (BASH, "-c", BOOT, "hpct-boot", node_root, run_id, payload_sha256, *node_args)
 
 
-def node_settings(*, sha: str, uv: str, uv_version: str, python: str, timeout_s: int, cores: int, keep: bool) -> str:
+def node_settings(
+    *, sha: str, uv: str, uv_version: str, python: str, timeout_s: int, cores: int, keep: bool, step_path: str = ""
+) -> str:
     """The `settings` file of the payload, which node.sh reads line by line (it is never sourced)."""
     checked(SHA1, sha, "the commit")
     checked(ABS_PATH, uv, "HPCT_UV")
     if uv_version:
         checked(UV_VERSION, uv_version, "HPCT_UV_VERSION")
     checked(PYTHON, python, "HPCT_PYTHON")
+    if step_path:
+        checked(STEP_PATH, step_path, "HPCT_STEP_PATH")
+    if not 60 <= timeout_s <= 259200 or not 1 <= cores <= 192:
+        raise HpcTestsError("the timeout is 60 s to 72 h and the cores 1 to 192")
     pairs = {
         "HPCT_SHA": sha,
         "HPCT_UV": uv,
@@ -309,5 +320,44 @@ def node_settings(*, sha: str, uv: str, uv_version: str, python: str, timeout_s:
         "HPCT_TIMEOUT_S": str(timeout_s),
         "HPCT_CORES": str(cores),
         "HPCT_KEEP": "1" if keep else "0",
+        "HPCT_STEP_PATH": step_path,
     }
     return "".join(f"{k}={v}\n" for k, v in pairs.items())
+
+
+# pytest options a run may not pass: each either writes outside the run directory (the node's tmpfs) or overrides
+# where the step's results go, or runs no test at all, so a 0 from it would read as a pass.
+REFUSED_OPTIONS = (
+    "--basetemp",
+    "--junitxml",
+    "--junit-xml",
+    "--log-file",
+    "--report-log",
+    "--result-log",
+    "--resultlog",
+    "--override-ini",
+    "--config-file",
+    "--pastebin",
+    "--collect-only",
+    "--co",
+    "--help",
+    "--version",
+    "--fixtures",
+    "--fixtures-per-test",
+    "--markers",
+    "--setup-plan",
+    "--setup-only",
+)
+REFUSED_SHORT = ("-o", "-c", "-h", "-V")
+
+
+def check_pytest_args(args: Sequence[str]) -> list[str]:
+    """The arguments, refused when one of them is an option of REFUSED_OPTIONS (with or without `=value`) or
+    REFUSED_SHORT (alone or with its value attached)."""
+    for arg in args:
+        name = arg.split("=", 1)[0]
+        if name in REFUSED_OPTIONS or any(arg == s or (arg.startswith(s) and s in ("-o", "-c")) for s in REFUSED_SHORT):
+            raise HpcTestsError(
+                f"the pytest option {name} is not allowed in a run (it writes outside the run, or runs no test)"
+            )
+    return list(args)

@@ -50,10 +50,10 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 
 # The payload's settings, read line by line, never sourced: known keys only, values in a plain alphabet.
-HPCT_SHA="" HPCT_UV="" HPCT_UV_VERSION="" HPCT_PYTHON="" HPCT_TIMEOUT_S="" HPCT_CORES="" HPCT_KEEP=0
+HPCT_SHA="" HPCT_UV="" HPCT_UV_VERSION="" HPCT_PYTHON="" HPCT_TIMEOUT_S="" HPCT_CORES="" HPCT_KEEP=0 HPCT_STEP_PATH=""
 while IFS='=' read -r key value; do
   case "$key" in
-    HPCT_SHA | HPCT_UV | HPCT_UV_VERSION | HPCT_PYTHON | HPCT_TIMEOUT_S | HPCT_CORES | HPCT_KEEP)
+    HPCT_SHA | HPCT_UV | HPCT_UV_VERSION | HPCT_PYTHON | HPCT_TIMEOUT_S | HPCT_CORES | HPCT_KEEP | HPCT_STEP_PATH)
       case "$value" in *[!A-Za-z0-9_./:+-]*) fail "the setting $key has characters it may not carry" ;; esac
       printf -v "$key" '%s' "$value"
       ;;
@@ -88,7 +88,7 @@ do_env() {
   fi
   local d
   for d in uv-cache python; do mkdir -m 0700 "$root/$d" 2> /dev/null || [ -d "$root/$d" ] || return 1; done
-  flock "$root/python.lock" "$HPCT_UV" python install "$HPCT_PYTHON" || return 1
+  flock "$root/python.lock" "$HPCT_UV" python install --no-bin "$HPCT_PYTHON" || return 1
   (cd "$dir/repo" && UV_PROJECT_ENVIRONMENT=$dir/venv "$HPCT_UV" sync --frozen --python "$HPCT_PYTHON")
 }
 
@@ -116,8 +116,8 @@ do_pytest() {
       MKL_NUM_THREADS="$HPCT_CORES" GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=hpct GIT_AUTHOR_EMAIL=hpct@invalid \
       GIT_COMMITTER_NAME=hpct GIT_COMMITTER_EMAIL=hpct@invalid \
       timeout --signal=TERM --kill-after=30 "$HPCT_TIMEOUT_S" \
-      "$dir/venv/bin/python" -m pytest -p no:cacheprovider -ra "--junitxml=$res/junit.xml" \
-      "--basetemp=$dir/tmp/pytest" "${args[@]}"
+      "$dir/venv/bin/python" -m pytest "${args[@]}" -p no:cacheprovider -ra "--junitxml=$res/junit.xml" \
+      "--basetemp=$dir/tmp/pytest"
   ) > "$res/pytest.log" 2>&1 &
   child=$!
   wait "$child"
@@ -142,6 +142,14 @@ cmd_run() {
   case "$HPCT_TIMEOUT_S$HPCT_CORES" in "" | *[!0-9]*) fail "the timeout and cores are whole numbers" ;; esac
   mkdir -m 0700 "$res" "$dir/home" "$dir/tmp"
   echo "$$" > "$dir/pid"
+  # Everything from here on writes under the run directory or the node root, never the account's home: uv, git and
+  # Python would otherwise fall back to the passwd entry's home (a shared filesystem) when HOME is unset.
+  export HOME=$dir/home TMPDIR=$dir/tmp XDG_CACHE_HOME=$dir/home/.cache XDG_CONFIG_HOME=$dir/home/.config
+  export XDG_DATA_HOME=$dir/home/.local/share XDG_STATE_HOME=$dir/home/.local/state XDG_BIN_HOME=$dir/home/.local/bin
+  export UV_CACHE_DIR=$root/uv-cache UV_PYTHON_INSTALL_DIR=$root/python UV_PYTHON_BIN_DIR=$root/python-bin
+  export UV_TOOL_DIR=$root/uv-tools UV_TOOL_BIN_DIR=$root/uv-tools/bin UV_NO_CONFIG=1 UV_NO_PROGRESS=1
+  export UV_PYTHON_PREFERENCE=only-managed
+  [ -z "$HPCT_STEP_PATH" ] || export PATH=$HPCT_STEP_PATH
   local t0 t1 t2 t3 t4 rc=0
   t0=$(date +%s)
   if ! do_clone > "$res/clone.log" 2>&1; then rc=73; fi
@@ -179,7 +187,7 @@ cmd_clean() {
     fi
   done
   if [ "$mode" = all ] && [ "$live" = 0 ]; then
-    force_rm "$root/uv-cache" "$root/python" "$root/python.lock"
+    force_rm "$root/uv-cache" "$root/python" "$root/python-bin" "$root/uv-tools" "$root/python.lock"
     say "clean: the uv cache and Python removed"
   fi
   say "clean: removed $removed run directories, kept $kept younger ones, $live live"
