@@ -257,6 +257,12 @@ HELPER_USERS = {
         "provisioner.replicate",
     },
     "ingest.py": {"provisioner.verify_space"},
+    "bulkingest.py": {  # a manifest's uploads through one cache, and the fresh listing that checks them (O67)
+        "provisioner.upload",
+        "provisioner.resolve",
+        "provisioner.root",
+        "provisioner.children",
+    },
     "ingestsparse.py": {
         "provisioner.resolve",
         "provisioner.read_file",
