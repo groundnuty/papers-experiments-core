@@ -7,6 +7,7 @@ the `platform.toml` beside study.toml). The pipeline passes the answers to the s
 to them, so a study whose plugin wraps both its health check and its run admission is still refused.
 """
 
+import dataclasses
 import shutil
 import uuid
 from pathlib import Path
@@ -159,6 +160,45 @@ def test_c11_a_platform_without_the_hook_and_one_the_study_does_not_list_declare
     assert platform_deferrals(study) == ()
     assert unlisted not in study.platforms
     assert platform_deferrals(load_study(study_with(tmp_path / "t"))) == ()  # no platform at all
+
+
+def test_c11_a_platform_configuration_that_is_a_link_out_of_the_study_directory_is_refused(tmp_path):
+    """C11: the file the core hands to a platform is inside the study directory whichever way it is named: a link
+    beside study.toml (the default) or under a named key that leaves the directory is refused when the study loads."""
+    outside = tmp_path / "outside.toml"
+    outside.write_text("deferral_s = 7\n", encoding="utf-8")
+    implicit = study_with(tmp_path / "implicit", platform=None)
+    (implicit / "platform.toml").symlink_to(outside)
+    named = study_with(tmp_path / "named", platform=None, key='platform_config = "link.toml"\n')
+    (named / "link.toml").symlink_to(outside)
+    for study in (implicit, named):
+        text = refused(study)
+        assert "platform_config" in text, text
+        assert "inside the study directory" in text, text
+
+
+def test_c11_a_study_built_in_code_with_a_platform_configuration_outside_the_directory_is_refused_unread(
+    tmp_path, monkeypatch
+):
+    """C11: `check_study` takes a `StudyConfig` built in code as it is, so the pipeline's own read of the platform
+    refuses a file outside the study directory (and a link out of it) before it calls the platform's function."""
+    calls = tmp_path / "calls"
+    module = platform_module(
+        tmp_path,
+        monkeypatch,
+        f"def {PLATFORM_HOOK}(path):\n    open({str(calls)!r}, 'a').write(str(path))\n    return None\n",
+    )
+    study = load_study(study_with(tmp_path / "s", module))
+    outside = tmp_path / "outside.toml"
+    outside.write_text("deferral_s = 7\n", encoding="utf-8")
+    link = study.root / "link.toml"
+    link.symlink_to(outside)
+    for path in (outside, link):
+        with pytest.raises(ConfigError) as caught:
+            platform_deferrals(dataclasses.replace(study, platform_config=path))
+        for part in ("[study] platform_config", "inside the study directory", module):
+            assert part in str(caught.value), caught.value
+    assert not calls.exists()  # the platform was never asked to read a file outside the study
 
 
 def test_c11_a_named_file_that_is_not_there_loads_and_is_refused_only_where_a_platform_reads_it(tmp_path, monkeypatch):

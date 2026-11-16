@@ -33,6 +33,7 @@ from expcore.study.config import (
     STUDY_FILE,
     StudyConfig,
     import_platforms,
+    inside_study,
 )
 
 PLATFORM_HOOK = "declared_deferral_from_config"  # a platform module's optional function, read by name
@@ -61,13 +62,19 @@ def platform_deferrals(study: StudyConfig) -> tuple[PlatformDeferral, ...]:
                 f"configuration, and this study points at none: name the file in [study] {PLATFORM_CONFIG_KEY}, or "
                 f"keep it as {PLATFORM_FILE} beside {STUDY_FILE}"
             )
+        if not inside_study(study.platform_config, study.root):  # a study built in code, or a link, can name another
+            raise ConfigError(
+                f"{study_file}: [study] {PLATFORM_CONFIG_KEY}: must name a file inside the study directory, and "
+                f"{study.platform_config.name!r} is not in it (a link that leaves the directory is not inside it); "
+                f"platform {name!r} is not asked to read it"
+            )
         if not study.platform_config.is_file():
             raise ConfigError(
                 f"{study_file}: [study] {PLATFORM_CONFIG_KEY}: names {study.platform_config.name!r}, which is not a "
                 f"file, and platform {name!r} declares its longest deferral from it"
             )
         try:
-            answer = hook(study.platform_config)
+            answer = hook(study.platform_config.resolve())  # the file just checked, not a link another read could swap
         except ConfigError:
             raise  # the platform's own words: they name the file and the key
         except Exception as error:  # its text may hold a credential, so the refusal names the type only

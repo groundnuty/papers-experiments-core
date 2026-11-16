@@ -203,13 +203,22 @@ def _platform_config(top: Section, root: Path) -> Path | None:
     its platform.toml and still loads it."""
     section = Section(top.section("study").data, top.file, "[study]")
     named = section.optional_string(PLATFORM_CONFIG_KEY)
-    if named is None:
-        default = root / PLATFORM_FILE
-        return default.resolve() if default.is_file() else None
-    file = (root / named).resolve()
-    if root.resolve() not in file.parents:
-        raise section.fail(PLATFORM_CONFIG_KEY, f"must name a file inside the study directory; {named!r} is not one")
+    if named is None and not (root / PLATFORM_FILE).is_file():
+        return None
+    given = PLATFORM_FILE if named is None else named
+    file = (root / given).resolve()  # a link is followed: where it leads is what the platform would read
+    if not inside_study(file, root):
+        raise section.fail(
+            PLATFORM_CONFIG_KEY,
+            f"must name a file inside the study directory; {given!r} is not one (a link that leaves the directory "
+            "is not inside it)",
+        )
     return file
+
+
+def inside_study(file: Path, root: Path) -> bool:
+    """Whether `file`, with its links followed, lies inside the study directory `root`."""
+    return root.resolve() in file.resolve().parents
 
 
 def import_platforms(study_file: Path, modules: Sequence[str]) -> None:
