@@ -15,6 +15,11 @@ directory the sandbox binds read-only into every cell at `[sandbox.mount] path`;
 directory is removed. `stop` shows the helper and its mount gone or raises `SandboxError`; it is called on every path
 that ends a sandbox the factory was called for, a failed start included, and may be called again after a stop that
 raised.
+
+Two methods a helper may add, which the sandbox looks for and reads as unknown when they are missing: `infra_state()`,
+its processes and its mount by role for `infra_check` (`apptainer.infra`; a helper without it is a death of state
+unknown), and `oneclient_log()`, oneclient's INFO log as bytes or None, for `mount_log` and `mount_errors` (O17, O18).
+`hostmount.HostMount` has both.
 """
 
 from __future__ import annotations

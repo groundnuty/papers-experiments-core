@@ -471,9 +471,25 @@ Four things differ from Docker, and the record says so (`infrastructure_facts`):
 
 Names resolve as on Docker (`dns: none` in the record): the federation's names resolve from `/etc/hosts` and no other name resolves. A Docker agent's network is `--internal` with `--add-host` entries and no `--dns`, and measured on engine 29.2.1 the engine's embedded resolver answers every outside name with SERVFAIL at once. So the name lookup is no departure; the connect to an outside address is, as the network bullet says (on Docker it fails at once with ENETUNREACH).
 
+**A tool server on the node.** `platform.tool_server(ctx, sandbox)` works as on Docker: the server is a process of your driver's, outside every cell, which no cell can address. The backend gives it a home of the run's own (removed when it stops) and the run's tag, and passes it nothing of the driver's environment but `PATH` (`docs/interfaces.md`, "The Apptainer backend on an HPC batch node"). Since the driver runs on the node, the node must hold the server's command (give an absolute path), its venv and interpreter, the checkout `[toolserver] clone` names and `git`, and the conditions' frozen manifests. Only the checkout is pinned, by its commit; the venv and the interpreter are not. `deploy/hpc-federation` renders no `[toolserver]` into a federation's `platform.toml`.
+
 Run the campaign's driver on the node that runs the cells, since the gate listens on that node's loopback. The campaign fingerprint holds the backend's pins, so a Docker run and an Apptainer run are never one experiment.
 
 On an HPC federation of `deploy/hpc-federation`, its shard driver does both for you (O63). The federation's `up` renders `[sandbox]` from the pilot's template with the SIF, the shim and their SHA-256s from `site.env`, checked before anything is held, and `shards.py step` runs your campaign on the agent's node with the federation's `platform.toml` copied beside your `study.toml` and the sandbox's work root made. So your plugin loads `platform.toml` from your study's own directory (beside `study.toml`), never from a path of the federation's, and only where it runs a campaign: `check`, `analyze` and `report` build your plugin on the login node, where your study has no such file. Never put a federation's path in `study.toml`: its hash is in the campaign fingerprint, and every shard's must be the same.
+
+### Reading the run's infrastructure after its loop
+
+When your executor asks, after the agent's loop, whether the data path was healthy (a gate that answered errors, a mount whose oneclient died), read the sandbox, not the backend:
+
+```python
+check = sandbox.infra_check()  # {"containers": {role: ...}, "deaths": [...], "death": [problem lines]}
+errors = sandbox.mount_errors()  # oneclient's warnings and errors, summarised; None without a mount
+log = sandbox.mount_log()  # {"text": oneclient's INFO log, the token as <token>}; None without a mount
+```
+
+The three have the same names and shapes on Docker and on an HPC node (`docs/interfaces.md`, "Reading a run's infrastructure after its loop"). Read them while the sandbox is up, before its collection or after: a component the collection stops itself is judged by its state just before. A state that cannot be read is a problem, never a healthy one, and `{"unavailable": ...}` from `mount_errors()` means the same. `oneclient_log.platform_errors(errors)` counts what is the platform's and not your agent's (O18). `mount_log()` may be read before the agent's first turn too: it is no access the mount guard counts.
+
+`infra_container_check()` and `sidecar_errors()` still work, and warn: rename them. A `docker exec` of your own into the sidecar, or `sandbox.host` and `sandbox.names`, work on Docker alone; `mount_log()` replaces them.
 
 ### What the code tool tells the agent of its output
 

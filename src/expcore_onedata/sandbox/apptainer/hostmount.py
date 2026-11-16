@@ -29,6 +29,10 @@ path a cell binds; the cell binds only the mount point, `<run>/mount`, read-only
 reads the log (`mount_watch_log()`) or at `stop()`: the watcher is stopped (SIGTERM: a last poll, `disarmed`, its end
 line), its log read once and judged (`expcore.mountguard`), and oneclient's I/O mode read from its log (`iomode`).
 
+**What the sandbox reads of it** (O17, O18): `infra_state()`, oneclient with its mount and the watcher by role, each
+as it is now or as it was just before the harness stopped it (`apptainer.infra`), and `oneclient_log()`, oneclient's
+INFO log, which the driver may read at any time: the watcher does not watch the log directory.
+
 **`stop()`**: the watch closed; the mount unmounted (`fusermount3 -u`, then oneclient stopped, then a lazy unmount if
 the mount is still in the table); oneclient shown gone; the token file shown gone; any file of oneclient's log that
 holds the token removed; the bundle's copy removed. Each step is tried and the stop raises `SandboxError` naming those
