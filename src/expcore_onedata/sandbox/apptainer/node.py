@@ -13,6 +13,7 @@ and removal helpers pass (`copyout`, `tokenfiles`) and runs the command as this 
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import os
 import platform
 import signal
@@ -28,6 +29,7 @@ from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.apptainer import procs as P
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, run_bounded
 
+SYS_PIDFD_SEND_SIGNAL, SYS_PIDFD_OPEN = 424, 434
 PROC = Path("/proc")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 VERSION_S = 20.0
@@ -63,6 +65,10 @@ class NodeOps(Protocol):
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
         """Run a command within `timeout_s` as this uid; `sudo` is taken and ignored (there is no privilege)."""
+        ...
+
+    def exists(self, path: str | Path) -> bool:
+        """Whether a path exists on the node (the shared copy helper asks it of the run's working directory)."""
         ...
 
     def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
@@ -117,6 +123,34 @@ class NodeOps(Protocol):
         ...
 
 
+def _syscall(number: int, *args: Any) -> int:
+    """A raw Linux system call through libc's `syscall`, for one this Python was built without; `OSError` with the
+    call's errno when it fails."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    found = libc.syscall(number, *args)
+    if found < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return int(found)
+
+
+def pidfd_open(pid: int) -> int:
+    """`pidfd_open(2)`: `os.pidfd_open` where this Python has it, else the system call itself (434 in Linux's generic
+    table, which every architecture shares for calls this new). A Python built elsewhere (a standalone build) may lack
+    it although the node's kernel has it."""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    return _syscall(SYS_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
+
+
+def pidfd_send_signal(fd: int, sig: int) -> None:
+    """`pidfd_send_signal(2)`, likewise (424)."""
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(fd, sig)
+        return
+    _syscall(SYS_PIDFD_SEND_SIGNAL, ctypes.c_int(fd), ctypes.c_int(int(sig)), None, ctypes.c_uint(0))
+
+
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
@@ -161,6 +195,9 @@ class LocalNode:
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
         return run_bounded(argv, timeout_s, input=input)
+
+    def exists(self, path: str | Path) -> bool:
+        return Path(path).exists()
 
     def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
@@ -237,7 +274,7 @@ class LocalNode:
         if pid < 1:
             return False
         try:
-            fd = os.pidfd_open(pid)
+            fd = pidfd_open(pid)
         except ProcessLookupError:
             return False
         except OSError:
@@ -248,7 +285,7 @@ class LocalNode:
                 return None  # hidden, or gone between the open and the read: not known to be the one asked for
             if now != start:
                 return False
-            signal.pidfd_send_signal(fd, sig)
+            pidfd_send_signal(fd, sig)
         except ProcessLookupError:
             return False
         except PermissionError:

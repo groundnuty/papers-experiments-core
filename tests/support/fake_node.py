@@ -60,6 +60,7 @@ class FakeProc:
     role: str = "cell"
     exit_status: int | None = None
     ignores: frozenset[int] = frozenset()  # signals it does not end on
+    unkillable: bool = False  # a process in the kernel that no signal ends (a read of a dead FUSE mount)
 
     def proc(self, tags: Collection[str]) -> Proc:
         found = frozenset(
@@ -189,7 +190,7 @@ class FakeNode:
             self._gate_signal(proc, sig)
         elif proc.role == "collector":
             self._collector_signal(proc, sig)
-        elif sig == signal.SIGKILL or sig not in proc.ignores:
+        elif not proc.unkillable and (sig == signal.SIGKILL or sig not in proc.ignores):
             proc.alive, proc.exit_status = False, 128 + sig
         return True
 
@@ -229,6 +230,9 @@ class FakeNode:
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
         return run_bounded(argv, timeout_s, input=input)
+
+    def exists(self, path: str | Path) -> bool:
+        return Path(path).exists()
 
     # ------------------------------------------------------------------------------------------------ helpers
     def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
@@ -354,7 +358,7 @@ class FakeNode:
         """The exec returns: its processes end, but for those a handler left behind (`cell_left`)."""
         with self.lock:
             for proc in cell.procs:
-                if proc not in self.cell_left:
+                if proc not in self.cell_left and not proc.unkillable:
                     proc.alive = False
 
     def default_cell(self, cell: Cell) -> CmdResult:
