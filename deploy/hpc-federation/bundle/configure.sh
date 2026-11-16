@@ -9,7 +9,10 @@
 #   rootfs/etc/hpcop-erlang-env      this job's epmd port (a random free one of 21300-21999), epmd and the Erlang
 #                                    distribution on loopback; sourced by every VM start path and read by
 #                                    the shim, which sends 4369 there.
-# Usage: configure.sh op --workdir W <provider-name> <zone-fqdn> <admin-email> [peer-ip ...]
+#   W/imports                        a provider's shared imported trees (O56), when it owns imported spaces: each
+#                                    --import=SPACE=PATH is checked by importstorage.py, its empty mountpoint made in
+#                                    the rootfs, and run_service binds the tree there read-only. Never for the zone.
+# Usage: configure.sh op --workdir W <provider-name> <zone-fqdn> <admin-email> [peer-ip ...] [--import=SPACE=PATH ...]
 #        configure.sh oz --workdir W <zone-name> [peer-ip ...]
 source "$(dirname "$0")/lib.sh"
 component "${1:-}"; shift
@@ -19,6 +22,8 @@ R=$W/rootfs; S=$(secrets_dir "$W")
 [[ -e $W/rootfs.complete ]] || die "$W has no complete rootfs: run node-init.sh first"
 
 FQDN=$(node_fqdn); SHORT=${FQDN%%.*}; DOMAIN=${FQDN#*.}
+split_imports IMPORTS ARGS "$@"; set -- "${ARGS[@]}"
+if [[ $COMP == oz && ${#IMPORTS[@]} -gt 0 ]]; then die "the zone mounts no import: only a provider holds an imported space"; fi
 if [[ $COMP == op ]]; then
   (( $# >= 3 )) || die "usage: configure.sh op --workdir W <provider-name> <zone-fqdn> <admin-email> [peer-ip ...]"
   NAME=$1 ZONE=$2 MAIL=$3; shift 3
@@ -44,7 +49,12 @@ chmod 600 -- "$S/env"
   for ip in "$@"; do valid ip "$ip"; printf '%s\n' "$ip"; done; } > "$R/etc/hpcop-peers"
 chmod 644 -- "$R/etc/hpcop-peers"
 
+if (( ${#IMPORTS[@]} > 0 )); then
+  "$HPCOP_PY" -I "$HPCOP_BUNDLE/importstorage.py" prepare --workdir "$W" "${IMPORTS[@]}" \
+    || die "a shared imported tree was refused: nothing was prepared for it (see above)"
+fi
+
 EPMD=$(pick_epmd_port)
 write_erlang_env "$R" "$EPMD"
 [[ $(epmd_port_of "$R") == "$EPMD" ]] || die "the Erlang env file does not hold epmd port $EPMD"
-ok "configured $COMP '$NAME' on $FQDN with $# peer(s); epmd on 127.0.0.1:$EPMD"
+ok "configured $COMP '$NAME' on $FQDN with $# peer(s) and ${#IMPORTS[@]} shared import(s); epmd on 127.0.0.1:$EPMD"

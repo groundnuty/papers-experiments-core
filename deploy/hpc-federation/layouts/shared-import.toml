@@ -1,0 +1,67 @@
+# The layout of an HPC federation whose data spaces are imported from trees on the cluster's shared filesystem, read by
+# other federations too (O56, DESIGN.md section 8). Every name is invented. It is read by deploy/compose-federation's
+# `fedspec.py`, as every layout of this deployment is, and holds no path: each import names the two variables of
+# `site.env` that hold its tree's directory and its manifest's file (site.env.example), and `up` reads them when it runs.
+#
+#   source deploy/hpc-federation/site.env     # EXPCORE_FED_IMPORT_ALPHA, ..._MANIFEST, and so on
+#
+# What `shared = true` asks of the federation: the tree is imported read-only (`readonly = true` is required beside it),
+# only its owner's service mounts it, read-only, and the owner's imported storage is read-only on the panel; the
+# platform file repeats `import = { readonly = true, shared = true }`, so the core refuses anything else, and
+# `fedimport.verify_imports` shows after up that the space holds exactly its manifest. The mirrors keep node-local
+# storage and fetch what the owner holds. A reset of such a space evicts the mirrors' replicas and removes the run's own
+# QoS requirements; it never writes a file, and the owner's copy is never evicted. To start again: down, then up.
+#
+# `direct_io = true` says the agent's mount reads this storage through the filesystem itself ([sandbox.mount]
+# io_mode = "direct", with the storage's id and this tree's directory in [sandbox.mount.storages]). The sandbox node must
+# then see the same directory, and the mode is shown per run by the record, never taken from this line (O49).
+#
+# This layout has the shape of an HPC federation with imported spaces, not the pilot's (layouts/pilot-shape.toml, when it
+# lands): two imported spaces owned by two providers and one regular space for the study's own files. Its platform
+# template beside it repeats each declaration.
+
+project = "expcore-hpcimp"
+domain = "expcore-hpcimp.test"
+study_space = "alpha-work"
+memory_limit = "6g"
+platform_template = "shared-import.platform.toml.template"
+
+[zone]
+port = 29743
+
+[providers.pine]
+port = 29744
+
+[providers.birch]
+port = 29745
+
+[providers.cedar]
+port = 29746
+
+[spaces.alpha-data]              # imported by pine; birch and cedar fetch what pine holds
+owner = "pine"
+mirrors = ["birch", "cedar"]
+baseline = false
+import = { readonly = true, shared = true, source_env = "EXPCORE_FED_IMPORT_ALPHA", manifest_env = "EXPCORE_FED_IMPORT_ALPHA_MANIFEST" }
+
+[spaces.beta-data]               # imported by birch, and read through a direct mount
+owner = "birch"
+mirrors = ["pine", "cedar"]
+baseline = false
+import = { readonly = true, shared = true, direct_io = true, source_env = "EXPCORE_FED_IMPORT_BETA", manifest_env = "EXPCORE_FED_IMPORT_BETA_MANIFEST" }
+
+[spaces.alpha-work]              # the study's own files: an ordinary space on node-local storage
+owner = "pine"
+mirrors = ["birch", "cedar"]
+
+[principals.alpha-reader]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-data", "beta-data", "alpha-work"]
+
+[principals.alpha-tools]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-data", "beta-data", "alpha-work"]
+
+[principals.alpha-health]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-data", "beta-data", "alpha-work"]

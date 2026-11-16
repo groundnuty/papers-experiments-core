@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fedspec import Import, Spec, load_spec
+from fedspec import Import, Space, Spec, load_spec
 
 ROOT_MARKER = ".expcore-fed-root"  # written by up into a root it made or found empty; holds the project name
 NESTED_DEPTH = 8  # how many levels below a root up and down look for another federation's marked root
@@ -239,6 +239,51 @@ class Layout:
         it with the root. A read-only import has no copy: its source is mounted as it is."""
         self.imported(space)
         return self.root / self.spec.space(space).owner / "import" / space
+
+    def shared_imports(self) -> list[Space]:
+        """The spaces whose imported tree other federations import too (`import.shared`, O56), in the layout's order."""
+        return [s for s in self.spec.spaces if s.imported is not None and s.imported.shared]
+
+    def owned_imports(self, provider: str) -> list[Space]:
+        """The imported spaces a provider owns: the only spaces whose tree it mounts. A mirror keeps a regular storage
+        and mounts nothing of an import."""
+        return [s for s in self.spec.spaces if s.imported is not None and s.owner == provider]
+
+    def import_manifest(self, space: str, environ: Mapping[str, str]) -> Path:
+        """The file of an imported space's manifest, from the variable its layout names (`import.manifest_env`).
+
+        As for the source, the layout never holds the path, and what the variable names is checked before anything
+        reads it: an absolute path of an existing regular file with no `..` step and no symbolic link on the way, not
+        inside the federation's root (down empties it) and not inside the tree of any imported space whose variable is
+        set, its own included: a scan would import it as a file of the dataset, and the listing would then hold an
+        entry the manifest does not. A refusal names the variable and never says what it holds."""
+        declared = self.imported(space)
+        name = declared.manifest_env
+        if name is None:
+            raise ValueError(f"spaces.{space}.import declares no manifest_env: it has no manifest to name")
+        value = environ.get(name)
+        if value is None:
+            raise ValueError(f"{name} is not set; it must name the manifest file of the dataset of {space}")
+        if not value or not os.path.isabs(value):
+            raise ValueError(f"{name} must be an absolute path of the manifest file of the dataset of {space}")
+        manifest = Path(value)
+        if ".." in manifest.parts:
+            raise ValueError(f"{name} may not hold a '..' step: a link before it would change where it leads")
+        for step in (*reversed(manifest.parents), manifest):
+            if step.is_symlink():
+                raise ValueError(f"{name} may not pass through a symbolic link")
+        if not manifest.is_file():
+            raise ValueError(f"{name} must be an existing regular file")
+        if manifest == self.root or self.root in manifest.parents:
+            raise ValueError(f"{name} lies inside the root of the federation, which down empties")
+        for other in self.spec.spaces:
+            tree = environ.get(other.imported.source_env, "") if other.imported is not None else ""
+            if tree and os.path.isabs(tree) and Path(tree) in manifest.parents:
+                raise ValueError(
+                    f"{name} lies inside the tree of {other.name}, where a scan would import it as a file of the "
+                    "dataset"
+                )
+        return manifest
 
     def import_source(self, space: str, environ: Mapping[str, str]) -> Path:
         """The host directory of an imported space's dataset, from the variable its layout names.

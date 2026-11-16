@@ -334,8 +334,26 @@ config_dir() {  # <rootfs> <service>: host path of the service's config.d, behin
   printf '%s\n' "$1$t/config.d"
 }
 
+# The shared imported trees a provider mounts (O56): configure.sh's `importstorage.py prepare` checks them and writes the
+# work directory's list; the service binds exactly that list, read-only, and nothing else of the node's filesystems.
+split_imports() {  # <imports-array> <other-array> args...: the --import=SPACE=PATH arguments, then every other one
+  local -n _imports=$1 _others=$2
+  local a
+  shift 2
+  _imports=() _others=()
+  for a in "$@"; do
+    if [[ $a == --import=* ]]; then _imports+=("$a"); else _others+=("$a"); fi
+  done
+}
+
+import_binds() {  # <workdir>: the `apptainer exec` arguments that bind each listed tree read-only, one per line; none for none
+  [[ -e $1/imports ]] || return 0
+  "$HPCOP_PY" -I "$HPCOP_BUNDLE/importstorage.py" binds --workdir "$1"
+}
+
 run_service() {  # <workdir>: become the service (apptainer exec) in the foreground of this process
-  local W=$1 R=$1/rootfs S f epmd
+  local W=$1 R=$1/rootfs S f epmd b
+  local -a binds=()
   S=$(secrets_dir "$W")
   [[ -e $W/rootfs.complete ]] || die "$W has no complete rootfs: run node-init.sh first"
   for f in passphrase erlang-cookie couchbase-user couchbase-password config.yaml env; do
@@ -347,14 +365,18 @@ run_service() {  # <workdir>: become the service (apptainer exec) in the foregro
   # Seconds before the bind, not minutes (node-init checked too, before the untar).
   if [[ ${HPCOP_SKIP_PORTCHECK:-0} == 1 ]]; then say "port check skipped (offline test)"; else ports_free "$COMP" "$epmd"; fi
   install -d -m 700 -- "$W/work"
+  b=$(import_binds "$W") || die "the shared imported trees of $W cannot be bound (see above): the service is not started"
+  if [[ -n $b ]]; then mapfile -t binds <<<"$b"; fi
   "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" check || die "$HPCOP_PY cannot use pidfds, which the service's stop needs"
   # exec keeps this PID for supervise.py, which stays visible in /proc under hidepid (apptainer's setuid starter, its
   # child, does not). teardown.sh signals it only while its start time (stat field 22) still matches.
   printf '%s %s\n' "$$" "$(proc_field "$$" 22)" > "$W/service.pid"
   # --containall: own PID, IPC and mount namespaces, clean environment; the node's network and name.
-  # --workdir keeps the container's /tmp and /var/tmp inside the private work directory.
+  # --workdir keeps the container's /tmp and /var/tmp inside the private work directory. A shared tree is a read-only
+  # bind (`:ro`) of the list's, over the empty mountpoint configure.sh made in the rootfs: the one thing of the node's
+  # filesystems the container sees, and one it cannot write to.
   exec "$HPCOP_PY" -I "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
-    --workdir "$W/work" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
+    --workdir "$W/work" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
 }
 
 # The Couchbase guard inside the container (hpcop-cb-init.py --watch) prints one of these into run.log: passed
