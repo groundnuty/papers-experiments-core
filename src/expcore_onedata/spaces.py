@@ -231,8 +231,10 @@ def parse_data(section: Section) -> str | None:
     path = Path(section.file).parent / section.string("data_manifest")
     try:
         return load_manifest(path).digest()
-    except ConfigError as error:
-        problem = str(error).split(": ", 1)[1] if ": " in str(error) else "cannot be read"
+    except ConfigError as error:  # the loader names the file first: that prefix, and the path anywhere, never shown
+        said, prefix = str(error), f"{path}: "
+        problem = said[len(prefix) :] if said.startswith(prefix) else "it cannot be read or checked"
+        problem = problem.replace(str(path), "<data_manifest>")
         raise section.fail("data_manifest", f"is no manifest of a space's data ({problem})") from None
 
 
