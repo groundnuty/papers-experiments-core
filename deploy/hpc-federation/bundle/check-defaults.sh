@@ -18,7 +18,7 @@
 #   no process of ours carries a secret or the default cookie on its command line; every Erlang node
 #   answers a ping that uses the file cookie (the init.d status path onepanel itself uses) and refuses
 #   one with 'cluster_node'; the vm.args onepanel rewrote hold no other cookie; Couchbase refuses
-#   admin/password, the retired deploy-time password and an anonymous admin request, and accepts the current one; the live Couchbase
+#   admin/password, every retired administrator password and an anonymous admin request, and accepts the current one; the live Couchbase
 #   cookies and memcached password are not the shipped ones; the served web key is not the shipped one.
 # Usage: check-defaults.sh <op|oz> --workdir W [--live]
 # shellcheck disable=SC2016  # single-quoted '$HOME' below is literal text to look for
@@ -116,10 +116,10 @@ fi
 if [[ $LIVE == --live ]]; then
   T=$(mktemp -d "$W/tmp/check.XXXXXX"); trap 'rm -rf -- "$T"' EXIT
   SECRETS=("$PASS" "$COOKIE" "$CB_PASS")
-  for f in couchbase-password.retired registration-token; do
-    v=''
-    if [[ -s $S/$f ]]; then read_secret v "$S/$f"; SECRETS+=("$v"); fi
-  done
+  RETIRED=()   # every password a rotation retired (a restart rotates again), not only the last
+  while IFS= read -r v; do RETIRED+=("$v"); done < <(retired_passwords "$S")
+  if (( ${#RETIRED[@]} )); then SECRETS+=("${RETIRED[@]}"); fi
+  if [[ -s $S/registration-token ]]; then v=''; read_secret v "$S/registration-token"; SECRETS+=("$v"); fi
   argv_clean() {  # every process of ours: no secret and no default cookie on its command line
     local d cl s exe bad=0
     for d in /proc/[0-9]*; do
@@ -162,9 +162,13 @@ if [[ $LIVE == --live ]]; then
   check "Couchbase accepts the current administrator" cb_is 200 "$CB_USER" "$CB_PASS"
   anon_refused() { [[ $(http GET http://127.0.0.1:8091/settings/web "$T/anon.out") == 401 ]]; }   # cb_guard in lib.sh: why this endpoint
   check "Couchbase refuses an anonymous admin request (GET /settings/web: 401), so it has an administrator" anon_refused
-  if [[ -s $S/couchbase-password.retired ]]; then
-    OLD=''; read_secret OLD "$S/couchbase-password.retired"
-    check "Couchbase refuses the retired deploy-time password" cb_is 401 "$CB_USER" "$OLD"
+  if (( ${#RETIRED[@]} )); then
+    n=0
+    for OLD in "${RETIRED[@]}"; do
+      n=$((n + 1))
+      check "Couchbase refuses retired administrator password $n of ${#RETIRED[@]}" cb_is 401 "$CB_USER" "$OLD"
+    done
+    unset OLD
   else
     fail "the deploy-time Couchbase password was never rotated"
   fi

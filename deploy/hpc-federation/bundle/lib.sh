@@ -116,6 +116,109 @@ stop_service() {  # <pid> <seconds> <start>: stop the service process run_servic
   wait "$pid" 2>/dev/null || true
 }
 
+# The kept stop (teardown.sh --keep) cannot wait for the service: it is not our child, so its end is polled. Same
+# escalation as stop_service: SIGTERM; after <seconds>, SIGUSR1 (supervise.py turns it into SIGKILL of the container);
+# 30 s later, SIGKILL to supervise.py itself. Sets STOP_ENDED (none: nothing was running; exit: it ended after the
+# TERM, in time; kill: it needed the escalation) and STOP_SECONDS (decimal, from the TERM to the process gone).
+# Returns 1 when the process is still there after the KILL. Polls every HPCOP_POLL_S s (1), and waits
+# HPCOP_KILL_WAIT_S s (30) after each of the USR1 and the KILL; both are knobs for the offline tests.
+stop_kept_service() {  # <pid> <start> <seconds>
+  local pid=$1 start=$2 limit=$3 poll=${HPCOP_POLL_S:-1} t0 end ms
+  STOP_ENDED=none STOP_SECONDS=0.000
+  running_ours "$pid" "$start" || return 0
+  t0=$(date +%s%N)
+  if ! signal_ours "$pid" "$start" TERM; then
+    if running_ours "$pid" "$start"; then return 1; else return 0; fi   # it ended between the check and the signal
+  fi
+  STOP_ENDED=exit
+  end=$((SECONDS + limit))
+  while running_ours "$pid" "$start" && (( SECONDS < end )); do sleep "$poll"; done
+  if running_ours "$pid" "$start"; then
+    STOP_ENDED=kill
+    say "the service did not stop in $limit s: SIGKILL"
+    signal_ours "$pid" "$start" USR1 || true
+    end=$((SECONDS + ${HPCOP_KILL_WAIT_S:-30}))
+    while running_ours "$pid" "$start" && (( SECONDS < end )); do sleep "$poll"; done
+    if running_ours "$pid" "$start"; then
+      signal_ours "$pid" "$start" KILL || true
+      end=$((SECONDS + ${HPCOP_KILL_WAIT_S:-30}))
+      while running_ours "$pid" "$start" && (( SECONDS < end )); do sleep "$poll"; done
+    fi
+  fi
+  ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  STOP_SECONDS=$(printf '%d.%03d' "$((ms / 1000))" "$((ms % 1000))")
+  if running_ours "$pid" "$start"; then return 1; else return 0; fi
+}
+
+# The process run_service recorded in <workdir>/service.pid (supervise.py: PID and start tick), as the steps that only
+# read or use a running service see it. Sets REC_PID and REC_START (both empty when there is no usable record);
+# recorded_service_runs also says whether that very process (same start tick, our uid) is alive.
+read_service_pid() {  # <workdir>
+  local f=$1/service.pid
+  REC_PID='' REC_START=''
+  if [[ -f $f && ! -L $f && -O $f && -s $f ]]; then read -r REC_PID REC_START < "$f" || true; fi
+  [[ $REC_PID =~ ^[1-9][0-9]*$ && $REC_START =~ ^[0-9]+$ ]] || { REC_PID='' REC_START=''; }
+  return 0
+}
+
+recorded_service_runs() {  # <workdir>
+  read_service_pid "$1"
+  [[ -n $REC_PID && -O /proc/$REC_PID ]] && running_ours "$REC_PID" "$REC_START"
+}
+
+# The ready marker: <workdir>/service-verified holds exactly the bytes of service.pid when this launch passed its
+# checks, so a marker left by an earlier launch (another PID or start tick) never reads as this one's.
+mark_verified() {  # <workdir>
+  local W=$1 t=$1/service-verified.tmp.$$
+  [[ -s $W/service.pid && ! -L $W/service.pid ]] || die "no service.pid in $W to mark as verified"
+  [[ ! -L $W/service-verified ]] || die "$W/service-verified is a symlink"
+  cat -- "$W/service.pid" > "$t"
+  chmod 600 -- "$t"
+  mv -f -- "$t" "$W/service-verified"
+}
+
+# The identity of a deployment, recorded once its first start has passed every check and compared by a restart:
+# <workdir>/identity.json, 0600, no secret: {"kind": ..., "<key>": "<value>", ...}. Values are the service's own
+# names (an id, a domain, a user id), held to a safe character set so the file is always valid JSON.
+write_identity() {  # <workdir> <kind> <key> <value> [<key> <value> ...]
+  local W=$1 body k v
+  body="{\"kind\": \"$2\""; shift 2
+  while (( $# >= 2 )); do
+    k=$1 v=$2; shift 2
+    [[ $k =~ ^[A-Za-z]{1,32}$ && $v =~ ^[A-Za-z0-9._:@-]{1,253}$ ]] || die "identity field '$k' is empty or outside the safe character set"
+    body+=", \"$k\": \"$v\""
+  done
+  put_secret "$W/identity.json" "$body}"$'\n'
+}
+
+check_identity() {  # <workdir> <key> <value> [<key> <value> ...]: each equals what the first start recorded
+  local W=$1 k v rec
+  [[ -f $W/identity.json && ! -L $W/identity.json && -O $W/identity.json ]] || die "$W/identity.json is missing or not yours"
+  shift
+  while (( $# >= 2 )); do
+    k=$1 v=$2; shift 2
+    rec=$(jsonget "$W/identity.json" "$k" --default '') || die "cannot read $W/identity.json"
+    [[ -n $rec && $rec == "$v" ]] || die "the service's identity changed across the restart: its $k is not the one recorded"
+  done
+  ok "identity unchanged since the first start"
+}
+
+# A work directory's owner record, as make_workdir writes it: the process (PID and start tick) whose life the
+# directory belongs to, for sweep_leftovers. restart.sh takes the directory over with it.
+record_owner() {  # <workdir> <pid>
+  local t=$1/owner.pid.tmp.$$
+  printf '%s %s\n' "$2" "$(proc_field "$2" 22)" > "$t"
+  mv -f -- "$t" "$1/owner.pid"
+}
+
+owner_runs() {  # <workdir>: its owner record names a process that still runs
+  local pid='' start=''
+  [[ -f $1/owner.pid && ! -L $1/owner.pid && -O $1/owner.pid ]] || return 1
+  read -r pid start < "$1/owner.pid" || true
+  [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 1
+  alive "$pid" && [[ $(proc_field "$pid" 22) == "$start" ]]
+}
+
 component() {  # <op|oz>: the names that differ between the provider and the zone image
   case "${1:-}" in
     op) COMP=op PANEL=op_panel WORKER=op_worker START=oneprovider CONFIG_VAR=ONEPROVIDER_CONFIG
@@ -164,8 +267,29 @@ make_workdir() {  # <label>: print a new private work directory under $TMPDIR, o
 # A SIGKILL (Slurm's KillWait, after the stop has run out of time) can end the batch script before
 # remove_workdir runs: the work directory then stays in the node-wide /tmp, holding the bucket data and
 # Couchbase's own secrets, readable only by us and root. The next job of ours on the node removes it.
+# A work directory a kept stop left (teardown.sh --keep) has no owner process, and must survive the next job's sweep:
+# its keep-until mark (a regular file of ours, not a link, holding one integer: an epoch in seconds, the allocation's
+# end) keeps it until that moment has passed.
+keep_until_future() {  # <dir>: its keep-until mark is a valid epoch that is still in the future
+  local f=$1/keep-until v
+  [[ -f $f && ! -L $f && -O $f ]] || return 1
+  v=$(<"$f") || return 1   # one trailing newline goes; a second line fails the pattern below
+  [[ $v =~ ^[0-9]{1,15}$ ]] || return 1
+  (( 10#$v > $(date +%s) ))
+}
+
+# A stop that keeps the work directory: stop-requested (teardown.sh --keep, or restart.sh after a failed restart)
+# begins with the line 'keep'. Any other stop-requested (an empty file) is a stop that removes everything.
+kept_stop() {  # <workdir>
+  local f=$1/stop-requested first=''
+  [[ -f $f && ! -L $f && -O $f ]] || return 1
+  IFS= read -r first < "$f" || true
+  [[ $first == keep ]]
+}
+
 leftover_owner_gone() {  # <dir>: its owner record names a process that is no longer running
   local pid='' start=''
+  if keep_until_future "$1"; then return 1; fi   # kept until the allocation ends, whoever owned it
   [[ -f $1/owner.pid && ! -L $1/owner.pid && -O $1/owner.pid ]] || return 1   # no record: being made, keep
   read -r pid start < "$1/owner.pid" || true
   [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 1
@@ -334,14 +458,20 @@ config_dir() {  # <rootfs> <service>: host path of the service's config.d, behin
   printf '%s\n' "$1$t/config.d"
 }
 
-run_service() {  # <workdir>: become the service (apptainer exec) in the foreground of this process
-  local W=$1 R=$1/rootfs S f epmd
+check_service_files() {  # <workdir>: what run_service needs on disk, refused with a message when it is not there
+  local W=$1 S f
   S=$(secrets_dir "$W")
   [[ -e $W/rootfs.complete ]] || die "$W has no complete rootfs: run node-init.sh first"
   for f in passphrase erlang-cookie couchbase-user couchbase-password config.yaml env; do
     [[ -s $S/$f && $(mode_of "$S/$f") == 600 ]] || die "$S/$f is missing or not 0600: run node-init.sh and configure.sh"
   done
   if [[ $COMP == op && ! -s $S/registration-token ]]; then die "no registration token yet: deliver-token.sh first"; fi
+}
+
+run_service() {  # <workdir>: become the service (apptainer exec) in the foreground of this process
+  local W=$1 R=$1/rootfs S epmd
+  S=$(secrets_dir "$W")
+  check_service_files "$W"
   command -v apptainer >/dev/null || die "apptainer not on PATH"
   epmd=$(epmd_port_of "$R")
   # Seconds before the bind, not minutes (node-init checked too, before the untar).
@@ -383,8 +513,12 @@ guard_evidence() {  # <run.log>
   grep -F "$CB_EVIDENCE_LABEL" "$1" 2>/dev/null | grep -E '^hpcop-evidence \{[ -~]{1,300}\}$' || true
 }
 
-wait_ready() {  # <workdir> <service pid> [timeout s]: until the stock launcher reports a fresh deployment
-  local W=$1 log=$1/run.log end=$((SECONDS + ${3:-1800}))
+wait_ready() {  # <workdir> <service pid> [timeout s] [fresh|restart]: until the stock launcher reports the service ready
+  # fresh (the default): a new deployment, so the launcher must also have printed 'Congratulations! New'. restart: the
+  # service started over an existing deployment, which prints no such line; the lock and the guard's verdict are
+  # still required (run.log is rewritten by every start, so both belong to this launch).
+  local W=$1 log=$1/run.log end=$((SECONDS + ${3:-1800})) mode=${4:-fresh}
+  [[ $mode == fresh || $mode == restart ]] || die "wait_ready: mode '$mode' is neither fresh nor restart"
   while (( SECONDS < end )); do
     # Polled every second: the guard's verdict ends the start at once (the batch script then stops the service).
     if grep -qF "$CB_GUARD_FAILED" "$log" 2>/dev/null; then
@@ -392,7 +526,9 @@ wait_ready() {  # <workdir> <service pid> [timeout s]: until the stock launcher 
       die "$(grep -m1 -F "$CB_GUARD_FAILED" "$log" | cut -c8-400 | tr -cd '[:print:]')"
     fi
     if [[ -e $W/rootfs/root/service-ready.lock ]]; then
-      grep -q 'Congratulations! New' "$log" || die "the service marked itself ready without a fresh deployment (see $log)"
+      if [[ $mode == fresh ]]; then
+        grep -q 'Congratulations! New' "$log" || die "the service marked itself ready without a fresh deployment (see $log)"
+      fi
       grep -qF "$CB_GUARD_PASSED" "$log" \
         || die "the deployment finished, but the Couchbase guard never confirmed this launch's administrator (no '$CB_GUARD_PASSED' line in $log)"
       guard_evidence "$log"
@@ -450,10 +586,33 @@ cb_guard() {  # <tmpdir> <user> <password> <when>: fail unless both hold
   ok "Couchbase guard ($4): this launch's administrator answers, and anonymous admin REST is refused (401)"
 }
 
+# Every password a rotation retired, one per line, never overwritten: a restart rotates again, and Couchbase must
+# refuse them all. Builtins only (read, printf), so no argv sees one.
+retired_passwords() {  # <secrets dir>: each retired password on its own line of stdout
+  local f=$1/couchbase-password.retired v
+  [[ -e $f ]] || return 0
+  [[ -f $f && ! -L $f && -O $f && $(mode_of "$f") == 600 ]] || die "$f is not a 0600 file of yours"
+  while IFS= read -r v || [[ -n $v ]]; do
+    if [[ -n $v ]]; then printf '%s\n' "$v"; fi
+  done < "$f"
+}
+
+append_retired() {  # <secrets dir> <password>: one more line, 0600, written atomically, the earlier lines kept
+  local f=$1/couchbase-password.retired body='' v
+  if [[ -e $f ]]; then   # read here, not through retired_passwords in a subshell: a refusal must stop the rotation
+    [[ -f $f && ! -L $f && -O $f && $(mode_of "$f") == 600 ]] || die "$f is not a 0600 file of yours"
+    while IFS= read -r v || [[ -n $v ]]; do
+      if [[ -n $v ]]; then body+=$v$'\n'; fi
+    done < "$f"
+  fi
+  put_secret "$f" "$body$2"$'\n'
+}
+
 # onepanel (service_couchbase) runs couchbase-cli cluster-init and bucket-create with the administrator
 # password on their command lines while it deploys. That is the image's code, out of our reach, so the
 # password it used is retired as soon as the deployment is done: a fresh one that no process ever saw
-# replaces it in Couchbase (POST /settings/web) and in onepanel's overlay, and the old one must fail.
+# replaces it in Couchbase (POST /settings/web) and in onepanel's overlay, and the old one must fail. A restart
+# rotates again (finish.sh --restart): the retired list grows, and every entry must stay refused.
 cb_rotate() {  # <workdir> <tmpdir>
   local S user old new code
   S=$(secrets_dir "$1")
@@ -466,7 +625,7 @@ cb_rotate() {  # <workdir> <tmpdir>
   code=$(http POST http://127.0.0.1:8091/settings/web "$2/cb-web.out" -K "$2/cb-old.cfg" --data @"$2/cb-web.form")
   rm -f -- "$2/cb-old.cfg" "$2/cb-web.form"
   need_2xx "$code" "Couchbase administrator password change" "$2/cb-web.out"
-  put_secret "$S/couchbase-password.retired" "$old"
+  append_retired "$S" "$old"
   put_secret "$S/couchbase-password" "$new"
   write_cb_overlay "$1/rootfs" "$user" "$new"
   [[ $(cb_status "$2" "$user" "$new") == 200 ]] || die "Couchbase rejects the new administrator password"
@@ -479,11 +638,12 @@ secret_values_file() {  # <workdir> <out>: this launch's secret values, one per 
   local S f v
   S=$(secrets_dir "$1")
   ( umask 077; : > "$2" )
-  for f in passphrase erlang-cookie couchbase-password couchbase-password.retired registration-token; do
+  for f in passphrase erlang-cookie couchbase-password registration-token; do
     v=''
     if [[ -s $S/$f ]]; then IFS= read -r v < "$S/$f" || true; fi
     if [[ -n $v ]]; then printf '%s\n' "$v" >> "$2"; fi
   done
+  retired_passwords "$S" >> "$2"   # every retired password, not only the last
 }
 
 scrub_secrets() {  # <workdir>: once the service has stopped, delete every secret it held; logs stay, redacted
