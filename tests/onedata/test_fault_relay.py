@@ -162,6 +162,77 @@ def test_o58_the_relay_refuses_another_federations_service_an_unlisted_command_a
     assert verbs.calls == []
 
 
+def test_o58_a_request_written_again_under_an_id_the_relay_took_never_runs_twice(tmp_path):
+    """O58: the same request file written again (same id, same relay, a deadline still ahead) after the relay took and
+    answered it: refused as `replayed`, nothing runs, and the first answer is never overwritten."""
+    root, verbs = root_of(tmp_path), Verbs()
+    relay = relay_of(root, verbs)
+    with relay.holding():
+        key = write_request(root, relay, verb="exec", command="restart_link")
+        replay = (relay_dir(root) / "requests" / f"{key}.json").read_text(encoding="utf-8")
+        assert relay.serve_once() == 1
+        first = answer(root, key)
+        (relay_dir(root) / "requests" / f"{key}.json").write_text(replay, encoding="utf-8")
+        assert relay.serve_once() == 1
+    assert len(verbs.calls) == 1
+    assert answer(root, key) == first
+    assert "refused" not in first
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"verb": "exec", "command": []},
+        {"service": []},
+        {"service": {"a": 1}},
+        {"verb": ["stop"]},
+        {"deadline": float("nan")},
+        {"bound_s": float("inf")},
+        {"bound_s": 0},
+        {"bound_s": -5},
+    ],
+    ids=[
+        "command a list",
+        "service a list",
+        "service a dict",
+        "verb a list",
+        "nan deadline",
+        "inf bound",
+        "zero",
+        "neg",
+    ],
+)
+def test_o58_a_malformed_request_is_refused_and_the_relay_goes_on_serving(tmp_path, fields):
+    """O58: a field of the wrong type, or a deadline or bound that is no finite positive number, is refused as
+    `malformed` with nothing run, and never stops the relay: the next request is served."""
+    root, verbs = root_of(tmp_path), Verbs()
+    relay = relay_of(root, verbs)
+    with relay.holding():
+        bad = write_request(root, relay, **fields)
+        assert relay.serve_once() == 1
+        good = write_request(root, relay)
+        assert relay.serve_once() == 1
+    assert answer(root, bad)["refused"] == "malformed"
+    assert "refused" not in answer(root, good)
+    assert len(verbs.calls) == 1
+
+
+def test_o58_a_verb_that_fails_after_it_may_have_run_is_unknown_never_not_run(tmp_path):
+    """O58: the runner raising anything but a failure to start (its output undecodable, say) once the verb may have
+    run is answered as a command with no answer, never `not_run`, so a stop or a link restart is never retried as
+    one that did not happen."""
+
+    def broken(argv, *, timeout_s):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    root = root_of(tmp_path)
+    relay = relay_of(root, broken)
+    with relay.holding():
+        key = write_request(root, relay, verb="exec", command="restart_link")
+        assert relay.serve_once() == 1
+    assert answer(root, key)["timed_out"] is True
+
+
 def test_o58_a_relay_restart_never_replays_a_request_made_for_the_relay_before_it(tmp_path):
     """O58: a request names the relay it was made for (its heartbeat's nonce). A relay that stopped before it took one
     leaves it waiting; the next relay of the same root answers it refused (`other_relay`) and runs nothing, so a

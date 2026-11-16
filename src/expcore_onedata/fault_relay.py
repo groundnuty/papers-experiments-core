@@ -15,8 +15,10 @@ file `hpc-federation.json`), one verb of `fault_hpc.VERBS`, one service, for an 
 
 **What the relay runs.** Only the four verbs of its own federation: it claims a request by renaming it into `taken/`
 (so no two relays, or one relay twice, run it), and refuses, with a word and nothing run, anything else: a request for
-another relay (an earlier one: a restart never replays an old request), another federation, a service its state file
-does not list, a verb or exec command outside the sets, a key it does not know, or a deadline already past. It runs
+another relay (an earlier one: a restart never replays an old request), an id it has taken before (`replayed`: a
+request file written again under a taken id never runs twice), another federation, a service its state file does not
+list, a verb or exec command outside the sets, a key it does not know, a field of the wrong type, a deadline or bound
+that is no finite number, or a deadline already past. No request, however malformed, stops the relay. It runs
 the verb as `[*prefix, <verb>, <service>]` (an exec: `[*prefix, "exec", <service>, "--", <the allowed command's
 argv>]`, `fault_hpc.VerbCommand`), where `prefix` is how `up` started it (`hpcfed.py` with the root and the layout),
 never anything a request says, within the request's bound and deadline, one request at a time, in the order they were
@@ -42,6 +44,7 @@ import contextlib
 import ctypes
 import fcntl
 import json
+import math
 import os
 import re
 import signal
@@ -271,6 +274,7 @@ def run_clean(environ: Mapping[str, str]) -> Callable[..., CommandResult]:
             list(argv),
             capture_output=True,
             text=True,
+            errors="replace",  # output that is not UTF-8 is still an answer, never an error after the verb ran
             timeout=timeout_s,
             check=False,
             env=env,
@@ -303,6 +307,7 @@ class Relay:
         self._verbs = VerbCommand(prefix, runner or run_clean(environ))
         self._clock, self._wall = clock, wall
         self._beats = 0
+        self._taken: set[str] = set()  # every request id this relay has claimed: one never runs twice
         self._stop = threading.Event()
 
     @contextlib.contextmanager
@@ -346,11 +351,19 @@ class Relay:
             taken += 1
             record = _read(claimed)
             key = path.stem if _ID.fullmatch(path.stem) else None
-            answer = self._answer(record, key)
+            replayed = key is not None and key in self._taken
             if key is not None:
-                _write(
-                    directory / "answers" / f"{key}.json", {"format": FORMAT, "id": key, "relay": self.nonce, **answer}
-                )
+                self._taken.add(key)
+            try:
+                answer = {"refused": "replayed"} if replayed else self._answer(record, key)
+            except Exception:  # a request that breaks its own checks never stops the relay: refused before it ran
+                answer = {"refused": "malformed"}
+            if key is not None and not replayed:  # a replay's id is answered for its first run, never overwritten
+                with contextlib.suppress(OSError):  # no answer: the client reads the taken request as unknown
+                    _write(
+                        directory / "answers" / f"{key}.json",
+                        {"format": FORMAT, "id": key, "relay": self.nonce, **answer},
+                    )
             with contextlib.suppress(OSError):
                 claimed.unlink()
         return taken
@@ -365,14 +378,19 @@ class Relay:
             return "other_relay"  # an earlier relay's: a restart never replays it
         if record.get("federation") is None or record.get("federation") != federation_of(self.root):
             return "other_federation"
-        if record.get("verb") not in VERBS or record.get("service") not in services_of(self.root):
+        verb, service, command = record.get("verb"), record.get("service"), record.get("command")
+        if not all(isinstance(value, str) for value in (verb, service)) or not isinstance(command, str | None):
+            return "malformed"
+        if verb not in VERBS or service not in services_of(self.root):
             return "not_allowed"
-        if record.get("verb") == "exec" and record.get("command") not in EXEC_COMMANDS:
+        if verb == "exec" and command not in EXEC_COMMANDS:
             return "not_allowed"
         deadline, bound = record.get("deadline"), record.get("bound_s")
         for value in (deadline, bound):
-            if isinstance(value, bool) or not isinstance(value, int | float):
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
                 return "malformed"
+        if bound <= 0:
+            return "malformed"
         if deadline <= self._wall():
             return "expired"
         return None
@@ -394,8 +412,10 @@ class Relay:
             done = self._verbs(request, timeout_s=bound)
         except subprocess.TimeoutExpired:
             return {"timed_out": True}
-        except OSError:
+        except OSError:  # the verb's process could not be started
             return {"refused": "not_run"}
+        except Exception:  # anything else once the verb may have run: its outcome is unknown, never "not run"
+            return {"timed_out": True}
         return {"returncode": done.returncode, "stdout": done.stdout[:OUTPUT_CAP], "stderr": done.stderr[:OUTPUT_CAP]}
 
     def stop(self) -> None:
@@ -413,7 +433,11 @@ class Relay:
             beater = threading.Thread(target=beating, name="fault-relay-beat", daemon=True)
             beater.start()
             while not self._stop.is_set():
-                if not self.serve_once():
+                try:
+                    served = self.serve_once()
+                except OSError:  # the relay's directory could not be read this time: looked at again, never fatal
+                    served = 0
+                if not served:
                     self._stop.wait(poll_s)
             beater.join(timeout=BEAT_S + 1)
 

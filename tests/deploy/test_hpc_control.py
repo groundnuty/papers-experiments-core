@@ -67,8 +67,9 @@ class Done:
 class FakeState:
     """A state file: read() copies, update(fn) is atomic (fn runs on a copy; an exception from it writes nothing)."""
 
-    def __init__(self, doc):
+    def __init__(self, doc, root=None):
         self.doc = doc
+        self.root = root  # where a stop or a start holds the verbs' lock, as M1's StateStore has it
         self.history = []
 
     def read(self):
@@ -141,9 +142,9 @@ def clock(monkeypatch):
 
 
 @pytest.fixture
-def world():
+def world(tmp_path):
     """A federation whose provider runs: its state, its launcher, and the output the verbs write."""
-    state = FakeState(document())
+    state = FakeState(document(), root=tmp_path)
     launcher = FakeLauncher(state, {f"{PREFIX}-prov-a-run-1": "77.2", f"{PREFIX}-zone-run-1": "77.1"})
     return type("World", (), {"state": state, "launcher": launcher})
 
@@ -1107,3 +1108,66 @@ def test_o59_a_proof_is_recorded_only_for_the_launch_the_status_read(world, cloc
     world.launcher.on_control = on_control
     verb(world, "status", mounts=Mounts())
     assert world.state.service()["mounts_proven"] is False
+
+
+# --- one stop or start at a time ------------------------------------------------------------------------------------
+
+
+def test_o58_a_start_while_another_start_is_between_its_claim_and_its_launch_runs_nothing(world, clock):
+    """O58: a second `hpcfed.py start` while the first holds the verbs' lock (here, from inside the first's launch,
+    before its client is recorded) is exit 1 and launches nothing: one service step on the work directory."""
+    stopped_provider(world)
+    nested = []
+
+    def second_start(name):
+        nested.append(verb(world, "start"))
+        world.launcher.steps[name] = "88.1"
+
+    world.launcher.on_service = second_start
+    assert verb(world, "start")[0] == 0
+    [(status, _out, err)] = nested
+    assert status == 1
+    assert "another stop or start" in err
+    assert [call["name"] for call in world.launcher.services] == [f"{PREFIX}-prov-a-run-2"]
+
+
+def test_o58_a_stop_while_a_start_runs_is_refused_and_runs_nothing(world, clock):
+    """O58: a stop is a mutation too: refused while a start holds the lock, so it never tears the new launch down
+    between its claim and its record."""
+    stopped_provider(world)
+    nested = []
+    world.launcher.on_service = lambda name: (
+        nested.append(verb(world, "stop")),
+        world.launcher.steps.update({name: "9"}),
+    )
+    assert verb(world, "start")[0] == 0
+    assert nested[0][0] == 1
+    assert [call["argv"][1] for call in world.launcher.controls] == []
+
+
+def test_o58_status_and_exec_take_no_lock(world, clock):
+    """O58: reading and the heal's exec go on while a stop or start holds the lock."""
+    world.launcher.on_control = lambda argv: alive() if argv[1].endswith("status.sh") else Done(0, "pong\n")
+    with control._exclusive(world.state):
+        assert verb(world, "status")[0] == 0
+        assert verb(world, "exec", argv=["op_worker", "ping"])[0] == 0
+
+
+def test_o58_a_state_store_with_no_root_refuses_a_stop_or_a_start(world, clock):
+    """O58: without the root to hold the lock in, no mutation runs: exit 2, nothing changed."""
+    world.state.root = None
+    for name in ("stop", "start"):
+        assert verb(world, name)[0] == 2
+    assert world.launcher.controls == []
+    assert world.state.history == []
+
+
+def test_o58_a_service_whose_longest_step_name_the_launcher_would_refuse_is_refused_at_once(world, clock):
+    """O58: every step name this module makes must fit the launcher's (100 characters): a name that would not is exit 2
+    before anything runs, never a step refused half way through a stop."""
+    long_name = "p" * 60  # with the allocation, its verb and a 13-digit stamp: 101 characters
+    world.state.doc["services"][long_name] = world.state.doc["services"].pop("prov-a")
+    status, _out, err = verb(world, "stop", service=long_name)
+    assert status == 2
+    assert "no name a step can carry" in err
+    assert world.launcher.controls == []

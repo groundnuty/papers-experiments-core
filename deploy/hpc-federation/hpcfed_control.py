@@ -38,6 +38,10 @@ or epoch seconds, is read as such), `site` (`node_tmp`, `logs`, `node_python`), 
 `hpcstate.checked_workdir` accepts for that kind (directly under the site's node tmpfs, `hpcop-<op|oz>.XXXXXX`).
 Anything else is exit 2 with a message that names neither a node nor a path.
 
+**One stop or start at a time.** A stop or a start holds `VERBS_LOCK` in the federation's root (the state store's
+`root`) from the state read that decides it to its last record, never waiting for it: a second one meanwhile is exit 1
+and runs nothing, so two processes never launch two service steps on one work directory. Status and exec take no lock.
+
 **status**: one JSON line `{"service", "state", "running", "identity", "launch", "node", "step", "ready"}`. `running`
 is true only when the service step is listed **and** a control step (`bundle/status.sh`, bounded to 60 s) finds the
 recorded process alive. `identity` is `"<launch>:<pid>:<start>"` while running, else null. `ready` is running and the
@@ -88,14 +92,17 @@ and stderr through unchanged; the exit status is the command's (`128 + n` for a 
 or the step's end is not known, and 125 when the step could not run.
 """
 
+import contextlib
+import fcntl
 import json
 import math
+import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import hpcslurm
 import hpcstate
@@ -106,6 +113,8 @@ KINDS = ("op", "oz")
 BUNDLE = Path(__file__).resolve().parent / "bundle"
 ENDED = ("exit", "kill", "none")
 STARTABLE = ("stopped", "stopping", "starting", "running")  # what a start may follow, once nothing runs (see above)
+MUTATING = ("stop", "start")  # one at a time per federation, under VERBS_LOCK
+VERBS_LOCK = "hpc-federation.verbs.lock"  # in the root, beside M1's state lock and lifecycle lock
 
 STATUS_TIMEOUT_S = 60  # the status control step's bound
 EXEC_TIMEOUT_S = 300  # the exec control step's bound
@@ -182,8 +191,8 @@ class Target:
         if not isinstance(node, str) or not node or node != node.strip():
             raise Refusal("the service has no recorded node")
         prefix = allocation.get("name")
-        if not isinstance(prefix, str) or not STEP_NAME.fullmatch("%s-%s-run-1" % (prefix, service)):
-            raise Refusal("the allocation or the service has no name a step can carry")
+        if not isinstance(prefix, str) or not STEP_NAME.fullmatch("%s-%s-mounts-%d" % (prefix, service, 10**12)):
+            raise Refusal("the allocation or the service has no name a step can carry")  # the longest name made here
         step = record.get("step")
         self.service, self.kind, self.node, self.workdir = service, kind, node, workdir
         self.prefix, self.site = prefix, site
@@ -576,6 +585,26 @@ def _exec(target: Target, launcher: Any, argv: Sequence[str], out: Any, err: Any
     return 128 - code if code < 0 else code  # a client a signal ended reads as the shell reads it
 
 
+@contextlib.contextmanager
+def _exclusive(state: Any) -> Iterator[None]:
+    """Hold the federation's verbs lock for a whole stop or start, never waiting for it: from the state read that
+    decides it to its last record, so two of them (two processes of `hpcfed.py`) never both launch a service step on
+    one work directory, nor a stop undo a start between its claim and its launch. M1's state lock is held only for one
+    change of the state; the kernel lets this one go with a process that dies."""
+    root = getattr(state, "root", None)
+    if root is None:
+        raise Refusal("the state store names no root to hold the verbs' lock in")
+    descriptor = os.open(os.path.join(str(root), VERBS_LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refusal("another stop or start of this federation is running: try again", 1) from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def run(
     verb: str,
     service: str,
@@ -596,18 +625,19 @@ def run(
             raise Refusal("unknown verb '%s'" % (verb,))
         if isinstance(stop_seconds, bool) or not isinstance(stop_seconds, int) or stop_seconds < 1:
             raise Refusal("stop_seconds must be a positive whole number")
-        try:
-            doc = state.read()
-        except Exception as error:  # an unreadable state names its path: only the error's type is told
-            raise Refusal("the federation's state could not be read (%s)" % type(error).__name__) from None
-        target = Target(doc, service, mounts)
-        if verb == "status":
-            return _status(target, launcher, state, mounts, out, err)
-        if verb == "stop":
-            return _stop(target, launcher, state, stop_seconds, out, err)
-        if verb == "start":
-            return _start(target, launcher, state, err)
-        return _exec(target, launcher, argv, out, err)
+        with _exclusive(state) if verb in MUTATING else contextlib.nullcontext():
+            try:
+                doc = state.read()
+            except Exception as error:  # an unreadable state names its path: only the error's type is told
+                raise Refusal("the federation's state could not be read (%s)" % type(error).__name__) from None
+            target = Target(doc, service, mounts)
+            if verb == "status":
+                return _status(target, launcher, state, mounts, out, err)
+            if verb == "stop":
+                return _stop(target, launcher, state, stop_seconds, out, err)
+            if verb == "start":
+                return _start(target, launcher, state, err)
+            return _exec(target, launcher, argv, out, err)
     except Refusal as refusal:
         _say(err, str(refusal))
         return refusal.status

@@ -322,7 +322,9 @@ argv prefix and `down` stops first; section 5), which runs the verb and answers.
 - `state` (`hpclaunch.StateStore`): `read()` and `update(fn)` (section 4).
 
 The verbs read a work directory only as `hpcstate.checked_workdir` accepts it, name every step as the launcher's
-`STEP_NAME` allows, and read a `returncode` of None (an end not known) as a failure, never a success.
+`STEP_NAME` allows, and read a `returncode` of None (an end not known) as a failure, never a success. A stop or a start
+holds `hpc-federation.verbs.lock` in the root, never waiting for it, from the state read that decides it to its last
+record, so two never interleave; status and exec take no lock.
 
 **(a) STOP** `hpcfed.py stop <service>`: a control step on the service's node runs `teardown.sh <oz|op> --workdir W
 --keep --timeout <stop_seconds>`: `stop-requested` is written with `keep` in it, SIGTERM goes to the recorded service
