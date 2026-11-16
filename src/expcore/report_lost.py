@@ -22,6 +22,12 @@ NOTES = [
     "without a price). A top-up or probe row is charged its dollars. A lost attempt is in none of the counts above:",
     "its run was run again.",
 ]
+# With a Basis column (an export whose journal kept call logs, C05): how an attempt whose end was not seen was charged
+BASIS_NOTE = [
+    "Basis: since the call log (C05), an attempt whose end the journal did not see is charged by its journaled log,",
+    "measured (every request answered) or measured plus one request in flight at that request's bound, and its",
+    "reserved bound (bound) only when no log could be read.",
+]
 UNKNOWN = "-"
 
 Table = Callable[[Sequence[str], Sequence[Sequence[object]]], list[str]]
@@ -47,7 +53,12 @@ def section(export: Mapping[str, Any], table: Table) -> list[str]:
         else:
             blank = [UNKNOWN] * 4
             rows.append([entry["kind"], entry.get("run_key", UNKNOWN), entry["model"], *blank, usd])
+    notes = NOTES
+    if any("basis" in entry for entry in entries):  # an export from before the call log has no such column (C05)
+        header.append("Basis")
+        rows = [[*row, entry.get("basis", UNKNOWN)] for entry, row in zip(entries, rows, strict=True)]
+        notes = [*NOTES, *BASIS_NOTE]
     if any("shard" in entry for entry in entries):
         header.insert(0, "Shard")
         rows = [[entry.get("shard", UNKNOWN), *row] for entry, row in zip(entries, rows, strict=True)]
-    return [HEADING, "", *NOTES, "", *table(header, rows), ""]
+    return [HEADING, "", *notes, "", *table(header, rows), ""]

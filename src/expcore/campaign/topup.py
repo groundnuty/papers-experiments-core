@@ -214,15 +214,35 @@ class Ledger:
         """Append an event about one of the model's requests."""
         self.store.event(self.stamp(), kind, model, detail)
 
+    def call_sent(self, attempt_id: int) -> None:
+        """Count a request of the attempt in its call log, committed and journaled before it goes out (C05)."""
+        self.store.note_call_sent(attempt_id)
+
+    def call_answered(self, attempt_id: int, counts: tuple[int | None, ...] | None) -> None:
+        """Add a reply's counts to the attempt's call log (None: billed, and not read), and journal them (C05)."""
+        self.store.note_call_answered(attempt_id, counts)
+
 
 class AttemptSpend:
     """The spend guard of one attempt (`expcore.models.spend.SpendGuard`), installed by the attempt runner."""
 
-    def __init__(self, ledger: Ledger, attempt_id: int, run_key: str, model: str, *, reserved_capped: bool):
+    def __init__(
+        self,
+        ledger: Ledger,
+        attempt_id: int,
+        run_key: str,
+        model: str,
+        *,
+        reserved_capped: bool,
+        calls_logged: bool = False,
+    ):
         """Take the ledger, the attempt, and whether the assessment that admitted its run reserved it by the reply
         maximum (C27). That decision is carried in, never read from the model's status here: another attempt may
-        have taken the model off the maximum since, and the run must still be checked as the run it was admitted as."""
+        have taken the model off the maximum since, and the run must still be checked as the run it was admitted as.
+        With `calls_logged` (the attempt's row was begun with a call log) each request and reply goes into the log
+        (C05); a row without one refuses the first, loudly."""
         self.ledger, self.attempt_id, self.run_key, self.model = ledger, attempt_id, run_key, model
+        self.calls_logged = calls_logged
         self.unaccounted = False  # a reply left a count out: from then on the cap does not bound the run
         self.maximum = ledger.maximum(model)
         self.reserved_capped = reserved_capped  # the run was admitted with the reservation by the reply maximum
@@ -231,18 +251,32 @@ class AttemptSpend:
 
     async def before_request(self) -> None:
         """Top up a request that follows a reply without usage, or end the attempt as a budget hold. A run reserved
-        by the reply maximum of a model since taken off it sends its next request only within the ceilings (C27)."""
+        by the reply maximum of a model since taken off it sends its next request only within the ceilings (C27). A
+        request cleared is counted in the attempt's call log before it goes out (C05)."""
         self.cleared = None
         if self.unaccounted:
             await asyncio.to_thread(self._reserve_or_hold, "a request after a reply that did not report its usage")
         elif self.reserved_capped:
             await asyncio.to_thread(self._check_if_unheld)
+        if self.calls_logged:
+            await asyncio.to_thread(self.ledger.call_sent, self.attempt_id)
 
-    async def after_reply(self, input_tokens: int | None, output_tokens: int | None) -> None:
-        """Record a reply past the reply maximum of a model held to it (C27), and a reply that left a count out, which
-        takes every later request of the attempt through a top-up. A reply past the maximum counts whether this run was
-        reserved by it or by the window: while the campaign holds the model to it, the reply is evidence against every
-        other run of the model."""
+    async def after_reply(
+        self,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        *,
+        cache_creation_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+        unread: bool = False,
+    ) -> None:
+        """Add the reply to the attempt's call log (C05); record a reply past the reply maximum of a model held to it
+        (C27), and a reply that left a count out, which takes every later request of the attempt through a top-up. A
+        reply past the maximum counts whether this run was reserved by it or by the window: while the campaign holds
+        the model to it, the reply is evidence against every other run of the model."""
+        if self.calls_logged:
+            counts = None if unread else (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+            await asyncio.to_thread(self.ledger.call_answered, self.attempt_id, counts)
         if output_tokens is not None and output_tokens > self.maximum:
             await asyncio.to_thread(self._past_maximum, output_tokens)
         if input_tokens is not None and output_tokens is not None:

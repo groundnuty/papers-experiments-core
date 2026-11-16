@@ -9,7 +9,9 @@ repairs a kill between them, and it is safe to run again after a kill of its own
 from dataclasses import dataclass
 from pathlib import Path
 
+from expcore.campaign import lost_ledger
 from expcore.campaign.attempts import TreatmentKindsMismatch
+from expcore.campaign.interrupted_spend import BASES, BOUND, basis_of, read_log
 from expcore.campaign.markers import read_marker
 from expcore.campaign.store import Store
 
@@ -27,8 +29,12 @@ def recover(store: Store, now: str, max_attempts: int) -> Recovery:
     """Settle the 'running' rows. Call only while holding the campaign lock: every 'running' row is stale.
 
     An attempt with a marker that names it is committed from the marker and never run again. Every other running
-    attempt becomes interrupted, uncharged, with its usage marked incomplete, and its run stays pending to be run
-    again under the same number. Only then do harness-error runs go back to pending, from the same row, their failed
+    attempt becomes interrupted, uncharged against the attempt limit, with its usage marked incomplete, and its run
+    stays pending to be run again under the same number. An attempt that kept a call log gets the basis it is charged
+    on (`spend_basis`, C05): the one its log says when the store was never journaled, so it is the store that ran it,
+    and `bound` when the store's ledger names a spend journal (the store may be a snapshot whose log the attempt
+    outgrew, which only that journal's count can confirm, `lost_spend.reconcile`) or cannot be read. Only then do
+    harness-error runs go back to pending, from the same row, their failed
     attempts kept: a kill after the marker and a kill after the metadata write leave the same state after one
     recovery, because a marker that ends as a harness error is requeued like a result that was stored. A marker that
     exists but cannot be trusted raises MarkerError and settles nothing further.
@@ -55,7 +61,9 @@ def recover(store: Store, now: str, max_attempts: int) -> Recovery:
                 "the version-1 treatment rule (the declared kind alone) applied",
             )
         committed += 1
-    interrupted = store.transact(lambda: _interrupt(store, orphans, now))
+    ledger = lost_ledger.read(store)
+    trusted = ledger is not None and ledger.journal is None  # never journaled: the store that ran the attempts
+    interrupted = store.transact(lambda: _interrupt(store, orphans, now, trusted))
     requeued = store.transact(lambda: _requeue_harness_errors(store, now))
     return Recovery(committed, interrupted, requeued)
 
@@ -72,16 +80,26 @@ def _requeue_harness_errors(store: Store, now: str) -> int:
     return len(keys)
 
 
-def _interrupt(store: Store, attempt_ids: list[int], now: str) -> int:
-    """Turn the given running attempts into interrupted ones; call inside a transaction."""
+def _interrupt(store: Store, attempt_ids: list[int], now: str, trusted: bool) -> int:
+    """Turn the given running attempts into interrupted ones, each with the basis it is charged on when it kept a call
+    log (`trusted`: the store's own log can be believed); call inside a transaction."""
+    bases: dict[str, int] = {}
     for attempt_id in attempt_ids:
+        row = store.db.execute("SELECT calls_sent, calls_usage FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        basis = None
+        if row["calls_sent"] is not None:  # a log was kept: a basis is recorded, its bound unless it can be trusted
+            basis = basis_of(read_log(row["calls_sent"], row["calls_usage"])) if trusted else BOUND
+            bases[basis] = bases.get(basis, 0) + 1
         store.db.execute(
-            "UPDATE attempts SET state='interrupted', charged=0, ended_utc=?, usage_complete=0 WHERE id=?",
-            (now, attempt_id),
+            "UPDATE attempts SET state='interrupted', charged=0, ended_utc=?, usage_complete=0, spend_basis=? "
+            "WHERE id=?",
+            (now, basis, attempt_id),
         )
     if attempt_ids:
+        detail = f"{len(attempt_ids)} attempt(s)"
+        if bases:
+            detail += "; charged by their call logs: " + ", ".join(f"{b} {bases[b]}" for b in BASES if b in bases)
         store.db.execute(
-            "INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)",
-            (now, "recovered_interrupted", None, f"{len(attempt_ids)} attempt(s)"),
+            "INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, "recovered_interrupted", None, detail)
         )
     return len(attempt_ids)

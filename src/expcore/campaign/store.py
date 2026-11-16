@@ -90,6 +90,12 @@ _ADDED_COLUMNS = (
     ("attempts", "deployments", "TEXT"),
     # what of the run admission the attempt held (attempts.ADMISSION_MODES); NULL: unknown
     ("attempts", "admission", "TEXT"),
+    # the call log (C05, `interrupted_spend`): the requests sent, each counted before it went out; NULL: none kept
+    ("attempts", "calls_sent", "INTEGER"),
+    # JSON: each answered request's [input, output, cache writes, cache reads], null for a reply that was not read
+    ("attempts", "calls_usage", "TEXT"),
+    # how an interrupted attempt is charged: measured | measured_plus_inflight | bound; NULL: no log was kept
+    ("attempts", "spend_basis", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -459,6 +465,7 @@ class Store:
         lease_outcome: str = "none",
         reserved_capped: bool | None = None,
         admission: str = "none",
+        calls_logged: bool = False,
     ) -> BegunAttempt:
         """Insert the 'running' row before the run starts; refuse in the transaction a run that is not pending.
 
@@ -469,7 +476,8 @@ class Store:
         how it was obtained (`LEASE_OUTCOMES`), the bound the budget gate reserved the run when it let it start:
         by the reply maximum or by the window (`reserved_capped`, C27; None when no gate decided it), and what it held
         of the platform's run admission (`ADMISSION_MODES`). An attempt whose usage turns out unknown is charged that
-        bound, at this start or any later one (`attempt_bounds`).
+        bound, at this start or any later one (`attempt_bounds`). With `calls_logged` (a budget, whose spend guard
+        keeps it) the row starts an empty call log, which `note_call_sent` and `note_call_answered` fill (C05).
         """
         if lease_outcome not in LEASE_OUTCOMES:
             raise ValueError(f"lease_outcome {lease_outcome!r} must be one of: {', '.join(LEASE_OUTCOMES)}")
@@ -493,7 +501,7 @@ class Store:
             capped = None if reserved_capped is None else int(reserved_capped)
             cursor = self.db.execute(
                 "INSERT INTO attempts(run_key,attempt,state,started_utc,pid,run_dir,dispatch_seq,lease_wait_s,"
-                "lease_outcome,reserved_capped,admission) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "lease_outcome,reserved_capped,admission,calls_sent,calls_usage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     run_key,
                     number,
@@ -506,6 +514,8 @@ class Store:
                     lease_outcome,
                     capped,
                     admission,
+                    0 if calls_logged else None,
+                    "[]" if calls_logged else None,
                 ),
             )
             attempt_id = int(cursor.lastrowid)
@@ -532,6 +542,50 @@ class Store:
                 raise AttemptRefused(f"attempt {attempt_id} is not running, so it takes no top-up")
             self.db.execute("INSERT INTO events(ts,kind,model,detail) VALUES(?,?,?,?)", (now, *event))
             self._note_spend(lambda: self._attempt_line(attempt_id))  # written before the send it pays for (O62)
+
+        self.transact(go)
+
+    def note_call_sent(self, attempt_id: int) -> None:
+        """Count a request of a running attempt in its call log before it goes out (C05): committed, and journaled
+        (O62), before the send, so a kill after it charges the request at its bound until its reply is noted. An
+        attempt that is not running, or keeps no log, is refused."""
+
+        def go() -> None:
+            cursor = self.db.execute(
+                "UPDATE attempts SET calls_sent = calls_sent + 1 WHERE id=? AND state='running' AND calls_sent IS NOT "
+                "NULL AND calls_usage IS NOT NULL",
+                (attempt_id,),
+            )
+            if cursor.rowcount != 1:
+                raise AttemptRefused(f"attempt {attempt_id} is not running with a call log, so no request is noted")
+            self._note_spend(lambda: self._attempt_line(attempt_id))
+
+        self.transact(go)
+
+    def note_call_answered(self, attempt_id: int, counts: Sequence[int | None] | None) -> None:
+        """Add a reply's counts (input, output, cache writes, cache reads; None for a reply that was billed and could
+        not be read) to a running attempt's call log, and journal it (C05, O62). A log that cannot be read is left as
+        it is, and charges the bound."""
+        entry = None if counts is None else [None if c is None else int(c) for c in counts]
+        if entry is not None and len(entry) != 4:
+            raise ValueError(f"a reply's counts are input, output, cache writes and cache reads, not {counts!r}")
+
+        def go() -> None:
+            row = self.db.execute(
+                "SELECT calls_usage FROM attempts WHERE id=? AND state='running' AND calls_usage IS NOT NULL",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise AttemptRefused(f"attempt {attempt_id} is not running with a call log, so no reply is noted")
+            try:
+                usage = json.loads(row["calls_usage"])
+            except ValueError:
+                return  # unreadable: it stays so, and charges the bound
+            if not isinstance(usage, list):
+                return
+            usage.append(entry)
+            self.db.execute("UPDATE attempts SET calls_usage=? WHERE id=?", (json.dumps(usage), attempt_id))
+            self._note_spend(lambda: self._attempt_line(attempt_id))
 
         self.transact(go)
 

@@ -7,9 +7,10 @@ and with it what was spent since: the attempts that began, their top-ups, admiss
 then count less than was billed. With `expcore run --spend-journal FILE`, the dispatcher appends a line to FILE for
 every change of what was spent, once the store has committed it and before the spend it allows:
 
-- `attempt`: an attempt's row as it stands once it began, once it took a top-up and once it ended: its id, run key,
-  model, the dispatcher's pid, when it began, its state, the bound it was reserved at (`reserved_capped`, C27), its
-  counts and its top-ups;
+- `attempt`: an attempt's row as it stands once it began, once it took a top-up, before each request it sends, after
+  each reply and once it ended: its id, run key, model, the dispatcher's pid, when it began, its state, the bound it
+  was reserved at (`reserved_capped`, C27), its counts, its top-ups and its call log (`calls_sent`, `calls_usage`,
+  C05: what an attempt the kill interrupted is charged by, `campaign.interrupted_spend`);
 - `probe`: a charge of admission's probes (C26): the id of the event the store wrote with it, the model and the
   dollars (a settlement is below 0);
 - `unheld`: a model taken off the reply maximum (C27), which raises the bound its attempts are charged.
@@ -25,9 +26,9 @@ read as spent. A line that cannot be written (the filesystem is unreachable, or 
 before the spend the change allows: the attempt does not start, the top-up and the probe are not sent, and the
 dispatcher stops (C17). Every later write raises too, so nothing spends unjournaled after a failure. A change the
 store committed whose line was not written allowed no spend; an attempt left so is settled as any interrupted one,
-at its bound. Each write is flushed and fsynced; the file is created new with a header line and its directory
-fsynced. A line cut short by a kill is the file's last, and reads as not written: its commit happened, but nothing
-was spent on it.
+by its call log or at its bound. Each write is flushed and fsynced; the file is created new with a header line and
+its directory fsynced. A line cut short by a kill is the file's last, and reads as not written: its commit happened,
+but nothing was spent on it.
 """
 
 import json
@@ -57,6 +58,8 @@ ATTEMPT_FIELDS = (
     "replies_checked",
     "topups",
     "topup_usd",
+    "calls_sent",
+    "calls_usage",
 )
 PROBE_FIELDS = ("event_id", "model", "usd")
 

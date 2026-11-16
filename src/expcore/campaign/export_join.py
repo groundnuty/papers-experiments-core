@@ -23,6 +23,8 @@ snapshot and this module joins the results:
   settings and nothing of them adds up. A shard whose store recorded none exports none and adds none;
 - `lost_in_kill` (O62), when any shard's store had spend a kill took out of it: every shard's own entries in shard
   order, each with `"shard"` added, since each shard counted its own journals against its own share;
+- `interrupted_spend` (C05), when any shard's interrupted attempts kept a call log: every shard's own entries in shard
+  order, each with `"shard"` added, since each was charged against its own shard's share;
 - `shard_retries_by_kind` keeps what the sum of `retries_by_kind` loses: every row of every shard's own table, in shard
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
@@ -48,6 +50,7 @@ from typing import Any
 
 from expcore.campaign.deployments import fingerprint_order
 from expcore.campaign.export import EXPORT_FINGERPRINT, RUN_LISTS, ExportError, none_last
+from expcore.campaign.interrupted_spend import EXPORT_KEY as INTERRUPTED_KEY
 from expcore.campaign.lost_ledger import KEY as LOST_KEY
 from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.shard import EXPORT_KEY
@@ -69,9 +72,10 @@ DEPLOYMENTS = "deployment_shares"
 HOLDS = "operator_holds"  # the holds an operator ends (C11): a shard's export has the key only when it met one
 _MODEL_SUMS = ("analysed_runs", "runs_without_mix", "mixed_runs", "turns")
 _FINGERPRINT_SUMS = ("turns", "runs")
-_ENTRIES = (HOLDS, LOST_KEY)  # each shard's own entries, joined in shard order with the shard named (C11, O62)
+# each shard's own entries, joined in shard order with the shard named (C11, O62, C05)
+_ENTRIES = (HOLDS, LOST_KEY, INTERRUPTED_KEY)
 # keys that one shard's export may have and another's lack
-_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY)
+_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY)
 
 
 def join_exports(
@@ -162,7 +166,7 @@ def _keys_of_the_join(exports: Mapping[int, Mapping[str, Any]], order: Sequence[
     and `operator_holds` and `reset_settings` are in when any shard's export has them, where `export_run_state` puts
     them: after `kinds`, in that order."""
     keys = [key for key in exports[order[0]] if key != EXPORT_KEY]
-    optional = (DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY)
+    optional = (DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY)
     for position, extra in enumerate(optional):
         if extra not in keys and any(extra in exports[index] for index in order):
             anchors = [keys.index(key) for key in ("kinds", *optional[:position]) if key in keys]

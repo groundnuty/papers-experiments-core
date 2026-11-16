@@ -24,6 +24,7 @@ from expcore.config.models import Limits, ModelSpec, ModelTable
 from expcore.config.prices import Price
 from expcore.errors import BudgetHold
 from expcore.models import spend
+from expcore.models.adapters import ModelTurn
 from expcore.models.retry import Retrier, RetryPolicy
 from expcore.records.schema import reply_count_rule
 from expcore.replay.replay import replay_record
@@ -385,15 +386,23 @@ def test_c27_a_restart_charges_an_interrupted_attempt_the_bound_by_the_maximum_i
         ] * 3
 
 
+async def count_left_out(request):
+    """The study's executor: one reply that left its input count out, so no call log can price it (C05)."""
+    request.backend.use([ModelTurn("done", [], None, 9, "stop", 0.0)])
+    config = FakeExecutor().config
+    return await record_run(request, [FakeProvider({})], "be brief", "do the task", config, code=dict(CODE))
+
+
 def test_c27_an_interrupted_attempt_reserved_by_the_window_stays_charged_so_after_a_restart_that_shows_the_model_held(
     tmp_path, endpoint
 ):
     """C27 and C05: a run of a model a plugin's factory builds, never probed and so reserved by the window, is killed
-    before its usage was recorded. The restart builds the model with the core's factory, whose probe shows it held to
+    before its usage was recorded, and its call log cannot say what it cost either (its reply left its input count
+    out), so it is charged a bound. The restart builds the model with the core's factory, whose probe shows it held to
     the reply maximum: new runs are reserved the smaller bound, and the interrupted attempt is still charged the bound
     by the window it was reserved."""
     roomy = Budget(max_usd=100.0)
-    killing = started(tmp_path, Factory(), FakeExecutor(), roomy, crash_hook=killed_before_marker)
+    killing = started(tmp_path, Factory(), FakeExecutor(default=count_left_out), roomy, crash_hook=killed_before_marker)
     with killing as killed, pytest.raises(RuntimeError, match="unexpected error"):
         killed.run()
     with started(tmp_path, default_backend_factory, FakeExecutor(), roomy) as restart:

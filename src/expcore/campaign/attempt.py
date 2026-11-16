@@ -260,7 +260,8 @@ class AttemptRunner:
         self, row: Any, lease: Lease | None = None, *, admission: str = "none", reserved_capped: bool | None = None
     ) -> tuple[Any, Path]:
         """Insert the 'running' row, with a directory of its own for this try, the lease it runs under, what it holds
-        of the run admission, and the bound the budget gate reserved the run (C27; None when no gate decided it)."""
+        of the run admission, and the bound the budget gate reserved the run (C27; None when no gate decided it). With
+        a budget the row starts a call log, which the attempt's spend guard fills (C05)."""
         p = self.p
         tries = len(p.store.q("SELECT 1 FROM attempts WHERE run_key=?", (row["run_key"],))) + 1
         run_dir = p.root / "runs" / row["digest"] / f"try{tries}"
@@ -274,6 +275,7 @@ class AttemptRunner:
             lease_outcome="none" if lease is None else "granted",
             reserved_capped=reserved_capped,
             admission=admission,
+            calls_logged=p.ledger is not None,
         )
         return begun, run_dir
 
@@ -321,7 +323,7 @@ class AttemptRunner:
             guard = None
             if p.ledger is not None:
                 capped = True if decided is None else decided
-                guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=capped)
+                guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=capped, calls_logged=True)
             defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
             request = RunRequest(
                 RunIdentity(key, factors, begun.number),
