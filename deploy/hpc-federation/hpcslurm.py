@@ -250,9 +250,10 @@ class Allocation:
 
 @dataclass(frozen=True)
 class Step:
-    """One job step: where it runs, its size, its name, and its command behind the environment allowlist. A step in a
-    heterogeneous job's further component names it (`het_group`, srun's `--het-group`; a step without one runs in
-    component 0) and that component's own job id (`component`), by which squeue -s and sacct list its steps."""
+    """One job step: where it runs, its size, its name, and its command behind the environment allowlist. A step of a
+    heterogeneous job names its component (`het_group`, srun's `--het-group`), 0 included: on the site's Slurm a step
+    of one with no `--het-group` is refused. A step of a further component also carries that component's own job id
+    (`component`), by which squeue -s and sacct list its steps. A job of one component takes no `het_group`."""
 
     job: str
     node: str

@@ -278,7 +278,8 @@ def test_a_separate_sandbox_s_step_goes_to_its_own_held_job(shards, tmp_path):
 
 
 def test_a_het_sandbox_without_its_group_is_refused(shards, tmp_path):
-    """O56: a step with no `--het-group` would land in component 0, the services' node shape."""
+    """O56: a step of a heterogeneous job with no `--het-group` is refused by the site's Slurm, and one in group 0
+    would land on the services' node shape: the agent's needs its own group, above 0."""
     plan = shards.load_plan(_manifest(tmp_path))
     state_file = plan.shards[0].root / "hpc-federation.json"
     state = json.loads(state_file.read_text())

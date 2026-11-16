@@ -228,7 +228,7 @@ def federation(shard: Shard) -> dict[str, Any]:
     component, the step name's prefix and the sandbox's node.
 
     The state's `sandbox` record says how the sandbox node was placed: `het`, a component of the federation's own
-    heterogeneous job (the step needs `--het-group`, or it lands in component 0, the services' node shape), or
+    heterogeneous job (the step needs its `--het-group`: the site's Slurm refuses one that names none), or
     `separate`, a held job of its own (its `job`). A state with no `sandbox` record is the federation's job alone, its
     node the `sandbox` role `up` placed there (`services.sandbox`), or the manifest's. Either way the manifest's
     `sandbox_node`, when given, must be the state's."""

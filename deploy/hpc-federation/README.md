@@ -286,7 +286,9 @@ uv run python deploy/hpc-federation/hpcfed.py --layout <layout> --root <root> do
   spaces and the probe space; its link check covers ten ordered pairs.
 - **The agent's node** (M5), when `[hpc] sandbox` declares it or the layout's platform template declares the
   Apptainer sandbox's limits, is held at its own shape: by default (`sandbox_placement = "het"`) as component 1 of a
-  heterogeneous job, every step there with `--het-group=1`; or (`"separate"`) as a held job of its own. Either is read
+  heterogeneous job, every step there with `--het-group=1` and every step on a service node with `--het-group=0`
+  (the site's Slurm refuses a heterogeneous job's step that names no component); or (`"separate"`) as a held job of
+  its own, whose steps name none. Either is read
   back as the services' job is, and `down` releases both. The state file's `sandbox` record names its node, its job
   and its het group, which M5's shard step takes. With the pilot's shape and a memory weight of 0.5 this bills about
   42 units per hour, against 63 for one uniform 18 GB shape (`DESIGN.md`, section 1).

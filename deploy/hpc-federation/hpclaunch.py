@@ -3,8 +3,9 @@ service verbs (`hpcfed_control.py`, M4) through the hook in `hpcfed.py` (DESIGN.
 
 - `StateStore`: `read()` the state file; `update(fn)` a locked, atomic read-modify-write of it (`fn` takes the state
   and returns the new one), under `hpc-federation.lock` in the root, so two commands never interleave their writes.
-- `Launcher`: steps of the held job the state names, on its own nodes only (the agent's node's in its own component,
-  `--het-group`, or its own held job, as the state's `sandbox` says). `control(node, argv, *, name, timeout_s)`
+- `Launcher`: steps of the held job the state names, on its own nodes only (every step of a heterogeneous job names
+  its component, `--het-group=0` on a service node and the sandbox's group on the agent's node; or the agent's node is
+  its own held job, as the state's `sandbox` says). `control(node, argv, *, name, timeout_s)`
   runs a bounded control step (`--exact`, the control reserve's size, the environment allowlist, stdin /dev/null)
   and raises `TimeoutError` at its bound after cancelling that step by its id; `service(node, argv, *, kind, name,
   log)` launches a detached service step of the kind's size; `listed(name)` is the step id `squeue -s` lists under a
@@ -94,16 +95,20 @@ class Launcher:
         self.settings = settings
 
     def _where(self, node: str, name: str) -> Tuple[str, Optional[int], Optional[str], Site]:
-        """The job a step on this node belongs to, the heterogeneous job's component it runs in (None: component 0,
-        or a job of one component) and that component's own id: a service node is the services' job's (component
-        0); the agent's node is the last component of the same job (`het`) or a held job of its own (`separate`)."""
+        """The job a step on this node belongs to, the heterogeneous job's component it runs in (None for a job of one
+        component, where no step names one) and that component's own id (None: the job's): a service node is the
+        services' job's, component 0 of a heterogeneous job; the agent's node is the last component of the same job
+        (`het`) or a held job of its own (`separate`). Every step of a heterogeneous job names its component, 0
+        included: on the site's Slurm a step of one with no `--het-group` is refused ("No directives to start
+        application on any available hetjob components")."""
         state = self.store.read()
         job = state["allocation"].get("job")
         if job is None:
             raise hpcstate.StateError("the state names no held job")
         sandbox = state.get("sandbox") or {}
         if node in (state["allocation"].get("nodes") or []):
-            where: Tuple[str, Optional[int], Optional[str]] = (job, None, None)
+            group = 0 if sandbox.get("placement") == "het" else None  # the services' component of a het job
+            where: Tuple[str, Optional[int], Optional[str]] = (job, group, None)
         elif sandbox.get("node") is not None and node == sandbox["node"] and sandbox.get("job") is not None:
             where = (sandbox["job"], sandbox.get("het_group"), sandbox.get("component_job"))
         else:

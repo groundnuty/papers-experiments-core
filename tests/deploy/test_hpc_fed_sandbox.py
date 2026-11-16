@@ -18,6 +18,7 @@ from hpc_fed_support import (
     FakeSlurm,
     agent_site,
     hpc_on_path,
+    services_only,
     without_sandbox,
 )
 
@@ -321,12 +322,15 @@ def test_a_heterogeneous_job_is_listed_by_its_components_and_found_by_its_name(h
 
 
 def test_a_step_in_the_agents_component_names_its_het_group_and_is_listed_by_the_components_id(hpc):
-    """O57: a step on the agent's node runs with --het-group=1 (a step without one runs in component 0), and its
-    status is asked of the component's own job id; a step of component 0 names no het group."""
+    """O57: a step on the agent's node runs with --het-group=1 and its status is asked of the component's own job id;
+    a step of component 0 names --het-group=0 (the site refuses a het job's step that names none), and a step of a
+    job of one component names no het group."""
     step = hpc.slurm.Step("4242", "node07", "hpcop-x-sandbox-facts", 1, 1024, (), ("true",), het_group=1,
                           component="4243")  # fmt: skip
     argv = step.argv()
     assert argv[1:3] == ["--jobid=4242", "--het-group=1"]
+    services = hpc.slurm.Step("4242", "node01", "x", 1, 1024, (), ("true",), het_group=0).argv()
+    assert services[1:3] == ["--jobid=4242", "--het-group=0"]
     assert "--het-group" not in " ".join(hpc.slurm.Step("4242", "node01", "x", 1, 1024, (), ("true",)).argv())
     fake = FakeSlurm()
     slurm = hpc.slurm.Slurm(fake, poll_s=0.0, sleep=lambda s: None)
@@ -376,20 +380,61 @@ def test_het_up_holds_the_services_and_the_agents_node_as_two_components_of_one_
 
 
 def test_every_step_on_the_agents_node_runs_in_its_component_and_no_service_runs_there(hpc, tmp_path, site):
-    """O57: the agent's node facts step runs with --het-group=1; every other step names no het group (component 0);
-    no service step runs on the agent's node, and down runs one step there, its sweep (O63), in the same component."""
+    """O57: the agent's node facts step runs with --het-group=1; every other step names --het-group=0, the services'
+    component (the site refuses a het job's step that names none); no service step runs on the agent's node, and down
+    runs one step there, its sweep (O63), in the same component, and every other step of its own in component 0."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     on_agent = [s for s in rig.fake.sruns if s.node == "node07"]
     assert [s.name.rsplit("-", 2)[-2:] for s in on_agent] == [["sandbox", "facts"]]
     assert all(s.het_group == 1 and s.job == "4242" for s in on_agent)
-    assert all(s.het_group is None for s in rig.fake.sruns if s.node != "node07")
+    assert all(s.het_group == 0 for s in rig.fake.sruns if s.node != "node07")
+    assert not [s for s in rig.fake.sruns if s.refused]
     assert all(s.node != "node07" for s in rig.fake.spawned)
     rig.fake.sruns.clear()
     rig.driver.down()
     (swept,) = [s for s in rig.fake.sruns if s.node == "node07"]
     assert swept in rig.fake.sweeps
     assert (swept.het_group, swept.job) == (1, "4242")
+    assert all(s.het_group == 0 for s in rig.fake.sruns if s.node != "node07")
+
+
+def test_the_fake_refuses_a_het_jobs_step_that_names_no_component_as_the_site_does(hpc, tmp_path, site):
+    """O57: on the site's Slurm a step of a heterogeneous job with no --het-group fails ("No directives to start
+    application on any available hetjob components"), component 0 included; the fake answers so, and up fails at its
+    first step instead of placing anything."""
+    from hpc_fed_support import HET_REFUSAL
+
+    rig = Rig(hpc, tmp_path, site)
+    where = rig.driver.launcher._where
+
+    def no_group(node, name):  # the driver as the slot ran it: no group on a service node
+        job, group, component, at = where(node, name)
+        return job, (None if group == 0 else group), component, at
+
+    rig.driver.launcher._where = no_group
+    with pytest.raises(RuntimeError, match="node facts of zone"):
+        rig.up()
+    (facts,) = rig.fake.sruns
+    assert facts.refused
+    assert "No directives to start application" in HET_REFUSAL
+    assert rig.fake.spawned == []
+
+
+@pytest.mark.parametrize("services_alone", [False, True])
+def test_a_job_of_one_component_takes_no_het_group(hpc, tmp_path, site, services_alone):
+    """O57: under "separate", and without an agent's node, each held job has one component: no step names a group."""
+    rig = Rig(hpc, tmp_path, site, "separate")
+    if services_alone:
+        rig.driver = hpc.cli.make_driver(services_only(tmp_path / "plain"), str(rig.root), runner=rig.fake)
+        rig.driver.sleep, rig.driver.slurm.sleep = (lambda s: None), (lambda s: None)
+        rig.driver.poll_s = rig.driver.slurm.poll_s = 0.0
+        rig.driver.core = lambda layout, owner, values, environ=None: "core: the link check passed"
+        rig.driver.relay_available = lambda: False
+    rig.up()
+    facts = [s for s in rig.fake.sruns if s.name.endswith("-facts")]
+    assert len(facts) == (6 if services_alone else 7)  # one on each node, the agent's included under "separate"
+    assert all(s.het_group is None and not s.refused for s in rig.fake.sruns)
 
 
 def test_het_up_whose_agents_component_is_recorded_otherwise_cancels_the_job_and_down_removes_the_root(

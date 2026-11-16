@@ -72,9 +72,11 @@ sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --
      : --account --partition --time --nodes=1 --ntasks-per-node=1 --cpus-per-task=<S> --mem=<S>
 ```
 
-- **Component 0 holds the services' nodes, component 1 holds S.** Its leader's id (component 0's) is the job's id:
-  every step on a service node is as before (a step with no `--het-group` runs in component 0), and **every step on S
-  runs with `--het-group=1`**. `--wrap` stands once, in component 0 (sbatch builds the script once, for component 0's
+- **Component 0 holds the services' nodes, component 1 holds S.** Its leader's id (component 0's) is the job's id.
+  **Every step names its component:** `--het-group=0` on a service node, `--het-group=1` on S. The site's Slurm
+  refuses a step of a heterogeneous job that names none ("No directives to start application on any available hetjob
+  components", the first live slot), so a step with no `--het-group` does not run in component 0 there. A held job of
+  one component (no S, or `separate`) names none. `--wrap` stands once, in component 0 (sbatch builds the script once, for component 0's
   first node). Component 1 repeats the account, partition and time: Slurm propagates no partition, nodes or cores to a
   later component, and the read-back checks what it recorded rather than trusting propagation.
 - **The read-back checks both components** (section 5): `scontrol show job -o <leader>` answers one record per
@@ -277,7 +279,8 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
    another count of nodes than asked, or on a node another holds.
 4. **Place** (section 1), then one control step per node prints the node's FQDN and its IPv4 address on the
    cluster's network (`nodefacts.py`, Python 3.9-compatible, stdlib only); on S, with `--het-group=1` under `het` and
-   S's own job id under `separate`. Nothing else of `up` runs on S.
+   S's own job id under `separate`, and on a service node with `--het-group=0` under `het`. Nothing else of `up` runs
+   on S.
 5. **The zone**: a detached service step, `zone.sbatch <bundle> <zone tar> <zone name> <every provider's address>`,
    run as a step (it holds the service for the step's life, as the standing run did). `up` waits for its log's verdict
    (`hpcop: OK zone`, or `FINISH FAILED` or `hpcop: ERROR`, which fail `up`).
