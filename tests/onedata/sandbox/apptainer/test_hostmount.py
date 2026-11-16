@@ -69,6 +69,15 @@ def test_oneclient_reads_the_token_from_a_private_file_that_is_gone_when_start_r
         mount.stop()
 
 
+def test_oneclient_and_the_watcher_carry_the_runs_tag_so_a_reaper_finds_them(node, settings, binary):
+    mount = helper(node, settings, binary)
+    try:
+        mount.start()
+        assert node.spawn_env == [{"EXPCORE_SANDBOX": "run-1"}] * 2
+    finally:
+        mount.stop()
+
+
 def test_no_argument_of_any_process_holds_the_token(node, settings, binary):
     mount = helper(node, settings, binary)
     try:

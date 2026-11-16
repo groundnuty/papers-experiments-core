@@ -66,6 +66,7 @@ class FakeMountNode(FakeNode):
         self.stuck_mount = False
         self.watches: list[Watch] = []
         self.unmounts: list[list[str]] = []
+        self.spawn_env: list[dict[str, str]] = []
 
     # ------------------------------------------------------------------------------------------------ the mount
     def mountinfo(self) -> str:
@@ -75,18 +76,20 @@ class FakeMountNode(FakeNode):
             line = f"3 1 {FUSE_DEV} / {self.mounted_at} ro,nosuid shared:3 - fuse.oneclient oneclient rw,{owner}\n"
         return BASE_TABLE + line
 
-    def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path) -> Spawned:
+    def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path, env: dict[str, str] | None = None) -> Spawned:
         if list(argv[:2]) == ["sh", "-c"] and SHELL_NAME in argv:
             os.close(os.open(stdout, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             os.close(os.open(stderr, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             self.spawned.append(list(argv))
+            self.spawn_env.append(dict(env or {}))
             return self._spawn_oneclient(list(argv))
         if "expcore_onedata.sandbox.mountwatch" in argv:
             os.close(os.open(stdout, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             os.close(os.open(stderr, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             self.spawned.append(list(argv))
+            self.spawn_env.append(dict(env or {}))
             return self._spawn_watch(list(argv), stdout)
-        return super().spawn(argv, stdout=stdout, stderr=stderr)
+        return super().spawn(argv, stdout=stdout, stderr=stderr, env=env)
 
     def _spawn_oneclient(self, argv: list[str]) -> Spawned:
         self.oneclient_argv = argv

@@ -53,6 +53,7 @@ from expcore_onedata import tls as TLS
 from expcore_onedata.sandbox import directio, iomode
 from expcore_onedata.sandbox import mountwatch as MW
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
+from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import helpers, layout
 from expcore_onedata.sandbox.apptainer.mounthook import MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
@@ -248,6 +249,9 @@ class HostMount:
         )
         self._mountinfo, self._sleep, self._clock = mountinfo, sleep, clock
         self.nonce = secrets.token_hex(16)
+        # The run's tag (the run directory is named by the sandbox's id): a reaper of a driver killed outright finds
+        # oneclient and the watcher by it, as it finds the gate and the collector (`runs.reap`).
+        self._tag = {AV.RUN_TAG: self.where.run_dir.name}
         self.oneclient: helpers.Helper | None = None
         self.watch: helpers.Helper | None = None
         self._closed = False
@@ -284,11 +288,12 @@ class HostMount:
         t0 = self._clock()
         argv = oneclient_argv(self.s, self.spec.provider, where, self._pin.path, ca)
         out, err = where.guard / "oneclient.stdout", where.guard / "oneclient.stderr"
-        self.oneclient = helpers.Helper("oneclient", self.node.spawn(argv, stdout=out, stderr=err), out, err)
+        spawned = self.node.spawn(argv, stdout=out, stderr=err, env=self._tag)
+        self.oneclient = helpers.Helper("oneclient", spawned, out, err)
         self._wait_mounted()
         self._meta["wait_s"] = round(self._clock() - t0, 3)
         watched = watcher_argv(self._python, where, self.nonce, self.oneclient.process, self._poll_s)
-        helpers.start(self.node, "mountwatch", watched, where.watch_dir, MW.READY, noted=self._noted,
+        helpers.start(self.node, "mountwatch", watched, where.watch_dir, MW.READY, noted=self._noted, env=self._tag,
                       sleep=self._sleep, clock=self._clock)  # fmt: skip
         self._remove_token()
         self._wait_armed()
