@@ -12,7 +12,8 @@ check writes its probes into (#221): one declared `agent_visible = false`, suppo
 agent may reach, in a layout with a `platform_template`; `reset --replicas` leaves it alone, since each probe is held by
 the provider that wrote it, owner or not. A space with an `import` table is held by its owner on an imported POSIX
 storage (Onedata's storage import) whose directory is a dataset the layout does not hold: the table names the
-environment variable that gives its path, never the path, since a layout is public. Every key is checked when the file
+environment variable that gives its path, never the path, since a layout is public. An import may be `shared` with
+other federations (O59): it is then read-only and names the variable of its manifest. Every key is checked when the file
 is read, and a refusal names the file and the key. The two images stay pinned by the deployment itself
 (fedlayout.IMAGES): a layout cannot name another.
 """
@@ -64,7 +65,8 @@ TOP_KEYS = {
 }
 SERVICE_KEYS = {"port", "memory_limit"}
 SPACE_KEYS = {"owner", "mirrors", "support_bytes", "agent_visible", "baseline", "import"}
-IMPORT_KEYS = {"readonly", "source_env"}
+IMPORT_KEYS = {"readonly", "source_env", "shared", "manifest_env", "direct_io"}
+IMPORT_REQUIRED = {"readonly", "source_env"}
 PRINCIPAL_KEYS = {"privileges", "spaces", "agent"}
 
 
@@ -102,10 +104,21 @@ class Import:
 
     Only the name is ever declared or recorded: a layout is a public file, and the path is the host's own. A read-only
     import mounts the directory itself, so the platform never writes to it; a writable one mounts a copy of it that
-    up makes inside the root, which goes with the root."""
+    up makes inside the root, which goes with the root.
+
+    `shared` (O59) says other federations import the same directory, so this one must not write to it: it is refused
+    unless `readonly`, and it needs a `manifest_env`, the variable that names the file listing the tree's paths, sizes
+    and hashes, which the verification compares the space with. `direct_io` says the agent's mount reads this storage
+    through the filesystem itself (`[sandbox.mount] io_mode = "direct"`), which the sandbox binds read-only, so it too
+    needs `readonly`. A direct mount reads the storage of the agent's own provider (`local` in the platform file): it is
+    meaningful only on a space that provider owns, which a layout, having no `local`, cannot check; the platform
+    template carries it, and the layout's test holds the two together."""
 
     readonly: bool
     source_env: str
+    shared: bool = False
+    manifest_env: str | None = None
+    direct_io: bool = False
 
 
 @dataclass(frozen=True)
@@ -291,20 +304,57 @@ def load_spec(path: Path | None = None) -> Spec:
 
 def _import(read: _Reader, table: Mapping[str, Any], key: str, has_baseline: bool, earlier: list[Space]) -> Import:
     """The `import` table of a space. Its space declares no baseline, which up would write into the dataset, and no two
-    writable imports name one variable, since each would then copy, and write into its copy of, one source. A
-    read-only import may share its source: nothing writes to it."""
+    writable imports name one variable, since each would then copy, and write into its copy of, one source. A read-only
+    import may share its source: nothing writes to it. A shared import (O59) is read-only, names the manifest it is
+    verified against, has a tree and a manifest of its own, and a direct mount of a storage needs it read-only."""
     where = f"{key}.import"
     if has_baseline:
         raise read.fail(where, "a space with an import must declare baseline = false, or up writes its baseline files")
-    value = read.table(table["import"], where, IMPORT_KEYS, required=IMPORT_KEYS)
+    value = read.table(table["import"], where, IMPORT_KEYS, required=IMPORT_REQUIRED)
     readonly = read.boolean(value["readonly"], f"{where}.readonly")
     variable = read.string(
         value["source_env"], f"{where}.source_env", IMPORT_ENV, "the name of an environment variable"
     )
-    shared = [s.name for s in earlier if s.imported and not s.imported.readonly and s.imported.source_env == variable]
+    shared = read.boolean(value.get("shared", False), f"{where}.shared")
+    direct = read.boolean(value.get("direct_io", False), f"{where}.direct_io")
+    manifest = None
+    if "manifest_env" in value:
+        manifest = read.string(
+            value["manifest_env"], f"{where}.manifest_env", IMPORT_ENV, "the name of an environment variable"
+        )
     if shared and not readonly:
-        raise read.fail(f"{where}.source_env", f"is also the source of writable {shared[0]}, which would share it")
-    return Import(readonly, variable)
+        raise read.fail(
+            f"{where}.readonly",
+            "must be true when shared is true: other federations import this directory too, and nothing of this one "
+            "may write to it",
+        )
+    if direct and not readonly:
+        raise read.fail(
+            f"{where}.direct_io",
+            "needs readonly = true: a direct mount reads the storage's directory itself, which the sandbox binds "
+            "read-only",
+        )
+    if shared and manifest is None:
+        raise read.fail(
+            f"{where}.manifest_env",
+            "is required when shared is true: the verification compares the space with a manifest of the tree",
+        )
+    others = [s for s in earlier if s.imported is not None]
+    writable = [s.name for s in others if not s.imported.readonly and s.imported.source_env == variable]
+    if writable and not readonly:
+        raise read.fail(f"{where}.source_env", f"is also the source of writable {writable[0]}, which would share it")
+    twice = [s.name for s in others if s.imported.shared and s.imported.source_env == variable]
+    if shared and twice:
+        raise read.fail(f"{where}.source_env", f"is also the source of shared {twice[0]}: each has a tree of its own")
+    if manifest is not None:
+        if manifest == variable:
+            raise read.fail(f"{where}.manifest_env", "is also the source_env of this import")
+        taken = [s.name for s in others if manifest in (s.imported.source_env, s.imported.manifest_env)]
+        if taken:
+            raise read.fail(f"{where}.manifest_env", f"is already a variable of {taken[0]}")
+    if any(s.imported.manifest_env == variable for s in others):
+        raise read.fail(f"{where}.source_env", "is already the manifest_env of another import")
+    return Import(readonly, variable, shared, manifest, direct)
 
 
 def _spec(read: _Reader, data: Any, path: Path, digest: str) -> Spec:

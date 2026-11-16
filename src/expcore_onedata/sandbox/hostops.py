@@ -331,6 +331,7 @@ def run_bounded(
     input: str | None = None,
     output_cap: int | None = None,
     marker: bytes | None = None,
+    inherit_env: bool = True,
 ) -> CmdResult:
     """Run a command within `timeout_s` and return its output as text; never raise for what the command did.
 
@@ -342,9 +343,11 @@ def run_bounded(
     and stderr keeps at most that many bytes and the rest is read and dropped, and `stdout_count` and `stderr_count` say
     what was written and kept (O43). With `marker`, the lines of either stream that start with it are taken out before
     the counting and the cap, and their payloads are `stdout_marks` and `stderr_marks`; `input_error` says when the
-    input did not go in whole and closed (O55). `env` is added to the environment."""
+    input did not go in whole and closed (O55). `env` is added to the environment; with `inherit_env` false it is the
+    whole environment and nothing of this process's own is carried over (an `apptainer` call: it reads `APPTAINER_*`
+    and `APPTAINERENV_*` from the environment it is given, so it is given only what the caller names, O56)."""
     cap = _check_cap(output_cap)
-    merged = None if env is None else {**os.environ, **env}
+    merged = dict(env or {}) if not inherit_env else None if env is None else {**os.environ, **env}
     try:
         child = subprocess.Popen(
             list(argv),

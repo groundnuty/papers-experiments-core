@@ -28,8 +28,8 @@ docker itself without that flag is no time limit either: a dead container is inf
 counters say, since after an abort or a stop they describe the harness's doing, not the cell's.
 
 One cause per run, in this order (kills can correlate with the condition, since a download may be charged to memory twice, so a cause must not depend on which
-was looked at first): `kill_survived`, `earlyoom` (its journal, whatever the counters and the exit code), `container_dead`, `host_oom`, `memory_limit`, `time_limit`,
-`killed_other`, `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause`
+was looked at first): `kill_survived`, `earlyoom` (its journal, whatever the counters and the exit code), `container_dead`, `host_oom`, `memory_limit`, `disk_limit`
+(the Apptainer backend's watch, O56: a cell's directory past its size, the agent's own as a memory limit is), `time_limit`, `killed_other`, `unknown`. An infrastructure cause ends the run and retries it; the agent's own cause, or an exception in its code, is its outcome and is kept. `run_cause`
 applies the order to a run's cells.
 """
 
@@ -38,11 +38,14 @@ from __future__ import annotations
 import re
 
 KILL_SURVIVED = "kill_survived"
+DISK_LIMIT = "disk_limit"  # the Apptainer backend's watch: a cell's directory past its size (O56)
 REASONS = (
     "memory_limit", "host_oom", "earlyoom", "container_dead", "time_limit", "killed_other", "unknown", KILL_SURVIVED,
+    DISK_LIMIT,
 )  # fmt: skip
 CATEGORY = {
     "memory_limit": "agent",
+    DISK_LIMIT: "agent",
     "time_limit": "agent",
     "host_oom": "infrastructure",
     "earlyoom": "infrastructure",
@@ -54,7 +57,8 @@ CATEGORY = {
 
 
 PRECEDENCE = (
-    KILL_SURVIVED, "earlyoom", "container_dead", "host_oom", "memory_limit", "time_limit", "killed_other", "unknown",
+    KILL_SURVIVED, "earlyoom", "container_dead", "host_oom", "memory_limit", DISK_LIMIT, "time_limit", "killed_other",
+    "unknown",
 )  # fmt: skip
 
 

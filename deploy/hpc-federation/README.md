@@ -107,6 +107,34 @@ run's outbound connections are logged and reported, and the analysis is run agai
 `tests/egress_probe.c`, which connects to a loopback listener and, non-blocking, to 192.0.2.1 (TEST-NET-1, never
 routed), so no test sends outside traffic. It needs Unix sockets, which some sandboxes forbid; it skips there.
 
+## The agent's gate on a shared loopback
+
+The data gate has no network of its own on these nodes either: it listens on the loopback every user of the node
+shares, on a port above 1023. Two pieces, neither run live yet:
+
+- **The gate's owner check** (`peer_uid_check: true` in the gate's configuration, `src/expcore_onedata/sandbox/gatepeer.py`).
+  The gate serves a connection only if the peer's socket belongs to its own uid, by the same `/proc/net/tcp` and
+  `tcp6` rows `portshim-owner.h` reads, and closes any other, one it cannot attribute and every one when the tables
+  cannot be read, before a byte is read or written, logging one `peer_refused` line with the reason. It is off by
+  default (Docker's gate is on its own network); the gate directory then needs `gate.py`, `gatepolicy.py` and
+  `gateboundary.py` as before, and `gatepeer.py` beside them when it is on. The gate does not start with it on if it
+  runs as uid 0 or cannot read the table.
+- **`gateport.c`**, the cell's connect-side mapper: an `LD_PRELOAD` shim that sends a TCP `connect()` to
+  `127.0.0.1:443` to the gate's port, because the published REST client dials 443 only, and touches no
+  other connection. The port is read once at load from the cell's `/etc/expcore/gate.json`
+  (`{"address": "127.0.0.1", "port": P, ...}`), which decides whenever it exists, and otherwise from
+  `EXPCORE_GATE_PORT`; a malformed file or variable makes the process redirect nothing and say so once on stderr. It
+  calls the next `connect()` by `dlsym(RTLD_NEXT)` and goes **before `egresslog.so`** in the preload list, so the
+  egress log records the gate's port; after it, it is never reached. Build: `gcc -shared -fPIC -O2
+  -fno-stack-protector -Wall -Wextra -Werror -o gateport.so gateport.c -ldl`, in the cell's image. The bundle hashes
+  tarballs (`.provenance`), not shims: whoever loads the built shim into a cell pins it by the hash of the file it
+  built. No IPv6 destination is rewritten, `[::1]:443` included: the core's gate listens on 127.0.0.1 only, and a rewrite to `[::1]:<gate port>` could reach another user's listener (see the header of the file).
+
+`tests/deploy/test_hpc_gate_port_shim.py` builds the shim with the host's gcc and drives it with a Python client
+against listeners of its own, a stand-in for the next `connect()` (`tests/fake_next_connect.c`) and the egress shim;
+`tests/onedata/sandbox/test_gatepeer.py` and `test_gate_peer_owner.py` read the kernel's own tables for a real
+connection and write another uid's rows from its address pair.
+
 ## The Couchbase administrator and its guard
 
 Couchbase 4.5 lets any REST caller act as its administrator until one exists. onepanel creates it, as the image
@@ -145,6 +173,54 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository.
+
+## A shared imported tree
+
+A space can be held on a directory of the cluster's shared filesystem that other federations import too, so several
+federations serve one dataset with no copy of it and each run's data is the same bytes. The tree is **read-only in every
+federation**; this section is what the bundle does for that, and `../../docs/storage-import.md`, "A tree on the
+cluster's shared filesystem", is why. `layouts/shared-import.toml` declares it (invented names),
+`layouts/pilot-shape-import.toml` is the pilot's shape with its four data spaces imported this way (the ingest-based
+`layouts/pilot-shape.toml` stays the primary layout until a live slot shows the two equivalent), `DESIGN.md` section 8
+says where `hpcfed.py up` calls each step, and `site.env.example` names the two variables of each import.
+
+- **Declared** in the layout: `import = { readonly = true, shared = true, source_env, manifest_env }` on the space, and
+  `direct_io = true` if the agent's mount reads the storage directly (a mode of the mount, which reads the storage of the
+  agent's own provider, so only on a space that provider owns; the sandbox node must see the same directory, and the
+  run's record shows the mode in effect). The path and the manifest's file are the variables'
+  values in `site.env`, never the layout's. The owner of the space is the one provider that mounts the tree; its mirrors
+  keep node-local storage.
+- **Checked on the node** (`bundle/importstorage.py`, called by `configure.sh` and at every start): `--import=SPACE=PATH`
+  must be a plain absolute path of `A-Z a-z 0-9 . _ + / -`, with no symbolic link on the way, an existing directory the
+  job's user can read, on no tmpfs (a tree on a node's memory is one the other nodes do not see), outside the work
+  directory. Nothing is created unless every tree passes. Then the service starts with `--bind PATH:/volumes/import/SPACE:ro`
+  over an empty mountpoint of the rootfs, which is the one thing of the node's filesystems the container sees. A refusal
+  names the space, never the path.
+- **Proven read-only by the kernel**: `python3.11 -I -B importstorage.py mounts --workdir <W>`, which `hpcfed.py up` runs
+  in a control step on each owner's node once every provider is up (the node's Python is `HPCOP_PY`; a failure fails
+  `up` before the bootstrap starts any scan), reads the mount table of this service's container processes (the children of the starter
+  its supervisor, named by `service.pid`, started, so another service of the account on the node is not counted),
+  prints per space how many hold the mount, or one below it, read-only and how many writable, and exits 0 only when each
+  space is held and none writable. It attempts no write: a write probe is the first thing that
+  could change the tree if a declaration were wrong.
+- **What the platform layer adds**: the Onedata storage is made `readonly` and imported by the bootstrap; the core
+  refuses a shared import that is not read-only (at load, and on the owner's panel), the provisioner refuses every write
+  and every eviction from the owner, and `fedimport.verify_imports` shows after up that the space holds exactly its
+  manifest.
+- **A reset** of the space evicts the mirrors and removes the run's own QoS requirements; it writes no file. To start
+  again: down, then up. `teardown.sh` removes the work directory with `rm -rf --one-file-system`, which never enters the
+  bind (it exists only in the container's own mount namespace).
+- **Not for the first run's helpers**: `bundle/onboard.py` and `run/fed_provider.py` support a space on the provider's
+  *first* storage, which is arbitrary once a provider has an imported one beside its own. The driver's bootstrap names
+  the storage; do not use those two helpers for a provider that owns an import.
+
+Written, not run. A live slot must show: that the mount check finds the service's container as the (visible) child of the
+setuid starter its supervisor started, and that `/proc/<pid>/task/*/children` exists on the nodes' kernel (it fails closed,
+proving nothing, when either is otherwise); Onepanel accepting the imported storage made with the job user's ids, the local
+LUMA feed and the canonical path type; the bind read-only by the mount table on this site's filesystem; the files'
+owner and mode as the scan gives them for another account's files (the tree must be readable by the job's group); the
+scan's time and its load on the shared filesystem for a tree of 15,000 files, which the site's file quota (pending) may
+bound; the sandbox node seeing the same directory for a direct mount; and two federations importing one tree at once.
 
 ## Steps
 
@@ -240,8 +316,9 @@ with `[hpc] core = "step"`, that the core's Python from a venv on the shared fil
 batch scripts as `--exact` steps of a multi-node job; the bootstrap's panel calls through 8443 with the LUMA local
 feed's mappings; the submit read-back's fields as the site's Slurm prints them, for each component of a heterogeneous
 job too, and a step with `--het-group=1` from the login node (`DESIGN.md`, section 9); and the ten pairs passing over
-the cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`); an
-imported space (M3) and the agent's node's step (M5) are not built here.
+the cluster's network. The service verbs (`stop`, `start`, `status`, `exec`) are M4's (`hpcfed_control.py`), which
+also repeats the mount check after a `start`; the agent's node's step (M5) is not built here. A layout with a shared
+import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs `[hpc] core = "login"`.
 
 ## The scripts
 
@@ -264,8 +341,26 @@ imported space (M3) and the agent's node's step (M5) are not built here.
 | `baked.py` | node | finds the Couchbase cookies and memcached password the images ship, by the SHA-256 that `lib.sh` lists (never the values) |
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
+| `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, the archives the merge takes |
 | `nodefacts.py` | control step | a node's FQDN, its IPv4 address, and the job's uid and gid, as JSON (`hpcfed.py up`) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
+| `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
+
+## A campaign's shards: one per federation (`shards.py`)
+
+A campaign whose agent runs in the core's Apptainer sandbox (`[sandbox] backend = "apptainer"`, O56) runs as #154
+shards, one per federation. The sandbox's data gate listens on its node's loopback and its cells are that node's
+`apptainer exec`s, so each shard's dispatcher runs as one job step on its federation's sandbox node, launched from the
+login node like every other step. `shards.py lines --manifest shards.toml` prints each shard's `srun --jobid --exact`
+line, whose environment is an allowlist (`PATH`, `LC_ALL` and the federation's root, where the study's plugin finds
+`platform.toml` and the platform layer finds the fault relay), to run detached. In the step, `shards.py step` copies
+the stamped study to the node's tmpfs (the store's lock refuses a network filesystem), checks the interpreter imports
+the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-label L`, and once the dispatcher has
+exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
+shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
+line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
+has its form). A step killed outright loses its shard's work since its last archive: the periodic snapshot is still to
+be built (`Snapshots`, the hook). Outage runs (`[faults]`) depend on the fault relay of milestone M4.
 
 ## What the repository's tests cover
 
