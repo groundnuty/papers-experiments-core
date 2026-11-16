@@ -324,3 +324,15 @@ def test_a_state_whose_job_holds_the_sandbox_role_names_its_node(shards, tmp_pat
     state_file.write_text(json.dumps(state))
     found = shards.federation(plan.shards[0])
     assert (found["job"], found["node"], found["het_group"]) == ("101", "node-r1", None)
+
+
+def test_a_sandbox_record_without_its_node_is_refused_whatever_else_names_one(shards, tmp_path):
+    """O56: a separate job's record with no node never takes the node of the federation's own job."""
+    plan = shards.load_plan(_manifest(tmp_path, placement="separate"))
+    state_file = plan.shards[0].root / "hpc-federation.json"
+    state = json.loads(state_file.read_text())
+    del state["sandbox"]["node"]
+    state["services"] = {"sandbox": {"kind": "sandbox", "node": "node-r1"}}
+    state_file.write_text(json.dumps(state))
+    with pytest.raises(shards.ShardsError, match="no sandbox node"):
+        shards.federation(plan.shards[0])
