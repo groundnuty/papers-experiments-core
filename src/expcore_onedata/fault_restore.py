@@ -57,6 +57,7 @@ from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.fault_sessions import await_sessions
 from expcore_onedata.fault_settings import (
     FaultSettings,
+    command_bound_s,
     heal_all_links_reserve,
     heal_container_reserve,
     heal_link_reserve,
@@ -84,6 +85,14 @@ class RestoreSettling(InfraError):
 def digest(identity: str) -> str:
     """The SHA-256 of an identity, the only form in which one is journalled or recorded."""
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def stop_record(driver: Any) -> dict[str, Any]:
+    """What a driver kept of the stop it just made (`fault_hpc.HpcDriver.last_stop`: whether it was confirmed, how it
+    ended and its seconds), as the `stop` key of the injection's `injected` or `stop_unknown` line and step; nothing
+    for a driver that keeps none (Compose), or for a stop that did not answer."""
+    found = getattr(driver, "last_stop", None)
+    return {"stop": dict(found)} if isinstance(found, Mapping) else {}
 
 
 def unhealed_detail(record: Mapping[str, Any], latest: LinkMatrix, before: str | None) -> str:
@@ -301,7 +310,7 @@ class LinkSettling:
             bound_s=settings.heal_timeout_s,
             gate_s=settings.gate_timeout_s,
             poll_s=settings.poll_s,
-            command_s=settings.command_timeout_s,
+            command_s=command_bound_s(settings),  # `command_timeout_s`, and the relay's wait on HPC
             settle_s=settings.heal_settle_s,
             link_s=heal_link_reserve(settings),
             all_links_s=heal_all_links_reserve(settings),
@@ -390,7 +399,8 @@ class LinkSettling:
                 unknown = True
             down = not unknown and self.wait(lambda s: not s.running, service, unreadable_ok=True) is not None
             with contextlib.suppress(OSError):  # the `stopping` line already makes recovery wait for it to show down
-                self.journal.append({"event": "injected" if down else "stop_unknown", "id": entry})
+                evidence = stop_record(self._driver)  # a stop that answered, confirmed or not, keeps its duration
+                self.journal.append({"event": "injected" if down else "stop_unknown", "id": entry, **evidence})
             plain = {"id": entry, "service": service, "identity_sha256": before, "injected": down}
             done, how, _, ready_after_s = self.settle({**plain, "stop_unknown": unknown}, links=False, clear=False)
             if done and how == "never_down":  # it never went down: nothing to restore, so its entry closes now
