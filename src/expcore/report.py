@@ -77,6 +77,7 @@ from typing import Any
 
 from expcore.accounting import condition_accounting
 from expcore.egress.sensitivity import EgressAnalysis
+from expcore.guards import GuardsAnalysis
 from expcore.mountguard.sensitivity import MountGuardAnalysis
 from expcore.report_egress import egress_lines
 from expcore.report_families import (
@@ -86,6 +87,8 @@ from expcore.report_families import (
     one_line,
     steps_lines,
 )
+from expcore.report_guards import LEFT_OUT as EITHER_GUARD
+from expcore.report_guards import guards_lines
 from expcore.report_holds import section as operator_holds
 from expcore.report_mountguard import LEFT_OUT as NOT_CLEAN
 from expcore.report_mountguard import mount_guard_lines
@@ -791,8 +794,26 @@ def _mount_guard_summary(guard: MountGuardAnalysis) -> list[str]:
     return lines + _rerun_lines(guard.sensitivity, "mount sensitivity")
 
 
+def _guards_summary(guards: GuardsAnalysis) -> list[str]:
+    """The terminal's lines of both guards together (O60): the runs either leaves out, then each confirmatory contrast
+    without them."""
+    n = guards.counts()
+    lines = [
+        f"both guards: {n['left_out']} of {n['analysed']} analysed run(s) left out ({n['egress_only']} by egress "
+        f"alone, {n['mount_only']} by the mount guard alone, {n['both']} by both)"
+    ]
+    if guards.refused is not None:
+        return [*lines, f"both-guards sensitivity: not computed ({guards.refused})"]
+    if guards.sensitivity is None:
+        return [*lines, "both-guards sensitivity: every run clean to both, the same as the analysis above"]
+    return lines + _rerun_lines(guards.sensitivity, "both-guards sensitivity")
+
+
 def summary_lines(
-    result: AnalysisResult, egress: EgressAnalysis | None = None, mount_guard: MountGuardAnalysis | None = None
+    result: AnalysisResult,
+    egress: EgressAnalysis | None = None,
+    mount_guard: MountGuardAnalysis | None = None,
+    guards: GuardsAnalysis | None = None,
 ) -> list[str]:
     """One line per contrast for a terminal: the estimate, the raw p-value, the Holm-adjusted one (or the word
     exploratory) and the conclusion word, which is labelled exploratory too outside the family. A conclusion is never
@@ -822,7 +843,8 @@ def summary_lines(
         interval = f"[{_num(d.ci_low)}, {_num(d.ci_high)}]"
         lines.append(f"{d.name} (descriptive, {kind} of {d.outcome} in {arm}): {_num(d.estimate)} {interval}")
     lines += _egress_summary(egress) if egress is not None else []
-    return lines + (_mount_guard_summary(mount_guard) if mount_guard is not None else [])
+    lines += _mount_guard_summary(mount_guard) if mount_guard is not None else []
+    return lines + (_guards_summary(guards) if guards is not None else [])
 
 
 def _partial_line(export: Mapping[str, Any]) -> str:
@@ -896,13 +918,15 @@ def render_report(
     interval_level: float | None = None,
     egress: EgressAnalysis | None = None,
     mount_guard: MountGuardAnalysis | None = None,
+    guards: GuardsAnalysis | None = None,
 ) -> str:
     """Render the report as Markdown.
 
     `code` is the code identity (`provenance.codestamp.version`), `scorers` the version of each scorer by name (the
     report says n/a without them), `interval_level` the level of the contrasts' intervals when the preregistration
     states one, `egress` the egress verdicts and the sensitivity analysis of a batch checked for egress (no section
-    without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60). A
+    without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
+    `guards` the rerun without the runs either guard leaves out (a batch checked by both, O60). A
     partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`). What each number
     counts is stated in the report beside it. The text ends with a newline.
     """
@@ -934,12 +958,14 @@ def render_report(
     shards = shard_lines(export, _table)  # only a batch merged from shards has any (#154)
     checked = egress_lines(egress, _table, lambda r: _sensitivity(r, interval_level))  # only a checked batch (#179)
     guarded = mount_guard_lines(mount_guard, _table, lambda r: _sensitivity(r, interval_level, NOT_CLEAN))  # O60
+    both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, EITHER_GUARD))  # O60
     sections = (
         _contrasts(result, interval_level)
         + _conditions(export)
         + shards
         + checked
         + guarded
+        + both
         + _deployments(export)
         + _left_out(left_out)
     )

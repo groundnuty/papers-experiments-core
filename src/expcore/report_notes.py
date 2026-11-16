@@ -344,8 +344,24 @@ MOUNT_SENSITIVITY_NOTES = [
     "out as an absent run (`excluded`), so its pairs count as `Unpaired or left out` and its arm's runs as `Left",
     "out`. The analysis above stands; this says whether its conclusions hold without the runs that touched the",
     "mount's token or oneclient's process, or could not be shown not to. A run is left out for what was detected",
-    "about it, never for its outcome. The egress section, if any, leaves out its own runs: a run flagged by both is",
-    "left out of both reruns.",
+    "about it, never for its outcome. The egress section, if any, leaves out its own runs, and a batch checked by",
+    "both guards also gets a rerun without the runs either leaves out.",
+]
+
+GUARDS_NOTES = [
+    "This batch was checked by both guards, the egress check and the mount guard, and each section above reruns the",
+    "analysis without its own runs. This one reruns it without every run either leaves out: flagged or unknown to",
+    "either, so a run unknown to one guard and clean to the other is left out. It is the rerun to read when the",
+    "question is whether the conclusions hold for the runs both guards show clean. A run's egress is `flagged` for an",
+    "outside connection or a static-scan hit and `unknown` for an unknown log alone; its mount is the mount guard's",
+    "verdict.",
+]
+
+GUARDS_SENSITIVITY_NOTES = [
+    "The preregistered analysis again, without every run either guard leaves out: each one is left out as an absent",
+    "run (`excluded`), so its pairs count as `Unpaired or left out` and its arm's runs as `Left out`. The analysis",
+    "above stands, and so do the two reruns of the single guards. A run is left out for what was detected about it,",
+    "never for its outcome.",
 ]
 
 SENSITIVITY_NOTES = [

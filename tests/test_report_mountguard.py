@@ -157,3 +157,61 @@ def test_the_terminal_summary_is_unchanged_without_a_mount_guard_analysis():
 def test_the_section_comes_after_the_conditions_and_before_the_left_out_attempts():
     report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=guarded())
     assert report.index("## Conditions") < report.index(HEADING) < report.index("## Attempts left out")
+
+
+BOTH_HEADING = "## Egress and mount isolation together (detected, not prevented)"
+BOTH_SENSITIVITY = "#### Preregistered contrasts without the runs either guard leaves out"
+
+
+def combined(**changes):
+    """k1 left out by egress alone, k2 by the mount guard alone (unknown to it), k3 by both, k4 clean to both; the
+    rerun keeps 34 of the primary's 40 pairs."""
+    from expcore.guards import GuardedRun, GuardsAnalysis
+
+    runs = (
+        GuardedRun("k1", 1, "cond-a", "flagged", "clean"),
+        GuardedRun("k2", 1, "cond-b", "clean", "unknown"),
+        GuardedRun("k3", 1, "cond-b", "unknown", "flagged"),
+        GuardedRun("k4", 1, "cond-a", "clean", "clean"),
+    )
+    again = analysis(contrast("a-vs-b", "difference", n_pairs=34, estimate=0.17))
+    return dataclasses.replace(GuardsAnalysis(runs, again), **changes)
+
+
+def test_the_combined_section_counts_the_runs_either_guard_leaves_out_by_condition_and_guard():
+    """O60: beside each guard's own rerun, the one without every run either leaves out, with its counts."""
+    report = render(analysis(contrast("a-vs-b", "difference")), mount_guard=guarded(), guards=combined())
+    assert report.index(HEADING) < report.index(BOTH_HEADING) < report.index("## Attempts left out")
+    assert (
+        "3 of 4 analysed run(s) left out by either guard: 1 by egress alone, 1 by the mount guard alone, 1 by both."
+        in report
+    )
+    by_condition = table_of(report, "### Left out by either guard, by condition")
+    assert by_condition["cond-a"][1:] == ["2", "1", "1", "0", "0"]
+    assert by_condition["cond-b"][1:] == ["2", "2", "0", "1", "1"]
+    rows = table_of(report, "### Runs either guard leaves out")
+    assert rows["k2"][3:] == ["clean", "unknown", "mount guard"]
+    assert rows["k3"][3:] == ["unknown", "flagged", "both"]
+    assert table_of(report, BOTH_SENSITIVITY)["a-vs-b"][3] == "0.17"
+    assert table_of(report, "#### Pairs without the runs either guard leaves out")["a-vs-b"][1] == "34"
+
+
+def test_without_a_combined_analysis_the_report_is_the_text_it_was():
+    result = analysis(contrast("a-vs-b", "difference"))
+    assert render(result, mount_guard=guarded()) == render(result, mount_guard=guarded(), guards=None)
+    assert BOTH_HEADING not in render(result, mount_guard=guarded())
+
+
+def test_a_refused_combined_rerun_is_said():
+    report = render(analysis(contrast("a-vs-b", "difference")), guards=combined(sensitivity=None, refused="why"))
+    assert "Not computed: the analysis refused the rerun (why)." in report
+    assert BOTH_SENSITIVITY not in report
+
+
+def test_the_terminal_summary_says_the_runs_either_guard_leaves_out_and_each_contrast_without_them():
+    lines = summary_lines(analysis(contrast("a-vs-b", "difference")), None, None, combined())
+    assert (
+        "both guards: 3 of 4 analysed run(s) left out (1 by egress alone, 1 by the mount guard alone, 1 by both)"
+        in lines
+    )
+    assert lines[-1].startswith("both-guards sensitivity a-vs-b: estimate 0.17, p 0.0120, Holm p 0.0200, difference")
