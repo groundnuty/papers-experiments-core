@@ -292,9 +292,10 @@ class PlatformConfig:
         support, data provider or token planes is refused. An entry that declares its data (`data_manifest`) is there
         by its declared identity and its data's content hash, without its Onezone id: a space is the same experimental
         condition across federations when its declared identity and its data identity match (C06); one that does not is
-        there with its id, as it always was. The one-space form holds its support set, its local provider and its
-        prefixes (`support`), its data identity (`space_data`) when `[space]` declares `data_manifest`, and
-        `storage_import` with its `readonly` (and `shared`, when true: O59) when it declares an imported storage (O41).
+        there with its id, as it always was. The one-space form holds its support set and its local provider by label
+        and its prefixes by their SHA-256 (`support`), its data identity (`space_data`) when `[space]` declares
+        `data_manifest`, and `storage_import` with its `readonly` (and `shared`, when true: O59) when it declares an
+        imported storage (O41).
 
         With a `[sandbox]`, it also holds every level of the data path with its kind, a REST level's listing mode and a
         mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is

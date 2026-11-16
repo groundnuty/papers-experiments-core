@@ -1,5 +1,6 @@
 """Several spaces in one platform configuration (`[[spaces]]`): loading, labels and the fingerprint."""
 
+import hashlib
 import json
 
 import pytest
@@ -28,8 +29,9 @@ def several(count=2, **override):
 
 
 def test_o12_the_one_space_form_is_the_single_space_labelled_space_with_its_fingerprint_unchanged(tmp_path):
-    """O12, C06: [space] and [support] read as one space, `spaces[0]` labelled `space`, and the fingerprint holds the
-    TLS setting alone, as it did before several spaces could be declared."""
+    """O12, C06: [space] and [support] read as one space, `spaces[0]` labelled `space`, and the fingerprint holds its
+    support set, local provider and prefixes (`support`), each provider by its label, and no `spaces`: never the
+    space's name or id, which each federation's up makes anew."""
     config = load(tmp_path)
     assert [(e.label, e.position) for e in config.spaces] == [("space", "spaces[0]")]
     assert config.space_named() is config.spaces[0]
@@ -38,7 +40,16 @@ def test_o12_the_one_space_form_is_the_single_space_labelled_space_with_its_fing
     assert config.support.providers == ("alpha",)
     assert config.space_ids("data_path") == config.space_ids("tool_server") == ("spmock0001",)
     assert config.prefixes == ("study-a-",)
-    assert config.fingerprint() == {"tls": {"mode": "verify"}}
+    fingerprint = config.fingerprint()
+    prefixes = hashlib.sha256(json.dumps(["study-a-"], separators=(",", ":")).encode()).hexdigest()
+    assert fingerprint["support"] == {
+        "providers": ["providers[0]"],
+        "local": "providers[0]",
+        "prefixes_sha256": prefixes,
+    }
+    assert not {"spaces", "space_data", "storage_import"} & set(fingerprint)
+    assert SPACE_NAME not in json.dumps(fingerprint)
+    assert "spmock0001" not in json.dumps(fingerprint)
 
 
 def test_o12_several_spaces_load_each_named_by_its_label_with_its_own_support_and_planes(tmp_path):
@@ -130,7 +141,7 @@ def test_c06_several_spaces_enter_the_fingerprint_by_hash_and_a_resume_under_ano
         "one space": load(tmp_path / "e"),
     }
     fingerprint = configs["two"].fingerprint()
-    assert set(fingerprint) == {"tls", "spaces"}
+    assert set(fingerprint) == {"tls", "tokens", "spaces", "toolserver"}  # no `support`: each entry's digest holds it
     assert len(fingerprint["spaces"]) == 2
     assert leaked_values(json.dumps(fingerprint), tmp_path / "a") == []
     schema, manifest = make_schema(), make_manifest(make_schema())
@@ -150,5 +161,5 @@ def test_c06_several_spaces_enter_the_fingerprint_by_hash_and_a_resume_under_ano
     for label in ("three", "reordered", "other support", "one space"):
         with pytest.raises(FingerprintMismatch) as caught:
             resume(configs[label])
-        assert all(line.startswith("platform.spaces") for line in caught.value.differences), label
+        assert all(line.startswith(("platform.spaces", "platform.support")) for line in caught.value.differences), label
     resume(configs["two"])

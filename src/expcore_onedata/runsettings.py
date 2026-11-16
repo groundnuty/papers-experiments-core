@@ -17,9 +17,10 @@ ports and roots, so give one fingerprint, and a changed setting that shapes a ru
 Canonical: each value is the effective one, after its default, so a key declared at its default and one left out are
 one experiment; each number is of its field's type, so `2` and `2.0` are one value and one canonical JSON; a set (an
 allow-list, the trust paths, a support set) is sorted, and an order that matters (oneclient's arguments) is kept. A
-configured name is never here: a provider is its label (`providers[i]`), and a value that can hold a name, a path or an
-address (oneclient's extra arguments) or that sits where a token goes (the placeholder token) is its SHA-256. An image
-is its pinned id, never its name, which can hold a registry's host or the SIF's path.
+configured name is never here: a provider is its label (`providers[i]`), a condition its name's SHA-256, and a value
+that can hold a name, a path or an address (oneclient's extra arguments) or that sits where a token goes (the
+placeholder token) is its SHA-256. An image is its pinned id, never its name, which can hold a registry's host or the
+SIF's path.
 """
 
 from __future__ import annotations
@@ -57,36 +58,40 @@ def tokens_record(tokens: TokenSettings) -> dict[str, Any]:
 def support_record(config: PlatformConfig) -> dict[str, Any]:
     """The one-space form's `[support]` and its space's prefixes: the providers that support the space, in the file's
     order of `[providers]`, and the agent's own, each by its label (`providers[i]`), and the prefixes a mutation's
-    target must start with. The space's name and id are the federation's (`up` makes the id anew); the `[[spaces]]`
-    form holds all of this in each entry's digest."""
+    target must start with, by their SHA-256, since a prefix is the start of the space's name (O12). The space's name
+    and id are the federation's (`up` makes the id anew); the `[[spaces]]` form holds all of this in each entry's
+    digest."""
     entry: StudySpace = config.spaces[0]
     supporting = [name for name in config.providers if name in entry.support.providers]
     return {
         "providers": [config.provider_label(name) for name in supporting],
         "local": config.provider_label(entry.support.local),
-        "prefixes": sorted(entry.space.prefixes),
+        "prefixes_sha256": digest_of(sorted(entry.space.prefixes)),
     }
 
 
 def sandbox_record(sandbox: SandboxSettings) -> dict[str, Any]:
     """`[sandbox]`'s settings that shape a run beside its data paths, served caps and Apptainer pins (which keep their
-    own keys): the backend; every image by its pinned id; every limit; the mount's path in the agent, its I/O mode and
-    oneclient's extra arguments (by their SHA-256); the paths in the agent's image that trust the run's CA; the agent's
-    user and interpreter; the kill's grace at a cell's deadline; and the agent's placeholder token by its SHA-256. Not
-    here: the work root, the name prefix, the label namespace, the privilege command and earlyoom's name for the driver
-    (the host's own), the network pools and `[sandbox.federation]` (the host's and the federation's addresses and
-    names), the mount's storages and check file (the federation's storage ids and the host's paths), and
-    `content_check_file`, read once before a campaign."""
+    own keys): the backend; on Docker every image by its pinned id (on Apptainer the SIF is in its pins); every limit;
+    the mount's path in the agent, its I/O mode and oneclient's extra arguments (by their SHA-256); the paths in the
+    agent's image that trust the run's CA; the agent's user and interpreter; the kill's grace at a cell's deadline; and
+    the agent's placeholder token by its SHA-256. Not here: the work root, the name prefix, the label namespace, the
+    privilege command and earlyoom's name for the driver (the host's own), the network pools and `[sandbox.federation]`
+    (the host's and the federation's addresses and names), the mount's storages and check file (the federation's
+    storage ids and the host's paths), and `content_check_file`, read once before a campaign."""
     from expcore_onedata.sandbox.settings import Limits  # it imports the sandbox's modules: import when used
 
     mount = sandbox.mount
-    return {
-        "backend": sandbox.backend,
+    images = {  # the Apptainer backend's one image is its SIF, pinned in `sandbox_backend` (O56)
         "images": {
             "agent": sandbox.agent.id,
             "gate": sandbox.gate.id,
             "oneclient": None if sandbox.oneclient is None else sandbox.oneclient.id,
-        },
+        }
+    }
+    return {
+        "backend": sandbox.backend,
+        **(images if sandbox.apptainer is None else {}),
         "limits": {
             item.name: float(getattr(sandbox.limits, item.name))
             if item.name == "cpus"
@@ -106,11 +111,12 @@ def sandbox_record(sandbox: SandboxSettings) -> dict[str, Any]:
 
 def toolserver_record(server: ToolServer, file: Any) -> dict[str, Any]:
     """`[toolserver]`'s settings that shape a run: the pinned commit of its checkout (None when none is pinned), the
-    longest its start may take, and each condition by its name with its allow-list, its rights and its frozen
-    manifest's SHA-256. Not here: the command, its arguments and the clone's path, which are the host's (a path, and
-    in the arguments often the federation's address); the code they start is the commit's, and what it serves is the
-    manifest, which the client holds the server to (L13). A manifest that cannot be read is refused naming its
-    condition's position, never its path."""
+    longest its start may take, and each condition, keyed by its name's SHA-256 (a message never names a condition,
+    O12, and the key still binds the name to its settings whatever the file's order), with its allow-list, its rights
+    and its frozen manifest's SHA-256. Not here: the command, its arguments and the clone's path, which are the
+    host's (a path, and in the arguments often the federation's address); the code they start is the commit's, and
+    what it serves is the manifest, which the client holds the server to (L13). A manifest that cannot be read is
+    refused naming its condition's position, never its path."""
     conditions: dict[str, Any] = {}
     for index, (name, condition) in enumerate(server.conditions.items()):
         try:
@@ -120,7 +126,7 @@ def toolserver_record(server: ToolServer, file: Any) -> dict[str, Any]:
                 f"{file}: [toolserver.conditions]: conditions[{index}]: key 'manifest' cannot be read "
                 f"({type(error).__name__})"
             ) from None
-        conditions[name] = {
+        conditions[hashlib.sha256(name.encode("utf-8")).hexdigest()] = {
             "allow": sorted(condition.allow),
             "rights": sorted(condition.rights),
             "manifest_sha256": manifest,
