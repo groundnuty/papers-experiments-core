@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -82,8 +83,12 @@ def write_config(path: Path, document: Mapping[str, Any]) -> None:
 
 
 def write_token(path: Path, token: str) -> None:
-    """The token's file: a new owner-only file (0400 once written) in a new owner-only directory."""
-    path.parent.mkdir(mode=0o700)
+    """The token's file: a new owner-only file (0400 once written) in an owner-only directory of the run's (made here,
+    or the one a gate tried before this one left), never through a link."""
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    info = os.lstat(path.parent)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
+        raise SandboxError("the directory of the run's token file is not an owner-only directory of the driver's")
     handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(handle, "w", encoding="utf-8") as stream:
         stream.write(token)
