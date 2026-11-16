@@ -8,7 +8,7 @@ it away is that each cell runs in a PID namespace of its own (`--containall`), w
 processes, and that its mount namespace binds none of the host's private directories. This module checks both from the
 host, through the host's `/proc`, which no cell can see or write. Everything is read; nothing is taken from a cell.
 
-`CellPoll` lists this uid's processes at each poll and looks once at each one it has not seen:
+`CellPoll` lists the processes at each poll and looks at each of this uid's (the others about once a second):
 
 - **A cell of this run** is a process in a PID namespace nested in the watcher's (more `NSpid` entries in
   `/proc/<pid>/status`, readable for one's own processes without ptrace) whose mount table holds the run's FUSE mount
@@ -55,7 +55,7 @@ PROTECTED_UNRESOLVED = "protected_unresolved"
 SAME_PID_NAMESPACE = "same_pid_namespace"
 CELL_ALIVE_AT_CLOSE = "cell_alive_at_close"
 CELL, HOST_PROCESS, CLOSE = "cell", "host_process", "close"
-OTHER_EVERY = 20  # a process of another uid is read again every this many polls (1 s at the watcher's 50 ms)
+OTHER_EVERY = 20  # a process of another uid is read again every this many polls (about 1 s at the watcher's 50 ms)
 
 
 class ProcView(Protocol):
