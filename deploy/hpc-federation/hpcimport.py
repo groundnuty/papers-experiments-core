@@ -9,6 +9,7 @@ platform file repeats and the core checks), and the mirrors keep node-local stor
 
 The hooks, in the order `up` meets them (DESIGN.md, section 8):
 
+0. `check_support`, in the preflight: the support the layout gives a space is no smaller than its tree's manifest.
 1. `provider_import_args`: appended to a provider's `provider.sbatch` command, so its service mounts the trees it owns.
 2. `import_storage_extra`: returned by the HPC bootstrap's `Bootstrap.import_storage_extra`, so an imported storage is
    made for a provider that runs as the job's user.
@@ -52,6 +53,25 @@ def provider_import_args(layout, provider, environ):
     ]
 
 
+def check_support(layout, environ):
+    """Refuse a shared import whose manifest holds more bytes than the support the layout gives its space
+    (`support_bytes`, 10 GiB by default), before the scan finds it out half way; return each shared space's manifest
+    bytes by its name. The message names the space and the two figures, never a path. Needs the core (the manifest is
+    read by its `load_manifest`, which checks it), so it runs in the driver, not on a node."""
+    from expcore_onedata.importmanifest import load_manifest
+
+    found = {}
+    for space in layout.shared_imports():
+        wanted = load_manifest(layout.import_manifest(space.name, environ)).bytes
+        if wanted > space.support_bytes:
+            raise HpcImportRefused(
+                f"spaces.{space.name}: the tree holds {wanted} bytes and its support is {space.support_bytes}: "
+                "raise support_bytes"
+            )
+        found[space.name] = wanted
+    return found
+
+
 def import_storage_extra(uid, gid):
     """What the HPC bootstrap adds to the creation of an imported storage (`Bootstrap.import_storage_extra`): the job
     user's ids, the local LUMA feed the mappings below need, and the canonical path type an imported storage keeps its
@@ -87,8 +107,10 @@ def direct_storages(layout, storage_ids, environ):
     """The storages a direct mount reads, as the platform file's `[sandbox.mount.storages]` maps them: each declared
     `direct_io` import's storage id (`storage_ids`, by (owner, space), as the bootstrap gave them out) to the host
     directory of its tree. The sandbox binds each of them read-only into its sidecar alone, never into the agent's
-    container, which is why only a read-only import may declare it. The paths are the host's own: the platform file
-    that holds them is the federation's root's, never committed."""
+    container, which is why only a read-only import may declare it. A direct mount reads the storage of the agent's own
+    provider (`local` in the platform file), so `direct_io` is meaningful only on a space that provider owns: the layout
+    has no `local` to check it against, and the platform template must put the two together. The paths are the host's
+    own: the platform file that holds them is the federation's root's, never committed."""
     mapping = {}
     for space in layout.shared_imports():
         if not space.imported.direct_io:

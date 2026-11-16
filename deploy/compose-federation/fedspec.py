@@ -109,7 +109,9 @@ class Import:
     unless `readonly`, and it needs a `manifest_env`, the variable that names the file listing the tree's paths, sizes
     and hashes, which the verification compares the space with. `direct_io` says the agent's mount reads this storage
     through the filesystem itself (`[sandbox.mount] io_mode = "direct"`), which the sandbox binds read-only, so it too
-    needs `readonly`."""
+    needs `readonly`. A direct mount reads the storage of the agent's own provider (`local` in the platform file): it is
+    meaningful only on a space that provider owns, which a layout, having no `local`, cannot check; the platform
+    template carries it, and the layout's test holds the two together."""
 
     readonly: bool
     source_env: str

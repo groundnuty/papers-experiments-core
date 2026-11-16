@@ -714,14 +714,29 @@ def rendered(fed, tmp_path) -> str:
 
 
 def test_o56_the_example_layout_declares_two_shared_read_only_imports_with_a_manifest_each(fed):
-    """O56: the example layout declares two shared read only imports with a manifest each."""
+    """O56: two imports, each shared, read-only and with a manifest, owned by two providers; only the one the agent's
+    provider owns declares a direct mount, which reads that provider's own storage."""
     spec = fed.spec.load_spec(LAYOUT_FILE)
     declared = {s.name: s.imported for s in spec.spaces if s.imported}
     assert set(declared) == {"alpha-data", "beta-data"}
     assert all(d.shared and d.readonly and d.manifest_env for d in declared.values())
-    assert {name: d.direct_io for name, d in declared.items()} == {"alpha-data": False, "beta-data": True}
+    assert {name: d.direct_io for name, d in declared.items()} == {"alpha-data": True, "beta-data": False}
     assert spec.space("alpha-work").imported is None
     assert spec.space("alpha-data").owner != spec.space("beta-data").owner
+
+
+def test_o56_a_direct_mount_is_declared_only_on_a_space_the_templates_local_provider_owns(fed, tmp_path):
+    """O56, O40: a direct mount reads the storage of the agent's own provider (`local` in the platform file). The layout
+    has no `local`, so the template's is held to the layout's: every `direct_io` space is owned by it, since on any
+    other the agent's provider holds replicas or reads through a provider, and the start check would refuse it."""
+    import tomllib
+
+    spec = fed.spec.load_spec(LAYOUT_FILE)
+    entries = {e["name"]: e for e in tomllib.loads(rendered(fed, tmp_path))["spaces"]}
+    direct = [s for s in spec.spaces if s.imported and s.imported.direct_io]
+    assert direct
+    for space in direct:
+        assert space.owner == entries[space.name]["local"]
 
 
 def test_o56_the_example_layout_and_its_template_hold_no_path_and_no_site_name():
@@ -774,3 +789,38 @@ def test_o56_only_the_owner_of_each_import_binds_its_tree_and_only_read_only_whe
     assert [(v["target"], v["read_only"]) for v in binds["pine"]] == [("/volumes/import/alpha-data", True)]
     assert [(v["target"], v["read_only"]) for v in binds["birch"]] == [("/volumes/import/beta-data", True)]
     assert not [name for name, found in binds.items() if found and name not in ("pine", "birch")]
+
+
+def test_o56_a_tree_whose_manifest_holds_more_bytes_than_the_support_is_refused_before_up(fed, base):
+    """O56: the support is a number the layout gives; a dataset larger than it is found by the preflight, not half way
+    through a scan. The message names the space and the two figures and no path."""
+    from federation_support import import_layout
+
+    from expcore_onedata.importmanifest import manifest_of_tree, write_manifest
+
+    text = LAYOUT.replace(
+        '[spaces.alpha-space]\nowner = "oak"', '[spaces.alpha-space]\nowner = "oak"\nsupport_bytes = 4194304'
+    )
+    layout, data = import_layout(fed, base, text)
+    trees = {}
+    for name, size in (("alpha", 4096), ("beta", 4194305)):
+        trees[name] = data / name
+        trees[name].mkdir()
+        (trees[name] / "x.bin").write_bytes(bytes(size))
+        write_manifest(manifest_of_tree(trees[name]), data / f"{name}.json")
+    environ = {
+        "EXPCORE_FED_IMPORT_ALPHA": str(trees["alpha"]),
+        "EXPCORE_FED_IMPORT_ALPHA_MANIFEST": str(data / "alpha.json"),
+        "EXPCORE_FED_IMPORT_BETA": str(trees["beta"]),
+        "EXPCORE_FED_IMPORT_BETA_MANIFEST": str(data / "beta.json"),
+    }
+    assert hpcimport.check_support(layout, environ) == {"alpha-space": 4096, "beta-space": 4194305}  # beta: 10 GiB
+    small = LAYOUT.replace(
+        '[spaces.beta-space]\nowner = "elm"', '[spaces.beta-space]\nowner = "elm"\nsupport_bytes = 1048576'
+    )
+    (base / "two").mkdir()
+    layout, _ = import_layout(fed, base / "two", small)
+    with pytest.raises(hpcimport.HpcImportRefused, match=r"spaces\.beta-space: the tree holds 4194305 bytes") as caught:
+        hpcimport.check_support(layout, environ)
+    assert "support is 1048576" in str(caught.value)
+    assert str(base) not in str(caught.value)

@@ -89,8 +89,10 @@ is one `stat` per entry per federation, and it is a live measurement, not a figu
 **Direct I/O** is a mode of the agent's mount, not of the storage: `[sandbox.mount] io_mode = "direct"` with the
 storage's id mapped to the tree's directory in `[sandbox.mount.storages]`. `direct_io = true` in the layout declares that
 this import is read that way, and `hpcimport.direct_storages` gives the mapping from the storage ids the bootstrap made;
-the mode in effect is shown per run by the record (O49), never by the layout. The sandbox node must see the same
-directory, which the sandbox milestone's step provides.
+the mode in effect is shown per run by the record (O49), never by the layout. A direct mount reads the storage of the
+agent's own provider (`local` in the platform file; O40's start check reads a file that provider holds in full), so
+`direct_io` belongs on a space that provider owns: the layout has no `local`, and the platform template carries it. The
+sandbox node must see the same directory, which the sandbox milestone's step provides.
 
 Not shown by anything in this repository, and for a live slot: that Onepanel accepts the imported storage with the job
 user's ids, the local LUMA feed and the canonical path type; that the apptainer bind is read-only on the site's
