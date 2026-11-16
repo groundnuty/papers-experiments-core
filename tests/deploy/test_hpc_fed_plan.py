@@ -5,7 +5,7 @@ Nothing here reaches a cluster: Slurm is the fake of hpc_fed_support."""
 import json
 import math
 import os
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -25,7 +25,7 @@ def hpc():
 
 
 def test_a_layout_without_an_hpc_table_takes_the_sizes_of_the_live_peaks(hpc):
-    """O56: every size is a layout setting, defaulting to the live peaks: the zone 4 cores and 8 GB, a provider 4 and
+    """O57: every size is a layout setting, defaulting to the live peaks: the zone 4 cores and 8 GB, a provider 4 and
     10 GB, a control reserve of 1 core and 1 GB on every node, so each node is 5 cores and 11 GB."""
     settings = hpc.settings.load_settings(None)
     assert (settings.zone.cpus, settings.zone.memory_mib) == (4, 8192)
@@ -34,7 +34,7 @@ def test_a_layout_without_an_hpc_table_takes_the_sizes_of_the_live_peaks(hpc):
 
 
 def test_the_held_job_holds_one_node_per_service_and_one_for_the_agent_when_declared(hpc):
-    """O56: one service per node: the zone first, the providers in the layout's order, the agent's node last."""
+    """O57: one service per node: the zone first, the providers in the layout's order, the agent's node last."""
     plain = hpc.settings.load_settings({})
     assert [r.name for r in plain.roles(("a", "b"))] == ["zone", "a", "b"]
     with_agent = hpc.settings.load_settings({"sandbox": {"cpus": 8, "memory": "17g"}})
@@ -44,14 +44,14 @@ def test_the_held_job_holds_one_node_per_service_and_one_for_the_agent_when_decl
 
 
 def test_billing_is_the_larger_of_cores_and_the_weight_times_the_memory_per_node(hpc):
-    """O56: what describe prints: nodes x max(cores, weight x GB), from the layout's sizes."""
+    """O57: what describe prints: nodes x max(cores, weight x GB), from the layout's sizes."""
     settings = hpc.settings.load_settings(None)
     assert settings.billing_per_hour(6, 0.5) == 6 * 5.5
     assert settings.billing_per_hour(6, 0.25) == 6 * 5
 
 
 def test_the_settle_time_exceeds_the_stops_whole_bound(hpc):
-    """O56: a stop takes at most stop_seconds, the 30 s SIGKILL tail and 60 s for its step to leave: settle_timeout_s
+    """O57: a stop takes at most stop_seconds, the 30 s SIGKILL tail and 60 s for its step to leave: settle_timeout_s
     is above that, derived from the layout, never a constant."""
     assert hpc.settings.load_settings(None).settle_timeout_s == 750
     settings = hpc.settings.load_settings({"stop_seconds": 120})
@@ -72,13 +72,13 @@ def test_the_settle_time_exceeds_the_stops_whole_bound(hpc):
     ids=["no cores", "bad memory", "missing memory", "bad time", "too short", "bad core place", "unknown key"],
 )
 def test_a_bad_hpc_table_is_refused_naming_the_key(hpc, table, words):
-    """O56: a bad hpc table is refused naming the key."""
+    """O57: a bad hpc table is refused naming the key."""
     with pytest.raises(hpc.settings.SettingsError, match=words):
         hpc.settings.load_settings(table)
 
 
 def test_the_compose_layout_reader_keeps_the_hpc_table_and_compose_ignores_it(hpc):
-    """O56: the HPC driver reads the very layout file the Compose federation does: fedspec keeps [hpc] as written, and
+    """O57: the HPC driver reads the very layout file the Compose federation does: fedspec keeps [hpc] as written, and
     the Compose file it generates is the same with or without it."""
     import fedcompose
     import fedspec
@@ -89,7 +89,7 @@ def test_the_compose_layout_reader_keeps_the_hpc_table_and_compose_ignores_it(hp
 
 
 def test_the_site_comes_from_the_environment_and_a_missing_value_is_named(hpc):
-    """O56: the site comes from the environment and a missing value is named."""
+    """O57: the site comes from the environment and a missing value is named."""
     environ = {
         "HPC_ACCOUNT": "test-account",
         "HPC_PARTITION": "test-partition",
@@ -109,6 +109,7 @@ def test_the_site_comes_from_the_environment_and_a_missing_value_is_named(hpc):
 
 
 def rendered_pilot(hpc, root: Path, make_ca) -> Path:
+    """The pilot-shape platform.toml as up writes it, over invented ids, in a root holding the files it names."""
     import fedspec
 
     spec = fedspec.load_spec(LAYOUT)
@@ -122,10 +123,6 @@ def rendered_pilot(hpc, root: Path, make_ca) -> Path:
         "spaces": {s.name: {"id": f"sid-{s.name}"} for s in spec.spaces},
         "principals": {p.name: {"user_id": f"uid-{p.name}"} for p in spec.principals},
     }
-    command = ["/venv/python", "/repo/hpcfed.py", "--layout", str(LAYOUT), "--root", str(root)]
-    text = hpc.boot.render_platform(
-        spec.platform_template.read_text(encoding="utf-8"), facts, command, settings.settle_timeout_s
-    )
     (root / "secrets" / "users").mkdir(parents=True)
     for name, value in [("secrets/admin.token", "an-admin-token")] + [
         (f"secrets/users/{p.name}.pass", "a-password") for p in spec.principals
@@ -134,7 +131,10 @@ def rendered_pilot(hpc, root: Path, make_ca) -> Path:
         os.chmod(root / name, 0o600)
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(root / "made").ca.read_bytes())
-    (root / "platform.toml").write_text(text, encoding="utf-8")
+    (root / "fault-journal").mkdir()
+    command = ["/venv/python", "/repo/hpcfed.py", "--layout", str(LAYOUT), "--root", str(root)]
+    values = hpc.boot.hpc_values(command, settings.stop_bound_s, settings.settle_timeout_s)
+    hpc.boot.write_platform(root / "platform.toml", spec.platform_template.read_text(encoding="utf-8"), facts, values)
     return root / "platform.toml"
 
 
@@ -147,7 +147,7 @@ def make_ca():
 
 
 def test_the_pilot_shape_has_five_providers_four_data_spaces_and_ten_link_pairs(hpc, tmp_path, make_ca):
-    """O56: the example layout matches the pilot's shape with invented names: five providers, four data spaces each
+    """O57: the example layout matches the pilot's shape with invented names: five providers, four data spaces each
     owned by one and mirrored by another, the probe space on all five; its rendered platform.toml loads and declares the
     ten ordered pairs the pilot's link check reports."""
     import fedspec
@@ -162,29 +162,62 @@ def test_the_pilot_shape_has_five_providers_four_data_spaces_and_ten_link_pairs(
     assert len(link_pairs(config.spaces, list(config.providers))) == 10
 
 
-def test_the_platform_names_this_driver_the_settle_time_and_the_least_token_margin(hpc, tmp_path, make_ca):
-    """O56: up renders [faults] command as this driver's argv prefix with --layout and --root (the fault runner passes
-    no environment), settle_timeout_s from the layout's stop bound, and [tokens] margin_s as the least the platform
-    layer's own rule accepts with those values, so the file is never refused at load for its margin."""
+def test_the_platform_declares_the_hpc_backend_and_its_stop_bound_and_no_compose_keys(hpc, tmp_path, make_ca):
+    """O57: up renders [faults] for the HPC backend (M4): backend "hpc", stop_bound_s from the layout (stop_seconds +
+    90 s), the journal in the root and every provider as a service, with none of the Compose keys it refuses."""
+    import tomllib
+
+    faults = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))["faults"]
+    assert faults["backend"] == "hpc"
+    assert faults["stop_bound_s"] == 690
+    assert faults["journal"] == "fault-journal"
+    assert set(faults["services"]) == {"aspen", "larch", "rowan", "alder", "hazel"}
+    assert not {"compose_file", "project", "command", "docker"} & set(faults)
+
+
+def test_the_token_margin_is_the_least_the_loader_of_this_core_accepts(hpc, tmp_path, make_ca, monkeypatch):
+    """O57: [tokens] margin_s is derived by the platform layer's own loader from the file as written (never a
+    constant), so a measured stop bound, or a term the loader adds, moves it."""
+    import tomllib
+
+    import expcore_onedata.fault_settings as fault_settings
+
+    loaded = FaultSettings(
+        file=Path("p"), sanctioned=False, journal=Path("j"), compose_file=Path("c"), services={},
+        settle_timeout_s=750.0, poll_s=10.0, clear_attempts=5,
+    )  # fmt: skip
+    seen = []
+
+    def load_faults(path, config):
+        seen.append(path)
+        return loaded
+
+    monkeypatch.setattr(fault_settings, "load_faults", load_faults)
+    document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
+    assert seen == [tmp_path / "platform.toml"]
+    assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(loaded))
+
+
+def test_a_core_without_the_hpc_backend_takes_the_restores_rule_with_the_hpc_settle_and_poll(hpc, tmp_path, make_ca):
+    """O57: a core whose loader cannot read the HPC [faults] (no backend "hpc" yet) still gets a margin: the restore's
+    rule over the keys it knows, with the HPC settle time (stop bound + 60 s) and poll (10 s)."""
     import tomllib
 
     document = tomllib.loads(rendered_pilot(hpc, tmp_path, make_ca).read_text(encoding="utf-8"))
-    faults = document["faults"]
-    assert faults["command"] == ["/venv/python", "/repo/hpcfed.py", "--layout", str(LAYOUT), "--root", str(tmp_path)]
-    assert faults["settle_timeout_s"] == 750
-    assert faults["backend"] == "hpc"
-    settings = FaultSettings(
+    rule = FaultSettings(
         file=Path("p"), sanctioned=False, journal=Path("j"), compose_file=Path("c"), services={},
-        settle_timeout_s=750.0, poll_s=faults["poll_s"],
+        settle_timeout_s=750.0, poll_s=10.0,
     )  # fmt: skip
-    assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(settings))
+    if "stop_bound_s" in {f.name for f in fields(FaultSettings)}:
+        pytest.skip("this core's loader reads the HPC backend: the loader's own rule applies (the test above)")
+    assert document["tokens"]["margin_s"] == math.ceil(restore_token_margin_s(rule))
 
 
 # -- the state file ---------------------------------------------------------------------------------------------
 
 
 def test_the_state_file_round_trips_and_holds_no_unknown_format(hpc, tmp_path):
-    """O56: the state file is written atomically (no draft left) and read back whole; another format is refused."""
+    """O57: the state file is written atomically (no draft left) and read back whole; another format is refused."""
     state = {
         "format": hpc.state.FORMAT,
         "project": "p",
@@ -208,14 +241,14 @@ def test_the_state_file_round_trips_and_holds_no_unknown_format(hpc, tmp_path):
     ids=["dots", "not tmpfs", "nested", "other kind", "relative"],
 )
 def test_a_work_directory_is_accepted_only_as_the_bundle_makes_one(hpc, value):
-    """O56: down removes what a recorded work directory names, so only <node tmpfs>/hpcop-<kind>.XXXXXX passes."""
+    """O57: down removes what a recorded work directory names, so only <node tmpfs>/hpcop-<kind>.XXXXXX passes."""
     assert hpc.state.checked_workdir("/tmp/hpcop-op.abcdef", "/tmp", "op") == "/tmp/hpcop-op.abcdef"
     with pytest.raises(hpc.state.StateError):
         hpc.state.checked_workdir(value, "/tmp", "op")
 
 
 def test_a_state_update_is_a_locked_read_modify_write(hpc, tmp_path):
-    """O56: the store's update reads, changes and writes under its lock; a change that returns no state is refused and
+    """O57: the store's update reads, changes and writes under its lock; a change that returns no state is refused and
     the file stays as it was."""
     store = hpc.launch.StateStore(tmp_path)
     store.create({"format": hpc.state.FORMAT, "project": "p", "allocation": {"job": None}, "services": {},
@@ -239,7 +272,7 @@ def allocation(hpc, **change):
 
 
 def test_the_held_job_is_submitted_unrequeued_timed_and_with_no_environment(hpc):
-    """O56: the held job: --no-requeue, a --time, one task per node, --export=NONE, held by exec sleep."""
+    """O57: the held job: --no-requeue, a --time, one task per node, --export=NONE, held by exec sleep."""
     argv = allocation(hpc).argv()
     for word in ("--no-requeue", "--time=02:00:00", "--ntasks-per-node=1", "--export=NONE", "--wrap=exec sleep 7200"):
         assert word in argv
@@ -261,7 +294,7 @@ def test_the_held_job_is_submitted_unrequeued_timed_and_with_no_environment(hpc)
     ids=["time", "requeue", "partition", "cpus", "memory", "account"],
 )
 def test_a_held_job_recorded_otherwise_than_asked_is_cancelled_by_its_own_id(hpc, recorded, field):
-    """O56: the submit reads back what Slurm recorded; any field otherwise than asked cancels that one job, by id."""
+    """O57: the submit reads back what Slurm recorded; any field otherwise than asked cancels that one job, by id."""
     fake = FakeSlurm(recorded=recorded)
     slurm = hpc.slurm.Slurm(fake, sleep=lambda s: None)
     asked = allocation(hpc)
@@ -273,7 +306,7 @@ def test_a_held_job_recorded_otherwise_than_asked_is_cancelled_by_its_own_id(hpc
 
 
 def test_a_held_job_recorded_as_asked_passes_the_read_back(hpc):
-    """O56: a held job recorded as asked passes the read back."""
+    """O57: a held job recorded as asked passes the read back."""
     fake = FakeSlurm()
     slurm = hpc.slurm.Slurm(fake, sleep=lambda s: None)
     asked = allocation(hpc)
@@ -283,7 +316,7 @@ def test_a_held_job_recorded_as_asked_passes_the_read_back(hpc):
 
 
 def test_every_step_is_exact_named_sized_and_sees_only_its_allowlist(hpc, monkeypatch):
-    """O56: a step is srun --exact (never --overlap) with its name, cores and memory, and env -i with PATH, LC_ALL and
+    """O57: a step is srun --exact (never --overlap) with its name, cores and memory, and env -i with PATH, LC_ALL and
     TMPDIR on the node's tmpfs only: nothing of the login environment reaches it."""
     monkeypatch.setenv("SSH_AUTH_SOCK", "/a/socket")
     monkeypatch.setenv("HPC_SECRET_LIKE", "x")
@@ -302,7 +335,7 @@ def test_every_step_is_exact_named_sized_and_sees_only_its_allowlist(hpc, monkey
 
 
 def test_a_hung_client_is_ended_only_once_its_step_has_been_gone_three_polls(hpc):
-    """O56: a finished step's srun client can hang on the login node: past its bound it is killed only once its step
+    """O57: a finished step's srun client can hang on the login node: past its bound it is killed only once its step
     is absent from squeue -s for three polls in a row, and the step's own status comes from the accounting."""
     from hpcslurm import Completed
 
@@ -323,7 +356,7 @@ def test_a_hung_client_is_ended_only_once_its_step_has_been_gone_three_polls(hpc
 
 
 def test_a_control_step_still_listed_at_its_bound_is_cancelled_by_its_id_and_times_out(hpc):
-    """O56: a step still running at its bound is cancelled by its own step id, never more, and the call raises a
+    """O57: a step still running at its bound is cancelled by its own step id, never more, and the call raises a
     TimeoutError (M4's launcher contract)."""
     from hpcslurm import Completed
 
@@ -340,7 +373,7 @@ def test_a_control_step_still_listed_at_its_bound_is_cancelled_by_its_id_and_tim
 
 
 def test_a_cancel_takes_one_job_id_and_nothing_else(hpc):
-    """O56: never scancel -u or by name: a cancel is one job id, or one step id."""
+    """O57: never scancel -u or by name: a cancel is one job id, or one step id."""
     slurm = hpc.slurm.Slurm(FakeSlurm())
     for bad in ("-u", "me", "12,13", "12 13", ""):
         with pytest.raises(hpc.slurm.SlurmError):

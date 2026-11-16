@@ -6,8 +6,8 @@ file (DESIGN.md is the process model; README.md says what has run).
     uv run python deploy/hpc-federation/hpcfed.py --layout PATH --root PATH exec SERVICE -- ARGV...
 
 Run on the login node. `up` reads the site's values from the environment (`set -a; . site.env; set +a`) and records
-them in the state file in the root, so `down` and the service verbs need no environment: `[faults] command` in the
-rendered platform.toml is this script's argv prefix, with `--layout` and `--root`.
+them in the state file in the root, so `down` and the service verbs need no environment: the login node's fault relay
+(M4), which `up` starts last, runs the verbs through this script's argv prefix, with `--layout` and `--root`.
 
 - up: one held job of `1 + providers` nodes (plus the agent's node when `[hpc]` declares `sandbox`), submitted and
   read back; the zone and each provider a service step on its own node (the bundle's `zone.sbatch` and

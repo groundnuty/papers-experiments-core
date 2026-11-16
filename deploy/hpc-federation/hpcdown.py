@@ -7,9 +7,11 @@ import os
 import re
 import shutil
 import stat
+import sys
 from pathlib import Path
 from typing import Any, List, Mapping, Optional
 
+import hpcrelay
 from fedlayout import ROOT_MARKER
 from hpcslurm import Client
 
@@ -41,12 +43,14 @@ class Down:
             remove_tree(self.root)
             return "down: no state file, so up never submitted a job; the root removed"
         state = self.set(lambda s: s.update(phase="stopping"))
-        job = state["allocation"].get("job") or self.job_by_name(state)
         unverified: List[str] = []
+        if self.relay_available() and not hpcrelay.stop(self.slurm.runner, sys.executable, self.root):
+            unverified.append("the fault relay")  # first: no verb may launch a step while the federation goes down
+        job = state["allocation"].get("job") or self.job_by_name(state)
         if job is not None:
             info = self.slurm.job(job)
             if info is not None and info.get("JobState") == "RUNNING":
-                unverified = self.stop_services(job)
+                unverified += self.stop_services(job)
             elif any(r["workdir"] and r["state"] != "removed" for r in state["services"].values()):
                 self.say(
                     "the held job had ended: its nodes could not be checked (the next job's sweep removes leftovers)"

@@ -51,8 +51,8 @@ class Rig:
         self.core_calls = []
         self.driver.core = self.core
 
-    def core(self, layout, owner, command, settle):
-        self.core_calls.append((layout, owner, command, settle))
+    def core(self, layout, owner, values):
+        self.core_calls.append((layout, owner, values))
         return "core: the link check passed"
 
     def up(self):
@@ -63,10 +63,10 @@ class Rig:
 
 
 def test_up_places_the_zone_and_each_provider_on_its_own_node_in_the_layouts_order(hpc, tmp_path, site):
-    """O56: one held job; the zone on its first node, each provider on the next, in the layout's order; every
+    """O57: one held job; the zone on its first node, each provider on the next, in the layout's order; every
     service's node, FQDN, address and work directory recorded in the state file, which holds no secret."""
     rig = Rig(hpc, tmp_path, site)
-    assert rig.up() == "core: the link check passed"
+    assert rig.up().startswith("core: the link check passed")
     state = rig.state()
     assert state["allocation"]["job"] == "4242"
     assert state["phase"] == "linked"
@@ -84,7 +84,7 @@ def test_up_places_the_zone_and_each_provider_on_its_own_node_in_the_layouts_ord
 
 
 def test_the_held_job_is_shaped_by_the_layout_and_read_back_before_anything_runs(hpc, tmp_path, site):
-    """O56: the held job is shaped by the layout and read back before anything runs."""
+    """O57: the held job is shaped by the layout and read back before anything runs."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     asked = rig.fake.asked
@@ -100,7 +100,7 @@ def test_the_held_job_is_shaped_by_the_layout_and_read_back_before_anything_runs
 
 
 def test_every_service_gets_every_peer_address_before_it_starts(hpc, tmp_path, site):
-    """O56: the shim reads its peers once, so the zone's step names every provider's address, and each provider's the
+    """O57: the shim reads its peers once, so the zone's step names every provider's address, and each provider's the
     zone's FQDN and address and every other provider's address."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
@@ -115,7 +115,7 @@ def test_every_service_gets_every_peer_address_before_it_starts(hpc, tmp_path, s
 
 
 def test_service_steps_and_control_steps_are_exact_and_sized_by_the_layout(hpc, tmp_path, site):
-    """O56: no step overlaps another's CPUs: services take their step's size, every control step the one control core
+    """O57: no step overlaps another's CPUs: services take their step's size, every control step the one control core
     and its memory, all behind the same allowlist."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
@@ -130,7 +130,7 @@ def test_service_steps_and_control_steps_are_exact_and_sized_by_the_layout(hpc, 
 
 
 def test_each_provider_is_registered_by_a_token_piped_from_the_zone_before_its_verdict(hpc, tmp_path, site):
-    """O56: each provider is registered by a token piped from the zone before its verdict."""
+    """O57: each provider is registered by a token piped from the zone before its verdict."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     assert rig.fake.delivered == PROVIDERS
@@ -140,7 +140,7 @@ def test_each_provider_is_registered_by_a_token_piped_from_the_zone_before_its_v
 
 
 def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_real_addresses(hpc, tmp_path, site):
-    """O56: the root gets the zone's passphrase (0600, as the Compose root holds it) and its CA; the core's phase
+    """O57: the root gets the zone's passphrase (0600, as the Compose root holds it) and its CA; the core's phase
     runs over https://<node FQDN>:8443, with the job's uid as the storage's owner, this driver's argv prefix and the
     settle time derived from the layout."""
     rig = Rig(hpc, tmp_path, site)
@@ -148,16 +148,17 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     secret = rig.root / "secrets" / "zone.passphrase"
     assert oct(secret.stat().st_mode & 0o777) == "0o600"
     assert (rig.root / "ca" / "federation-ca.pem").read_text(encoding="utf-8").startswith("-----BEGIN CERTIFICATE")
-    (layout, owner, command, settle) = rig.core_calls[0]
+    (layout, owner, values) = rig.core_calls[0]
     assert layout.spec.zone.url == "https://node01.cluster.example.org:8443"
     assert layout.spec.provider("hazel").url == "https://node06.cluster.example.org:8443"
     assert owner == (5001, 5001)
-    assert settle == 750
+    assert (values["hpc_stop_bound_s"], values["hpc_settle_timeout_s"]) == ("690", "750")
+    command = json.loads(values["hpc_command"])
     assert command[1:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
 
 
 def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancels_only_its_job(hpc, tmp_path, site):
-    """O56: down finds everything up placed: teardown.sh on each service's own node, the providers first and the zone
+    """O57: down finds everything up placed: teardown.sh on each service's own node, the providers first and the zone
     last, each node checked clean, then the held job cancelled by its id (never by user or name), the srun clients
     ended, and the root removed."""
     rig = Rig(hpc, tmp_path, site)
@@ -178,7 +179,7 @@ def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancel
 
 
 def test_a_held_job_recorded_otherwise_is_cancelled_and_down_after_it_removes_the_root(hpc, tmp_path, site):
-    """O56: a partial up: the read-back refuses the job and cancels it; down finds the job gone and removes the root
+    """O57: a partial up: the read-back refuses the job and cancels it; down finds the job gone and removes the root
     without a second cancel."""
     rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(recorded={"MinMemoryNode": "64G"}))
     with pytest.raises(hpc.slurm.SlurmError, match="MinMemoryNode"):
@@ -190,7 +191,7 @@ def test_a_held_job_recorded_otherwise_is_cancelled_and_down_after_it_removes_th
 
 
 def test_a_job_whose_id_never_reached_the_state_is_found_by_its_allocation_name(hpc, tmp_path, site):
-    """O56: up records the allocation's name (holding a random part) before sbatch; when the id never reached the
+    """O57: up records the allocation's name (holding a random part) before sbatch; when the id never reached the
     state, down finds the job by that exact name among this user's jobs and cancels that id."""
     rig = Rig(hpc, tmp_path, site)
     real = rig.fake.run
@@ -212,7 +213,7 @@ def test_a_job_whose_id_never_reached_the_state_is_found_by_its_allocation_name(
 
 
 def test_down_after_a_zone_that_failed_finds_its_work_directory_in_its_log(hpc, tmp_path, site):
-    """O56: up failed at the zone's verdict, before its work directory was recorded; down reads it from the zone's log
+    """O57: up failed at the zone's verdict, before its work directory was recorded; down reads it from the zone's log
     and tears the zone down on its node; the providers, never launched, need nothing."""
     fake = FakeSlurm()
     real = fake.spawn
@@ -237,7 +238,7 @@ def test_down_after_a_zone_that_failed_finds_its_work_directory_in_its_log(hpc, 
 
 
 def test_a_teardown_that_fails_keeps_the_root_and_its_state_and_still_cancels_the_job(hpc, tmp_path, site):
-    """O56: what down cannot verify it says, keeping the root and its state for a second down; the job is cancelled
+    """O57: what down cannot verify it says, keeping the root and its state for a second down; the job is cancelled
     all the same, so nothing keeps billing."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
@@ -252,7 +253,7 @@ def test_a_teardown_that_fails_keeps_the_root_and_its_state_and_still_cancels_th
 
 
 def test_up_refuses_a_root_that_holds_a_state_file(hpc, tmp_path, site):
-    """O56: up refuses a root that holds a state file."""
+    """O57: up refuses a root that holds a state file."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     with pytest.raises(RuntimeError, match="run down first"):
@@ -260,7 +261,7 @@ def test_up_refuses_a_root_that_holds_a_state_file(hpc, tmp_path, site):
 
 
 def test_a_step_on_a_node_outside_the_held_job_is_refused(hpc, tmp_path, site):
-    """O56: the launcher runs steps of the held job, on its own nodes only."""
+    """O57: the launcher runs steps of the held job, on its own nodes only."""
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     with pytest.raises(hpc.state.StateError, match="not one of the held job's"):
@@ -270,22 +271,45 @@ def test_a_step_on_a_node_outside_the_held_job_is_refused(hpc, tmp_path, site):
 # -- the core's phase -------------------------------------------------------------------------------------------
 
 
-@pytest.fixture
-def step_layout(tmp_path):
-    folder = tmp_path / "layout"
+def edited_layout(folder: Path, old: str, new: str) -> Path:
+    """The pilot-shape layout with one edit, beside a copy of its platform template."""
     folder.mkdir()
-    text = LAYOUT.read_text(encoding="utf-8").replace('core = "login"', 'core = "step"')
-    (folder / LAYOUT.name).write_text(text, encoding="utf-8")
+    text = LAYOUT.read_text(encoding="utf-8")
+    assert old in text
+    (folder / LAYOUT.name).write_text(text.replace(old, new), encoding="utf-8")
     template = LAYOUT.parent / "pilot-shape.platform.toml.template"
     (folder / template.name).write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
     return folder / LAYOUT.name
 
 
+@pytest.fixture
+def step_layout(tmp_path):
+    return edited_layout(tmp_path / "layout", 'core = "login"', 'core = "step"')
+
+
+def test_the_agents_node_is_held_and_placed_last_and_nothing_runs_or_is_torn_down_there(hpc, tmp_path, site):
+    """O57: [hpc] sandbox makes the agent's node one more role, the held job's last node; it enters the uniform shape,
+    gets no service step and no teardown, and has no ports of a service."""
+    control = 'control = { cpus = 1, memory = "1g" }'
+    layout = edited_layout(tmp_path / "layout", control, control + '\nsandbox = { cpus = 8, memory = "17g" }')
+    rig = Rig(hpc, tmp_path, site, layout=layout)
+    rig.up()
+    assert (rig.fake.asked["--nodes"], rig.fake.asked["--cpus-per-task"]) == ("7", "9")
+    assert rig.fake.asked["--mem"] == "18432M"
+    sandbox = rig.state()["services"]["sandbox"]
+    assert sandbox["node"] == "node07"
+    assert sandbox["ports"] == {}
+    assert all(s.node != "node07" for s in rig.fake.spawned)
+    rig.fake.sruns.clear()
+    rig.driver.down()
+    assert [s for s in rig.fake.sruns if s.node == "node07"] == []
+
+
 def test_with_core_step_the_core_runs_as_a_control_step_on_the_zones_node(hpc, tmp_path, site, step_layout):
-    """O56: [hpc] core = "step" (the fallback when the login node cannot reach the services) runs the core's phase in
+    """O57: [hpc] core = "step" (the fallback when the login node cannot reach the services) runs the core's phase in
     a control step on the zone's node, with the core's Python in isolated mode and this driver's own arguments."""
     rig = Rig(hpc, tmp_path, {**site, "HPC_CORE_PYTHON": "/shared/venv/bin/python"}, layout=step_layout)
-    assert rig.up() == "core: the link check passed"
+    assert rig.up().startswith("core: the link check passed")
     core = next(s for s in rig.fake.sruns if "hpcfed.py" in " ".join(s.command))
     assert core.node == "node01"
     assert core.command[:2] == ["/shared/venv/bin/python", "-I"]
@@ -294,7 +318,7 @@ def test_with_core_step_the_core_runs_as_a_control_step_on_the_zones_node(hpc, t
 
 
 def test_a_core_step_that_imports_another_core_fails_up(hpc, tmp_path, site, step_layout):
-    """O56: the core step's self-check exits 97 when its interpreter imports another core; up fails on it."""
+    """O57: the core step's self-check exits 97 when its interpreter imports another core; up fails on it."""
     from hpc_fed_support import FakeProcess
     from hpcslurm import Completed
 
@@ -306,7 +330,7 @@ def test_a_core_step_that_imports_another_core_fails_up(hpc, tmp_path, site, ste
 
 
 def test_the_self_check_names_the_core_this_interpreter_imports(hpc):
-    """O56: the self-check passes for this checkout's core and records where each module came from."""
+    """O57: the self-check passes for this checkout's core and records where each module came from."""
     paths = hpc.cli.self_check()
     assert paths["expcore_onedata"].endswith("src/expcore_onedata")
     assert paths["hpcfed"].endswith("hpcfed.py")
@@ -323,7 +347,7 @@ def make_ca():
 def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the_root(
     hpc, tmp_path, make_ca, monkeypatch
 ):
-    """O56: the core's phase renders platform.toml from the layout's template and runs the platform layer's link check
+    """O57: the core's phase renders platform.toml from the layout's template and runs the platform layer's link check
     through it (fedlinks.check_after_up); the record of all ten pairs is written in the root as link-check.json,
     through expcore_onedata.linkrecord's writer."""
     import fedlayout
@@ -361,7 +385,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
 
     monkeypatch.setattr(fedlinks, "check_links", check)
     out = hpc.boot.core_phase(
-        layout, (5001, 5001), ["/venv/python", "hpcfed.py"], 750,
+        layout, (5001, 5001), hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750),
         rest=lambda ca: SimpleNamespace(close=lambda: None),
         bootstrap=lambda rest, layout, owner: SimpleNamespace(layout=layout, ids=ids, spec=layout.spec),
         steps=lambda boot: None,
@@ -380,7 +404,7 @@ def test_the_core_phase_writes_platform_toml_and_the_ten_pair_link_record_in_the
 
 
 def test_the_service_verbs_go_through_the_stable_hook_with_the_launcher_and_the_state_store(hpc, tmp_path, monkeypatch):
-    """O56: stop, start, status and exec are hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds)
+    """O57: stop, start, status and exec are hpcfed_control.run(verb, service, argv, *, launcher, state, stop_seconds)
     (M4's module); what follows -- is exec's argv, and the stop bound is the layout's."""
     calls = []
     module = SimpleNamespace(VERBS=("stop", "start", "status", "exec"), run=lambda *a, **k: calls.append((a, k)) or 3)
@@ -395,3 +419,61 @@ def test_the_service_verbs_go_through_the_stable_hook_with_the_launcher_and_the_
     assert keywords["stop_seconds"] == 600
     assert isinstance(keywords["launcher"], hpc.launch.Launcher)
     assert isinstance(keywords["state"], hpc.launch.StateStore)
+
+
+# -- the login node's fault relay (M4) ----------------------------------------------------------------------------
+
+
+def test_up_starts_the_fault_relay_last_with_no_environment_but_its_own_and_waits_for_its_heartbeat(
+    hpc, tmp_path, site
+):
+    """O57: once the federation is linked, up starts the login node's fault relay detached, in an environment of
+    PATH, HOME and LC_ALL alone (it refuses a secret-like name), serving this root with this driver's argv prefix, and
+    waits for its heartbeat; it is recorded in the state file."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.relay_available = lambda: True
+    rig.driver.environ = {"PATH": "/usr/bin:/bin", "HOME": "/home/someone", "SSH_AUTH_SOCK": "/s", "A_TOKEN": "t"}
+    assert rig.up().endswith("fault relay: serving")
+    (argv,) = rig.fake.relays
+    cut = argv.index("-m")
+    assert argv[:cut] == ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "HOME=/home/someone", "LC_ALL=C", sys.executable]
+    command = rig.state()["command"]
+    assert argv[cut:] == ["-m", "expcore_onedata.fault_relay", "serve", "--root", str(rig.root), "--", *command]
+    assert rig.fake.relay_calls[:2] == ["serve", "alive"]
+    assert rig.state()["relay"]["pid"] == 9999
+
+
+def test_an_up_whose_relay_never_beats_fails_and_ends_the_relay(hpc, tmp_path, site):
+    """O57: a relay whose heartbeat never comes fails up, and its process is ended."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.relay_available = lambda: True
+    rig.fake.relay_rc["alive"] = 1
+    clock = iter(range(0, 10**6, 10))
+    rig.driver.clock = lambda: next(clock)
+    with pytest.raises(RuntimeError, match="did not beat"):
+        rig.up()
+    assert [c.pid for c in rig.fake.ended_clients] == [9999]
+
+
+def test_down_stops_the_fault_relay_before_anything_else(hpc, tmp_path, site):
+    """O57: down stops the relay first, so no service verb launches a step while the federation goes down; a relay
+    that will not stop is reported, and the job is cancelled all the same."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.relay_available = lambda: True
+    rig.up()
+    rig.fake.calls.clear()
+    rig.fake.relay_rc["stop"] = 1
+    with pytest.raises(RuntimeError, match="the fault relay"):
+        rig.driver.down()
+    first = rig.fake.calls[0]
+    assert first[1:4] == ["-m", "expcore_onedata.fault_relay", "stop"]
+    assert rig.fake.cancelled == ["4242"]
+
+
+def test_a_core_without_the_relay_starts_and_stops_none(hpc, tmp_path, site):
+    """O57: a core without M4's relay module says so at up, and down does not call it."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.driver.relay_available = lambda: False
+    assert "fault relay: none" in rig.up()
+    rig.driver.down()
+    assert rig.fake.relay_calls == []

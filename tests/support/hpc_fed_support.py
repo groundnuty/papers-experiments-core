@@ -140,6 +140,9 @@ class FakeSlurm:
     teardown_rc: int = 0
     next_step: int = 0
     queued: bool = True
+    relay_calls: list = field(default_factory=list)  # alive, stop, ... in order
+    relay_rc: dict = field(default_factory=dict)  # a relay verb's exit status, when not 0
+    relays: list = field(default_factory=list)  # each relay started: its argv
 
     # -- the Runner interface ------------------------------------------------------------------------------------
 
@@ -182,6 +185,9 @@ class FakeSlurm:
             return Completed(0, "", "")
         if tool == "sacct":
             return Completed(0, "", "")
+        if argv[1:3] == ["-m", "expcore_onedata.fault_relay"]:
+            self.relay_calls.append(argv[3])
+            return Completed(self.relay_rc.get(argv[3], 0), "", "")
         raise AssertionError(f"an unexpected command: {argv}")
 
     def scontrol_line(self) -> str:
@@ -266,6 +272,10 @@ class FakeSlurm:
     def spawn(self, argv, client_log):
         from hpcslurm import Client
 
+        if argv[0] == "/usr/bin/env":  # the login node's fault relay, not a step
+            self.relays.append(list(argv))
+            self.relay_calls.append("serve")
+            return Client(9999, 1)
         srun = self._step(argv)
         self.spawned.append(srun)
         self.next_step += 1

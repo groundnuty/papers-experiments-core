@@ -5,6 +5,7 @@ store (`hpclaunch.StateStore`), written before the action it enables, so `down` 
 """
 
 import json
+import os
 import re
 import secrets
 import sys
@@ -13,11 +14,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+import hpcrelay
 import hpcstate
 from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
-from hpcboot import core_phase, hpc_spec, load_owner
+from hpcboot import core_phase, hpc_spec, hpc_values, load_owner
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore
 from hpcsettings import HpcSettings, Site
@@ -60,13 +62,15 @@ class Driver(Down):
     store: StateStore
     launcher: Launcher
     user: str
-    command: List[str]  # this driver's argv prefix for this federation: what `[faults] command` holds
+    command: List[str]  # this driver's argv prefix for this federation: what the fault relay runs a verb through
     say: Callable[[str], None] = _say
     core: Callable[..., str] = core_phase
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     poll_s: float = 5.0
     core_paths: Dict[str, str] = field(default_factory=dict)
+    relay_available: Callable[[], bool] = hpcrelay.available
+    environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     timeouts: Dict[str, float] = field(default_factory=lambda: dict(TIMEOUTS))
 
     @property
@@ -202,7 +206,20 @@ class Driver(Down):
         self.export_zone()
         out = self.run_core()
         self.set(lambda s: s.update(phase="linked"))
-        return out
+        return f"{out}\n{self.start_relay()}"
+
+    def start_relay(self) -> str:
+        """The login node's fault relay, for a campaign on a compute node (M4); none in a core without it."""
+        if not self.relay_available():
+            return f"fault relay: none, this core has no {hpcrelay.RELAY}"
+        state = self.store.read()
+        log = Path(state["site"]["logs"]) / f"{state['allocation']['name']}-fault-relay.log"
+        client = hpcrelay.start(
+            self.slurm.runner, state["command"][0], self.root, state["command"], log, self.environ,
+            clock=self.clock, sleep=self.sleep,
+        )  # fmt: skip
+        self.set(lambda s: s.update(relay={"pid": client.pid, "start": client.start, "log": str(log)}))
+        return "fault relay: serving"
 
     def place(self, state: Dict[str, Any], nodes: List[str], info: Mapping[str, str]) -> None:
         state["allocation"].update(nodes=nodes, started=info.get("StartTime"), ends=info.get("EndTime"))
@@ -359,7 +376,9 @@ class Driver(Down):
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
             raise RuntimeError("the state names no owner of the providers' storage: the node facts did not run")
-        out = self.core(self.placed_layout(state), owner, state["command"], self.settings.settle_timeout_s)
+        s = self.settings
+        values = hpc_values(state["command"], s.stop_bound_s, s.settle_timeout_s)
+        out = self.core(self.placed_layout(state), owner, values)
         self.set(lambda s: s.update(phase="bootstrapped"))
         return out
 

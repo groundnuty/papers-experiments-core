@@ -8,9 +8,9 @@ real addresses (DESIGN.md, sections 5 and 6).
   the node's tmpfs, with Onedata's LUMA local feed: each support also maps the space's default credentials, and every
   user of the federation, to that uid (as `bundle/onboard.py` does), or the users could reach none of its files.
 - **`platform.toml`** is rendered from the layout's own template by the Compose renderer, plus the HPC values a
-  template may name: `@hpc_command@` (the argv prefix of this driver, for `[faults] command`), `@hpc_settle_timeout_s@`
-  (above the stop's whole bound) and `@hpc_token_margin_s@` (the least `[tokens] margin_s` the platform layer accepts
-  with that settle time and the template's other `[faults]` values, `fault_settings.restore_token_margin_s`).
+  template may name: `@hpc_stop_bound_s@` (a stop's whole bound, `[hpc] stop_seconds` + 90 s), `@hpc_settle_timeout_s@`
+  (above it), `@hpc_command@` (this driver's argv prefix) and `@hpc_token_margin_s@`: the least `[tokens] margin_s`
+  the platform layer's own loader accepts for the rest of the file (`least_margin_s`).
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -51,6 +51,8 @@ NOT_A_BOUND = {
     "docker",
     "config_sha256",
 }
+HPC_POLL_S = 10.0  # the HPC backend's poll: every status is a step on a node's one control core
+PROVISIONAL_MARGIN_S = 10**9  # the margin the platform file is first written with: above any the loader's rule asks
 
 
 @dataclass(frozen=True)
@@ -136,59 +138,80 @@ def bring_up(boot: Bootstrap) -> None:
             boot.ensure_members(space.name)
 
 
-def token_margin_s(rendered: str, settle_timeout_s: int) -> int:
-    """The least `[tokens] margin_s` of a platform whose `[faults]` holds these values and this settle time: the
-    platform layer's own rule (`restore_token_margin_s`), so the file `up` renders is never refused at load for it."""
+def rule_margin_s(rendered: str, settle_timeout_s: float) -> int:
+    """The least `[tokens] margin_s` by the restore's rule (`restore_token_margin_s`) over every `[faults]` key the
+    platform layer's settings know, the HPC backend's settle time and poll standing in where the file leaves them out:
+    for a core whose loader cannot read this `[faults]` (one without the HPC backend)."""
     table = tomllib.loads(rendered).get("faults", {})
     known = {item.name for item in fields(FaultSettings)} - NOT_A_BOUND
     declared = {key: value for key, value in table.items() if key in known}
+    declared.setdefault("settle_timeout_s", float(settle_timeout_s))
+    declared.setdefault("poll_s", HPC_POLL_S)
     settings = FaultSettings(
         file=Path("platform.toml"),
         sanctioned=False,
         journal=Path("fault-journal"),
         compose_file=Path("-"),
         services={},
-        **{**declared, "settle_timeout_s": float(settle_timeout_s)},
+        **declared,
     )
     return math.ceil(restore_token_margin_s(settings))
 
 
-def hpc_values(command: Sequence[str], settle_timeout_s: int) -> Dict[str, str]:
-    """The HPC values a platform template may name, but the token margin (`render_platform` derives it)."""
+def least_margin_s(path: Path, rendered: str, settle_timeout_s: float) -> int:
+    """The least `[tokens] margin_s` the platform layer's own loader accepts for the platform file at `path`, written
+    with a provisional margin no rule refuses: `load_faults` reads it as a campaign would, and its rule gives the least
+    (so a term the loader adds, or a measured stop bound, moves it with no change here). A core whose loader refuses
+    this `[faults]` for another reason has no HPC backend yet; the rule over the keys it knows stands in."""
+    from expcore.config.loading import ConfigError
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.fault_settings import load_faults
+
+    try:
+        settings = load_faults(path, load_platform(path))
+    except ConfigError:
+        return rule_margin_s(rendered, settle_timeout_s)
+    return math.ceil(restore_token_margin_s(settings))
+
+
+def hpc_values(command: Sequence[str], stop_bound_s: int, settle_timeout_s: int) -> Dict[str, str]:
+    """The HPC values a platform template may name, but the token margin (`write_platform` derives it)."""
     return {
         "hpc_command": json.dumps(list(command)),  # a TOML array of basic strings is JSON's
+        "hpc_stop_bound_s": str(stop_bound_s),
         "hpc_settle_timeout_s": str(settle_timeout_s),
     }
 
 
-def render_platform(template: str, facts: dict, command: Sequence[str], settle_timeout_s: int) -> str:
-    """The platform file: the Compose placeholders from the facts, then the HPC ones; the token margin last, from the
-    rest of the rendered file."""
-    values = {**placeholders(facts), **hpc_values(command, settle_timeout_s), "hpc_token_margin_s": "0"}
-    first = render(template, values)
+def write_platform(path: Path, template: str, facts: dict, values: Mapping[str, str]) -> str:
+    """Write the platform file: the Compose placeholders from the facts, the HPC ones, and the token margin last, the
+    least the platform layer accepts for the rest of the file. Returns the text written."""
+    filled = {**placeholders(facts), **values, "hpc_token_margin_s": str(PROVISIONAL_MARGIN_S)}
+    text = render(template, filled)
+    write_private(path, text)
     if "@hpc_token_margin_s@" not in template:
-        return first
-    values["hpc_token_margin_s"] = str(token_margin_s(first, settle_timeout_s))
-    return render(template, values)
+        return text
+    filled["hpc_token_margin_s"] = str(least_margin_s(path, text, float(values["hpc_settle_timeout_s"])))
+    text = render(template, filled)
+    write_private(path, text)
+    return text
 
 
-def write_facts(layout: Layout, boot: Bootstrap, command: Sequence[str], settle_timeout_s: int) -> str:
+def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> str:
     """facts.json, and platform.toml from the layout's template with the HPC values."""
     facts = facts_of(boot)
     layout.facts.write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     template = layout.spec.platform_template
     if template is None:
         return "facts.json written; the layout names no platform_template, so no platform.toml"
-    text = render_platform(template.read_text(encoding="utf-8"), facts, command, settle_timeout_s)
-    write_private(layout.platform, text)
+    write_platform(layout.platform, template.read_text(encoding="utf-8"), facts, values)
     return "facts.json and platform.toml written"
 
 
 def core_phase(
     layout: Layout,
     owner: Tuple[int, int],
-    command: Sequence[str],
-    settle_timeout_s: int,
+    values: Mapping[str, str],
     *,
     rest: Callable[[Path], Any] = Rest,
     bootstrap: Callable[[Any, Layout, Tuple[int, int]], Bootstrap] = HpcBootstrap,
@@ -208,7 +231,7 @@ def core_phase(
         steps(boot)
         if not layout.facts.exists():
             content(boot).reset(TRANSFER_TIMEOUT_S)
-        written = write_facts(layout, boot, command, settle_timeout_s)
+        written = write_facts(layout, boot, values)
         checked = links(layout, dict(boot.ids.spaces))
     finally:
         client.close()

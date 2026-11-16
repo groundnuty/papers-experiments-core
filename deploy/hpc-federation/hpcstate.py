@@ -46,7 +46,9 @@ def checked_workdir(value: str, node_tmp: str, kind: str) -> str:
 
 
 def new_service(kind: str) -> Dict[str, Any]:
-    ports: Dict[str, Any] = {"https": 8443, "epmd": None}
+    """A role's record before up places it: a service (`oz`, `op`) with its public ports, or the agent's node
+    (`sandbox`), which hosts no Onedata service and has none."""
+    ports: Dict[str, Any] = {} if kind == "sandbox" else {"https": 8443, "epmd": None}
     if kind == "op":
         ports["rtransfer"] = 6665
     return {
