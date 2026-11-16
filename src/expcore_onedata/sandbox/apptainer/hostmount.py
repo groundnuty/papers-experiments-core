@@ -78,6 +78,7 @@ ARMED_WAIT_S = 30.0
 POLL_S = 0.1
 STEP_S = 30.0
 UNMOUNT = ("fusermount3", "-u")
+LAZY = "-uz"  # the lazy unmount, as the reaper's (`runs`): the mount detached even while a process holds it
 ENV_ACCESS_TOKEN = "ONECLIENT_ACCESS_TOKEN"
 # The wrapper's shell: read the token file named by its first argument into oneclient's variable, refuse an empty one,
 # then become `env` with the rest. The value lives in oneclient's own environment, never in an argument.
@@ -299,6 +300,10 @@ class HostMount:
         self._wait_armed()
         return where.mountpoint
 
+    def token_paths(self) -> list[Path]:
+        """The token's file, which the sandbox lists in the run's record before the start writes it (O60)."""
+        return [self.where.token_file]
+
     def _noted(self, helper: helpers.Helper) -> None:
         self.watch = helper
 
@@ -396,7 +401,7 @@ class HostMount:
 
     def _mount_gone(self) -> None:
         if self._mounted():
-            self.node.run([*self._unmount, "-z", str(self.where.mountpoint)], STEP_S)
+            self.node.run([self._unmount[0], LAZY, str(self.where.mountpoint)], STEP_S)
         if self._mounted():
             raise SandboxError("the oneclient mount is still in the mount table")
 

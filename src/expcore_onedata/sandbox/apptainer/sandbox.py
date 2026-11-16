@@ -306,6 +306,9 @@ class ApptainerSandbox:
         """Hook (c): the mount's helper, started before any cell; the node directory bound at the mount path."""
         self.register_creation()
         self._mount = self._mount_factory(self.node, self.s, self.spec, self.dir)
+        # before they exist: the record lists them, so a reaper removes them first, and every teardown too (O60)
+        self._token_files = [*self._token_files, *self._mount.token_paths()]
+        self.run_record()
         return self._mount.start()
 
     def _start_gate(self) -> None:

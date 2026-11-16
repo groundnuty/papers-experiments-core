@@ -305,3 +305,51 @@ def test_through_the_sandbox_every_cell_binds_the_mount_point_alone_and_the_coll
     finally:
         box.stop()
     assert node.mounted_at is None
+
+
+def test_the_run_record_lists_the_mounts_token_file_before_the_start_writes_it(node, settings, binary):
+    """O60 (M5's review): the reaper removes the token files the record lists before anything else it does."""
+    from expcore_onedata.sandbox.apptainer import runs
+
+    factory = HM.host_mount_factory(binary, mountinfo=node.mountinfo)
+    box = ApptainerSandbox.start(node, settings, make_spec("mounted"), **options(mount_helper=factory))
+    try:
+        document = json.loads(runs.record_path(settings.work_root, box.sid).read_text())
+        assert document["token_files"] == ["mount-guard/token/token"]
+    finally:
+        box.stop()
+
+
+def test_a_dead_drivers_mount_run_whose_unmount_fails_still_has_its_token_file_removed_by_the_reaper(
+    node, settings, binary
+):
+    """O60 (M5's review): a driver killed outright while the token file was on disk, and a mount no unmount takes:
+    the next start's reaper removes the token file first, kills oneclient and the watcher by the run's tag, and keeps
+    the run for a later reap since its mount stays."""
+    from expcore_onedata.sandbox.apptainer import runs
+    from expcore_onedata.sandbox.apptainer.node import Spawned
+
+    factory = HM.host_mount_factory(binary, mountinfo=node.mountinfo)
+    old = ApptainerSandbox.start(
+        node, settings, make_spec("mounted", lease_key="slot-a"), **options(mount_helper=factory)
+    )
+    token = old._mount.where.token_file
+    token.write_text(TOKEN)  # the file as the start had it on disk, before its removal
+    node.stuck_mount = True
+    node.procs[node.owner.pid].alive = False  # the driver is gone, its teardown never run
+    node.owner = Spawned(1001, "5151")
+    node.procs[1001] = type(node.procs[999])(1001, "5151", "pid:[4026531836]", "driver", role="driver")
+    fresh = start_box(node, settings)
+    try:
+        assert not os.path.lexists(token)
+        assert not node.watch().proc.alive
+        assert fresh.metadata()["reaped_orphans"]["left"] == 1  # the mount stays: kept for a later reap
+        assert runs.record_path(settings.work_root, old.sid).exists()
+    finally:
+        fresh.stop()
+
+
+def start_box(node, settings):
+    from apptainer_support import start
+
+    return start(node, settings)

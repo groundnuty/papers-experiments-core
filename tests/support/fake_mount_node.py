@@ -1,8 +1,9 @@
 """The fake HPC node (`fake_node.FakeNode`) with the host mount's two processes emulated: oneclient and its watcher.
 
 oneclient's wrapper (`sh -c HOST_START ...`) is emulated by what it does: it reads the token file its argv names (kept
-in `oneclient_tokens`) and the FUSE mount appears at the last argument in `mountinfo()`, this uid's, read-only, without
-`allow_other`; SIGTERM ends it and the mount. `fusermount3 -u` ends the mount too, unless `stuck_mount`.
+in `oneclient_tokens`) and the FUSE mount appears at the last argument, in the fake node's `mounts` (which the reaper's
+`mounts_under` reads) and in `mountinfo()`, this uid's, read-only, without `allow_other`; a signal ends it and the
+mount. `fusermount3` ends the mount as the fake node's own emulation does, and nothing ends it with `stuck_mount`.
 
 The watcher (`-m expcore_onedata.sandbox.mountwatch`) writes its start and oneclient lines in the real format and says
 it is ready; once the token file is gone (looked at whenever the harness asks whether a process is alive, as the real
@@ -58,17 +59,20 @@ class FakeMountNode(FakeNode):
 
     def __init__(self) -> None:
         super().__init__()
-        self.mounted_at: str | None = None
+        self.mountpoint: str | None = None  # oneclient's, once it has started
         self.oneclient_tokens: list[str] = []
         self.oneclient_argv: list[str] | None = None
         self.oneclient_fails = False
         self.mount_never = False
         self.stuck_mount = False
         self.watches: list[Watch] = []
-        self.unmounts: list[list[str]] = []
         self.spawn_env: list[dict[str, str]] = []
 
     # ------------------------------------------------------------------------------------------------ the mount
+    @property
+    def mounted_at(self) -> str | None:
+        return self.mountpoint if self.mountpoint in self.mounts else None
+
     def mountinfo(self) -> str:
         line = ""
         if self.mounted_at is not None:
@@ -82,27 +86,30 @@ class FakeMountNode(FakeNode):
             os.close(os.open(stderr, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             self.spawned.append(list(argv))
             self.spawn_env.append(dict(env or {}))
-            return self._spawn_oneclient(list(argv))
+            return self._spawn_oneclient(list(argv), env or {})
         if "expcore_onedata.sandbox.mountwatch" in argv:
             os.close(os.open(stdout, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             os.close(os.open(stderr, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             self.spawned.append(list(argv))
             self.spawn_env.append(dict(env or {}))
-            return self._spawn_watch(list(argv), stdout)
+            return self._spawn_watch(list(argv), stdout, env or {})
         return super().spawn(argv, stdout=stdout, stderr=stderr, env=env)
 
-    def _spawn_oneclient(self, argv: list[str]) -> Spawned:
+    def _spawn_oneclient(self, argv: list[str], env: dict[str, str]) -> Spawned:
         self.oneclient_argv = argv
         self.oneclient_tokens.append(Path(argv[4]).read_text(encoding="utf-8"))
-        proc = self._new_proc(OWN_NS, "oneclient", cmdline=tuple(argv), role="oneclient")
+        environ = tuple(f"{k}={v}" for k, v in env.items())  # the run's tag, by which a reaper finds it
+        proc = self._new_proc(OWN_NS, "oneclient", cmdline=tuple(argv), environ=environ, role="oneclient")
         if self.oneclient_fails:
             proc.alive, proc.exit_status = False, 1
         elif not self.mount_never:
-            self.mounted_at = argv[-1]
+            self.mountpoint = argv[-1]
+            self.mounts.add(argv[-1])
         return Spawned(proc.pid, proc.start)
 
-    def _spawn_watch(self, argv: list[str], stdout: Path) -> Spawned:
-        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), role="mountwatch")
+    def _spawn_watch(self, argv: list[str], stdout: Path, env: dict[str, str]) -> Spawned:
+        environ = tuple(f"{k}={v}" for k, v in env.items())
+        proc = self._new_proc(OWN_NS, "python3", cmdline=tuple(argv), environ=environ, role="mountwatch")
         watch = Watch(argv, stdout, proc)
         assert not watch.log.exists(), "the watcher's log exists before it starts"
         assert watch.token.exists(), "the watcher starts while the token file is there"
@@ -147,16 +154,14 @@ class FakeMountNode(FakeNode):
                 if watch.armed:
                     watch.write("disarmed")
                 watch.write("end", lines=watch.seq, samples=3, polls=5, polls_failed=0, unwritten=0)
-            if proc.role == "oneclient" and not self.stuck_mount:
-                self.mounted_at = None
+            if proc.role == "oneclient" and not self.stuck_mount and self.mountpoint is not None:
+                self.mounts.discard(self.mountpoint)
             proc.alive, proc.exit_status = False, 0 if sig == signal.SIGTERM else 128 + sig
             return True
         return super().signal(pid, start, sig)
 
     def run(self, argv: Sequence[str], timeout_s: float, *, sudo: bool = False, input: str | None = None) -> CmdResult:
-        if argv and argv[0] == "fusermount3":
+        if argv and argv[0] == "fusermount3" and self.stuck_mount:
             self.unmounts.append(list(argv))
-            if not self.stuck_mount:
-                self.mounted_at = None
-            return CmdResult(0, "", "")
+            return CmdResult(1, "", "fusermount3: failed to unmount: Device or resource busy\n")
         return super().run(argv, timeout_s, sudo=sudo, input=input)
