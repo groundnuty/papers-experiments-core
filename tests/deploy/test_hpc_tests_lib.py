@@ -121,8 +121,9 @@ def test_the_remote_command_quotes_every_word_and_execs_srun(hpct, site):
     argv = step(hpct, site).argv()
     assert "\n" in hpct.lib.BOOT
     line = hpct.lib.remote_command(argv)
-    assert line.startswith("exec srun ")
-    assert shlex.split(line)[1:] == argv
+    login, _, rest = line.partition("; exec ")
+    assert login.startswith('printf "HPCT-LOG login %s\\n" "$(hostname -s | sha256sum | cut -c1-8)"')
+    assert shlex.split(rest) == argv
     with pytest.raises(hpct.lib.HpcTestsError, match="NUL"):
         hpct.lib.remote_command(["srun", "a\0b"])
 
@@ -283,9 +284,9 @@ def test_o64_a_run_s_remote_command_holds_the_use_lock_shared_and_is_bounded_on_
     """O64: a run's step runs under a shared lock on the login directory's use.lock (which the idle release must take
     exclusively) and under `timeout`, so a client that never returns cannot hold it past the run's bound."""
     argv = step(hpct, site).argv()
-    words = shlex.split(hpct.lib.remote_command(argv, ".expcore-hpct", 3900))
-    assert words[:10] == ["exec", "flock", "-s", "-w", "600", ".expcore-hpct/use.lock", "timeout", "-k", "30", "3900"]
-    assert words[10:] == argv
+    words = shlex.split(hpct.lib.remote_command(argv, ".expcore-hpct", 3900).partition("; exec ")[2])
+    assert words[:9] == ["flock", "-s", "-w", "600", ".expcore-hpct/use.lock", "timeout", "-k", "30", "3900"]
+    assert words[9:] == argv
     with pytest.raises(hpct.lib.HpcTestsError):
         hpct.lib.remote_command(argv, "../elsewhere", 60)
 

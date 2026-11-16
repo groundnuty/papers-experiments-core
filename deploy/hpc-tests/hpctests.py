@@ -33,6 +33,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import hpctestlib as lib
@@ -43,6 +44,9 @@ SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAl
 SSH_OPTIONS += ("-o", "ServerAliveCountMax=6", "-T")
 GRACE_S = 30.0  # after the end marker: the srun client of a finished step can hang (seen live); it is ended then
 WAIT_FOR_CORES_S = 3600  # how long a step may wait for free cores (--exact queues it) before the run gives up
+LAUNCH_TRIES = 3  # a step whose launch failed before its boot ran (seen live: a transient name lookup) is tried again
+LAUNCH_PAUSE_S = 30.0
+LAUNCH_FAILED = ("Application launch failed", "Task launch for StepId")
 
 
 def private_text(path: Path, what: str) -> str:
@@ -164,6 +168,36 @@ def stream_step(remote: Remote, command: str, payload: Path, bound_s: float, tra
     return reader.result()
 
 
+def never_launched(streamed: parse.Streamed, transport: Path) -> bool:
+    """The step's task never started: srun says its launch failed, and the boot (whose first act would be a line of
+    ours) printed nothing; so nothing ran on the node and trying again repeats nothing."""
+    if (
+        streamed.archive is not None
+        or streamed.failure is not None
+        or any(not x.startswith("login ") for x in streamed.logs)
+    ):
+        return False
+    text = transport.read_text(encoding="utf-8", errors="replace") if transport.exists() else ""
+    return any(marker in text for marker in LAUNCH_FAILED)
+
+
+def launch(remote: Remote, command: str, payload: Path, bound_s: float, out: Path) -> parse.Streamed:
+    """stream_step, tried again (up to LAUNCH_TRIES in all) while the step's launch failed before its boot ran."""
+    for attempt in range(1, LAUNCH_TRIES + 1):
+        transport = out / "transport.log"
+        streamed = stream_step(remote, command, payload, bound_s, transport)
+        if attempt == LAUNCH_TRIES or not never_launched(streamed, transport):
+            return streamed
+        transport.rename(out / f"transport-{attempt}.log")
+        print(
+            f"srun could not launch the step (try {attempt} of {LAUNCH_TRIES}; see transport-{attempt}.log): again in"
+            f" {LAUNCH_PAUSE_S:.0f} s",
+            flush=True,
+        )
+        time.sleep(LAUNCH_PAUSE_S)
+    return streamed
+
+
 def tail(path: Path, lines: int = 20) -> str:
     return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]) if path.exists() else ""
 
@@ -263,7 +297,7 @@ def cmd_run(site: lib.Site, remote: Remote, args: argparse.Namespace) -> int:
         meta: dict[str, object] = {"run": run_id, "commit": sha, "job": job.id, "cores": args.cores, "mem": args.mem}
         meta["pytest_args"] = args.pytest
         try:
-            streamed = stream_step(remote, command, payload, bound + 120, out / "transport.log")
+            streamed = launch(remote, command, payload, bound + 120, out)
         except lib.HpcTestsError as error:
             print(f"the results did not verify: {error}")
             return 71

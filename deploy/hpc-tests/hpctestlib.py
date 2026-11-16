@@ -256,12 +256,15 @@ def remote_command(argv: Sequence[str], login_dir: str | None = None, bound_s: i
     that never returns (seen on a site) cannot hold that lock past the run's own bound."""
     if any("\0" in word for word in argv):
         raise HpcTestsError("a remote word holds a NUL")
+    # A short hash of the login node's name first, so runs that fail on one login node of several can be told apart
+    # without its name in anyone's output.
     words: list[str] = []
+    login = 'printf "HPCT-LOG login %s\\n" "$(hostname -s | sha256sum | cut -c1-8)"; '
     if login_dir is not None:
         words += ["flock", "-s", "-w", "600", f"{checked(LOGIN_DIR, login_dir, 'HPCT_LOGIN_DIR')}/{USE_LOCK}"]
     if bound_s is not None:
         words += ["timeout", "-k", "30", str(int(bound_s))]
-    return "exec " + shlex.join([*words, *argv])
+    return login + "exec " + shlex.join([*words, *argv])
 
 
 # The step's first program: read the payload from stdin into a fresh 0700 run directory under the node's tmpfs root,

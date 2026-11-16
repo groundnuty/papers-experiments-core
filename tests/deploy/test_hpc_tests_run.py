@@ -317,3 +317,25 @@ def test_the_boot_refuses_a_runs_directory_that_is_a_link(cli, world, tmp_path):
     allocate(cli, world)
     assert run(cli, world, "tests") == 72
     assert list(elsewhere.iterdir()) == []
+
+
+def test_o64_a_step_whose_launch_failed_before_its_boot_ran_is_tried_again(cli, world, monkeypatch, capsys):
+    """O64: srun can fail a step's launch before its task starts (seen live: the login node's lookup of the node's
+    name, for a minute); nothing ran on the node, so the run tries again, up to three times in all."""
+    monkeypatch.setattr(cli.module, "LAUNCH_PAUSE_S", 0.0)
+    allocate(cli, world)
+    (world.fake / "launch-fail").write_text("")
+    assert run(cli, world, "tests") == 0
+    assert "srun could not launch the step (try 1 of 3" in capsys.readouterr().out
+    assert (only_run(world) / "transport-1.log").exists()
+
+
+def test_a_launch_that_keeps_failing_ends_with_no_results(cli, world, monkeypatch):
+    monkeypatch.setattr(cli.module, "LAUNCH_PAUSE_S", 0.0)
+    allocate(cli, world)
+    (world.fake / "launch-fail").write_text("always")
+    assert run(cli, world, "tests") == 70
+    out = only_run(world)
+    assert (out / "transport-1.log").exists()
+    assert (out / "transport-2.log").exists()
+    assert "Application launch failed" in (out / "transport.log").read_text()
