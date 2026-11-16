@@ -13,6 +13,7 @@ from hpc_fed_support import LAYOUT, SITE, FakeProcess, FakeSlurm, hpc_on_path
 
 PROVIDERS = ["aspen", "larch", "rowan", "alder", "hazel"]
 CONTROL = 'control = { cpus = 1, memory = "1g" }'
+PLACEMENT = 'sandbox_placement = "het"'
 AGENT = 'sandbox = { cpus = 8, memory = "17g" }'
 GIB = 1 << 30
 
@@ -40,8 +41,10 @@ def agent_layout(folder: Path, placement: str = "het", template_extra: str = "",
     folder.mkdir()
     text = LAYOUT.read_text(encoding="utf-8")
     assert CONTROL in text
-    extra = f'{CONTROL}\nsandbox_placement = "{placement}"' + (f"\n{hpc_extra}" if hpc_extra else "")
-    (folder / LAYOUT.name).write_text(text.replace(CONTROL, extra), encoding="utf-8")
+    assert PLACEMENT in text  # the pilot's layout records the coordinator's choice
+    text = text.replace(PLACEMENT, f'sandbox_placement = "{placement}"')
+    text = text.replace(CONTROL, f"{CONTROL}\n{hpc_extra}") if hpc_extra else text
+    (folder / LAYOUT.name).write_text(text, encoding="utf-8")
     template = LAYOUT.parent / "pilot-shape.platform.toml.template"
     (folder / template.name).write_text(template.read_text(encoding="utf-8") + template_extra, encoding="utf-8")
     return folder / LAYOUT.name
@@ -134,6 +137,17 @@ def test_a_template_without_the_apptainer_sandbox_gives_no_agents_limits(hpc, tm
     docker = tmp_path / "docker.toml.template"
     docker.write_text(apptainer_limits().replace('"apptainer"', '"docker"'), encoding="utf-8")
     assert hpc.settings.agent_limits(docker) is None
+
+
+def test_the_pilot_layout_records_the_coordinators_choice_and_declares_no_agents_node_yet(hpc):
+    """O57: the pilot's layout records sandbox_placement = "het" in its [hpc] table; its template declares no
+    Apptainer sandbox, so it holds no agent's node until M5's lane declares one."""
+    import fedspec
+
+    spec = fedspec.load_spec(LAYOUT)
+    assert spec.hpc["sandbox_placement"] == "het"
+    settings = hpc.settings.load_settings(spec.hpc, hpc.settings.agent_limits(spec.platform_template))
+    assert (settings.sandbox_placement, settings.sandbox) == ("het", None)
 
 
 def test_the_layouts_template_gives_the_driver_the_agents_node(hpc, tmp_path):
