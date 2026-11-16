@@ -270,11 +270,12 @@ run's context, so its admission), and the caller keeps that thread's future as `
   target whose lock is held. The re-reads above refuse each of these that lands before `inject` reads; the identity
   read before the stop, the session gate's probe and the holder line are `inject`'s own.
 - **The fault relay on the HPC backend** (`fault_relay`), which the run's admission requires live (`relay_refusal`, the
-  hold `federation_busy`), can stop answering in the window. It is not read again here: every request of the driver
-  checks the relay's heartbeat first and sends nothing to a relay that is not answering, so `inject`'s first request,
-  the read of the target's identity, fails with nothing sent, and `inject` fails as `injector_failure` before anything
-  is journalled, locked or stopped, the admission let go at the block's exit. Unlike the admission's hold, that
-  failure costs the attempt, as a failed start's does.
+  hold `federation_busy`), can stop answering in the window. It is not read again here: `inject`'s first request of
+  the driver, the read of the target's identity, fails when it does. With the heartbeat already missing or stale it is
+  never sent; a relay that died within `RELAY_STALE_S` of its last beat never takes it, and it is withdrawn when its
+  wait ends; one that took it and never answers leaves a reading that failed. Either way `_journal_injection` lets the
+  target's lock go and `inject` fails as `injector_failure`, with nothing journalled and nothing stopped, the admission
+  let go at the block's exit. Unlike the admission's hold, that failure costs the attempt, as a failed start's does.
 - **The token's window and the deferral bound: the window documented.** In the documented order the run's tokens are
   minted before the injector starts, so a baseline spends token life, and the least `[tokens] margin_s`
   (`fault_settings.restore_token_margin_s`) counts no baseline: the injector's start after the mint falls inside
