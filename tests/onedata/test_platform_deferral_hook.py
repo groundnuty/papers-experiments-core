@@ -49,8 +49,9 @@ HPC_DEFAULTS = dict.fromkeys(("stop_bound_s", "settle_timeout_s", "relay_wait_s"
 
 
 def compose_platform(root: Path, margin_s: int = 100_000, **changes) -> Path:
+    """The journal is stated in full, as it must be in a study directory (a `study.toml` beside the file)."""
     root.mkdir(parents=True, exist_ok=True)
-    return write_faults(root, margin_s=margin_s, **{**SHARED, **changes})
+    return write_faults(root, margin_s=margin_s, **{**SHARED, "journal": str(root / "fault-journal"), **changes})
 
 
 def hpc_platform(root: Path, **changes) -> Path:
@@ -58,7 +59,7 @@ def hpc_platform(root: Path, **changes) -> Path:
     keep = {
         k: v for k, v in SHARED.items() if k in ("heal", "ready_timeout_s", "session_drain_s", "admission_timeout_s")
     }
-    return write_hpc_platform(root, **{**HPC_DEFAULTS, **keep, **changes})
+    return write_hpc_platform(root, **{**HPC_DEFAULTS, **keep, "journal": str(root / "fault-journal"), **changes})
 
 
 def bound_of(platform: Path) -> DeferralBound | None:

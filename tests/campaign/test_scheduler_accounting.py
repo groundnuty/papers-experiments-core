@@ -2,6 +2,7 @@
 
 import datetime as dt
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -129,7 +130,8 @@ def test_c15_a_kill_after_the_marker_of_the_third_endpoint_failure_still_pauses_
 
 
 def test_c13_a_stop_fired_by_a_running_campaign_is_dated_at_the_clocks_full_precision(tmp_path):
-    """C13: the dispatcher dates the harness stop with its clock to the microsecond, not to the whole second."""
+    """C13: the dispatcher dates the harness stop with its clock to the microsecond, for display, and records its
+    serial with it."""
     moment = dt.datetime(2026, 1, 1, 0, 0, 5, 800000, tzinfo=dt.UTC)
     with build(tmp_path, executor=FakeExecutor(default=("defect",)), plan=SMALL, clock=lambda: moment) as scheduler:
         scheduler.run()
@@ -137,3 +139,4 @@ def test_c13_a_stop_fired_by_a_running_campaign_is_dated_at_the_clocks_full_prec
         assert stop["utc"] == "2026-01-01T00:00:05Z"
         assert stop["epoch"] == pytest.approx(moment.timestamp())
         assert stop["epoch"] > dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.UTC).timestamp() + 0.79
+        assert re.fullmatch(r"[0-9]+\.[a-z2-7]{8}", stop["serial"])

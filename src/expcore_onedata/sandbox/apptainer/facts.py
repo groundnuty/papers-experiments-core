@@ -3,7 +3,12 @@
 
 Every run's metadata holds `infrastructure_facts` (this list, by key) so a reader of a record knows which bounds held
 on the node it ran on. A key is stable; its text explains it. Each departure is the node's (an HPC batch node gives an
-unprivileged user no namespace but setuid Apptainer's and no cgroup of its own), never a choice of the study's.
+unprivileged user no namespace but setuid Apptainer's and no cgroup of its own), never a choice of the study's. One
+key, `dns_none`, records what a cell resolves and is no departure: a Docker cell resolves the same (measured).
+
+One key is conditional, `mount_refused`: it is listed only for a run whose sandbox refuses a mount data path at its
+start (`ApptainerSandbox._mount_refused`: no mount helper is given, or the platform declares no `[sandbox.mount]`), so a
+mount run, which was not refused, never carries it, nor does any run of a sandbox that would accept one.
 """
 
 from __future__ import annotations
@@ -38,8 +43,29 @@ FACTS: dict[str, str] = {
         "RssShmem of the run's processes every memory_poll_s and kills them all over the limit (Docker's kernel "
         "kills the largest process alone); a spike shorter than the period is missed, and the kernel's limit is "
         "the step's, shared with the driver and the gate, so its OOM kill is infrastructure. A process that makes "
-        "itself non-dumpable is hidden by /proc's hidepid, so the watch neither counts nor kills it; the end of its "
-        "cell's PID namespace when the exec returns ends it"
+        "itself non-dumpable is hidden by /proc's hidepid, so this sum neither counts nor kills it (hidden_memory); "
+        "the end of its cell's PID namespace when the exec returns ends it"
+    ),
+    "hidden_memory": (
+        "a process /proc hides is checked from outside: at every poll the watch compares the anonymous memory of the "
+        "driver's own cgroup (memory.stat anon, which counts a hidden process) with the RssAnon of every process of "
+        "the uid /proc shows in it (the larger of two listings' totals around the cgroup's), and memory nothing "
+        "visible explains that grew past hidden_memory_margin_bytes during a cell for two polls kills the cell as "
+        "memory_limit (memory_hidden); one that cannot be told the "
+        "cell's (another run's cell in the cgroup, or a margin the start's own cells passed) makes the run's memory "
+        "reading unknown, never within, as do a child of a cell process that /proc does not show (hidden_process, "
+        "which a process that forks twice under the cell's hidden init escapes) and a reading that failed; hidden "
+        "memory under the margin, and a hidden process's shared memory (a memfd, a shared anonymous mapping), which "
+        "the cgroup counts with the run's tmpfs files, are bounded by the step's limit alone"
+    ),
+    "dns_none": (
+        "a cell has no name server: its /etc/resolv.conf names none and its /etc/nsswitch.conf looks hosts up in "
+        "files alone, so the C library resolves the names of /etc/hosts (the federation's, on the loopback) and no "
+        "other; a program with a resolver of its own can still send a query, which is egress like any other. This "
+        "is no departure from Docker: the agent's network there is --internal with --add-host entries and no --dns; "
+        "the engine's embedded resolver (127.0.0.11) answers every outside name with SERVFAIL at once (no addresses, "
+        "no timeout), the --add-host names resolve only through /etc/hosts, and a connect to an outside address "
+        "fails at once with ENETUNREACH (no default route); measured on engine 29.2.1"
     ),
     "disk_watch": (
         "/work, /tmp and /dev/shm are directories on the node's tmpfs, charged to the step's memory: the watch "
@@ -59,15 +85,23 @@ FACTS: dict[str, str] = {
     ),
     "apptainer_stderr": "Apptainer's own warnings would be the cell's stderr: it runs with -q, which keeps its errors",
     "mount_refused": (
-        "a mount data path is refused at the start until the mount's helper lands (hook c): a cell would share the "
-        "uid of the oneclient that holds the mount's token"
+        "this sandbox refuses a mount data path at its start: it is given no mount helper (`mount_helper=`, hook c, "
+        "`host_mount_factory()`) or the platform declares no `[sandbox.mount]`; listed only for a run whose sandbox "
+        "refuses one, so a mount run never carries it. The helper accepts proxy I/O only, and refuses a direct "
+        "mount: HPC mounts are proxy-only until the direct-I/O comparison passes"
     ),
 }
 
 
-def record() -> dict[str, Any]:
-    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up."""
-    return {"backend": "apptainer", "facts": sorted(FACTS)}
+DNS = "none"  # what a cell's name lookups reach (dns_none)
+
+
+def record(*, mount_refused: bool) -> dict[str, Any]:
+    """The run's `infrastructure_facts`: every key, sorted, for a reader to look up, and its name service.
+    `mount_refused` is listed only when the run's sandbox refuses a mount data path (the module's docstring). The
+    sandbox's metadata adds the watch's memory reading (`memory`) once it exists."""
+    keys = sorted(key for key in FACTS if mount_refused or key != "mount_refused")
+    return {"backend": "apptainer", "facts": keys, "dns": DNS}
 
 
 __all__ = ["FACTS", "record"]

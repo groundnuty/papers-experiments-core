@@ -129,6 +129,11 @@ shares, on a port above 1023. Two pieces, neither run live yet:
   -fno-stack-protector -Wall -Wextra -Werror -o gateport.so gateport.c -ldl`, in the cell's image. The bundle hashes
   tarballs (`.provenance`), not shims: whoever loads the built shim into a cell pins it by the hash of the file it
   built. No IPv6 destination is rewritten, `[::1]:443` included: the core's gate listens on 127.0.0.1 only, and a rewrite to `[::1]:<gate port>` could reach another user's listener (see the header of the file).
+- **An image without gcc** (a slim Python image has none): build both shims, `egresslog.so` and `gateport.so`, with
+  the node's gcc and the same flags. The built library loads in the cell only when the node's glibc is no newer than
+  the image's (older, on the nodes the probes ran on), so every symbol version it needs is in the image's. A node whose glibc is newer than the image's makes
+  a library the cell's loader refuses: build it in a container of the image's own release then. Either way, pin the
+  file you built.
 
 `tests/deploy/test_hpc_gate_port_shim.py` builds the shim with the host's gcc and drives it with a Python client
 against listeners of its own, a stand-in for the next `connect()` (`tests/fake_next_connect.c`) and the egress shim;
@@ -237,7 +242,8 @@ says where `hpcfed.py up` calls each step, and `site.env.example` names the two 
 - **Declared** in the layout: `import = { readonly = true, shared = true, source_env, manifest_env }` on the space, and
   `direct_io = true` if the agent's mount reads the storage directly (a mode of the mount, which reads the storage of the
   agent's own provider, so only on a space that provider owns; the sandbox node must see the same directory, and the
-  run's record shows the mode in effect). The path and the manifest's file are the variables'
+  run's record shows the mode in effect; HPC mounts are proxy-only until the direct-I/O comparison passes, since the
+  Apptainer backend's mount helper refuses a direct mount). The path and the manifest's file are the variables'
   values in `site.env`, never the layout's. The owner of the space is the one provider that mounts the tree; its mirrors
   keep node-local storage.
 - **Checked on the node** (`bundle/importstorage.py`, called by `configure.sh` and at every start): `--import=SPACE=PATH`
