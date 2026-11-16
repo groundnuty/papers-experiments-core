@@ -1,0 +1,80 @@
+# The pilot's shape on HPC batch nodes, every name invented: a zone, five providers, four data spaces each owned by one
+# provider and mirrored by another, and the link check's probe space on all five. The platform template beside it
+# declares the four data spaces, so the link check covers ten ordered provider pairs, as the pilot's does.
+#
+#   set -a; . deploy/hpc-federation/site.env; set +a
+#   uv run python deploy/hpc-federation/hpcfed.py --layout deploy/hpc-federation/layouts/pilot-shape.toml \
+#     --root <a directory on a filesystem the login node and the nodes see> up
+#
+# The ports and memory limits are the Compose federation's and unused here: on HPC every service listens on its node's
+# 8443 (and a provider on 6665), and the [hpc] table sizes the steps. The same file brings the federation up under
+# Compose (deploy/compose-federation/federation.py --layout), which ignores [hpc].
+
+project = "expcore-hpc-pilot"
+domain = "expcore-hpc-pilot.test"
+study_space = "alpha-space"
+memory_limit = "6g"
+platform_template = "pilot-shape.platform.toml.template"
+probe_space = "link-probes"
+
+[hpc]
+time = "02:00:00"                        # the held job's --time: bring it down well before
+stop_seconds = 600                       # a service's graceful stop bound; settle_timeout_s is derived from it
+core = "login"                           # where the bootstrap and the link check run: "login", or "step" (DESIGN.md 9)
+zone = { cpus = 4, memory = "8g" }       # live peaks: about 4.0 GB of RSS and the 1.9 GB rootfs on tmpfs
+provider = { cpus = 4, memory = "10g" }  # about 4.8 GB of RSS, the 2.5 GB rootfs and the posix storage on tmpfs
+control = { cpus = 1, memory = "1g" }    # every node's reserve for control steps (a token's delivery peaked at 180 MB)
+
+[zone]
+port = 29743
+
+[providers.aspen]                        # the agent's local provider: it supports every data space
+port = 29744
+
+[providers.larch]
+port = 29745
+
+[providers.rowan]
+port = 29746
+
+[providers.alder]
+port = 29747
+
+[providers.hazel]
+port = 29748
+
+[spaces.alpha-space]                     # the study space: owned by larch, mirrored by aspen and rowan
+owner = "larch"
+mirrors = ["aspen", "rowan"]
+
+[spaces.beta-space]
+owner = "rowan"
+mirrors = ["aspen"]
+
+[spaces.gamma-space]
+owner = "alder"
+mirrors = ["aspen"]
+
+[spaces.delta-space]                     # stands for the pilot's largest space, 15,340 files; up writes none into it
+owner = "hazel"                          # (its synthetic tree of that count is M3's, on an imported storage)
+mirrors = ["aspen"]
+baseline = false
+
+[spaces.link-probes]                     # the link check's probes: no agent user is a member, up writes nothing
+owner = "aspen"
+mirrors = ["larch", "rowan", "alder", "hazel"]
+agent_visible = false
+baseline = false
+support_bytes = 1073741824
+
+[principals.alpha-reader]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+[principals.alpha-tools]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
+
+[principals.alpha-health]
+privileges = ["space_view", "space_read_data"]
+spaces = ["alpha-space", "beta-space", "gamma-space", "delta-space"]
