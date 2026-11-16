@@ -18,8 +18,10 @@ adds one). The start's own cells (the egress canary and the read-only probe, the
 harness's code) calibrate it: one that grew past the margin means this node's own share is too large to tell an agent's
 from, and the run's memory reading is then unknown (`margin_exceeded_at_start`), never a kill.
 
-A growth past the margin for `HIDDEN_CONFIRM` polls in a row (so a process that ends or allocates between the two
-readings never makes one) is the running cell's when no other cell's namespace is in the cgroup. Memory the watch
+A poll whose growth passes the margin lists `/proc` again after the cgroup's second reading and counts each visible
+process at the larger of its two readings, so a process that freed memory just as it was read and took it again
+before the cgroup was must do so around both readings to look hidden. A growth that passes so for `HIDDEN_CONFIRM`
+polls in a row is the running cell's when no other cell's namespace is in the cgroup. Memory the watch
 cannot see is taken as past the limit, as a directory the disk walk cannot read is taken as past its size: the watch
 kills the run's processes as `memory_limit`, of `memory_hidden` (`watch.Watch`), once per cell. With another run's
 cell in the cgroup it cannot be told whose it is, and the reading is unknown (`unattributed`).
@@ -34,7 +36,9 @@ What neither sees: a hidden process's shared memory (a memfd, a shared anonymous
 the margin; and a spike shorter than two polls. The step's own limit bounds them, and the end of the cell's PID
 namespace when its exec returns ends every hidden process (`facts.py`).
 
-The run's reading is `over` when the watch killed it for memory, `unknown` with every reason that held, or `within`.
+The run's reading is `over` when a kill of the watch's for memory reached a process, `unknown` with every reason that
+held (a kill that reached none among them), or `within`. A cell killed for hidden memory counts as one whatever its
+kill reached.
 Not thread-safe: the watch calls it under its lock, and makes the node's reads outside it.
 """
 
@@ -130,21 +134,49 @@ class HiddenCheck:
         if self._cell is not None:
             self._cell_reasons.add(PROC_UNREADABLE)
 
+    def _visible(self, listings: Sequence[Sequence[P.Proc]]) -> tuple[int, set[str]]:
+        """The RssAnon of every process of the uid the listings show in the cgroup, each at the larger of its readings,
+        and the PID namespaces of the cells among them."""
+        held: dict[tuple[int, str], int] = {}
+        cells: set[str] = set()
+        for found in listings:
+            for proc in found:
+                if not P.in_cgroup(proc.cgroup, str(self.cgroup)):
+                    continue
+                key = (proc.pid, proc.start)
+                held[key] = max(held.get(key, 0), proc.anon or 0)
+                if proc.pidns is not None and proc.pidns != self._own:
+                    cells.add(proc.pidns)
+        return sum(held.values()), cells
+
+    def suspect(self, found: Sequence[P.Proc], before: int | None, after: int | None, run_namespaces: set[str]) -> bool:
+        """Whether the poll's one listing leaves the running cell's growth past its allowance. The watch then lists
+        `/proc` again, after the cgroup's second reading, for `assess`: a visible process that freed memory just as it
+        was read and took it again before the cgroup was must have done so twice, around both readings, to count."""
+        if self._cell is None or self.cgroup is None or before is None or after is None:
+            return False
+        visible, cells = self._visible([found])
+        grown = min(before, after) - visible - self._baseline
+        return grown > self.margin * (1 + len(cells - run_namespaces))
+
     def assess(
-        self, found: Sequence[P.Proc], before: int | None, after: int | None, run_namespaces: set[str]
+        self,
+        listings: Sequence[Sequence[P.Proc]],
+        before: int | None,
+        after: int | None,
+        run_namespaces: set[str],
     ) -> Hidden | None:
-        """One poll's cgroup reading against what the listing `found` shows: the growth to kill the running cell for,
-        or None."""
+        """One poll's cgroup readings against what the listings show (`listings`: the poll's own, and the one taken
+        after the cgroup's second reading when the first was `suspect`): the growth to kill the running cell for, or
+        None."""
         if self.cgroup is None or before is None or after is None:
             self._streak = 0
             if self._cell is not None:
                 self.cgroup_unreadable_polls += 1
                 self._cell_reasons.add(CGROUP_UNREADABLE)
             return None
-        inside = [p for p in found if P.in_cgroup(p.cgroup, self.cgroup)]
-        charged, visible = min(before, after), sum(p.anon or 0 for p in inside)
+        charged, (visible, cells) = min(before, after), self._visible(listings)
         unexplained = charged - visible
-        cells = {p.pidns for p in inside if p.pidns is not None and p.pidns != self._own}
         if self._cell is None:
             if not cells:  # another run's cell, hidden memory and all, is never this run's baseline
                 self._idle = unexplained
@@ -175,13 +207,19 @@ class HiddenCheck:
         return Hidden(grown, allowance, charged, visible)
 
     def killed(self, signalled: int) -> None:
-        """The watch's kill for a growth `assess` gave: a kill that reached no process leaves the memory unknown."""
+        """The watch's kill for a growth `assess` gave: the cell held hidden memory whatever the kill reached, and a
+        kill that reached no process leaves its memory unknown (it may be tried again at the next poll)."""
         if self._cell is None:
             return
+        self._hidden_memory_cells.add(self._cell)
         if signalled > 0:
             self._acted = True
-            self._hidden_memory_cells.add(self._cell)
         else:
+            self._cell_reasons.add(KILL_REACHED_NONE)
+
+    def unreached(self) -> None:
+        """A kill of the watch's for visible memory that signalled no process: the cell's memory is unknown."""
+        if self._cell is not None:
             self._cell_reasons.add(KILL_REACHED_NONE)
 
     def note_children(self, hidden: set[int], unreadable: bool) -> None:

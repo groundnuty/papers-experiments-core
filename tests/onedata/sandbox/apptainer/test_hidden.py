@@ -2,10 +2,14 @@
 visible processes', and a child of a cell process that `/proc` does not show (the HPC probes of 16 Nov 2026: a
 non-dumpable process held 768 MiB while the watch saw 12.7 MB, and the step's cgroup counted a hidden 512 MiB)."""
 
+import dataclasses
+from types import SimpleNamespace
+
 import pytest
 from fake_node import CGROUP, OWN_NS, FakeNode
 
-from expcore.visibility.instrument import readable
+from expcore.visibility import judge
+from expcore.visibility.instrument import readable, snapshot
 from expcore_onedata.sandbox.apptainer.hidden import HIDDEN_CONFIRM
 from expcore_onedata.sandbox.apptainer.watch import Space, Watch
 
@@ -323,3 +327,60 @@ def test_o56_every_reading_is_one_the_core_s_instrument_reads(node, tmp_path):
     assert (seen["memory"], seen["hidden_memory"], seen["hidden_process"]) == ("over", 1, 1)
     node.cgroup_path = None
     assert readable(_watch(node, tmp_path).visibility())["memory"] == "unknown"
+
+
+def test_o56_a_worker_that_frees_and_takes_its_memory_again_around_a_read_is_no_kill(node, tmp_path):
+    """O56: a visible worker read just as it freed 512 MiB, and charged again by both cgroup readings, looks hidden
+    to one listing; the second listing, after the cgroup's second reading, counts it at its larger reading, so a
+    normal run that churns its memory is never killed for hidden memory."""
+    watch = _watch(node, tmp_path)
+    watch.poll()
+    watch.begin_cell(1, "n")
+    _ns, top, agent = _cell(node, rss=512 * MIB)
+    listed, real = [0], node.processes
+
+    def churning(tags=()):
+        listed[0] += 1
+        found = real(tags)
+        if listed[0] % 2:  # each poll's own listing caught the worker between a free and its next allocation
+            found = [dataclasses.replace(p, rss=0, anon=0) if p.pid == agent.pid else p for p in found]
+        return found
+
+    node.processes = churning
+    _polls(watch, 6)
+    assert top.alive
+    assert agent.alive
+    found = watch.end_cell()
+    assert found["kills"] == []
+    assert found["memory"]["reading"] == "within"
+
+
+def test_o56_a_hidden_memory_kill_that_signals_no_process_is_unknown_and_flagged_never_clean(node, tmp_path):
+    """O56: the cell's visible processes ended before the watch's signal: nothing was bounded, so the reading is
+    unknown, never `over`, and the cell still counts as one that held hidden memory: the run is flagged."""
+    watch = _watch(node, tmp_path)
+    watch.poll()
+    watch.begin_cell(1, "n")
+    ns, _top, _agent = _cell(node)
+    node._new_proc(ns, "python3", hidden=True, anon=768 * MIB)
+    node.signal = lambda pid, start, sig: False  # each one gone by the time it is signalled
+    _polls(watch, 3)
+    found = watch.end_cell()
+    assert found["kills"][0]["signalled"] == 0
+    assert (found["memory"]["reading"], found["memory"]["unknown"]) == ("unknown", ["kill_reached_none"])
+    seen = snapshot(watch.visibility())
+    assert (seen["memory"], seen["hidden_memory"]) == ("unknown", 1)
+    record = SimpleNamespace(run_key="k", attempt=1, instruments={"process_visibility": seen})
+    assert judge(record, "cond-a").verdict == "flagged"
+
+
+def test_o56_a_visible_memory_kill_that_signals_no_process_is_unknown_never_over(node, tmp_path):
+    watch = _watch(node, tmp_path, limit=64 * MIB)
+    watch.poll()
+    watch.begin_cell(1, "n")
+    _cell(node, rss=200 * MIB)
+    node.signal = lambda pid, start, sig: False
+    watch.poll()
+    found = watch.end_cell()
+    assert found["kills"][0]["signalled"] == 0
+    assert (found["memory"]["reading"], found["memory"]["unknown"]) == ("unknown", ["kill_reached_none"])

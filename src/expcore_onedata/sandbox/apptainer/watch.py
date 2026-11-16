@@ -143,7 +143,7 @@ class Watch:
         """The cell has ended: whether its namespace was found, its peak, the watch's kills during it, and its memory
         reading (`hidden.HiddenCheck.end_cell`)."""
         with self._lock:
-            killed = any(k["reason"] == "memory_limit" for k in self._cell_kills)
+            killed = _killed_for_memory(self._cell_kills)
             found = {"seen": self._seen, "peak_bytes": self._cell_peak, "kills": list(self._cell_kills),
                      "memory": self._hidden.end_cell(killed)}  # fmt: skip
             self._cell = self._nonce = None
@@ -200,7 +200,9 @@ class Watch:
             if self._cell is not None:
                 self._cell_peak = max(self._cell_peak, total)
         if members and total > self._limit:
-            self._kill(members, "memory_limit", "memory", total, self._limit)
+            if self._kill(members, "memory_limit", "memory", total, self._limit) == 0:
+                with self._lock:  # nothing was signalled: never a reading of `over`
+                    self._hidden.unreached()
             return
         self._check_hidden(found, members, before, after)
         if self._clock() >= self._next_walk:
@@ -208,9 +210,22 @@ class Watch:
 
     def _check_hidden(self, found: list[Proc], members: list[Proc], before: int | None, after: int | None) -> None:
         """The cgroup's memory against the visible processes', and the cell's children against `/proc`: a growth past
-        the margin that is the running cell's kills it (`memory_hidden`); the rest goes into the memory reading."""
+        the margin that is the running cell's kills it (`memory_hidden`); the rest goes into the memory reading. A poll
+        whose own listing leaves a growth past the margin lists `/proc` again, after the cgroup's second reading, and
+        is judged on both (`hidden.HiddenCheck.suspect`)."""
         with self._lock:
-            hidden = self._hidden.assess(found, before, after, set(self._ns))
+            namespaces = set(self._ns)
+            suspect = self._hidden.suspect(found, before, after, namespaces)
+        listings: list[list[Proc]] | None = [found]
+        if suspect:
+            again = self._node.processes(())
+            listings = None if again is None else [found, again]
+        with self._lock:
+            if listings is None:
+                self._hidden.unreadable_poll()
+                hidden = None
+            else:
+                hidden = self._hidden.assess(listings, before, after, namespaces)
             running = self._hidden.running
         if hidden is not None:
             sent = self._kill(members, "memory_limit", "memory_hidden", hidden.grown_bytes, hidden.allowance_bytes,
@@ -311,19 +326,21 @@ class Watch:
                 "memory": self.reading(),
             }
 
-    def _killed_for_memory(self) -> bool:
-        return any(k["reason"] == "memory_limit" for k in self.kills)
-
     def reading(self) -> dict[str, Any]:
-        """The run's memory reading with its figures (`hidden.HiddenCheck.reading`): `over` once the watch killed it
-        for memory, `unknown` with its reasons, never `within` without the check having held."""
+        """The run's memory reading with its figures (`hidden.HiddenCheck.reading`): `over` once a kill of the watch's
+        for memory reached a process, `unknown` with its reasons, never `within` without the check having held."""
         with self._lock:
-            return self._hidden.reading(self._killed_for_memory())
+            return self._hidden.reading(_killed_for_memory(self.kills))
 
     def visibility(self) -> dict[str, Any]:
         """The reading the core's `process_visibility` instrument takes (`expcore.visibility`)."""
         with self._lock:
-            return self._hidden.visibility(self._killed_for_memory())
+            return self._hidden.visibility(_killed_for_memory(self.kills))
+
+
+def _killed_for_memory(kills: list[dict[str, Any]]) -> bool:
+    """Whether a kill of the watch's for memory reached a process: one that signalled none bounded nothing."""
+    return any(k["reason"] == "memory_limit" and k["signalled"] > 0 for k in kills)
 
 
 def _figures(hidden: Hidden) -> dict[str, int]:

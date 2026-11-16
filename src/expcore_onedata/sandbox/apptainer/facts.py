@@ -44,8 +44,9 @@ FACTS: dict[str, str] = {
     "hidden_memory": (
         "a process /proc hides is checked from outside: at every poll the watch compares the anonymous memory of the "
         "driver's own cgroup (memory.stat anon, which counts a hidden process) with the RssAnon of every process of "
-        "the uid /proc shows in it, and memory nothing visible explains that grew past hidden_memory_margin_bytes "
-        "during a cell for two polls kills the cell as memory_limit (memory_hidden); one that cannot be told the "
+        "the uid /proc shows in it (each at the larger of two readings around the cgroup's), and memory nothing "
+        "visible explains that grew past hidden_memory_margin_bytes during a cell for two polls kills the cell as "
+        "memory_limit (memory_hidden); one that cannot be told the "
         "cell's (another run's cell in the cgroup, or a margin the start's own cells passed) makes the run's memory "
         "reading unknown, never within, as do a child of a cell process that /proc does not show (hidden_process, "
         "which a process that forks twice under the cell's hidden init escapes) and a reading that failed; hidden "
