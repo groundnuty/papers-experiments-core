@@ -807,6 +807,8 @@ class ApptainerSandbox:
         finally:
             try:
                 runs.remove_tree(home)
+                if self._stopped:  # a stop that completed left no run directory: one there now is the server's
+                    runs.remove_tree(self.dir)  # making its home again after the teardown, which no reaper would take
             except OSError as error:  # the teardown removes the run's directory, this one with it
                 log.error("the tool server's directory could not be removed: %s", describe_error(error))
 

@@ -235,8 +235,16 @@ def test_o56_a_run_kept_as_evidence_while_its_tool_server_runs_keeps_no_file_of_
         kept = settings.work_root / KEPT / box.sid
         assert kept.is_dir()
         assert not (kept / "toolserver").exists()
+        (process.home / ".cache").mkdir(parents=True)  # the server, still running, makes its home again
     assert not (kept / "toolserver").exists()
-    assert not os.path.lexists(box.dir)
+    assert not os.path.lexists(box.dir)  # nothing a probe would take for the run's directory is left
+    assert stage_probe_gone(settings, box)
+
+
+def stage_probe_gone(settings, box) -> bool:
+    from expcore_onedata.sandbox.apptainer.runs import ApptainerProbe
+
+    return ApptainerProbe(box.node, settings.work_root).resource_gone(box.spec.lease_key or "run-key-1", {})
 
 
 def test_o56_the_tool_servers_home_holds_its_temporary_files_too(stage):

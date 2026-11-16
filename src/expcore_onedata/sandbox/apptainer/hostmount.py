@@ -45,6 +45,7 @@ passed), a platform that declares no bundle, and a bundle that is not the pinned
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 import shutil
@@ -81,6 +82,8 @@ from expcore_onedata.sandbox.oneclient_args import (
     mount_problem,
     short_letters,
 )
+
+log = logging.getLogger(__name__)
 
 MOUNT_WAIT_S = 60.0
 ARMED_WAIT_S = 30.0
@@ -436,7 +439,11 @@ class HostMount:
         if self.oneclient is not None:  # its last state of the run, before the stop's own unmount and signals
             with self._lock:
                 if "mount" not in self._before:
-                    self._before["mount"] = self._mount_state()
+                    try:
+                        self._before["mount"] = self._mount_state()
+                    except Exception as error:  # unknown, never clean: and the stop's steps run all the same
+                        self._before["mount"] = {"running": None, "exit_status": None, "mount": "unread"}
+                        log.error("oneclient's state before the stop could not be read: %s", describe_error(error))
         errors: list[str] = []
         for what, step in (("watch", self.close_watch), ("unmount", self._unmount_once),
                            ("oneclient", self._stop_oneclient), ("mount", self._mount_gone),
