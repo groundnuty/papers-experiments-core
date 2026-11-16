@@ -38,16 +38,16 @@ the federation shared together). No clock is read for the order. The lock is a l
 (`admission`). The lock file is opened for writing (created when it is not there) and its owner makes it 0644:
 NFS implements `flock` as a POSIX lock, which needs a descriptor open for writing to be exclusive, so a read-only
 descriptor fails there with EBADF and no check would ever be serialized on an NFS root (found live, on an HPC
-federation's NFSv4 root). A file this process cannot write (another user's 0644 file, a read-only mount: EACCES or
-EROFS) is opened read-only instead, which is enough on a local filesystem, where `flock` needs no write permission, so
-every process that can write the directory can take part there. A lock that still cannot be taken is no reason to skip
-the check: `recording` yields False, and a caller that cannot serialize publishes no verdict (`fault_serves.recorded`
-removes the older record instead), so an unordered write never leaves an old pass standing; `up`, which alone runs
-while nothing else does, writes and says so. The residuals: a lock file that something other than `recording` made
-unreadable to a process (not 0644, another user's), and, where `flock` needs a write descriptor (NFS), one that this
-process cannot write, while a process that holds it is mid-write. The first runs unserialized, publishes nothing and
-removes the older record, which the second can still replace with its older pass. No lock the first cannot take orders
-it; the file's mode, or its owner, is the operator's to fix.
+federation's NFSv4 root). A file this process cannot write (another user's 0644 file, a read-only mount, an immutable
+file: EACCES, EROFS or EPERM) is opened read-only instead, which is enough on a local filesystem, where `flock` needs
+no write permission, so every process that can write the directory can take part there. A lock that still cannot be
+taken is no reason to skip the check: `recording` yields False, and a caller that cannot serialize publishes no
+verdict (`fault_serves.recorded` removes the older record instead), so an unordered write never leaves an old pass
+standing; `up`, which alone runs while nothing else does, writes and says so. The residuals: a lock file that
+something other than `recording` made unreadable to a process (not 0644, another user's), and, where `flock` needs a
+write descriptor (NFS), one that this process cannot write, while a process that holds it is mid-write. The first runs
+unserialized, publishes nothing and removes the older record, which the second can still replace with its older pass.
+No lock the first cannot take orders it; the file's mode, or its owner, is the operator's to fix.
 
 **An older verdict never stands.** `discard_record` removes the record, or, when the directory refuses that, empties it
 in place (which needs only the file's own write permission) and dates it to the epoch, so that no reader takes it, by
@@ -157,13 +157,13 @@ def _empty(path: Path) -> None:
 
 def _open_lock(lock: Path) -> int:
     """Open the lock file, creating it when it is not there: for writing, which an exclusive `flock` needs on NFS, and,
-    when the file is one this process cannot write (EACCES, EROFS), read-only, which suffices on a local filesystem.
-    Any other failure to open it raises, and a read-only descriptor that the filesystem will not lock exclusively is
-    refused by the `flock` that follows."""
+    when the file is one this process cannot write (EACCES, EROFS, EPERM), read-only, which suffices on a local
+    filesystem. Any other failure to open it raises, and a read-only descriptor that the filesystem will not lock
+    exclusively is refused by the `flock` that follows."""
     try:
         return os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
     except OSError as error:
-        if error.errno not in (errno.EACCES, errno.EROFS):
+        if error.errno not in (errno.EACCES, errno.EROFS, errno.EPERM):  # EPERM: an immutable or append-only file
             raise
     return os.open(lock, os.O_RDONLY | os.O_CREAT, 0o666)
 
@@ -174,7 +174,7 @@ def recording(path: Path) -> Iterator[bool]:
     check and the writing of its record; yield whether it is held. False means the lock file could not be opened or
     locked, and the caller must not publish a verdict that is not ordered. The file is opened for writing (created when
     it is not there), because an exclusive `flock` needs a write descriptor on NFS; one this process cannot write
-    (EACCES, EROFS) is opened read-only, which a local filesystem locks all the same, and which NFS refuses, so that
+    (EACCES, EROFS, EPERM) is opened read-only, which a local filesystem locks all the same and NFS refuses, so that
     case is False there. Its owner makes it readable to all (0644, whatever the umask), so that a process of another
     user can take part through that read-only open. A lock file made some other way and unreadable to this process
     leaves it unserialized (the module's residual). The lock is let go when the block ends, and by the kernel with a

@@ -107,15 +107,15 @@ def _no_message_holds_a_configured_value(monkeypatch, tmp_path):
 @pytest.fixture
 def refuse_lock_writes(monkeypatch) -> Callable[[int], list[int]]:
     """Make the link-check record's lock file one this process cannot open for writing, whatever its user is (a mode
-    change would not stop a root): `refuse(code)` makes every writing open of it fail with `code` (EACCES, EROFS) and
-    returns the list of access modes (`os.O_RDONLY`, `os.O_RDWR`) the code tries, in order."""
+    change would not stop a root): `refuse(code)` makes every writing open of it fail with `code` (EACCES, EROFS,
+    EPERM) and returns the list of access modes (`os.O_RDONLY`, `os.O_RDWR`) the code tries, in order."""
     real = os.open
 
     def refuse(code: int) -> list[int]:
         tried: list[int] = []
 
         def opening(path, flags, *args, **kwargs):
-            if Path(path).name == LOCK:
+            if Path(os.fsdecode(path)).name == LOCK:
                 access = flags & os.O_ACCMODE
                 tried.append(access)
                 if access != os.O_RDONLY:

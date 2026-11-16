@@ -276,8 +276,8 @@ def test_o35_a_check_that_starts_while_another_is_under_way_waits_for_it(tmp_pat
 
 
 def test_o35_a_lock_file_another_user_made_read_only_is_still_taken(tmp_path):
-    """O35: `flock` needs no write permission, so the lock file is opened read-only: a lock file that only its owner can
-    write (0644, or here 0444) is taken by every process that can read it, and is not skipped."""
+    """O35: `flock` needs no write permission on a local filesystem, so a lock file that only its owner can write (0644,
+    or here 0444) is opened read-only by a process that cannot write it, and taken by every process that can read it."""
     lock = tmp_path / LOCK
     lock.write_bytes(b"")
     lock.chmod(0o444)
@@ -320,12 +320,13 @@ def test_o35_the_lock_is_taken_where_an_exclusive_flock_needs_a_write_descriptor
     assert (tmp_path / LOCK).stat().st_mode & 0o777 == 0o644
 
 
-@pytest.mark.parametrize("code", [errno.EACCES, errno.EROFS])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EROFS, errno.EPERM])
 def test_o35_a_lock_file_that_cannot_be_written_is_opened_read_only_and_taken_where_flock_allows_it(
     tmp_path, refuse_lock_writes, code
 ):
-    """O35: a lock file this process may read but not write (another user's 0644 file, a read-only mount) is opened
-    read-only after the write is refused, and locked: on a local filesystem `flock` needs no write permission."""
+    """O35: a lock file this process may read but not write (another user's 0644 file, a read-only mount, an immutable
+    file) is opened read-only after the write is refused, and locked: on a local filesystem `flock` needs no write
+    permission."""
     (tmp_path / LOCK).write_bytes(b"")
     tried = refuse_lock_writes(code)
     with recording(tmp_path / RECORD) as held:
@@ -333,7 +334,7 @@ def test_o35_a_lock_file_that_cannot_be_written_is_opened_read_only_and_taken_wh
     assert tried == [os.O_RDWR, os.O_RDONLY]
 
 
-@pytest.mark.parametrize("code", [errno.EACCES, errno.EROFS])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EROFS, errno.EPERM])
 def test_o35_a_lock_file_that_cannot_be_written_is_not_taken_where_flock_needs_a_write_descriptor(
     tmp_path, nfs_flock_rule, refuse_lock_writes, code
 ):
@@ -350,8 +351,8 @@ def test_o35_a_lock_file_that_cannot_be_written_is_not_taken_where_flock_needs_a
 def test_o35_a_failure_to_open_the_lock_that_is_no_refusal_to_write_is_not_tried_read_only(
     tmp_path, refuse_lock_writes, code
 ):
-    """O35: only a refusal to write (EACCES, EROFS) sends the lock to a read-only open; any other failure to open the
-    lock file is a lock that cannot be taken, said by a False."""
+    """O35: only a refusal to write (EACCES, EROFS, EPERM) sends the lock to a read-only open; any other failure to
+    open the lock file is a lock that cannot be taken, said by a False."""
     tried = refuse_lock_writes(code)
     with recording(tmp_path / RECORD) as held:
         assert held is False
