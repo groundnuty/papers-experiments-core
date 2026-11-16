@@ -104,7 +104,8 @@ RECORD_PREFIX_BYTES = 4096
 UNEXPECTED_STAGE = "unexpected"  # the stage of a check failure for a file of the batch that nothing accounts for
 UNEXPECTED = (
     "neither a run record (the core writes one only as <SHA-256 of the run key>.<attempt>.json) nor a file the check "
-    "hashes (an outcome marker, the campaign's snapshot, a declared side file): evidence nothing vouches for. Declare "
+    "hashes (an outcome marker, the campaign's snapshot, a declared side file), or no regular file at all (a link to a "
+    "directory, a dangling link, a FIFO): evidence nothing vouches for. Declare "
     "a file the analysis reads as a side file ([[study.side_files]] in study.toml, its SHA-256 named in the record), "
     "or keep it out of the batch"
 )
@@ -226,14 +227,20 @@ def batch_files(batch: Path, hashed_only: Sequence[str] = ()) -> BatchFiles:
     A hashed-only pattern is matched first, so that a record a pattern names is found and refused
     (`HashedOnlyRecord`); then a file is a record only when it is named as one (`is_record_name`). The check file at
     the top of the batch and the temporary files an interrupted write leaves (names starting with a dot) are none of
-    the three: the check never reads them.
+    the three: the check never reads them. A link to a directory is unexpected whatever its name, since the walk does
+    not enter it and a copy of the batch (the merge's) would follow it; so is any other entry that is neither a
+    directory nor a regular file (a dangling link, a FIFO, a socket), which is never opened.
     """
     records, hashed, unexpected = [], [], []
     for path in batch.rglob("*"):
         rel = path.relative_to(batch).as_posix()
-        if not path.is_file() or rel == CHECK_FILE or path.name.startswith("."):
+        if path.is_symlink() and path.is_dir():
+            unexpected.append(rel)
+        elif rel == CHECK_FILE or path.name.startswith(".") or path.is_dir():
             continue
-        if any(fnmatch.fnmatchcase(rel, pattern) for pattern in hashed_only):
+        elif not path.is_file():
+            unexpected.append(rel)
+        elif any(fnmatch.fnmatchcase(rel, pattern) for pattern in hashed_only):
             hashed.append(rel)
         elif is_record_name(path.name):
             records.append(rel)

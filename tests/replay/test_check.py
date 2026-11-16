@@ -3,6 +3,7 @@
 import dataclasses
 import hashlib
 import json
+import os
 import tarfile
 from pathlib import Path
 
@@ -408,6 +409,31 @@ def test_R04_an_unexpected_file_added_after_a_passing_check_is_refused_by_the_an
         assert not (tmp_path / "records.tar.gz").exists()
         stray.unlink()
     assert require_current_check(checked, code=CODE)
+
+
+def test_R04_a_link_to_a_directory_and_any_entry_that_is_no_regular_file_are_unexpected_whatever_their_names(
+    batch, tmp_path
+):
+    """R04: the walk does not enter a link to a directory, and a copy of the batch (the merge's) would follow it, so
+    the link itself is unexpected, a dot-name included; so is a dangling link or a FIFO, which is never opened. Each
+    fails the check, and one added after a passing check is refused."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sandbox.json").write_text("{}", encoding="utf-8")
+    write_check(batch, verify_batch(batch, code=CODE))
+    entries = {
+        "shard-2/evidence": lambda path: path.symlink_to(outside, target_is_directory=True),
+        "shard-2/.evidence": lambda path: path.symlink_to(outside, target_is_directory=True),
+        "shard-2/gone.json": lambda path: path.symlink_to(tmp_path / "nothing-here"),
+        "shard-2/pipe": os.mkfifo,
+    }
+    for rel, make in entries.items():
+        make(batch / rel)
+        assert batch_files(batch).unexpected == [rel]
+        refused(batch, f"unexpected file.*{rel}")
+        assert unexpected_of(verify_batch(batch, code=CODE)) == [rel]
+        (batch / rel).unlink()
+    assert require_current_check(batch, code=CODE)
 
 
 def test_R04_the_check_file_hidden_files_and_hashed_only_files_are_not_unexpected(batch):
