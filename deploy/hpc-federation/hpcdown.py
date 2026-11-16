@@ -256,6 +256,11 @@ class Down:
         kind there. A check that fails, or prints anything but such a count, is no proof."""
         state = self.store.read()
         record, site = state["services"][service], Site.from_json(state["site"])
+        log = Path(record["log"]) if record.get("log") else None
+        if log is None or not log.is_file() or WORKDIR_LINE.search(log.read_text(encoding="utf-8", errors="replace")):
+            # its log is gone, or it named a directory the driver refused (outside the tmpfs, say): never shown clean
+            self.say(f"{service}: its log cannot show that its step never made a work directory")
+            return False
         name = record["step"]["name"]
         client = state.get("clients", {}).get(name)
         seen = record["step"].get("id") is not None

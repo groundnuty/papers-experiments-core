@@ -385,6 +385,31 @@ def test_a_nodes_check_that_fails_is_no_proof_that_it_is_clean(hpc, tmp_path, si
     assert rig.root.exists()
 
 
+def test_a_zone_whose_log_names_a_directory_the_driver_refused_is_never_shown_clean(hpc, tmp_path, site):
+    """O57: a zone whose log named a work directory the driver refused (not on the node's tmpfs) left that directory
+    where the node's check does not look: its step ended all the same, it stays unverified and the root is kept."""
+    fake = zone_died_in_node_init(FakeSlurm())
+    real = fake.spawn
+
+    def elsewhere(argv, client_log):
+        client = real(argv, client_log)
+        srun = fake.sruns[-1]
+        if srun.name.endswith("-zone-run-1"):
+            Path(srun.output).write_text("hpcop: work directory /scratch/hpcop-oz.abcdef\nhpcop: ERROR: x\n", "utf-8")
+        return client
+
+    fake.spawn = elsewhere
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    rig.fake.sruns.clear()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert leftover_checks(rig.fake) == []
+    assert rig.fake.cancelled == ["4242"]
+    assert rig.root.exists()
+
+
 def test_a_step_still_listed_is_cancelled_by_its_id_and_its_node_checked_once_it_left(hpc, tmp_path, site):
     """O57: a zone step still listed whose log names no work directory is cancelled by its own id, recorded as seen;
     once every step has left, its node's check counts none and the root goes."""
