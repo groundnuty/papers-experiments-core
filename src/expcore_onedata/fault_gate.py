@@ -91,6 +91,7 @@ from expcore.campaign.healthgate import DeferralBound, Health, HealthCheck, read
 from expcore.errors import TARGET_LABEL, InfraError
 from expcore_onedata.admission import (
     EXCLUSIVE_RUN,
+    INGEST,
     INJECTOR,
     OUTAGE_RUN,
     RECOVERY,
@@ -120,6 +121,7 @@ _PURPOSES = {
     EXCLUSIVE_RUN: "an exclusive run",
     INJECTOR: "an injector",
     RECOVERY: "the recovery of the health check",
+    INGEST: "an ingest",
 }
 log = logging.getLogger(__name__)
 _STAMP = re.compile(r"[0-9T:+.-]{10,40}")

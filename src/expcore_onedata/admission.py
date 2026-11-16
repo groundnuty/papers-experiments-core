@@ -162,6 +162,7 @@ FEDERATION_LOCK = "federation.lock"
 FEDERATION_INTENT = "federation.intent"  # the turnstile every admission passes before the main lock
 OUTAGE_RUN, INJECTOR, RECOVERY = "outage_run", "injector", "recovery"  # why the federation is held exclusively
 EXCLUSIVE_RUN = "exclusive_run"  # a run whose condition declares `exclusive = true`: a matched control, no fault
+INGEST = "ingest"  # a manifest ingested into a space as its sole writer (`bulkingest`, O67)
 TOOL_SERVER_STEP, SANDBOX_STEP = "tool_server", "sandbox"  # the run's steps that use its tokens (`token_step`)
 _ADMISSION: ContextVar["Admission | None"] = ContextVar("expcore_onedata_admission", default=None)
 # locks kept for the life of the process: a drain that could be neither recorded nor waited out (`_release`)
@@ -715,7 +716,7 @@ class FederationLock:
         )
         token = _ADMISSION.set(admission)
         try:
-            if not exclusive or purpose == EXCLUSIVE_RUN:  # an outage run settles the journal itself, under its lock
+            if not exclusive or purpose in (EXCLUSIVE_RUN, INGEST):  # an outage run settles the journal itself
                 self._require_settled()
             # the record is read again after the journal was: a restore that cleared an injection without this lock (the
             # health gate's, of a stuck holder's) wrote its record first, so an admission that finds the journal

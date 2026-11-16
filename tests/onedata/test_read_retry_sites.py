@@ -27,6 +27,7 @@ SKIPPED = {"sandbox/gate.py"}  # the data gate, a program of its own with no cli
 # The harness's own plumbing: a read that timed out is tried again, three attempts with pauses of 2 s and 5 s.
 PLUMBING = {
     ("provision.py", "Provisioner._size_of", "client.get"): ["self._retry"],
+    ("provision.py", "Provisioner._current", "client.get"): ["self._retry"],  # a cached entry read again (O67)
     ("provision.py", "Provisioner.read_file", "client.get"): ["self._retry"],  # the metadata read, with the deadline
     # the visibility wait before a transfer: a reset's policy when its stage names one (`retry`, O46)
     ("provision.py", "Provisioner.await_visible", "client.get"): ["self._retry if retry is None else retry"],
