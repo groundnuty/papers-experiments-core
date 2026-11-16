@@ -465,23 +465,55 @@ not a regular file, is missing or is over 1 MiB, printing nothing; a plan that h
 `collect` never reads it. With no `pre_step` the lines and the plan are what they were, word for word.
 
 `step` runs the guard first, before the core check, before a `--resume` removes a killed step's directory, and before
-it makes the sandbox's work root, its own directory on the tmpfs, the journals or an archive. It opens the guard part
-by part below `--study` with no link followed, refuses a file whose SHA-256 is not the one on the line, and runs those
-bytes, never the file read a second time: `<python> -I - <label> <study>/campaign.toml`, the script on the
-interpreter's stdin, so the guard's `sys.argv[1:]` is the shard's label and the path of the stamped `campaign.toml`.
-It runs with `-I`, the same interpreter as the step, in the study's root (`--study`, the stamped copy: the step's tmpfs
-copy does not exist yet; refused unless it is a directory of this user's that no group or other can write to), in an environment of the step's allowlist (`PATH`, `LC_ALL`, `EXPCORE_FED_ROOT_PARENT`,
-`EXPCORE_FED_ROOT`) and the step's no-home variables and nothing else, and in a session of its own, killed with
-everything it started when it does not end within its bound. Its stdout and stderr are the step's. A non-zero exit, a
-signal, a timeout, a hash that is not the plan's or a guard that cannot be read refuses the step with exit status 73
-(`PRE_STEP_REFUSED`), naming the guard and why, and leaves nothing made. A step that passes records
-`pre_step: {path, sha256, exit_status}` in its `step.json` and in its archive's manifest (`<label>.out.json`).
+it makes the sandbox's work root, its own directory on the tmpfs, the journals or an archive. It opens the study's root
+(`--study`, the stamped copy: the step's tmpfs copy does not exist yet) once and holds it, and refuses a root that is
+not a directory of this user's or that group or others can write to. It reads the guard part by part below that
+descriptor with no link followed, refuses a file whose SHA-256 is not the one on the line, and runs those bytes, never
+the file read a second time: `<python> -I -B - <label> <campaign.toml>`, the script on the interpreter's stdin. The
+guard's `sys.argv[1]` is the shard's label and `sys.argv[2]` names the stamped `campaign.toml` through the held root
+(a path under `/proc/self/fd`, good in the guard only), and its working directory is that same root, so a root renamed
+after the check is never the one it runs in. It runs with the same interpreter as the step, in an environment of the
+step's allowlist (`PATH`, `LC_ALL`, `EXPCORE_FED_ROOT_PARENT`, `EXPCORE_FED_ROOT`) and its no-home variables and nothing
+else, and in a session of its own, killed with everything it started when it does not end within its bound or when the
+step is told to stop. Its stdout and stderr are the step's. A non-zero exit, a signal, a timeout, a hash that is not the
+plan's or a guard that cannot be read refuses the step with exit status 73 (`PRE_STEP_REFUSED`), naming the guard and
+why, and leaves nothing made. A step that passes records `pre_step: {path, sha256, exit_status}` in its `step.json`
+and in its archive's manifest (`<label>.out.json`).
 
 The guard rides on the generated line, so running a line directly runs it; nothing in `lines` skips it. What it does
 not cover: a line edited by hand to drop the three `--pre-step` words runs without it, and `step --archive-left`, which
 starts no work and makes no directory, ignores them, so a refusing guard cannot strand the only whole `out/` of a step
 (the archive carries the record of the guard that step ran). The guard is the study's own code, hashed as it was when
-the plan was made; it is not a sandbox, and it asserts only what its own file reads.
+the plan was made (run `lines` again after editing it); it is not a sandbox, and it asserts only what its own file reads.
+
+**The study's own check of its results: a post-run script.** The same shape for the check that needs the live
+federation, such as the study's owner check of what the shard left in it:
+
+    post_run = "guards/post_run.py"   # a path relative to the study's root, with the guard's path rules
+    post_run_timeout_s = 300          # optional, with post_run: above 0, at most 1800 (300 by default)
+
+`plan` and `lines` record its SHA-256 too (`plan` prints `post_run: {path, sha256, timeout_s}`), and each line ends
+with `--post-run REL --post-run-sha256 HEX --post-run-timeout S` after the guard's words. `step` reads and hashes it
+with the guard, before anything is made: a script that is a link, missing or not the plan's hash refuses the step with
+73, so a campaign is never spent on a check that cannot run. It holds the bytes and runs them once the dispatcher has
+exited 0, while the federation is up, and before `archive()`: `<python> -I -B - <label> <out/> <exit status>`, so
+`sys.argv[1:]` is the shard's label, the path of the study copy's `out/` on the node's tmpfs and the dispatcher's exit
+status (`0`). Its working directory is the study copy's root on the tmpfs and its environment is the dispatcher's own
+(the allowlist, the step's home and TMPDIR), in a session of its own, killed at its bound or when the step is told to
+stop. It may read `out/` and the federation, and it may write into `out/`, which is archived afterwards.
+
+An exit 0 makes the shard's results **final**. A non-zero exit, a signal, a timeout, or a dispatcher that did not exit 0
+(the script is then not run) leaves them **not final**. They are archived all the same, so nothing is lost: the
+manifest says `final: false` and the script's record with its reason, the archived `out/` holds `NOT-FINAL.json`, and
+the step ends with exit status 74 (`POST_RUN_FAILED`) when the dispatcher's own status was 0, the dispatcher's otherwise.
+A step's record (`step.json`) and its manifest hold `post_run: {path, sha256, ran, exit_status, final}` (and a `reason`
+when not final); with none declared the record, the manifest and the archive are what they were. `collect` refuses a
+shard that is not final, naming it and the reason, before it unpacks anything, and, when the plan declares a post-run
+script, a shard whose manifest does not say `final: true` with that script's hash (a line that dropped the words). The
+core's `python -m expcore merge` refuses an `out/` holding `NOT-FINAL.json`, naming the shard. `--resume` starts from a
+not-final archive as from any other, without the mark, and decides afresh; `step --archive-left` of an `out/` kept on the
+node archives it final only when the step's record says its script passed, and not final (with the mark) otherwise, so a
+step killed before its script passed is never archived as final.
 
 **A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
 archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into

@@ -47,17 +47,38 @@ is over 1 MiB. `plan` and `lines` read it and record its SHA-256 (`plan` prints 
 each line carries `--pre-step REL --pre-step-sha256 HEX --pre-step-timeout S`; no line is made from a plan that has not
 pinned it, and with no `pre_step` the line and the `plan` output are what they were. `step` does this before anything
 else, before the core check, before a `--resume` removes a killed step's directory, and before it makes the sandbox's
-work root, its own directory, the journals or an archive: it opens the guard part by part below `--study` (no link
-followed), refuses a file whose SHA-256 is not the one on its line, and runs those same bytes, never the file read
-again, as `<python> -I - <label> <study>/campaign.toml` (the script on the interpreter's stdin) with the study's root,
-`--study` (the stamped copy, since its tmpfs copy does not exist yet; refused unless it is a directory of this
-user's that no group or other can write to), as its working directory, in an environment of
-`ALLOWLIST` and the step's home below a path nobody can make, and in a session of its own, killed with everything it
-started when it does not end within `pre_step_timeout_s` (60 s by default, above 0 and at most 600). A non-zero exit, a
+work root, its own directory, the journals or an archive. It opens the study's root (`--study`, the stamped copy, since
+its tmpfs copy does not exist yet) once and holds it: refused unless it is a directory of this user's that no group or
+other can write to; reads the guard part by part below that descriptor (no link followed), refuses a file whose
+SHA-256 is not the one on its line, and runs those same bytes, never the file read again, as
+`<python> -I -B - <label> <campaign.toml>` (the script on the interpreter's stdin), with the held root as its working
+directory and `campaign.toml` named through it (a path under `/proc/self/fd`, valid in the guard alone), so a root
+renamed after the check is never the one it runs in. Its environment is `ALLOWLIST` and the step's home below a path
+nobody can make, and it runs in a session of its own, killed with everything it started when it does not end within
+`pre_step_timeout_s` (60 s by default, above 0 and at most 600), or when the step is told to stop. A non-zero exit, a
 signal, a timeout, a hash mismatch or a guard that cannot be read refuses the step with `PRE_STEP_REFUSED` (73), naming
 the guard and why, and nothing is made. A step that passes records `{path, sha256, exit_status}` as `pre_step` in
 its `step.json` and in its archive's manifest. The line carries the guard, so a line run as it was printed runs it; a
 hand-edited line that drops the three words runs without it, and `--archive-left`, which starts no work, ignores them.
+
+**The study's own check of its results: a post-run script.** Symmetrical, for the check that needs the live
+federation (the study's own owner check of what the shard left in it). The manifest's `post_run` names a script of
+the study (the same path rules; `post_run_timeout_s`, 300 s by default, above 0 and at most 1800), `plan` and `lines`
+record its SHA-256 and each line also carries `--post-run REL --post-run-sha256 HEX --post-run-timeout S`. `step` reads
+and hashes it with the guard, before anything is made (one that is a link, missing or not the plan's hash refuses the
+step with 73, so a campaign is never spent on a check that cannot run), holds its bytes, and runs them once the
+dispatcher has exited 0, while the federation is up and before the archive is written: `<python> -I -B - <label>
+<out/> <dispatcher's exit status>`, the study copy's root on the node's tmpfs as its working directory, in the
+dispatcher's own environment (`ALLOWLIST`, the step's home and TMPDIR), in a session of its own, killed at its bound.
+Its exit 0 makes the shard's results final. A non-zero exit, a signal, a timeout, or a dispatcher that did not exit 0
+(the script is not run) leaves them NOT final: they are archived all the same, so nothing is lost, with `final: false`
+and its reason in the manifest, a `NOT-FINAL.json` in the archived `out/`, and the step ends with `POST_RUN_FAILED`
+(74) unless the dispatcher's own status was not 0. The record of the script (`post_run`: path, SHA-256, whether it ran,
+its exit status, `final`) is in `step.json` and the manifest. `collect` refuses a not-final shard, naming it and its
+reason, and, when the plan declares a post-run, a shard whose manifest does not carry that script's hash with `final`
+true (a line that dropped the words); the core's `merge` refuses an `out/` holding `NOT-FINAL.json`. `--resume` starts
+from such an archive as from any and decides afresh; `--archive-left` archives a kept `out/` as final only when the
+step's record says its script passed.
 
 **The node's tmpfs is the node's, not the job's.** Each step's directory there (`expcore-shard-<label>.<random>`)
 records its step (`step.json`: its pid and start time, its shard, its federation's root, its results directory, the
@@ -121,6 +142,8 @@ The manifest (`shards.toml`, operator-local, never committed, since it names the
     snapshot_every_s = 900            # optional: seconds between snapshots of a running shard's out/ (also at run ends)
     pre_step = "guards/pre_step.py"   # optional: a script of the study that each step runs first (see above)
     pre_step_timeout_s = 60           # optional, with pre_step: its bound in seconds (above 0, at most 600)
+    post_run = "guards/post_run.py"   # optional: a script of the study that each step runs after its dispatcher exits 0
+    post_run_timeout_s = 300          # optional, with post_run: its bound in seconds (above 0, at most 1800)
     [[shards]]                        # in order: shard i is the i-th entry
     label = "fed-a"                   # the shard's label (no host name: it travels with the export)
     root = "/shared/fed/a"            # the federation's root, holding hpc-federation.json and platform.toml
@@ -163,11 +186,20 @@ LOCK_NAME = "campaign.lock"  # expcore.campaign.lock.LOCK_NAME: the merge refuse
 ALLOWLIST = ("PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT")
 CORE_MISMATCH = 97  # the step's interpreter imports another core than the one it was given
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
-PRE_STEP_REFUSED = 73  # the study's pre-step guard refused the step, or could not be run as declared: nothing made
+PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared: nothing made
+POST_RUN_FAILED = 74  # the dispatcher exited 0 and the study's post-run script did not: archived, marked not final
 PRE_STEP_TIMEOUT_S = 60.0  # a guard's bound when the manifest names none
 PRE_STEP_MAX_S = 600.0  # the longest bound a manifest may give a guard
-PRE_STEP_MAX_BYTES = 1 << 20  # a guard script is at most this long
+POST_RUN_TIMEOUT_S = 300.0  # a post-run script's bound when the manifest names none
+POST_RUN_MAX_S = 1800.0  # the longest bound a manifest may give a post-run script
+HOOK_MAX_BYTES = 1 << 20  # a declared script is at most this long
 CAMPAIGN = "campaign.toml"  # the study's stamped campaign file: the guard's second argument
+NOT_FINAL = "NOT-FINAL.json"  # expcore.campaign.shard.NOT_FINAL_FILE: in a not-final out/, which the merge refuses
+NOT_FINAL_FORMAT = "expcore-hpc-shard-not-final/1"
+HOOKS = {  # what each declared script is called in a message, its default bound and its longest
+    "pre_step": ("pre-step guard", PRE_STEP_TIMEOUT_S, PRE_STEP_MAX_S),
+    "post_run": ("post-run script", POST_RUN_TIMEOUT_S, POST_RUN_MAX_S),
+}
 CHUNK = 1 << 20
 SNAPSHOT_EVERY_S = 900.0  # a running shard's out/ is snapshotted this often, and after each run's end
 POLL_S = 30.0  # how often the snapshot thread looks for a run's end in the store
@@ -176,6 +208,7 @@ WORK_PREFIX = "expcore-shard-"  # a step's directory on the node's tmpfs: <tmpfs
 OWNER, OWNER_FORMAT = "step.json", "expcore-hpc-shard-step/1"  # in it: the step's process, campaign and federation
 OWNER_ENDING = ".step.ended.json"  # written at the start, renamed over step.json when the dispatcher ends
 OWNER_STATUS = ".step.status.json"  # the same with the dispatcher's exit status, written when it ends, if it can be
+OWNER_POST = ".step.post.json"  # the same with the post-run script's record, written when it ends
 RUNNING, ARCHIVING = "running", "archiving"  # the step's phase: its dispatcher runs; it ended and out/ is whole
 ARCHIVE_FAILED_MARK = "ARCHIVE-FAILED.json"  # in it: the out/ in it could not be archived, so it is kept
 PLATFORM = "platform.toml"  # the federation's, in its root; the step's copy of the study has it beside study.toml
@@ -235,6 +268,9 @@ class Plan:
     pre_step: str | None = None  # the study's pre-step guard: a path relative to its root
     pre_step_sha256: str | None = None  # its SHA-256, recorded by `pinned` when `plan` and `lines` read it
     pre_step_timeout_s: float = PRE_STEP_TIMEOUT_S
+    post_run: str | None = None  # the study's post-run script: a path relative to its root
+    post_run_sha256: str | None = None  # its SHA-256, recorded by `pinned`
+    post_run_timeout_s: float = POST_RUN_TIMEOUT_S
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -255,7 +291,7 @@ def load_plan(path: Path) -> Plan:
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
-    optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s"}
+    optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s"}
     if not keys <= set(data) <= keys | optional:
         raise ShardsError(
             f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps {', '.join(sorted(optional))}"
@@ -263,13 +299,15 @@ def load_plan(path: Path) -> Plan:
     every = data.get("snapshot_every_s", SNAPSHOT_EVERY_S)
     if isinstance(every, bool) or not isinstance(every, int | float) or not 60 <= every < float("inf"):
         raise ShardsError("snapshot_every_s must be a number of seconds, at least 60")
-    if "pre_step" in data and (problem := guard_path_problem(data["pre_step"])):
-        raise ShardsError(f"pre_step {problem}")
-    if "pre_step_timeout_s" in data and "pre_step" not in data:
-        raise ShardsError("pre_step_timeout_s is the bound of a pre_step, which the manifest does not declare")
-    bound = data.get("pre_step_timeout_s", PRE_STEP_TIMEOUT_S)
-    if problem := bound_problem(bound):
-        raise ShardsError(f"pre_step_timeout_s {problem}")
+    bounds = {}
+    for key, (_, default, maximum) in HOOKS.items():
+        if key in data and (problem := guard_path_problem(data[key])):
+            raise ShardsError(f"{key} {problem}")
+        if f"{key}_timeout_s" in data and key not in data:
+            raise ShardsError(f"{key}_timeout_s is the bound of a {key}, which the manifest does not declare")
+        bounds[key] = data.get(f"{key}_timeout_s", default)
+        if problem := bound_problem(bounds[key], maximum):
+            raise ShardsError(f"{key}_timeout_s {problem}")
     for key in ("study", "core_src", "results", "tmpfs"):
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
@@ -293,7 +331,8 @@ def load_plan(path: Path) -> Plan:
         raise ShardsError("a label is given to two shards")
     return Plan(Path(data["study"]), str(data["python"]), Path(data["core_src"]), Path(data["results"]),
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
-                float(every), data.get("pre_step"), None, float(bound))  # fmt: skip
+                float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
+                float(bounds["post_run"]))  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -385,6 +424,11 @@ def step_argv(plan: Plan, shard: Shard, fed: Mapping[str, str], script: Path) ->
             )
         step += ["--pre-step", plan.pre_step, "--pre-step-sha256", plan.pre_step_sha256,
                  "--pre-step-timeout", f"{plan.pre_step_timeout_s:g}"]  # fmt: skip
+    if plan.post_run is not None:  # and the study's post-run script: `step` runs it before it archives (`run_post_run`)
+        if plan.post_run_sha256 is None:
+            raise ShardsError("the post-run script is not pinned: no line is made from a plan that has not hashed it")
+        step += ["--post-run", plan.post_run, "--post-run-sha256", plan.post_run_sha256,
+                 "--post-run-timeout", f"{plan.post_run_timeout_s:g}"]  # fmt: skip
     return [
         "srun", f"--jobid={fed['job']}", *([f"--het-group={fed['het_group']}"] if fed.get("het_group") else []),
         "--exact", "-N1", "-n1", "-w", fed["node"], "-c", str(plan.cpus),
@@ -405,23 +449,21 @@ def guard_path_problem(path: Any) -> str | None:
     return None
 
 
-def bound_problem(bound: Any) -> str | None:
-    """Why `bound` is not a guard's bound (seconds above 0 and at most `PRE_STEP_MAX_S`), or None."""
-    if isinstance(bound, bool) or not isinstance(bound, int | float) or not 0 < bound <= PRE_STEP_MAX_S:
-        return f"must be a number of seconds above 0 and at most {PRE_STEP_MAX_S:g}"
+def bound_problem(bound: Any, maximum: float = PRE_STEP_MAX_S) -> str | None:
+    """Why `bound` is not a declared script's bound (seconds above 0 and at most `maximum`), or None."""
+    if isinstance(bound, bool) or not isinstance(bound, int | float) or not 0 < bound <= maximum:
+        return f"must be a number of seconds above 0 and at most {maximum:g}"
     return None
 
 
-def read_guard(study: Path, path: str) -> bytes:
-    """The bytes of the study's guard `path`: each part opened with `O_NOFOLLOW` from the directory before it, so that a
-    link anywhere on the way, or a part swapped for one after a check, never leads out of the study; a regular file of
-    at most `PRE_STEP_MAX_BYTES`. `ShardsError` naming the guard otherwise, never the study's own path."""
-    name = f"pre-step guard {path}"
+def read_below(root_fd: int, path: str, name: str) -> bytes:
+    """The bytes of the file `path` below the directory `root_fd` holds: each part opened with `O_NOFOLLOW` from the
+    directory before it, so that a link anywhere on the way, or a part swapped for one after a check, never leads out of
+    the study; a regular file of at most `HOOK_MAX_BYTES`. `ShardsError` naming `name`, never the study's own path."""
     if problem := guard_path_problem(path):
         raise ShardsError(f"{name} {problem}")
-    parts, fd = path.split("/"), -1
+    parts, fd = path.split("/"), os.dup(root_fd)
     try:
-        fd = os.open(study, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         for n, part in enumerate(parts):
             last = n == len(parts) - 1  # the file itself may be a FIFO that blocks: never waited on, and refused below
             flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_NONBLOCK if last else os.O_DIRECTORY)
@@ -433,8 +475,8 @@ def read_guard(study: Path, path: str) -> bytes:
         chunks, size = [], 0
         while chunk := os.read(fd, CHUNK):
             size += len(chunk)
-            if size > PRE_STEP_MAX_BYTES:
-                raise ShardsError(f"{name} is over {PRE_STEP_MAX_BYTES} bytes")
+            if size > HOOK_MAX_BYTES:
+                raise ShardsError(f"{name} is over {HOOK_MAX_BYTES} bytes")
             chunks.append(chunk)
         return b"".join(chunks)
     except OSError as error:
@@ -442,34 +484,32 @@ def read_guard(study: Path, path: str) -> bytes:
                errno.ENOTDIR: "a part of its path is a link or not a directory"}  # fmt: skip
         raise ShardsError(f"{name} cannot be read: {why.get(error.errno, type(error).__name__)}") from None
     finally:
-        if fd >= 0:
-            os.close(fd)
+        os.close(fd)
 
 
-def study_root_problem(study: Path) -> str | None:
-    """Why the study's root cannot be the guard's working directory, or None: it must be a directory of this user's that
-    no group or other can write to (a shared directory would let another user swap the campaign.toml the guard reads, or
-    anything it opens by a relative name). The check is of the directory the path leads to."""
+def read_in_study(study: Path, key: str, path: str) -> bytes:
+    """The bytes of the study's declared script `path` (`key` says which), read below the study's root."""
+    name = f"{HOOKS[key][0]} {path}"
     try:
-        info = os.stat(study)
+        fd = os.open(study, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError:
-        return "the study's root cannot be read"
-    if not stat.S_ISDIR(info.st_mode):
-        return "the study's root is not a directory"
-    if info.st_uid != os.getuid():
-        return "the study's root is not this user's"
-    if stat.S_IMODE(info.st_mode) & 0o022:
-        return "the study's root can be written by its group or others"
-    return None
+        raise ShardsError(f"{name} cannot be read: the study's root cannot be opened") from None
+    try:
+        return read_below(fd, path, name)
+    finally:
+        os.close(fd)
 
 
 def pinned(plan: Plan) -> Plan:
-    """The plan with its pre-step guard's SHA-256 recorded, from the study as it is now (`plan` and `lines` call it, so
-    that a guard that leaves the study, is a link or is missing refuses them before a line is printed; `collect` never
-    reads it). The same plan when none is declared."""
-    if plan.pre_step is None:
-        return plan
-    return replace(plan, pre_step_sha256=hashlib.sha256(read_guard(plan.study, plan.pre_step)).hexdigest())
+    """The plan with the SHA-256 of each declared script (its pre-step guard, its post-run script) recorded, from the
+    study as it is now: `plan` and `lines` call it, so that a script that leaves the study, is a link or is missing
+    refuses them before a line is printed. The same plan when none is declared."""
+    found = {}
+    for key in HOOKS:
+        path = getattr(plan, key)
+        if path is not None:
+            found[f"{key}_sha256"] = hashlib.sha256(read_in_study(plan.study, key, path)).hexdigest()
+    return replace(plan, **found)
 
 
 # ------------------------------------------------------------------------------------------------ archives
@@ -492,10 +532,16 @@ def _write_whole(path: Path, write: Callable[[Path], None]) -> None:
 
 
 def archive(
-    out: Path, results: Path, spec: Mapping[str, Any], exit_status: int, pre_step: Mapping[str, Any] | None = None
+    out: Path,
+    results: Path,
+    spec: Mapping[str, Any],
+    exit_status: int,
+    pre_step: Mapping[str, Any] | None = None,
+    post_run: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write `out/` whole to `<results>/<label>.out.tar` and its manifest; the manifest, as written. `pre_step`, the
-    record of the guard the step ran (`run_pre_step`), is in it only when there is one."""
+    record of the guard the step ran (`start_hooks`), and `post_run`, the record of the post-run script, are in it only
+    when there is one; with a post-run record it also says `final`, whether that script passed."""
     label = str(spec["label"])
     tar_path = results / f"{label}.out.tar"
     files = sum(1 for p in out.rglob("*") if p.is_file() and not p.is_symlink())
@@ -515,6 +561,7 @@ def archive(
         "lock": (out / LOCK_NAME).is_file(),
         "exit_status": exit_status,
         **({"pre_step": dict(pre_step)} if pre_step is not None else {}),
+        **({"post_run": dict(post_run), "final": post_run.get("final") is True} if post_run is not None else {}),
     }
     _write_whole(results / f"{label}.out.json", lambda d: d.write_text(json.dumps(manifest, sort_keys=True) + "\n"))
     return manifest
@@ -574,14 +621,39 @@ def _read_only(root: Path) -> None:
     root.chmod(stat.S_IMODE(root.stat().st_mode) & ~0o222)
 
 
+def final_problem(shard: Shard, manifest: Mapping[str, Any], wanted: str | None) -> str | None:
+    """Why a verified shard's results are not to be merged, or None: its manifest says they are not final (the
+    study's post-run script did not pass), or, with `wanted` (the plan's SHA-256 of the post-run script), does not say
+    that this script passed (a step whose line dropped it)."""
+    record = manifest.get("post_run")
+    if manifest.get("final") is False:
+        reason = record.get("reason") if isinstance(record, Mapping) else None
+        return f"shard {shard.label}: its results are not final ({reason or 'its post-run script did not pass'})"
+    if wanted is not None and not (
+        manifest.get("final") is True and isinstance(record, Mapping) and record.get("sha256") == wanted
+    ):
+        return (
+            f"shard {shard.label}: its step did not run the plan's post-run script to a pass: its results are not final"
+        )
+    return None
+
+
 def collect(plan: Plan, into: Path) -> list[Path]:
-    """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails."""
+    """Every shard's out/, verified and unpacked read-only into `<into>/<label>/out`; refused whole if any fails, and
+    when any is not final (`final_problem`), naming it."""
     if into.exists() and any(into.iterdir()):
         raise ShardsError("the directory to collect into must be new or empty")
+    wanted = None
+    if plan.post_run is not None:  # the script the plan declares, as the study holds it now
+        wanted = pinned(replace(plan, pre_step=None)).post_run_sha256
     created = not into.exists()
     into.mkdir(parents=True, exist_ok=True)
     try:
-        found = [verified(plan.results, shard, into) for shard in plan.shards]
+        found = []
+        for shard in plan.shards:
+            found.append(verified(plan.results, shard, into))
+            if problem := final_problem(shard, found[-1][1], wanted):
+                raise ShardsError(problem)
     except ShardsError:  # refused whole: nothing of it is left behind
         for leftover in into.glob(".*.out.tar"):
             leftover.unlink()
@@ -594,6 +666,8 @@ def collect(plan: Plan, into: Path) -> list[Path]:
         tar_path.unlink()
         if not (out / LOCK_NAME).is_file():
             raise ShardsError(f"shard {shard.label}: its unpacked out/ has no {LOCK_NAME}")
+        if os.path.lexists(out / NOT_FINAL):
+            raise ShardsError(f"shard {shard.label}: its out/ is marked not final ({NOT_FINAL})")
         _read_only(out)
         outs.append(out)
     return outs
@@ -1010,8 +1084,12 @@ def archive_left(args: argparse.Namespace) -> int:
         raise ShardsError(f"shard {args.label}: {left.path.name} holds no out/")
     settle_store(out)
     status = left.owner.get("exit_status", (left.failed or {}).get("exit_status", 1))
-    guard = left.owner.get("pre_step")  # the guard that step ran; this one starts no work and runs none
-    manifest = archive(out, args.results, spec, int(status), guard if isinstance(guard, Mapping) else None)
+    guard, post = left.owner.get("pre_step"), left.owner.get("post_run")  # what that step ran; this one runs none
+    post = dict(post) if isinstance(post, Mapping) else None
+    if post is not None and post.get("final") is not True:  # its script did not pass, or the step ended before it did
+        post["reason"] = post.get("reason") or "the step ended before its post-run script passed"
+        mark_not_final(out, str(post["reason"]))
+    manifest = archive(out, args.results, spec, int(status), guard if isinstance(guard, Mapping) else None, post)
     remove_tree(left.path)
     print(f"shards: shard {args.label}'s kept out/ archived: {manifest['files']} files, sha256 {manifest['sha256']}")
     return 0
@@ -1062,8 +1140,24 @@ def _ended(work: Path, status: int) -> bool:
     return True
 
 
-class PreStepRefused(Exception):
-    """The study's pre-step guard refused the step, or could not be run as declared; the message names the guard."""
+class StepRefused(Exception):
+    """A script the study declared refused the step, or could not be run as declared; the message names it."""
+
+
+@dataclass(frozen=True)
+class Hook:
+    """A script of the study that this step's line declared (`--pre-step`, `--post-run`), its bytes read and hashed at
+    the step's start: what runs is these bytes, never the file read again."""
+
+    key: str  # `pre_step` or `post_run`
+    path: str
+    sha256: str
+    timeout: float
+    source: bytes
+
+    @property
+    def name(self) -> str:
+        return f"{HOOKS[self.key][0]} {self.path}"
 
 
 def pre_step_env() -> dict[str, str]:
@@ -1072,72 +1166,186 @@ def pre_step_env() -> dict[str, str]:
     return {k: os.environ[k] for k in ALLOWLIST if k in os.environ} | home_env(NO_HOME)
 
 
-def run_guard(source: bytes, args: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float) -> int | None:
-    """Run a guard's `source` as this interpreter's `-I -` (its script on its stdin) with `args`, in `cwd`, in a session
-    of its own, and return its exit status (negative for a signal). None when it did not end within `timeout`
-    seconds: it and everything it started are killed. Its stdout and stderr are this step's."""
-    child = subprocess.Popen([sys.executable, "-I", "-", *args], stdin=subprocess.PIPE, env=dict(env), cwd=cwd,
-                             start_new_session=True)  # fmt: skip
+def run_hook(
+    source: bytes,
+    args: Sequence[str],
+    cwd: str | Path,
+    env: Mapping[str, str],
+    timeout: float,
+    *,
+    pass_fds: Sequence[int] = (),
+) -> int | None:
+    """Run a script's `source` as this interpreter's `-I -B -` (its script on its stdin) with `args`, in `cwd`, in a
+    session of its own, and return its exit status (negative for a signal). None when it did not end within `timeout`
+    seconds. Past the bound, or when this step is told to stop (SIGTERM, SIGINT) while it runs, the script's whole
+    process group is killed, whether its leader is alive still or not: the leader is reaped only afterwards, so its
+    pid names its group until then. Its stdout and stderr are this step's."""
+    child = subprocess.Popen([sys.executable, "-I", "-B", "-", *args], stdin=subprocess.PIPE, env=dict(env), cwd=cwd,
+                             start_new_session=True, pass_fds=tuple(pass_fds))  # fmt: skip
+
+    def kill_group(*_: Any) -> None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+
+    previous: dict[int, Any] = {}
+    with contextlib.suppress(ValueError):  # only the main thread sets handlers
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.signal(sig, kill_group)
     try:
-        child.communicate(source, timeout=timeout)
-        return child.returncode
-    except subprocess.TimeoutExpired:
-        return None
-    finally:
-        if child.poll() is None:  # overrun, or this step is ending: nothing the guard started outlives it
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child.pid, signal.SIGKILL)
+        try:
+            child.communicate(source, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_group()
             child.wait()
+            return None
+        except BaseException:
+            kill_group()
+            child.wait()
+            raise
+        return child.returncode
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
-def run_pre_step(args: argparse.Namespace) -> dict[str, Any] | None:
-    """The step's first act (the module's docstring): None when its line declares no guard, else the record
-    `{path, sha256, exit_status: 0}` of the guard that passed. `PreStepRefused`, naming the guard and why, for a
-    declaration that is incomplete or not a plain path of the study, a file that cannot be read or is not the one the
-    plan hashed, a study root that is not this user's or that group or others can write, a study with no campaign.toml
-    of its own, a guard that cannot start, does not end in its bound or does
-    not exit 0. It runs the bytes it hashed, in the study's root, given the shard's label and campaign.toml's path."""
-    path, wanted, bound = (getattr(args, key, None) for key in ("pre_step", "pre_step_sha256", "pre_step_timeout"))
+def read_hook(args: argparse.Namespace, key: str, root_fd: int) -> Hook | None:
+    """The script this step's line declares under `key`, its bytes read below the study's root `root_fd` and shown to
+    be the file the plan hashed; None when the line declares none. `StepRefused` naming it for a declaration that is
+    incomplete or not a plain path of the study, a file that cannot be read, or a hash that is not the plan's."""
+    label, default, maximum = HOOKS[key]
+    flag = key.replace("_", "-")
+    path, wanted, bound = (getattr(args, f"{key}{suffix}", None) for suffix in ("", "_sha256", "_timeout"))
     if path is None:
         if wanted is not None or bound is not None:
-            raise PreStepRefused("--pre-step-sha256 and --pre-step-timeout belong to a --pre-step, not given")
+            raise StepRefused(f"--{flag}-sha256 and --{flag}-timeout belong to a --{flag}, which is not given")
         return None
-    name = f"pre-step guard {path}"
+    name = f"{label} {path}"
     if problem := guard_path_problem(path):
-        raise PreStepRefused(f"{name} {problem}")
+        raise StepRefused(f"{name} {problem}")
     if not isinstance(wanted, str) or not re.fullmatch(r"[0-9a-f]{64}", wanted):
-        raise PreStepRefused(f"{name} has no SHA-256 from the plan: --pre-step-sha256 is 64 hex digits")
-    bound = PRE_STEP_TIMEOUT_S if bound is None else bound
-    if problem := bound_problem(bound):
-        raise PreStepRefused(f"{name}: --pre-step-timeout {problem}")
-    study = Path(os.path.abspath(args.study))
-    if problem := study_root_problem(study):
-        raise PreStepRefused(f"{name} cannot run: {problem}; the guard's working directory must be this user's alone")
+        raise StepRefused(f"{name} has no SHA-256 from the plan: --{flag}-sha256 is 64 hex digits")
+    bound = default if bound is None else bound
+    if problem := bound_problem(bound, maximum):
+        raise StepRefused(f"{name}: --{flag}-timeout {problem}")
     try:
-        source = read_guard(study, path)
+        source = read_below(root_fd, path, name)
     except ShardsError as error:
-        raise PreStepRefused(str(error)) from None
+        raise StepRefused(str(error)) from None
     digest = hashlib.sha256(source).hexdigest()
     if digest != wanted:
-        raise PreStepRefused(f"{name} is not the file the plan hashed: its sha256 is {digest}, the plan's {wanted}")
-    campaign = study / CAMPAIGN
+        raise StepRefused(f"{name} is not the file the plan hashed: its sha256 is {digest}, the plan's {wanted}")
+    return Hook(key, path, wanted, float(bound), source)
+
+
+def run_guard(guard: Hook, label: str, root_fd: int) -> dict[str, Any]:
+    """Run the pre-step guard: in the study's root as `root_fd` holds it (a directory of this user's that no group or
+    other can write to), as its working directory and the base of the `campaign.toml` it is given, so a root renamed
+    since is never the one it runs in; the record `{path, sha256, exit_status: 0}` when it exits 0, else `StepRefused`
+    naming the guard and why (a root that is not ours, no campaign.toml of its own, a guard that cannot start, does not
+    end in its bound or does not exit 0)."""
+    info = os.fstat(root_fd)
+    if info.st_uid != os.getuid():
+        problem = "the study's root is not this user's"
+    elif stat.S_IMODE(info.st_mode) & 0o022:
+        problem = "the study's root can be written by its group or others"
+    else:
+        problem = None
+    if problem:
+        raise StepRefused(f"{guard.name} cannot run: {problem}; its working directory must be this user's alone")
     try:
-        found = stat.S_ISREG(os.lstat(campaign).st_mode)
+        found = stat.S_ISREG(os.lstat(CAMPAIGN, dir_fd=root_fd).st_mode)
     except OSError:
         found = False
     if not found:
-        raise PreStepRefused(f"{name} cannot run: the study's {CAMPAIGN} is missing, a link or not a file")
+        raise StepRefused(f"{guard.name} cannot run: the study's {CAMPAIGN} is missing, a link or not a file")
+    held = f"/proc/self/fd/{root_fd}"
     try:
-        status = run_guard(source, [args.label, str(campaign)], study, pre_step_env(), bound)
+        status = run_hook(guard.source, [label, f"{held}/{CAMPAIGN}"], held, pre_step_env(), guard.timeout,
+                          pass_fds=(root_fd,))  # fmt: skip
     except OSError as error:
-        raise PreStepRefused(f"{name} could not be started ({type(error).__name__})") from None
+        raise StepRefused(f"{guard.name} could not be started ({type(error).__name__})") from None
     if status is None:
-        raise PreStepRefused(f"{name} did not end within {bound:g} s: it was killed")
+        raise StepRefused(f"{guard.name} did not end within {guard.timeout:g} s: it was killed")
     if status < 0:
-        raise PreStepRefused(f"{name} refused the step: it was killed by signal {-status}")
+        raise StepRefused(f"{guard.name} refused the step: it was killed by signal {-status}")
     if status != 0:
-        raise PreStepRefused(f"{name} refused the step: exit status {status}")
-    return {"path": path, "sha256": digest, "exit_status": status}
+        raise StepRefused(f"{guard.name} refused the step: exit status {status}")
+    return {"path": guard.path, "sha256": guard.sha256, "exit_status": status}
+
+
+def start_hooks(args: argparse.Namespace) -> tuple[dict[str, Any] | None, Hook | None]:
+    """The step's first act (the module's docstring): the record `{path, sha256, exit_status: 0}` of the pre-step guard
+    that passed (None when the line declares none) and the post-run script, read and shown to be the plan's, for the
+    step to run after its dispatcher (None when none). Both are read before the guard runs, so that a campaign is never
+    started that cannot be checked at its end. `StepRefused` for any that is not as declared; nothing is made."""
+    keys = [
+        key for key in HOOKS if any(getattr(args, f"{key}{s}", None) is not None for s in ("", "_sha256", "_timeout"))
+    ]
+    if not keys:
+        return None, None
+    try:
+        root_fd = os.open(os.path.abspath(args.study), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        names = ", ".join(f"{HOOKS[key][0]} {getattr(args, key)}" for key in keys)
+        raise StepRefused(f"the study's root cannot be opened, so {names} cannot be read") from None
+    try:
+        guard, post = read_hook(args, "pre_step", root_fd), read_hook(args, "post_run", root_fd)
+        return (None if guard is None else run_guard(guard, args.label, root_fd)), post
+    finally:
+        os.close(root_fd)
+
+
+def run_post_run(hook: Hook, label: str, copy: Path, out: Path, env: Mapping[str, str], status: int) -> dict[str, Any]:
+    """The post-run script's turn, once the dispatcher has exited with `status`: its record `{path, sha256, ran,
+    exit_status, final}`, `final` only when the script ran and exited 0, with a `reason` when it is not. The script
+    gets the shard's label, `out` and `status`, runs in `copy` (the study's copy, on the node's tmpfs), and gets the
+    dispatcher's own environment. It is not run for a dispatcher that did not exit 0."""
+    record: dict[str, Any] = {"path": hook.path, "sha256": hook.sha256, "ran": False, "exit_status": None,
+                              "final": False}  # fmt: skip
+    if status != 0:
+        return {**record, "reason": f"the dispatcher exited {status}: the post-run script was not run"}
+    try:
+        code = run_hook(hook.source, [label, str(out), str(status)], copy, env, hook.timeout)
+    except OSError as error:
+        return {**record, "reason": f"the post-run script could not be started ({type(error).__name__})"}
+    record["ran"] = True
+    if code is None:
+        return {**record, "reason": f"the post-run script did not end within {hook.timeout:g} s: it was killed"}
+    record["exit_status"] = code
+    if code < 0:
+        return {**record, "reason": f"the post-run script was killed by signal {-code}"}
+    if code != 0:
+        return {**record, "reason": f"the post-run script exited with status {code}"}
+    return {**record, "final": True}
+
+
+def note_post_run(work: Path, post: Mapping[str, Any]) -> None:
+    """Put the post-run script's record in the step's record (`step.json`), written whole into a file of its own, read
+    back and swapped in by rename, as `_ended` does; should that fail (a full tmpfs) the record written at the start
+    stands, which says the script did not pass."""
+    current = _record(work / OWNER)
+    if current is None:
+        return
+    record = {**current, "post_run": dict(post)}
+    try:
+        (work / OWNER_POST).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        if _record(work / OWNER_POST) == record:
+            os.replace(work / OWNER_POST, work / OWNER)
+    except OSError as error:
+        print(f"shards: the post-run record could not be written to the step's record ({type(error).__name__})",
+              file=sys.stderr)  # fmt: skip
+
+
+def mark_not_final(out: Path, reason: str) -> None:
+    """Mark the shard's `out/` not final, in a file the merge refuses (`NOT_FINAL`); said when it cannot be written
+    (the manifest of the archive says it as well, and `collect` reads that)."""
+    mark = {"format": NOT_FINAL_FORMAT, "final": False, "reason": reason}
+    try:
+        (out / NOT_FINAL).write_text(json.dumps(mark, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as error:
+        print(
+            f"shards: ERROR: the not-final mark could not be written to out/ ({type(error).__name__})", file=sys.stderr
+        )
 
 
 def step(
@@ -1150,10 +1358,12 @@ def step(
     """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
     status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
     end, into `<results>/<label>/snapshots/`. Its first act is the study's pre-step guard, when its line declares one
-    (`run_pre_step`): nothing is made, removed or read before it, and `PRE_STEP_REFUSED` ends a step it refuses."""
+    (`start_hooks`): nothing is made, removed or read before it, and `PRE_STEP_REFUSED` ends a step it refuses. A
+    declared post-run script runs after the dispatcher exits 0 and before the archive (`run_post_run`): a step whose
+    script does not pass archives its results marked not final and ends with `POST_RUN_FAILED`."""
     try:
-        guard = run_pre_step(args)
-    except PreStepRefused as error:
+        guard, post_hook = start_hooks(args)
+    except StepRefused as error:
         print(f"shards: ERROR: {error}; the step is refused, with nothing made", file=sys.stderr)
         return PRE_STEP_REFUSED
     if guard is not None:
@@ -1192,7 +1402,9 @@ def step(
         work.chmod(0o700)
         owner = {"format": OWNER_FORMAT, "shard": spec, "pid": os.getpid(), "start": _start_of(os.getpid()),
                  "root": os.environ.get("EXPCORE_FED_ROOT"), "results": str(args.results), "base": base,
-                 "phase": RUNNING, **({"pre_step": guard} if guard is not None else {})}  # fmt: skip
+                 "phase": RUNNING, **({"pre_step": guard} if guard is not None else {}),
+                 **({"post_run": {"path": post_hook.path, "sha256": post_hook.sha256, "ran": False, "exit_status": None,
+                                  "final": False}} if post_hook is not None else {})}  # fmt: skip
         (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
         (work / OWNER_ENDING).write_text(json.dumps({**owner, "phase": ARCHIVING}, sort_keys=True) + "\n", "utf-8")
         copy = work / "study"
@@ -1203,6 +1415,9 @@ def step(
             (copy / PLATFORM).chmod(0o600)
         if args.resume:
             resume_into(args, spec, base, work, copy / "out")
+            (copy / "out" / NOT_FINAL).unlink(
+                missing_ok=True
+            )  # an archive not final is resumed; this step decides afresh
         for name in ("home", "tmp", *(f"home/{sub}" for sub in HOME_DIRS)):
             (work / name).mkdir(mode=0o700)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
@@ -1233,8 +1448,19 @@ def step(
         if not out.is_dir():
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
             return status
+        post = None
+        if post_hook is not None:  # the dispatcher has exited and the federation is up: the study's own check
+            post = run_post_run(post_hook, args.label, copy, out, env, status)
+            note_post_run(work, post)
+            if post["final"]:
+                print(f"shards: {post_hook.name} passed for shard {args.label}: its results are final", file=sys.stderr)
+            else:
+                mark_not_final(out, post["reason"])
+                print(f"shards: ERROR: {post['reason']}; shard {args.label}'s results are archived, NOT final",
+                      file=sys.stderr)  # fmt: skip
+            settle_store(out)  # a script that read the store may leave its -shm
         try:
-            manifest = archive(out, args.results, spec, status, guard)
+            manifest = archive(out, args.results, spec, status, guard, post)
         except (OSError, tarfile.TarError) as error:  # the only whole out/ is the tmpfs copy: kept, never removed
             keep = True
             mark = {"shard": spec, "exit_status": status, "error": type(error).__name__}
@@ -1243,6 +1469,8 @@ def step(
                   f"kept at {out} until `shards.py step --archive-left` archives it", file=sys.stderr)  # fmt: skip
             return ARCHIVE_FAILED
         print(f"shards: shard {args.label} archived: {manifest['files']} files, sha256 {manifest['sha256']}")
+        if post is not None and not post["final"]:
+            return status or POST_RUN_FAILED
         return status
     finally:
         if not keep:
@@ -1271,6 +1499,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--pre-step", dest="pre_step", default=None)  # the study's guard: `lines` writes all three
     one.add_argument("--pre-step-sha256", dest="pre_step_sha256", default=None)
     one.add_argument("--pre-step-timeout", dest="pre_step_timeout", type=float, default=None)
+    one.add_argument("--post-run", dest="post_run", default=None)  # the study's post-run script: all three
+    one.add_argument("--post-run-sha256", dest="post_run_sha256", default=None)
+    one.add_argument("--post-run-timeout", dest="post_run_timeout", type=float, default=None)
     left = sub.add_parser("sweep")
     left.add_argument("--tmpfs", type=Path, required=True)
     left.add_argument("--root", required=True)
@@ -1291,7 +1522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"a campaign on {len(plan.shards)} federations is one only where each declares every space's data "
                 f"(data_manifest in its platform.toml, C06); undeclared: {'; '.join(missing)}"
             )
-        plan = pinned(plan)  # the guard read and hashed before any line is printed
+        plan = pinned(plan)  # each declared script read and hashed before any line is printed
         script = Path(__file__).resolve()
         for shard in plan.shards:
             fed = federation(shard)
@@ -1300,6 +1531,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if plan.pre_step is not None:
                 record["pre_step"] = {"path": plan.pre_step, "sha256": plan.pre_step_sha256,
                                       "timeout_s": plan.pre_step_timeout_s}  # fmt: skip
+            if plan.post_run is not None:
+                record["post_run"] = {"path": plan.post_run, "sha256": plan.post_run_sha256,
+                                      "timeout_s": plan.post_run_timeout_s}  # fmt: skip
             print(json.dumps(record) if args.command == "plan" else shlex.join(line))
         return 0
     except ShardsError as error:

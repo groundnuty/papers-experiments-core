@@ -8,7 +8,11 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
+import signal
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -123,8 +127,9 @@ def test_o63_the_guard_is_run_isolated_in_the_studys_root_under_the_steps_allowl
     seen = tmp_path / "seen.json"
     guard = (
         "import json, os, sys\n"
-        f"json.dump({{'isolated': sys.flags.isolated, 'cwd': os.getcwd(), 'argv': sys.argv, 'env': dict(os.environ), "
-        f"'exe': sys.executable, 'file': globals().get('__file__')}}, open({str(seen)!r}, 'w'))\n"
+        f"json.dump({{'isolated': sys.flags.isolated, 'bytecode': sys.flags.dont_write_bytecode, "
+        f"'cwd': os.getcwd(), 'argv': sys.argv, 'env': dict(os.environ), 'exe': sys.executable, "
+        f"'real': os.path.realpath(sys.argv[2]), 'campaign': open(sys.argv[2]).read()}}, open({str(seen)!r}, 'w'))\n"
     )
     args = step_args(tmp_path, guard)
     (args.study / "json.py").write_text("raise SystemExit(99)\n")  # what `-I` keeps out of an import
@@ -137,10 +142,13 @@ def test_o63_the_guard_is_run_isolated_in_the_studys_root_under_the_steps_allowl
         monkeypatch.setenv(name, value)
     assert run_step(shards, args)[0] == 0
     found = json.loads(seen.read_text())
-    assert found["isolated"] == 1
+    assert (found["isolated"], found["bytecode"]) == (1, 1)  # `-I -B`
     assert found["exe"] == sys.executable
     assert Path(found["cwd"]).resolve() == args.study.resolve()
-    assert found["argv"][1:] == ["fed-a", str(args.study / "campaign.toml")]
+    assert found["argv"][1] == "fed-a"  # campaign.toml is named through the root the step holds, never by its path
+    assert re.fullmatch(r"/proc/self/fd/\d+/campaign\.toml", found["argv"][2])
+    assert found["real"] == str((args.study / "campaign.toml").resolve())
+    assert found["campaign"] == "[scheduler]\nworkers = 1\n"
     assert set(found["env"]) == {"PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT"} | HOME_NAMES
     assert found["env"]["HOME"] == NO_HOME
     assert found["env"]["EXPCORE_FED_ROOT"] == "/fed/root"
@@ -151,13 +159,13 @@ def test_o63_the_guard_runs_the_bytes_the_step_hashed_never_the_file_read_again(
     hashed (the script goes in on the interpreter's stdin)."""
     monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
     args = step_args(tmp_path, "raise SystemExit(0)\n")
-    real = shards.run_guard
+    real = shards.run_hook
 
     def swapping(source, *rest, **more):
         (args.study / GUARD).write_text("raise SystemExit(5)\n")  # the file changes between the check and the run
         return real(source, *rest, **more)
 
-    monkeypatch.setattr(shards, "run_guard", swapping)
+    monkeypatch.setattr(shards, "run_hook", swapping)
     assert run_step(shards, args)[0] == 0
 
 
@@ -592,3 +600,89 @@ def test_o63_collect_does_not_read_the_guard(shards, tmp_path):
         shards.pinned(plan)
     with pytest.raises(shards.ShardsError, match="pinned"):  # a line is never made from a plan whose guard is not
         shards.step_argv(plan, plan.shards[0], shards.federation(plan.shards[0]), SCRIPT)
+
+
+def test_o63_a_study_root_renamed_after_its_check_is_not_the_one_the_guard_runs_in(shards, tmp_path, monkeypatch):
+    """O63: the step holds the root it checked: a directory put at the study's path after the check (the checked one
+    renamed away) is neither the guard's working directory nor the place its campaign.toml is read from."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    seen = tmp_path / "seen.json"
+    guard = (
+        "import json, os, sys\n"
+        f"json.dump({{'cwd': os.path.realpath(os.getcwd()), 'campaign': open(sys.argv[2]).read()}}, "
+        f"open({str(seen)!r}, 'w'))\n"
+    )
+    args = step_args(tmp_path, guard)
+    real = shards.run_hook
+
+    def swapped(*more, **kwargs):
+        args.study.rename(tmp_path / "study-moved")
+        args.study.mkdir()
+        args.study.chmod(0o755)
+        (args.study / "campaign.toml").write_text("[scheduler]\nworkers = 99\n")
+        return real(*more, **kwargs)
+
+    monkeypatch.setattr(shards, "run_hook", swapped)
+    run_step(shards, args)
+    found = json.loads(seen.read_text())
+    assert found["cwd"] == str((tmp_path / "study-moved").resolve())
+    assert found["campaign"] == "[scheduler]\nworkers = 1\n"
+
+
+def test_o63_a_guard_whose_leader_exits_as_the_bound_expires_still_has_everything_it_started_killed(
+    shards, tmp_path, monkeypatch, capfd
+):
+    """O63: the bound runs out just as the guard's leader exits (here: the leader has exited and is not yet reaped when
+    the step reports the timeout): the group is killed all the same, not only when the leader is found alive, so the
+    helper the guard left running does not outlive the step that said it was killed."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    pids = tmp_path / "pids"
+    guard = (
+        "import subprocess, sys\n"
+        "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(pids)!r}, 'w').write(str(helper.pid))\n"
+    )
+
+    class Late(subprocess.Popen):
+        def communicate(self, input=None, timeout=None):  # the bound expires after the leader has exited, unreaped
+            self.stdin.write(input)
+            self.stdin.close()
+            os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+    monkeypatch.setattr(shards.subprocess, "Popen", Late)
+    code, seen = run_step(shards, step_args(tmp_path, guard))
+    assert code == shards.PRE_STEP_REFUSED
+    assert not seen
+    assert "did not end within" in capfd.readouterr().err
+    helper = int(pids.read_text())
+    for _ in range(50):
+        if not alive(helper):
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("the guard's helper still runs")
+    nothing_made(tmp_path)
+
+
+def test_o63_a_step_told_to_stop_while_its_guard_runs_kills_the_guard_and_makes_nothing(
+    shards, tmp_path, monkeypatch, capfd
+):
+    """O63: SIGTERM to the step during the guard (a scancel) kills the guard's whole group, which lives in a session of
+    its own, so it is not left to run out its bound; the step is refused, with nothing made."""
+    monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
+    earlier = signal.signal(signal.SIGTERM, lambda *_: None)  # a SIGTERM that arrives too early is not the test's end
+    timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM))
+    try:
+        timer.start()
+        began = time.monotonic()
+        code, seen = run_step(shards, step_args(tmp_path, "import time\ntime.sleep(60)\n"))
+        assert time.monotonic() - began < 30
+        assert signal.getsignal(signal.SIGTERM).__name__ == "<lambda>"  # the step's handlers are put back
+    finally:
+        timer.cancel()
+        signal.signal(signal.SIGTERM, earlier)
+    assert code == shards.PRE_STEP_REFUSED
+    assert not seen
+    assert "signal 9" in capfd.readouterr().err
+    nothing_made(tmp_path)
