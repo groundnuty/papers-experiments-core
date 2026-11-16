@@ -406,3 +406,21 @@ def test_o60_the_eighth_fixture_pins_a_mount_guard_snapshot_and_the_seven_before
     assert replay_record(record).dumps().encode("utf-8") == eighth[0].read_bytes()
     for earlier in FIXTURES[:7]:
         assert NAMESPACE not in load_record(earlier).instruments
+
+
+def test_o56_the_ninth_fixture_pins_a_process_visibility_snapshot_and_the_eight_before_it_hold_none():
+    """O56 and R03: the ninth merge point added the `process_visibility` instrument of a run on an HPC node, another
+    entry of `instruments`, so no field of the schema changes. Its fixture is the eighth's record with a clean run's
+    snapshot put in by the record's own API: it validates and replays to its own bytes (the parametrized tests above),
+    the redaction leaves it as it is, and the judge reads it as clean. The eight fixtures before it hold none."""
+    from expcore.visibility import NAMESPACE, judge
+
+    ninth = [p for p in FIXTURES if p.name.startswith("09-")]
+    assert [p.name for p in ninth] == ["09-process-visibility.json"]
+    record = load_record(ninth[0])
+    assert record.instruments[NAMESPACE]["memory"] == "within"
+    assert judge(record, "cond").verdict == "clean"
+    assert record.redacted_paths == load_record(FIXTURES[7]).redacted_paths
+    assert replay_record(record).dumps().encode("utf-8") == ninth[0].read_bytes()
+    for earlier in FIXTURES[:8]:
+        assert NAMESPACE not in load_record(earlier).instruments
