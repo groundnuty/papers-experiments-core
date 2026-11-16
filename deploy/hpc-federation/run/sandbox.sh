@@ -111,7 +111,10 @@ done
 grep -q 'gate ready' "$D/gate/stdout" || { echo "sandbox: ERROR: the gate did not start: $(tail -c 400 "$D/gate/stderr")" >&2; exit 1; }
 rm -f -- "${D:?}/gate/token"   # the gate keeps its token in memory; the scan's copy stays until the cell has exited
 echo "sandbox: gate ready on 127.0.0.1:$port (the gate's token file removed; held in the gate's memory)" >&2
-total=$(ss -Hltn | wc -l); ours=$(ss -Hltnp 2> /dev/null | grep -c 'pid=' || true)
+# The node's listeners, counted only from a listing that was read: a missing or failing ss stops the run, never 0.
+all=$(ss -Hltn) && mine=$(ss -Hltnp 2> /dev/null) \
+  || { echo "sandbox: ERROR: ss failed or is missing: this node's listeners could not be counted" >&2; exit 1; }
+total=$(grep -c . <<<"$all" || true); ours=$(grep -c 'pid=' <<<"$mine" || true)
 rec kv "$E/sandbox/node.json" "tcp_listeners_total=int:$total" "tcp_listeners_ours=int:$ours"
 
 cp "$RUN/agent.py" "$D/cell/agent.py"

@@ -250,9 +250,10 @@ class Allocation:
 
 @dataclass(frozen=True)
 class Step:
-    """One job step: where it runs, its size, its name, and its command behind the environment allowlist. A step in a
-    heterogeneous job's further component names it (`het_group`, srun's `--het-group`; a step without one runs in
-    component 0) and that component's own job id (`component`), by which squeue -s and sacct list its steps."""
+    """One job step: where it runs, its size, its name, and its command behind the environment allowlist. A step of a
+    heterogeneous job names its component (`het_group`, srun's `--het-group`), 0 included: on the site's Slurm a step
+    of one with no `--het-group` is refused. A step of a further component also carries that component's own job id
+    (`component`), by which squeue -s and sacct list its steps. A job of one component takes no `het_group`."""
 
     job: str
     node: str
@@ -294,6 +295,28 @@ class Step:
             *self.env,
             *self.command,
         ]
+
+
+def home_env(home: str) -> Dict[str, str]:
+    """A step's own home, so that no tool of a step falls back to the account's home, which every job and agent of the
+    account shares (with HOME unset, many tools take the passwd entry's): HOME, the XDG base directories, Apptainer's
+    configuration and cache, uv's and pip's caches, all under `home`; Python's user site off; git's global and system
+    configuration none. The launcher names a path nobody can make (`hpclaunch.NO_HOME`); a step that makes a private
+    directory of its own on the node's tmpfs points them into it (`lib.sh`'s home_in, `shards.py step`)."""
+    return {
+        "HOME": home,
+        "XDG_CONFIG_HOME": f"{home}/.config",
+        "XDG_CACHE_HOME": f"{home}/.cache",
+        "XDG_DATA_HOME": f"{home}/.local/share",
+        "XDG_STATE_HOME": f"{home}/.local/state",
+        "APPTAINER_CONFIGDIR": f"{home}/.apptainer",
+        "APPTAINER_CACHEDIR": f"{home}/.apptainer/cache",
+        "UV_CACHE_DIR": f"{home}/.cache/uv",
+        "PIP_CACHE_DIR": f"{home}/.cache/pip",
+        "PYTHONNOUSERSITE": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
 
 
 def allowlist(step_path: str, node_tmp: str, extra: Mapping[str, str] = {}) -> Tuple[str, ...]:

@@ -49,8 +49,13 @@ except OSError as e:
     print("none (%s)" % e.strerror)' 2>&1)"
 for t in ss findmnt curl od sha256sum tar getent; do kv "tool_$t" "$(command -v "$t" || echo MISSING)"; done
 kv registry_http "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 https://docker.onedata.org/v2/ 2>&1)"
-kv epmd_4369 "$(ss -ltnH 'sport = :4369' | grep -q . && echo listening || echo free)"
-used=$(used_ports)
+# A listing that could not be read is an error, never "free" (a missing ss once read as no listener at all).
+if epmd=$(ss -ltnH 'sport = :4369'); then
+  kv epmd_4369 "$([[ -n $epmd ]] && echo listening || echo free)"
+else
+  kv epmd_4369 "ERROR (ss failed or is missing)"
+fi
+used=$(used_ports) || { kv ports_busy "ERROR (this node's listeners could not be listed)"; exit 1; }
 taken=''
 for p in $HPCOP_PUBLIC_PORTS $(dialled_ports oz); do if grep -qx -- "$p" <<<"$used"; then taken+="$p "; fi; done
 kv ports_busy "$taken"

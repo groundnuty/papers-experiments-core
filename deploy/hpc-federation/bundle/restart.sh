@@ -33,6 +33,7 @@ if owner_runs "$W"; then die "the process that owns $W still runs: the stop has 
 case $COMP in op) RUN=run-node.sh FINISH=finish.sh ;; oz) RUN=run-zone.sh FINISH=finish-zone.sh ;; esac
 export HPCOP_OWNER_PID=$$
 record_owner "$W" "$$"   # this script owns the directory now: no later sweep removes it while this runs
+home_in "$W"   # every child's HOME, caches and Apptainer's directories in the work directory, never the account's ~
 svc='' svc_start=''
 cleanup() {
   local removing=0

@@ -10,7 +10,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, SITE, FakeSlurm, agent_site, data_stand_in, hpc_on_path, pin_values
+from hpc_fed_support import (
+    LAYOUT,
+    PEM,
+    SITE,
+    FakeProcess,
+    FakeSlurm,
+    agent_site,
+    data_stand_in,
+    hpc_on_path,
+    pin_values,
+)
 
 from expcore_onedata.linkcheck import LinkReport, PairResult
 from expcore_onedata.linksettings import link_pairs
@@ -128,7 +138,30 @@ def test_service_steps_and_control_steps_are_exact_and_sized_by_the_layout(hpc, 
     controls = [s for s in rig.fake.sruns if s not in rig.fake.spawned]
     assert controls
     assert {(s.cpus, s.mem) for s in controls} == {(1, "1024M")}
-    assert {tuple(s.env) for s in rig.fake.sruns} == {("PATH=/usr/bin:/bin", "LC_ALL=C", "TMPDIR=/tmp")}
+    homeless = tuple(f"{k}={v}" for k, v in hpc.slurm.home_env(hpc.launch.NO_HOME).items())
+    assert {tuple(s.env) for s in rig.fake.sruns} == {("PATH=/usr/bin:/bin", "LC_ALL=C", "TMPDIR=/tmp", *homeless)}
+
+
+HOME_NAMES = ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPTAINER_CONFIGDIR",
+              "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR")  # fmt: skip
+
+
+def test_o57_no_step_of_up_or_down_can_fall_back_to_the_accounts_home(hpc, tmp_path, site):
+    """O57: with env -i and HOME unset, many tools take the passwd entry's home, which every job and agent of the
+    account shares. Every step of up and down, control and service, names HOME, the XDG base directories, Apptainer's,
+    uv's and pip's directories under a path nobody can make (below /dev/null, not a path of the shared tmpfs another
+    user could make first), Python's user site off and no git configuration; nothing else joins the allowlist."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    rig.driver.down()
+    assert rig.fake.spawned
+    for srun in rig.fake.sruns:
+        env = dict(word.split("=", 1) for word in srun.env)
+        assert set(env) == {"PATH", "LC_ALL", "TMPDIR", *HOME_NAMES, "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
+                            "GIT_CONFIG_NOSYSTEM"}, srun.name  # fmt: skip
+        assert all(env[name].startswith("/dev/null/") for name in HOME_NAMES), srun.name
+        flags = [env[n] for n in ("PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")]
+        assert flags == ["1", "/dev/null", "1"], srun.name
 
 
 def test_each_provider_is_registered_by_a_token_piped_from_the_zone_before_its_verdict(hpc, tmp_path, site):
@@ -158,6 +191,28 @@ def test_the_zones_passphrase_and_ca_reach_the_root_and_the_core_runs_over_the_r
     command = json.loads(values["hpc_command"])
     assert command[1] == "-B"
     assert command[2:] == [str(Path(rig.hpc.cli.__file__).resolve()), "--layout", str(LAYOUT), "--root", str(rig.root)]
+
+
+KEY_BLOCK = "-----BEGIN RSA " + "PRIVATE KEY-----\nTUlJQg==\n-----END RSA " + "PRIVATE KEY-----\n"  # a stand-in
+
+
+def test_the_root_keeps_only_the_certificate_of_a_ca_export_that_holds_its_key_first(hpc, tmp_path, site):
+    """O57: the image's CA file holds the CA's private key before its certificate (seen live: the core's phase refused
+    the root's ca_file, so every up failed before the link check); the root keeps the certificate alone."""
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(ca_pem=KEY_BLOCK + "\n" + PEM))
+    rig.up()
+    kept = (rig.root / "ca" / "federation-ca.pem").read_text(encoding="utf-8")
+    assert kept == PEM
+    assert "PRIVATE KEY" not in kept
+
+
+def test_an_up_whose_ca_export_holds_no_certificate_fails_and_writes_no_ca(hpc, tmp_path, site):
+    """O57: a CA export with a key and no certificate fails up, and the root holds no CA file."""
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(ca_pem=KEY_BLOCK))
+    with pytest.raises(RuntimeError, match="holds no certificate"):
+        rig.up()
+    assert not (rig.root / "ca" / "federation-ca.pem").exists()
+    assert rig.core_calls == []
 
 
 def test_down_tears_down_the_providers_then_the_zone_checks_each_node_and_cancels_only_its_job(hpc, tmp_path, site):
@@ -240,6 +295,135 @@ def test_down_after_a_zone_that_failed_finds_its_work_directory_in_its_log(hpc, 
     assert not rig.root.exists()
 
 
+NODE_INIT_FAILED = "ok: /proc hides other users' processes\nhpcop: ERROR: ss failed: cannot list the listeners\n"
+
+
+def zone_died_in_node_init(fake, *, client_ends=True, listed=False):
+    """The fake's zone step as the live one ran: its log holds node-init's error and no work directory, and its step
+    ends at once (listed no more), its srun client too unless `client_ends` is False; `listed` keeps it listed."""
+    real = fake.spawn
+
+    def failing(argv, client_log):
+        client = real(argv, client_log)
+        srun = fake.sruns[-1]
+        if srun.name.endswith("-zone-run-1"):
+            Path(srun.output).write_text(NODE_INIT_FAILED, encoding="utf-8")
+            if not listed:
+                fake.steps.pop(srun.name, None)
+            if client_ends:
+                fake.dead_clients.append(client)
+        return client
+
+    fake.spawn = failing
+    return fake
+
+
+def leftover_checks(fake):
+    return [s for s in fake.sruns if any(Path(word).name == "leftovers.py" for word in s.command)]
+
+
+def test_down_after_a_zone_that_died_before_naming_its_work_directory_checks_its_node_and_removes_the_root(
+    hpc, tmp_path, site
+):
+    """O57: a zone whose step ended before its log named a work directory (live: node-init failed before making
+    one) is clean once its step is shown ended and a read-only check on its node counts no work directory of ours of
+    its kind; down then removes the root instead of refusing it."""
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm()))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    assert rig.state()["services"]["zone"]["workdir"] is None
+    rig.fake.sruns.clear()
+    assert "is gone, and so is the root" in rig.driver.down()
+    (check,) = leftover_checks(rig.fake)
+    assert (check.node, check.command[-2:]) == ("node01", ["oz", "/tmp"])
+    assert check.command[:3] == ["python3.11", "-I", "-B"]
+    assert rig.fake.cancelled == ["4242"]
+    assert not rig.root.exists()
+
+
+def test_down_keeps_the_root_when_the_nodes_check_finds_a_work_directory_of_ours(hpc, tmp_path, site):
+    """O57: a work directory of ours of the zone's kind on its node keeps the zone unverified and the root kept; the
+    held job is cancelled all the same."""
+    fake = zone_died_in_node_init(FakeSlurm(leftovers={"node01": 1}))
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert rig.fake.cancelled == ["4242"]
+    assert rig.root.exists()
+
+
+def test_a_step_whose_end_cannot_be_shown_stays_unverified_without_a_check(hpc, tmp_path, site):
+    """O57: a step never seen listed whose srun client still runs may yet start: its end cannot be shown, so the zone
+    stays unverified and no check of its node is taken as proof."""
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm(), client_ends=False))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    rig.fake.sruns.clear()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert leftover_checks(rig.fake) == []
+    assert rig.root.exists()
+
+
+def test_a_nodes_check_that_fails_is_no_proof_that_it_is_clean(hpc, tmp_path, site):
+    """O57: the node's check ending with a traceback, or printing no count, keeps the zone unverified: a check that
+    could not read the tmpfs is never a count of 0."""
+    from hpcslurm import Completed
+
+    def broken(srun):
+        if any(Path(word).name == "leftovers.py" for word in srun.command):
+            return FakeProcess(Completed(1, "", "Traceback (most recent call last):\nPermissionError\n"))
+        return None
+
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm(on_control=broken)))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert rig.root.exists()
+
+
+def test_a_zone_whose_log_names_a_directory_the_driver_refused_is_never_shown_clean(hpc, tmp_path, site):
+    """O57: a zone whose log named a work directory the driver refused (not on the node's tmpfs) left that directory
+    where the node's check does not look: its step ended all the same, it stays unverified and the root is kept."""
+    fake = zone_died_in_node_init(FakeSlurm())
+    real = fake.spawn
+
+    def elsewhere(argv, client_log):
+        client = real(argv, client_log)
+        srun = fake.sruns[-1]
+        if srun.name.endswith("-zone-run-1"):
+            Path(srun.output).write_text("hpcop: work directory /scratch/hpcop-oz.abcdef\nhpcop: ERROR: x\n", "utf-8")
+        return client
+
+    fake.spawn = elsewhere
+    rig = Rig(hpc, tmp_path, site, fake=fake)
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    rig.fake.sruns.clear()
+    with pytest.raises(RuntimeError, match="zone could not be verified clean"):
+        rig.driver.down()
+    assert leftover_checks(rig.fake) == []
+    assert rig.fake.cancelled == ["4242"]
+    assert rig.root.exists()
+
+
+def test_a_step_still_listed_is_cancelled_by_its_id_and_its_node_checked_once_it_left(hpc, tmp_path, site):
+    """O57: a zone step still listed whose log names no work directory is cancelled by its own id, recorded as seen;
+    once every step has left, its node's check counts none and the root goes."""
+    rig = Rig(hpc, tmp_path, site, fake=zone_died_in_node_init(FakeSlurm(), client_ends=False, listed=True))
+    with pytest.raises(RuntimeError, match="zone failed to start"):
+        rig.up()
+    step = rig.fake.steps[f"{rig.state()['allocation']['name']}-zone-run-1"]
+    rig.fake.sruns.clear()
+    rig.driver.down()
+    assert rig.fake.cancelled.index(step) < rig.fake.cancelled.index("4242")
+    assert len(leftover_checks(rig.fake)) == 1
+    assert not rig.root.exists()
+
+
 def test_a_teardown_that_fails_keeps_the_root_and_its_state_and_still_cancels_the_job(hpc, tmp_path, site):
     """O57: what down cannot verify it says, keeping the root and its state for a second down; the job is cancelled
     all the same, so nothing keeps billing."""
@@ -260,6 +444,41 @@ def test_up_refuses_a_root_that_holds_a_state_file(hpc, tmp_path, site):
     rig = Rig(hpc, tmp_path, site)
     rig.up()
     with pytest.raises(RuntimeError, match="run down first"):
+        rig.up()
+
+
+def test_a_node_facts_step_that_fails_is_named_with_its_status_and_the_end_of_its_stderr(hpc, tmp_path, site):
+    """O57: a failed node facts step fails up with its status and the last of its stderr on one line, bounded, so a
+    failure like the site's refusal of a het job's step with no group is diagnosable from the message alone."""
+    from hpcslurm import Completed
+
+    noise = "".join(f"line {i} of a long traceback\n" for i in range(200))
+    said = noise + "srun: error: the step could not start\x07\n"
+
+    def failing(srun):
+        return FakeProcess(Completed(1, "", said)) if srun.name.endswith("-facts") else None
+
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(on_control=failing))
+    with pytest.raises(RuntimeError) as raised:
+        rig.up()
+    message = str(raised.value)
+    assert message.startswith("the node facts of zone are not a name")
+    assert "(the step's status 1; its stderr: " in message
+    assert message.endswith("srun: error: the step could not start?)")
+    assert "\n" not in message
+    assert len(message) < 500
+    assert "line 0 of" not in message
+
+
+def test_a_node_facts_step_that_says_nothing_is_named_so(hpc, tmp_path, site):
+    """O57: a node facts step that printed nothing usable and nothing on stderr says so in up's message."""
+    from hpcslurm import Completed
+
+    def silent(srun):
+        return FakeProcess(Completed(0, "not json\n", "")) if srun.name.endswith("-facts") else None
+
+    rig = Rig(hpc, tmp_path, site, fake=FakeSlurm(on_control=silent))
+    with pytest.raises(RuntimeError, match=r"\(the step's status 0; nothing on its stderr\)$"):
         rig.up()
 
 
