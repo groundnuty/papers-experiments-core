@@ -17,9 +17,11 @@ the status and the reports (`BudgetState.estimate_usd`) and decides nothing.
 A send of a run in flight that its token cap cannot account for asks for a top-up first (`refusal`, C26; the ledger
 is `expcore.campaign.topup`): the same figure, with the top-up in place of a new run's bound. What was spent includes
 every top-up, of finished attempts and of running ones, from the moment it was reserved, and what admission's probes
-were charged (`expcore.campaign.probe_spend`), which each send of a probe asks for the same way before it goes out. A
-start of the campaign takes a release before its probes ask (`take_releases`), so a released campaign is not held
-for want of the room the release gave.
+were charged (`expcore.campaign.probe_spend`), which each send of a probe asks for the same way before it goes out,
+and what a kill took out of a store copied back, counted from the spend journal (`expcore.campaign.lost_spend`, O62):
+each lost attempt charged as its row would be, each lost top-up and probe charge at its dollars. A start of the
+campaign takes a release before its probes ask (`take_releases`), so a released campaign is not held for want of the
+room the release gave.
 
 Cost that cannot be known holds like cost that is over: a model whose price is unknown (no price, not free) is held,
 and so is every model once an attempt of an unpriced model has been charged, because the total spent is then unknown.

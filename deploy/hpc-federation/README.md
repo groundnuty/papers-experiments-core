@@ -285,7 +285,7 @@ space (M3) and the agent's node's step (M5) are not built here.
 | `baked.py` | node | finds the Couchbase cookies and memcached password the images ship, by the SHA-256 that `lib.sh` lists (never the values) |
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
-| `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, the archives the merge takes |
+| `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, its snapshots, the archives the merge takes |
 | `nodefacts.py` | control step | a node's FQDN, its IPv4 address, and the job's uid and gid, as JSON (`hpcfed.py up`) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
 | `gateport.c` | agent's cell | the connect-side mapper: a TCP connect to 127.0.0.1:443 goes to the gate's port; nothing else is touched |
@@ -303,8 +303,34 @@ the core it was given, runs `python -m expcore run STUDY --shard i/N --shard-lab
 exited writes the copy's `out/` whole to `<results>/<label>.out.tar` with a manifest. `shards.py collect --manifest
 shards.toml --into DIR` verifies every archive, unpacks each `out/` read-only and prints the `python -m expcore merge`
 line (`--run` runs it). The manifest names the site's paths and stays out of the repository (the script's docstring
-has its form). A step killed outright loses its shard's work since its last archive: the periodic snapshot is still to
-be built (`Snapshots`, the hook). Outage runs (`[faults]`) depend on the fault relay of milestone M4.
+has its form). Outage runs (`[faults]`) depend on the fault relay of milestone M4.
+
+**A step killed outright (O62).** Walltime, a node's end or an OOM in the step's cgroup ends the step with no chance to
+archive, and the tmpfs copy goes with the node. So while the dispatcher runs, the step snapshots its `out/` into
+`<results>/<label>/snapshots/` every `snapshot_every_s` seconds (a manifest key, 900 by default, at least 60) and after
+each run's end (the thread looks for a new attempt marker every 30 s), one at a time, and once more after the
+dispatcher exits, before the archive:
+
+- the store first, by the core's online backup of the live store, then `runs/`, so the snapshot's store never names
+  a record its `runs/` lacks. A run that ends between the two is `running` in the snapshot with its marker beside it,
+  which the resume's recovery commits. A run directory no row of the store copy names (an attempt begun after the
+  backup) is left out: after a restore that run's next attempt would get the same directory and the same attempt id;
+- written into a fresh `.snap-<n>.part`, checked (the store's integrity, every ended attempt's marker present, every
+  file read back against its hash), its manifest written last, then renamed to `snap-<n>`; the two newest are kept,
+  so a kill at any point leaves the last good one and a damaged newest falls back to the one before;
+- the dispatcher journals its spend to `<results>/<label>/journals/<stamp>-<pid>-<hex>.jsonl`, a new file per step
+  (`expcore run --spend-journal`): one line per attempt begun, top-up, attempt ended and probe charge, written after
+  the store commits it and before the spend; a journal that cannot be written stops the dispatcher.
+
+`shards.py step --resume` restores the newest snapshot that verifies, unless the archive is newer (each snapshot names
+the archive its step started from), else the archive, as before; either way the store's attempt directories are
+pointed at the new copy. The dispatcher's start then counts what the journals hold and the restored store lacks
+(attempts begun, top-ups and probe sends after the snapshot) as `lost_in_kill`, once, against the shard's share of the
+budget: an attempt whose end was journaled at its measured cost, one in flight at its reserved bound. The export and
+the report list it. A start without `--resume` of a shard with a snapshot is refused; a snapshot or a journal of
+another shard or campaign is refused, naming it. A snapshot holds the store and `runs/`, nothing else of `out/` (the
+harness-error log of a restored part and the lease directory are not kept), and copies them whole each time: size
+`snapshot_every_s` to what the shared filesystem can take.
 
 ## What the repository's tests cover
 
