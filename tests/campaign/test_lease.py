@@ -694,3 +694,25 @@ def test_o62_a_lease_directory_put_back_from_a_snapshot_needs_the_proof_for_ever
     asked = len(probe.asked)
     assert leases.try_acquire("g", "run-c") is not None  # proven once: released in order from then on
     assert len(probe.asked) == asked
+
+
+def test_o62_the_start_of_a_rolled_back_directory_counts_a_key_with_no_file_as_maybe_live(tmp_path):
+    """O62: a key first taken after the snapshot has no file, and its sandbox may outlive the kill; the start's sweep
+    looks at it too, so until its resource is shown gone it counts against every unit's cap, though no run asks it."""
+    before = pool(tmp_path, keys=("k1",))
+    before.try_acquire("g", "run-a").release()
+    mark_rolled_back(tmp_path / "leases")
+    probe = Probe(gone_keys={"k1"})
+    leases = pool(tmp_path, keys=("k1", "k2"), probe=probe)
+    assert leases.sweep_dead_holders(["g"]) == ["k2"]
+    assert sorted(key for key, _ in probe.asked) == ["k1", "k2"]
+    assert leases.may_be_live() == [None]
+
+
+def test_o62_a_directory_never_rolled_back_still_skips_a_key_with_no_file(tmp_path):
+    """O62: without a snapshot's restore nothing changes: a key never used is not looked at."""
+    probe = Probe()
+    leases = pool(tmp_path, keys=("k1",), probe=probe)
+    assert leases.sweep_dead_holders(["g"]) == []
+    assert probe.asked == []
+    assert not (tmp_path / "leases" / "k1.lock").exists()

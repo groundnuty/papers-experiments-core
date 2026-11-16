@@ -695,10 +695,13 @@ class LeasePool:
     def sweep_dead_holders(self, groups: Iterable[str]) -> list[str]:
         """Look at every key of the groups for a dead holder's leftovers, at a campaign's start and again while any is
         stuck. Return the keys still held back: free to lock, but the holder's resource is not shown gone. A key
-        whose lock is busy has a live holder and is not one of them."""
+        whose lock is busy has a live holder and is not one of them. In a directory put back from a snapshot
+        (`ROLLED_BACK`, O62) a key with no lock file may have been first taken after the copy, so it is looked at
+        too, its file created needing the proof, and until the proof it counts in `may_be_live` like any other."""
         out = []
+        rolled_back = (self.dir / ROLLED_BACK).exists()
         for key in dict.fromkeys(k for g in groups for k in self.keys_of(g)):
-            if not self._lock_path(key).exists():
+            if not rolled_back and not self._lock_path(key).exists():
                 continue
             handle = self._flock(key)
             if handle is None:
