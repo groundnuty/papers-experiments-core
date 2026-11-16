@@ -80,8 +80,9 @@ def test_c10_one_kind_across_three_models_stops_all_dispatch_and_records_it(tmp_
         assert "harness_error_stop_all" in event_kinds(scheduler.store)
 
 
-def test_c13_a_release_older_than_the_harness_stop_resumes_nothing_and_a_newer_one_resumes_once(tmp_path):
-    """C13: a stale release file does not end a stop; one written after it does, once, and is used up."""
+def test_c13_a_release_older_than_the_harness_stop_resumes_nothing_and_the_stops_own_line_resumes_once(tmp_path):
+    """C13: a stale release file (a bare name, written long before the stop) does not end it; the line the hold names
+    does, once, whatever time the file carries, and is used up."""
     plan = {"tasks": ("task-a", "task-b"), "seeds": (1, 2)}
     first = order(plan)[:3]
     release = tmp_path / "release.txt"
@@ -94,9 +95,13 @@ def test_c13_a_release_older_than_the_harness_stop_resumes_nothing_and_a_newer_o
         plan=plan,
         settings=settings_for(harness_stop=stop),
     ) as scheduler:
-        assert scheduler.run().holds["m1"].kind == "harness_errors"
-        assert release.exists()  # the stale file ended nothing
-        release.write_text("m1\n", encoding="utf-8")  # now newer than the stop
+        hold = scheduler.run().holds["m1"]
+        assert hold.kind == "harness_errors"
+        assert release.read_text(encoding="utf-8") == "m1\n"  # the stale file ended nothing
+        line = re.search(r"write the line '([^']+)'", hold.reason).group(1)
+        assert line.startswith("m1 ")
+        release.write_text(f"{line}\n", encoding="utf-8")
+        os.utime(release, (1_000_000, 1_000_000))  # a time long before the stop changes nothing
         summary = scheduler.run()
         assert not release.exists()  # used up
         assert summary.statuses.get("pending", 0) == 0  # dispatch resumed and finished the plan
@@ -308,16 +313,18 @@ def test_c12_and_c13_budgets_are_enforced_and_a_release_lets_the_campaign_go_on_
         assert summary.statuses == {"done": 2, "pending": 4}  # a third would be expected to pass 3 USD
         assert summary.holds["m1"].kind == "budget"
         assert "over the ceiling of 3.00 USD" in summary.holds["m1"].reason
-        release.write_text("ALL\n", encoding="utf-8")  # after the stop
+        line = re.search(r"write the line '([^']+)'", summary.holds["m1"].reason).group(1)
+        release.write_text(f"{line}\n", encoding="utf-8")  # the line the hold names
         summary = scheduler.run()
         assert not release.exists()
         assert summary.statuses == {"done": 5, "pending": 1}  # the ceiling is now 6.50 USD
         assert "budget_released" in event_kinds(scheduler.store)
         assert summary.holds["m1"].kind == "budget"  # a new stop, which needs a release of its own
+        assert line not in summary.holds["m1"].reason
 
 
 def test_c13_a_release_file_older_than_the_budget_stop_does_not_resume_dispatch(tmp_path):
-    """C13: a stale or reused release file does not resume dispatch."""
+    """C13: a stale release file, a bare scope written long before the stop, does not resume dispatch."""
     plan = {"tasks": ("task-a", "task-b"), "seeds": (1,)}
     release = tmp_path / "release.txt"
     release.write_text("ALL\n", encoding="utf-8")
