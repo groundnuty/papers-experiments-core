@@ -148,3 +148,33 @@ def test_o67_a_name_absent_from_the_cache_is_made_and_a_concurrent_one_fails_lou
     with pytest.raises((PlatformError, ProvisionError)):
         provisioner.upload("dir/two.bin", local(tmp_path, "two.bin", content(3)), listings=cache)
     assert bytes(fake.nodes[other].content) == content(2)
+
+
+def test_o67_a_cached_directory_renamed_behind_the_cache_is_not_descended_into(provisioner, fake, tmp_path):
+    """O67 (Codex): the cache holds `dir` by its id; another writer renames it. The file's own parent is unchanged, so
+    a check of the file alone would take `renamed/one.bin` for `dir/one.bin` and skip it. Every directory on the way is
+    read again by its id, so the renamed one is not taken for `dir`: `dir` and its file are made again, and the
+    renamed file is untouched."""
+    cache = {}
+    source = local(tmp_path, "one.bin", content(1))
+    made = provisioner.upload("dir/one.bin", source, listings=cache)
+    directory = fake.id_of("dir")
+    fake.nodes[directory].name = "renamed"
+    result = provisioner.upload("dir/one.bin", source, listings=cache)
+    assert result.action == "created"
+    assert result.file_id != made.file_id
+    assert fake.id_of("dir") != directory
+    assert fake.id_of("renamed/one.bin") == made.file_id
+
+
+def test_o67_a_cached_directory_moved_behind_the_cache_is_not_descended_into(provisioner, fake, tmp_path):
+    """O67: the cached `a/b` is moved under `elsewhere`; `a/b/one.bin` is made again under a new `a/b`."""
+    cache = {}
+    source = local(tmp_path, "one.bin", content(1))
+    made = provisioner.upload("a/b/one.bin", source, listings=cache)
+    elsewhere = fake.add_file("elsewhere/keep.bin", b"k")
+    fake.nodes[fake.id_of("a/b")].parent = fake.nodes[elsewhere].parent
+    result = provisioner.upload("a/b/one.bin", source, listings=cache)
+    assert result.action == "created"
+    assert fake.id_of("elsewhere/b/one.bin") == made.file_id
+    assert fake.id_of("a/b/one.bin") == result.file_id

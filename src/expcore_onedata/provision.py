@@ -660,10 +660,11 @@ class Provisioner:
         """Create every directory of a path that is missing, log each creation, and return the last one's id.
 
         `listings` is one operation's cache, as `upload` takes it: each directory on the way is listed once in it, and
-        each one made is added to its parent's listing (and listed as empty)."""
+        each one made is added to its parent's listing (and listed as empty). A directory the cache holds is read again
+        by its id before it is descended into (`_named`), so one renamed or moved since is never taken for the path."""
         parent = self.root()
         for part in safe_path(path):
-            existing = self.children(parent, listings=listings).get(part)
+            existing = self._named(parent, part, listings)
             if existing is not None:
                 if existing.kind != "DIR":
                     raise ProvisionError(f"{self._where}a part of the path exists and is not a directory")
@@ -673,9 +674,10 @@ class Provisioner:
         return parent
 
     def _named(self, parent: str, name: str, listings: Listings | None) -> Entry | None:
-        """The entry of `name` in a directory, for an upload to decide on: listed whole without a cache. With one (O67)
-        the directory is listed once, and an entry found in it is read again by its id before anything is decided, so
-        a skip, a resume or a restart compares the file as it is now: an entry that is gone, renamed or moved since
+        """The entry of `name` in a directory, for an upload or `make_dir` to decide on: listed whole without a cache.
+        With one (O67) the directory is listed once, and an entry found in it is read again by its id before anything
+        is decided, a directory on the way as well as the file, so a skip, a resume or a restart compares the file at
+        this path as it is now: an entry that is gone, renamed or moved since
         (`_current`) drops the directory's listing, which is read afresh. A name the cache does not hold is taken as
         absent: the cache holds what the directory held when it was listed and every entry made through it, and a
         file another writer made since is outside it (its creation is refused by the platform, loudly)."""
